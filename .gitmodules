@@ -1,0 +1,6 @@
+[submodule "vendor/tinyagents"]
+	path = vendor/tinyagents
+	url = git@github.com:tinyhumansai/tinyagents.git
+[submodule "vendor/openhuman"]
+	path = vendor/openhuman
+	url = git@github.com:tinyhumansai/openhuman.git
