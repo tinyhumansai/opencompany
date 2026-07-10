@@ -1,0 +1,15 @@
+# Rust build artifacts
+target/
+*.profraw
+*.profdata
+lcov.info
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,32 @@
+[package]
+name = "opencompany"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Company operating system scaffold built on OpenHuman and TinyHumans Rust modules."
+repository = "https://github.com/tinyhumansai/opencompany"
+readme = "README.md"
+keywords = ["company", "agents", "openhuman", "tinyagents", "axum"]
+categories = ["web-programming", "asynchronous"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite", "repl"] }
+
+[features]
+default = []
+tiny = ["tinyagents"]
+
+[patch.crates-io]
+tinyagents = { path = "vendor/tinyagents" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
