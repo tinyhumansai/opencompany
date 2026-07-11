@@ -70,6 +70,10 @@ module's `README.md`.
 Use concise, imperative commit subjects. Keep the first line specific to the
 change and avoid bundling unrelated work.
 
+Keep commits small and concise. Commit each coherent, validated slice on its
+own rather than batching many changes together, and keep the message short and
+focused on that one change.
+
 Pull requests should include a short summary, the commands run locally, and any
 API or behavior changes. Include updated examples or docs when public APIs,
 architecture, or expected usage changes.
