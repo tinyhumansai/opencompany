@@ -55,8 +55,11 @@ impl<'a> CycleRunner<'a> {
 
         // 2. Persist input — durable before any thinking.
         let mut persisted_seq = None;
+        let mut event_seqs = Vec::with_capacity(events.len());
         for event in &events {
-            persisted_seq = Some(self.rt.events.append(&company, event.clone()).await?);
+            let seq = self.rt.events.append(&company, event.clone()).await?;
+            event_seqs.push(seq);
+            persisted_seq = Some(seq);
         }
 
         // 3. Load — history, context index, roster.
@@ -81,6 +84,7 @@ impl<'a> CycleRunner<'a> {
             cycle_id: cycle_id.clone(),
             company_id: company.clone(),
             events,
+            event_seqs,
             compressed_history,
             roster,
             context_index,

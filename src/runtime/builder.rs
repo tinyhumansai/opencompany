@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
-use crate::brain::EchoBrain;
+use crate::app::config::BrainMode;
+use crate::brain::medulla::MedullaTransport;
+use crate::brain::medulla::wire::ToolManifestEntry;
+use crate::brain::{EchoBrain, HostedMedullaBrain};
 use crate::company::CompanyManifest;
 use crate::company::runtime::CompanyRuntime;
 use crate::feedback::github::{GitHubClient, RateLimiter};
@@ -24,7 +27,7 @@ use crate::feedback::types::ConsentMode;
 use crate::openhuman::rpc::OpenHumanRpc;
 use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
-use crate::ports::types::{CompanyId, CompanyRecord};
+use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
     AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, MemoryStore,
     SecretStore, ToolProvider,
@@ -107,6 +110,10 @@ pub struct RuntimeBuilder {
     id: CompanyId,
     manifest: CompanyManifest,
     brain: Option<Arc<dyn Brain>>,
+    brain_mode: Option<BrainMode>,
+    credential: Option<SecretValue>,
+    api_url: Option<String>,
+    transport: Option<Arc<dyn MedullaTransport>>,
     store: Option<Arc<dyn CompanyStore>>,
     events: Option<Arc<dyn EventLog>>,
     memory: Option<Arc<dyn MemoryStore>>,
@@ -134,6 +141,10 @@ impl RuntimeBuilder {
             id,
             manifest,
             brain: None,
+            brain_mode: None,
+            credential: None,
+            api_url: None,
+            transport: None,
             store: None,
             events: None,
             memory: None,
@@ -157,8 +168,47 @@ impl RuntimeBuilder {
     }
 
     /// Swaps the cognition brain (default [`EchoBrain`]).
+    ///
+    /// An explicit brain wins over hosted-brain selection: setting this bypasses
+    /// [`with_brain_mode`](Self::with_brain_mode) entirely.
     pub fn with_brain(mut self, brain: Arc<dyn Brain>) -> Self {
         self.brain = Some(brain);
+        self
+    }
+
+    /// Sets the brain mode driving hosted-brain selection (default
+    /// [`BrainMode::Hosted`]).
+    ///
+    /// Hosted mode plus a credential selects the
+    /// [`HostedMedullaBrain`](crate::brain::HostedMedullaBrain); anything else
+    /// falls back to the degraded [`EchoBrain`].
+    pub fn with_brain_mode(mut self, mode: BrainMode) -> Self {
+        self.brain_mode = Some(mode);
+        self
+    }
+
+    /// Provides the TinyHumans hosted-brain credential. Without it, hosted mode
+    /// degrades to [`EchoBrain`]. Never logged.
+    pub fn with_credential(mut self, credential: SecretValue) -> Self {
+        self.credential = Some(credential);
+        self
+    }
+
+    /// Sets the orchestration API base URL used to build the networked
+    /// transport under the `medulla` feature.
+    pub fn with_api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.api_url = Some(api_url.into());
+        self
+    }
+
+    /// Injects a [`MedullaTransport`] for the hosted brain to drive.
+    ///
+    /// Always available (not feature-gated) so offline tests can wire the
+    /// in-memory mock transport and exercise [`HostedMedullaBrain`] end-to-end
+    /// in the default build. An injected transport takes precedence over the
+    /// networked transport the `medulla` feature would otherwise construct.
+    pub fn with_transport(mut self, transport: Arc<dyn MedullaTransport>) -> Self {
+        self.transport = Some(transport);
         self
     }
 
@@ -273,8 +323,6 @@ impl RuntimeBuilder {
         let context: Arc<dyn ContextStore> = self
             .context
             .unwrap_or_else(|| Arc::new(FsContextStore::new(home.clone())));
-        let brain: Arc<dyn Brain> = self.brain.unwrap_or_else(|| Arc::new(EchoBrain::new()));
-
         // Effective grants narrow the company allow-list by per-agent tools.
         let grants = effective_grants(&self.manifest);
         let openhuman = self.openhuman;
@@ -375,6 +423,37 @@ impl RuntimeBuilder {
             }
         };
 
+        // Brain selection: an explicit brain wins; otherwise hosted mode plus a
+        // credential selects the hosted Medulla brain (over an injected or, under
+        // the `medulla` feature, a networked transport). Every other combination
+        // — no credential, sidecar mode, or a hosted default build with no
+        // transport — degrades to the offline echo brain so the default build
+        // stays green.
+        let brain: Arc<dyn Brain> = match self.brain {
+            Some(brain) => brain,
+            None => {
+                let tool_catalog: Vec<ToolManifestEntry> = self
+                    .manifest
+                    .tools
+                    .allow
+                    .iter()
+                    .map(|name| ToolManifestEntry {
+                        name: name.clone(),
+                        description: None,
+                        input_schema: None,
+                    })
+                    .collect();
+                select_hosted_or_echo(
+                    self.brain_mode.unwrap_or(BrainMode::Hosted),
+                    self.credential,
+                    self.transport,
+                    self.api_url,
+                    &id,
+                    tool_catalog,
+                )
+            }
+        };
+
         // Materialize the manifest so status/roster loads have a record to read.
         // `save` only writes company.toml + meta.json; the append-only ledger
         // file is left untouched, so an existing ledger survives a rebuild.
@@ -424,6 +503,68 @@ impl RuntimeBuilder {
             filer,
         ))
     }
+}
+
+/// Chooses the hosted Medulla brain or the degraded echo brain.
+///
+/// An injected transport is used verbatim; otherwise the networked transport is
+/// built under the `medulla` feature (and degrades to echo without it).
+fn select_hosted_or_echo(
+    mode: BrainMode,
+    credential: Option<SecretValue>,
+    transport: Option<Arc<dyn MedullaTransport>>,
+    api_url: Option<String>,
+    id: &CompanyId,
+    tool_catalog: Vec<ToolManifestEntry>,
+) -> Arc<dyn Brain> {
+    match (mode, credential) {
+        (BrainMode::Hosted, Some(credential)) => match transport {
+            Some(transport) => Arc::new(HostedMedullaBrain::new(
+                transport,
+                id,
+                id.as_ref(),
+                credential,
+                tool_catalog,
+            )),
+            None => build_networked_brain(credential, api_url, id, tool_catalog),
+        },
+        // No credential (degraded) or sidecar mode (a later phase): offline echo.
+        _ => Arc::new(EchoBrain::new()),
+    }
+}
+
+/// Builds the hosted brain over the networked `HttpSocketTransport`.
+#[cfg(feature = "medulla")]
+fn build_networked_brain(
+    credential: SecretValue,
+    api_url: Option<String>,
+    id: &CompanyId,
+    tool_catalog: Vec<ToolManifestEntry>,
+) -> Arc<dyn Brain> {
+    use crate::brain::medulla::HttpSocketTransport;
+
+    let base = api_url.unwrap_or_else(|| crate::app::config::DEFAULT_API_URL.to_string());
+    let transport = Arc::new(HttpSocketTransport::new(base, credential.clone()));
+    Arc::new(HostedMedullaBrain::new(
+        transport,
+        id,
+        id.as_ref(),
+        credential,
+        tool_catalog,
+    ))
+}
+
+/// Default build: no network transport is linked, so hosted-with-credential
+/// degrades to the offline echo brain. Rebuild with `--features medulla` to get
+/// real hosted cognition.
+#[cfg(not(feature = "medulla"))]
+fn build_networked_brain(
+    _credential: SecretValue,
+    _api_url: Option<String>,
+    _id: &CompanyId,
+    _tool_catalog: Vec<ToolManifestEntry>,
+) -> Arc<dyn Brain> {
+    Arc::new(EchoBrain::new())
 }
 
 #[cfg(test)]

@@ -435,6 +435,13 @@ pub struct CycleRequest {
     pub company_id: CompanyId,
     /// The batch of events driving this cycle.
     pub events: Vec<CompanyEvent>,
+    /// The [`EventLog`](crate::ports::EventLog) sequence of each event in
+    /// [`Self::events`], positionally aligned. Empty when a caller builds a
+    /// request without threading seqs (a brain then falls back to the event's
+    /// index); the runtime always populates it so hosted cognition can key its
+    /// idempotent `POST /events` on the durable log seq.
+    #[serde(default)]
+    pub event_seqs: Vec<EventSeq>,
     /// Compressed traces of prior cycles.
     pub compressed_history: Vec<CompressedTrace>,
     /// The company roster (agent ids).
