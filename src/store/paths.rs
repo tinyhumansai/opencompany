@@ -11,7 +11,12 @@
 //!   memory/           # compressed traces + task results
 //!   context/          # content-addressed context blobs + index
 //!   secrets/          # per-company secret files (0700 on unix)
+//!   keys/             # Ed25519 identity seed (0700 dir, 0600 files)
 //! ```
+//!
+//! `secrets/` and `keys/` are excluded from bundle exports (see
+//! [`Bundle::EXPORT_EXCLUDES`]) so a shared bundle never leaks the company's
+//! signing key or per-company secrets.
 
 use std::path::{Path, PathBuf};
 
@@ -129,6 +134,16 @@ impl Bundle {
         self.context_dir().join("index.jsonl")
     }
 
+    /// The per-company feedback subdirectory (the "feedback family").
+    pub fn feedback_dir(&self) -> PathBuf {
+        self.dir.join("feedback")
+    }
+
+    /// Path to the append-only feedback-item log.
+    pub fn feedback_items_jsonl(&self) -> PathBuf {
+        self.feedback_dir().join("items.jsonl")
+    }
+
     /// The per-company secrets subdirectory.
     pub fn secrets_dir(&self) -> PathBuf {
         self.dir.join("secrets")
@@ -139,6 +154,26 @@ impl Bundle {
         self.secrets_dir().join(slug(&CompanyId::new(key)))
     }
 
+    /// The per-company key material subdirectory (`0700` on unix).
+    pub fn keys_dir(&self) -> PathBuf {
+        self.dir.join("keys")
+    }
+
+    /// Path to the Ed25519 identity seed (`0600` on unix).
+    pub fn agent_key(&self) -> PathBuf {
+        self.keys_dir().join("agent.ed25519")
+    }
+
+    /// Bundle subdirectories excluded from exports. A shared or copied bundle
+    /// must never carry the company's private key or per-company secrets; an
+    /// export flow honours this list unless explicitly overridden.
+    pub const EXPORT_EXCLUDES: &'static [&'static str] = &["secrets", "keys"];
+
+    /// Returns the bundle subdirectories a copy/export must skip.
+    pub fn export_excludes() -> &'static [&'static str] {
+        Self::EXPORT_EXCLUDES
+    }
+
     /// Creates every directory in the bundle layout if absent.
     pub async fn ensure_dirs(&self) -> Result<()> {
         for dir in [
@@ -146,6 +181,7 @@ impl Bundle {
             self.memory_dir(),
             self.context_blobs_dir(),
             self.secrets_dir(),
+            self.keys_dir(),
         ] {
             tokio::fs::create_dir_all(&dir)
                 .await
@@ -155,6 +191,7 @@ impl Bundle {
                 })?;
         }
         restrict_dir(&self.secrets_dir())?;
+        restrict_dir(&self.keys_dir())?;
         Ok(())
     }
 }
@@ -177,6 +214,27 @@ fn restrict_dir(dir: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn restrict_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Restricts a file to owner read/write only (`0600`) on unix.
+///
+/// Used for identity key material (`keys/agent.ed25519`). A no-op on non-unix
+/// targets, which rely on directory isolation instead. Gated to the sole
+/// consumer (the `tinyplace` signer) so the default build has no dead code.
+#[cfg(all(unix, feature = "tinyplace"))]
+pub(crate) fn restrict_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms).map_err(|source| OpenCompanyError::StoreIo {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(all(not(unix), feature = "tinyplace"))]
+pub(crate) fn restrict_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -206,6 +264,15 @@ mod test {
                 .context_index_jsonl()
                 .ends_with("context/index.jsonl")
         );
+    }
+
+    #[test]
+    fn keys_paths_nest_and_are_excluded_from_exports() {
+        let bundle = Bundle::new("/root", &CompanyId::new("acme"));
+        assert!(bundle.keys_dir().ends_with("companies/acme/keys"));
+        assert!(bundle.agent_key().ends_with("keys/agent.ed25519"));
+        assert!(Bundle::export_excludes().contains(&"keys"));
+        assert!(Bundle::export_excludes().contains(&"secrets"));
     }
 
     #[test]

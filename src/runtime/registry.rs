@@ -41,6 +41,14 @@ impl CompanyRegistry {
             .insert(id, runtime);
     }
 
+    /// Removes and returns the runtime registered under `id`, if any.
+    ///
+    /// Used by the archive lifecycle transition to park a company: once removed,
+    /// the company is no longer addressable and chatting it returns a 404.
+    pub fn remove(&self, id: &CompanyId) -> Option<Arc<CompanyRuntime>> {
+        self.inner.write().expect("registry poisoned").remove(id)
+    }
+
     /// The ids of every registered company, sorted.
     pub fn list(&self) -> Vec<CompanyId> {
         let mut ids: Vec<CompanyId> = self
@@ -123,6 +131,21 @@ mod test {
         assert!(registry.sole().is_none());
         assert_eq!(registry.len(), 2);
         assert!(registry.get(&CompanyId::new("globex")).is_some());
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn remove_unregisters_the_company() {
+        let home =
+            std::env::temp_dir().join(format!("opencompany-reg-{}", crate::ports::generate_id()));
+        let registry = CompanyRegistry::new();
+        registry.insert(CompanyId::new("acme"), runtime(&home, "acme").await);
+        assert!(registry.get(&CompanyId::new("acme")).is_some());
+
+        let removed = registry.remove(&CompanyId::new("acme"));
+        assert!(removed.is_some());
+        assert!(registry.get(&CompanyId::new("acme")).is_none());
+        assert!(registry.remove(&CompanyId::new("acme")).is_none());
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }

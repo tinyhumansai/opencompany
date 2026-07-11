@@ -30,10 +30,17 @@ impl ApiError {
             OpenCompanyError::CompanyNotFound(_) => StatusCode::NOT_FOUND,
             OpenCompanyError::ManifestInvalid { .. }
             | OpenCompanyError::ManifestParse(_, _)
-            | OpenCompanyError::MissingManifest(_) => StatusCode::BAD_REQUEST,
+            | OpenCompanyError::MissingManifest(_)
+            | OpenCompanyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             OpenCompanyError::LifecycleConflict(_) => StatusCode::CONFLICT,
             OpenCompanyError::ToolNotGranted(_) => StatusCode::FORBIDDEN,
             OpenCompanyError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,
+            // tiny.place transport: an unreachable backend degrades to 503 so
+            // callers retry; any other protocol failure is an upstream 502.
+            OpenCompanyError::Tinyplace { code, .. } if code == "unreachable" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            OpenCompanyError::Tinyplace { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -75,5 +82,15 @@ mod test {
 
         let other = ApiError(OpenCompanyError::Store("disk full".into()));
         assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn maps_tinyplace_transport_to_503_and_502() {
+        let unreachable = ApiError(OpenCompanyError::tinyplace("unreachable", "offline"));
+        assert_eq!(unreachable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unreachable.0.code(), "tinyplace_unreachable");
+
+        let upstream = ApiError(OpenCompanyError::tinyplace("http_500", "boom"));
+        assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
     }
 }

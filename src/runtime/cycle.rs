@@ -55,8 +55,11 @@ impl<'a> CycleRunner<'a> {
 
         // 2. Persist input — durable before any thinking.
         let mut persisted_seq = None;
+        let mut event_seqs = Vec::with_capacity(events.len());
         for event in &events {
-            persisted_seq = Some(self.rt.events.append(&company, event.clone()).await?);
+            let seq = self.rt.events.append(&company, event.clone()).await?;
+            event_seqs.push(seq);
+            persisted_seq = Some(seq);
         }
 
         // 3. Load — history, context index, roster.
@@ -81,6 +84,7 @@ impl<'a> CycleRunner<'a> {
             cycle_id: cycle_id.clone(),
             company_id: company.clone(),
             events,
+            event_seqs,
             compressed_history,
             roster,
             context_index,
@@ -135,6 +139,57 @@ impl<'a> CycleRunner<'a> {
         .await
     }
 
+    /// Resolves a parked approval to an operator-amended effect
+    /// (approve-with-edit): overlays `amended_payload` onto the parked effect,
+    /// executes the amended version (at-most-once), and runs a follow-up cycle.
+    ///
+    /// Both the original and the amended effect are preserved in the immutable
+    /// journal (`ApprovalParked` + `ApprovalAmended`), so the audit trail shows
+    /// what the brain requested and what the operator approved.
+    pub async fn resolve_approval_amended(
+        &self,
+        id: &ApprovalId,
+        amended_payload: serde_json::Value,
+        by: Actor,
+    ) -> Result<CycleReport> {
+        let now = now_millis();
+
+        // Overlay the operator's edit onto the parked effect. A missing id (or
+        // an expired one, caught by the gate below) yields no executable effect.
+        let amended = self.rt.approval_gate.parked_effect(id).map(|mut original| {
+            original.payload = overlay_payload(original.payload, amended_payload);
+            original
+        });
+        let executed = match amended {
+            Some(effect) => self
+                .rt
+                .approval_gate
+                .resolve_amended(id, effect, by.clone(), now),
+            None => None,
+        };
+
+        // Audit the amendment (when one ran) and drain the queue durably.
+        if let Some(effect) = &executed {
+            self.rt.journal.record_amended(id, effect, now).await?;
+        }
+        self.rt.journal.record_resolved(id).await?;
+
+        if let Some(effect) = &executed {
+            let key = format!("approval:{id}");
+            execute_effect_once(self.rt, &key, effect).await?;
+        }
+
+        // Follow-up cycle so the brain learns the approval resolved (with an
+        // edit). `CompanyEvent` is closed, so the verdict rides as `Approve`;
+        // the edit itself lives in the journal audit trail.
+        self.run(vec![CompanyEvent::ApprovalResolved {
+            approval_id: id.clone(),
+            verdict: Verdict::Approve,
+            by,
+        }])
+        .await
+    }
+
     /// Replays the journal to rebuild the executed-key set and approval queue.
     pub async fn recover(&self) -> Result<()> {
         self.rt.journal.load().await
@@ -149,6 +204,23 @@ impl<'a> CycleRunner<'a> {
         }
         // No adapter for this channel id: drop silently in Phase 1.
         Ok(())
+    }
+}
+
+/// Overlays an operator's payload edit onto the original effect payload.
+///
+/// When both are JSON objects the top-level keys are merged (the edit wins);
+/// otherwise the edit replaces the original wholesale. An operator can thus
+/// tweak individual fields (e.g. lower an amount) without restating the payload.
+fn overlay_payload(original: serde_json::Value, edit: serde_json::Value) -> serde_json::Value {
+    match (original, edit) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(over)) => {
+            for (key, value) in over {
+                base.insert(key, value);
+            }
+            serde_json::Value::Object(base)
+        }
+        (_, edit) => edit,
     }
 }
 
@@ -301,11 +373,15 @@ mod test {
     use std::sync::atomic::AtomicUsize;
 
     use crate::company::CompanyManifest;
+    use crate::policy::ManifestApprovalGate;
+    use crate::ports::ChannelAdapter;
     use crate::ports::brain::Brain;
     use crate::ports::types::{
         ActorKind, CompressedTrace, CycleResult, EffectGroup, EventSeq, TokenUsage,
     };
     use crate::runtime::RuntimeBuilder;
+    use crate::runtime::channel::OperatorChannel;
+    use crate::store::paths::Bundle;
 
     fn tmp_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("opencompany-cycle-{}", crate::ports::generate_id()))
@@ -515,6 +591,115 @@ mod test {
             .await
             .unwrap();
         assert!(rt2.pending_approvals().is_empty());
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn amend_then_approve_executes_edited_effect() {
+        let home = tmp_home();
+        // A parked Sign effect whose payload the operator will overwrite so the
+        // executed effect routes an amended message to the operator channel.
+        let sign_effect = Effect {
+            kind: "filing.submit".into(),
+            group: EffectGroup::Sign,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "channel": "operator", "text": "ORIGINAL" }),
+        };
+        // A recording operator channel we keep a handle to (Arc-shared buffer).
+        let operator_channel = OperatorChannel::new();
+        let channels: Vec<Arc<dyn ChannelAdapter>> = vec![Arc::new(operator_channel.clone())];
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_brain(Arc::new(EffectBrain {
+                effect: sign_effect,
+            }))
+            .with_channels(channels)
+            .build()
+            .await
+            .unwrap();
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "file it".into(),
+            }])
+            .await
+            .unwrap();
+        let approval_id = report.parked[0].clone();
+
+        // Approve with an edited payload: only `text` changes.
+        let follow_up = rt
+            .resolve_approval_amended(
+                &approval_id,
+                serde_json::json!({ "text": "AMENDED" }),
+                operator(),
+            )
+            .await
+            .unwrap();
+        assert!(follow_up.parked.is_empty());
+        assert!(rt.pending_approvals().is_empty());
+
+        // The amended effect executed: the operator channel saw "AMENDED",
+        // never the original "ORIGINAL" text.
+        let sent = operator_channel.sent();
+        assert!(
+            sent.iter().any(|m| m.text == "AMENDED"),
+            "amended text was routed, got {sent:?}"
+        );
+        assert!(sent.iter().all(|m| m.text != "ORIGINAL"));
+
+        // The immutable journal records both the original park and the amend.
+        let raw = tokio::fs::read_to_string(Bundle::new(&home, rt.id()).journal_jsonl())
+            .await
+            .unwrap();
+        assert!(raw.contains("ApprovalParked"));
+        assert!(raw.contains("ApprovalAmended"));
+        assert!(raw.contains("AMENDED"));
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn sweep_expires_parked_approval_to_deny() {
+        let home = tmp_home();
+        let sign_effect = Effect {
+            kind: "filing.submit".into(),
+            group: EffectGroup::Sign,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::Value::Null,
+        };
+        // A zero-TTL gate: anything parked is immediately past its deadline.
+        let gate = Arc::new(
+            ManifestApprovalGate::new(manifest("supervised").policy.clone()).with_ttl_millis(0),
+        );
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_brain(Arc::new(EffectBrain {
+                effect: sign_effect,
+            }))
+            .with_approvals(gate)
+            .build()
+            .await
+            .unwrap();
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "file it".into(),
+            }])
+            .await
+            .unwrap();
+        let approval_id = report.parked[0].clone();
+        assert_eq!(rt.pending_approvals().len(), 1);
+
+        // The maintenance sweep resolves the silent approval to a default-deny.
+        let expired = rt.sweep_expired_approvals().await.unwrap();
+        assert_eq!(expired, vec![approval_id]);
+        assert!(rt.pending_approvals().is_empty());
+
+        let raw = tokio::fs::read_to_string(Bundle::new(&home, rt.id()).journal_jsonl())
+            .await
+            .unwrap();
+        assert!(raw.contains("ApprovalExpired"));
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 

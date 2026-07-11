@@ -6,7 +6,6 @@
 //! `tokio::sync::Mutex` locks serialize concurrent writers within a process.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -29,6 +28,7 @@ use crate::ports::types::{
     TaskResult,
 };
 use crate::ports::{generate_id, now_millis};
+use crate::store::content_address;
 use crate::store::paths::Bundle;
 
 // ---------------------------------------------------------------------------
@@ -454,12 +454,6 @@ impl FsContextStore {
     }
 }
 
-fn content_address(body: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    body.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 #[async_trait]
 impl ContextStore for FsContextStore {
     async fn put(&self, id: &CompanyId, chunk: ContextChunk) -> Result<ChunkAddr> {
@@ -597,10 +591,58 @@ impl SecretStore for FsSecretStore {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::store::conformance;
     use futures::StreamExt;
 
     fn tmp_root() -> PathBuf {
         std::env::temp_dir().join(format!("opencompany-test-{}", generate_id()))
+    }
+
+    // The fs backend runs the identical port-conformance suite the sqlite
+    // backend runs under `--features sqlite`. Each test gets a fresh root so the
+    // stores start empty.
+    #[tokio::test]
+    async fn conformance_isolation_by_company() {
+        let root = tmp_root();
+        conformance::assert_isolation_by_company(
+            Arc::new(FsCompanyStore::new(&root)),
+            Arc::new(FsEventLog::new(&root)),
+            Arc::new(FsMemoryStore::new(&root)),
+            Arc::new(FsContextStore::new(&root)),
+        )
+        .await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_append_only_event_and_ledger() {
+        let root = tmp_root();
+        conformance::assert_append_only_event_and_ledger(
+            Arc::new(FsCompanyStore::new(&root)),
+            Arc::new(FsEventLog::new(&root)),
+        )
+        .await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_monotonic_event_seq() {
+        let root = tmp_root();
+        conformance::assert_monotonic_event_seq(Arc::new(FsEventLog::new(&root))).await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_export_totality() {
+        let root = tmp_root();
+        conformance::assert_export_totality(
+            Arc::new(FsCompanyStore::new(&root)),
+            Arc::new(FsEventLog::new(&root)),
+            Arc::new(FsMemoryStore::new(&root)),
+            Arc::new(FsContextStore::new(&root)),
+        )
+        .await;
+        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     fn sample_manifest() -> crate::company::CompanyManifest {

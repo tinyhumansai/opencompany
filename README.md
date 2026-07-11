@@ -68,8 +68,14 @@ where a human signs off:
 | **[Accounting Firm](examples/agentic_accounting_firm/)** | Bookkeeping, tax, payroll, forecasting, audit prep | Signing the filings |
 | **[Law Firm](examples/agentic_law_firm/)** | Research, drafting, litigation support, discovery, compliance | Approving filings |
 | **[Pharma Startup](examples/agentic_pharma_startup/)** | Literature, molecule discovery, simulation, trial planning | The lab work |
+| **[Signals + Opportunity Studio](examples/signals_opportunity_studio/)** | Scouting signals, clustering pains, ranking opportunities into a weekly brief | Which opportunities to fund |
 
-Eighteen companies. One operator. Pick one and run it — or run several at once.
+Nineteen companies. One operator. Pick one and run it — or run several at once.
+
+**Signals and the Opportunity Engine are a template, not kernel code.** The
+[Signals + Opportunity Studio](examples/signals_opportunity_studio/) realizes
+them as a roster, a charter, and a weekly `[[schedule]]` over the existing
+channel, memory, and brain ports — nothing new in the runtime.
 
 ## Why it works
 
@@ -131,6 +137,13 @@ Without a key you can still build, inspect, and explore every company in
 `examples/`. Add the key when you're ready to put Medulla in the driver's seat
 and let the agents run for real.
 
+To let companies trade with other agents on tiny.place, build with the
+`tinyplace` feature and pass `serve --discoverable` to opt every loaded company
+into going public (register a `@handle`, publish an Agent Card, and answer
+inbound A2A `tasks/send` over SIWX + x402). See
+[`docs/modules/server/README.md`](docs/modules/server/README.md) for the full
+discovery flow and the `TINYPLACE_API_URL` / `OPENCOMPANY_PUBLIC_URL` settings.
+
 Each example loads its manifest, validates it, and prints the company's
 effective configuration. Open its `README.md` to see what it does and
 `agents.toml` to see (or edit) the team; `opencompany check` reports any
@@ -162,7 +175,8 @@ src/ports/              Kernel port traits and shared types
 src/store/              File-based CompanyStore/EventLog/Memory/Context/Secrets
 src/policy/             Manifest-driven ApprovalGate
 src/brain/              Offline EchoBrain (the default cognition seam)
-src/runtime/            CompanyRuntime, CycleRunner, and the company registry
+src/feedback/           Feedback items, privacy scrubber, GitHub issue filing
+src/runtime/            CompanyRuntime, CycleRunner, cron scheduler, registry
 src/server/             Axum HTTP router and handlers
 src/openhuman/          OpenHuman launcher seams
 src/tiny/               TinyAgents/OpenHuman status surface

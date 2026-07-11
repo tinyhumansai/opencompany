@@ -6,12 +6,17 @@ use crate::{AppState, Result};
 
 /// Builds the Axum router.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/spec", get(spec))
         .route("/tiny", get(tiny))
         .merge(crate::server::operator::router())
-        .with_state(state)
+        .merge(crate::server::provision::router())
+        .merge(crate::server::feedback::router());
+    // tiny.place A2A inbound + discovery routes, only when the feature is on.
+    #[cfg(feature = "tinyplace")]
+    let router = router.merge(crate::server::a2a::router());
+    router.with_state(state)
 }
 
 /// Serves the Axum application.
