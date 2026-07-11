@@ -20,6 +20,7 @@ the behavior lives in the OpenCompany host and the vendored modules.
 | Harness | Output | Human keeps |
 | --- | --- | --- |
 | [`agentic_venture_studio`](agentic_venture_studio/) | A portfolio of startups | Capital allocation, major strategy |
+| [`agentic_software_company`](agentic_software_company/) | An entire SaaS product | Product direction |
 | [`startup_accelerator`](startup_accelerator/) | A funded, mentored cohort | Investment & demo-day decisions |
 | [`agentic_venture_capital`](agentic_venture_capital/) | Investment memos & a managed portfolio | Investment decisions |
 | [`agentic_consultation_firm`](agentic_consultation_firm/) | Strategy decks & implementation plans | Executive workshops |

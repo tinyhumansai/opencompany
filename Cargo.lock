@@ -101,6 +101,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentic-software-company"
+version = "0.1.0"
+dependencies = [
+ "opencompany",
+]
+
+[[package]]
 name = "agentic-venture-capital"
 version = "0.1.0"
 dependencies = [

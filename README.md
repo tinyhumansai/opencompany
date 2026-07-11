@@ -54,6 +54,7 @@ where a human signs off:
 | **[Startup Accelerator](examples/startup_accelerator/)** | Sourcing, screening, mentoring, demo day, investor intros | Investment decisions |
 | **[VC Firm](examples/agentic_venture_capital/)** | Deal flow, diligence, memos, portfolio support | The final "yes" |
 | **[Consulting Firm](examples/agentic_consultation_firm/)** | Research, analysis, modeling, decks, implementation plans | Executive workshops |
+| **[Software Company](examples/agentic_software_company/)** | PM, design, frontend, backend, QA, security, docs, support, DevRel | Product direction |
 | **[Marketing Agency](examples/agentic_marketing_agency/)** | Creative, copy, SEO, paid, email, landing pages, analytics | Campaign sign-off |
 | **[Design Studio](examples/agentic_design_studio/)** | Branding, UI, motion, illustration, user testing | Creative direction |
 | **[Media Company](examples/agentic_media_company/)** | Finding, verifying, writing, illustrating, distributing stories | Editorial standards |
@@ -68,7 +69,7 @@ where a human signs off:
 | **[Law Firm](examples/agentic_law_firm/)** | Research, drafting, litigation support, discovery, compliance | Approving filings |
 | **[Pharma Startup](examples/agentic_pharma_startup/)** | Literature, molecule discovery, simulation, trial planning | The lab work |
 
-Seventeen companies. One operator. Pick one and run it — or run several at once.
+Eighteen companies. One operator. Pick one and run it — or run several at once.
 
 ## Why it works
 
@@ -133,7 +134,7 @@ to see what it does and `agents.toml` to see (or edit) the team.
 Build every company at once, or just the host:
 
 ```sh
-cargo build --workspace   # the host + all 17 example companies
+cargo build --workspace   # the host + all 18 example companies
 cargo build               # just the host (fast default build)
 ```
 
@@ -155,7 +156,7 @@ src/server/             Axum HTTP router and handlers
 src/openhuman/          OpenHuman launcher seams
 src/tiny/               TinyAgents/OpenHuman status surface
 src/bin/opencompany.rs  CLI entrypoint
-examples/               17 runnable one-person companies (workspace members)
+examples/               18 runnable one-person companies (workspace members)
 docs/spec/              Architecture reference
 docs/modules/           Per-package design docs
 vendor/openhuman/       OpenHuman git submodule

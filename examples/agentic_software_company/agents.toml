@@ -1,0 +1,53 @@
+# Agent roster for the Agentic Software Company harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Software Company"
+output = "An entire SaaS product"
+human_role = "Product direction"
+
+[[agent]]
+id = "product_manager"
+role = "Product Manager"
+description = "Own the roadmap, specs, and prioritization."
+
+[[agent]]
+id = "designer"
+role = "Designer"
+description = "Product and UX design."
+
+[[agent]]
+id = "backend_engineer"
+role = "Backend Engineer"
+description = "Build and operate the backend and services."
+
+[[agent]]
+id = "frontend_engineer"
+role = "Frontend Engineer"
+description = "Build the user-facing frontend."
+
+[[agent]]
+id = "qa_engineer"
+role = "QA Engineer"
+description = "Test features and catch regressions."
+
+[[agent]]
+id = "security_engineer"
+role = "Security Engineer"
+description = "Security review, hardening, and response."
+
+[[agent]]
+id = "docs_writer"
+role = "Documentation Writer"
+description = "Write and maintain product documentation."
+
+[[agent]]
+id = "customer_support"
+role = "Customer Support"
+description = "Resolve customer issues and feed insight back."
+
+[[agent]]
+id = "devrel"
+role = "Developer Relations"
+description = "Engage developers with demos, content, and community."
