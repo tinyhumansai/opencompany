@@ -16,17 +16,24 @@ use crate::Result;
 use crate::brain::EchoBrain;
 use crate::company::CompanyManifest;
 use crate::company::runtime::CompanyRuntime;
+use crate::feedback::github::{GitHubClient, RateLimiter};
+use crate::feedback::service::FeedbackFiler;
+use crate::feedback::store::FeedbackStore;
+use crate::feedback::tool::BuiltinToolProvider;
+use crate::feedback::types::ConsentMode;
+use crate::openhuman::rpc::OpenHumanRpc;
+use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
 use crate::ports::types::{CompanyId, CompanyRecord};
 use crate::ports::{
-    AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    MemoryStore, ToolProvider,
+    AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, MemoryStore,
+    SecretStore, ToolProvider,
 };
-use crate::runtime::channel::OperatorChannel;
+use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
 use crate::runtime::journal::RuntimeJournal;
-use crate::runtime::tools::StubToolProvider;
+use crate::runtime::tools::{StubToolProvider, grant_matches};
 use crate::store::paths::Bundle;
-use crate::store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore};
+use crate::store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
 
 /// Derives a filesystem-and-URL-safe company id from a display name.
 ///
@@ -52,6 +59,48 @@ pub fn company_id_from_name(name: &str) -> CompanyId {
     })
 }
 
+/// Computes a company's effective tool grants: the company-wide
+/// `[tools].allow` narrowed by per-agent `tools` (most-restrictive-wins).
+///
+/// An agent with no explicit `tools` inherits the full company allow-list; an
+/// agent that lists tools contributes only those covered by the allow-list. The
+/// result is the de-duplicated union across the roster, preserving order. A
+/// company with no roster yields the allow-list unchanged.
+pub fn effective_grants(manifest: &CompanyManifest) -> Vec<String> {
+    let allow = &manifest.tools.allow;
+    if manifest.agents.is_empty() {
+        return dedup(allow.clone());
+    }
+    let mut grants: Vec<String> = Vec::new();
+    for agent in &manifest.agents {
+        if agent.tools.is_empty() {
+            grants.extend(allow.iter().cloned());
+        } else {
+            for tool in &agent.tools {
+                if allow_covers(allow, tool) {
+                    grants.push(tool.clone());
+                }
+            }
+        }
+    }
+    dedup(grants)
+}
+
+/// Whether the company allow-list covers an agent-requested grant glob.
+fn allow_covers(allow: &[String], tool: &str) -> bool {
+    let literal = tool.strip_suffix('*').unwrap_or(tool);
+    allow.iter().any(|grant| grant_matches(grant, literal))
+}
+
+/// De-duplicates a grant list while preserving first-seen order.
+fn dedup(grants: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    grants
+        .into_iter()
+        .filter(|grant| seen.insert(grant.clone()))
+        .collect()
+}
+
 /// Builds one company's [`CompanyRuntime`] over a filesystem home.
 pub struct RuntimeBuilder {
     home: PathBuf,
@@ -66,6 +115,11 @@ pub struct RuntimeBuilder {
     channels: Option<Vec<Arc<dyn ChannelAdapter>>>,
     economy: Option<Arc<dyn AgentEconomy>>,
     approvals: Option<Arc<ManifestApprovalGate>>,
+    openhuman: Option<Arc<dyn OpenHumanRpc>>,
+    secrets: Option<Arc<dyn SecretStore>>,
+    feedback: Option<Arc<FeedbackStore>>,
+    github: Option<Arc<dyn GitHubClient>>,
+    consent: ConsentMode,
 }
 
 impl RuntimeBuilder {
@@ -88,6 +142,11 @@ impl RuntimeBuilder {
             channels: None,
             economy: None,
             approvals: None,
+            openhuman: None,
+            secrets: None,
+            feedback: None,
+            github: None,
+            consent: ConsentMode::default(),
         }
     }
 
@@ -151,6 +210,43 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Attaches an OpenHuman JSON-RPC transport.
+    ///
+    /// When present and healthy at [`build`](Self::build) time, an
+    /// `openhuman`-provider manifest routes tools (and `openhuman` channels)
+    /// through it; otherwise the runtime degrades to built-in tools and the
+    /// operator channel with a boot warning.
+    pub fn with_openhuman_rpc(mut self, rpc: Arc<dyn OpenHumanRpc>) -> Self {
+        self.openhuman = Some(rpc);
+        self
+    }
+
+    /// Swaps the secret store (default: fs-backed). The feedback scrubber reads
+    /// it to fail closed on secret leaks.
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    /// Overrides the feedback store (default: the company bundle's feedback
+    /// family).
+    pub fn with_feedback(mut self, feedback: Arc<FeedbackStore>) -> Self {
+        self.feedback = Some(feedback);
+        self
+    }
+
+    /// Wires a GitHub client for feedback filing (default: none → manual links).
+    pub fn with_github(mut self, github: Arc<dyn GitHubClient>) -> Self {
+        self.github = Some(github);
+        self
+    }
+
+    /// Sets the standing feedback consent mode (default: `manual`).
+    pub fn with_feedback_consent(mut self, consent: ConsentMode) -> Self {
+        self.consent = consent;
+        self
+    }
+
     /// Convenience: build a fully fs-backed runtime with all Phase-1 defaults.
     pub async fn fs_defaults(
         home: impl Into<PathBuf>,
@@ -177,13 +273,107 @@ impl RuntimeBuilder {
         let context: Arc<dyn ContextStore> = self
             .context
             .unwrap_or_else(|| Arc::new(FsContextStore::new(home.clone())));
-        let tools: Arc<dyn ToolProvider> = self
-            .tools
-            .unwrap_or_else(|| Arc::new(StubToolProvider::new(self.manifest.tools.allow.clone())));
         let brain: Arc<dyn Brain> = self.brain.unwrap_or_else(|| Arc::new(EchoBrain::new()));
-        let channels = self
-            .channels
-            .unwrap_or_else(|| vec![Arc::new(OperatorChannel::new()) as Arc<dyn ChannelAdapter>]);
+
+        // Effective grants narrow the company allow-list by per-agent tools.
+        let grants = effective_grants(&self.manifest);
+        let openhuman = self.openhuman;
+
+        // Feedback family: the item store, secret store (for the scrubber), and
+        // filing configuration. The consent mode is also the built-in feedback
+        // tool's capture mode.
+        let bundle = Bundle::new(home.clone(), &id);
+        let feedback = self
+            .feedback
+            .unwrap_or_else(|| Arc::new(FeedbackStore::new(&bundle)));
+        let secrets: Arc<dyn SecretStore> = self
+            .secrets
+            .unwrap_or_else(|| Arc::new(FsSecretStore::new(home.clone())));
+        let consent = self.consent;
+        let filer = Arc::new(FeedbackFiler {
+            client: self.github,
+            repo: crate::feedback::DEFAULT_REPO.to_string(),
+            consent,
+            limiter: RateLimiter::default(),
+        });
+
+        // Probe OpenHuman once; an unreachable daemon degrades, never fails.
+        let openhuman_healthy = match &openhuman {
+            Some(rpc) => rpc.health().await.unwrap_or(false),
+            None => false,
+        };
+
+        // Tools: route through OpenHuman only when the manifest asks for it and
+        // the daemon is reachable; otherwise use the grant-enforcing built-in.
+        let tools: Arc<dyn ToolProvider> = match self.tools {
+            Some(tools) => tools,
+            None => {
+                let builtin: Arc<dyn ToolProvider> =
+                    Arc::new(StubToolProvider::new(grants.clone()));
+                if self.manifest.tools.provider == "openhuman" {
+                    match &openhuman {
+                        Some(rpc) if openhuman_healthy => Arc::new(OpenHumanToolProvider::new(
+                            rpc.clone(),
+                            grants.clone(),
+                            builtin,
+                        )),
+                        Some(_) => {
+                            tracing::warn!(
+                                company = %id,
+                                "openhuman tool provider requested but unreachable; using built-in tools"
+                            );
+                            builtin
+                        }
+                        None => builtin,
+                    }
+                } else {
+                    builtin
+                }
+            }
+        };
+
+        // Wrap with the built-in `feedback` tool so the brain can always
+        // self-report (the feedback tool is never gated); every other tool
+        // still delegates to the selected provider, which enforces grants.
+        let tools: Arc<dyn ToolProvider> = Arc::new(BuiltinToolProvider::new(
+            tools,
+            feedback.clone(),
+            events.clone(),
+            consent,
+        ));
+
+        // Channels: always the operator surface, plus any `openhuman` channel
+        // the manifest enables when the daemon is reachable.
+        let channels = match self.channels {
+            Some(channels) => channels,
+            None => {
+                let mut channels: Vec<Arc<dyn ChannelAdapter>> =
+                    vec![Arc::new(OperatorChannel::new())];
+                if let Some(rpc) = &openhuman {
+                    for (name, config) in &self.manifest.channels {
+                        if name == OPERATOR_CHANNEL
+                            || config.enabled == Some(false)
+                            || config.provider.as_deref() != Some("openhuman")
+                        {
+                            continue;
+                        }
+                        if openhuman_healthy {
+                            channels.push(Arc::new(OpenHumanChannelAdapter::new(
+                                name.clone(),
+                                rpc.clone(),
+                            )));
+                        } else {
+                            tracing::warn!(
+                                company = %id,
+                                channel = %name,
+                                "openhuman channel requested but unreachable; skipping"
+                            );
+                        }
+                    }
+                }
+                channels
+            }
+        };
 
         // Materialize the manifest so status/roster loads have a record to read.
         // `save` only writes company.toml + meta.json; the append-only ledger
@@ -216,7 +406,6 @@ impl RuntimeBuilder {
         for pending in journal.pending() {
             gate.rehydrate(pending.id, pending.effect, pending.at_millis);
         }
-        let approvals: Arc<dyn ApprovalGate> = gate;
 
         Ok(CompanyRuntime::new(
             id,
@@ -228,8 +417,11 @@ impl RuntimeBuilder {
             tools,
             channels,
             self.economy,
-            approvals,
+            gate,
             journal,
+            secrets,
+            feedback,
+            filer,
         ))
     }
 }
@@ -237,11 +429,148 @@ impl RuntimeBuilder {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::openhuman::MockOpenHumanRpc;
+    use crate::ports::types::ToolCall;
 
     #[test]
     fn slugifies_display_names() {
         assert_eq!(company_id_from_name("Acme Co!").as_ref(), "acme-co");
         assert_eq!(company_id_from_name("  Widgets  ").as_ref(), "widgets");
         assert_eq!(company_id_from_name("***").as_ref(), "company");
+    }
+
+    fn parse(toml_src: &str) -> CompanyManifest {
+        toml::from_str(toml_src).expect("valid manifest")
+    }
+
+    #[test]
+    fn effective_grants_no_roster_is_company_allow() {
+        let manifest = parse("[company]\nname=\"X\"\n[tools]\nallow=[\"email.*\",\"email.*\"]\n");
+        assert_eq!(effective_grants(&manifest), vec!["email.*".to_string()]);
+    }
+
+    #[test]
+    fn effective_grants_agent_without_tools_inherits_allow() {
+        let manifest = parse(
+            "[company]\nname=\"X\"\n[[agent]]\nid=\"a\"\nrole=\"A\"\n[tools]\nallow=[\"email.*\"]\n",
+        );
+        assert_eq!(effective_grants(&manifest), vec!["email.*".to_string()]);
+    }
+
+    #[test]
+    fn effective_grants_agent_tools_intersect_allow() {
+        let manifest = parse(
+            r#"
+            [company]
+            name = "X"
+            [[agent]]
+            id = "a"
+            role = "A"
+            tools = ["email.send", "payment.send"]
+            [tools]
+            allow = ["email.*"]
+            "#,
+        );
+        // `email.send` is covered by `email.*`; `payment.send` is not.
+        assert_eq!(effective_grants(&manifest), vec!["email.send".to_string()]);
+    }
+
+    fn openhuman_manifest() -> CompanyManifest {
+        parse(
+            r#"
+            [company]
+            name = "Acme"
+            [[agent]]
+            id = "ceo"
+            role = "Chief"
+            [tools]
+            provider = "openhuman"
+            allow = ["email.*"]
+            [channels.email]
+            provider = "openhuman"
+            "#,
+        )
+    }
+
+    #[tokio::test]
+    async fn healthy_openhuman_wires_provider_and_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = Arc::new(MockOpenHumanRpc::new().with_result(
+            "openhuman.tools_invoke",
+            serde_json::json!({ "ok": true, "output": {} }),
+        ));
+        let runtime = RuntimeBuilder::new(dir.path(), openhuman_manifest())
+            .with_openhuman_rpc(rpc.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Operator + the openhuman-backed email channel.
+        assert_eq!(runtime.channels.len(), 2);
+        assert!(runtime.channels.iter().any(|c| c.channel_id() == "email"));
+
+        // A granted call routes through the OpenHuman transport.
+        let result = runtime
+            .tools
+            .invoke(
+                runtime.id(),
+                ToolCall {
+                    tool: "email.send".into(),
+                    args: serde_json::Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.ok);
+        assert_eq!(rpc.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unreachable_openhuman_degrades_to_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = Arc::new(MockOpenHumanRpc::new().unhealthy());
+        let runtime = RuntimeBuilder::new(dir.path(), openhuman_manifest())
+            .with_openhuman_rpc(rpc.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // No openhuman channel is added when the daemon is unreachable.
+        assert_eq!(runtime.channels.len(), 1);
+        assert_eq!(runtime.channels[0].channel_id(), "operator");
+
+        // Tools degrade to the grant-enforcing built-in: ungranted rejected,
+        // granted returns a well-formed not-implemented result — and the RPC
+        // transport is never touched.
+        let ungranted = runtime
+            .tools
+            .invoke(
+                runtime.id(),
+                ToolCall {
+                    tool: "payment.send".into(),
+                    args: serde_json::Value::Null,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ungranted,
+            crate::OpenCompanyError::ToolNotGranted(t) if t == "payment.send"
+        ));
+
+        let granted = runtime
+            .tools
+            .invoke(
+                runtime.id(),
+                ToolCall {
+                    tool: "email.send".into(),
+                    args: serde_json::Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!granted.ok);
+        // Only the boot-time `health()` probe touched the transport.
+        assert_eq!(rpc.call_count(), 0);
     }
 }

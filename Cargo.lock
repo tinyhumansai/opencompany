@@ -1123,6 +1123,7 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

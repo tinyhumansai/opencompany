@@ -34,7 +34,11 @@ impl StubToolProvider {
 }
 
 /// Matches a single grant glob against a tool name.
-fn grant_matches(grant: &str, tool: &str) -> bool {
+///
+/// A tool is granted when the glob matches it exactly, via a trailing `*`
+/// prefix (`email.*`), or the catch-all `*`. Shared with the OpenHuman-backed
+/// provider so both enforce grants identically.
+pub(crate) fn grant_matches(grant: &str, tool: &str) -> bool {
     if grant == "*" {
         return true;
     }

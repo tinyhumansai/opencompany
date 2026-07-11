@@ -3,11 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use opencompany::company::Schedule;
+use opencompany::runtime::{CompanyScheduler, SystemClock};
 use opencompany::{
-    AppConfig, AppState, CompanyManifest, Result,
+    AppConfig, AppState, CompanyId, CompanyManifest, Result,
     openhuman::{LaunchMode, OpenHumanLaunch},
     runtime::RuntimeBuilder,
 };
+use tokio::sync::Notify;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -94,17 +97,69 @@ async fn register_company(
     state: &AppState,
     home: &std::path::Path,
     dir: &std::path::Path,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Vec<Schedule>)> {
     let manifest = CompanyManifest::from_path(dir)?;
     let name = manifest.company.name.clone();
-    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
-        .build()
-        .await?;
+    // Capture the schedules before the manifest is moved into the builder; boot
+    // uses them to start this company's cron scheduler (lifecycle step 4).
+    let schedules = manifest.schedules.clone();
+    let builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest));
+    let runtime = builder.build().await?;
     let id = runtime.id().as_ref().to_string();
     state
         .registry()
         .insert(runtime.id().clone(), Arc::new(runtime));
-    Ok((id, name))
+    Ok((id, name, schedules))
+}
+
+/// Starts a company's cron scheduler as a background task, if it has schedules.
+///
+/// A schedule whose cron fails to parse (which `opencompany check` does not
+/// catch beyond field count) logs a warning and is skipped rather than aborting
+/// boot. The returned handle is held by the caller and stops when `shutdown`
+/// fires.
+fn spawn_scheduler(
+    state: &AppState,
+    id: &str,
+    schedules: &[Schedule],
+    shutdown: &Arc<Notify>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if schedules.is_empty() {
+        return None;
+    }
+    let runtime = state.registry().get(&CompanyId::new(id))?;
+    match CompanyScheduler::new(runtime, schedules, Arc::new(SystemClock)) {
+        Ok(scheduler) => Some(scheduler.spawn(shutdown.clone())),
+        Err(err) => {
+            eprintln!("skipping scheduler for `{id}`: {err}");
+            None
+        }
+    }
+}
+
+/// Attaches an OpenHuman JSON-RPC transport when the `openhuman-rpc` feature is
+/// enabled and `OPENCOMPANY_OPENHUMAN_URL` is set (the attach path).
+///
+/// Without the feature this is the identity function, so the default build
+/// stays network-free and degrades to built-in tools and the operator channel.
+#[cfg(not(feature = "openhuman-rpc"))]
+fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+}
+
+#[cfg(feature = "openhuman-rpc")]
+fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
+    use opencompany::openhuman::HttpOpenHumanRpc;
+    use opencompany::ports::SecretValue;
+
+    match std::env::var("OPENCOMPANY_OPENHUMAN_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            let bearer =
+                SecretValue(std::env::var("OPENCOMPANY_OPENHUMAN_TOKEN").unwrap_or_default());
+            builder.with_openhuman_rpc(Arc::new(HttpOpenHumanRpc::attach(url, bearer)))
+        }
+        _ => builder,
+    }
 }
 
 #[tokio::main]
@@ -126,13 +181,37 @@ async fn main() -> Result<()> {
                 ..AppConfig::default()
             });
             let home = home.unwrap_or_else(default_home);
+            // Schedulers stop cleanly when this is notified (Ctrl-C below).
+            let shutdown = Arc::new(Notify::new());
+            let mut scheduler_handles = Vec::new();
             for dir in &companies {
-                let (id, name) = register_company(&state, &home, dir).await?;
-                println!("registered company `{id}` ({name}) from {}", dir.display());
+                let (id, name, schedules) = register_company(&state, &home, dir).await?;
+                if let Some(handle) = spawn_scheduler(&state, &id, &schedules, &shutdown) {
+                    scheduler_handles.push(handle);
+                    println!(
+                        "registered company `{id}` ({name}) from {} with {} schedule(s)",
+                        dir.display(),
+                        schedules.len()
+                    );
+                } else {
+                    println!("registered company `{id}` ({name}) from {}", dir.display());
+                }
             }
             if companies.is_empty() {
                 println!("serving with no companies; pass --company <dir> to load one");
             }
+
+            // Stop the schedulers on Ctrl-C so background cycle work halts with
+            // the process (lifecycle shutdown).
+            {
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        shutdown.notify_waiters();
+                    }
+                });
+            }
+
             opencompany::server::serve(state).await
         }
         Some(Command::Spec { openhuman_root }) => {
@@ -194,7 +273,7 @@ mod test {
         let state = AppState::new(AppConfig::default());
         let dir = std::path::Path::new("examples/agentic_law_firm");
 
-        let (id, name) = register_company(&state, &home, dir).await.unwrap();
+        let (id, name, _schedules) = register_company(&state, &home, dir).await.unwrap();
 
         assert_eq!(name, "Agentic Law Firm");
         assert_eq!(id, "agentic-law-firm");

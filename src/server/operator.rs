@@ -142,6 +142,20 @@ async fn run_chat(
     message: ChatMessage,
 ) -> Result<Json<ChatResponse>, ApiError> {
     runtime.ensure_running().await?;
+    // Operator-chat feedback intent: a complaint phrase ("that was wrong — flag
+    // it") captures a feedback item alongside the normal cycle. Neutral chat
+    // carries no intent, so ordinary messages are untouched.
+    if let Some(category) = crate::feedback::detect_chat_intent(&message.text) {
+        runtime
+            .capture_feedback(crate::feedback::FeedbackInput {
+                category,
+                note: message.text.clone(),
+                work_ref: None,
+                template_name: None,
+                template_version: None,
+            })
+            .await?;
+    }
     let report = runtime
         .run_cycle(vec![CompanyEvent::OperatorMessage { text: message.text }])
         .await?;
@@ -187,6 +201,11 @@ async fn list_approvals_single(
 }
 
 /// The operator's resolution of a parked approval.
+///
+/// `verdict` stays `approve`/`deny`; the api.md wire enum gains no `edit`
+/// verdict. Instead, an optional `amended_payload` paired with an `approve`
+/// verdict routes to the approve-with-edit path. Pairing `amended_payload` with
+/// `deny` is a contradiction and is rejected as a 400.
 #[derive(Debug, Deserialize)]
 struct ResolveApproval {
     /// `approve` or `deny`.
@@ -195,6 +214,9 @@ struct ResolveApproval {
     #[allow(dead_code)]
     #[serde(default)]
     note: Option<String>,
+    /// An optional payload edit; overlaid onto the parked effect on `approve`.
+    #[serde(default)]
+    amended_payload: Option<serde_json::Value>,
 }
 
 async fn run_resolve(
@@ -207,9 +229,20 @@ async fn run_resolve(
         kind: ActorKind::Operator,
         id: "operator".to_string(),
     };
-    let report = runtime
-        .resolve_approval(&ApprovalId::new(approval_id), body.verdict, actor)
-        .await?;
+    let id = ApprovalId::new(approval_id);
+    let report = match (body.verdict, body.amended_payload) {
+        (Verdict::Approve, Some(payload)) => {
+            runtime
+                .resolve_approval_amended(&id, payload, actor)
+                .await?
+        }
+        (Verdict::Deny, Some(_)) => {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(
+                "amended_payload cannot accompany a deny verdict".to_string(),
+            )));
+        }
+        (verdict, None) => runtime.resolve_approval(&id, verdict, actor).await?,
+    };
     Ok(Json(ChatResponse {
         responses: report.responses,
     }))
@@ -436,6 +469,61 @@ mod test {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 0);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn amended_approve_resolves_and_returns_responses() {
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        // An `approve` verdict carrying an amended payload routes to the
+        // approve-with-edit path. Even against an unknown id it resolves
+        // cleanly (nothing to execute) and the follow-up cycle replies.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/approvals/missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"verdict":"approve","amended_payload":{"text":"edited"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value["responses"].is_array());
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn deny_with_amended_payload_is_400() {
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/approvals/missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"verdict":"deny","amended_payload":{"text":"edited"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["code"], "invalid_request");
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 

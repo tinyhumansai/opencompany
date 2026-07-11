@@ -14,6 +14,19 @@ pub enum OpenCompanyError {
     #[error("openhuman process error: {0}")]
     OpenHumanProcess(#[from] std::io::Error),
 
+    /// An OpenHuman JSON-RPC call failed at the transport or protocol level.
+    ///
+    /// Carries the failure as an owned `code`/`message` pair rather than a
+    /// `#[from] std::io::Error` so it never collides with the existing
+    /// `OpenHumanProcess` conversion.
+    #[error("openhuman rpc error ({code}): {message}")]
+    OpenHuman {
+        /// The JSON-RPC error code (or a synthetic transport code).
+        code: i64,
+        /// A human-readable description of the failure.
+        message: String,
+    },
+
     /// No manifest (`company.toml` or `agents.toml`) was found.
     #[error("no company.toml or agents.toml found in {0}")]
     MissingManifest(PathBuf),
@@ -76,6 +89,11 @@ pub enum OpenCompanyError {
     #[error("company is {0}")]
     LifecycleConflict(String),
 
+    /// A request was malformed or internally inconsistent (e.g. an approval
+    /// resolution that pairs a `deny` verdict with an amended payload).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
     /// A port method has no implementation in the current build.
     #[error("port not implemented: {0}")]
     Unimplemented(&'static str),
@@ -90,6 +108,7 @@ impl OpenCompanyError {
         match self {
             Self::MissingOpenHumanRoot(_) => "openhuman_root_missing",
             Self::OpenHumanProcess(_) => "openhuman_process",
+            Self::OpenHuman { .. } => "openhuman_rpc",
             Self::MissingManifest(_) => "manifest_missing",
             Self::ManifestRead { .. } => "manifest_read",
             Self::ManifestParse(_, _) => "manifest_parse",
@@ -101,6 +120,7 @@ impl OpenCompanyError {
             Self::ToolNotGranted(_) => "tool_not_granted",
             Self::BudgetExceeded(_) => "budget_exceeded",
             Self::LifecycleConflict(_) => "lifecycle_conflict",
+            Self::InvalidRequest(_) => "invalid_request",
             Self::Unimplemented(_) => "unimplemented",
         }
     }

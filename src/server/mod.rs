@@ -1,4 +1,5 @@
 mod error;
+pub mod feedback;
 pub mod operator;
 mod routes;
 

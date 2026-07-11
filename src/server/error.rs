@@ -30,7 +30,8 @@ impl ApiError {
             OpenCompanyError::CompanyNotFound(_) => StatusCode::NOT_FOUND,
             OpenCompanyError::ManifestInvalid { .. }
             | OpenCompanyError::ManifestParse(_, _)
-            | OpenCompanyError::MissingManifest(_) => StatusCode::BAD_REQUEST,
+            | OpenCompanyError::MissingManifest(_)
+            | OpenCompanyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             OpenCompanyError::LifecycleConflict(_) => StatusCode::CONFLICT,
             OpenCompanyError::ToolNotGranted(_) => StatusCode::FORBIDDEN,
             OpenCompanyError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,

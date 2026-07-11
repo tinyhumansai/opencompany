@@ -129,6 +129,16 @@ impl Bundle {
         self.context_dir().join("index.jsonl")
     }
 
+    /// The per-company feedback subdirectory (the "feedback family").
+    pub fn feedback_dir(&self) -> PathBuf {
+        self.dir.join("feedback")
+    }
+
+    /// Path to the append-only feedback-item log.
+    pub fn feedback_items_jsonl(&self) -> PathBuf {
+        self.feedback_dir().join("items.jsonl")
+    }
+
     /// The per-company secrets subdirectory.
     pub fn secrets_dir(&self) -> PathBuf {
         self.dir.join("secrets")

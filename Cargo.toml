@@ -44,10 +44,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite", "repl"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 [features]
 default = []
 tiny = ["tinyagents"]
+# Real HTTP transport to openhuman-core. The trait + offline mock + providers
+# compile without this; only `HttpOpenHumanRpc` is gated behind it.
+openhuman-rpc = ["dep:reqwest"]
+# Real GitHub REST filer for feedback issues. The `GitHubClient` trait + offline
+# mock + the whole filing flow compile without this; only `HttpGitHubClient` is
+# gated behind it.
+github = ["dep:reqwest"]
 
 [patch.crates-io]
 tinyagents = { path = "vendor/tinyagents" }

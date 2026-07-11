@@ -11,6 +11,7 @@ pub fn router(state: AppState) -> Router {
         .route("/spec", get(spec))
         .route("/tiny", get(tiny))
         .merge(crate::server::operator::router())
+        .merge(crate::server::feedback::router())
         .with_state(state)
 }
 

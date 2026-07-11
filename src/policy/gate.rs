@@ -9,8 +9,18 @@
 //! 3. mode dispatch: `readonly` gates everything, `full` allows everything,
 //!    `supervised` applies the checkpoint taxonomy by [`EffectGroup`].
 //!
+//! The three policy modes map 1:1 onto OpenHuman's security tiers — `readonly`,
+//! `supervised`, and `full` — so a company's autonomy setting means the same
+//! thing to the gate and to the OpenHuman daemon that ultimately runs the tools.
+//!
 //! `evaluate` returns a bare [`PolicyDecision`]; the [`ApprovalId`] for a
 //! `RequireApproval` outcome is minted separately by [`park`](ManifestApprovalGate::park).
+//!
+//! Silence is a default-deny: a parked approval left unresolved past its TTL
+//! (default [`DEFAULT_TTL_MILLIS`]) resolves to deny, whether swept by
+//! [`sweep_expired`](ManifestApprovalGate::sweep_expired) or observed at
+//! resolution time by [`resolve_at`](ManifestApprovalGate::resolve_at) /
+//! [`resolve_amended`](ManifestApprovalGate::resolve_amended).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -94,6 +104,42 @@ impl ManifestApprovalGate {
             map.remove(id);
         }
         expired
+    }
+
+    /// A clone of a parked effect without resolving it.
+    ///
+    /// Used by the amend path to overlay an operator's payload edit onto the
+    /// original before re-submitting it for execution.
+    pub fn parked_effect(&self, id: &ApprovalId) -> Option<Effect> {
+        self.parked
+            .lock()
+            .expect("parked map poisoned")
+            .get(id)
+            .map(|pe| pe.effect.clone())
+    }
+
+    /// Resolves a parked approval to an operator-amended effect
+    /// (approve-with-edit), as of `now`.
+    ///
+    /// Removes the parked entry and returns the `amended` effect to execute, or
+    /// `None` when the approval is unknown or has expired past its TTL — the
+    /// same default-deny-on-silence that governs [`resolve_at`](Self::resolve_at).
+    pub fn resolve_amended(
+        &self,
+        id: &ApprovalId,
+        amended: Effect,
+        _by: Actor,
+        now_millis: u64,
+    ) -> Option<Effect> {
+        let parked = self
+            .parked
+            .lock()
+            .expect("parked map poisoned")
+            .remove(id)?;
+        if now_millis.saturating_sub(parked.parked_at_millis) >= self.ttl_millis {
+            return None;
+        }
+        Some(amended)
     }
 
     /// Resolves a parked approval as of `now`, so expiry is testable.
@@ -383,6 +429,42 @@ mod test {
         let future = now_millis() + 10_000;
         let resolved = gate.resolve_at(&id, Verdict::Approve, operator(), future);
         assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_amended_returns_amended_effect() {
+        let gate = ManifestApprovalGate::new(policy("supervised", None));
+        let original = effect("filing.submit", EffectGroup::Sign);
+        let id = gate.park(&company(), original.clone()).await.unwrap();
+
+        // The operator peeks the original, edits its payload, and approves it.
+        let parked = gate.parked_effect(&id).expect("parked effect readable");
+        assert_eq!(parked, original);
+        let mut amended = parked;
+        amended.payload = serde_json::json!({ "edited": true });
+
+        let resolved = gate.resolve_amended(&id, amended.clone(), operator(), now_millis());
+        assert_eq!(resolved, Some(amended));
+        // Resolving drains the queue.
+        assert!(gate.parked_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_amended_expired_denies() {
+        let gate = ManifestApprovalGate::new(policy("supervised", None)).with_ttl_millis(1000);
+        let id = gate
+            .park(&company(), effect("filing.submit", EffectGroup::Sign))
+            .await
+            .unwrap();
+        let mut amended = effect("filing.submit", EffectGroup::Sign);
+        amended.payload = serde_json::json!({ "edited": true });
+
+        // Past the TTL: the amend resolves to deny even though a payload was
+        // supplied — default-deny-on-silence wins.
+        let future = now_millis() + 10_000;
+        let resolved = gate.resolve_amended(&id, amended, operator(), future);
+        assert_eq!(resolved, None);
+        assert!(gate.parked_ids().is_empty());
     }
 
     #[tokio::test]

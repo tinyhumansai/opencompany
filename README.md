@@ -162,7 +162,8 @@ src/ports/              Kernel port traits and shared types
 src/store/              File-based CompanyStore/EventLog/Memory/Context/Secrets
 src/policy/             Manifest-driven ApprovalGate
 src/brain/              Offline EchoBrain (the default cognition seam)
-src/runtime/            CompanyRuntime, CycleRunner, and the company registry
+src/feedback/           Feedback items, privacy scrubber, GitHub issue filing
+src/runtime/            CompanyRuntime, CycleRunner, cron scheduler, registry
 src/server/             Axum HTTP router and handlers
 src/openhuman/          OpenHuman launcher seams
 src/tiny/               TinyAgents/OpenHuman status surface

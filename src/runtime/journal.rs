@@ -51,6 +51,28 @@ enum JournalRecord {
         /// The resolved approval's id.
         id: ApprovalId,
     },
+    /// A parked approval that expired to a default-deny with no operator action.
+    ApprovalExpired {
+        /// The expired approval's id.
+        id: ApprovalId,
+        /// Epoch-millis the expiry was recorded.
+        at_millis: u64,
+    },
+    /// A parked approval the operator approved with an amended effect payload.
+    ///
+    /// Audit-only: the queue removal is recorded by the paired
+    /// [`ApprovalResolved`](JournalRecord::ApprovalResolved). The original
+    /// effect stays recoverable from the earlier
+    /// [`ApprovalParked`](JournalRecord::ApprovalParked), so the immutable log
+    /// shows both what was requested and what the operator approved.
+    ApprovalAmended {
+        /// The amended approval's id.
+        id: ApprovalId,
+        /// The operator-amended effect that was executed.
+        amended_effect: Effect,
+        /// Epoch-millis the amendment was recorded.
+        at_millis: u64,
+    },
 }
 
 /// A parked approval awaiting resolution.
@@ -119,6 +141,11 @@ impl RuntimeJournal {
                 JournalRecord::ApprovalResolved { id } => {
                     state.parked.remove(&id);
                 }
+                JournalRecord::ApprovalExpired { id, .. } => {
+                    state.parked.remove(&id);
+                }
+                // Audit-only: the paired `ApprovalResolved` handles removal.
+                JournalRecord::ApprovalAmended { .. } => {}
             }
         }
         *self.state.lock().expect("journal state poisoned") = state;
@@ -179,6 +206,39 @@ impl RuntimeJournal {
             .remove(id);
         self.append(&JournalRecord::ApprovalResolved { id: id.clone() })
             .await
+    }
+
+    /// Records that a parked approval expired to a default-deny, removing it
+    /// from the queue. This is the durable audit entry for
+    /// default-deny-on-silence.
+    pub async fn record_expired(&self, id: &ApprovalId, at_millis: u64) -> Result<()> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .parked
+            .remove(id);
+        self.append(&JournalRecord::ApprovalExpired {
+            id: id.clone(),
+            at_millis,
+        })
+        .await
+    }
+
+    /// Records an operator-amended approval (an approve-with-edit) for the audit
+    /// trail. Removal from the queue is recorded separately by
+    /// [`record_resolved`](Self::record_resolved).
+    pub async fn record_amended(
+        &self,
+        id: &ApprovalId,
+        amended_effect: &Effect,
+        at_millis: u64,
+    ) -> Result<()> {
+        self.append(&JournalRecord::ApprovalAmended {
+            id: id.clone(),
+            amended_effect: amended_effect.clone(),
+            at_millis,
+        })
+        .await
     }
 
     /// A snapshot of the currently parked approvals, oldest first.
@@ -312,5 +372,85 @@ mod test {
         after.load().await.unwrap();
         assert!(after.pending().is_empty());
         tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn expired_record_removes_parked_and_survives_reload() {
+        let path = tmp_path();
+        let journal = RuntimeJournal::new(&path);
+        let id = ApprovalId::new("appr-exp");
+        journal
+            .record_parked(&id, &effect(), now_millis())
+            .await
+            .unwrap();
+        assert_eq!(journal.pending().len(), 1);
+
+        journal.record_expired(&id, now_millis()).await.unwrap();
+        assert!(journal.pending().is_empty());
+
+        // A restart replays the expiry: the approval stays gone.
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        assert!(reloaded.pending().is_empty());
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("ApprovalExpired"));
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn amended_record_is_audit_only_and_round_trips() {
+        let path = tmp_path();
+        let journal = RuntimeJournal::new(&path);
+        let id = ApprovalId::new("appr-amend");
+        journal
+            .record_parked(&id, &effect(), now_millis())
+            .await
+            .unwrap();
+
+        let mut amended = effect();
+        amended.payload = serde_json::json!({ "edited": true });
+        journal
+            .record_amended(&id, &amended, now_millis())
+            .await
+            .unwrap();
+        // The audit record alone does not drain the queue.
+        assert_eq!(journal.pending().len(), 1);
+        // The paired resolution removes it.
+        journal.record_resolved(&id).await.unwrap();
+        assert!(journal.pending().is_empty());
+
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        assert!(reloaded.pending().is_empty());
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("ApprovalAmended"));
+        assert!(raw.contains("\"edited\":true"));
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[test]
+    fn expired_and_amended_records_round_trip_under_record_tag() {
+        for record in [
+            JournalRecord::ApprovalExpired {
+                id: ApprovalId::new("x"),
+                at_millis: 42,
+            },
+            JournalRecord::ApprovalAmended {
+                id: ApprovalId::new("y"),
+                amended_effect: effect(),
+                at_millis: 7,
+            },
+        ] {
+            let json = serde_json::to_value(&record).unwrap();
+            assert!(json.get("record").is_some());
+            let back: JournalRecord = serde_json::from_value(json).unwrap();
+            // Re-serialize to compare (JournalRecord has no PartialEq).
+            assert_eq!(
+                serde_json::to_string(&back).unwrap(),
+                serde_json::to_string(&record).unwrap()
+            );
+        }
     }
 }
