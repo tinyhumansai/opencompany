@@ -1,7 +1,7 @@
-//! Offline tests for [`HostedMedullaBrain`] over the in-memory
-//! [`MockTransport`], plus end-to-end tests that drive a real
+//! Offline tests for [`SidecarBrain`] over the mock sidecar transport and mock
+//! inference client, plus an end-to-end test that drives a real
 //! [`CompanyRuntime`](crate::company::runtime::CompanyRuntime) with the brain
-//! wired in through the builder.
+//! injected through the builder. No test touches the network or a Node process.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -9,11 +9,10 @@ use std::sync::Mutex;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::brain::medulla::MockTransport;
-use crate::brain::medulla::wire::{self, EffectFrame, OrchErrorCode, Role, ToolCallFrame};
+use crate::brain::medulla::wire::{self, EffectFrame, OrchErrorCode, ToolCallFrame};
 use crate::ports::types::{
     ApprovalId, ChunkAddr, ChunkHit, CompanyEvent, ContextOp, ContextOpResult, Effect,
-    EffectDisposition, ToolResult, Verdict,
+    EffectDisposition, ToolResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,12 +76,15 @@ impl CycleHost for RecordingHost {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn brain(transport: Arc<MockTransport>) -> HostedMedullaBrain {
-    HostedMedullaBrain::new(
+fn brain(
+    transport: Arc<MockSidecarTransport>,
+    inference: Arc<MockInferenceClient>,
+) -> SidecarBrain {
+    SidecarBrain::new(
         transport,
+        inference,
         &CompanyId::new("acme"),
         "acme",
-        SecretValue("th_super_secret".into()),
         vec![ToolManifestEntry {
             name: "noop".into(),
             description: None,
@@ -91,7 +93,6 @@ fn brain(transport: Arc<MockTransport>) -> HostedMedullaBrain {
     )
 }
 
-/// The deterministic cycle id for a first operator event on company `acme`.
 fn cid() -> String {
     wire::cycle_id("opencompany:acme", "acme", 0)
 }
@@ -108,8 +109,8 @@ fn operator_request() -> CycleRequest {
     }
 }
 
-fn effect_frame(kind: &str, index: usize, payload: Value) -> InboundFrame {
-    InboundFrame::Effect(EffectFrame {
+fn effect_frame(kind: &str, index: usize, payload: Value) -> SidecarFrame {
+    SidecarFrame::Effect(EffectFrame {
         kind: kind.into(),
         cycle_id: cid(),
         call_id: wire::call_id(&cid(), kind, index),
@@ -117,8 +118,8 @@ fn effect_frame(kind: &str, index: usize, payload: Value) -> InboundFrame {
     })
 }
 
-fn tool_call_frame(name: &str, index: usize, args: Value) -> InboundFrame {
-    InboundFrame::ToolCall(ToolCallFrame {
+fn tool_call_frame(name: &str, index: usize, args: Value) -> SidecarFrame {
+    SidecarFrame::ToolCall(ToolCallFrame {
         cycle_id: cid(),
         call_id: wire::call_id(&cid(), "tool", index),
         name: name.into(),
@@ -127,68 +128,90 @@ fn tool_call_frame(name: &str, index: usize, args: Value) -> InboundFrame {
     })
 }
 
+fn inference_frame(index: usize, prompt: &str) -> SidecarFrame {
+    SidecarFrame::Inference {
+        call_id: wire::call_id(&cid(), "infer", index),
+        request: InferenceRequest {
+            messages: vec![InferenceMessage {
+                role: "user".into(),
+                content: prompt.into(),
+            }],
+            session_id: "acme".into(),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn posts_one_normalized_event_without_a_model_field() {
-    let transport = Arc::new(MockTransport::new());
-    let brain = brain(transport.clone());
+async fn posts_event_and_registers_tools_once() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    let inference = Arc::new(MockInferenceClient::new());
+    let brain = brain(transport.clone(), inference);
     let host = RecordingHost::executing();
 
     brain.run_cycle(operator_request(), &host).await.unwrap();
+    brain.run_cycle(operator_request(), &host).await.unwrap();
 
     let posted = transport.posted_events();
-    assert_eq!(posted.len(), 1);
-    let event = &posted[0].event;
-    assert_eq!(event.seq, 0);
-    assert_eq!(event.role, Role::User);
-    assert_eq!(event.sender, "operator");
-    assert_eq!(event.body, "hi");
-    assert_eq!(event.kind, "operator.message");
+    assert_eq!(posted.len(), 2);
     assert_eq!(posted[0].counterpart_agent_id, "opencompany:acme");
     assert_eq!(posted[0].session_id, "acme");
-
-    // The serialized wire body must never carry a `model` field.
-    let body = serde_json::to_value(wire::Envelope::v1(posted[0].clone())).unwrap();
-    assert!(wire::assert_no_model(&body).is_ok());
-
+    assert_eq!(posted[0].event.kind, "operator.message");
     // The device-tool manifest was registered exactly once.
     assert_eq!(transport.registered_tools().len(), 1);
 }
 
 #[tokio::test]
-async fn register_tools_fires_only_on_the_first_cycle() {
-    let transport = Arc::new(MockTransport::new());
-    let brain = brain(transport.clone());
+async fn inference_frame_invokes_host_callback_and_answers() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(cid(), vec![inference_frame(0, "what next?")]);
+    let inference = Arc::new(
+        MockInferenceClient::new()
+            .with_text("do the thing")
+            .with_tokens(11, 7),
+    );
+    let brain = brain(transport.clone(), inference.clone());
     let host = RecordingHost::executing();
 
-    brain.run_cycle(operator_request(), &host).await.unwrap();
-    brain.run_cycle(operator_request(), &host).await.unwrap();
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
 
-    assert_eq!(transport.registered_tools().len(), 1);
+    // The host-bound inference callback fired with the sidecar's prompt.
+    let requests = inference.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages[0].content, "what next?");
+
+    // The completion was answered back to the sidecar, keyed on its call id.
+    let answers = transport.inference_answers();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].response.text, "do the thing");
+
+    // Token usage accumulated into the cycle result.
+    assert_eq!(result.token_usage.input, 11);
+    assert_eq!(result.token_usage.output, 7);
 }
 
 #[tokio::test]
 async fn executed_send_dm_becomes_a_channel_response_and_acks_ok() {
-    let transport = Arc::new(MockTransport::new());
+    let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(
         cid(),
         vec![effect_frame(
             "send_dm",
             0,
-            json!({ "to": "operator", "body": "hello from medulla" }),
+            json!({ "to": "operator", "body": "hello from the sidecar" }),
         )],
     );
-    let brain = brain(transport.clone());
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
     let host = RecordingHost::executing();
 
     let result = brain.run_cycle(operator_request(), &host).await.unwrap();
 
     assert_eq!(result.channel_responses.len(), 1);
     assert_eq!(result.channel_responses[0].channel, "operator");
-    assert_eq!(result.channel_responses[0].text, "hello from medulla");
+    assert_eq!(result.channel_responses[0].text, "hello from the sidecar");
 
     let acks = transport.acks();
     assert_eq!(acks.len(), 1);
@@ -198,81 +221,10 @@ async fn executed_send_dm_becomes_a_channel_response_and_acks_ok() {
 }
 
 #[tokio::test]
-async fn duplicate_effect_frame_is_handled_once() {
-    let transport = Arc::new(MockTransport::new());
-    // Two frames sharing a callId: the replay must be ignored.
-    let payload = json!({ "to": "operator", "body": "dup" });
-    transport.script_cycle(
-        cid(),
-        vec![
-            effect_frame("send_dm", 0, payload.clone()),
-            effect_frame("send_dm", 0, payload),
-        ],
-    );
-    let brain = brain(transport.clone());
-    let host = RecordingHost::executing();
-
-    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
-
-    assert_eq!(host.effects.lock().unwrap().len(), 1);
-    assert_eq!(transport.acks().len(), 1);
-    assert_eq!(result.channel_responses.len(), 1);
-}
-
-#[tokio::test]
-async fn tool_call_frame_routes_to_call_tool_and_answers() {
-    let transport = Arc::new(MockTransport::new());
-    transport.script_cycle(cid(), vec![tool_call_frame("noop", 0, json!({ "q": 1 }))]);
-    let brain = brain(transport.clone());
-    let host = RecordingHost::executing();
-
-    brain.run_cycle(operator_request(), &host).await.unwrap();
-
-    let calls = host.tool_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].tool, "noop");
-
-    let answers = transport.tool_answers();
-    assert_eq!(answers.len(), 1);
-    assert!(answers[0].ok);
-    assert!(answers[0].result.is_some());
-}
-
-#[tokio::test]
-async fn context_device_tool_routes_to_context_op() {
-    let transport = Arc::new(MockTransport::new());
-    transport.script_cycle(
-        cid(),
-        vec![tool_call_frame(
-            "context_search",
-            0,
-            json!({ "query": "roadmap", "limit": 3 }),
-        )],
-    );
-    let brain = brain(transport.clone());
-    let host = RecordingHost::executing();
-
-    brain.run_cycle(operator_request(), &host).await.unwrap();
-
-    let ops = host.context_ops.lock().unwrap();
-    assert_eq!(ops.len(), 1);
-    match &ops[0] {
-        ContextOp::Search { query, limit } => {
-            assert_eq!(query, "roadmap");
-            assert_eq!(*limit, 3);
-        }
-        other => panic!("expected a context search, got {other:?}"),
-    }
-    // The tool_call was not forwarded to the tool provider.
-    assert!(host.tool_calls.lock().unwrap().is_empty());
-    assert_eq!(transport.tool_answers().len(), 1);
-}
-
-#[tokio::test]
 async fn parked_effect_acks_not_ok_with_pending_approval() {
-    let transport = Arc::new(MockTransport::new());
+    let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(cid(), vec![effect_frame("filing.submit", 0, Value::Null)]);
-    let brain = brain(transport.clone());
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
     let host = RecordingHost::parking();
 
     let result = brain.run_cycle(operator_request(), &host).await.unwrap();
@@ -287,72 +239,135 @@ async fn parked_effect_acks_not_ok_with_pending_approval() {
             .unwrap()
             .contains("pending approval")
     );
-    // A parked effect yields no channel response and no world-diff.
     assert!(result.channel_responses.is_empty());
-    assert!(transport.posted_world_diffs().is_empty());
+}
+
+#[tokio::test]
+async fn tool_call_frame_routes_to_call_tool_and_answers() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(cid(), vec![tool_call_frame("noop", 0, json!({ "q": 1 }))]);
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
+    let host = RecordingHost::executing();
+
+    brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    let calls = host.tool_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].tool, "noop");
+
+    let answers = transport.tool_answers();
+    assert_eq!(answers.len(), 1);
+    assert!(answers[0].ok);
+}
+
+#[tokio::test]
+async fn context_device_tool_routes_to_context_op() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![tool_call_frame(
+            "context_search",
+            0,
+            json!({ "query": "roadmap", "limit": 3 }),
+        )],
+    );
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
+    let host = RecordingHost::executing();
+
+    brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    let ops = host.context_ops.lock().unwrap();
+    assert_eq!(ops.len(), 1);
+    match &ops[0] {
+        ContextOp::Search { query, limit } => {
+            assert_eq!(query, "roadmap");
+            assert_eq!(*limit, 3);
+        }
+        other => panic!("expected a context search, got {other:?}"),
+    }
+    assert!(host.tool_calls.lock().unwrap().is_empty());
+    assert_eq!(transport.tool_answers().len(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_frame_is_handled_once() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    let payload = json!({ "to": "operator", "body": "dup" });
+    transport.script_cycle(
+        cid(),
+        vec![
+            effect_frame("send_dm", 0, payload.clone()),
+            effect_frame("send_dm", 0, payload),
+        ],
+    );
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(host.effects.lock().unwrap().len(), 1);
+    assert_eq!(transport.acks().len(), 1);
+    assert_eq!(result.channel_responses.len(), 1);
+}
+
+#[tokio::test]
+async fn max_passes_caps_inference_frames() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![
+            inference_frame(0, "one"),
+            inference_frame(1, "two"),
+            inference_frame(2, "three"),
+        ],
+    );
+    let inference = Arc::new(MockInferenceClient::new());
+    let brain = brain(transport.clone(), inference.clone()).with_max_passes(2);
+    let host = RecordingHost::executing();
+
+    brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    // Only two inference passes ran before the cap stopped the drain.
+    assert_eq!(inference.requests().len(), 2);
+    assert_eq!(transport.inference_answers().len(), 2);
 }
 
 #[tokio::test]
 async fn orchestration_error_on_post_events_propagates_with_code() {
-    let transport = Arc::new(MockTransport::new());
-    transport.fail_post_events(OrchErrorCode::InsufficientBalance);
-    let brain = brain(transport.clone());
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.fail_post_events(OrchErrorCode::DeviceOffline);
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
     let host = RecordingHost::executing();
 
     let err = brain
         .run_cycle(operator_request(), &host)
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "ORCH_INSUFFICIENT_BALANCE");
-}
-
-#[tokio::test]
-async fn spend_effect_records_ledger_delta_and_posts_world_diff() {
-    let transport = Arc::new(MockTransport::new());
-    transport.script_cycle(
-        cid(),
-        vec![effect_frame(
-            "x402.spend",
-            0,
-            json!({ "amountUsd": 4.25, "memo": "api call" }),
-        )],
-    );
-    let brain = brain(transport.clone());
-    let host = RecordingHost::executing();
-
-    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
-
-    assert_eq!(result.ledger_deltas.len(), 1);
-    assert_eq!(result.ledger_deltas[0].amount_usd, 4.25);
-    assert_eq!(result.ledger_deltas[0].kind, "x402.spend");
-    // Spend is notable, so a world-diff was uploaded.
-    let diffs = transport.posted_world_diffs();
-    assert_eq!(diffs.len(), 1);
-    assert_eq!(diffs[0].entries.len(), 1);
-    assert_eq!(diffs[0].session_id, "acme");
+    assert_eq!(err.code(), "ORCH_DEVICE_OFFLINE");
 }
 
 #[test]
-fn debug_redacts_the_credential() {
-    let transport = Arc::new(MockTransport::new());
-    let brain = brain(transport);
+fn debug_does_not_expose_internals_beyond_labels() {
+    let brain = brain(
+        Arc::new(MockSidecarTransport::new()),
+        Arc::new(MockInferenceClient::new()),
+    );
     let rendered = format!("{brain:?}");
-    assert!(!rendered.contains("th_super_secret"));
-    assert!(rendered.contains("redacted"));
+    assert!(rendered.contains("SidecarBrain"));
+    assert!(rendered.contains("acme"));
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end tests through a real CompanyRuntime
+// End-to-end test through a real CompanyRuntime
 // ---------------------------------------------------------------------------
 
-use crate::app::config::BrainMode;
 use crate::company::CompanyManifest;
-use crate::ports::types::{Actor, ActorKind};
+use crate::ports::types::{Actor, ActorKind, Verdict};
 use crate::runtime::RuntimeBuilder;
 
 fn tmp_home() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "opencompany-hosted-{}",
+        "opencompany-sidecar-{}",
         crate::ports::generate_id()
     ))
 }
@@ -364,7 +379,7 @@ fn manifest(policy_mode: &str) -> CompanyManifest {
         name = "Acme"
 
         [brain]
-        mode = "hosted"
+        mode = "sidecar"
 
         [tools]
         allow = ["noop"]
@@ -376,28 +391,46 @@ fn manifest(policy_mode: &str) -> CompanyManifest {
     toml::from_str(&toml_src).expect("valid manifest")
 }
 
-/// The deterministic first-cycle id a real runtime for `Acme` produces: the
-/// company id slugs to `acme`, the first event lands at seq 0.
 fn runtime_cid() -> String {
     wire::cycle_id("opencompany:acme", "acme", 0)
 }
 
+fn sidecar_brain_for(
+    transport: Arc<MockSidecarTransport>,
+    inference: Arc<MockInferenceClient>,
+) -> Arc<dyn Brain> {
+    Arc::new(SidecarBrain::new(
+        transport,
+        inference,
+        &CompanyId::new("acme"),
+        "acme",
+        vec![ToolManifestEntry {
+            name: "noop".into(),
+            description: None,
+            input_schema: None,
+        }],
+    ))
+}
+
 #[tokio::test]
-async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
+async fn e2e_inference_then_gated_send_dm_drives_a_channel_response() {
     let home = tmp_home();
-    let transport = Arc::new(MockTransport::new());
+    let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(
         runtime_cid(),
         vec![
-            tool_call_frame("noop", 0, json!({ "q": "status" })),
+            inference_frame(0, "how are we doing?"),
             effect_frame("send_dm", 0, json!({ "to": "operator", "body": "on it" })),
         ],
     );
+    let inference = Arc::new(
+        MockInferenceClient::new()
+            .with_text("plan ready")
+            .with_tokens(5, 3),
+    );
 
     let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
-        .with_brain_mode(BrainMode::Hosted)
-        .with_credential(SecretValue("th_live".into()))
-        .with_transport(transport.clone())
+        .with_brain(sidecar_brain_for(transport.clone(), inference.clone()))
         .build()
         .await
         .unwrap();
@@ -409,7 +442,11 @@ async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
         .await
         .unwrap();
 
-    // The gated send_dm produced a channel response routed to the operator.
+    // The inference callback fired through the real runtime.
+    assert_eq!(inference.requests().len(), 1);
+    assert_eq!(transport.inference_answers().len(), 1);
+
+    // The gated send_dm produced an operator channel response.
     assert_eq!(report.responses.len(), 1);
     assert_eq!(report.responses[0].channel, "operator");
     assert_eq!(report.responses[0].text, "on it");
@@ -419,12 +456,6 @@ async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
     assert_eq!(acks.len(), 1);
     assert!(acks[0].ok);
 
-    // The device tool was serviced and answered.
-    assert_eq!(transport.tool_answers().len(), 1);
-
-    // Exactly one event was posted for the operator message.
-    assert_eq!(transport.posted_events().len(), 1);
-
     // A compressed trace was persisted to the fs-backed MemoryStore.
     let traces = rt.memory.recent_traces(rt.id(), 10).await.unwrap();
     assert!(!traces.is_empty());
@@ -433,19 +464,17 @@ async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
 }
 
 #[tokio::test]
-async fn e2e_supervised_effect_parks_and_acks_not_ok() {
+async fn e2e_supervised_effect_parks_through_the_real_gate() {
     let home = tmp_home();
-    let transport = Arc::new(MockTransport::new());
+    let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(
         runtime_cid(),
-        // A Sign-group effect always parks under supervised policy.
         vec![effect_frame("filing.submit", 0, Value::Null)],
     );
+    let inference = Arc::new(MockInferenceClient::new());
 
     let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
-        .with_brain_mode(BrainMode::Hosted)
-        .with_credential(SecretValue("th_live".into()))
-        .with_transport(transport.clone())
+        .with_brain(sidecar_brain_for(transport.clone(), inference))
         .build()
         .await
         .unwrap();
@@ -457,24 +486,18 @@ async fn e2e_supervised_effect_parks_and_acks_not_ok() {
         .await
         .unwrap();
 
-    // The effect parked: an approval is queued and no channel response emitted.
+    // The Sign-group effect parked under supervised policy: an approval is
+    // queued and no channel response emitted.
     assert_eq!(report.parked.len(), 1);
     assert_eq!(rt.pending_approvals().len(), 1);
     assert!(report.responses.is_empty());
 
-    // Medulla was told the effect is pending, not that it succeeded.
+    // The sidecar was told the effect is pending, not that it succeeded.
     let acks = transport.acks();
     assert_eq!(acks.len(), 1);
     assert!(!acks[0].ok);
-    assert!(
-        acks[0]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("pending approval")
-    );
 
-    // Resolving the approval executes the parked effect and drains the queue.
+    // Resolving the approval drains the queue.
     let approval_id = report.parked[0].clone();
     rt.resolve_approval(
         &approval_id,

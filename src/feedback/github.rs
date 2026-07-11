@@ -52,6 +52,8 @@ pub trait GitHubClient: Send + Sync {
     async fn create_issue(&self, repo: &str, draft: &IssueDraft) -> Result<String>;
     /// Comments on an existing issue (the dedupe path).
     async fn comment_issue(&self, repo: &str, number: u64, body: &str) -> Result<()>;
+    /// Closes an existing issue (the merge-duplicate and cluster paths).
+    async fn close_issue(&self, repo: &str, number: u64) -> Result<()>;
 }
 
 /// The result of a filing attempt.
@@ -118,11 +120,13 @@ impl Default for RateLimiter {
 /// Files a feedback issue, honoring consent, dedupe, rate-limit, and the
 /// tokenless fallback.
 ///
-/// `body` must already be scrubbed and signed with the company `@handle`. When
-/// `client` is `None` or `consent` is [`ConsentMode::Manual`], the operator
-/// files via the returned [`FilingOutcome::ManualLink`]. Otherwise the client
-/// searches for a duplicate (commenting if found), checks the per-company rate
-/// limit, and creates the issue.
+/// `body` must already be scrubbed and signed with the company `@handle`. Only
+/// standing [`ConsentMode::Auto`] auto-creates the issue. `Manual` and
+/// `Assisted` (the latter is also where a throttled low-quality filer lands)
+/// return a [`FilingOutcome::ManualLink`] so the operator approves/files the
+/// exact body themselves; a missing `client` degrades the same way. When it does
+/// file, the client searches for a duplicate (commenting if found), checks the
+/// per-company rate limit, and creates the issue.
 #[allow(clippy::too_many_arguments)]
 pub async fn file_feedback(
     client: Option<&dyn GitHubClient>,
@@ -134,8 +138,10 @@ pub async fn file_feedback(
     consent: ConsentMode,
     limiter: &RateLimiter,
 ) -> Result<FilingOutcome> {
-    // Manual consent or no client: degrade to a prefilled manual link.
-    let Some(client) = client.filter(|_| consent != ConsentMode::Manual) else {
+    // Only standing Auto consent auto-files. Manual and Assisted (incl. a
+    // throttled filer downgraded to Assisted) go to the operator via a prefilled
+    // link; a missing client degrades the same way.
+    let Some(client) = client.filter(|_| consent == ConsentMode::Auto) else {
         return Ok(FilingOutcome::ManualLink {
             url: manual_issue_url(repo, title, body, labels),
         });
@@ -209,6 +215,7 @@ pub struct MockGitHubClient {
     existing: StdMutex<Vec<ExistingIssue>>,
     created: StdMutex<Vec<IssueDraft>>,
     comments: StdMutex<Vec<(u64, String)>>,
+    closed: StdMutex<Vec<u64>>,
     next_number: StdMutex<u64>,
 }
 
@@ -219,6 +226,7 @@ impl MockGitHubClient {
             existing: StdMutex::new(Vec::new()),
             created: StdMutex::new(Vec::new()),
             comments: StdMutex::new(Vec::new()),
+            closed: StdMutex::new(Vec::new()),
             next_number: StdMutex::new(100),
         }
     }
@@ -244,6 +252,11 @@ impl MockGitHubClient {
     /// A snapshot of every comment `(issue_number, body)` recorded.
     pub fn comments(&self) -> Vec<(u64, String)> {
         self.comments.lock().expect("mock poisoned").clone()
+    }
+
+    /// A snapshot of every issue number closed through this mock.
+    pub fn closed(&self) -> Vec<u64> {
+        self.closed.lock().expect("mock poisoned").clone()
     }
 }
 
@@ -292,6 +305,17 @@ impl GitHubClient for MockGitHubClient {
             .lock()
             .expect("mock poisoned")
             .push((number, body.to_string()));
+        Ok(())
+    }
+
+    async fn close_issue(&self, _repo: &str, number: u64) -> Result<()> {
+        self.closed.lock().expect("mock poisoned").push(number);
+        // Drop the issue from the open set so subsequent dedupe searches never
+        // rematch a closed duplicate, exactly as the real tracker would.
+        self.existing
+            .lock()
+            .expect("mock poisoned")
+            .retain(|issue| issue.number != number);
         Ok(())
     }
 }
@@ -410,6 +434,20 @@ mod http {
                 .map_err(|e| Self::err("comment", e))?;
             Ok(())
         }
+
+        async fn close_issue(&self, repo: &str, number: u64) -> Result<()> {
+            let url = format!("https://api.github.com/repos/{repo}/issues/{number}");
+            self.http
+                .patch(&url)
+                .header("Authorization", format!("Bearer {}", self.token.expose()))
+                .header("User-Agent", "opencompany")
+                .header("Accept", "application/vnd.github+json")
+                .json(&serde_json::json!({ "state": "closed" }))
+                .send()
+                .await
+                .map_err(|e| Self::err("close", e))?;
+            Ok(())
+        }
     }
 }
 
@@ -455,6 +493,28 @@ mod test {
             "b",
             &[],
             ConsentMode::Manual,
+            &limiter,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, FilingOutcome::ManualLink { .. }));
+        assert!(client.created().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assisted_consent_never_auto_creates() {
+        // A throttled low-quality filer is downgraded Auto -> Assisted, which
+        // must go to the operator for approval, never silently auto-file.
+        let client = MockGitHubClient::new();
+        let limiter = RateLimiter::default();
+        let out = file_feedback(
+            Some(&client),
+            "r/r",
+            "acme",
+            "t",
+            "b",
+            &[],
+            ConsentMode::Assisted,
             &limiter,
         )
         .await

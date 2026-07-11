@@ -14,9 +14,9 @@ use crate::company::CompanyManifest;
 use crate::feedback::github::{
     FilingOutcome, GitHubClient, RateLimiter, file_feedback, manual_issue_url,
 };
-use crate::feedback::labels::labels_for;
 use crate::feedback::scrub::{CharterTerm, ScrubOutcome, scrub};
 use crate::feedback::store::FeedbackStore;
+use crate::feedback::triage::{FeedbackSource, QualityLedger, Severity, classify_labels};
 use crate::feedback::types::{ConsentMode, FeedbackItem};
 use crate::ports::SecretStore;
 use crate::ports::types::CompanyId;
@@ -32,6 +32,9 @@ pub struct FeedbackFiler {
     pub consent: ConsentMode,
     /// The per-company rate limiter.
     pub limiter: RateLimiter,
+    /// Per-handle filing quality, throttling auto-consent after repeated
+    /// low-quality filings.
+    pub quality: QualityLedger,
 }
 
 impl Default for FeedbackFiler {
@@ -41,6 +44,7 @@ impl Default for FeedbackFiler {
             repo: crate::feedback::DEFAULT_REPO.to_string(),
             consent: ConsentMode::default(),
             limiter: RateLimiter::default(),
+            quality: QualityLedger::default(),
         }
     }
 }
@@ -101,6 +105,7 @@ impl FeedbackResponse {
 /// * `preview` → the byte-exact final body plus a prefilled link.
 /// * Otherwise → file through the [`FeedbackFiler`], updating the stored item's
 ///   status on success.
+#[allow(clippy::too_many_arguments)]
 pub async fn finalize(
     store: &FeedbackStore,
     secrets: &dyn SecretStore,
@@ -108,6 +113,8 @@ pub async fn finalize(
     company: &CompanyId,
     manifest: Option<&CompanyManifest>,
     item: &FeedbackItem,
+    severity: Severity,
+    source: FeedbackSource,
     preview: bool,
 ) -> Result<FeedbackResponse> {
     let handle = manifest
@@ -116,7 +123,7 @@ pub async fn finalize(
     let roster = roster_names(manifest);
     let charter = charter_terms(manifest);
     let keys = secret_keys(manifest);
-    let labels = labels_for(item);
+    let labels = classify_labels(item, severity, source);
     let (title, body) = candidate_issue(item, &handle);
 
     let scrubbed = match scrub(&body, company, secrets, &keys, &roster, &charter).await? {
@@ -137,6 +144,10 @@ pub async fn finalize(
         });
     }
 
+    // A throttled handle (too many low-quality filings) has its standing Auto
+    // consent downgraded to Assisted before anything leaves the machine.
+    let consent = filer.quality.effective_consent(&handle, filer.consent);
+
     let outcome = file_feedback(
         filer.client.as_deref(),
         &filer.repo,
@@ -144,13 +155,15 @@ pub async fn finalize(
         &title,
         &scrubbed,
         &labels,
-        filer.consent,
+        consent,
         &filer.limiter,
     )
     .await?;
 
     Ok(match outcome {
         FilingOutcome::Filed { url } => {
+            // A clean filing counts toward the handle's quality history.
+            filer.quality.record_filed(&handle);
             store.update_status(&item.id, &url, "open").await?;
             FeedbackResponse {
                 item_id: item.id.clone(),
@@ -164,6 +177,10 @@ pub async fn finalize(
             }
         }
         FilingOutcome::Deduped { url } => {
+            // A filing that immediately duplicates an existing issue is a
+            // low-quality signal against the filing handle.
+            filer.quality.record_filed(&handle);
+            filer.quality.record_low_quality(&handle);
             store.update_status(&item.id, &url, "duplicate").await?;
             FeedbackResponse {
                 item_id: item.id.clone(),

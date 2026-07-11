@@ -1,29 +1,26 @@
-//! [`HostedMedullaBrain`]: the [`Brain`] that drives hosted Medulla cognition
-//! over a [`MedullaTransport`].
+//! [`SidecarBrain`]: a [`Brain`] that drives a local sidecar process.
 //!
-//! One company is one Medulla session: the `sessionId` is the [`CompanyId`] and
-//! the `counterpartAgentId` is `opencompany:<slug>`. Each [`CycleRequest`] event
-//! is posted as its own `POST /events` keyed on the durable
-//! [`EventLog`](crate::ports::EventLog) sequence, and the returned cycle's frames
-//! are drained:
+//! The sidecar brain speaks the *same* `/orchestration/v1` wire frames as
+//! [`HostedMedullaBrain`](crate::brain::HostedMedullaBrain) — it reuses
+//! [`wire`](crate::brain::medulla::wire) verbatim and the shared wire→kernel
+//! mapping in [`effects`](crate::brain::medulla::effects) — but talks to a local
+//! sidecar process over stdio/HTTP instead of the hosted orchestrator. Its one
+//! distinctive addition is the **inference inversion**: the sidecar runs the
+//! cognitive loop but has no model access, so it calls *back* into the Rust host
+//! through an [`InferenceClient`] to run each model pass (offline in tests; under
+//! the `tiny` feature, into the TinyAgents harness).
 //!
-//! - Every **effect** frame passes through [`CycleHost::emit_effect`] — the
-//!   approval gate — *before* it is acked. An executed effect acks `ok:true`; a
-//!   parked or denied effect acks `ok:false` with the reason, so Medulla hears
-//!   the gate's verdict rather than a silent success.
-//! - Every **tool_call** frame is serviced through [`CycleHost::call_tool`]
-//!   (or [`CycleHost::context_op`] for the context device-tools) and answered.
-//! - Frames are deduped on `callId`, matching the at-least-once delivery
-//!   contract, so a replay is handled exactly once.
+//! Cycle drain shape, deduplication on `callId`, the effect→gate→ack flow, and
+//! the tool/context routing are identical to the hosted brain, so a supervised
+//! `Sign`/`Spend` effect parks an approval through the real kernel gate exactly
+//! as it does under hosted cognition.
 //!
-//! Cycle summaries are journaled as [`CompressedTrace`]s, spend effects become
-//! ledger deltas, and notable effects trigger a `POST /world-diff`. The brain
-//! never fabricates a channel response: the ones it returns are the `send_dm`
-//! effects Medulla executed.
-//!
-//! The transport is abstracted, so the brain and its whole test surface live in
-//! the default build against [`MockTransport`](super::medulla::MockTransport);
-//! the networked `HttpSocketTransport` lands behind the `medulla` feature.
+//! The whole module is gated behind the `sidecar` feature; the default build
+//! links none of it and the builder routes `sidecar` mode to the echo brain.
+
+mod mock;
+mod transport;
+mod types;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -34,59 +31,72 @@ use futures::StreamExt;
 
 use crate::Result;
 use crate::ports::brain::{Brain, CycleHost};
-use crate::ports::now_millis;
 use crate::ports::types::{
-    CompanyId, CompressedTrace, CycleRequest, CycleResult, EffectDisposition, SecretValue,
-    TokenUsage, ToolCall,
+    CompanyId, CompressedTrace, CycleRequest, CycleResult, EffectDisposition, LedgerEntry,
+    OutboundMessage, TokenUsage, ToolCall,
 };
 
-use super::medulla::effects::{
+use crate::brain::medulla::effects::{
     EffectOutcome, channel_message_from_effect, context_op_from_call, context_result_to_value,
-    effect_from_frame, is_notable, ledger_delta_from_effect, wire_event,
+    effect_from_frame, ledger_delta_from_effect, wire_event,
 };
-use super::medulla::transport::{InboundFrame, MedullaTransport};
-use super::medulla::wire::{
+use crate::brain::medulla::wire::{
     EffectFrame, EffectResult, EventsRequest, ToolCallFrame, ToolManifestEntry, ToolResultFrame,
-    WorldDiffEntry, WorldDiffRequest,
 };
 
-/// The hosted Medulla brain: one company's cognition over a transport.
-pub struct HostedMedullaBrain {
-    transport: Arc<dyn MedullaTransport>,
+pub use mock::{MockInferenceClient, MockSidecarTransport, RecordedInference};
+pub use transport::{
+    InferenceClient, SidecarTransport, StdioSidecarTransport, TinyAgentsInferenceClient,
+};
+pub use types::{InferenceMessage, InferenceRequest, InferenceResponse, SidecarFrame};
+
+/// The default cap on inference passes the brain will run within one cycle.
+pub const DEFAULT_MAX_PASSES: usize = 12;
+
+/// The local-sidecar brain: one company's cognition over a sidecar process, with
+/// inference routed back into the host.
+pub struct SidecarBrain {
+    transport: Arc<dyn SidecarTransport>,
+    inference: Arc<dyn InferenceClient>,
     session_id: String,
     counterpart: String,
-    /// The hosted-brain bearer credential. Held for parity with the transport
-    /// and redacted in [`std::fmt::Debug`]; never logged or serialized.
-    credential: SecretValue,
     tool_catalog: Vec<ToolManifestEntry>,
+    max_passes: usize,
     registered: AtomicBool,
 }
 
-impl HostedMedullaBrain {
-    /// Builds a hosted brain for `company` addressed as `opencompany:<slug>`.
+impl SidecarBrain {
+    /// Builds a sidecar brain for `company` addressed as `opencompany:<slug>`.
     ///
-    /// `slug` is the company's manifest-derived slug (typically the same string
-    /// as the [`CompanyId`]); `credential` is the TinyHumans bearer token and is
-    /// never logged. `tool_catalog` is the device-tool manifest registered with
-    /// Medulla on the first cycle.
+    /// `inference` is the host-fulfilled callback the sidecar reaches back
+    /// through; `tool_catalog` is the device-tool manifest registered on the
+    /// first cycle. The pass cap defaults to [`DEFAULT_MAX_PASSES`]; override it
+    /// with [`with_max_passes`](Self::with_max_passes).
     pub fn new(
-        transport: Arc<dyn MedullaTransport>,
+        transport: Arc<dyn SidecarTransport>,
+        inference: Arc<dyn InferenceClient>,
         company: &CompanyId,
         slug: &str,
-        credential: SecretValue,
         tool_catalog: Vec<ToolManifestEntry>,
     ) -> Self {
         Self {
             transport,
+            inference,
             session_id: company.as_ref().to_string(),
             counterpart: format!("opencompany:{slug}"),
-            credential,
             tool_catalog,
+            max_passes: DEFAULT_MAX_PASSES,
             registered: AtomicBool::new(false),
         }
     }
 
-    /// The Medulla session id (the company id).
+    /// Overrides the inference-pass cap enforced per cycle.
+    pub fn with_max_passes(mut self, max_passes: usize) -> Self {
+        self.max_passes = max_passes.max(1);
+        self
+    }
+
+    /// The sidecar session id (the company id).
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -97,9 +107,6 @@ impl HostedMedullaBrain {
     }
 
     /// Registers the device-tool manifest exactly once (on the first cycle).
-    ///
-    /// A no-op when the catalog is empty. The `registered` flag is flipped with
-    /// `compare_exchange` so concurrent first cycles register at most once.
     async fn ensure_registered(&self) -> Result<()> {
         if self.tool_catalog.is_empty() {
             return Ok(());
@@ -116,12 +123,8 @@ impl HostedMedullaBrain {
         Ok(())
     }
 
-    /// Services one `orch:tool_call` frame and builds its answer.
-    ///
-    /// Context device-tools (`context_*`) route to [`CycleHost::context_op`];
-    /// everything else routes to [`CycleHost::call_tool`], which enforces the
-    /// manifest grant. A host error (e.g. an ungranted tool) becomes an
-    /// `ok:false` answer rather than aborting the cycle.
+    /// Services one tool-call frame, routing `context_*` tools to the context
+    /// store and everything else to the manifest-enforcing tool provider.
     async fn service_tool_call(
         &self,
         host: &dyn CycleHost,
@@ -164,16 +167,15 @@ impl HostedMedullaBrain {
         })
     }
 
-    /// Passes an effect frame through the gate, acks it, and returns the channel
-    /// response and ledger delta it produced (if any).
+    /// Passes an effect frame through the gate, acks it, and returns what it
+    /// contributed. The gate runs *before* the ack, so a parked effect acks
+    /// `ok:false` and the sidecar learns it must wait.
     async fn service_effect(
         &self,
         host: &dyn CycleHost,
         frame: &EffectFrame,
     ) -> Result<EffectOutcome> {
         let effect = effect_from_frame(frame);
-        // The gate runs BEFORE the ack, so a parked effect acks `ok:false` and
-        // Medulla learns it must wait rather than seeing a false success.
         let disposition = host.emit_effect(effect.clone()).await?;
 
         let mut outcome = EffectOutcome::default();
@@ -181,7 +183,6 @@ impl HostedMedullaBrain {
             EffectDisposition::Executed => {
                 outcome.channel_response = channel_message_from_effect(&effect);
                 outcome.ledger_delta = ledger_delta_from_effect(&effect);
-                outcome.notable = is_notable(&effect);
                 EffectResult {
                     call_id: frame.call_id.clone(),
                     ok: true,
@@ -208,18 +209,16 @@ impl HostedMedullaBrain {
 }
 
 #[async_trait]
-impl Brain for HostedMedullaBrain {
+impl Brain for SidecarBrain {
     async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
         self.ensure_registered().await?;
 
-        let mut channel_responses = Vec::new();
+        let mut channel_responses: Vec<OutboundMessage> = Vec::new();
         let mut new_traces = Vec::new();
-        let mut ledger_deltas = Vec::new();
-        let mut world_notes: Vec<WorldDiffEntry> = Vec::new();
+        let mut ledger_deltas: Vec<LedgerEntry> = Vec::new();
+        let mut token_usage = TokenUsage::default();
 
         for (index, event) in req.events.iter().enumerate() {
-            // Prefer the durable EventLog seq; fall back to the position when a
-            // caller did not thread seqs (idempotency then holds within a cycle).
             let seq = req
                 .event_seqs
                 .get(index)
@@ -236,11 +235,12 @@ impl Brain for HostedMedullaBrain {
 
             // Drain the cycle's frames, deduping on callId (at-least-once).
             let mut seen: HashSet<String> = HashSet::new();
+            let mut passes = 0usize;
             let mut frames = self.transport.cycle_frames(&cycle_id);
             while let Some(frame) = frames.next().await {
                 match frame? {
-                    InboundFrame::CycleComplete => break,
-                    InboundFrame::Effect(effect_frame) => {
+                    SidecarFrame::CycleComplete => break,
+                    SidecarFrame::Effect(effect_frame) => {
                         if !seen.insert(effect_frame.call_id.clone()) {
                             continue;
                         }
@@ -251,61 +251,55 @@ impl Brain for HostedMedullaBrain {
                         if let Some(delta) = outcome.ledger_delta {
                             ledger_deltas.push(delta);
                         }
-                        if outcome.notable {
-                            world_notes.push(WorldDiffEntry {
-                                seq,
-                                note: format!("executed {}", effect_frame.kind),
-                                ts: now_millis() as i64,
-                            });
-                        }
                     }
-                    InboundFrame::ToolCall(call) => {
+                    SidecarFrame::ToolCall(call) => {
                         if !seen.insert(call.call_id.clone()) {
                             continue;
                         }
                         let answer = self.service_tool_call(host, &call).await?;
                         self.transport.answer_tool_call(answer).await?;
                     }
+                    SidecarFrame::Inference { call_id, request } => {
+                        if !seen.insert(call_id.clone()) {
+                            continue;
+                        }
+                        // Honor the pass cap: stop draining once the sidecar has
+                        // asked for more inference passes than the budget allows.
+                        if passes >= self.max_passes {
+                            break;
+                        }
+                        passes += 1;
+                        // The inference inversion: the host runs the model pass.
+                        let response = self.inference.infer(request).await?;
+                        token_usage.input += response.token_usage.input;
+                        token_usage.output += response.token_usage.output;
+                        self.transport.answer_inference(&call_id, response).await?;
+                    }
                 }
             }
 
             new_traces.push(CompressedTrace::now(
                 &cycle_id,
-                format!("medulla cycle for `{}` (seq {seq})", self.session_id),
+                format!("sidecar cycle for `{}` (seq {seq})", self.session_id),
             ));
-        }
-
-        // Upload a world-diff after notable effects (payments, filings, etc.).
-        if !world_notes.is_empty() {
-            self.transport
-                .post_world_diff(WorldDiffRequest {
-                    session_id: self.session_id.clone(),
-                    entries: world_notes,
-                })
-                .await?;
         }
 
         Ok(CycleResult {
             channel_responses,
             new_traces,
             ledger_deltas,
-            token_usage: TokenUsage::default(),
+            token_usage,
         })
     }
 }
 
-/// A hand-written `Debug` that redacts the credential so it can never reach a
-/// log line or panic message.
-impl std::fmt::Debug for HostedMedullaBrain {
+impl std::fmt::Debug for SidecarBrain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Borrow the credential so it counts as held/used, but never render its
-        // bytes — only the redaction marker reaches the formatter.
-        let _held = &self.credential;
-        f.debug_struct("HostedMedullaBrain")
+        f.debug_struct("SidecarBrain")
             .field("session_id", &self.session_id)
             .field("counterpart", &self.counterpart)
-            .field("credential", &"<redacted>")
             .field("tools", &self.tool_catalog.len())
+            .field("max_passes", &self.max_passes)
             .field("registered", &self.registered.load(Ordering::Acquire))
             .finish()
     }

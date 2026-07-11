@@ -218,7 +218,9 @@ mod test {
         assert!(preview.contains("— filed by @acme"));
         assert!(github.created().is_empty());
 
-        // 3. Filing (auto consent) creates one issue with the agent-filed label.
+        // 3. Filing (auto consent) creates one issue. The `POST .../feedback`
+        //    route is operator-driven, so it carries the `source/operator`
+        //    label from the four-axis triage taxonomy.
         let (status, value) = post_json(
             &app,
             "/api/v1/company/feedback",
@@ -230,11 +232,9 @@ mod test {
         assert!(value["issue_url"].is_string());
         let created = github.created();
         assert_eq!(created.len(), 1);
-        assert!(
-            created[0]
-                .labels
-                .contains(&"source/agent-filed".to_string())
-        );
+        assert!(created[0].labels.contains(&"source/operator".to_string()));
+        assert!(created[0].labels.contains(&"sev/annoyance".to_string()));
+        assert!(created[0].labels.contains(&"type/wrong-output".to_string()));
 
         // 4. A second filing with the same title dedupes: it comments, does not
         //    create a duplicate.

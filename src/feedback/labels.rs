@@ -4,25 +4,22 @@
 //! `type/`, `area/`, `sev/`, and `source/`. Agent-filed issues always carry
 //! `source/agent-filed` so triage can weight them.
 
+use crate::feedback::triage::{FeedbackSource, Severity, classify_labels};
 use crate::feedback::types::{FeedbackCategory, FeedbackItem};
 
 /// Builds the full label set for an agent-filed feedback issue.
 ///
-/// The `type/` label follows the category; `area/` defaults per category (or
-/// `template:<name>` for a template gap with a known template); `sev/` defaults
-/// to `annoyance`; `source/` is always `agent-filed`.
+/// A thin wrapper over [`classify_labels`](crate::feedback::triage::classify_labels)
+/// — the single source of truth — with the agent-filer defaults: `sev/annoyance`
+/// and `source/agent-filed`. The `type/` label follows the category; `area/`
+/// defaults per category (or `template:<name>` for a template gap with a known
+/// template).
 pub fn labels_for(item: &FeedbackItem) -> Vec<String> {
-    vec![
-        "feedback".to_string(),
-        format!("type/{}", item.category.as_str()),
-        format!("area/{}", area_for(item)),
-        "sev/annoyance".to_string(),
-        "source/agent-filed".to_string(),
-    ]
+    classify_labels(item, Severity::Annoyance, FeedbackSource::AgentFiled)
 }
 
 /// The owning surface for a feedback item.
-fn area_for(item: &FeedbackItem) -> String {
+pub(crate) fn area_for(item: &FeedbackItem) -> String {
     if item.category == FeedbackCategory::TemplateGap
         && let Some(name) = &item.template_name
         && !name.trim().is_empty()

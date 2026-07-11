@@ -375,6 +375,7 @@ impl RuntimeBuilder {
             repo: crate::feedback::DEFAULT_REPO.to_string(),
             consent,
             limiter: RateLimiter::default(),
+            quality: crate::feedback::QualityLedger::default(),
         });
 
         // Probe OpenHuman once; an unreachable daemon degrades, never fails.
@@ -706,9 +707,39 @@ fn select_hosted_or_echo(
             )),
             None => build_networked_brain(credential, api_url, id, tool_catalog),
         },
-        // No credential (degraded) or sidecar mode (a later phase): offline echo.
+        // Sidecar mode routes to the local sidecar brain under the `sidecar`
+        // feature, degrading to echo when no sidecar process is configured.
+        (BrainMode::Sidecar, _) => build_sidecar_brain(id, tool_catalog),
+        // No credential in hosted mode: offline echo.
         _ => Arc::new(EchoBrain::new()),
     }
+}
+
+/// Builds the local-sidecar brain over the stdio transport with a host-bound
+/// inference client.
+///
+/// The offline end-to-end test injects a fully mocked [`SidecarBrain`] through
+/// [`RuntimeBuilder::with_brain`], so this path only needs to serve a real
+/// deployment. Because no sidecar process endpoint is configured today, it
+/// degrades to the offline echo brain with a warning — mirroring
+/// [`build_networked_brain`]'s degrade-to-echo behavior. Rebuild with
+/// `--features sidecar` and inject a configured transport to drive a real
+/// sidecar.
+#[cfg(feature = "sidecar")]
+fn build_sidecar_brain(id: &CompanyId, _tool_catalog: Vec<ToolManifestEntry>) -> Arc<dyn Brain> {
+    tracing::warn!(
+        company = %id,
+        "sidecar brain requires a configured sidecar process; using the offline echo brain"
+    );
+    Arc::new(EchoBrain::new())
+}
+
+/// Default build: the sidecar brain is not linked, so sidecar mode degrades to
+/// the offline echo brain. Rebuild with `--features sidecar` for the sidecar
+/// brain.
+#[cfg(not(feature = "sidecar"))]
+fn build_sidecar_brain(_id: &CompanyId, _tool_catalog: Vec<ToolManifestEntry>) -> Arc<dyn Brain> {
+    Arc::new(EchoBrain::new())
 }
 
 /// Builds the hosted brain over the networked `HttpSocketTransport`.

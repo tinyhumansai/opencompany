@@ -1,0 +1,77 @@
+# Agent roster for the Signals + Opportunity Engine harness.
+#
+# Signals and the Opportunity Engine are NOT kernel code. They are realized
+# here — over the existing OpenCompany ports — as a roster plus a charter plus
+# schedules:
+#
+#   * ingress  → channels (operator/email) and the POST /hooks/{company}/{channel}
+#                webhook path carry raw signals into the company
+#   * memory   → the runtime's MemoryStore/ContextStore hold the signal corpus
+#   * reasoning → the brain clusters pain, ranks opportunities, drafts the digest
+#   * cadence  → [[schedule]] entries drive the weekly scan/rank/report loop
+#
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Signals + Opportunity Studio"
+output = "A ranked weekly opportunity brief the operator can act on"
+human_role = "Deciding which opportunities to fund and pursue"
+handle = "signalstudio"
+
+[[agent]]
+id = "signal_scout"
+role = "Signal Scout"
+description = "Continuously gather raw market signals from web, forums, and inbound channels."
+tier = "subconscious"
+tools = ["web.*"]
+budget_usd_daily = 5.0
+
+[[agent]]
+id = "opportunity_analyst"
+role = "Opportunity Analyst"
+description = "Cluster signals into pains and rank the resulting opportunities by evidence and size."
+tier = "reasoning"
+tools = ["web.*", "docs.*"]
+budget_usd_daily = 8.0
+
+[[agent]]
+id = "research_agent"
+role = "Research Agent"
+description = "Deep-dive the top opportunities and compile the operator's weekly brief."
+tier = "reasoning"
+tools = ["web.*", "docs.*"]
+budget_usd_daily = 8.0
+
+[brain]
+mode = "hosted"
+max_passes = 12
+
+[tools]
+allow = ["web.*", "docs.*"]
+
+[channels.operator]
+enabled = true
+
+[channels.email]
+enabled = true
+
+[policy]
+mode = "supervised"
+always_approve = ["payment.send", "filing.submit", "external.publish"]
+auto_approve_under_usd = 1.0
+
+[place]
+discoverable = false
+skills = [
+  { id = "opportunity.brief", price_usd = "49.00", description = "A ranked, evidence-backed weekly opportunity brief for a chosen market." },
+]
+
+[budget]
+monthly_usd = 200.0
+
+# Weekly loop: scan fresh signals, cluster them into pains, rank opportunities,
+# and deliver the digest to the operator. Monday 06:00.
+[[schedule]]
+cron = "0 6 * * 1"
+prompt = "Scan this week's signals, cluster them into pains, rank the top opportunities, and send the operator a ranked brief."

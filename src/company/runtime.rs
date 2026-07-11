@@ -210,6 +210,10 @@ impl CompanyRuntime {
             &self.id,
             manifest.as_ref(),
             &item,
+            // The `POST .../feedback` route is operator-driven; default to an
+            // annoyance-severity operator filing.
+            crate::feedback::Severity::Annoyance,
+            crate::feedback::FeedbackSource::Operator,
             preview,
         )
         .await

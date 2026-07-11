@@ -435,6 +435,50 @@ mod tests {
     }
 
     #[test]
+    fn signals_opportunity_studio_template_passes_lint() {
+        // The Signals + Opportunity Engine ship as a venture-studio template,
+        // not kernel code. This guards that the shipped manifest keeps passing
+        // the same lint `opencompany check` runs — unique agent ids, priced +
+        // described `[place].skills`, a `[policy]`, and a stated `human_role`.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/signals_opportunity_studio/agents.toml");
+        let manifest = CompanyManifest::from_file(&path).expect("template manifest is valid");
+
+        assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+        assert!(
+            manifest.company.human_role.is_some(),
+            "the template must name what the human keeps"
+        );
+        // Unique agent ids.
+        let mut ids: Vec<&str> = manifest.agents.iter().map(|a| a.id.as_str()).collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique, "agent ids must be unique");
+        // Every advertised skill is priced and described.
+        assert!(!manifest.place.skills.is_empty());
+        for skill in &manifest.place.skills {
+            assert!(
+                parse_usd(&skill.price_usd).is_some(),
+                "skill must be priced"
+            );
+            assert!(
+                skill
+                    .description
+                    .as_deref()
+                    .is_some_and(|d| !d.trim().is_empty()),
+                "skill `{}` must be described",
+                skill.id
+            );
+        }
+        // A supervised policy with a defined always-approve fence.
+        assert_eq!(manifest.policy.mode, "supervised");
+        assert!(!manifest.policy.always_approve.is_empty());
+        // The weekly opportunity loop is a schedule.
+        assert!(!manifest.schedules.is_empty());
+    }
+
+    #[test]
     fn discover_prefers_company_toml() {
         let dir = std::env::temp_dir().join(format!("oc-discover-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

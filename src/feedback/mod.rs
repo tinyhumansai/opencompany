@@ -18,16 +18,21 @@ pub mod scrub;
 pub mod service;
 pub mod store;
 pub mod tool;
+pub mod triage;
 pub mod types;
 
 pub use github::{
-    FilingOutcome, GitHubClient, IssueDraft, MockGitHubClient, RateLimiter, file_feedback,
-    manual_issue_url, sign_body,
+    ExistingIssue, FilingOutcome, GitHubClient, IssueDraft, MockGitHubClient, RateLimiter,
+    file_feedback, manual_issue_url, sign_body,
 };
 pub use scrub::{CharterTerm, ScrubOutcome, scrub};
 pub use service::{FeedbackFiler, FeedbackResponse};
 pub use store::FeedbackStore;
 pub use tool::BuiltinToolProvider;
+pub use triage::{
+    ClusterPlan, DedupePlan, EscalationPlan, FeedbackSource, QualityLedger, Severity, TriageAgent,
+    classify_labels, cluster_plans, escalation_for, map_fixed_issues, process_bug_check,
+};
 pub use types::{ConsentMode, FeedbackCategory, FeedbackInput, FeedbackItem, detect_chat_intent};
 
 #[cfg(feature = "github")]

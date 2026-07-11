@@ -15,6 +15,7 @@
 //! The networked `HttpSocketTransport` lands in a later batch behind an
 //! optional feature; nothing here pulls a network dependency.
 
+pub(crate) mod effects;
 #[cfg(feature = "medulla")]
 pub mod http;
 pub mod mock;

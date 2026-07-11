@@ -19,6 +19,14 @@ pub mod paths;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+/// TinyCortex-backed memory and context ports over a mockable client. TinyCortex
+/// is not checked out here, so the compiled backend is an offline in-memory
+/// client; a real HTTP client (inert until the service is reachable through the
+/// OpenHuman seam) is present behind the same feature. Only links under
+/// `tinycortex`.
+#[cfg(feature = "tinycortex")]
+pub mod tinycortex;
+
 /// A backend-agnostic port-conformance suite: async assertions parameterized
 /// over any [`CompanyStore`](crate::ports::CompanyStore) /
 /// [`EventLog`](crate::ports::EventLog) /
@@ -35,6 +43,11 @@ pub use paths::{Bundle, default_home};
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
+
+#[cfg(feature = "tinycortex")]
+pub use tinycortex::{
+    CortexClient, CortexContextStore, CortexMemoryStore, HttpCortexClient, InMemoryCortex,
+};
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 

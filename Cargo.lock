@@ -1874,6 +1874,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "signals-opportunity-studio"
+version = "0.1.0"
+dependencies = [
+ "opencompany",
+]
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

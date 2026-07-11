@@ -41,6 +41,13 @@ configuration.
 | [`agentic_accounting_firm`](agentic_accounting_firm/) | Books, taxes, forecasts | Sign-off on filings |
 | [`agentic_law_firm`](agentic_law_firm/) | Drafts, research, discovery | Approving filings |
 | [`agentic_pharma_startup`](agentic_pharma_startup/) | Candidate molecules & trial plans | Laboratory work |
+| [`signals_opportunity_studio`](signals_opportunity_studio/) | A ranked weekly opportunity brief | Which opportunities to fund |
+
+Signals and the Opportunity Engine ship as the
+[`signals_opportunity_studio`](signals_opportunity_studio/) **template, not
+kernel code**: a roster, a charter, and a weekly `[[schedule]]` over the
+existing channels, memory/context, and brain ports. There is no Signals
+subsystem in `src/`.
 
 ## Running a harness
 

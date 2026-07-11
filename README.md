@@ -68,8 +68,14 @@ where a human signs off:
 | **[Accounting Firm](examples/agentic_accounting_firm/)** | Bookkeeping, tax, payroll, forecasting, audit prep | Signing the filings |
 | **[Law Firm](examples/agentic_law_firm/)** | Research, drafting, litigation support, discovery, compliance | Approving filings |
 | **[Pharma Startup](examples/agentic_pharma_startup/)** | Literature, molecule discovery, simulation, trial planning | The lab work |
+| **[Signals + Opportunity Studio](examples/signals_opportunity_studio/)** | Scouting signals, clustering pains, ranking opportunities into a weekly brief | Which opportunities to fund |
 
-Eighteen companies. One operator. Pick one and run it — or run several at once.
+Nineteen companies. One operator. Pick one and run it — or run several at once.
+
+**Signals and the Opportunity Engine are a template, not kernel code.** The
+[Signals + Opportunity Studio](examples/signals_opportunity_studio/) realizes
+them as a roster, a charter, and a weekly `[[schedule]]` over the existing
+channel, memory, and brain ports — nothing new in the runtime.
 
 ## Why it works
 

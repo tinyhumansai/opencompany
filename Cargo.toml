@@ -104,6 +104,21 @@ platform-jwt = ["dep:jsonwebtoken"]
 # plus SecretStore) sharing one bundled connection. The fs stores and the
 # port-conformance suite compile without this; only `SqliteStore` is gated here.
 sqlite = ["dep:rusqlite"]
+# TinyCortex-backed MemoryStore + ContextStore over a mockable CortexClient.
+# TinyCortex itself is not vendored, so this feature adds no dependency: the
+# compiled backend is an offline in-memory client and the real HTTP client is
+# inert until the service is reachable through the OpenHuman seam. The fs stores
+# and the port-conformance suite compile without this.
+tinycortex = []
+# Node sidecar brain for self-hosters (bring-your-own-inference). Adds
+# `SidecarBrain`, which speaks the same `/orchestration/v1` wire frames as the
+# hosted brain but against a local sidecar process, with inference routed back
+# into the Rust host through an `InferenceClient`. Process launch uses the
+# already-enabled tokio `process` feature and real inference rides the existing
+# `tiny` feature, so this flag adds no dependency. The whole brain, its mocks,
+# and the offline end-to-end test are gated here; the default build links none
+# of it and the builder routes `sidecar` mode to the echo brain.
+sidecar = []
 # Single-file `.tar` bundle packing for `opencompany export`/`import`. The
 # port-driven export/import core (unpacked bundle directory) compiles without
 # this; only `pack_tar`/`unpack_tar` are gated here.
