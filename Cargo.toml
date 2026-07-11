@@ -1,13 +1,34 @@
-[package]
-name = "opencompany"
+[workspace]
+members = ["examples/*"]
+# Keep the default build small: a bare `cargo build` compiles only the host.
+# Build the harnesses explicitly with `cargo build --workspace` or `-p <name>`.
+default-members = ["."]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Company operating system scaffold built on OpenHuman and TinyHumans Rust modules."
 repository = "https://github.com/tinyhumansai/opencompany"
+
+# Shared dependency each example harness inherits from the parent crate.
+[workspace.dependencies]
+opencompany = { path = "." }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[package]
+name = "opencompany"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Company operating system scaffold built on OpenHuman and TinyHumans Rust modules."
 readme = "README.md"
 keywords = ["company", "agents", "openhuman", "tinyagents", "axum"]
 categories = ["web-programming", "asynchronous"]
+# Each example is a standalone workspace member crate, not a bare-file example
+# target of the host crate.
+autoexamples = false
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
