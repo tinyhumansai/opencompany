@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 
 use crate::app::config::{BrainMode, redacted};
-use crate::ports::types::SecretValue;
+use crate::ports::types::{CompanyId, SecretValue};
 use crate::runtime::CompanyRegistry;
+use crate::server::platform_auth::PlatformAuthConfig;
+use crate::server::webhook::WebhookConfig;
 use crate::{VERSION, tiny::RuntimeModuleStatus};
 
 /// Runtime configuration for OpenCompany.
@@ -31,6 +35,16 @@ pub struct AppConfig {
     pub public_url: Option<String>,
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
     pub tinyhumans_credential: Option<SecretValue>,
+    /// Platform (multi-tenant) auth. When set, `{id}` routes honor tenant scopes
+    /// and provisioning/suspension require the `platform` scope. When `None`, the
+    /// prosumer `operator_token` path is used.
+    pub platform_auth: Option<PlatformAuthConfig>,
+    /// Global cap on the number of provisioned companies. `None` = unlimited.
+    pub max_companies: Option<usize>,
+    /// Per-tenant cap on provisioned companies. `None` = unlimited.
+    pub max_companies_per_tenant: Option<usize>,
+    /// Outbound webhook delivery configuration. `None` disables webhooks.
+    pub webhook: Option<WebhookConfig>,
 }
 
 impl Default for AppConfig {
@@ -44,6 +58,10 @@ impl Default for AppConfig {
             tinyplace_api_url: crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string(),
             public_url: None,
             tinyhumans_credential: None,
+            platform_auth: None,
+            max_companies: None,
+            max_companies_per_tenant: None,
+            webhook: None,
         }
     }
 }
@@ -81,6 +99,10 @@ impl std::fmt::Debug for AppConfig {
                 "tinyhumans_credential",
                 &redacted(&self.tinyhumans_credential),
             )
+            .field("platform_auth", &self.platform_auth)
+            .field("max_companies", &self.max_companies)
+            .field("max_companies_per_tenant", &self.max_companies_per_tenant)
+            .field("webhook", &self.webhook)
             .finish()
     }
 }
@@ -93,6 +115,12 @@ pub struct AppState {
     /// OpenCompany home root holding company bundles. Used by the tiny.place
     /// A2A inbound routes to resolve a company's Ed25519 identity.
     home: std::path::PathBuf,
+    /// Company → owning-tenant map, populated when a company is provisioned in
+    /// platform mode. Drives per-tenant quotas and cross-tenant isolation.
+    ///
+    /// Batch-1 durability is a documented stub: this map is in-memory and resets
+    /// on restart until a durable `tenant_id` slot exists on the company record.
+    ownership: Arc<RwLock<HashMap<CompanyId, String>>>,
     /// Host-global replay-protection cache shared across every inbound A2A
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
@@ -106,6 +134,7 @@ impl AppState {
             config,
             registry: CompanyRegistry::new(),
             home: std::path::PathBuf::from("."),
+            ownership: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
@@ -115,6 +144,69 @@ impl AppState {
     pub fn with_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
         self.home = home.into();
         self
+    }
+
+    /// Installs platform (multi-tenant) auth. Mirrors [`Self::with_home`].
+    pub fn with_platform_auth(mut self, platform_auth: PlatformAuthConfig) -> Self {
+        self.config.platform_auth = Some(platform_auth);
+        self
+    }
+
+    /// Installs an outbound webhook sink configuration.
+    pub fn with_webhook(mut self, webhook: WebhookConfig) -> Self {
+        self.config.webhook = Some(webhook);
+        self
+    }
+
+    /// Sets provisioning quotas: a global cap and a per-tenant cap.
+    pub fn with_quota(
+        mut self,
+        max_companies: Option<usize>,
+        max_companies_per_tenant: Option<usize>,
+    ) -> Self {
+        self.config.max_companies = max_companies;
+        self.config.max_companies_per_tenant = max_companies_per_tenant;
+        self
+    }
+
+    /// The tenant that owns `id`, if it was provisioned in platform mode.
+    pub fn owner_of(&self, id: &CompanyId) -> Option<String> {
+        self.ownership
+            .read()
+            .expect("ownership poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    /// Records that `tenant` owns `id`.
+    pub fn set_owner(&self, id: CompanyId, tenant: impl Into<String>) {
+        self.ownership
+            .write()
+            .expect("ownership poisoned")
+            .insert(id, tenant.into());
+    }
+
+    /// Forgets the ownership record for `id` (used by archive).
+    pub fn remove_owner(&self, id: &CompanyId) {
+        self.ownership
+            .write()
+            .expect("ownership poisoned")
+            .remove(id);
+    }
+
+    /// The number of companies owned by `tenant`.
+    pub fn tenant_company_count(&self, tenant: &str) -> usize {
+        self.ownership
+            .read()
+            .expect("ownership poisoned")
+            .values()
+            .filter(|owner| owner.as_str() == tenant)
+            .count()
+    }
+
+    /// The configured webhook delivery, if any.
+    pub fn webhook(&self) -> Option<&WebhookConfig> {
+        self.config.webhook.as_ref()
     }
 
     /// Returns runtime configuration.

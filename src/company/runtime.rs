@@ -230,6 +230,35 @@ impl CompanyRuntime {
         })
     }
 
+    /// Transitions the company's lifecycle to `to`, persisting the new state and
+    /// appending a [`CompanyEvent::LifecycleChanged`] audit event stamped with
+    /// the acting `by` actor. Returns the previous lifecycle string.
+    ///
+    /// Powers the platform pause/resume/suspend/archive controls. A company with
+    /// no durable record yet is a [`OpenCompanyError::CompanyNotFound`].
+    pub async fn set_lifecycle(&self, to: impl Into<String>, by: Actor) -> Result<String> {
+        let to = to.into();
+        let mut record = self
+            .store
+            .load(&self.id)
+            .await?
+            .ok_or_else(|| OpenCompanyError::CompanyNotFound(self.id.to_string()))?;
+        let from = record.lifecycle.clone();
+        record.lifecycle = to.clone();
+        self.store.save(&record).await?;
+        self.events
+            .append(
+                &self.id,
+                CompanyEvent::LifecycleChanged {
+                    from: from.clone(),
+                    to,
+                    by,
+                },
+            )
+            .await?;
+        Ok(from)
+    }
+
     /// Rejects operation on a company that is not accepting work.
     ///
     /// Returns [`OpenCompanyError::LifecycleConflict`] when the loaded record's

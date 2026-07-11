@@ -49,6 +49,24 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # default build links no network crates.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
+# Real HMAC-SHA256 webhook signing. Pure-Rust, no system libs, no network beyond
+# the shared `reqwest` client used by `HttpWebhookSink`.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# Real signed per-tenant JWT verification for platform auth.
+jsonwebtoken = { version = "9", optional = true }
+
+# SQLite-backed implementations of the storage ports. The `bundled` feature
+# vendors SQLite into the build, so no system libsqlite3 is required and the
+# compile stays fully offline. Only links under the `sqlite` feature.
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+
+# Single-file `.tar` packing/unpacking for `opencompany export`/`import`. Pure
+# Rust, no system libs, no network. Only links under the `export` feature; the
+# port-driven bundle core works on an unpacked directory without it.
+tar = { version = "0.4", optional = true }
+
 # Offline crypto for the tiny.place economy identity. All three are optional and
 # only link under the `tinyplace` feature; the default build pulls none of them.
 # `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
@@ -74,6 +92,22 @@ medulla = ["dep:reqwest"]
 # and (in later batches) the HTTP transport. Card projection + wire types stay
 # in the default build; only crypto and the networked client are gated here.
 tinyplace = ["dep:reqwest", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core"]
+# Real HTTP POST webhook delivery + HMAC-SHA256 signing. The `WebhookSink` trait,
+# the offline `RecordingWebhookSink`, and the deterministic default signer
+# compile without this; only `HttpWebhookSink`/`HmacSha256Signer` are gated here.
+webhooks = ["dep:reqwest", "dep:hmac", "dep:sha2"]
+# Real signed per-tenant JWT verification. The `PlatformVerifier` trait and the
+# offline `StaticPlatformVerifier` compile without this; only the JWT verifier is
+# gated behind it.
+platform-jwt = ["dep:jsonwebtoken"]
+# SQLite-backed storage ports (CompanyStore/EventLog/MemoryStore/ContextStore
+# plus SecretStore) sharing one bundled connection. The fs stores and the
+# port-conformance suite compile without this; only `SqliteStore` is gated here.
+sqlite = ["dep:rusqlite"]
+# Single-file `.tar` bundle packing for `opencompany export`/`import`. The
+# port-driven export/import core (unpacked bundle directory) compiles without
+# this; only `pack_tar`/`unpack_tar` are gated here.
+export = ["dep:tar"]
 
 [patch.crates-io]
 tinyagents = { path = "vendor/tinyagents" }

@@ -69,6 +69,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export a company's bundle: read everything through the storage ports and
+    /// write the canonical filesystem layout. With `--features export` the output
+    /// is a single `.tar`; otherwise an unpacked bundle directory. Secrets and
+    /// keys are excluded unless `--include-secrets` is set.
+    Export {
+        /// Company id (slug) to export.
+        company: String,
+        /// Output path (`<slug>.tar` under `--features export`, else a bundle
+        /// directory). Defaults to the current directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Include the fs-only `secrets/` and `keys/` directories.
+        #[arg(long)]
+        include_secrets: bool,
+        /// OpenCompany home holding company bundles. Defaults to
+        /// `$HOME/.opencompany/companies`.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
+    /// Import a company bundle (a `.tar` under `--features export`, else an
+    /// unpacked bundle directory) into a home through the storage ports.
+    Import {
+        /// Bundle `.tar` or unpacked bundle directory to import.
+        path: PathBuf,
+        /// OpenCompany home to import into. Defaults to
+        /// `$HOME/.opencompany/companies`.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
     /// Launch a sibling OpenHuman checkout through cargo.
     OpenHuman {
         /// OpenHuman checkout path.
@@ -199,6 +228,179 @@ fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
     }
 }
 
+/// Parses a non-empty `usize` environment variable, ignoring unset/empty/invalid
+/// values (an invalid value logs a warning and is treated as unset).
+fn env_usize(key: &str) -> Option<usize> {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => match value.trim().parse::<usize>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                eprintln!("ignoring {key}=`{value}`: expected a non-negative integer");
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Default build: outbound webhooks require the `webhooks` feature; without it a
+/// configured URL is warned and dropped.
+#[cfg(not(feature = "webhooks"))]
+fn webhook_config(_url: String) -> Option<opencompany::server::webhook::WebhookConfig> {
+    eprintln!(
+        "OPENCOMPANY_WEBHOOK_URL is set but the `webhooks` feature is not built; webhooks disabled"
+    );
+    None
+}
+
+/// Feature build: post to the configured URL with an HMAC-SHA256 signature.
+#[cfg(feature = "webhooks")]
+fn webhook_config(url: String) -> Option<opencompany::server::webhook::WebhookConfig> {
+    use opencompany::server::webhook::{HmacSha256Signer, HttpWebhookSink, WebhookConfig};
+    let secret = std::env::var("OPENCOMPANY_WEBHOOK_SECRET").unwrap_or_default();
+    Some(WebhookConfig {
+        sink: Arc::new(HttpWebhookSink::new(url)),
+        signer: Arc::new(HmacSha256Signer),
+        secret,
+    })
+}
+
+/// Builds the four fs storage ports over `home` as trait objects.
+fn fs_ports(home: &std::path::Path) -> opencompany::store::export::Ports {
+    use opencompany::store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore};
+    (
+        Arc::new(FsCompanyStore::new(home.to_path_buf())),
+        Arc::new(FsEventLog::new(home.to_path_buf())),
+        Arc::new(FsMemoryStore::new(home.to_path_buf())),
+        Arc::new(FsContextStore::new(home.to_path_buf())),
+    )
+}
+
+/// A process-unique temporary path under the system temp dir. Used only by the
+/// `.tar` staging paths, which are compiled under the `export` feature.
+#[cfg(feature = "export")]
+fn unique_temp(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("opencompany-{tag}-{}-{nanos}", std::process::id()))
+}
+
+/// Exports `id`'s bundle over the fs ports into the directory `dest`.
+async fn export_to_dir(
+    home: &std::path::Path,
+    id: &CompanyId,
+    include_secrets: bool,
+    dest: &std::path::Path,
+) -> Result<()> {
+    use opencompany::store::export::{ExportOpts, export_bundle};
+    use opencompany::store::paths::Bundle;
+
+    let (store, events, memory, context) = fs_ports(home);
+    let opts = ExportOpts {
+        include_secrets,
+        fs_bundle: Some(Bundle::new(home.to_path_buf(), id).dir().to_path_buf()),
+    };
+    export_bundle(id, dest, store, events, memory, context, opts).await
+}
+
+/// Default build: export writes an unpacked bundle directory (no `.tar` support
+/// without the `export` feature).
+#[cfg(not(feature = "export"))]
+async fn run_export(
+    company: String,
+    out: Option<PathBuf>,
+    include_secrets: bool,
+    home: Option<PathBuf>,
+) -> Result<()> {
+    let home = home.unwrap_or_else(default_home);
+    let id = CompanyId::new(company);
+    let dest = out.unwrap_or_else(|| PathBuf::from(format!("{}-bundle", id.as_ref())));
+    export_to_dir(&home, &id, include_secrets, &dest).await?;
+    println!(
+        "exported bundle for `{id}` to {} (build with --features export to produce a .tar)",
+        dest.display()
+    );
+    Ok(())
+}
+
+/// Feature build: export writes a single-file `.tar`.
+#[cfg(feature = "export")]
+async fn run_export(
+    company: String,
+    out: Option<PathBuf>,
+    include_secrets: bool,
+    home: Option<PathBuf>,
+) -> Result<()> {
+    use opencompany::store::export::pack_tar;
+
+    let home = home.unwrap_or_else(default_home);
+    let id = CompanyId::new(company);
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("{}.tar", id.as_ref())));
+
+    // Stage the unpacked bundle under a slug-named dir so the tar nests cleanly.
+    let staging = unique_temp("export");
+    let bundle_dir = staging.join(id.as_ref());
+    let result = async {
+        export_to_dir(&home, &id, include_secrets, &bundle_dir).await?;
+        pack_tar(&bundle_dir, &out)
+    }
+    .await;
+    tokio::fs::remove_dir_all(&staging).await.ok();
+    result?;
+    println!("exported bundle for `{id}` to {}", out.display());
+    Ok(())
+}
+
+/// Default build: import reads an unpacked bundle directory (no `.tar` support
+/// without the `export` feature).
+#[cfg(not(feature = "export"))]
+async fn run_import(path: PathBuf, home: Option<PathBuf>) -> Result<()> {
+    use opencompany::OpenCompanyError;
+
+    if !path.is_dir() {
+        return Err(OpenCompanyError::InvalidRequest(format!(
+            "{} is not a directory; rebuild with --features export to import a .tar",
+            path.display()
+        )));
+    }
+    import_from_dir(&path, home).await
+}
+
+/// Feature build: import a `.tar` (unpacked to a temp dir first) or a directory.
+#[cfg(feature = "export")]
+async fn run_import(path: PathBuf, home: Option<PathBuf>) -> Result<()> {
+    use opencompany::store::export::unpack_tar;
+
+    if path.is_dir() {
+        return import_from_dir(&path, home).await;
+    }
+    let staging = unique_temp("import");
+    let result = async {
+        unpack_tar(&path, &staging)?;
+        import_from_dir(&staging, home.clone()).await
+    }
+    .await;
+    tokio::fs::remove_dir_all(&staging).await.ok();
+    result
+}
+
+/// Imports the bundle rooted under `dir` into `home` through the fs ports,
+/// restoring any fs-only secrets/keys the bundle carried.
+async fn import_from_dir(dir: &std::path::Path, home: Option<PathBuf>) -> Result<()> {
+    use opencompany::store::export::{find_bundle_root, import_bundle, restore_fs_artifacts};
+    use opencompany::store::paths::Bundle;
+
+    let home = home.unwrap_or_else(default_home);
+    let root = find_bundle_root(dir)?;
+    let (store, events, memory, context) = fs_ports(&home);
+    let id = import_bundle(&root, store, events, memory, context).await?;
+    restore_fs_artifacts(&root, Bundle::new(home.clone(), &id).dir()).await?;
+    println!("imported company `{id}` into {}", home.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -224,14 +426,41 @@ async fn main() -> Result<()> {
             let public_url = std::env::var("OPENCOMPANY_PUBLIC_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
-            let state = AppState::new(AppConfig {
+            let mut state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
                 tinyplace_api_url,
                 public_url,
                 ..AppConfig::default()
             })
-            .with_home(home.clone());
+            .with_home(home.clone())
+            .with_quota(
+                env_usize("OPENCOMPANY_MAX_COMPANIES"),
+                env_usize("OPENCOMPANY_MAX_COMPANIES_PER_TENANT"),
+            );
+            // Platform (multi-tenant) auth: a shared platform token enables the
+            // provisioning/lifecycle surface. Without it the prosumer operator
+            // path stays in force. Real signed JWT is `platform-jwt`.
+            if let Some(token) = std::env::var("OPENCOMPANY_PLATFORM_TOKEN")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+            {
+                use opencompany::server::platform_auth::{
+                    PlatformAuthConfig, StaticPlatformVerifier,
+                };
+                state = state.with_platform_auth(PlatformAuthConfig::new(Arc::new(
+                    StaticPlatformVerifier::new(token),
+                )));
+            }
+            // Outbound webhooks: a URL wires the HTTP sink under `webhooks`;
+            // without the feature the request is warned and dropped.
+            if let Some(url) = std::env::var("OPENCOMPANY_WEBHOOK_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                && let Some(webhook) = webhook_config(url)
+            {
+                state = state.with_webhook(webhook);
+            }
             // Schedulers stop cleanly when this is notified (Ctrl-C below).
             let shutdown = Arc::new(Notify::new());
             let mut scheduler_handles = Vec::new();
@@ -315,6 +544,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Export {
+            company,
+            out,
+            include_secrets,
+            home,
+        }) => run_export(company, out, include_secrets, home).await,
+        Some(Command::Import { path, home }) => run_import(path, home).await,
         Some(Command::OpenHuman {
             root,
             mode,

@@ -253,6 +253,16 @@ pub enum CompanyEvent {
         /// A memo describing the payment.
         memo: String,
     },
+    /// The company's lifecycle state changed (e.g. `running` → `paused`),
+    /// recorded with the acting actor for the audit trail.
+    LifecycleChanged {
+        /// The previous lifecycle state.
+        from: String,
+        /// The new lifecycle state.
+        to: String,
+        /// Who performed the transition.
+        by: Actor,
+    },
 }
 
 /// A `CompanyEvent` durably appended to the log with its sequence and time.

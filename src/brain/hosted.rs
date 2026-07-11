@@ -373,6 +373,12 @@ fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("received ${amount_usd}: {memo}"),
             "payment.received",
         ),
+        CompanyEvent::LifecycleChanged { from, to, by } => (
+            Role::System,
+            by.id.clone(),
+            format!("Lifecycle changed from {from} to {to}"),
+            "lifecycle.changed",
+        ),
     };
     WireEvent {
         seq,

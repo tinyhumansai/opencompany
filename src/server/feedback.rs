@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -22,6 +23,7 @@ use crate::feedback::types::FeedbackInput;
 use crate::ports::types::CompanyId;
 use crate::server::error::ApiError;
 use crate::server::operator::OperatorAuth;
+use crate::server::platform_auth::{PlatformOrOperatorAuth, authorize_address};
 
 /// Builds the feedback route fragment, merged into the main router.
 pub fn router() -> Router<AppState> {
@@ -66,13 +68,24 @@ async fn run(
 }
 
 /// `POST /api/v1/companies/{id}/feedback`.
+///
+/// A per-company route: like every other `/companies/{id}/…` handler it takes
+/// platform-or-operator auth and enforces tenant ownership, so one tenant can
+/// never file feedback (or trigger issue-filing) against another's company.
 async fn submit(
-    _auth: OperatorAuth,
+    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<FeedbackRequest>,
-) -> Result<Json<FeedbackResponse>, ApiError> {
-    run(lookup(&state, &id)?, body).await
+) -> Result<Json<FeedbackResponse>, Response> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &claims, &company) {
+        return Err(resp);
+    }
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    run(runtime, body)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 /// `POST /api/v1/company/feedback` (single-company alias).

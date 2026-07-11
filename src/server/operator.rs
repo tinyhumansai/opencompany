@@ -31,8 +31,10 @@ use crate::error::OpenCompanyError;
 use crate::ports::types::{
     Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, Verdict,
 };
-use crate::runtime::types::{ApprovalSummary, CompanyStatus};
+use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::error::ApiError;
+use crate::server::platform_auth::{PlatformOrOperatorAuth, authorize_address};
+use crate::server::provision::{emit_cycle_webhooks, emit_feedback_webhook};
 
 /// Builds the operator route fragment, merged into the main router.
 pub fn router() -> Router<AppState> {
@@ -100,12 +102,26 @@ fn sole(state: &AppState) -> Result<Arc<CompanyRuntime>, ApiError> {
 }
 
 /// `GET /api/v1/companies` — status of every registered company.
+///
+/// In platform mode a tenant token without the `platform` scope sees only the
+/// companies it owns; a platform-scope token (and the prosumer operator) sees
+/// all of them.
 async fn list_companies(
-    _auth: OperatorAuth,
+    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CompanyStatus>>, ApiError> {
+    // A scoped tenant is confined to the companies it owns.
+    let tenant_filter = claims
+        .as_ref()
+        .filter(|c| !c.has_platform_scope())
+        .map(|c| c.tenant.clone());
     let mut out = Vec::new();
     for id in state.registry().list() {
+        if let Some(tenant) = &tenant_filter
+            && state.owner_of(&id).as_deref() != Some(tenant.as_str())
+        {
+            continue;
+        }
         if let Some(runtime) = state.registry().get(&id) {
             out.push(runtime.status().await?);
         }
@@ -115,12 +131,20 @@ async fn list_companies(
 
 /// `GET /api/v1/companies/{id}` — one company's status.
 async fn company_status(
-    _auth: OperatorAuth,
+    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<CompanyStatus>, ApiError> {
-    let runtime = lookup(&state, &id)?;
-    Ok(Json(runtime.status().await?))
+) -> Result<Json<CompanyStatus>, Response> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &claims, &company) {
+        return Err(resp);
+    }
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    runtime
+        .status()
+        .await
+        .map(Json)
+        .map_err(|e| ApiError(e).into_response())
 }
 
 /// The operator's chat request body.
@@ -137,15 +161,18 @@ struct ChatResponse {
     responses: Vec<OutboundMessage>,
 }
 
+/// Runs one operator-chat cycle, returning the report and, when a complaint
+/// intent captured feedback, the note that was captured (so the caller can emit
+/// the `feedback.created` webhook).
 async fn run_chat(
     runtime: Arc<CompanyRuntime>,
     message: ChatMessage,
-) -> Result<Json<ChatResponse>, ApiError> {
+) -> Result<(CycleReport, Option<String>), ApiError> {
     runtime.ensure_running().await?;
     // Operator-chat feedback intent: a complaint phrase ("that was wrong — flag
     // it") captures a feedback item alongside the normal cycle. Neutral chat
     // carries no intent, so ordinary messages are untouched.
-    if let Some(category) = crate::feedback::detect_chat_intent(&message.text) {
+    let feedback_note = if let Some(category) = crate::feedback::detect_chat_intent(&message.text) {
         runtime
             .capture_feedback(crate::feedback::FeedbackInput {
                 category,
@@ -155,10 +182,28 @@ async fn run_chat(
                 template_version: None,
             })
             .await?;
-    }
+        Some(message.text.clone())
+    } else {
+        None
+    };
     let report = runtime
         .run_cycle(vec![CompanyEvent::OperatorMessage { text: message.text }])
         .await?;
+    Ok((report, feedback_note))
+}
+
+/// Runs a chat cycle and emits any implied webhooks, rendering the responses.
+async fn chat_and_emit(
+    state: &AppState,
+    id: &CompanyId,
+    runtime: Arc<CompanyRuntime>,
+    message: ChatMessage,
+) -> Result<Json<ChatResponse>, ApiError> {
+    let (report, feedback_note) = run_chat(runtime, message).await?;
+    emit_cycle_webhooks(state, id, &report).await;
+    if let Some(note) = feedback_note {
+        emit_feedback_webhook(state, id, &note).await;
+    }
     Ok(Json(ChatResponse {
         responses: report.responses,
     }))
@@ -166,12 +211,19 @@ async fn run_chat(
 
 /// `POST /api/v1/companies/{id}/chat`.
 async fn operator_chat(
-    _auth: OperatorAuth,
+    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(message): Json<ChatMessage>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    run_chat(lookup(&state, &id)?, message).await
+) -> Result<Json<ChatResponse>, Response> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &claims, &company) {
+        return Err(resp);
+    }
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    chat_and_emit(&state, &company, runtime, message)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 /// `POST /api/v1/company/chat` (single-company alias).
@@ -180,16 +232,23 @@ async fn operator_chat_single(
     State(state): State<AppState>,
     Json(message): Json<ChatMessage>,
 ) -> Result<Json<ChatResponse>, ApiError> {
-    run_chat(sole(&state)?, message).await
+    let runtime = sole(&state)?;
+    let id = runtime.id().clone();
+    chat_and_emit(&state, &id, runtime, message).await
 }
 
 /// `GET /api/v1/companies/{id}/approvals`.
 async fn list_approvals(
-    _auth: OperatorAuth,
+    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<ApprovalSummary>>, ApiError> {
-    Ok(Json(lookup(&state, &id)?.pending_approvals()))
+) -> Result<Json<Vec<ApprovalSummary>>, Response> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &claims, &company) {
+        return Err(resp);
+    }
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    Ok(Json(runtime.pending_approvals()))
 }
 
 /// `GET /api/v1/company/approvals` (single-company alias).
@@ -220,6 +279,8 @@ struct ResolveApproval {
 }
 
 async fn run_resolve(
+    state: &AppState,
+    company: &CompanyId,
     runtime: Arc<CompanyRuntime>,
     approval_id: String,
     body: ResolveApproval,
@@ -243,6 +304,7 @@ async fn run_resolve(
         }
         (verdict, None) => runtime.resolve_approval(&id, verdict, actor).await?,
     };
+    emit_cycle_webhooks(state, company, &report).await;
     Ok(Json(ChatResponse {
         responses: report.responses,
     }))
@@ -250,12 +312,19 @@ async fn run_resolve(
 
 /// `POST /api/v1/companies/{id}/approvals/{aid}`.
 async fn resolve_approval(
-    _auth: OperatorAuth,
+    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
     Json(body): Json<ResolveApproval>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    run_resolve(lookup(&state, &id)?, aid, body).await
+) -> Result<Json<ChatResponse>, Response> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &claims, &company) {
+        return Err(resp);
+    }
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    run_resolve(&state, &company, runtime, aid, body)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 /// `POST /api/v1/company/approvals/{aid}` (single-company alias).
@@ -265,7 +334,9 @@ async fn resolve_approval_single(
     Path(aid): Path<String>,
     Json(body): Json<ResolveApproval>,
 ) -> Result<Json<ChatResponse>, ApiError> {
-    run_resolve(sole(&state)?, aid, body).await
+    let runtime = sole(&state)?;
+    let id = runtime.id().clone();
+    run_resolve(&state, &id, runtime, aid, body).await
 }
 
 #[cfg(test)]
