@@ -48,6 +48,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 ## Reading Paths
 
 - **Product / UX**: [product/](product/README.md) →
+  [agentic/](agentic/README.md) →
   [company-as-agent/](company-as-agent/README.md) →
   [feedback-loop/](feedback-loop/README.md)
 - **Runtime engineering**: [runtime/](runtime/README.md) →
@@ -66,6 +67,10 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [product/prosumer.md](product/prosumer.md) | Non-technical operator journey end to end |
 | [product/platform.md](product/platform.md) | Embed mode and hosted multi-tenant mode |
 | [product/templates.md](product/templates.md) | Templates: the productized company manifests |
+| [agentic/README.md](agentic/README.md) | The agentic company: design, run, evolve — agents propose, the Operator disposes |
+| [agentic/setup.md](agentic/setup.md) | Agentic setup: the Architect and Blueprints |
+| [agentic/manager.md](agentic/manager.md) | The Manager: continuous-fit loop and its fence |
+| [agentic/proposals.md](agentic/proposals.md) | Change Proposal schema, lifecycle, provenance (normative) |
 | [company-brain/README.md](company-brain/README.md) | What the company brain is; the cycle |
 | [company-brain/charter.md](company-brain/charter.md) | The company constitution |
 | [company-brain/approvals.md](company-brain/approvals.md) | Checkpoints and the approval model |

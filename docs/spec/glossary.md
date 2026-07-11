@@ -27,6 +27,10 @@ This file is the authoritative vocabulary for every document under
 | **Engagement** | A paid job between Companies delivered over A2A. |
 | **Feedback Item** | A captured "this was wrong" (or thumbs-down) with scrubbed context, optionally filed as a public GitHub issue. |
 | **Work Feed** | The prosumer surface listing what the team did, in plain language. |
+| **Architect** | The setup-time cognition job that turns an Operator conversation into a tailored Blueprint; invocable post-launch to propose reshaping. Internal-only name. See [agentic/setup.md](agentic/setup.md). |
+| **Blueprint** | The Architect's artifact: a complete draft company (manifest + charter + per-decision rationale + provenance), validated before the Operator reviews it at launch. |
+| **Manager** | The scheduled cognition job that watches how a Company actually runs and files Change Proposals. Internal-only name; its output surfaces as the company's own suggestions. See [agentic/manager.md](agentic/manager.md). |
+| **Change Proposal** | A typed, evidenced, Operator-approvable diff against a Company's effective configuration — the only way any agent changes a running company. See [agentic/proposals.md](agentic/proposals.md). |
 
 ## Brain and cycle terms (Medulla mapping)
 
@@ -85,3 +89,6 @@ use the left-hand column:
 | A2A engagement | "a job from/for another company" |
 | effect denied by policy | "blocked by your rules" |
 | event log replay | (never shown) |
+| Architect, Blueprint | "we'll build your company" / "your company plan" |
+| Manager, manager tick | (never shown; suggestions come from "your company") |
+| change proposal | "a suggestion from your company" |
