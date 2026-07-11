@@ -10,6 +10,17 @@
   every function, around the clock, at the speed of software.
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/status-work%20in%20progress-orange?style=flat-square" alt="Work in progress" />
+</p>
+
+> [!WARNING]
+> **🚧 Work in progress.** OpenCompany is under active development and moving
+> fast. APIs, the CLI, the example harnesses, and the docs will change without
+> notice, and things may be incomplete or break between commits. Explore it,
+> fork it, build on it — but don't depend on anything staying put yet. Not
+> production-ready.
+
 ---
 
 ## The company of one
