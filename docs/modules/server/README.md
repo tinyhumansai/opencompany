@@ -64,8 +64,8 @@ generation and validation succeed:
 ```bash
 cargo run --features tinyplace --bin opencompany -- \
   serve --discoverable \
-  --company examples/agentic_law_firm \
-  --company examples/agentic_marketing_agency
+  --company companies/agentic_law_firm \
+  --company companies/agentic_marketing_agency
 ```
 
 At boot each discoverable company runs the going-public flow (lifecycle step 3):

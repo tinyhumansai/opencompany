@@ -1,10 +1,9 @@
 [workspace]
-members = ["examples/*"]
-# The unified operator console is a Vite/TypeScript app, not a Cargo package.
-exclude = ["examples/console"]
-# Keep the default build small: a bare `cargo build` compiles only the host.
-# Build the harnesses explicitly with `cargo build --workspace` or `-p <name>`.
-default-members = ["."]
+# The host is the single configurable backend. Business types are data-only
+# definitions under companies/ (a company.toml manifest + docs), loaded at
+# runtime via `opencompany serve --company companies/<name>` — not Cargo crates.
+# The operator console is a Vite/TypeScript app under frontend/.
+members = ["."]
 resolver = "3"
 
 [workspace.package]

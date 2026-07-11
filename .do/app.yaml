@@ -1,0 +1,56 @@
+# DigitalOcean App Platform spec.
+#   doctl apps create --spec .do/app.yaml
+# Update `github.repo`/`branch` to your fork. The company switch is the
+# OPENCOMPANY_COMPANY env on the `opencompany` service — change it in the
+# dashboard or here and redeploy.
+spec:
+  name: opencompany
+  region: nyc
+
+  services:
+    - name: opencompany
+      dockerfile_path: Dockerfile
+      source_dir: /
+      github:
+        repo: tinyhumansai/opencompany
+        branch: main
+        deploy_on_push: true
+      http_port: 8080
+      instance_size_slug: basic-s
+      instance_count: 1
+      health_check:
+        http_path: /healthz
+      envs:
+        # ── the switch: which company (module) runs ──
+        - key: OPENCOMPANY_COMPANY
+          scope: RUN_TIME
+          value: agentic_marketing_agency
+        - key: OPENCOMPANY_DISCOVERABLE
+          scope: RUN_TIME
+          value: "false"
+        # Optional: unlocks live cognition. Set in the dashboard as a secret.
+        - key: TINYHUMANS_API_KEY
+          scope: RUN_TIME
+          type: SECRET
+          value: ""
+      # API paths route to the host; everything else falls to the console.
+      routes:
+        - path: /api
+        - path: /healthz
+        - path: /spec
+        - path: /tiny
+
+  # The console is served as a static site; its same-origin /api calls are
+  # routed to the host service above by App Platform ingress (no CORS, no proxy).
+  static_sites:
+    - name: console
+      source_dir: frontend
+      github:
+        repo: tinyhumansai/opencompany
+        branch: main
+        deploy_on_push: true
+      build_command: npm ci && npm run build
+      output_dir: dist
+      catchall_document: index.html
+      routes:
+        - path: /

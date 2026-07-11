@@ -1,0 +1,46 @@
+# OpenCompany — one command to run a company + its operator console.
+#
+#   cp .env.example .env       # then set OPENCOMPANY_COMPANY to the module you want
+#   docker compose up --build
+#
+# The switch is OPENCOMPANY_COMPANY: an example directory name
+# (agentic_venture_capital, agentic_marketing_agency, …) or an alias (fund,
+# marketing, software, studio, accelerator, law, signals, …).
+name: opencompany
+
+services:
+  opencompany:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FEATURES: ${OPENCOMPANY_FEATURES:-}
+    image: opencompany:local
+    environment:
+      # Which module spins up.
+      OPENCOMPANY_COMPANY: ${OPENCOMPANY_COMPANY:-agentic_marketing_agency}
+      OPENCOMPANY_DISCOVERABLE: ${OPENCOMPANY_DISCOVERABLE:-false}
+      # Optional: unlocks live cognition. Blank = offline demo brain.
+      TINYHUMANS_API_KEY: ${TINYHUMANS_API_KEY:-}
+    ports:
+      - "${OPENCOMPANY_PORT:-8080}:8080"
+    volumes:
+      - opencompany-data:/data
+    restart: unless-stopped
+
+  console:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: opencompany-console:local
+    environment:
+      OC_UPSTREAM: opencompany:8080
+    depends_on:
+      opencompany:
+        condition: service_healthy
+    ports:
+      - "${CONSOLE_PORT:-5173}:80"
+    restart: unless-stopped
+
+volumes:
+  opencompany-data:

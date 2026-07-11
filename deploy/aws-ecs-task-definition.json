@@ -1,0 +1,51 @@
+{
+  "family": "opencompany",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "opencompany",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/opencompany:latest",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8080, "protocol": "tcp" }],
+      "environment": [
+        { "name": "OPENCOMPANY_COMPANY", "value": "agentic_marketing_agency" },
+        { "name": "OPENCOMPANY_DISCOVERABLE", "value": "false" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"],
+        "interval": 15,
+        "timeout": 3,
+        "retries": 5,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/opencompany",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "opencompany"
+        }
+      }
+    },
+    {
+      "name": "console",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/opencompany-console:latest",
+      "essential": true,
+      "dependsOn": [{ "containerName": "opencompany", "condition": "HEALTHY" }],
+      "environment": [{ "name": "OC_UPSTREAM", "value": "localhost:8080" }],
+      "portMappings": [{ "containerPort": 80, "protocol": "tcp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/opencompany",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "console"
+        }
+      }
+    }
+  ]
+}

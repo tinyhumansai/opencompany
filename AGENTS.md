@@ -10,9 +10,12 @@ under `src/`. Public module surfaces live in source module directories:
 - `src/openhuman/`: launcher and integration seams for the vendored OpenHuman checkout
 - `src/tiny/`: optional TinyAgents crate feature/status surface
 
-The command-line entrypoint lives in `src/bin/opencompany.rs`. Runnable examples
-live in `examples/`. Design notes and module specifications live in `docs/`,
-with `docs/spec/README.md` as the top-level architecture reference and
+The command-line entrypoint lives in `src/bin/opencompany.rs`. Business types
+are data-only definitions under `companies/` (a `company.toml` manifest plus a
+`README.md` — not Cargo crates), loaded at runtime via `opencompany serve
+--company companies/<name>`. The operator console is a Vite/React app under
+`frontend/`. Design notes and module specifications live in `docs/`, with
+`docs/spec/README.md` as the top-level architecture reference and
 `docs/modules/` holding per-surface design docs.
 Vendored runtime sources live under `vendor/` as Git submodules:
 

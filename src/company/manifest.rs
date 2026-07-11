@@ -441,7 +441,7 @@ mod tests {
         // the same lint `opencompany check` runs — unique agent ids, priced +
         // described `[place].skills`, a `[policy]`, and a stated `human_role`.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/signals_opportunity_studio/agents.toml");
+            .join("companies/signals_opportunity_studio/company.toml");
         let manifest = CompanyManifest::from_file(&path).expect("template manifest is valid");
 
         assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());

@@ -593,7 +593,7 @@ mod test {
     async fn register_company_loads_manifest_and_registers() {
         let home = std::env::temp_dir().join(format!("oc-bin-{}", std::process::id()));
         let state = AppState::new(AppConfig::default());
-        let dir = std::path::Path::new("examples/agentic_law_firm");
+        let dir = std::path::Path::new("companies/agentic_law_firm");
 
         let (id, name, _schedules) = register_company(&state, &home, dir, false).await.unwrap();
 

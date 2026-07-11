@@ -1,0 +1,13 @@
+# Build artifacts and heavy/irrelevant paths kept out of the build context.
+.git
+target/
+**/node_modules/
+**/dist/
+# The host binary build needs vendor/tinyagents (the [patch] source) but never
+# the 90 MB OpenHuman checkout.
+vendor/openhuman/
+docs/
+gitbooks/
+*.log
+.env
+.DS_Store

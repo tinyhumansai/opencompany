@@ -3,125 +3,6 @@
 version = 4
 
 [[package]]
-name = "agentic-accounting-firm"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-consultation-firm"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-customer-support"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-design-studio"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-enterprise-sales"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-game-business"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-game-studio"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-influencer-business"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-law-firm"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-marketing-agency"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-media-company"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-pharma-startup"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-realestate-company"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-recruiting-company"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-software-company"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-venture-capital"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
-name = "agentic-venture-studio"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1874,13 +1755,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "signals-opportunity-studio"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
-
-[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1973,13 +1847,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "startup-accelerator"
-version = "0.1.0"
-dependencies = [
- "opencompany",
-]
 
 [[package]]
 name = "static_assertions"
