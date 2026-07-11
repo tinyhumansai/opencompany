@@ -74,9 +74,34 @@ Seventeen companies. One operator. Pick one and run it — or run several at onc
   operate, easy to test.
 - **Yours to own.** GPL-3.0, self-hostable, no lock-in.
 
+## The engine: Medulla
+
+A company of one only works if something can hold the whole company in its head.
+That something is **Medulla** — TinyHumans' orchestrator model, purpose-built to
+run large fleets of agents as a single coordinated business.
+
+Medulla is **orchestrator-first**. Every event — a customer email, a market
+signal, a finished task — lands on a deep orchestration tier that reads the full
+picture, decides what matters, and fans the work out across your agents. It
+compresses the noise coming in, compiles the right output for each channel going
+out, and routes results back into the loop. One brain, many hands.
+
+It's the difference between a pile of chatbots and an actual org that runs. As
+your company grows from nine agents to nine hundred, Medulla is what keeps it
+coherent, on-strategy, and moving — without you in every message.
+
+**Medulla is a hosted model.** You reach it with a **TinyHumans API key**;
+OpenCompany is the open host that points your companies at it.
+
+> Grab your key and request Medulla access at
+> **[tinyhumans.ai](https://tinyhumans.ai)**.
+
 ## Start your company
 
 ```sh
+# 0. Get a TinyHumans API key (unlocks Medulla, the orchestrator) and set it
+export TINYHUMANS_API_KEY="th-..."
+
 # 1. Pull in the OpenHuman + TinyAgents runtimes
 git submodule update --init --recursive
 
@@ -86,6 +111,10 @@ cargo run --bin opencompany -- serve --bind 127.0.0.1:8080
 # 3. Launch a company — e.g. your one-person marketing agency
 cargo run -p agentic-marketing-agency
 ```
+
+Without a key you can still build, inspect, and explore every company in
+`examples/`. Add the key when you're ready to put Medulla in the driver's seat
+and let the agents run for real.
 
 Each example prints its roster and runs on the shared host. Open its `README.md`
 to see what it does and `agents.toml` to see (or edit) the team.
