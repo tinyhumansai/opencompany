@@ -1,0 +1,33 @@
+# Agent roster for the Agentic Customer Support Company harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Customer Support Company"
+output = "Resolved tickets and current documentation"
+human_role = "Escalation and policy"
+
+[[agent]]
+id = "support_agent"
+role = "Support Agent"
+description = "Resolve inbound customer tickets."
+
+[[agent]]
+id = "docs_writer"
+role = "Docs Writer"
+description = "Write and maintain help docs."
+
+[[agent]]
+id = "bug_reporter"
+role = "Bug Reporter"
+description = "File actionable bug reports."
+
+[[agent]]
+id = "escalation_manager"
+role = "Escalation Manager"
+description = "Route and manage escalations."
+
+[[agent]]
+id = "refund_handler"
+role = "Refund Handler"
+description = "Process refunds within policy."

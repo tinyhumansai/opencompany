@@ -1,0 +1,48 @@
+# Agent roster for the Startup Accelerator harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Startup Accelerator"
+output = "A funded, mentored startup cohort"
+human_role = "Investment and demo-day decisions"
+
+[[agent]]
+id = "startup_scout"
+role = "Startup Scout"
+description = "Source promising founders and startups into the pipeline."
+
+[[agent]]
+id = "application_screener"
+role = "Application Screener"
+description = "Score and shortlist applications against the thesis."
+
+[[agent]]
+id = "mentor_matcher"
+role = "Mentor Matcher"
+description = "Pair startups with the right mentors and resources."
+
+[[agent]]
+id = "curriculum_designer"
+role = "Curriculum Designer"
+description = "Design and schedule the program curriculum."
+
+[[agent]]
+id = "progress_coach"
+role = "Progress Coach"
+description = "Track weekly milestones and unblock founders."
+
+[[agent]]
+id = "demo_day_producer"
+role = "Demo Day Producer"
+description = "Prepare pitches and stage demo day."
+
+[[agent]]
+id = "investor_liaison"
+role = "Investor Liaison"
+description = "Make warm, targeted investor introductions."
+
+[[agent]]
+id = "portfolio_support"
+role = "Portfolio Support"
+description = "Support alumni after the program."

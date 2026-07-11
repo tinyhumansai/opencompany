@@ -1,0 +1,33 @@
+# Agent roster for the Agentic Design Studio harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Design Studio"
+output = "Brand and product design systems"
+human_role = "Creative direction sign-off"
+
+[[agent]]
+id = "brand_designer"
+role = "Brand Designer"
+description = "Identity systems, logos, and guidelines."
+
+[[agent]]
+id = "ui_designer"
+role = "UI Designer"
+description = "Product UI and design systems."
+
+[[agent]]
+id = "motion_designer"
+role = "Motion Designer"
+description = "Animation and motion graphics."
+
+[[agent]]
+id = "illustrator"
+role = "Illustrator"
+description = "Custom illustration and iconography."
+
+[[agent]]
+id = "user_researcher"
+role = "User Researcher"
+description = "User testing and design validation."

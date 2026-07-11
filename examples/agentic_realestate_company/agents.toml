@@ -1,0 +1,33 @@
+# Agent roster for the Agentic Real Estate Company harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Real Estate Company"
+output = "Underwritten deals and managed properties"
+human_role = "Purchase approvals"
+
+[[agent]]
+id = "property_scout"
+role = "Property Scout"
+description = "Find and screen candidate properties."
+
+[[agent]]
+id = "neighborhood_analyst"
+role = "Neighborhood Analyst"
+description = "Analyze neighborhoods, comps, and trends."
+
+[[agent]]
+id = "deal_underwriter"
+role = "Deal Underwriter"
+description = "Underwrite deals and model returns."
+
+[[agent]]
+id = "contractor_coordinator"
+role = "Contractor Coordinator"
+description = "Coordinate contractors and renovations."
+
+[[agent]]
+id = "tenant_manager"
+role = "Tenant Manager"
+description = "Manage tenants and property operations."

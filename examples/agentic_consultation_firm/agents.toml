@@ -1,0 +1,43 @@
+# Agent roster for the Agentic Consulting Firm harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Consulting Firm"
+output = "Strategy decks and implementation plans"
+human_role = "Executive workshops"
+
+[[agent]]
+id = "researcher"
+role = "Researcher"
+description = "Desk research and evidence gathering."
+
+[[agent]]
+id = "interviewer"
+role = "Interviewer"
+description = "Conduct and synthesize stakeholder interviews."
+
+[[agent]]
+id = "industry_analyst"
+role = "Industry Analyst"
+description = "Industry, market, and competitive analysis."
+
+[[agent]]
+id = "strategist"
+role = "Strategist"
+description = "Synthesize findings into strategy recommendations."
+
+[[agent]]
+id = "financial_modeler"
+role = "Financial Modeler"
+description = "Build the supporting financial models."
+
+[[agent]]
+id = "deck_builder"
+role = "Deck Builder"
+description = "Produce client-ready presentations."
+
+[[agent]]
+id = "implementation_planner"
+role = "Implementation Planner"
+description = "Turn strategy into an execution roadmap."

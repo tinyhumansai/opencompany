@@ -1,0 +1,38 @@
+# Agent roster for the Agentic Enterprise Sales Organization harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Enterprise Sales Organization"
+output = "Qualified pipeline and proposals"
+human_role = "Closing strategic accounts"
+
+[[agent]]
+id = "lead_gen"
+role = "Lead Generation"
+description = "Generate and qualify leads."
+
+[[agent]]
+id = "outreach_personalizer"
+role = "Outreach Personalizer"
+description = "Craft personalized outreach at scale."
+
+[[agent]]
+id = "crm_updater"
+role = "CRM Updater"
+description = "Keep CRM records accurate and current."
+
+[[agent]]
+id = "proposal_writer"
+role = "Proposal Writer"
+description = "Write tailored proposals."
+
+[[agent]]
+id = "contract_generator"
+role = "Contract Generator"
+description = "Generate contracts from templates."
+
+[[agent]]
+id = "follow_up_agent"
+role = "Follow-up Agent"
+description = "Nurture and follow up on pipeline."

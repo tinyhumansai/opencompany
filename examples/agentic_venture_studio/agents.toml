@@ -1,0 +1,53 @@
+# Agent roster for the Agentic Venture Studio harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Venture Studio"
+output = "A portfolio of startups"
+human_role = "Capital allocation and major strategic decisions"
+
+[[agent]]
+id = "opportunity_scout"
+role = "Opportunity Scout"
+description = "Surface and score market opportunities and startup theses."
+
+[[agent]]
+id = "founder"
+role = "Founder"
+description = "Turn a thesis into a company: vision, roadmap, and priorities."
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Build and ship the product."
+
+[[agent]]
+id = "designer"
+role = "Designer"
+description = "Own product and brand design."
+
+[[agent]]
+id = "marketer"
+role = "Marketer"
+description = "Positioning, demand generation, and launches."
+
+[[agent]]
+id = "lawyer"
+role = "Lawyer"
+description = "Incorporation, contracts, and compliance."
+
+[[agent]]
+id = "finance"
+role = "Finance"
+description = "Financial modeling, runway, and reporting."
+
+[[agent]]
+id = "customer_support"
+role = "Customer Support"
+description = "Resolve customer issues and feed insight back to product."
+
+[[agent]]
+id = "recruiter"
+role = "Recruiter"
+description = "Source and staff each venture with agents or humans."

@@ -1,0 +1,38 @@
+# Agent roster for the Agentic Recruiting Company harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Recruiting Company"
+output = "Sourced, screened, and scheduled candidates"
+human_role = "Final hiring decisions"
+
+[[agent]]
+id = "candidate_sourcer"
+role = "Candidate Sourcer"
+description = "Source candidates for open roles."
+
+[[agent]]
+id = "outreach_agent"
+role = "Outreach Agent"
+description = "Run personalized candidate outreach."
+
+[[agent]]
+id = "resume_analyst"
+role = "Resume Analyst"
+description = "Screen and rank resumes against the spec."
+
+[[agent]]
+id = "interviewer"
+role = "Interviewer"
+description = "Conduct first-round interviews."
+
+[[agent]]
+id = "scheduler"
+role = "Scheduler"
+description = "Coordinate interview scheduling."
+
+[[agent]]
+id = "offer_generator"
+role = "Offer Generator"
+description = "Draft and generate offers."

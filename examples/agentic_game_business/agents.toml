@@ -1,0 +1,43 @@
+# Agent roster for the Agentic Game Business harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Game Business"
+output = "LiveOps, user acquisition, and monetization for a live game"
+human_role = "Monetization and growth strategy"
+
+[[agent]]
+id = "user_acquisition"
+role = "User Acquisition"
+description = "Run paid and organic UA campaigns."
+
+[[agent]]
+id = "monetization_designer"
+role = "Monetization Designer"
+description = "Design offers, pricing, and the in-game economy."
+
+[[agent]]
+id = "liveops_manager"
+role = "LiveOps Manager"
+description = "Plan and run events and content updates."
+
+[[agent]]
+id = "store_optimizer"
+role = "Store Optimizer"
+description = "App-store optimization and conversion."
+
+[[agent]]
+id = "analytics_analyst"
+role = "Analytics Analyst"
+description = "Track KPIs, LTV, retention, and cohorts."
+
+[[agent]]
+id = "community_manager"
+role = "Community Manager"
+description = "Grow and moderate the player community."
+
+[[agent]]
+id = "player_support"
+role = "Player Support"
+description = "Resolve player issues and refunds."

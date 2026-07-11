@@ -1,0 +1,12 @@
+[package]
+name = "agentic-media-company"
+description = "Finds, writes, illustrates, and distributes stories."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Inherit the host crate from the parent workspace.
+opencompany.workspace = true

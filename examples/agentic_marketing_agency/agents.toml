@@ -1,0 +1,48 @@
+# Agent roster for the Agentic Marketing Agency harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Marketing Agency"
+output = "Campaigns across every channel"
+human_role = "Campaign review and sign-off"
+
+[[agent]]
+id = "creative_director"
+role = "Creative Director"
+description = "Own creative concept and direction."
+
+[[agent]]
+id = "copywriter"
+role = "Copywriter"
+description = "Write ads, pages, and campaign copy."
+
+[[agent]]
+id = "seo_specialist"
+role = "SEO Specialist"
+description = "Organic search strategy and optimization."
+
+[[agent]]
+id = "paid_ads_manager"
+role = "Paid Ads Manager"
+description = "Plan and run paid-acquisition campaigns."
+
+[[agent]]
+id = "landing_page_builder"
+role = "Landing Page Builder"
+description = "Build and test conversion pages."
+
+[[agent]]
+id = "email_marketer"
+role = "Email Marketer"
+description = "Design and send lifecycle email."
+
+[[agent]]
+id = "analytics_analyst"
+role = "Analytics Analyst"
+description = "Measure performance and report."
+
+[[agent]]
+id = "brand_strategist"
+role = "Brand Strategist"
+description = "Positioning and brand strategy."

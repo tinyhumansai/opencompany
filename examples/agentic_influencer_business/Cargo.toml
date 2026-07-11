@@ -1,0 +1,12 @@
+[package]
+name = "agentic-influencer-business"
+description = "Operates a creator brand that never sleeps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Inherit the host crate from the parent workspace.
+opencompany.workspace = true

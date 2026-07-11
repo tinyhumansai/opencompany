@@ -1,0 +1,12 @@
+[package]
+name = "agentic-law-firm"
+description = "Researches, drafts, and supports legal work."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Inherit the host crate from the parent workspace.
+opencompany.workspace = true

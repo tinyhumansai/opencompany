@@ -1,0 +1,43 @@
+# Agent roster for the Agentic Game Studio harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Game Studio"
+output = "Shippable games"
+human_role = "Creative and design direction"
+
+[[agent]]
+id = "world_builder"
+role = "World Builder"
+description = "Design worlds, lore, and settings."
+
+[[agent]]
+id = "narrative_designer"
+role = "Narrative Designer"
+description = "Story, characters, and dialogue."
+
+[[agent]]
+id = "gameplay_engineer"
+role = "Gameplay Engineer"
+description = "Implement gameplay systems and code."
+
+[[agent]]
+id = "asset_generator"
+role = "Asset Generator"
+description = "Generate art, audio, and 3D assets."
+
+[[agent]]
+id = "qa_tester"
+role = "QA Tester"
+description = "Find and report bugs."
+
+[[agent]]
+id = "balance_designer"
+role = "Balance Designer"
+description = "Tune difficulty and game balance."
+
+[[agent]]
+id = "marketer"
+role = "Marketer"
+description = "Market and promote the launch."

@@ -1,0 +1,38 @@
+# Agent roster for the Agentic Venture Capital Firm harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Venture Capital Firm"
+output = "Investment memos and a managed portfolio"
+human_role = "Investment decisions"
+
+[[agent]]
+id = "founder_sourcer"
+role = "Founder Sourcer"
+description = "Source founders and deal flow."
+
+[[agent]]
+id = "deck_evaluator"
+role = "Deck Evaluator"
+description = "Evaluate pitch decks and business models."
+
+[[agent]]
+id = "code_analyst"
+role = "Code Analyst"
+description = "Analyze codebases, product, and technical traction."
+
+[[agent]]
+id = "reference_checker"
+role = "Reference Checker"
+description = "Run founder and customer reference checks."
+
+[[agent]]
+id = "market_sizer"
+role = "Market Sizer"
+description = "Size markets and model opportunity."
+
+[[agent]]
+id = "portfolio_support"
+role = "Portfolio Support"
+description = "Support portfolio companies post-investment."

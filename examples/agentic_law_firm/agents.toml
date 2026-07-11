@@ -1,0 +1,33 @@
+# Agent roster for the Agentic Law Firm harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Law Firm"
+output = "Research, drafts, and discovery"
+human_role = "Approving filings"
+
+[[agent]]
+id = "legal_researcher"
+role = "Legal Researcher"
+description = "Case law and legal research."
+
+[[agent]]
+id = "contract_drafter"
+role = "Contract Drafter"
+description = "Draft contracts and legal documents."
+
+[[agent]]
+id = "litigation_support"
+role = "Litigation Support"
+description = "Prepare materials for litigation."
+
+[[agent]]
+id = "discovery_agent"
+role = "Discovery Agent"
+description = "Run and review document discovery."
+
+[[agent]]
+id = "compliance_agent"
+role = "Compliance Agent"
+description = "Check regulatory compliance."

@@ -1,0 +1,48 @@
+# Agent roster for the Agentic Influencer Business harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Influencer Business"
+output = "A creator brand that never sleeps"
+human_role = "Occasional appearance or AI avatar"
+
+[[agent]]
+id = "scriptwriter"
+role = "Scriptwriter"
+description = "Write video and post scripts."
+
+[[agent]]
+id = "trend_scout"
+role = "Trend Scout"
+description = "Detect trends and content opportunities."
+
+[[agent]]
+id = "video_editor"
+role = "Video Editor"
+description = "Edit video content."
+
+[[agent]]
+id = "thumbnail_designer"
+role = "Thumbnail Designer"
+description = "Generate thumbnails and cover art."
+
+[[agent]]
+id = "publisher"
+role = "Publisher"
+description = "Schedule and post content."
+
+[[agent]]
+id = "analytics_analyst"
+role = "Analytics Analyst"
+description = "Analyze performance and advise."
+
+[[agent]]
+id = "community_manager"
+role = "Community Manager"
+description = "Engage and moderate the community."
+
+[[agent]]
+id = "sponsorship_outreach"
+role = "Sponsorship Outreach"
+description = "Source and negotiate sponsorships."

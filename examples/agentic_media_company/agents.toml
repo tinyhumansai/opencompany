@@ -1,0 +1,48 @@
+# Agent roster for the Agentic Media Company harness.
+# The OpenCompany host instantiates one runtime agent per [[agent]], backed by
+# the vendored OpenHuman / TinyAgents modules.
+
+[company]
+name = "Agentic Media Company"
+output = "Published, distributed stories"
+human_role = "Editorial standards"
+
+[[agent]]
+id = "story_scout"
+role = "Story Scout"
+description = "Find and pitch story ideas."
+
+[[agent]]
+id = "source_verifier"
+role = "Source Verifier"
+description = "Verify sources and fact-check."
+
+[[agent]]
+id = "writer"
+role = "Writer"
+description = "Write and edit articles."
+
+[[agent]]
+id = "illustrator"
+role = "Illustrator"
+description = "Create article illustrations."
+
+[[agent]]
+id = "translator"
+role = "Translator"
+description = "Localize stories across languages."
+
+[[agent]]
+id = "seo_optimizer"
+role = "SEO Optimizer"
+description = "Optimize articles for search."
+
+[[agent]]
+id = "publisher"
+role = "Publisher"
+description = "Publish to the CMS."
+
+[[agent]]
+id = "social_distributor"
+role = "Social Distributor"
+description = "Distribute across social channels."
