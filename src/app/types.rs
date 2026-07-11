@@ -24,6 +24,11 @@ pub struct AppConfig {
     pub api_url: String,
     /// Which brain the runtime drives.
     pub brain_mode: BrainMode,
+    /// tiny.place economy API base URL.
+    pub tinyplace_api_url: String,
+    /// Public host base URL advertised in published Agent Cards. When `None`,
+    /// the card endpoint falls back to `http://{bind}`.
+    pub public_url: Option<String>,
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
     pub tinyhumans_credential: Option<SecretValue>,
 }
@@ -36,6 +41,8 @@ impl Default for AppConfig {
             operator_token: None,
             api_url: crate::app::config::DEFAULT_API_URL.to_string(),
             brain_mode: BrainMode::Hosted,
+            tinyplace_api_url: crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string(),
+            public_url: None,
             tinyhumans_credential: None,
         }
     }
@@ -45,6 +52,15 @@ impl AppConfig {
     /// True when hosted cognition can run: hosted mode plus a credential.
     pub fn cycles_available(&self) -> bool {
         self.brain_mode == BrainMode::Hosted && self.tinyhumans_credential.is_some()
+    }
+
+    /// The host base URL to embed in published Agent Card endpoints: the
+    /// configured [`Self::public_url`] when set, otherwise `http://{bind}`.
+    pub fn host_base_url(&self) -> String {
+        match &self.public_url {
+            Some(url) => url.clone(),
+            None => format!("http://{}", self.bind),
+        }
     }
 }
 
@@ -59,6 +75,8 @@ impl std::fmt::Debug for AppConfig {
             )
             .field("api_url", &self.api_url)
             .field("brain_mode", &self.brain_mode)
+            .field("tinyplace_api_url", &self.tinyplace_api_url)
+            .field("public_url", &self.public_url)
             .field(
                 "tinyhumans_credential",
                 &redacted(&self.tinyhumans_credential),
@@ -72,6 +90,13 @@ impl std::fmt::Debug for AppConfig {
 pub struct AppState {
     config: AppConfig,
     registry: CompanyRegistry,
+    /// OpenCompany home root holding company bundles. Used by the tiny.place
+    /// A2A inbound routes to resolve a company's Ed25519 identity.
+    home: std::path::PathBuf,
+    /// Host-global replay-protection cache shared across every inbound A2A
+    /// request. Gated behind `tinyplace` so the default build links no crypto.
+    #[cfg(feature = "tinyplace")]
+    nonce: std::sync::Arc<crate::economy::NonceCache>,
 }
 
 impl AppState {
@@ -80,7 +105,16 @@ impl AppState {
         Self {
             config,
             registry: CompanyRegistry::new(),
+            home: std::path::PathBuf::from("."),
+            #[cfg(feature = "tinyplace")]
+            nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
+    }
+
+    /// Sets the OpenCompany home root used to resolve company identities.
+    pub fn with_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
+        self.home = home.into();
+        self
     }
 
     /// Returns runtime configuration.
@@ -88,9 +122,20 @@ impl AppState {
         &self.config
     }
 
+    /// The OpenCompany home root holding company bundles.
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
     /// The registry of running companies served by this host.
     pub fn registry(&self) -> &CompanyRegistry {
         &self.registry
+    }
+
+    /// The host-global A2A replay-protection nonce cache.
+    #[cfg(feature = "tinyplace")]
+    pub fn nonce(&self) -> &std::sync::Arc<crate::economy::NonceCache> {
+        &self.nonce
     }
 
     /// Returns a serializable system specification snapshot.
@@ -160,6 +205,18 @@ mod tests {
 
         assert_eq!(spec.framework, "axum");
         assert!(spec.modules.contains(&"server"));
+    }
+
+    #[test]
+    fn host_base_url_falls_back_to_bind() {
+        let config = AppConfig::default();
+        assert_eq!(config.host_base_url(), "http://127.0.0.1:8080");
+
+        let public = AppConfig {
+            public_url: Some("https://acme.example".into()),
+            ..AppConfig::default()
+        };
+        assert_eq!(public.host_base_url(), "https://acme.example");
     }
 
     #[test]

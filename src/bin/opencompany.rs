@@ -39,6 +39,12 @@ enum Command {
         /// `$HOME/.opencompany/companies`.
         #[arg(long)]
         home: Option<PathBuf>,
+        /// Opt every loaded company into going public on tiny.place, regardless
+        /// of each manifest's `[place].discoverable`. Requires the `tinyplace`
+        /// feature to actually reach the network; without it the flag only marks
+        /// companies discoverable for the local A2A routes.
+        #[arg(long)]
+        discoverable: bool,
     },
     /// Print a JSON runtime specification.
     Spec {
@@ -110,13 +116,31 @@ async fn register_company(
     state: &AppState,
     home: &std::path::Path,
     dir: &std::path::Path,
+    discoverable: bool,
 ) -> Result<(String, String, Vec<Schedule>)> {
-    let manifest = CompanyManifest::from_path(dir)?;
+    let mut manifest = CompanyManifest::from_path(dir)?;
+    // `serve --discoverable` opts this company into going public regardless of
+    // its manifest: mark it discoverable and synthesize a @handle when absent so
+    // Agent Card generation and validation succeed.
+    if discoverable {
+        manifest.place.discoverable = true;
+        if manifest.company.handle.is_none() {
+            let handle = opencompany::runtime::company_id_from_name(&manifest.company.name)
+                .as_ref()
+                .to_string();
+            manifest.company.handle = Some(handle);
+        }
+    }
     let name = manifest.company.name.clone();
     // Capture the schedules before the manifest is moved into the builder; boot
     // uses them to start this company's cron scheduler (lifecycle step 4).
     let schedules = manifest.schedules.clone();
-    let builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest));
+    let mut builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest))
+        .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
+        .with_host_base_url(state.config().host_base_url());
+    if discoverable {
+        builder = builder.with_discoverable(true);
+    }
     let runtime = builder.build().await?;
     let id = runtime.id().as_ref().to_string();
     state
@@ -187,27 +211,50 @@ async fn main() -> Result<()> {
             openhuman_root,
             companies,
             home,
+            discoverable,
         }) => {
+            let home = home.unwrap_or_else(default_home);
+            // tiny.place economy + public-card configuration resolved from the
+            // environment (with built-in defaults); the a2a routes and boot
+            // going-public flow read these off `AppConfig`.
+            let tinyplace_api_url = std::env::var("TINYPLACE_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| opencompany::app::config::DEFAULT_TINYPLACE_API_URL.to_string());
+            let public_url = std::env::var("OPENCOMPANY_PUBLIC_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
             let state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
+                tinyplace_api_url,
+                public_url,
                 ..AppConfig::default()
-            });
-            let home = home.unwrap_or_else(default_home);
+            })
+            .with_home(home.clone());
             // Schedulers stop cleanly when this is notified (Ctrl-C below).
             let shutdown = Arc::new(Notify::new());
             let mut scheduler_handles = Vec::new();
             for dir in &companies {
-                let (id, name, schedules) = register_company(&state, &home, dir).await?;
+                let (id, name, schedules) =
+                    register_company(&state, &home, dir, discoverable).await?;
+                let visibility = if discoverable {
+                    " [discoverable: public]"
+                } else {
+                    ""
+                };
                 if let Some(handle) = spawn_scheduler(&state, &id, &schedules, &shutdown) {
                     scheduler_handles.push(handle);
                     println!(
-                        "registered company `{id}` ({name}) from {} with {} schedule(s)",
+                        "registered company `{id}` ({name}) from {} with {} schedule(s){visibility}",
                         dir.display(),
                         schedules.len()
                     );
                 } else {
-                    println!("registered company `{id}` ({name}) from {}", dir.display());
+                    println!(
+                        "registered company `{id}` ({name}) from {}{visibility}",
+                        dir.display()
+                    );
                 }
             }
             if companies.is_empty() {
@@ -312,7 +359,7 @@ mod test {
         let state = AppState::new(AppConfig::default());
         let dir = std::path::Path::new("examples/agentic_law_firm");
 
-        let (id, name, _schedules) = register_company(&state, &home, dir).await.unwrap();
+        let (id, name, _schedules) = register_company(&state, &home, dir, false).await.unwrap();
 
         assert_eq!(name, "Agentic Law Firm");
         assert_eq!(id, "agentic-law-firm");

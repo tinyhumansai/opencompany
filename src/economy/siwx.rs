@@ -174,7 +174,7 @@ pub fn verify(
 /// Entries older than [`SKEW_SECS`] are pruned on insert, bounding memory to the
 /// skew window. In-memory only; cross-restart persistence is a documented
 /// follow-up.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct NonceCache {
     seen: Mutex<HashMap<String, i64>>,
 }

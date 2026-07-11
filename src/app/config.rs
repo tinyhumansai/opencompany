@@ -203,6 +203,8 @@ pub struct ConfigFile {
     pub openhuman_url: Option<String>,
     /// tiny.place economy API base URL.
     pub tinyplace_api_url: Option<String>,
+    /// Public host base URL advertised in published Agent Cards.
+    pub public_url: Option<String>,
     /// GitHub token used by GitHub-backed tools.
     pub github_token: Option<String>,
 }
@@ -248,6 +250,9 @@ pub struct RuntimeConfig {
     pub openhuman_url: Option<String>,
     /// tiny.place economy API base URL.
     pub tinyplace_api_url: String,
+    /// Public host base URL advertised in published Agent Cards, if configured.
+    /// When unset, the card endpoint falls back to `http://{bind}`.
+    pub public_url: Option<String>,
     /// GitHub token, if configured. Redacted in `Debug`.
     pub github_token: Option<SecretValue>,
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
@@ -272,6 +277,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("brain_mode", &self.brain_mode)
             .field("openhuman_url", &self.openhuman_url)
             .field("tinyplace_api_url", &self.tinyplace_api_url)
+            .field("public_url", &self.public_url)
             .field("github_token", &redacted(&self.github_token))
             .field(
                 "tinyhumans_credential",
@@ -356,6 +362,13 @@ pub fn resolve(
         config_toml.and_then(|c| c.openhuman_url.clone()),
     );
 
+    let public_url = resolve_opt(
+        &mut prov,
+        "public_url",
+        env.get("OPENCOMPANY_PUBLIC_URL"),
+        config_toml.and_then(|c| c.public_url.clone()),
+    );
+
     let github_token = resolve_opt(
         &mut prov,
         "github_token",
@@ -379,6 +392,7 @@ pub fn resolve(
         brain_mode,
         openhuman_url,
         tinyplace_api_url,
+        public_url,
         github_token,
         tinyhumans_credential,
     };
@@ -527,6 +541,34 @@ mod test {
         assert!(cfg.tinyhumans_credential.is_some());
         assert!(cfg.cycles_available());
         assert_eq!(prov.layer("tinyhumans_credential"), Some(ConfigLayer::Env));
+    }
+
+    #[test]
+    fn public_url_and_tinyplace_url_resolve_by_precedence() {
+        // public_url: env wins; tinyplace_api_url only in config.toml.
+        let env = MapEnv::new([("OPENCOMPANY_PUBLIC_URL", "https://public.example")]);
+        let file = ConfigFile {
+            public_url: Some("https://toml.example".into()),
+            tinyplace_api_url: Some("https://tp.toml".into()),
+            ..ConfigFile::default()
+        };
+        let (cfg, prov) = resolve(&env, Some(&file), &default_manifest()).unwrap();
+
+        assert_eq!(cfg.public_url.as_deref(), Some("https://public.example"));
+        assert_eq!(prov.layer("public_url"), Some(ConfigLayer::Env));
+        assert_eq!(cfg.tinyplace_api_url, "https://tp.toml");
+        assert_eq!(
+            prov.layer("tinyplace_api_url"),
+            Some(ConfigLayer::ConfigToml)
+        );
+    }
+
+    #[test]
+    fn public_url_defaults_to_none() {
+        let env = MapEnv::default();
+        let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
+        assert!(cfg.public_url.is_none());
+        assert_eq!(prov.layer("public_url"), Some(ConfigLayer::Default));
     }
 
     #[test]

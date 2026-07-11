@@ -121,6 +121,9 @@ pub struct RuntimeBuilder {
     tools: Option<Arc<dyn ToolProvider>>,
     channels: Option<Vec<Arc<dyn ChannelAdapter>>>,
     economy: Option<Arc<dyn AgentEconomy>>,
+    discoverable_override: Option<bool>,
+    tinyplace_api_url: Option<String>,
+    host_base_url: Option<String>,
     approvals: Option<Arc<ManifestApprovalGate>>,
     openhuman: Option<Arc<dyn OpenHumanRpc>>,
     secrets: Option<Arc<dyn SecretStore>>,
@@ -152,6 +155,9 @@ impl RuntimeBuilder {
             tools: None,
             channels: None,
             economy: None,
+            discoverable_override: None,
+            tinyplace_api_url: None,
+            host_base_url: None,
             approvals: None,
             openhuman: None,
             secrets: None,
@@ -249,8 +255,34 @@ impl RuntimeBuilder {
     }
 
     /// Wires an agent economy (default: none).
+    ///
+    /// An injected economy wins over the auto-wired tiny.place economy the
+    /// `tinyplace` feature would otherwise construct at [`build`](Self::build).
     pub fn with_economy(mut self, economy: Arc<dyn AgentEconomy>) -> Self {
         self.economy = Some(economy);
+        self
+    }
+
+    /// Forces going-public on (or off) regardless of `[place].discoverable`.
+    ///
+    /// Powers `serve --discoverable`, which opts every loaded company into the
+    /// tiny.place economy. Left unset, the manifest's `[place].discoverable`
+    /// decides.
+    pub fn with_discoverable(mut self, discoverable: bool) -> Self {
+        self.discoverable_override = Some(discoverable);
+        self
+    }
+
+    /// Sets the tiny.place economy API base URL used to build the networked
+    /// client under the `tinyplace` feature.
+    pub fn with_tinyplace_api_url(mut self, api_url: impl Into<String>) -> Self {
+        self.tinyplace_api_url = Some(api_url.into());
+        self
+    }
+
+    /// Sets the host base URL embedded in the published Agent Card endpoint.
+    pub fn with_host_base_url(mut self, host_base_url: impl Into<String>) -> Self {
+        self.host_base_url = Some(host_base_url.into());
         self
     }
 
@@ -486,8 +518,29 @@ impl RuntimeBuilder {
             gate.rehydrate(pending.id, pending.effect, pending.at_millis);
         }
 
-        Ok(CompanyRuntime::new(
-            id,
+        // Economy: an injected economy wins; otherwise the `tinyplace` feature
+        // auto-wires one for a discoverable company with a handle. Going-public
+        // (the paid handle-claim) fires only when discovery is enabled.
+        let going_public = self
+            .discoverable_override
+            .unwrap_or(self.manifest.place.discoverable);
+        let economy: Option<Arc<dyn AgentEconomy>> = match self.economy {
+            Some(economy) => Some(economy),
+            None => {
+                maybe_build_economy(
+                    &self.manifest,
+                    &home,
+                    &id,
+                    store.clone(),
+                    self.tinyplace_api_url.clone(),
+                    going_public,
+                )
+                .await
+            }
+        };
+
+        let runtime = CompanyRuntime::new(
+            id.clone(),
             brain,
             store,
             events,
@@ -495,14 +548,139 @@ impl RuntimeBuilder {
             context,
             tools,
             channels,
-            self.economy,
+            economy.clone(),
             gate,
             journal,
             secrets,
             feedback,
             filer,
-        ))
+        );
+
+        // Boot lifecycle step 3: going-public. Best-effort and non-blocking —
+        // any failure degrades to "private" with a warning and never fails boot.
+        maybe_go_public(
+            &economy,
+            &self.manifest,
+            &id,
+            going_public,
+            self.host_base_url.as_deref(),
+        )
+        .await;
+
+        Ok(runtime)
     }
+}
+
+/// Auto-wires the tiny.place economy for a discoverable company (feature build).
+///
+/// Returns `None` unless `[place].discoverable` is set and a `@handle` is
+/// present; a missing/unreadable identity key degrades to `None` with a warning.
+#[cfg(feature = "tinyplace")]
+async fn maybe_build_economy(
+    manifest: &CompanyManifest,
+    home: &std::path::Path,
+    id: &CompanyId,
+    store: Arc<dyn CompanyStore>,
+    tinyplace_api_url: Option<String>,
+    going_public: bool,
+) -> Option<Arc<dyn AgentEconomy>> {
+    use crate::economy::signer::load_or_create_signer;
+    use crate::economy::{HttpTinyplaceClient, TinyplaceEconomy};
+    use crate::store::paths::Bundle;
+
+    if !(manifest.place.discoverable && manifest.company.handle.is_some()) {
+        return None;
+    }
+
+    let bundle = Bundle::new(home.to_path_buf(), id);
+    let signer = match load_or_create_signer(&bundle).await {
+        Ok(signer) => Arc::new(signer),
+        Err(err) => {
+            tracing::warn!(company = %id, "tiny.place identity unavailable ({err}); staying private");
+            return None;
+        }
+    };
+
+    let base = tinyplace_api_url
+        .unwrap_or_else(|| crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string());
+    let client = Arc::new(HttpTinyplaceClient::new(base, signer.clone()));
+    let economy = TinyplaceEconomy::new(
+        client,
+        signer,
+        store,
+        id.clone(),
+        manifest.budget.monthly_usd,
+    )
+    .going_public(going_public);
+    Some(Arc::new(economy))
+}
+
+/// Default build: no tiny.place economy is linked.
+#[cfg(not(feature = "tinyplace"))]
+async fn maybe_build_economy(
+    _manifest: &CompanyManifest,
+    _home: &std::path::Path,
+    _id: &CompanyId,
+    _store: Arc<dyn CompanyStore>,
+    _tinyplace_api_url: Option<String>,
+    _going_public: bool,
+) -> Option<Arc<dyn AgentEconomy>> {
+    None
+}
+
+/// Runs the going-public flow best-effort: `ensure_registered` then, on success,
+/// `publish_card`. Every outcome degrades to a warning; boot never blocks.
+#[cfg(feature = "tinyplace")]
+async fn maybe_go_public(
+    economy: &Option<Arc<dyn AgentEconomy>>,
+    manifest: &CompanyManifest,
+    id: &CompanyId,
+    going_public: bool,
+    host_base_url: Option<&str>,
+) {
+    use crate::economy::build_agent_card;
+    use crate::ports::types::{CompanyIdentity, RegistrationState};
+
+    if !going_public {
+        return;
+    }
+    let (Some(economy), Some(handle)) = (economy, manifest.company.handle.clone()) else {
+        return;
+    };
+    let identity = CompanyIdentity {
+        company: id.clone(),
+        handle,
+    };
+    match economy.ensure_registered(&identity).await {
+        Ok(RegistrationState::Registered { .. }) => {
+            let base = host_base_url
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("http://{}", crate::app::config::DEFAULT_BIND));
+            let card = build_agent_card(manifest, &base);
+            if let Err(err) = economy.publish_card(&identity, &card).await {
+                tracing::warn!(company = %id, "tiny.place publish_card failed ({err}); card is stale");
+            } else {
+                tracing::info!(company = %id, handle = %identity.handle, "tiny.place: discoverable (public)");
+            }
+        }
+        Ok(RegistrationState::Unregistered) => {
+            tracing::warn!(company = %id, "tiny.place: private (awaiting funding/identity approval)");
+        }
+        Err(err) => {
+            tracing::warn!(company = %id, "tiny.place go-public failed ({err}); staying private");
+        }
+    }
+}
+
+/// Default build: going-public is a no-op with no tiny.place economy.
+#[cfg(not(feature = "tinyplace"))]
+async fn maybe_go_public(
+    _economy: &Option<Arc<dyn AgentEconomy>>,
+    _manifest: &CompanyManifest,
+    _id: &CompanyId,
+    _going_public: bool,
+    _host_base_url: Option<&str>,
+) {
 }
 
 /// Chooses the hosted Medulla brain or the degraded echo brain.
@@ -713,5 +891,47 @@ mod test {
         assert!(!granted.ok);
         // Only the boot-time `health()` probe touched the transport.
         assert_eq!(rpc.call_count(), 0);
+    }
+
+    #[cfg(feature = "tinyplace")]
+    #[tokio::test]
+    async fn discoverable_company_registers_and_publishes_without_blocking() {
+        use crate::economy::signer::LocalSigner;
+        use crate::economy::{MockTinyplaceClient, TinyplaceEconomy};
+        use crate::ports::AgentEconomy;
+        use crate::ports::CompanyStore;
+        use crate::store::FsCompanyStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = parse(
+            r#"
+            [company]
+            name = "Acme"
+            handle = "acme"
+            [place]
+            discoverable = true
+            skills = [{ id = "seo.audit", price_usd = "25.00" }]
+            "#,
+        );
+        let id = CompanyId::new("acme");
+        let store: Arc<dyn CompanyStore> = Arc::new(FsCompanyStore::new(dir.path().to_path_buf()));
+        let signer = Arc::new(LocalSigner::generate());
+        let mock = Arc::new(MockTinyplaceClient::new());
+        let economy: Arc<dyn AgentEconomy> = Arc::new(
+            TinyplaceEconomy::new(mock.clone(), signer, store, id.clone(), None).going_public(true),
+        );
+
+        let runtime = RuntimeBuilder::new(dir.path().to_path_buf(), manifest)
+            .with_id(id)
+            .with_economy(economy)
+            .with_discoverable(true)
+            .build()
+            .await
+            .unwrap();
+
+        // The economy is wired, and boot registered + published the card.
+        assert!(runtime.has_economy());
+        assert_eq!(mock.count("register_name"), 1, "boot claimed the handle");
+        assert_eq!(mock.count("put_agent"), 1, "boot published the card");
     }
 }

@@ -1,3 +1,5 @@
+#[cfg(feature = "tinyplace")]
+pub mod a2a;
 mod error;
 pub mod feedback;
 pub mod operator;

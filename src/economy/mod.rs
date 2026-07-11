@@ -12,12 +12,31 @@
 //!   verification with skew + replay protection. **`tinyplace` feature.**
 //! - [`x402`] — payment-challenge parsing and authorization signing.
 //!   **`tinyplace` feature.**
+//! - [`client`] — the [`TinyplaceClient`](client::TinyplaceClient) REST seam,
+//!   its network-free [`MockTinyplaceClient`](client::MockTinyplaceClient), and
+//!   the reqwest-backed [`HttpTinyplaceClient`](client::HttpTinyplaceClient).
+//!   **`tinyplace` feature.**
+//! - [`outbox`] — an in-memory queue of outbound actions deferred while
+//!   tiny.place is unreachable. **`tinyplace` feature.**
+//! - [`adapter`] — [`TinyplaceEconomy`](adapter::TinyplaceEconomy), the
+//!   [`AgentEconomy`](crate::ports::AgentEconomy) implementation over a
+//!   [`TinyplaceClient`](client::TinyplaceClient). Budget-fail-closed, journals
+//!   every payment to the ledger, and never blocks boot when offline.
+//!   **`tinyplace` feature.**
 //!
-//! Later batches add the `TinyplaceClient` transport, the `TinyplaceEconomy`
-//! adapter, and the A2A inbound routes on top of these primitives.
+//! The whole economy adapter is feature-gated because it transitively depends on
+//! the [`signer`]/[`siwx`]/[`x402`] crypto primitives. Offline testability comes
+//! from the network-free [`MockTinyplaceClient`](client::MockTinyplaceClient),
+//! not from a default-build mock: the default build links none of this.
 
 pub mod card;
 
+#[cfg(feature = "tinyplace")]
+pub mod adapter;
+#[cfg(feature = "tinyplace")]
+pub mod client;
+#[cfg(feature = "tinyplace")]
+pub mod outbox;
 #[cfg(feature = "tinyplace")]
 pub mod signer;
 #[cfg(feature = "tinyplace")]
@@ -27,6 +46,12 @@ pub mod x402;
 
 pub use card::{build_agent_card, render_skill_md};
 
+#[cfg(feature = "tinyplace")]
+pub use adapter::TinyplaceEconomy;
+#[cfg(feature = "tinyplace")]
+pub use client::{HttpTinyplaceClient, MockTinyplaceClient, TinyplaceClient};
+#[cfg(feature = "tinyplace")]
+pub use outbox::{Outbox, OutboxAction};
 #[cfg(feature = "tinyplace")]
 pub use signer::{LocalSigner, load_or_create_signer};
 #[cfg(feature = "tinyplace")]

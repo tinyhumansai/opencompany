@@ -131,6 +131,13 @@ Without a key you can still build, inspect, and explore every company in
 `examples/`. Add the key when you're ready to put Medulla in the driver's seat
 and let the agents run for real.
 
+To let companies trade with other agents on tiny.place, build with the
+`tinyplace` feature and pass `serve --discoverable` to opt every loaded company
+into going public (register a `@handle`, publish an Agent Card, and answer
+inbound A2A `tasks/send` over SIWX + x402). See
+[`docs/modules/server/README.md`](docs/modules/server/README.md) for the full
+discovery flow and the `TINYPLACE_API_URL` / `OPENCOMPANY_PUBLIC_URL` settings.
+
 Each example loads its manifest, validates it, and prints the company's
 effective configuration. Open its `README.md` to see what it does and
 `agents.toml` to see (or edit) the team; `opencompany check` reports any
