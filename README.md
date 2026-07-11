@@ -158,6 +158,11 @@ each example company is a standalone member crate that inherits from it.
 ```text
 src/app/                Runtime config and shared state
 src/company/            Company manifest parsing, validation, and boot
+src/ports/              Kernel port traits and shared types
+src/store/              File-based CompanyStore/EventLog/Memory/Context/Secrets
+src/policy/             Manifest-driven ApprovalGate
+src/brain/              Offline EchoBrain (the default cognition seam)
+src/runtime/            CompanyRuntime, CycleRunner, and the company registry
 src/server/             Axum HTTP router and handlers
 src/openhuman/          OpenHuman launcher seams
 src/tiny/               TinyAgents/OpenHuman status surface
@@ -170,8 +175,11 @@ vendor/tinyagents/      TinyAgents git submodule
 ```
 
 Package surfaces: **`app`** (config + shared state), **`company`** (manifest
-parsing, validation, and boot), **`server`** (Axum router), **`openhuman`**
-(launcher seams), **`tiny`** (vendored TinyAgents status).
+parsing, validation, and boot), **`ports`** (kernel trait seams),
+**`store`** (file-based default stores), **`policy`** (approval gate),
+**`brain`** (offline cognition seam), **`runtime`** (company runtime + cycle
+loop), **`server`** (Axum router), **`openhuman`** (launcher seams),
+**`tiny`** (vendored TinyAgents status).
 
 See [docs/spec/README.md](docs/spec/README.md) for the architecture reference
 and [examples/README.md](examples/README.md) for the full company catalog.
