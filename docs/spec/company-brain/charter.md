@@ -40,6 +40,13 @@ should I never do without asking you?* Answers populate `mission`,
 fields keep template defaults. Non-AI-savvy phrasing is a requirement, not a
 nicety — the interview is most prosumers' first contact with the product.
 
+With [agentic setup](../agentic/setup.md) enabled, the interview is the
+conversational core of the Architect's Blueprint flow, which designs the
+whole company rather than four fields; this static interview remains the
+offline fallback. Post-launch, Charter changes suggested by the company
+arrive as [Change Proposals](../agentic/proposals.md), which add one
+provenance layer between interview answers and operator edits.
+
 ## Enforcement points
 
 The Charter is consulted, not decorative:

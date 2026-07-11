@@ -52,6 +52,12 @@ The product improves itself and companies remember.
   `ContextStore` implementations; `SidecarBrain`; feedback triage agent;
   Signals and the Opportunity Engine arrive as a venture-studio Template, not
   kernel code.
+- **Phase 7 — Agentic setup + Manager.** The [agentic company](agentic/README.md):
+  the Architect's Blueprint flow generalizes the onboarding interview (its
+  conversational core can ship as early as Phase 2, since it only needs the
+  hosted brain); the Manager tick and the Change Proposal pipeline land on
+  top of approvals and the event log. Templates become the Architect's
+  priors and the offline fallback.
 
 ## Stage 4 — Venture Factory
 

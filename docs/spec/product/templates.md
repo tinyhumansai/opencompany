@@ -45,6 +45,11 @@ marketing agency keeps *campaign review and sign-off*; the law firm keeps
 
 ## Customization without forking
 
+With [agentic setup](../agentic/setup.md), templates additionally serve as
+the Architect's **priors**: it may start from one, blend several, or compose
+from scratch, and the gallery remains the offline fallback when no brain is
+reachable. Template lint rules apply to Blueprints unchanged.
+
 An operator's changes (interview answers, charter edits, standing rules)
 layer **over** the template with provenance
 ([charter.md](../company-brain/charter.md)) — the template underneath stays

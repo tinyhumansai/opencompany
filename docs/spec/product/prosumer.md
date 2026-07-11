@@ -21,20 +21,27 @@ didn't work — check for a missing character" / "your subscription is out of
 credit"). Without a key the app still opens in explore mode: browse
 templates, read what each company would do.
 
-## 3. Pick a template
+## 3. Describe your business (or pick a template)
 
-The 18 example companies presented as a **Template Gallery** — Marketing
-Agency, Law Firm, Design Studio, … ([templates.md](templates.md)). Each card
-shows: what the company produces, the team it comes with (roles in plain
-words), and **what you keep** (the human role — sign-offs, taste, client
-relationships).
+The default path is a conversation: *"Tell us about your business in your
+own words"* — and the company gets built around the answers
+([agentic setup](../agentic/setup.md)): the team, what always asks first,
+the weekly rhythm. The 18 companies remain browsable as a **Template
+Gallery** ([templates.md](templates.md)) — picking a card pins it as the
+starting point, and it is the whole path when the brain is unreachable.
+Each card shows: what the company produces, the team it comes with (roles
+in plain words), and **what you keep** (the human role — sign-offs, taste,
+client relationships).
 
-## 4. Name it and interview
+## 4. Name it and review the plan
 
-The operator names the company; the brain runs a five-minute onboarding
-interview ([charter](../company-brain/charter.md)): who your customers are,
-what you charge, what it must never do without asking. Every question is
-skippable; skipped answers keep sensible template defaults.
+The operator names the company and reviews the plan in plain language: the
+team, what it will never do without asking, the suggested monthly budget
+(always explicitly confirmed, never defaulted). They revise in chat ("add
+someone for bookkeeping") until it fits, then launch. On the fallback path
+this step is the classic five-minute interview
+([charter](../company-brain/charter.md)); every question is skippable and
+skipped answers keep sensible template defaults.
 
 ## 5. Go live
 
@@ -70,6 +77,14 @@ Each is a single plain-language decision in Settings:
 - **Say something was wrong** — thumbs-down on any piece of work opens the
   [feedback flow](../feedback-loop/README.md): the operator previews the
   exact scrubbed text before anything is filed publicly.
+- **The company suggests its own tune-ups** — over time, suggestions appear
+  in the Approvals Inbox with their evidence ("You've approved 14 purchases
+  like this — want to stop being asked under $5?"). Approve, deny, or edit;
+  every applied change is visible in Settings with a one-click revert
+  ([agentic manager](../agentic/manager.md)).
+- **Reshape the company** — "My business changed — rebuild around it" reruns
+  the setup conversation; changes arrive as individual suggestions to
+  approve, never a silent rebuild ([agentic setup](../agentic/setup.md)).
 
 ## Failure states, in plain words
 
