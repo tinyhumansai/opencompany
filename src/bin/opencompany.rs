@@ -7,6 +7,8 @@ use opencompany::company::Schedule;
 use opencompany::runtime::{CompanyScheduler, SystemClock};
 use opencompany::{
     AppConfig, AppState, CompanyId, CompanyManifest, Result,
+    app::config::{ConfigFile, ProcessEnv, resolve},
+    app::doctor,
     openhuman::{LaunchMode, OpenHumanLaunch},
     runtime::RuntimeBuilder,
 };
@@ -49,6 +51,17 @@ enum Command {
         /// Manifest file or a directory containing `company.toml`/`agents.toml`.
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Report the effective runtime configuration, which layer set each value,
+    /// and what is missing per optional capability.
+    Doctor {
+        /// Optional company manifest whose `[brain].mode` participates in
+        /// resolution. Defaults to a synthetic manifest when omitted.
+        #[arg(long = "company", value_name = "DIR")]
+        company: Option<PathBuf>,
+        /// Print the report as JSON instead of aligned text.
+        #[arg(long)]
+        json: bool,
     },
     /// Launch a sibling OpenHuman checkout through cargo.
     OpenHuman {
@@ -228,6 +241,32 @@ async fn main() -> Result<()> {
             } else {
                 std::process::exit(1);
             }
+        }
+        Some(Command::Doctor { company, json }) => {
+            let env = ProcessEnv;
+            // Locate config.toml under the resolved data dir (env override or
+            // the default `$HOME/.opencompany`).
+            let config_dir = match std::env::var_os("OPENCOMPANY_DATA_DIR") {
+                Some(dir) => PathBuf::from(dir),
+                None => match std::env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(".opencompany"),
+                    None => PathBuf::from(".opencompany"),
+                },
+            };
+            let config_toml = ConfigFile::load(&config_dir)?;
+            let manifest = match &company {
+                Some(dir) => CompanyManifest::from_path(dir)?,
+                None => toml::from_str("[company]\nname = \"opencompany\"\n")
+                    .expect("synthetic manifest is valid"),
+            };
+            let (cfg, prov) = resolve(&env, config_toml.as_ref(), &manifest)?;
+            let report = doctor::report(&cfg, &prov);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                print!("{}", report.to_text());
+            }
+            Ok(())
         }
         Some(Command::OpenHuman {
             root,

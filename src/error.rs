@@ -94,34 +94,64 @@ pub enum OpenCompanyError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// Runtime configuration could not be resolved (bad value, unreadable or
+    /// malformed `config.toml`).
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    /// The hosted Medulla orchestrator (`/orchestration/v1`) reported a wire
+    /// error. `code` is the verbatim `ORCH_*` string from the server envelope.
+    #[error("orchestration error [{code}]: {message}")]
+    Orchestration {
+        /// The verbatim `ORCH_*` error code from the server envelope.
+        code: String,
+        /// The human-readable error message.
+        message: String,
+    },
+
     /// A port method has no implementation in the current build.
     #[error("port not implemented: {0}")]
     Unimplemented(&'static str),
 }
 
 impl OpenCompanyError {
+    /// Builds an [`OpenCompanyError::Orchestration`] from a wire error code and
+    /// message. `code` is stored verbatim and surfaced by [`Self::code`].
+    pub fn orchestration(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Orchestration {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     /// A stable, machine-readable code for this error.
     ///
     /// Surfaced in the HTTP error envelope (`{ "error", "code" }`) so clients
     /// can branch on the code rather than parsing the human-readable message.
-    pub fn code(&self) -> &'static str {
+    ///
+    /// Returns an owned `String` because [`Self::Orchestration`] carries a
+    /// runtime `ORCH_*` code that is not `'static`; every other variant maps to
+    /// a fixed string literal.
+    pub fn code(&self) -> String {
         match self {
-            Self::MissingOpenHumanRoot(_) => "openhuman_root_missing",
-            Self::OpenHumanProcess(_) => "openhuman_process",
-            Self::OpenHuman { .. } => "openhuman_rpc",
-            Self::MissingManifest(_) => "manifest_missing",
-            Self::ManifestRead { .. } => "manifest_read",
-            Self::ManifestParse(_, _) => "manifest_parse",
-            Self::ManifestInvalid { .. } => "manifest_invalid",
-            Self::Store(_) => "store_error",
-            Self::StoreIo { .. } => "store_io",
-            Self::Serde(_) => "serialization_error",
-            Self::CompanyNotFound(_) => "company_not_found",
-            Self::ToolNotGranted(_) => "tool_not_granted",
-            Self::BudgetExceeded(_) => "budget_exceeded",
-            Self::LifecycleConflict(_) => "lifecycle_conflict",
-            Self::InvalidRequest(_) => "invalid_request",
-            Self::Unimplemented(_) => "unimplemented",
+            Self::MissingOpenHumanRoot(_) => "openhuman_root_missing".to_string(),
+            Self::OpenHumanProcess(_) => "openhuman_process".to_string(),
+            Self::OpenHuman { .. } => "openhuman_rpc".to_string(),
+            Self::MissingManifest(_) => "manifest_missing".to_string(),
+            Self::ManifestRead { .. } => "manifest_read".to_string(),
+            Self::ManifestParse(_, _) => "manifest_parse".to_string(),
+            Self::ManifestInvalid { .. } => "manifest_invalid".to_string(),
+            Self::Store(_) => "store_error".to_string(),
+            Self::StoreIo { .. } => "store_io".to_string(),
+            Self::Serde(_) => "serialization_error".to_string(),
+            Self::CompanyNotFound(_) => "company_not_found".to_string(),
+            Self::ToolNotGranted(_) => "tool_not_granted".to_string(),
+            Self::BudgetExceeded(_) => "budget_exceeded".to_string(),
+            Self::LifecycleConflict(_) => "lifecycle_conflict".to_string(),
+            Self::InvalidRequest(_) => "invalid_request".to_string(),
+            Self::Config(_) => "config_error".to_string(),
+            Self::Orchestration { code, .. } => code.clone(),
+            Self::Unimplemented(_) => "unimplemented".to_string(),
         }
     }
 }
