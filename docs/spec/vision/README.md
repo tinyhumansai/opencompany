@@ -1,4 +1,28 @@
-# Agentic Venture Incubator (AVI)
+# Vision: the Agentic Venture Incubator (AVI)
+
+> **Status: aspirational north star.** This document predates the
+> one-person-company specification and describes where OpenCompany is
+> headed, not what it builds today. The normative specs live in the
+> sibling directories under [`docs/spec/`](../README.md).
+>
+> **Terminology bridge** (AVI term → current spec term, defined in
+> [`glossary.md`](../glossary.md)):
+>
+> | AVI term | Current term |
+> | --- | --- |
+> | Venture | Company |
+> | Assigned humans | Operator |
+> | Agent team | Roster of Teammates |
+> | Venture Orchestrator | Brain (Medulla) |
+> | Governance / approvals | Checkpoints and Approvals |
+> | Learning loop | Feedback Loop |
+> | Knowledge Graph | Memory (future evolution) |
+>
+> **Path from here:** the [roadmap](../roadmap.md) maps AVI components to
+> stages — Signals and the Opportunity Engine arrive as a *venture-studio
+> company template* in Stage 3+ (Learning Company), and the full venture
+> factory is Stage 4. Nothing in this document overrides the normative
+> specs.
 
 ## Vision
 
