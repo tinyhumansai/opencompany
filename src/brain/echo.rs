@@ -112,6 +112,7 @@ mod test {
             cycle_id: "cycle-1".to_string(),
             company_id: CompanyId::new("acme"),
             events,
+            event_seqs: Vec::new(),
             compressed_history: Vec::new(),
             roster: Vec::new(),
             context_index: Vec::new(),

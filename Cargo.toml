@@ -1,5 +1,7 @@
 [workspace]
 members = ["examples/*"]
+# The unified operator console is a Vite/TypeScript app, not a Cargo package.
+exclude = ["examples/console"]
 # Keep the default build small: a bare `cargo build` compiles only the host.
 # Build the harnesses explicitly with `cargo build --workspace` or `-p <name>`.
 default-members = ["."]
@@ -45,9 +47,84 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite", "repl"] }
 
+# Optional network client shared by the feature-gated integrations below; the
+# default build links no network crates.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+# Real HMAC-SHA256 webhook signing. Pure-Rust, no system libs, no network beyond
+# the shared `reqwest` client used by `HttpWebhookSink`.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# Real signed per-tenant JWT verification for platform auth.
+jsonwebtoken = { version = "9", optional = true }
+
+# SQLite-backed implementations of the storage ports. The `bundled` feature
+# vendors SQLite into the build, so no system libsqlite3 is required and the
+# compile stays fully offline. Only links under the `sqlite` feature.
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+
+# Single-file `.tar` packing/unpacking for `opencompany export`/`import`. Pure
+# Rust, no system libs, no network. Only links under the `export` feature; the
+# port-driven bundle core works on an unpacked directory without it.
+tar = { version = "0.4", optional = true }
+
+# Offline crypto for the tiny.place economy identity. All three are optional and
+# only link under the `tinyplace` feature; the default build pulls none of them.
+# `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
+# `SigningKey::from_bytes` so dalek's own `rand_core` feature stays off.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+bs58 = { version = "0.5", default-features = false, features = ["std"], optional = true }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"], optional = true }
+
 [features]
 default = []
 tiny = ["tinyagents"]
+# Real HTTP transport to openhuman-core. The trait + offline mock + providers
+# compile without this; only `HttpOpenHumanRpc` is gated behind it.
+openhuman-rpc = ["dep:reqwest"]
+# Real GitHub REST filer for feedback issues. The `GitHubClient` trait + offline
+# mock + the whole filing flow compile without this; only `HttpGitHubClient` is
+# gated behind it.
+github = ["dep:reqwest"]
+# Real HTTP/Socket.IO transport to hosted Medulla. The wire types + offline
+# MockTransport compile without this; only the networked transport is gated.
+medulla = ["dep:reqwest"]
+# tiny.place economy: Ed25519 identity, SIWX auth, x402 payment authorization,
+# and (in later batches) the HTTP transport. Card projection + wire types stay
+# in the default build; only crypto and the networked client are gated here.
+tinyplace = ["dep:reqwest", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core"]
+# Real HTTP POST webhook delivery + HMAC-SHA256 signing. The `WebhookSink` trait,
+# the offline `RecordingWebhookSink`, and the deterministic default signer
+# compile without this; only `HttpWebhookSink`/`HmacSha256Signer` are gated here.
+webhooks = ["dep:reqwest", "dep:hmac", "dep:sha2"]
+# Real signed per-tenant JWT verification. The `PlatformVerifier` trait and the
+# offline `StaticPlatformVerifier` compile without this; only the JWT verifier is
+# gated behind it.
+platform-jwt = ["dep:jsonwebtoken"]
+# SQLite-backed storage ports (CompanyStore/EventLog/MemoryStore/ContextStore
+# plus SecretStore) sharing one bundled connection. The fs stores and the
+# port-conformance suite compile without this; only `SqliteStore` is gated here.
+sqlite = ["dep:rusqlite"]
+# TinyCortex-backed MemoryStore + ContextStore over a mockable CortexClient.
+# TinyCortex itself is not vendored, so this feature adds no dependency: the
+# compiled backend is an offline in-memory client and the real HTTP client is
+# inert until the service is reachable through the OpenHuman seam. The fs stores
+# and the port-conformance suite compile without this.
+tinycortex = []
+# Node sidecar brain for self-hosters (bring-your-own-inference). Adds
+# `SidecarBrain`, which speaks the same `/orchestration/v1` wire frames as the
+# hosted brain but against a local sidecar process, with inference routed back
+# into the Rust host through an `InferenceClient`. Process launch uses the
+# already-enabled tokio `process` feature and real inference rides the existing
+# `tiny` feature, so this flag adds no dependency. The whole brain, its mocks,
+# and the offline end-to-end test are gated here; the default build links none
+# of it and the builder routes `sidecar` mode to the echo brain.
+sidecar = []
+# Single-file `.tar` bundle packing for `opencompany export`/`import`. The
+# port-driven export/import core (unpacked bundle directory) compiles without
+# this; only `pack_tar`/`unpack_tar` are gated here.
+export = ["dep:tar"]
 
 [patch.crates-io]
 tinyagents = { path = "vendor/tinyagents" }

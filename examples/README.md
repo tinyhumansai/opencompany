@@ -19,6 +19,14 @@ in the OpenCompany host and the vendored modules. Running a harness today
 parses and validates its manifest and prints the company's effective
 configuration.
 
+## The operator console
+
+[`console/`](console/) is the exception to the shape above: a single,
+company-agnostic operator UI (Vite + React + TypeScript) that talks to any
+OpenCompany host and any company at runtime — chat, approvals, and feedback in
+one place. It is reused across every harness instead of shipping a bespoke
+front end per company. See [`console/README.md`](console/README.md).
+
 ## Catalog
 
 | Harness | Output | Human keeps |
@@ -41,6 +49,13 @@ configuration.
 | [`agentic_accounting_firm`](agentic_accounting_firm/) | Books, taxes, forecasts | Sign-off on filings |
 | [`agentic_law_firm`](agentic_law_firm/) | Drafts, research, discovery | Approving filings |
 | [`agentic_pharma_startup`](agentic_pharma_startup/) | Candidate molecules & trial plans | Laboratory work |
+| [`signals_opportunity_studio`](signals_opportunity_studio/) | A ranked weekly opportunity brief | Which opportunities to fund |
+
+Signals and the Opportunity Engine ship as the
+[`signals_opportunity_studio`](signals_opportunity_studio/) **template, not
+kernel code**: a roster, a charter, and a weekly `[[schedule]]` over the
+existing channels, memory/context, and brain ports. There is no Signals
+subsystem in `src/`.
 
 ## Running a harness
 

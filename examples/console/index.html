@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenCompany Console</title>
+    <!--
+      Optional runtime configuration for deployments that serve the built assets
+      as static files (no rebuild needed). Point it at any OpenCompany host:
+
+      <script>
+        window.OPENCOMPANY_CONFIG = {
+          baseUrl: "https://my-host.example.com",
+          company: "acme-marketing",   // omit for single-company mode
+          operatorToken: "…"           // omit in dev mode
+        };
+      </script>
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

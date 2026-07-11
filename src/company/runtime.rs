@@ -16,10 +16,15 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::Result;
 use crate::error::OpenCompanyError;
+use crate::feedback::service::{FeedbackFiler, FeedbackResponse};
+use crate::feedback::store::FeedbackStore;
+use crate::feedback::types::{FeedbackInput, FeedbackItem};
+use crate::policy::ManifestApprovalGate;
+use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    MemoryStore, ToolProvider,
+    MemoryStore, SecretStore, ToolProvider,
 };
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
@@ -38,7 +43,18 @@ pub struct CompanyRuntime {
     pub(crate) channels: Vec<Arc<dyn ChannelAdapter>>,
     pub(crate) economy: Option<Arc<dyn AgentEconomy>>,
     pub(crate) approvals: Arc<dyn ApprovalGate>,
+    /// The concrete gate, kept alongside the `dyn` port so the runtime can reach
+    /// the amend and expiry-sweep methods that live outside the trait without a
+    /// downcast.
+    pub(crate) approval_gate: Arc<ManifestApprovalGate>,
     pub(crate) journal: Arc<RuntimeJournal>,
+    /// Per-company secrets, read by the feedback scrubber (and webhook HMAC
+    /// verification, later).
+    pub(crate) secrets: Arc<dyn SecretStore>,
+    /// Durable store of feedback items (the "feedback family").
+    pub(crate) feedback: Arc<FeedbackStore>,
+    /// Filing configuration: the GitHub client, target repo, consent, limiter.
+    pub(crate) filer: Arc<FeedbackFiler>,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
 }
@@ -57,9 +73,13 @@ impl CompanyRuntime {
         tools: Arc<dyn ToolProvider>,
         channels: Vec<Arc<dyn ChannelAdapter>>,
         economy: Option<Arc<dyn AgentEconomy>>,
-        approvals: Arc<dyn ApprovalGate>,
+        approval_gate: Arc<ManifestApprovalGate>,
         journal: Arc<RuntimeJournal>,
+        secrets: Arc<dyn SecretStore>,
+        feedback: Arc<FeedbackStore>,
+        filer: Arc<FeedbackFiler>,
     ) -> Self {
+        let approvals: Arc<dyn ApprovalGate> = approval_gate.clone();
         Self {
             id,
             brain,
@@ -71,7 +91,11 @@ impl CompanyRuntime {
             channels,
             economy,
             approvals,
+            approval_gate,
             journal,
+            secrets,
+            feedback,
+            filer,
             serial: TokioMutex::new(()),
         }
     }
@@ -104,6 +128,34 @@ impl CompanyRuntime {
             .await
     }
 
+    /// Resolves a parked approval to an operator-amended effect
+    /// (approve-with-edit): the operator's `amended_payload` is overlaid onto
+    /// the parked effect, which is then executed. Runs a follow-up cycle so the
+    /// brain learns the resolution; the immutable journal records both the
+    /// original (parked) and amended effects.
+    pub async fn resolve_approval_amended(
+        &self,
+        id: &ApprovalId,
+        amended_payload: serde_json::Value,
+        by: Actor,
+    ) -> Result<CycleReport> {
+        CycleRunner::new(self)
+            .resolve_approval_amended(id, amended_payload, by)
+            .await
+    }
+
+    /// Sweeps every parked approval past its TTL, resolving each to a
+    /// default-deny and writing an `ApprovalExpired` audit entry to the journal.
+    /// Returns the ids that expired. Driven by the runtime's maintenance timer.
+    pub async fn sweep_expired_approvals(&self) -> Result<Vec<ApprovalId>> {
+        let now = now_millis();
+        let expired = self.approval_gate.sweep_expired(now);
+        for id in &expired {
+            self.journal.record_expired(id, now).await?;
+        }
+        Ok(expired)
+    }
+
     /// Replays the journal to rebuild the executed-key set and approval queue.
     pub async fn recover(&self) -> Result<()> {
         self.journal.load().await
@@ -123,6 +175,50 @@ impl CompanyRuntime {
             .collect()
     }
 
+    /// Captures a feedback item: persists it to the feedback family and logs a
+    /// `FeedbackFiled` event. Nothing is filed — capture is always safe and
+    /// local. Used by the built-in `feedback` tool and operator-chat intent.
+    pub async fn capture_feedback(&self, input: FeedbackInput) -> Result<FeedbackItem> {
+        let item = FeedbackItem::capture(input, crate::VERSION, self.filer.consent);
+        self.feedback.append(&item).await?;
+        self.events
+            .append(
+                &self.id,
+                CompanyEvent::FeedbackFiled {
+                    note: item.operator_words.clone(),
+                },
+            )
+            .await?;
+        Ok(item)
+    }
+
+    /// Captures feedback, then runs the scrub-then-preview gate and either
+    /// previews the exact final issue body or files it (per consent). The
+    /// scrubber fails closed, so a report that cannot be safely scrubbed is
+    /// blocked rather than risked.
+    pub async fn submit_feedback(
+        &self,
+        input: FeedbackInput,
+        preview: bool,
+    ) -> Result<FeedbackResponse> {
+        let item = self.capture_feedback(input).await?;
+        let manifest = self.store.load(&self.id).await?.map(|r| r.manifest);
+        crate::feedback::service::finalize(
+            &self.feedback,
+            self.secrets.as_ref(),
+            &self.filer,
+            &self.id,
+            manifest.as_ref(),
+            &item,
+            // The `POST .../feedback` route is operator-driven; default to an
+            // annoyance-severity operator filing.
+            crate::feedback::Severity::Annoyance,
+            crate::feedback::FeedbackSource::Operator,
+            preview,
+        )
+        .await
+    }
+
     /// A status snapshot, loading the company record for name and lifecycle.
     pub async fn status(&self) -> Result<CompanyStatus> {
         let record = self.store.load(&self.id).await?;
@@ -136,6 +232,35 @@ impl CompanyRuntime {
             lifecycle,
             pending_approvals: self.journal.pending().len(),
         })
+    }
+
+    /// Transitions the company's lifecycle to `to`, persisting the new state and
+    /// appending a [`CompanyEvent::LifecycleChanged`] audit event stamped with
+    /// the acting `by` actor. Returns the previous lifecycle string.
+    ///
+    /// Powers the platform pause/resume/suspend/archive controls. A company with
+    /// no durable record yet is a [`OpenCompanyError::CompanyNotFound`].
+    pub async fn set_lifecycle(&self, to: impl Into<String>, by: Actor) -> Result<String> {
+        let to = to.into();
+        let mut record = self
+            .store
+            .load(&self.id)
+            .await?
+            .ok_or_else(|| OpenCompanyError::CompanyNotFound(self.id.to_string()))?;
+        let from = record.lifecycle.clone();
+        record.lifecycle = to.clone();
+        self.store.save(&record).await?;
+        self.events
+            .append(
+                &self.id,
+                CompanyEvent::LifecycleChanged {
+                    from: from.clone(),
+                    to,
+                    by,
+                },
+            )
+            .await?;
+        Ok(from)
     }
 
     /// Rejects operation on a company that is not accepting work.
