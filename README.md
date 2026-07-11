@@ -120,7 +120,10 @@ git submodule update --init --recursive
 # 2. Boot the company host
 cargo run --bin opencompany -- serve --bind 127.0.0.1:8080
 
-# 3. Launch a company — e.g. your one-person marketing agency
+# 3. Check a company manifest before you launch it
+cargo run --bin opencompany -- check examples/agentic_marketing_agency
+
+# 4. Launch a company — e.g. your one-person marketing agency
 cargo run -p agentic-marketing-agency
 ```
 
@@ -128,8 +131,10 @@ Without a key you can still build, inspect, and explore every company in
 `examples/`. Add the key when you're ready to put Medulla in the driver's seat
 and let the agents run for real.
 
-Each example prints its roster and runs on the shared host. Open its `README.md`
-to see what it does and `agents.toml` to see (or edit) the team.
+Each example loads its manifest, validates it, and prints the company's
+effective configuration. Open its `README.md` to see what it does and
+`agents.toml` to see (or edit) the team; `opencompany check` reports any
+manifest problems in plain language.
 
 Build every company at once, or just the host:
 
@@ -152,6 +157,7 @@ each example company is a standalone member crate that inherits from it.
 
 ```text
 src/app/                Runtime config and shared state
+src/company/            Company manifest parsing, validation, and boot
 src/server/             Axum HTTP router and handlers
 src/openhuman/          OpenHuman launcher seams
 src/tiny/               TinyAgents/OpenHuman status surface
@@ -163,8 +169,9 @@ vendor/openhuman/       OpenHuman git submodule
 vendor/tinyagents/      TinyAgents git submodule
 ```
 
-Package surfaces: **`app`** (config + shared state), **`server`** (Axum router),
-**`openhuman`** (launcher seams), **`tiny`** (vendored TinyAgents status).
+Package surfaces: **`app`** (config + shared state), **`company`** (manifest
+parsing, validation, and boot), **`server`** (Axum router), **`openhuman`**
+(launcher seams), **`tiny`** (vendored TinyAgents status).
 
 See [docs/spec/README.md](docs/spec/README.md) for the architecture reference
 and [examples/README.md](examples/README.md) for the full company catalog.

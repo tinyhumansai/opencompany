@@ -11,9 +11,13 @@ Every harness follows the same shape:
 
 - `README.md` — what the company does, its agent roster, and the human role.
 - `agents.toml` — the machine-readable manifest of agent definitions.
+- `src/main.rs` — a two-line entrypoint that calls
+  `opencompany::run_company(...)` on the manifest.
 
-These are scaffolds: the manifests declare the agents each company *will* run;
-the behavior lives in the OpenCompany host and the vendored modules.
+The manifests declare the agents each company *will* run; the behavior lives
+in the OpenCompany host and the vendored modules. Running a harness today
+parses and validates its manifest and prints the company's effective
+configuration.
 
 ## Catalog
 
@@ -40,16 +44,22 @@ the behavior lives in the OpenCompany host and the vendored modules.
 
 ## Running a harness
 
-Harnesses are launched through the OpenCompany CLI/host (see the repository
-[`README.md`](../README.md)). Initialize the vendored runtime first:
+Boot any harness directly — it loads, validates, and reports its company:
+
+```sh
+cargo run -p agentic-marketing-agency
+```
+
+Or validate a manifest and print its effective configuration without booting:
+
+```sh
+cargo run --bin opencompany -- check examples/agentic_marketing_agency
+```
+
+Initialize the vendored runtime before using deeper integrations, then boot
+the shared HTTP host (surface under active development):
 
 ```sh
 git submodule update --init --recursive
-```
-
-Then boot the host and point it at a harness manifest (surface under active
-development):
-
-```sh
 cargo run --bin opencompany -- serve --bind 127.0.0.1:8080
 ```
