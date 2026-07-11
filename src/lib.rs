@@ -5,12 +5,14 @@
 //! feature to compile against the sibling `tiny*` crates.
 
 pub mod app;
+pub mod company;
 pub mod error;
 pub mod openhuman;
 pub mod server;
 pub mod tiny;
 
 pub use app::{AppConfig, AppState};
+pub use company::{CompanyManifest, run_company};
 pub use error::{OpenCompanyError, Result};
 
 /// Current crate version.

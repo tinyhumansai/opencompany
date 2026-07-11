@@ -30,6 +30,12 @@ enum Command {
         #[arg(long)]
         openhuman_root: Option<PathBuf>,
     },
+    /// Validate a company manifest and print its effective configuration.
+    Check {
+        /// Manifest file or a directory containing `company.toml`/`agents.toml`.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Launch a sibling OpenHuman checkout through cargo.
     OpenHuman {
         /// OpenHuman checkout path.
@@ -86,6 +92,13 @@ async fn main() -> Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&state.spec()).unwrap());
             Ok(())
+        }
+        Some(Command::Check { path }) => {
+            if opencompany::company::run_check(&path) {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
         }
         Some(Command::OpenHuman {
             root,
