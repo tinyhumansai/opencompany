@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::runtime::CompanyRegistry;
 use crate::{VERSION, tiny::RuntimeModuleStatus};
 
 /// Runtime configuration for OpenCompany.
@@ -11,6 +12,9 @@ pub struct AppConfig {
     pub bind: String,
     /// Optional sibling OpenHuman checkout used by launcher commands.
     pub openhuman_root: Option<PathBuf>,
+    /// Bearer token required on operator routes. When `None`, Phase-1 dev mode
+    /// allows local operator calls without authentication.
+    pub operator_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -18,6 +22,7 @@ impl Default for AppConfig {
         Self {
             bind: "127.0.0.1:8080".to_string(),
             openhuman_root: None,
+            operator_token: None,
         }
     }
 }
@@ -26,17 +31,26 @@ impl Default for AppConfig {
 #[derive(Clone, Debug)]
 pub struct AppState {
     config: AppConfig,
+    registry: CompanyRegistry,
 }
 
 impl AppState {
-    /// Builds state from runtime configuration.
+    /// Builds state from runtime configuration with an empty company registry.
     pub fn new(config: AppConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            registry: CompanyRegistry::new(),
+        }
     }
 
     /// Returns runtime configuration.
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// The registry of running companies served by this host.
+    pub fn registry(&self) -> &CompanyRegistry {
+        &self.registry
     }
 
     /// Returns a serializable system specification snapshot.
@@ -45,7 +59,18 @@ impl AppState {
             name: "opencompany",
             version: VERSION,
             framework: "axum",
-            modules: vec!["app", "server", "openhuman", "tiny"],
+            modules: vec![
+                "app",
+                "company",
+                "ports",
+                "store",
+                "policy",
+                "brain",
+                "runtime",
+                "server",
+                "openhuman",
+                "tiny",
+            ],
             runtime_modules: RuntimeModuleStatus::all(),
             openhuman_root: self
                 .config

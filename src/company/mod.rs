@@ -6,6 +6,7 @@
 //! loop, stores) lands in later phases; see `docs/spec/roadmap.md`.
 
 mod manifest;
+pub mod runtime;
 mod types;
 
 use std::path::Path;

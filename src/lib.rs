@@ -5,15 +5,25 @@
 //! feature to compile against the sibling `tiny*` crates.
 
 pub mod app;
+pub mod brain;
 pub mod company;
 pub mod error;
 pub mod openhuman;
+pub mod policy;
+pub mod ports;
+pub mod runtime;
 pub mod server;
+pub mod store;
 pub mod tiny;
 
 pub use app::{AppConfig, AppState};
+pub use brain::EchoBrain;
 pub use company::{CompanyManifest, run_company};
 pub use error::{OpenCompanyError, Result};
+pub use policy::ManifestApprovalGate;
+pub use ports::{CompanyEvent, CompanyId, Effect, EffectDisposition, PolicyDecision, Verdict};
+pub use runtime::{CompanyRegistry, CompanyRuntime, CycleReport, RuntimeBuilder};
+pub use store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
 
 /// Current crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

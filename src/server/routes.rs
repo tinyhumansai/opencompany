@@ -10,6 +10,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/spec", get(spec))
         .route("/tiny", get(tiny))
+        .merge(crate::server::operator::router())
         .with_state(state)
 }
 

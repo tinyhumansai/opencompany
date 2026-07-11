@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Cognition tiers a company may hint per agent. The client only names a tier;
 /// the TinyHumans backend maps tier → model SKU.
@@ -36,7 +36,7 @@ pub const KNOWN_CHANNELS: &[&str] = &["operator", "email", "slack", "sms", "web"
 pub const DEFAULT_ALWAYS_APPROVE: &[&str] = &["payment.send", "filing.submit", "external.publish"];
 
 /// The on-disk definition of a Company.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompanyManifest {
     /// Company-level identity; seeds the Charter.
     pub company: Company,
@@ -67,7 +67,7 @@ pub struct CompanyManifest {
 }
 
 /// `[company]` — the seed of the Charter.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Company {
     /// Display name.
     pub name: String,
@@ -83,7 +83,7 @@ pub struct Company {
 }
 
 /// A `[[agent]]` roster entry.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Agent {
     /// snake_case, unique within the roster.
     pub id: String,
@@ -104,7 +104,7 @@ pub struct Agent {
 }
 
 /// `[brain]` — selects the `Brain` implementation.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Brain {
     /// `hosted` (default) | `sidecar`.
     #[serde(default = "default_brain_mode")]
@@ -128,7 +128,7 @@ fn default_brain_mode() -> String {
 }
 
 /// A `[channels.*]` entry.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ChannelConfig {
     /// Whether the channel is enabled. Defaults to on for `operator`.
     #[serde(default)]
@@ -139,7 +139,7 @@ pub struct ChannelConfig {
 }
 
 /// `[tools]` — company-wide tool grants.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tools {
     /// `openhuman` (default) | `builtin`.
     #[serde(default = "default_tool_provider")]
@@ -163,7 +163,7 @@ fn default_tool_provider() -> String {
 }
 
 /// `[policy]` — the default `ApprovalGate` configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Policy {
     /// `readonly` | `supervised` (default) | `full`.
     #[serde(default = "default_policy_mode")]
@@ -198,7 +198,7 @@ fn default_always_approve() -> Vec<String> {
 }
 
 /// `[place]` — tiny.place going-public configuration.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Place {
     /// Going public is opt-in; defaults to false.
     #[serde(default)]
@@ -209,7 +209,7 @@ pub struct Place {
 }
 
 /// A priced skill advertised on the company's Agent Card.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Skill {
     /// Skill identifier, e.g. `seo.audit`.
     pub id: String,
@@ -221,7 +221,7 @@ pub struct Skill {
 }
 
 /// `[budget]` — a hard ceiling across inference and x402 spend.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Budget {
     /// Monthly hard cap in USD.
     #[serde(default)]
@@ -229,10 +229,56 @@ pub struct Budget {
 }
 
 /// A `[[schedule]]` entry; becomes a `ScheduleFired` event.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Schedule {
     /// Standard 5-field cron expression.
     pub cron: String,
     /// Prompt delivered to the company when the schedule fires.
     pub prompt: String,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    // Guards the newly-added `Serialize` derive: a manifest with renamed
+    // `[[agent]]`/`[[schedule]]` arrays must survive a serialize→deserialize
+    // round-trip through JSON without dropping the renamed fields.
+    #[test]
+    fn manifest_serialize_deserialize_round_trips() {
+        let toml_src = r#"
+            [company]
+            name = "Acme"
+            output = "widgets"
+
+            [[agent]]
+            id = "ceo"
+            role = "Chief"
+            tools = ["email.send"]
+
+            [[schedule]]
+            cron = "0 9 * * *"
+            prompt = "daily standup"
+
+            [policy]
+            mode = "supervised"
+            auto_approve_under_usd = 5.0
+        "#;
+        let manifest: CompanyManifest = toml::from_str(toml_src).expect("parse toml");
+
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        let back: CompanyManifest = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.company.name, "Acme");
+        assert_eq!(back.agents.len(), 1);
+        assert_eq!(back.agents[0].id, "ceo");
+        assert_eq!(back.schedules.len(), 1);
+        assert_eq!(back.schedules[0].cron, "0 9 * * *");
+        assert_eq!(back.policy.auto_approve_under_usd, Some(5.0));
+
+        // The renamed arrays serialize under their manifest keys.
+        let value = serde_json::to_value(&manifest).unwrap();
+        assert!(value.get("agent").is_some());
+        assert!(value.get("schedule").is_some());
+    }
 }
