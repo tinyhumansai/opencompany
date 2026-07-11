@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use opencompany::{
-    AppConfig, AppState, Result,
+    AppConfig, AppState, CompanyManifest, Result,
     openhuman::{LaunchMode, OpenHumanLaunch},
+    runtime::RuntimeBuilder,
 };
 
 #[derive(Debug, Parser)]
@@ -23,6 +26,14 @@ enum Command {
         /// Optional OpenHuman checkout path to report in `/spec`.
         #[arg(long)]
         openhuman_root: Option<PathBuf>,
+        /// A company to load and register at boot (a manifest file or a
+        /// directory containing one). Repeatable for multi-company hosting.
+        #[arg(long = "company", value_name = "DIR")]
+        companies: Vec<PathBuf>,
+        /// OpenCompany home holding company bundles. Defaults to
+        /// `$HOME/.opencompany/companies`.
+        #[arg(long)]
+        home: Option<PathBuf>,
     },
     /// Print a JSON runtime specification.
     Spec {
@@ -68,6 +79,34 @@ impl From<ModeArg> for LaunchMode {
     }
 }
 
+/// The default OpenCompany home: `$HOME/.opencompany/companies`, falling back
+/// to a relative path when `$HOME` is unset.
+fn default_home() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".opencompany").join("companies"),
+        None => PathBuf::from(".opencompany").join("companies"),
+    }
+}
+
+/// Loads the manifest under `dir`, builds a runtime over `home`, and registers
+/// it in `state`. Returns the derived company id and display name.
+async fn register_company(
+    state: &AppState,
+    home: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<(String, String)> {
+    let manifest = CompanyManifest::from_path(dir)?;
+    let name = manifest.company.name.clone();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .build()
+        .await?;
+    let id = runtime.id().as_ref().to_string();
+    state
+        .registry()
+        .insert(runtime.id().clone(), Arc::new(runtime));
+    Ok((id, name))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -78,12 +117,23 @@ async fn main() -> Result<()> {
         Some(Command::Serve {
             bind,
             openhuman_root,
+            companies,
+            home,
         }) => {
-            opencompany::server::serve(AppState::new(AppConfig {
+            let state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
-            }))
-            .await
+                ..AppConfig::default()
+            });
+            let home = home.unwrap_or_else(default_home);
+            for dir in &companies {
+                let (id, name) = register_company(&state, &home, dir).await?;
+                println!("registered company `{id}` ({name}) from {}", dir.display());
+            }
+            if companies.is_empty() {
+                println!("serving with no companies; pass --company <dir> to load one");
+            }
+            opencompany::server::serve(state).await
         }
         Some(Command::Spec { openhuman_root }) => {
             let state = AppState::new(AppConfig {
@@ -124,5 +174,32 @@ async fn main() -> Result<()> {
             println!("opencompany {}", opencompany::VERSION);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn default_home_lands_under_opencompany() {
+        let home = default_home();
+        assert!(home.ends_with("companies"));
+        assert!(home.to_string_lossy().contains(".opencompany"));
+    }
+
+    #[tokio::test]
+    async fn register_company_loads_manifest_and_registers() {
+        let home = std::env::temp_dir().join(format!("oc-bin-{}", std::process::id()));
+        let state = AppState::new(AppConfig::default());
+        let dir = std::path::Path::new("examples/agentic_law_firm");
+
+        let (id, name) = register_company(&state, &home, dir).await.unwrap();
+
+        assert_eq!(name, "Agentic Law Firm");
+        assert_eq!(id, "agentic-law-firm");
+        assert_eq!(state.registry().list().len(), 1);
+        assert!(state.registry().sole().is_some());
+        std::fs::remove_dir_all(&home).ok();
     }
 }
