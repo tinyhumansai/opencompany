@@ -1,0 +1,2 @@
+- we want to make sure that we can also enable Discovery through tiny.place for all of the businesses that are created here 
+
