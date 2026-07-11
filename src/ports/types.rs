@@ -667,8 +667,12 @@ pub enum RegistrationState {
     },
 }
 
-/// A published Agent Card advertising skills.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A published Agent Card advertising a company's skills on tiny.place.
+///
+/// The three original fields (`handle`, `description`, `skills`) are unchanged;
+/// every field added for the A2A wire shape carries `#[serde(default)]` so
+/// records written by earlier phases round-trip without loss.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentCard {
     /// The advertised `@handle`.
     pub handle: String,
@@ -676,6 +680,40 @@ pub struct AgentCard {
     pub description: String,
     /// The advertised skill ids.
     pub skills: Vec<String>,
+    /// Human-readable display name (the company name).
+    #[serde(default)]
+    pub name: String,
+    /// The actor kind; always `"agent"` for a company.
+    #[serde(default)]
+    pub actor_type: String,
+    /// The A2A endpoint, e.g. `https://host/a2a/{handle}`.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Interfaces the endpoint speaks, e.g. `["a2a-jsonrpc"]`.
+    #[serde(default)]
+    pub supported_interfaces: Vec<String>,
+    /// Capability tokens derived from the advertised skills.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Free-form discovery tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Per-skill payment requirements advertised to counterparties.
+    #[serde(default)]
+    pub payment_requirements: Vec<CardPayment>,
+}
+
+/// A single priced skill on an [`AgentCard`], in x402 terms.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CardPayment {
+    /// The skill this price applies to.
+    pub skill_id: String,
+    /// The decimal price string, e.g. `"25.00"`.
+    pub price: String,
+    /// The settlement asset, e.g. `"USDC"`.
+    pub asset: String,
+    /// The settlement network, e.g. `"solana"`.
+    pub network: String,
 }
 
 /// An addressable agent on tiny.place.
@@ -851,5 +889,39 @@ mod test {
     fn event_seq_orders_numerically() {
         assert!(EventSeq::new(1) < EventSeq::new(2));
         assert_eq!(EventSeq::new(7).value(), 7);
+    }
+
+    #[test]
+    fn agent_card_round_trips_with_extended_fields() {
+        let card = AgentCard {
+            handle: "acme".into(),
+            description: "We audit SEO.".into(),
+            skills: vec!["seo.audit".into()],
+            name: "Acme SEO".into(),
+            actor_type: "agent".into(),
+            endpoint: "https://host/a2a/acme".into(),
+            supported_interfaces: vec!["a2a-jsonrpc".into()],
+            capabilities: vec!["seo.audit".into()],
+            tags: vec!["seo.audit".into()],
+            payment_requirements: vec![CardPayment {
+                skill_id: "seo.audit".into(),
+                price: "25.00".into(),
+                asset: "USDC".into(),
+                network: "solana".into(),
+            }],
+        };
+        assert_eq!(round_trip(&card), card);
+    }
+
+    #[test]
+    fn legacy_agent_card_json_deserializes_with_defaults() {
+        // A card written by an earlier phase carried only three fields; the new
+        // `#[serde(default)]` fields must fill in without error.
+        let json = r#"{"handle":"acme","description":"d","skills":["a"]}"#;
+        let card: AgentCard = serde_json::from_str(json).expect("deserialize legacy card");
+        assert_eq!(card.handle, "acme");
+        assert!(card.name.is_empty());
+        assert!(card.payment_requirements.is_empty());
+        assert!(card.supported_interfaces.is_empty());
     }
 }

@@ -49,6 +49,14 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # default build links no network crates.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
+# Offline crypto for the tiny.place economy identity. All three are optional and
+# only link under the `tinyplace` feature; the default build pulls none of them.
+# `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
+# `SigningKey::from_bytes` so dalek's own `rand_core` feature stays off.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+bs58 = { version = "0.5", default-features = false, features = ["std"], optional = true }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"], optional = true }
+
 [features]
 default = []
 tiny = ["tinyagents"]
@@ -62,6 +70,10 @@ github = ["dep:reqwest"]
 # Real HTTP/Socket.IO transport to hosted Medulla. The wire types + offline
 # MockTransport compile without this; only the networked transport is gated.
 medulla = ["dep:reqwest"]
+# tiny.place economy: Ed25519 identity, SIWX auth, x402 payment authorization,
+# and (in later batches) the HTTP transport. Card projection + wire types stay
+# in the default build; only crypto and the networked client are gated here.
+tinyplace = ["dep:reqwest", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core"]
 
 [patch.crates-io]
 tinyagents = { path = "vendor/tinyagents" }
