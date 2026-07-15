@@ -1,5 +1,8 @@
+import path from "node:path";
+
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // The console is company-agnostic and talks to the OpenCompany operator API.
 // In dev it proxies the API routes to a locally-running `opencompany serve`
@@ -8,7 +11,12 @@ import react from "@vitejs/plugin-react";
 const API_TARGET = process.env.OC_API_TARGET ?? "http://127.0.0.1:8080";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
   server: {
     proxy: {
       "/api": { target: API_TARGET, changeOrigin: true },
