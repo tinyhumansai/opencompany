@@ -63,6 +63,10 @@ jsonwebtoken = { version = "9", optional = true }
 # compile stays fully offline. Only links under the `sqlite` feature.
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
+# MongoDB-backed implementations of the storage ports (official async driver).
+# Only links under the `mongodb` feature; the default build stays offline.
+mongodb = { version = "3", optional = true }
+
 # Single-file `.tar` packing/unpacking for `opencompany export`/`import`. Pure
 # Rust, no system libs, no network. Only links under the `export` feature; the
 # port-driven bundle core works on an unpacked directory without it.
@@ -105,6 +109,12 @@ platform-jwt = ["dep:jsonwebtoken"]
 # plus SecretStore) sharing one bundled connection. The fs stores and the
 # port-conformance suite compile without this; only `SqliteStore` is gated here.
 sqlite = ["dep:rusqlite"]
+# MongoDB-backed storage ports (CompanyStore/EventLog/MemoryStore/ContextStore
+# plus SecretStore) sharing one database handle — the multi-tenant platform
+# backend: every document is keyed by company_id and the hosting layer gives
+# each tenant its own database on a shared cluster. The fs stores and the
+# port-conformance suite compile without this; only `MongoStore` is gated here.
+mongodb = ["dep:mongodb"]
 # TinyCortex-backed MemoryStore + ContextStore over a mockable CortexClient.
 # TinyCortex itself is not vendored, so this feature adds no dependency: the
 # compiled backend is an offline in-memory client and the real HTTP client is

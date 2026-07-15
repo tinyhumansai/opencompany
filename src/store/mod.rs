@@ -19,6 +19,14 @@ pub mod paths;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+/// MongoDB-backed implementations of all five storage ports over the official
+/// async driver — the multi-tenant platform backend: every document is keyed
+/// on `company_id`, the hosting layer points each tenant at its own database
+/// on a shared cluster, and an `owners` collection makes the company → tenant
+/// map durable for shared-database platform mode. Only links under `mongodb`.
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
+
 /// TinyCortex-backed memory and context ports over a mockable client. TinyCortex
 /// is not checked out here, so the compiled backend is an offline in-memory
 /// client; a real HTTP client (inert until the service is reachable through the
@@ -43,6 +51,9 @@ pub use paths::{Bundle, default_home};
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
+
+#[cfg(feature = "mongodb")]
+pub use mongodb::MongoStore;
 
 #[cfg(feature = "tinycortex")]
 pub use tinycortex::{
