@@ -33,7 +33,7 @@ import { FeedbackDialog } from "@/components/feedback-dialog";
 import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useCompany } from "@/hooks/use-company";
-import { type ChatMessage, nextMessageId } from "@/lib/chat";
+import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -86,8 +86,7 @@ export function AppShell({
 
   const pending = feed.status.pending_approvals;
 
-  const noteSystem = (line: string) =>
-    setMessages((m) => [...m, { id: nextMessageId(), from: "system", text: line }]);
+  const noteSystem = (line: string) => setMessages((m) => [...m, makeMessage("system", line)]);
 
   return (
     <SidebarProvider>
