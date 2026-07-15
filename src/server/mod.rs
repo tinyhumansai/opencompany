@@ -2,6 +2,7 @@
 pub mod a2a;
 mod error;
 pub mod feedback;
+pub mod graphql;
 pub mod operator;
 pub mod platform_auth;
 pub mod provision;

@@ -32,6 +32,8 @@ categories = ["web-programming", "asynchronous"]
 autoexamples = false
 
 [dependencies]
+async-graphql = "7"
+async-graphql-axum = "7"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 clap = { version = "4", features = ["derive"] }
