@@ -60,6 +60,25 @@ export interface FeedbackResponse {
   deduped: boolean;
 }
 
+/**
+ * One third-party connection's state, from `GET .../connections`.
+ * Forward-looking: hosts that don't expose the connections surface yet simply
+ * 404, and the console treats connections as unavailable.
+ */
+export interface ConnectionState {
+  /** Provider id, matching the console's connection catalog (e.g. "slack"). */
+  provider: string;
+  connected: boolean;
+  /** The connected account label, when known (e.g. an email or workspace). */
+  account?: string;
+}
+
+/** Response of `POST .../connections/{provider}/start`: where to send the user. */
+export interface ConnectionStart {
+  /** The provider's OAuth authorize URL to redirect the operator to. */
+  url: string;
+}
+
 /** Error envelope shape: `{ error, code }`. */
 export interface ApiErrorBody {
   error: string;

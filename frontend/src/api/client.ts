@@ -13,6 +13,8 @@ import {
   type ApprovalSummary,
   type ChatResponse,
   type CompanyStatus,
+  type ConnectionStart,
+  type ConnectionState,
   type FeedbackInput,
   type FeedbackResponse,
   type Verdict,
@@ -116,6 +118,30 @@ export class OpenCompanyClient {
   /** Capture feedback (optionally preview the exact issue body first). */
   feedback(input: FeedbackInput, company?: string | null): Promise<FeedbackResponse> {
     return this.request<FeedbackResponse>("POST", `${this.scope(company)}/feedback`, input);
+  }
+
+  /**
+   * Third-party connections for a company (forward-looking surface). Hosts
+   * that don't expose it yet return 404 — callers treat that as "unavailable".
+   */
+  listConnections(company?: string | null): Promise<ConnectionState[]> {
+    return this.request<ConnectionState[]>("GET", `${this.scope(company)}/connections`);
+  }
+
+  /** Begin an OAuth connect flow; returns the provider authorize URL to open. */
+  startConnection(provider: string, company?: string | null): Promise<ConnectionStart> {
+    return this.request<ConnectionStart>(
+      "POST",
+      `${this.scope(company)}/connections/${encodeURIComponent(provider)}/start`,
+    );
+  }
+
+  /** Revoke a connected provider. */
+  disconnectConnection(provider: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "POST",
+      `${this.scope(company)}/connections/${encodeURIComponent(provider)}/disconnect`,
+    );
   }
 
   /** Platform lifecycle control (requires a scoped company id). */

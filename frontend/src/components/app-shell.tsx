@@ -4,6 +4,7 @@ import {
   LayoutDashboard,
   type LucideIcon,
   MessagesSquare,
+  Plug,
   Settings2,
   ShieldCheck,
 } from "lucide-react";
@@ -37,9 +38,10 @@ import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
+import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
 
-export type View = "overview" | "conversation" | "approvals" | "settings";
+export type View = "overview" | "conversation" | "approvals" | "connections" | "settings";
 
 interface NavItem {
   view: View;
@@ -47,17 +49,34 @@ interface NavItem {
   icon: LucideIcon;
 }
 
-const NAV: NavItem[] = [
-  { view: "overview", label: "Overview", icon: LayoutDashboard },
-  { view: "conversation", label: "Conversation", icon: MessagesSquare },
-  { view: "approvals", label: "Approvals", icon: ShieldCheck },
-  { view: "settings", label: "Settings", icon: Settings2 },
+interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+const NAV: NavGroup[] = [
+  {
+    label: "Operate",
+    items: [
+      { view: "overview", label: "Overview", icon: LayoutDashboard },
+      { view: "conversation", label: "Conversation", icon: MessagesSquare },
+      { view: "approvals", label: "Approvals", icon: ShieldCheck },
+    ],
+  },
+  {
+    label: "Configure",
+    items: [
+      { view: "connections", label: "Connections", icon: Plug },
+      { view: "settings", label: "Settings", icon: Settings2 },
+    ],
+  },
 ];
 
 const TITLES: Record<View, string> = {
   overview: "Overview",
   conversation: "Conversation",
   approvals: "Approvals",
+  connections: "Connections",
   settings: "Settings",
 };
 
@@ -100,26 +119,28 @@ export function AppShell({
           />
         </SidebarHeader>
         <SidebarContent>
-          <SidebarGroup>
-            <SidebarGroupLabel>Operate</SidebarGroupLabel>
-            <SidebarMenu>
-              {NAV.map((item) => (
-                <SidebarMenuItem key={item.view}>
-                  <SidebarMenuButton
-                    isActive={view === item.view}
-                    tooltip={item.label}
-                    onClick={() => setView(item.view)}
-                  >
-                    <item.icon />
-                    <span>{item.label}</span>
-                  </SidebarMenuButton>
-                  {item.view === "approvals" && pending > 0 && (
-                    <SidebarMenuBadge>{pending}</SidebarMenuBadge>
-                  )}
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroup>
+          {NAV.map((group) => (
+            <SidebarGroup key={group.label}>
+              <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+              <SidebarMenu>
+                {group.items.map((item) => (
+                  <SidebarMenuItem key={item.view}>
+                    <SidebarMenuButton
+                      isActive={view === item.view}
+                      tooltip={item.label}
+                      onClick={() => setView(item.view)}
+                    >
+                      <item.icon />
+                      <span>{item.label}</span>
+                    </SidebarMenuButton>
+                    {item.view === "approvals" && pending > 0 && (
+                      <SidebarMenuBadge>{pending}</SidebarMenuBadge>
+                    )}
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroup>
+          ))}
         </SidebarContent>
         <SidebarFooter>
           <SidebarMenu>
@@ -182,6 +203,7 @@ export function AppShell({
               onGoToConversation={() => setView("conversation")}
             />
           )}
+          {view === "connections" && <ConnectionsView client={client} company={company} />}
           {view === "settings" && (
             <SettingsView client={client} company={company} feed={feed} onFlag={() => setFeedbackOpen(true)} />
           )}
