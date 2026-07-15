@@ -16,6 +16,11 @@ pub mod export;
 pub mod fs;
 pub mod paths;
 
+/// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
+/// mongodb) onto opened port implementations, injected once per process into
+/// every company's `RuntimeBuilder`.
+pub mod select;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
@@ -48,6 +53,7 @@ pub mod conformance;
 
 pub use fs::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
 pub use paths::{Bundle, default_home};
+pub use select::{StorageHandles, StorageKind, StorageSettings, open_storage};
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;

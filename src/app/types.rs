@@ -121,6 +121,10 @@ pub struct AppState {
     /// Batch-1 durability is a documented stub: this map is in-memory and resets
     /// on restart until a durable `tenant_id` slot exists on the company record.
     ownership: Arc<RwLock<HashMap<CompanyId, String>>>,
+    /// The opened storage backend's port handles, when a non-fs backend is
+    /// selected (`OPENCOMPANY_STORAGE`). Provisioning injects these into each
+    /// new company's builder; `None` means fs defaults.
+    stores: Option<crate::store::StorageHandles>,
     /// Host-global replay-protection cache shared across every inbound A2A
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
@@ -135,6 +139,7 @@ impl AppState {
             registry: CompanyRegistry::new(),
             home: std::path::PathBuf::from("."),
             ownership: Arc::new(RwLock::new(HashMap::new())),
+            stores: None,
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
@@ -144,6 +149,17 @@ impl AppState {
     pub fn with_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
         self.home = home.into();
         self
+    }
+
+    /// Installs the opened storage backend's port handles (non-fs backends).
+    pub fn with_stores(mut self, stores: crate::store::StorageHandles) -> Self {
+        self.stores = Some(stores);
+        self
+    }
+
+    /// The opened storage backend's handles, if a non-fs backend is selected.
+    pub fn stores(&self) -> Option<&crate::store::StorageHandles> {
+        self.stores.as_ref()
     }
 
     /// Installs platform (multi-tenant) auth. Mirrors [`Self::with_home`].
