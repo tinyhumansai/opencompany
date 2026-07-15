@@ -242,6 +242,16 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Swaps every durable port at once from one opened storage backend
+    /// (see [`crate::store::select`]).
+    pub fn with_stores(self, handles: &crate::store::StorageHandles) -> Self {
+        self.with_store(handles.company.clone())
+            .with_events(handles.events.clone())
+            .with_memory(handles.memory.clone())
+            .with_context(handles.context.clone())
+            .with_secrets(handles.secrets.clone())
+    }
+
     /// Swaps the tool provider.
     pub fn with_tools(mut self, tools: Arc<dyn ToolProvider>) -> Self {
         self.tools = Some(tools);

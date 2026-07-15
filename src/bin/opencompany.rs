@@ -167,6 +167,9 @@ async fn register_company(
     let mut builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest))
         .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
         .with_host_base_url(state.config().host_base_url());
+    if let Some(stores) = state.stores() {
+        builder = builder.with_stores(stores);
+    }
     if discoverable {
         builder = builder.with_discoverable(true);
     }
@@ -438,6 +441,24 @@ async fn main() -> Result<()> {
                 env_usize("OPENCOMPANY_MAX_COMPANIES"),
                 env_usize("OPENCOMPANY_MAX_COMPANIES_PER_TENANT"),
             );
+            // Storage backend selection: fs (default) needs nothing; sqlite and
+            // mongodb are opened once here and injected into every company's
+            // builder. A selected-but-unavailable backend aborts boot rather
+            // than silently falling back to fs.
+            let storage_settings = opencompany::store::StorageSettings::from_env()?;
+            if let Some(handles) =
+                opencompany::store::open_storage(&storage_settings, &home).await?
+            {
+                // Shared-database platform mode: restore the durable company →
+                // tenant map so ownership survives restarts.
+                if let Some(ownership) = &handles.ownership {
+                    for (id, tenant) in ownership.owners().await? {
+                        state.set_owner(id, tenant);
+                    }
+                }
+                state = state.with_stores(handles);
+                println!("storage backend: {:?}", storage_settings.kind);
+            }
             // Platform (multi-tenant) auth: a shared platform token enables the
             // provisioning/lifecycle surface. Without it the prosumer operator
             // path stays in force. Real signed JWT is `platform-jwt`.

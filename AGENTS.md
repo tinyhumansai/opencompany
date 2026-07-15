@@ -68,6 +68,27 @@ Keep every Markdown file, including this one, at 500 lines or fewer. When a
 topic grows past that limit, split it into focused files and link them from the
 module's `README.md`.
 
+## Running under the platform harness (hosted mode)
+
+This repo is also the tenant workload of the OpenCompany hosting platform:
+the `opencompany-manager` control plane (the superproject at
+`tinyhumansai/opencompany-microservices`, where this repo is the
+`opencompany/` submodule) builds this crate into a per-tenant container and
+injects its environment. When developing hosted behavior, know the seams:
+
+- The manager injects `OPENCOMPANY_COMPANY`, `OPENCOMPANY_BIND=0.0.0.0:8080`,
+  `OPENCOMPANY_DATA_DIR=/data`, and `OPENCOMPANY_PUBLIC_URL` into every
+  tenant container, plus — when database-per-tenant storage is enabled —
+  `OPENCOMPANY_STORAGE=mongodb`, `OPENCOMPANY_MONGODB_URI` (credentials
+  scoped to that tenant's database only), and `OPENCOMPANY_MONGODB_DB`.
+- Storage backend selection and the MongoDB backend are documented in
+  `docs/spec/runtime/storage.md`; the port traits it implements are the
+  entire persistence contract (`docs/spec/runtime/ports.md`).
+- The container must serve `/healthz` on `:8080` quickly — the manager's
+  wake-on-request proxy blocks on it and gives up after its startup timeout.
+- Run the full platform locally by following
+  `docs/local-development.md` in the superproject.
+
 ## Commit & Pull Request Guidelines
 
 Use concise, imperative commit subjects. Keep the first line specific to the

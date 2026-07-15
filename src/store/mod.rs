@@ -16,8 +16,21 @@ pub mod export;
 pub mod fs;
 pub mod paths;
 
+/// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
+/// mongodb) onto opened port implementations, injected once per process into
+/// every company's `RuntimeBuilder`.
+pub mod select;
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+/// MongoDB-backed implementations of all five storage ports over the official
+/// async driver — the multi-tenant platform backend: every document is keyed
+/// on `company_id`, the hosting layer points each tenant at its own database
+/// on a shared cluster, and an `owners` collection makes the company → tenant
+/// map durable for shared-database platform mode. Only links under `mongodb`.
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 
 /// TinyCortex-backed memory and context ports over a mockable client. TinyCortex
 /// is not checked out here, so the compiled backend is an offline in-memory
@@ -40,9 +53,13 @@ pub mod conformance;
 
 pub use fs::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
 pub use paths::{Bundle, default_home};
+pub use select::{StorageHandles, StorageKind, StorageSettings, open_storage};
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
+
+#[cfg(feature = "mongodb")]
+pub use mongodb::MongoStore;
 
 #[cfg(feature = "tinycortex")]
 pub use tinycortex::{

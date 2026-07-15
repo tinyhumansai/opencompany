@@ -160,14 +160,16 @@ async fn provision(
         );
     }
 
-    // Build over the data dir with fs defaults.
-    let runtime = match RuntimeBuilder::new(state.home().to_path_buf(), manifest)
+    // Build over the data dir, honoring the selected storage backend (fs
+    // defaults when none is configured).
+    let mut builder = RuntimeBuilder::new(state.home().to_path_buf(), manifest)
         .with_id(id.clone())
         .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
-        .with_host_base_url(state.config().host_base_url())
-        .build()
-        .await
-    {
+        .with_host_base_url(state.config().host_base_url());
+    if let Some(stores) = state.stores() {
+        builder = builder.with_stores(stores);
+    }
+    let runtime = match builder.build().await {
         Ok(runtime) => runtime,
         Err(err) => return ApiError(err).into_response(),
     };
@@ -179,7 +181,14 @@ async fn provision(
     state
         .registry()
         .insert(id.clone(), std::sync::Arc::new(runtime));
-    state.set_owner(id, tenant);
+    state.set_owner(id.clone(), tenant.clone());
+    // Persist ownership when the backend supports it, so the tenant map
+    // survives restarts (best-effort: the in-memory map already reflects it).
+    if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
+        && let Err(err) = ownership.set_owner(&id, &tenant).await
+    {
+        tracing::warn!(company = %id, error = %err, "failed to persist company ownership");
+    }
 
     (StatusCode::CREATED, Json(status)).into_response()
 }
@@ -301,6 +310,11 @@ async fn archive(
     if response.status() == StatusCode::OK {
         state.registry().remove(&id);
         state.remove_owner(&id);
+        if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
+            && let Err(err) = ownership.remove_owner(&id).await
+        {
+            tracing::warn!(company = %id, error = %err, "failed to remove persisted ownership");
+        }
     }
     response
 }
