@@ -139,6 +139,21 @@ fn default_home() -> PathBuf {
     }
 }
 
+/// Resolves a `--company` argument to its source *directory*. `--company`
+/// accepts either the company directory (`companies/<name>`) or the manifest
+/// file inside it (`companies/<name>/company.toml`); the file form is normalized
+/// to its parent so workspace seeding and the skill/workflow read resolvers look
+/// under the company directory rather than under `company.toml/…`.
+fn company_source_dir(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_file() {
+        path.parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Loads the manifest under `dir`, builds a runtime over `home`, and registers
 /// it in `state`. Returns the derived company id and display name.
 async fn register_company(
@@ -168,7 +183,7 @@ async fn register_company(
     // workspace tree on first boot and lets read resolvers find its committed
     // skills/workflows content.
     let mut builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest))
-        .with_seed_dir(dir.to_path_buf())
+        .with_seed_dir(company_source_dir(dir))
         .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
         .with_host_base_url(state.config().host_base_url());
     if let Some(stores) = state.stores() {
@@ -516,12 +531,12 @@ async fn main() -> Result<()> {
             // The repo-level shared skill library (`skills/`) sits beside the
             // `companies/` dir; derive it from the first loaded company's source
             // dir so the `skillRegistry` query resolves the committed library.
-            if let Some(skills_root) = companies
-                .first()
-                .and_then(|dir| dir.parent())
-                .and_then(|companies_dir| companies_dir.parent())
-                .map(|repo_root| repo_root.join("skills"))
-            {
+            if let Some(skills_root) = companies.first().and_then(|path| {
+                let dir = company_source_dir(path);
+                dir.parent()
+                    .and_then(|companies_dir| companies_dir.parent())
+                    .map(|repo_root| repo_root.join("skills"))
+            }) {
                 state = state.with_skills_root(skills_root);
             }
             // Schedulers stop cleanly when this is notified (Ctrl-C below).
@@ -671,6 +686,39 @@ mod test {
         assert!(
             !runtime.workspace().is_empty(runtime.id()).await.unwrap(),
             "workspace seeded from the company source dir"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn company_source_dir_normalizes_manifest_file_to_its_directory() {
+        let dir = std::path::Path::new("companies/agentic_law_firm");
+        // A directory argument is returned unchanged.
+        assert_eq!(company_source_dir(dir), dir);
+        // A manifest-file argument resolves to its parent company directory, so
+        // the serve-path `workspace`/`skills`/`workflows` lookups stay correct.
+        assert_eq!(company_source_dir(&dir.join("company.toml")), dir);
+    }
+
+    #[tokio::test]
+    async fn register_company_accepts_a_manifest_file_path() {
+        let home = std::env::temp_dir().join(format!("oc-bin-file-{}", std::process::id()));
+        let state = AppState::new(AppConfig::default());
+        // `--company` also accepts the manifest file inside the company dir.
+        let file = std::path::Path::new("companies/agentic_law_firm/company.toml");
+
+        let (_id, name, _schedules) = register_company(&state, &home, file, false).await.unwrap();
+
+        assert_eq!(name, "Agentic Law Firm");
+        let runtime = state.registry().sole().expect("sole company");
+        // The recorded source dir is the company directory, not `company.toml`.
+        assert_eq!(
+            runtime.source_dir(),
+            Some(std::path::Path::new("companies/agentic_law_firm"))
+        );
+        assert!(
+            !runtime.workspace().is_empty(runtime.id()).await.unwrap(),
+            "workspace still seeds when --company is a manifest file"
         );
         std::fs::remove_dir_all(&home).ok();
     }
