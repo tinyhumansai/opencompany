@@ -18,16 +18,25 @@ stores remain authoritative for export and migration.
 
 ## Port boundary
 
-Memory is two ports, not a database
+Memory spans three ports, not a database
 ([runtime/ports.md](../runtime/ports.md)):
 
-- **`MemoryStore`** — traces and task results; the shape of Medulla's
-  `CyclePersistence` (`save_trace`, `recent_traces`, `save_task_result`,
-  `evict`).
+- **`MemoryStore`** — the brain's own traces and task results; the shape of
+  Medulla's `CyclePersistence` (`save_trace`, `recent_traces`,
+  `save_task_result`, `evict`).
 - **`ContextStore`** — the RLM environment (`put`/`list`/`peek`/`search`)
   the brain queries lazily instead of stuffing context windows.
+- **`FactStore`** — the **operator's** durable, hand-curated Memory view: the
+  facts, preferences, people, projects, and references the console's Memory
+  surface lists, searches, adds, and deletes (`list`/`upsert`/`delete`). This
+  is distinct from the two cognition ports above — it is a person-authored
+  record, not compressed cognition — and is not fed into the cycle loop the way
+  traces are.
 
-**TinyCortex is the intended backend for both**
+The first two ports are the brain's memory; `FactStore` is the operator's. All
+three key on `CompanyId` and travel with the export bundle.
+
+**TinyCortex is the intended backend for `MemoryStore` and `ContextStore`**
 ([integrations/tinycortex.md](../integrations/tinycortex.md)) but is a
 choice, not a dependency: the fs default preserves the one-key promise, and
 DB-agnosticism applies to memory exactly as to every other store.
@@ -44,9 +53,10 @@ until retention policy or the Operator says otherwise.
 
 - **Inspect**: `GET /api/v1/companies/{id}/memory/traces` and the exported
   bundle expose everything remembered, human-readably.
-- **Delete**: the Operator MAY delete any memory item or context chunk;
-  deletion propagates to the backing store and is journaled (that a deletion
-  happened is auditable; the content is gone).
+- **Delete**: the Operator MAY delete any memory item, context chunk, or
+  `FactStore` fact; deletion propagates to the backing store and is journaled
+  to the `EventLog` (that a deletion happened is auditable; the content is
+  gone).
 - **Redact**: customer-content redaction requests are honored across traces
   and chunks — required for the privacy stance in
   [feedback-loop/privacy.md](../feedback-loop/privacy.md).
