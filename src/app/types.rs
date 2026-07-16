@@ -126,6 +126,10 @@ pub struct AppState {
     /// selected (`OPENCOMPANY_STORAGE`). Provisioning injects these into each
     /// new company's builder; `None` means fs defaults.
     stores: Option<crate::store::StorageHandles>,
+    /// The repo-level shared skill library directory (`skills/`), set on the
+    /// serve path. `None` in platform-provisioned mode (no repo checkout), where
+    /// the `skillRegistry` query degrades to empty.
+    skills_root: Option<std::path::PathBuf>,
     /// Cache of the repo-level shared skill registry (`skills/*/SKILL.md`).
     /// Populated on first read via [`AppState::skill_registry`]; never
     /// invalidated because the repo's skill library is immutable at runtime.
@@ -163,6 +167,7 @@ impl AppState {
             home: std::path::PathBuf::from("."),
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
+            skills_root: None,
             skill_registry: Arc::new(OnceLock::new()),
             schema: crate::server::graphql::build_schema(),
             connections: crate::server::ops::ConnectionsRuntime::new(),
@@ -175,6 +180,19 @@ impl AppState {
     pub fn with_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
         self.home = home.into();
         self
+    }
+
+    /// Sets the repo-level shared skill library directory (`skills/`) backing the
+    /// top-level `skillRegistry` query. Set on the serve path; unset in
+    /// platform-provisioned mode.
+    pub fn with_skills_root(mut self, skills_root: impl Into<std::path::PathBuf>) -> Self {
+        self.skills_root = Some(skills_root.into());
+        self
+    }
+
+    /// The repo-level shared skill library directory, when set.
+    pub fn skills_root(&self) -> Option<&std::path::Path> {
+        self.skills_root.as_deref()
     }
 
     /// Installs the opened storage backend's port handles (non-fs backends).

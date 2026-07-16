@@ -164,7 +164,11 @@ async fn register_company(
     // Capture the schedules before the manifest is moved into the builder; boot
     // uses them to start this company's cron scheduler (lifecycle step 4).
     let schedules = manifest.schedules.clone();
+    // The company's on-disk source directory (`companies/<name>`) seeds the
+    // workspace tree on first boot and lets read resolvers find its committed
+    // skills/workflows content.
     let mut builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest))
+        .with_seed_dir(dir.to_path_buf())
         .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
         .with_host_base_url(state.config().host_base_url());
     if let Some(stores) = state.stores() {
@@ -509,6 +513,17 @@ async fn main() -> Result<()> {
             // test send and outbound mail. Absent the features these stay `None`
             // and the surfaces degrade to "not wired yet" (404).
             state = state.with_connections(connections_runtime());
+            // The repo-level shared skill library (`skills/`) sits beside the
+            // `companies/` dir; derive it from the first loaded company's source
+            // dir so the `skillRegistry` query resolves the committed library.
+            if let Some(skills_root) = companies
+                .first()
+                .and_then(|dir| dir.parent())
+                .and_then(|companies_dir| companies_dir.parent())
+                .map(|repo_root| repo_root.join("skills"))
+            {
+                state = state.with_skills_root(skills_root);
+            }
             // Schedulers stop cleanly when this is notified (Ctrl-C below).
             let shutdown = Arc::new(Notify::new());
             let mut scheduler_handles = Vec::new();
@@ -648,7 +663,15 @@ mod test {
         assert_eq!(name, "Agentic Law Firm");
         assert_eq!(id, "agentic-law-firm");
         assert_eq!(state.registry().list().len(), 1);
-        assert!(state.registry().sole().is_some());
+        let runtime = state.registry().sole().expect("sole company");
+
+        // The serve path records the source dir and seeds the workspace from
+        // `companies/<name>/workspace/**` on first boot.
+        assert_eq!(runtime.source_dir(), Some(dir));
+        assert!(
+            !runtime.workspace().is_empty(runtime.id()).await.unwrap(),
+            "workspace seeded from the company source dir"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
