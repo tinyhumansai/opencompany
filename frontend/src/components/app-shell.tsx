@@ -40,6 +40,7 @@ import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { DISCORD_INVITE_URL } from "@/lib/links";
+import { defaultThreads } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -126,13 +127,24 @@ export function AppShell({
   onBackToPicker,
 }: Props) {
   const [view, setView] = useHashView<View>(VIEWS, "overview");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [threads, setThreads] = useState(defaultThreads);
+  const [activeThreadId, setActiveThreadId] = useState("main");
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const feed = useCompany(client, company, initialStatus);
 
   const pending = feed.status.pending_approvals;
 
-  const noteSystem = (line: string) => setMessages((m) => [...m, makeMessage("system", line)]);
+  const setThreadMessages = (
+    threadId: string,
+    updater: (m: ChatMessage[]) => ChatMessage[],
+  ) =>
+    setThreads((ts) =>
+      ts.map((t) => (t.id === threadId ? { ...t, messages: updater(t.messages) } : t)),
+    );
+
+  // Approval decisions and other events land in the active thread's transcript.
+  const noteSystem = (line: string) =>
+    setThreadMessages(activeThreadId, (m) => [...m, makeMessage("system", line)]);
 
   return (
     <SidebarProvider>
@@ -219,8 +231,10 @@ export function AppShell({
             <Conversation
               client={client}
               company={company}
-              messages={messages}
-              setMessages={setMessages}
+              threads={threads}
+              activeId={activeThreadId}
+              onSelect={setActiveThreadId}
+              setMessages={setThreadMessages}
               onReply={() => void feed.refresh()}
             />
           )}

@@ -129,6 +129,7 @@ export function App() {
     case "console":
       return (
         <AppShell
+          key={phase.company ?? "single"}
           client={client}
           company={phase.company}
           initialStatus={phase.status}
