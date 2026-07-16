@@ -46,3 +46,8 @@ description = "Make warm, targeted investor introductions."
 id = "portfolio_support"
 role = "Portfolio Support"
 description = "Support alumni after the program."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["cohort_pipeline"]

@@ -31,3 +31,8 @@ description = "Coordinate contractors and renovations."
 id = "tenant_manager"
 role = "Tenant Manager"
 description = "Manage tenants and property operations."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["acquisition_pipeline"]

@@ -67,6 +67,11 @@ skills = [
   { id = "opportunity.brief", price_usd = "49.00", description = "A ranked, evidence-backed weekly opportunity brief for a chosen market." },
 ]
 
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["opportunity_pipeline"]
+
 [budget]
 monthly_usd = 200.0
 

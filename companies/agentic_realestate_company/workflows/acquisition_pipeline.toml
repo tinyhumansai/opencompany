@@ -1,0 +1,96 @@
+# Workflow graph: acquisition_pipeline
+#
+# Referenced by `[workflows].enabled = ["acquisition_pipeline"]` in ../company.toml.
+# A listing goes from scouting through underwriting to a purchase the operator
+# approves, then into rehab and management. Node kinds mirror the tinyflows model.
+
+id = "acquisition_pipeline"
+name = "Acquisition pipeline"
+description = "A listing goes from scouting to a purchase ready for approval."
+
+[[node]]
+id = "lead"
+kind = "trigger"
+name = "New listing"
+summary = "A candidate property appears."
+
+[[node]]
+id = "scout"
+kind = "agent"
+name = "Scout the property"
+summary = "Assess the property and its condition."
+agent = "property_scout"
+
+[[node]]
+id = "neighborhood"
+kind = "agent"
+name = "Analyze the area"
+summary = "Read the neighborhood and comparables."
+agent = "neighborhood_analyst"
+
+[[node]]
+id = "underwrite"
+kind = "agent"
+name = "Underwrite the deal"
+summary = "Model the returns and the risks."
+agent = "deal_underwriter"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Pencils out?"
+summary = "Advance to purchase or pass."
+
+[[node]]
+id = "rehab"
+kind = "agent"
+name = "Scope the rehab"
+summary = "Plan and cost the renovation."
+agent = "contractor_coordinator"
+
+[[node]]
+id = "tenant"
+kind = "agent"
+name = "Plan tenancy"
+summary = "Prepare to lease and manage."
+agent = "tenant_manager"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Purchase approval"
+summary = "Send the deal to the operator to approve."
+
+[[edge]]
+from = "lead"
+to = "scout"
+
+[[edge]]
+from = "scout"
+to = "neighborhood"
+
+[[edge]]
+from = "neighborhood"
+to = "underwrite"
+
+[[edge]]
+from = "underwrite"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "rehab"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "no"
+
+[[edge]]
+from = "rehab"
+to = "tenant"
+
+[[edge]]
+from = "tenant"
+to = "done"
