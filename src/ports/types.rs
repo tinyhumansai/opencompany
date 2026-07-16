@@ -263,6 +263,17 @@ pub enum CompanyEvent {
         /// Who performed the transition.
         by: Actor,
     },
+    /// An agent replied in a desk/chat. Journaled by the harness/chat layer so
+    /// the GraphQL `Chat.history` resolver (WS2c) can read replies back
+    /// alongside the operator messages that prompted them.
+    AgentReply {
+        /// The desk / group-chat the reply belongs to.
+        chat_id: String,
+        /// The agent that produced the reply.
+        agent_id: String,
+        /// The reply text.
+        text: String,
+    },
 }
 
 /// A `CompanyEvent` durably appended to the log with its sequence and time.

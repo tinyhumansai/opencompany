@@ -10,6 +10,11 @@ pub mod company;
 pub mod economy;
 pub mod error;
 pub mod feedback;
+/// WS4: openhuman embedded as a library (the harness). Compiled only under the
+/// `openhuman` feature; the default build links none of it and keeps the
+/// echo-brained, offline behaviour unchanged.
+#[cfg(feature = "openhuman")]
+pub mod harness;
 pub mod openhuman;
 pub mod policy;
 pub mod ports;

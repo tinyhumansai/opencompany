@@ -130,6 +130,10 @@ pub struct RuntimeBuilder {
     feedback: Option<Arc<FeedbackStore>>,
     github: Option<Arc<dyn GitHubClient>>,
     consent: ConsentMode,
+    /// WS4: the embedded openhuman harness pool. Feature-gated so the default
+    /// build is unaffected; wired through to [`CompanyRuntime`] when present.
+    #[cfg(feature = "openhuman")]
+    harness: Option<Arc<crate::harness::HarnessPool>>,
 }
 
 impl RuntimeBuilder {
@@ -164,6 +168,8 @@ impl RuntimeBuilder {
             feedback: None,
             github: None,
             consent: ConsentMode::default(),
+            #[cfg(feature = "openhuman")]
+            harness: None,
         }
     }
 
@@ -310,6 +316,17 @@ impl RuntimeBuilder {
     /// operator channel with a boot warning.
     pub fn with_openhuman_rpc(mut self, rpc: Arc<dyn OpenHumanRpc>) -> Self {
         self.openhuman = Some(rpc);
+        self
+    }
+
+    /// WS4: attaches the embedded openhuman harness pool. When present, the
+    /// runtime exposes it through [`CompanyRuntime::harness`] so the chat layer
+    /// (WS3) can route desk turns through it; without it the runtime keeps its
+    /// echo/hosted brain path unchanged. Feature-gated — the default build has
+    /// no harness.
+    #[cfg(feature = "openhuman")]
+    pub fn with_harness(mut self, harness: Arc<crate::harness::HarnessPool>) -> Self {
+        self.harness = Some(harness);
         self
     }
 
@@ -550,7 +567,8 @@ impl RuntimeBuilder {
             }
         };
 
-        let runtime = CompanyRuntime::new(
+        #[cfg_attr(not(feature = "openhuman"), allow(unused_mut))]
+        let mut runtime = CompanyRuntime::new(
             id.clone(),
             brain,
             store,
@@ -566,6 +584,12 @@ impl RuntimeBuilder {
             feedback,
             filer,
         );
+
+        // WS4: attach the embedded harness pool when one was provided.
+        #[cfg(feature = "openhuman")]
+        if let Some(harness) = self.harness.clone() {
+            runtime.set_harness(harness);
+        }
 
         // Boot lifecycle step 3: going-public. Best-effort and non-blocking —
         // any failure degrades to "private" with a warning and never fails boot.

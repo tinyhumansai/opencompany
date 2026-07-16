@@ -86,6 +86,16 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Lifecycle changed from {from} to {to}"),
             "lifecycle.changed",
         ),
+        CompanyEvent::AgentReply {
+            chat_id,
+            agent_id,
+            text,
+        } => (
+            Role::Assistant,
+            agent_id.clone(),
+            format!("[{chat_id}] {text}"),
+            "agent.reply",
+        ),
     };
     WireEvent {
         seq,

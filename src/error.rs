@@ -154,6 +154,11 @@ pub enum OpenCompanyError {
     /// A port method has no implementation in the current build.
     #[error("port not implemented: {0}")]
     Unimplemented(&'static str),
+
+    /// The embedded openhuman harness failed to build or run an agent.
+    #[cfg(feature = "openhuman")]
+    #[error("harness error: {0}")]
+    Harness(String),
 }
 
 impl OpenCompanyError {
@@ -207,6 +212,8 @@ impl OpenCompanyError {
             Self::Orchestration { code, .. } => code.clone(),
             Self::Tinyplace { code, .. } => format!("tinyplace_{code}"),
             Self::Unimplemented(_) => "unimplemented".to_string(),
+            #[cfg(feature = "openhuman")]
+            Self::Harness(_) => "harness_error".to_string(),
         }
     }
 }
