@@ -1,0 +1,107 @@
+# Workflow graph: sales_pipeline
+#
+# Referenced by `[workflows].enabled = ["sales_pipeline"]` in ../company.toml.
+# A lead moves from research and outreach through qualification to a proposal
+# and contract. Node kinds mirror the tinyflows model.
+
+id = "sales_pipeline"
+name = "Sales pipeline"
+description = "A lead moves from research to a proposal and contract."
+
+[[node]]
+id = "lead"
+kind = "trigger"
+name = "New lead"
+summary = "A lead enters the pipeline."
+
+[[node]]
+id = "research"
+kind = "agent"
+name = "Research the account"
+summary = "Profile the account and the buyer."
+agent = "lead_gen"
+
+[[node]]
+id = "outreach"
+kind = "agent"
+name = "Personalized outreach"
+summary = "Reach out with a relevant hook."
+agent = "outreach_personalizer"
+
+[[node]]
+id = "crm"
+kind = "agent"
+name = "Update the CRM"
+summary = "Log the account and next steps."
+agent = "crm_updater"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Qualified?"
+summary = "Advance or nurture the lead."
+
+[[node]]
+id = "proposal"
+kind = "agent"
+name = "Write the proposal"
+summary = "Draft the proposal for the account."
+agent = "proposal_writer"
+
+[[node]]
+id = "contract"
+kind = "agent"
+name = "Generate the contract"
+summary = "Prepare the contract for approval."
+agent = "contract_generator"
+
+[[node]]
+id = "followup"
+kind = "agent"
+name = "Follow up"
+summary = "Nurture toward the next step."
+agent = "follow_up_agent"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report to operator"
+summary = "Report pipeline state and the ask."
+
+[[edge]]
+from = "lead"
+to = "research"
+
+[[edge]]
+from = "research"
+to = "outreach"
+
+[[edge]]
+from = "outreach"
+to = "crm"
+
+[[edge]]
+from = "crm"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "proposal"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "followup"
+label = "no"
+
+[[edge]]
+from = "proposal"
+to = "contract"
+
+[[edge]]
+from = "contract"
+to = "followup"
+
+[[edge]]
+from = "followup"
+to = "done"

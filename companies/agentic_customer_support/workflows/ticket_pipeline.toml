@@ -1,0 +1,113 @@
+# Workflow graph: ticket_pipeline
+#
+# Referenced by `[workflows].enabled = ["ticket_pipeline"]` in ../company.toml.
+# A ticket goes from triage to resolution — escalated, filed as a bug, or
+# refunded — and the knowledge base learns from it. Node kinds mirror the
+# tinyflows model.
+
+id = "ticket_pipeline"
+name = "Ticket pipeline"
+description = "A ticket goes from triage to resolution, and the docs learn from it."
+
+[[node]]
+id = "ticket"
+kind = "trigger"
+name = "New ticket"
+summary = "A customer opens a support ticket."
+
+[[node]]
+id = "triage"
+kind = "agent"
+name = "Triage the ticket"
+summary = "Understand and classify the issue."
+agent = "support_agent"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Resolvable now?"
+summary = "Resolve directly or escalate."
+
+[[node]]
+id = "escalate"
+kind = "agent"
+name = "Escalate"
+summary = "Route the harder issue for handling."
+agent = "escalation_manager"
+
+[[node]]
+id = "gate2"
+kind = "condition"
+name = "Bug or refund?"
+summary = "Route the escalation to the right path."
+
+[[node]]
+id = "bug"
+kind = "agent"
+name = "File a bug"
+summary = "Write a reproducible bug report."
+agent = "bug_reporter"
+
+[[node]]
+id = "refund"
+kind = "agent"
+name = "Handle refund"
+summary = "Process the refund within policy."
+agent = "refund_handler"
+
+[[node]]
+id = "docs"
+kind = "agent"
+name = "Update the docs"
+summary = "Capture the fix in the knowledge base."
+agent = "docs_writer"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Close and report"
+summary = "Close the ticket and report back."
+
+[[edge]]
+from = "ticket"
+to = "triage"
+
+[[edge]]
+from = "triage"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "docs"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "escalate"
+label = "no"
+
+[[edge]]
+from = "escalate"
+to = "gate2"
+
+[[edge]]
+from = "gate2"
+to = "bug"
+label = "bug"
+
+[[edge]]
+from = "gate2"
+to = "refund"
+label = "refund"
+
+[[edge]]
+from = "bug"
+to = "docs"
+
+[[edge]]
+from = "refund"
+to = "docs"
+
+[[edge]]
+from = "docs"
+to = "done"
