@@ -109,7 +109,7 @@ impl std::fmt::Debug for AppConfig {
 }
 
 /// Shared application state passed to Axum handlers.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AppState {
     config: AppConfig,
     registry: CompanyRegistry,
@@ -130,6 +130,9 @@ pub struct AppState {
     /// Populated on first read via [`AppState::skill_registry`]; never
     /// invalidated because the repo's skill library is immutable at runtime.
     skill_registry: Arc<OnceLock<Arc<[SkillDoc]>>>,
+    /// The GraphQL read-plane schema, built once at construction and reused for
+    /// every `/graphql` request (per-request auth is injected as request data).
+    schema: crate::server::graphql::OcSchema,
     /// Injected network seams for the credential surfaces (DNS resolver, mail
     /// sender). Empty by default so the build stays offline.
     connections: crate::server::ops::ConnectionsRuntime,
@@ -137,6 +140,18 @@ pub struct AppState {
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
     nonce: std::sync::Arc<crate::economy::NonceCache>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The GraphQL schema carries no useful debug state and is not `Debug`.
+        f.debug_struct("AppState")
+            .field("config", &self.config)
+            .field("registry", &self.registry)
+            .field("home", &self.home)
+            .field("stores", &self.stores)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AppState {
@@ -149,6 +164,7 @@ impl AppState {
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
             skill_registry: Arc::new(OnceLock::new()),
+            schema: crate::server::graphql::build_schema(),
             connections: crate::server::ops::ConnectionsRuntime::new(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
@@ -274,6 +290,11 @@ impl AppState {
     /// The registry of running companies served by this host.
     pub fn registry(&self) -> &CompanyRegistry {
         &self.registry
+    }
+
+    /// The prebuilt GraphQL read-plane schema.
+    pub fn schema(&self) -> &crate::server::graphql::OcSchema {
+        &self.schema
     }
 
     /// The host-global A2A replay-protection nonce cache.

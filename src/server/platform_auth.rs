@@ -183,7 +183,10 @@ impl std::fmt::Debug for PlatformAuthConfig {
 }
 
 /// Extracts the bearer token from the `Authorization` header.
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+///
+/// Shared with [`resolve_claims`](crate::server::graphql::auth::resolve_claims)
+/// so REST and GraphQL parse the credential identically.
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -223,19 +226,11 @@ impl FromRequestParts<AppState> for PlatformOrOperatorAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(platform) = state.config().platform_auth.as_ref() {
-            let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
-            let claims = platform
-                .verifier
-                .verify(token)
-                .map_err(|_| unauthorized())?;
-            return Ok(Self(Some(claims)));
-        }
-        // Prosumer mode: operator-token semantics.
-        match state.config().operator_token.as_deref() {
-            None => Ok(Self(None)),
-            Some(expected) if bearer(&parts.headers) == Some(expected) => Ok(Self(None)),
-            Some(_) => Err(unauthorized()),
+        use crate::server::graphql::auth::{GqlAuth, resolve_claims};
+        match resolve_claims(&parts.headers, state) {
+            Ok(GqlAuth::Platform(claims)) => Ok(Self(Some(claims))),
+            Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(Self(None)),
+            Err(_) => Err(unauthorized()),
         }
     }
 }
@@ -252,21 +247,12 @@ impl FromRequestParts<AppState> for PlatformScope {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(platform) = state.config().platform_auth.as_ref() {
-            let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
-            let claims = platform
-                .verifier
-                .verify(token)
-                .map_err(|_| unauthorized())?;
-            if claims.has_platform_scope() {
-                return Ok(Self(Some(claims)));
-            }
-            return Err(forbidden());
-        }
-        match state.config().operator_token.as_deref() {
-            None => Ok(Self(None)),
-            Some(expected) if bearer(&parts.headers) == Some(expected) => Ok(Self(None)),
-            Some(_) => Err(unauthorized()),
+        use crate::server::graphql::auth::{GqlAuth, resolve_claims};
+        match resolve_claims(&parts.headers, state) {
+            Ok(GqlAuth::Platform(claims)) if claims.has_platform_scope() => Ok(Self(Some(claims))),
+            Ok(GqlAuth::Platform(_)) => Err(forbidden()),
+            Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(Self(None)),
+            Err(_) => Err(unauthorized()),
         }
     }
 }

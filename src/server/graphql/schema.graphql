@@ -1,0 +1,72 @@
+"""
+A parked approval awaiting the operator. Mirrors
+[`ApprovalSummary`](crate::runtime::types::ApprovalSummary).
+"""
+type Approval {
+	"""
+	The approval's id.
+	"""
+	id: ID!
+	"""
+	The parked effect's dotted kind.
+	"""
+	kind: String!
+	"""
+	The USD amount involved, if any.
+	"""
+	amountUsd: Float
+	"""
+	Epoch-millis the effect was parked. `Float` round-trips the full u64
+	range that would overflow GraphQL's `Int`.
+	"""
+	atMillis: Float!
+}
+
+type Company {
+	"""
+	The company id.
+	"""
+	id: ID!
+	"""
+	The display name from the company charter.
+	"""
+	name: String!
+	"""
+	Lifecycle state, e.g. `running`, `paused`, `archived`.
+	"""
+	lifecycle: String!
+	"""
+	The number of approvals currently awaiting the operator.
+	"""
+	pendingApprovals: Int!
+	"""
+	The approvals currently awaiting the operator for this company.
+	"""
+	approvals: [Approval!]!
+}
+
+type Query {
+	"""
+	Every company visible to the caller: all registered companies for the
+	operator / platform-scope principal, or just a tenant's own in platform
+	mode.
+	"""
+	companies: [Company!]!
+	"""
+	One company by id, or — when `id` is omitted in single-company mode — the
+	sole registered company. `null` when no such company is registered.
+	"""
+	company(id: ID): Company
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: Query
+}
