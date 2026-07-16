@@ -20,19 +20,18 @@
 //! public accessor, [`HarnessPool::run`](crate::harness::HarnessPool::run) fills
 //! [`TurnUsage`] from it; the mapping below is unchanged.
 //!
-//! ## WS5 seam
+//! ## Usage port (WS3)
 //!
-//! opencompany does not yet ship a `UsageMeter` port (it lands with WS3/WS5), so
-//! this module defines a **minimal local [`UsageMeter`] trait + [`UsageSample`]**
-//! to keep the cost hook whole and testable. When WS5 lands its real port, this
-//! seam should be replaced by (or re-exported from) `crate::ports`. The ledger
-//! half already writes through the real [`CompanyStore`] port.
-
-use async_trait::async_trait;
+//! The usage half writes through the canonical
+//! [`UsageMeter`](crate::ports::UsageMeter) port shipped by WS3, mapping the
+//! turn onto a [`UsageSample`](crate::ports::UsageSample); WS5 reads the meter
+//! back for the Usage/Finances surfaces. The ledger half writes through the
+//! real [`CompanyStore`] port.
 
 use crate::ports::CompanyStore;
 use crate::ports::now_millis;
 use crate::ports::types::{CompanyId, LedgerEntry};
+use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
 
 /// A turn's token/cost totals — a host-side mirror of openhuman's crate-private
 /// `TurnCost` (see module docs).
@@ -48,43 +47,6 @@ pub struct TurnUsage {
     pub cost_usd: f64,
     /// Number of model calls made during the turn.
     pub call_count: u32,
-}
-
-/// What produced a usage sample.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SampleKind {
-    /// Tokens consumed by a model inference call.
-    Inference,
-    /// An OAuth-connected tool invocation (populates the calls-by-provider
-    /// chart). Wired by the runtime when a connected tool runs.
-    OauthCall,
-}
-
-/// One metered usage event. The WS5 seam type — kept minimal until the real
-/// `UsageMeter` port lands.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UsageSample {
-    /// The agent that produced the usage.
-    pub agent: String,
-    /// The inference/tool provider slug (e.g. `managed`, `github`).
-    pub provider: String,
-    /// Input tokens consumed.
-    pub input_tokens: u64,
-    /// Output tokens produced.
-    pub output_tokens: u64,
-    /// Input tokens served from the KV cache.
-    pub cached_input_tokens: u64,
-    /// USD cost attributed to the sample.
-    pub cost_usd: f64,
-    /// What produced the sample.
-    pub kind: SampleKind,
-}
-
-/// Minimal usage sink — the WS5 `UsageMeter` seam.
-#[async_trait]
-pub trait UsageMeter: Send + Sync {
-    /// Records a single usage sample.
-    async fn record(&self, sample: UsageSample) -> crate::Result<()>;
 }
 
 /// Build the `inference.spend` [`LedgerEntry`] for a turn, or `None` when the
@@ -107,6 +69,7 @@ pub fn usage_sample_for(turn: &TurnUsage, agent_id: &str, provider: &str) -> Opt
         return None;
     }
     Some(UsageSample {
+        at_millis: now_millis(),
         agent: agent_id.to_string(),
         provider: provider.to_string(),
         input_tokens: turn.input_tokens,
@@ -140,7 +103,7 @@ pub async fn record_turn_cost(
         store.append_ledger(company, entry).await?;
     }
     if let (Some(meter), Some(sample)) = (meter, usage_sample_for(turn, agent_id, provider)) {
-        meter.record(sample).await?;
+        meter.record(company, &sample).await?;
     }
     Ok(())
 }
@@ -149,6 +112,8 @@ pub async fn record_turn_cost(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    use async_trait::async_trait;
 
     use crate::ports::types::{CompanyRecord, CompanySummary};
 
@@ -181,9 +146,16 @@ mod tests {
 
     #[async_trait]
     impl UsageMeter for RecordingMeter {
-        async fn record(&self, sample: UsageSample) -> crate::Result<()> {
-            self.samples.lock().unwrap().push(sample);
+        async fn record(&self, _company: &CompanyId, sample: &UsageSample) -> crate::Result<()> {
+            self.samples.lock().unwrap().push(sample.clone());
             Ok(())
+        }
+        async fn query(
+            &self,
+            _company: &CompanyId,
+            _since: u64,
+        ) -> crate::Result<Vec<UsageSample>> {
+            Ok(self.samples.lock().unwrap().clone())
         }
     }
 

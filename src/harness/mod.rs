@@ -51,10 +51,10 @@ use oh::inference::provider::Provider;
 
 use crate::company::Policy;
 use crate::error::OpenCompanyError;
-use crate::harness::cost::{TurnUsage, UsageMeter, record_turn_cost};
+use crate::harness::cost::{TurnUsage, record_turn_cost};
 use crate::harness::policy::ApprovalPolicy;
 use crate::ports::types::{CompanyId, CompanyRecord};
-use crate::ports::{CompanyStore, ContextStore};
+use crate::ports::{CompanyStore, ContextStore, UsageMeter};
 
 /// Shared dependencies every harness-built agent draws on.
 #[derive(Clone)]
