@@ -15,6 +15,9 @@ pub mod feedback;
 /// echo-brained, offline behaviour unchanged.
 #[cfg(feature = "openhuman")]
 pub mod harness;
+/// WS5: pure Usage & Finances projections over the runtime's accounting data
+/// (usage samples, ledger, `[budget]`). No I/O; WS2 wraps these in GraphQL.
+pub mod metering;
 pub mod openhuman;
 pub mod policy;
 pub mod ports;
