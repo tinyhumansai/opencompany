@@ -71,7 +71,15 @@ export function Conversation({ client, company, messages, setMessages, onReply }
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      <div ref={scroller} className="flex-1 overflow-y-auto">
+      <div
+        ref={scroller}
+        className="flex-1 overflow-y-auto"
+        style={{
+          backgroundImage:
+            "radial-gradient(color-mix(in oklab, var(--muted-foreground) 9%, transparent) 1px, transparent 1px)",
+          backgroundSize: "22px 22px",
+        }}
+      >
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-1.5 px-4 py-6">
           {messages.length === 0 && <EmptyConversation />}
           {groups.map((g, i) => (
@@ -140,9 +148,8 @@ function MessageGroup({ group, prev }: { group: Group; prev?: Group }) {
         {!mine && <SenderAvatar senderKey={group.senderKey} name={group.name} />}
         <div className={cn("flex min-w-0 flex-col gap-1", mine ? "items-end" : "items-start")}>
           {!mine && (
-            <div className="flex items-baseline gap-2 px-1">
+            <div className="px-1">
               <span className="text-xs font-semibold">{group.name}</span>
-              <span className="text-[11px] text-muted-foreground">{formatTime(group.at)}</span>
             </div>
           )}
           {group.messages.map((m, i) => (
@@ -158,20 +165,21 @@ function Bubble({ message, mine, last }: { message: ChatMessage; mine: boolean; 
   return (
     <div
       className={cn(
-        "group/bubble relative max-w-[85%] whitespace-pre-wrap px-3.5 py-2 text-sm leading-relaxed sm:max-w-[75%]",
-        mine
-          ? "rounded-2xl bg-primary text-primary-foreground"
-          : "rounded-2xl border bg-card text-card-foreground",
-        // Tuck the tail on the last bubble of a group.
+        "relative max-w-[85%] rounded-2xl px-3 py-1.5 text-sm leading-relaxed shadow-sm sm:max-w-[75%]",
+        mine ? "bg-primary text-primary-foreground" : "border bg-card text-card-foreground",
         last && (mine ? "rounded-br-md" : "rounded-bl-md"),
       )}
     >
-      {message.text}
-      {mine && last && (
-        <span className="mt-0.5 block text-right text-[10px] text-primary-foreground/70">
-          {formatTime(message.at)}
-        </span>
-      )}
+      {/* WhatsApp-style: text flows, the timestamp tucks into the last line. */}
+      <span className="whitespace-pre-wrap break-words align-bottom">{message.text}</span>
+      <span
+        className={cn(
+          "float-right ml-2 translate-y-1 select-none text-[10px]",
+          mine ? "text-primary-foreground/70" : "text-muted-foreground",
+        )}
+      >
+        {formatTime(message.at)}
+      </span>
     </div>
   );
 }
