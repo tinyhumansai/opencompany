@@ -36,3 +36,8 @@ description = "Generate contracts from templates."
 id = "follow_up_agent"
 role = "Follow-up Agent"
 description = "Nurture and follow up on pipeline."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["sales_pipeline"]

@@ -19,10 +19,16 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
+use crate::ports::facts::FactStore;
+use crate::ports::inbox::InboxStore;
 use crate::ports::memory::MemoryStore;
 use crate::ports::secrets::SecretStore;
+use crate::ports::skills_state::SkillStateStore;
 use crate::ports::store::CompanyStore;
+use crate::ports::tasks::TaskStore;
 use crate::ports::types::CompanyId;
+use crate::ports::usage::UsageMeter;
+use crate::ports::workspace::WorkspaceStore;
 
 /// Which storage backend hosts the durable ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -70,6 +76,12 @@ pub struct StorageHandles {
     pub memory: Arc<dyn MemoryStore>,
     pub context: Arc<dyn ContextStore>,
     pub secrets: Arc<dyn SecretStore>,
+    pub inbox: Arc<dyn InboxStore>,
+    pub tasks: Arc<dyn TaskStore>,
+    pub workspace: Arc<dyn WorkspaceStore>,
+    pub facts: Arc<dyn FactStore>,
+    pub usage: Arc<dyn UsageMeter>,
+    pub skills: Arc<dyn SkillStateStore>,
     /// Present when the backend persists company → tenant ownership.
     pub ownership: Option<Arc<dyn OwnershipStore>>,
 }
@@ -136,7 +148,13 @@ fn open_sqlite(data_dir: &Path) -> Result<Option<StorageHandles>> {
         events: store.clone(),
         memory: store.clone(),
         context: store.clone(),
-        secrets: store,
+        secrets: store.clone(),
+        inbox: store.clone(),
+        tasks: store.clone(),
+        workspace: store.clone(),
+        facts: store.clone(),
+        usage: store.clone(),
+        skills: store,
         ownership: None,
     }))
 }
@@ -163,6 +181,12 @@ async fn open_mongodb(settings: &StorageSettings) -> Result<Option<StorageHandle
         memory: store.clone(),
         context: store.clone(),
         secrets: store.clone(),
+        inbox: store.clone(),
+        tasks: store.clone(),
+        workspace: store.clone(),
+        facts: store.clone(),
+        usage: store.clone(),
+        skills: store.clone(),
         ownership: Some(store),
     }))
 }

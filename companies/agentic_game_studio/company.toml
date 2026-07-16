@@ -41,3 +41,8 @@ description = "Tune difficulty and game balance."
 id = "marketer"
 role = "Marketer"
 description = "Market and promote the launch."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["game_build_pipeline"]

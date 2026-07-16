@@ -1,0 +1,107 @@
+# Workflow graph: diligence_pipeline
+#
+# Referenced by `[workflows].enabled = ["diligence_pipeline"]` in ../company.toml.
+# A deal goes from sourcing through diligence to an investment memo the operator
+# decides on. Node kinds mirror the tinyflows model.
+
+id = "diligence_pipeline"
+name = "Diligence pipeline"
+description = "A deal goes from sourcing to an investment memo for the operator."
+
+[[node]]
+id = "inbound"
+kind = "trigger"
+name = "New deal"
+summary = "A deal enters the pipeline."
+
+[[node]]
+id = "source"
+kind = "agent"
+name = "Source and screen"
+summary = "Profile the founders and the fit."
+agent = "founder_sourcer"
+
+[[node]]
+id = "deck"
+kind = "agent"
+name = "Evaluate the deck"
+summary = "Read the pitch and the story."
+agent = "deck_evaluator"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Worth diligence?"
+summary = "Advance to diligence or pass."
+
+[[node]]
+id = "market"
+kind = "agent"
+name = "Size the market"
+summary = "Assess the market and timing."
+agent = "market_sizer"
+
+[[node]]
+id = "code"
+kind = "agent"
+name = "Technical diligence"
+summary = "Review the product and code."
+agent = "code_analyst"
+
+[[node]]
+id = "references"
+kind = "agent"
+name = "Check references"
+summary = "Talk to references on the team."
+agent = "reference_checker"
+
+[[node]]
+id = "portfolio"
+kind = "agent"
+name = "Prep onboarding"
+summary = "Ready portfolio support if it closes."
+agent = "portfolio_support"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Investment memo"
+summary = "Deliver the memo and recommendation."
+
+[[edge]]
+from = "inbound"
+to = "source"
+
+[[edge]]
+from = "source"
+to = "deck"
+
+[[edge]]
+from = "deck"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "market"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "no"
+
+[[edge]]
+from = "market"
+to = "code"
+
+[[edge]]
+from = "code"
+to = "references"
+
+[[edge]]
+from = "references"
+to = "portfolio"
+
+[[edge]]
+from = "portfolio"
+to = "done"

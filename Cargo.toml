@@ -48,6 +48,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite", "repl"] }
 
+# WS4: openhuman embedded as a library (the harness). Only links under the
+# `openhuman` feature; the default build pulls none of this enormous native
+# dependency tree. `default-features = false` drops only the treesitter code
+# compressor — openhuman has no other optional heavy deps to shed.
+openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false }
+# The openhuman `Provider`/`Memory` traits return `anyhow::Result` and log via
+# the `log` facade; both only link under the `openhuman` feature.
+anyhow = { version = "1", optional = true }
+log = { version = "0.4", optional = true }
+
 # Optional network client shared by the feature-gated integrations below; the
 # default build links no network crates.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
@@ -74,6 +84,16 @@ mongodb = { version = "3", optional = true }
 # port-driven bundle core works on an unpacked directory without it.
 tar = { version = "0.4", optional = true }
 
+# Recursive DNS resolution for custom-domain verification. Only links under the
+# `dns` feature; the `DnsResolver` trait + offline `StaticDnsResolver` compile
+# without it.
+hickory-resolver = { version = "0.24", optional = true }
+
+# SMTP outbound transport for the test-send and per-teammate outbound mail. Only
+# links under the `smtp` feature; the `MailSender` trait + offline mock compile
+# without it. Pure-Rust rustls TLS so no system libs are required.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
+
 # Offline crypto for the tiny.place economy identity. All three are optional and
 # only link under the `tinyplace` feature; the default build pulls none of them.
 # `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
@@ -85,6 +105,12 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 [features]
 default = []
 tiny = ["tinyagents"]
+# WS4: embed `vendor/openhuman` (`openhuman_core`) directly as the tenant agent
+# harness via `AgentBuilder`. `src/harness/` compiles only under this feature;
+# the default build stays offline and echo-brained (byte-for-byte unaffected).
+# `reqwest` is pulled in for the hosted Medulla inference `Provider`; the
+# `MockProvider` and every adapter compile without touching the network.
+openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log"]
 # Real HTTP transport to openhuman-core. The trait + offline mock + providers
 # compile without this; only `HttpOpenHumanRpc` is gated behind it.
 openhuman-rpc = ["dep:reqwest"]
@@ -136,9 +162,33 @@ sidecar = []
 # port-driven export/import core (unpacked bundle directory) compiles without
 # this; only `pack_tar`/`unpack_tar` are gated here.
 export = ["dep:tar"]
+# Recursive DNS resolution for custom-domain verification. The `DnsResolver`
+# trait, the offline `StaticDnsResolver`, and the pure record generation compile
+# without this; only `HickoryDnsResolver` is gated here.
+dns = ["dep:hickory-resolver"]
+# Real SMTP send for the domain/email surface. The `MailSender` trait and the
+# offline `RecordingMailSender` compile without this; only `LettreMailSender` is
+# gated here.
+smtp = ["dep:lettre"]
+# OAuth connection lifecycle (authorize-url + server-side token exchange). The
+# read-only connections catalog compiles without this; only the token-exchanging
+# write routes are gated here (they need the shared `reqwest` client).
+oauth = ["dep:reqwest"]
 
 [patch.crates-io]
+# opencompany's own vendored tinyagents (1.8.0). Satisfies openhuman's `^1.7`.
 tinyagents = { path = "vendor/tinyagents" }
+# WS4: openhuman's own Cargo.toml `[patch.crates-io]` is ignored when it is a
+# path dependency, so its vendored-submodule patches must be replicated here
+# (paths rebased onto `vendor/openhuman/vendor/...`). These entries are inert in
+# the default build — none of these crates are in the graph until the
+# `openhuman` feature is on — so they leave the offline build unaffected.
+tinyflows = { path = "vendor/openhuman/vendor/tinyflows" }
+tinycortex = { path = "vendor/openhuman/vendor/tinycortex" }
+tinyjuice = { path = "vendor/openhuman/vendor/tinyjuice" }
+tinychannels = { path = "vendor/openhuman/vendor/tinychannels" }
+tinyplace = { path = "vendor/openhuman/vendor/tinyplace/sdk/rust" }
+whisper-rs-sys = { git = "https://github.com/tinyhumansai/whisper-rs-sys.git", branch = "main" }
 
 [dev-dependencies]
 tempfile = "3"

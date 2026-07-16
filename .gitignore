@@ -13,3 +13,6 @@ lcov.info
 .DS_Store
 .idea/
 .vscode/
+
+# agent worktrees (isolation)
+.claude/worktrees/

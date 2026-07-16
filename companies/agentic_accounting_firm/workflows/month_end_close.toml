@@ -1,0 +1,85 @@
+# Workflow graph: month_end_close
+#
+# Referenced by `[workflows].enabled = ["month_end_close"]` in ../company.toml.
+# The books close, taxes and forecasts update, and the package is parked for
+# the operator's sign-off. Node kinds mirror the tinyflows model.
+
+id = "month_end_close"
+name = "Month-end close"
+description = "The books close, filings and forecasts update, ready for sign-off."
+
+[[node]]
+id = "close"
+kind = "trigger"
+name = "Month closes"
+summary = "The period ends and the close begins."
+
+[[node]]
+id = "reconcile"
+kind = "agent"
+name = "Reconcile the books"
+summary = "Record and reconcile every account."
+agent = "bookkeeper"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Filing due?"
+summary = "Branch on whether a tax filing is due."
+
+[[node]]
+id = "taxes"
+kind = "agent"
+name = "Prepare filing"
+summary = "Prepare the tax filing for the period."
+agent = "tax_preparer"
+
+[[node]]
+id = "forecast"
+kind = "agent"
+name = "Update forecast"
+summary = "Refresh the forecast with actuals."
+agent = "forecaster"
+
+[[node]]
+id = "package"
+kind = "agent"
+name = "Assemble audit trail"
+summary = "Collect the documentation for the record."
+agent = "audit_prep"
+
+[[node]]
+id = "review"
+kind = "output"
+name = "Park for sign-off"
+summary = "Send the close package to the operator."
+
+[[edge]]
+from = "close"
+to = "reconcile"
+
+[[edge]]
+from = "reconcile"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "taxes"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "forecast"
+label = "no"
+
+[[edge]]
+from = "taxes"
+to = "forecast"
+
+[[edge]]
+from = "forecast"
+to = "package"
+
+[[edge]]
+from = "package"
+to = "review"

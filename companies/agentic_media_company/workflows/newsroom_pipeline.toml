@@ -1,0 +1,129 @@
+# Workflow graph: newsroom_pipeline
+#
+# Referenced by `[workflows].enabled = ["newsroom_pipeline"]` in ../company.toml.
+# A story tip goes from scouting through verification to a written, illustrated,
+# published and distributed story. Node kinds mirror the tinyflows model.
+
+id = "newsroom_pipeline"
+name = "Newsroom pipeline"
+description = "A tip becomes a verified, published, and distributed story."
+
+[[node]]
+id = "tip"
+kind = "trigger"
+name = "Story tip"
+summary = "A tip or lead arrives."
+
+[[node]]
+id = "scout"
+kind = "agent"
+name = "Scout the story"
+summary = "Assess whether there is a story here."
+agent = "story_scout"
+
+[[node]]
+id = "verify"
+kind = "agent"
+name = "Verify sources"
+summary = "Check the facts and sourcing."
+agent = "source_verifier"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Verified?"
+summary = "Run the story or spike it."
+
+[[node]]
+id = "write"
+kind = "agent"
+name = "Write the story"
+summary = "Draft the piece."
+agent = "writer"
+
+[[node]]
+id = "illustrate"
+kind = "agent"
+name = "Illustrate"
+summary = "Produce the art for the piece."
+agent = "illustrator"
+
+[[node]]
+id = "seo"
+kind = "agent"
+name = "Optimize for search"
+summary = "Tune the headline and metadata."
+agent = "seo_optimizer"
+
+[[node]]
+id = "translate"
+kind = "agent"
+name = "Translate"
+summary = "Localize the piece for other audiences."
+agent = "translator"
+
+[[node]]
+id = "publish"
+kind = "agent"
+name = "Publish"
+summary = "Publish the story."
+agent = "publisher"
+
+[[node]]
+id = "distribute"
+kind = "agent"
+name = "Distribute"
+summary = "Push the story across social."
+agent = "social_distributor"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report back"
+summary = "Report what ran and how it did."
+
+[[edge]]
+from = "tip"
+to = "scout"
+
+[[edge]]
+from = "scout"
+to = "verify"
+
+[[edge]]
+from = "verify"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "write"
+label = "verified"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "spiked"
+
+[[edge]]
+from = "write"
+to = "illustrate"
+
+[[edge]]
+from = "illustrate"
+to = "seo"
+
+[[edge]]
+from = "seo"
+to = "translate"
+
+[[edge]]
+from = "translate"
+to = "publish"
+
+[[edge]]
+from = "publish"
+to = "distribute"
+
+[[edge]]
+from = "distribute"
+to = "done"

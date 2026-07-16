@@ -189,6 +189,124 @@ pub trait SecretStore: Send + Sync {
 }
 ```
 
+## Console-surface stores (WS3)
+
+Six additional ports back the operator console's durable surfaces. They follow
+the same one-trait-per-file convention (`src/ports/{tasks,workspace,facts,
+usage,skills_state,inbox}.rs`), key everything on `CompanyId`, return the crate
+`Result<T>`, and are covered by the conformance suite
+([storage.md](storage.md)). Their fs/sqlite/mongodb backends live alongside the
+five core ports.
+
+### TaskStore
+
+The Kanban task board (`src/ports/tasks.rs`).
+
+```rust
+pub trait TaskStore: Send + Sync {
+    async fn list(&self, company: &CompanyId) -> Result<Vec<TaskRecord>>;
+    async fn upsert(&self, company: &CompanyId, task: &TaskRecord) -> Result<()>;
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
+}
+```
+
+`TaskRecord` carries `{id, title, note, column, priority, assignee,
+updated_at}`. `column` ∈ `backlog|in_progress|in_review|done`.
+
+### WorkspaceStore
+
+The Obsidian-style note tree (`src/ports/workspace.rs`), seeded from the
+company's `workspace/**` on first use.
+
+```rust
+pub trait WorkspaceStore: Send + Sync {
+    async fn tree(&self, company: &CompanyId) -> Result<Vec<WorkspaceNode>>;
+    async fn read(&self, company: &CompanyId, id: &str)
+        -> Result<Option<(WorkspaceNode, String)>>;
+    async fn write(&self, company: &CompanyId, id: &str, content: &str)
+        -> Result<WorkspaceNode>;
+    async fn create(&self, /* parent, name, kind, content */) -> Result<WorkspaceNode>;
+    async fn rename_move(&self, /* id, new_name, new_parent */) -> Result<WorkspaceNode>;
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
+    async fn is_empty(&self, company: &CompanyId) -> Result<bool>;
+}
+```
+
+Nodes are folders or files (`NodeKind`); `[[wikilink]]` backlinks are derived
+at read time by the GraphQL layer.
+
+### FactStore
+
+The operator's durable, hand-curated Memory view — distinct from the two
+cognition-facing memory ports (see
+[company-brain/memory.md](../company-brain/memory.md)).
+
+```rust
+pub trait FactStore: Send + Sync {
+    async fn list(&self, company: &CompanyId, /* query, kind, page */)
+        -> Result<Vec<FactRecord>>;
+    async fn upsert(&self, company: &CompanyId, fact: &FactRecord) -> Result<()>;
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
+}
+```
+
+`FactRecord` carries `{id, kind, title, body, source, updated_at}`; `FactKind`
+∈ `fact|preference|person|project|reference`.
+
+### UsageMeter
+
+Durable per-company usage accounting (`src/ports/usage.rs`); the WS5
+usage/finances projections read it.
+
+```rust
+pub trait UsageMeter: Send + Sync {
+    async fn record(&self, company: &CompanyId, sample: &UsageSample) -> Result<()>;
+    async fn query(&self, company: &CompanyId, since_millis: u64)
+        -> Result<Vec<UsageSample>>;
+}
+```
+
+`UsageSample` records one metered event (`SampleKind::Inference` tokens or
+`SampleKind::OauthCall`). **Retention:** backends evict samples older than
+**90 days** (`RETENTION_DAYS`, the console's maximum `D90` window) on write,
+anchored to the newest observed sample for deterministic eviction. Samples are
+non-secret accounting rows; money still resolves from the ledger and `[budget]`.
+
+### SkillStateStore
+
+Per-company installed-skill state overlay (`src/ports/skills_state.rs`) —
+enable/disable and provenance on top of the read-only `skills/` directory.
+
+```rust
+pub trait SkillStateStore: Send + Sync {
+    async fn list(&self, company: &CompanyId) -> Result<Vec<SkillState>>;
+    async fn set(&self, company: &CompanyId, state: &SkillState) -> Result<()>;
+    async fn remove(&self, company: &CompanyId, slug: &str) -> Result<bool>;
+}
+```
+
+`SkillState` carries the slug, `enabled`, and a `SkillSource`
+(`company|registry|custom`).
+
+### InboxStore
+
+Per-teammate email inboxes and their messages (`src/ports/inbox.rs`).
+
+```rust
+pub trait InboxStore: Send + Sync {
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<InboxMeta>>;
+    async fn set_enabled(&self, company: &CompanyId, key: &str, meta: &InboxMeta)
+        -> Result<()>;
+    async fn messages(&self, company: &CompanyId, /* key, page */)
+        -> Result<Vec<EmailRecord>>;
+    async fn append(&self, company: &CompanyId, msg: &EmailRecord) -> Result<()>;
+    async fn mark_read(&self, /* company, key, ids */) -> Result<u64>;
+}
+```
+
+Real send/receive depends on the domain/SMTP transport and the HMAC-signed
+inbound ingest webhook ([api.md](api.md)); the store itself is transport-blind.
+
 ## Assembly
 
 ```rust
@@ -223,3 +341,4 @@ the multi-tenant platform case with the same type.
 | `AgentEconomy` | none (companies work offline) | tinyplace |
 | `ApprovalGate` | manifest `[policy]` evaluator | OpenHuman policy hook |
 | `SecretStore` | fs (encrypted at rest) | OS keychain, operator-supplied |
+| `TaskStore`, `WorkspaceStore`, `FactStore`, `UsageMeter`, `SkillStateStore`, `InboxStore` | fs bundle | sqlite, mongodb |

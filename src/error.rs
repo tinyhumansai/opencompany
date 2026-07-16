@@ -54,6 +54,37 @@ pub enum OpenCompanyError {
         problems: Vec<String>,
     },
 
+    /// A company data file (workflow graph, skill doc, workspace note) could
+    /// not be read from disk.
+    #[error("could not read {path}: {source}")]
+    DataRead {
+        /// The data file path that failed to load.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// A company data file could not be parsed (invalid TOML, or a malformed
+    /// SKILL.md frontmatter block).
+    #[error("{path} could not be parsed: {message}")]
+    DataParse {
+        /// The data file path (or synthetic label) that failed to parse.
+        path: PathBuf,
+        /// A human-readable description of the parse failure.
+        message: String,
+    },
+
+    /// A company data file parsed but failed validation. Every message is
+    /// written in prosumer language and lists all problems at once, mirroring
+    /// [`Self::ManifestInvalid`].
+    #[error("{}", format_manifest_problems(.path, .problems))]
+    DataInvalid {
+        /// The data file path that failed validation.
+        path: PathBuf,
+        /// One human-readable problem per line.
+        problems: Vec<String>,
+    },
+
     /// A persistence backend reported a failure that has no more specific
     /// variant.
     #[error("store error: {0}")]
@@ -89,6 +120,12 @@ pub enum OpenCompanyError {
     #[error("company is {0}")]
     LifecycleConflict(String),
 
+    /// A write conflicts with a durable invariant that is not a lifecycle state
+    /// (e.g. uninstalling a built-in skill, or deleting a manifest-defined
+    /// agent). Renders as `409 Conflict`.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// A request was malformed or internally inconsistent (e.g. an approval
     /// resolution that pairs a `deny` verdict with an amended payload).
     #[error("invalid request: {0}")]
@@ -123,6 +160,11 @@ pub enum OpenCompanyError {
     /// A port method has no implementation in the current build.
     #[error("port not implemented: {0}")]
     Unimplemented(&'static str),
+
+    /// The embedded openhuman harness failed to build or run an agent.
+    #[cfg(feature = "openhuman")]
+    #[error("harness error: {0}")]
+    Harness(String),
 }
 
 impl OpenCompanyError {
@@ -161,6 +203,9 @@ impl OpenCompanyError {
             Self::ManifestRead { .. } => "manifest_read".to_string(),
             Self::ManifestParse(_, _) => "manifest_parse".to_string(),
             Self::ManifestInvalid { .. } => "manifest_invalid".to_string(),
+            Self::DataRead { .. } => "data_read".to_string(),
+            Self::DataParse { .. } => "data_parse".to_string(),
+            Self::DataInvalid { .. } => "data_invalid".to_string(),
             Self::Store(_) => "store_error".to_string(),
             Self::StoreIo { .. } => "store_io".to_string(),
             Self::Serde(_) => "serialization_error".to_string(),
@@ -168,11 +213,14 @@ impl OpenCompanyError {
             Self::ToolNotGranted(_) => "tool_not_granted".to_string(),
             Self::BudgetExceeded(_) => "budget_exceeded".to_string(),
             Self::LifecycleConflict(_) => "lifecycle_conflict".to_string(),
+            Self::Conflict(_) => "conflict".to_string(),
             Self::InvalidRequest(_) => "invalid_request".to_string(),
             Self::Config(_) => "config_error".to_string(),
             Self::Orchestration { code, .. } => code.clone(),
             Self::Tinyplace { code, .. } => format!("tinyplace_{code}"),
             Self::Unimplemented(_) => "unimplemented".to_string(),
+            #[cfg(feature = "openhuman")]
+            Self::Harness(_) => "harness_error".to_string(),
         }
     }
 }

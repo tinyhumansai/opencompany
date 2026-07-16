@@ -10,6 +10,49 @@ Operator chat and approvals live under `/api/v1/...` (see `server::operator`),
 and feedback under `server::feedback`. Add future API routes as focused handler
 groups rather than wiring behavior directly in the binary entrypoint.
 
+## Read plane — `server::graphql`
+
+The console's reads are one async-graphql query surface (`POST /graphql`, plus
+a `GET /graphql` GraphiQL explorer). The schema is **built once at startup**
+(`build_schema`) and stored on `AppState`; each request injects its resolved
+`GqlAuth` principal via request data. It is query-only — REST owns writes.
+
+The module is split one file per surface: `mod.rs` (the `Company`-rooted
+`QueryRoot` — `companies`, `company(id)`, `skillRegistry`), `auth.rs`
+(`GqlAuth`, claim resolution + `visible_companies`), `company.rs` (the
+aggregation object every view fetches through), `pagination.rs`, and one
+resolver file per view (`tasks`, `workspace`, `memory_facts`, `skills`,
+`inbox`, `workflows`, `usage`, `finances`, `connections`). `schema.graphql` is
+the checked-in SDL snapshot (the read contract); `graphql::sdl()` regenerates
+it and a snapshot test guards drift.
+
+## Write plane — `server::ops`
+
+Console writes are the `server::ops` router family. Each route is registered
+under **both** scope forms — `…/companies/{id}/…` and the `…/company/…`
+prosumer alias — by the `scoped` helper; the `ScopedCompany` extractor resolves
+the target runtime and enforces authorization per form (platform-or-operator +
+address check for `{id}`, operator + `sole()` for the alias).
+
+| Surface (`ops::*`) | Routes |
+|---|---|
+| `tasks` | `POST …/tasks`, `PATCH`/`DELETE …/tasks/{id}` |
+| `memory` | `POST …/memory`, `DELETE …/memory/{id}` (journals `MemoryFactDeleted`) |
+| `workspace` | `POST …/workspace`, `PUT …/workspace/file/{id}`, `PATCH`/`DELETE …/workspace/{id}` |
+| `skills` | `POST …/skills`, `POST …/skills/{slug}/install\|uninstall`, `PUT …/skills/{slug}` |
+| `team` | `POST …/team`, `DELETE …/team/{id}`, `PUT …/team/{id}/inbox` (overlay; roster-only in v1) |
+| `mail` | `POST …/inboxes/{key}/read` |
+| `inbox` | `POST …/inboxes/ingest` (HMAC-signed inbound email) |
+| `domain` | `PUT …/domain`, `POST …/domain/verify` |
+| `smtp` | `PUT …/smtp`, `POST …/smtp/test` |
+| `connections` (feature `oauth`) | `POST …/connections/{provider}/start\|disconnect`, `GET /api/v1/oauth/callback` |
+
+Every credential-shaped value written here lands in the `SecretStore`; the
+responses expose only non-secret status. The networked seams (DNS, SMTP, OAuth
+exchange) are dependency-inverted behind traits carried on `ConnectionsRuntime`
+and default to empty (offline) — a surface whose seam is absent returns
+`404 {"code":"not_wired"}`, which the console degrades gracefully.
+
 ## tiny.place A2A inbound + discovery (`tinyplace` feature)
 
 Behind the `tinyplace` feature the server mounts the agent-to-agent surface

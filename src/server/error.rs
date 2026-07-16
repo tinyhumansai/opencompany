@@ -23,6 +23,12 @@ impl From<OpenCompanyError> for ApiError {
     }
 }
 
+impl From<serde_json::Error> for ApiError {
+    fn from(error: serde_json::Error) -> Self {
+        Self(OpenCompanyError::from(error))
+    }
+}
+
 impl ApiError {
     /// The HTTP status this error maps to.
     pub fn status(&self) -> StatusCode {
@@ -32,7 +38,9 @@ impl ApiError {
             | OpenCompanyError::ManifestParse(_, _)
             | OpenCompanyError::MissingManifest(_)
             | OpenCompanyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-            OpenCompanyError::LifecycleConflict(_) => StatusCode::CONFLICT,
+            OpenCompanyError::LifecycleConflict(_) | OpenCompanyError::Conflict(_) => {
+                StatusCode::CONFLICT
+            }
             OpenCompanyError::ToolNotGranted(_) => StatusCode::FORBIDDEN,
             OpenCompanyError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,
             // tiny.place transport: an unreachable backend degrades to 503 so

@@ -1,11 +1,13 @@
 # Storage backends
 
-The five storage ports (`CompanyStore`, `EventLog`, `MemoryStore`,
-`ContextStore`, `SecretStore` — see [ports.md](ports.md)) are the entire
-persistence contract. The kernel never names an engine; a backend is anything
-that implements those traits and passes the conformance suite
-(`src/store/conformance.rs`). This file documents the shipped backends and
-how one is selected at boot.
+The storage ports (see [ports.md](ports.md)) are the entire persistence
+contract. The five core ports — `CompanyStore`, `EventLog`, `MemoryStore`,
+`ContextStore`, `SecretStore` — plus the six console-surface stores added in
+WS3 — `TaskStore`, `WorkspaceStore`, `FactStore`, `UsageMeter`,
+`SkillStateStore`, `InboxStore` — are all that a backend must implement. The
+kernel never names an engine; a backend is anything that implements those
+traits and passes the conformance suite (`src/store/conformance.rs`). This file
+documents the shipped backends and how one is selected at boot.
 
 ## Selection
 
@@ -19,6 +21,11 @@ aborts boot — there is never a silent fallback to the filesystem.
 | `fs` (default) | Per-company bundle directories | — | Human-inspectable; no external service |
 | `sqlite` | One SQLite file under the data dir | `sqlite` | Single-file, offline |
 | `mongodb` | A MongoDB database on a shared cluster | `mongodb` | The multi-tenant platform backend |
+
+Each backend implements **all eleven** ports. The fs backend keeps the core
+records as inspectable TOML/JSONL bundles and the WS3 console-surface stores
+under a sibling `ops/` layout (`src/store/fs_ops.rs`); sqlite and mongodb add
+one collection/table per store.
 
 MongoDB settings:
 
@@ -35,7 +42,10 @@ from a `counters` collection via atomic `findOneAndUpdate {$inc}`.
 
 Collections (all uniquely indexed on `company_id` + their key):
 `companies`, `ledger`, `events`, `memory_traces`, `memory_tasks`,
-`context_chunks`, `secrets`, plus `counters` and `owners`.
+`context_chunks`, `secrets`, plus `counters` and `owners`; and the WS3
+console-surface collections `tasks`, `workspace`, `facts`, `usage`, `skills`,
+and `inboxes`. The `usage` collection is trimmed to the 90-day retention window
+on each `record` (see [ports.md](ports.md), `UsageMeter`).
 
 ### Multi-tenant isolation (two layers)
 
@@ -60,6 +70,16 @@ Implement the five traits in a new `src/store/<engine>.rs` behind a feature
 flag, key everything on `company_id`, run the conformance suite against it,
 and add a `StorageKind` arm in `src/store/select.rs`. No business logic
 changes.
+
+## Conformance coverage
+
+`src/store/conformance.rs` is the backend-agnostic suite every backend runs.
+Beyond the core assertions (per-company isolation, append-only event/ledger,
+monotonic event sequence, export totality) it exercises each WS3 store —
+`assert_task_store`, `assert_workspace_store`, `assert_fact_store`,
+`assert_skill_state_store`, `assert_inbox_store`, `assert_usage_meter` — plus a
+dedicated `assert_usage_retention` that verifies samples older than the 90-day
+window are evicted on write. A new backend passes only when all of these hold.
 
 ## Testing
 

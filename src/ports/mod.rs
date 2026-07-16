@@ -14,11 +14,17 @@ pub mod channel;
 pub mod context;
 pub mod economy;
 pub mod events;
+pub mod facts;
+pub mod inbox;
 pub mod memory;
 pub mod secrets;
+pub mod skills_state;
 pub mod store;
+pub mod tasks;
 pub mod tools;
 pub mod types;
+pub mod usage;
+pub mod workspace;
 
 pub use approvals::ApprovalGate;
 pub use brain::{Brain, CycleHost};
@@ -26,12 +32,18 @@ pub use channel::ChannelAdapter;
 pub use context::ContextStore;
 pub use economy::AgentEconomy;
 pub use events::EventLog;
+pub use facts::{FactKind, FactRecord, FactStore};
 pub use ids::{generate_id, now_millis};
+pub use inbox::{EmailRecord, InboxMeta, InboxStore};
 pub use memory::MemoryStore;
 pub use secrets::SecretStore;
+pub use skills_state::{SkillSource, SkillState, SkillStateStore};
 pub use store::CompanyStore;
+pub use tasks::{TaskRecord, TaskStore};
 pub use tools::ToolProvider;
 pub use types::*;
+pub use usage::{SampleKind, UsageMeter, UsageSample};
+pub use workspace::{NodeKind, WorkspaceNode, WorkspaceStore};
 
 #[cfg(test)]
 mod test {
@@ -55,6 +67,12 @@ mod test {
         _economy: &dyn AgentEconomy,
         _approvals: &dyn ApprovalGate,
         _secrets: &dyn SecretStore,
+        _inbox: &dyn crate::ports::inbox::InboxStore,
+        _tasks: &dyn crate::ports::tasks::TaskStore,
+        _workspace: &dyn crate::ports::workspace::WorkspaceStore,
+        _facts: &dyn crate::ports::facts::FactStore,
+        _usage: &dyn crate::ports::usage::UsageMeter,
+        _skills: &dyn crate::ports::skills_state::SkillStateStore,
     ) {
     }
 

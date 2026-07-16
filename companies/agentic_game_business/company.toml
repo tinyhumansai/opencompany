@@ -41,3 +41,8 @@ description = "Grow and moderate the player community."
 id = "player_support"
 role = "Player Support"
 description = "Resolve player issues and refunds."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["liveops_pipeline"]

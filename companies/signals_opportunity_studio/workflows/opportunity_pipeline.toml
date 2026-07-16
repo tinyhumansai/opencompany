@@ -1,0 +1,74 @@
+# Workflow graph: opportunity_pipeline
+#
+# Referenced by `[workflows].enabled = ["opportunity_pipeline"]` in ../company.toml.
+# The weekly scan turns raw signals into a ranked, researched opportunity brief.
+# Node kinds mirror the tinyflows model.
+
+id = "opportunity_pipeline"
+name = "Opportunity pipeline"
+description = "The weekly scan turns signals into a ranked opportunity brief."
+
+[[node]]
+id = "cadence"
+kind = "trigger"
+name = "Weekly scan"
+summary = "The weekly cadence fires."
+
+[[node]]
+id = "scout"
+kind = "agent"
+name = "Gather signals"
+summary = "Pull fresh signals from every source."
+agent = "signal_scout"
+
+[[node]]
+id = "cluster"
+kind = "agent"
+name = "Cluster into pains"
+summary = "Group signals and rank the opportunities."
+agent = "opportunity_analyst"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Strong signal?"
+summary = "Deep-dive the top opportunities or brief as-is."
+
+[[node]]
+id = "research"
+kind = "agent"
+name = "Deep research"
+summary = "Investigate the top opportunities."
+agent = "research_agent"
+
+[[node]]
+id = "brief"
+kind = "output"
+name = "Ranked brief"
+summary = "Deliver the ranked brief to the operator."
+
+[[edge]]
+from = "cadence"
+to = "scout"
+
+[[edge]]
+from = "scout"
+to = "cluster"
+
+[[edge]]
+from = "cluster"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "research"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "brief"
+label = "no"
+
+[[edge]]
+from = "research"
+to = "brief"

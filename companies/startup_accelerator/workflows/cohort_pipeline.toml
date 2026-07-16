@@ -1,0 +1,129 @@
+# Workflow graph: cohort_pipeline
+#
+# Referenced by `[workflows].enabled = ["cohort_pipeline"]` in ../company.toml.
+# Applications go from screening through the program to demo day and alumni
+# support. Node kinds mirror the tinyflows model.
+
+id = "cohort_pipeline"
+name = "Cohort pipeline"
+description = "Applications go from screening through the program to demo day."
+
+[[node]]
+id = "open"
+kind = "trigger"
+name = "Applications open"
+summary = "The application window opens."
+
+[[node]]
+id = "scout"
+kind = "agent"
+name = "Scout startups"
+summary = "Source strong applicants."
+agent = "startup_scout"
+
+[[node]]
+id = "screen"
+kind = "agent"
+name = "Screen applications"
+summary = "Rank applicants against the bar."
+agent = "application_screener"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Admit?"
+summary = "Admit to the cohort or pass."
+
+[[node]]
+id = "mentor"
+kind = "agent"
+name = "Match mentors"
+summary = "Pair each startup with mentors."
+agent = "mentor_matcher"
+
+[[node]]
+id = "curriculum"
+kind = "agent"
+name = "Design curriculum"
+summary = "Tailor the program to the cohort."
+agent = "curriculum_designer"
+
+[[node]]
+id = "coach"
+kind = "agent"
+name = "Coach progress"
+summary = "Track and unblock each startup."
+agent = "progress_coach"
+
+[[node]]
+id = "demo"
+kind = "agent"
+name = "Produce demo day"
+summary = "Prepare the cohort for demo day."
+agent = "demo_day_producer"
+
+[[node]]
+id = "investors"
+kind = "agent"
+name = "Connect investors"
+summary = "Introduce the cohort to investors."
+agent = "investor_liaison"
+
+[[node]]
+id = "alumni"
+kind = "agent"
+name = "Support alumni"
+summary = "Keep supporting after the program."
+agent = "portfolio_support"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report to operator"
+summary = "Report cohort outcomes and the ask."
+
+[[edge]]
+from = "open"
+to = "scout"
+
+[[edge]]
+from = "scout"
+to = "screen"
+
+[[edge]]
+from = "screen"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "mentor"
+label = "admit"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "pass"
+
+[[edge]]
+from = "mentor"
+to = "curriculum"
+
+[[edge]]
+from = "curriculum"
+to = "coach"
+
+[[edge]]
+from = "coach"
+to = "demo"
+
+[[edge]]
+from = "demo"
+to = "investors"
+
+[[edge]]
+from = "investors"
+to = "alumni"
+
+[[edge]]
+from = "alumni"
+to = "done"

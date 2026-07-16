@@ -1,0 +1,96 @@
+# Workflow graph: design_pipeline
+#
+# Referenced by `[workflows].enabled = ["design_pipeline"]` in ../company.toml.
+# A brief goes from research through brand and UI to delivered design. Node
+# kinds mirror the tinyflows model.
+
+id = "design_pipeline"
+name = "Design pipeline"
+description = "A brief goes from research to a delivered design system."
+
+[[node]]
+id = "brief"
+kind = "trigger"
+name = "New design brief"
+summary = "A client drops a design brief."
+
+[[node]]
+id = "research"
+kind = "agent"
+name = "User research"
+summary = "Validate the audience and needs."
+agent = "user_researcher"
+
+[[node]]
+id = "brand"
+kind = "agent"
+name = "Brand direction"
+summary = "Set the visual direction."
+agent = "brand_designer"
+
+[[node]]
+id = "ui"
+kind = "agent"
+name = "UI design"
+summary = "Design the screens and components."
+agent = "ui_designer"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Needs motion?"
+summary = "Branch on whether motion is in scope."
+
+[[node]]
+id = "motion"
+kind = "agent"
+name = "Motion design"
+summary = "Design the transitions and micro-interactions."
+agent = "motion_designer"
+
+[[node]]
+id = "illustration"
+kind = "agent"
+name = "Illustration"
+summary = "Produce custom illustration and icons."
+agent = "illustrator"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Deliver for direction"
+summary = "Hand the system to the operator for sign-off."
+
+[[edge]]
+from = "brief"
+to = "research"
+
+[[edge]]
+from = "research"
+to = "brand"
+
+[[edge]]
+from = "brand"
+to = "ui"
+
+[[edge]]
+from = "ui"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "motion"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "illustration"
+label = "no"
+
+[[edge]]
+from = "motion"
+to = "illustration"
+
+[[edge]]
+from = "illustration"
+to = "done"

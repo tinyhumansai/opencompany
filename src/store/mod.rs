@@ -14,6 +14,9 @@
 /// directory; a single-file `.tar` wrapper is gated behind the `export` feature.
 pub mod export;
 pub mod fs;
+/// Filesystem backends for the WS3 console ports (tasks, facts, usage,
+/// skill-state, workspace tree) over the same [`Bundle`](paths::Bundle) layout.
+pub mod fs_ops;
 pub mod paths;
 
 /// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
@@ -51,7 +54,10 @@ pub mod tinycortex;
 #[cfg(test)]
 pub mod conformance;
 
-pub use fs::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
+pub use fs::{
+    FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsSecretStore,
+};
+pub use fs_ops::FsOps;
 pub use paths::{Bundle, default_home};
 pub use select::{StorageHandles, StorageKind, StorageSettings, open_storage};
 

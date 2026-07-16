@@ -26,3 +26,8 @@ description = "Run in-silico simulations and screening."
 id = "trial_planner"
 role = "Trial Planner"
 description = "Design and plan clinical trials."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["discovery_pipeline"]

@@ -31,3 +31,8 @@ description = "Route and manage escalations."
 id = "refund_handler"
 role = "Refund Handler"
 description = "Process refunds within policy."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["ticket_pipeline"]

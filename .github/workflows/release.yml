@@ -21,6 +21,16 @@ jobs:
           persist-credentials: false
           submodules: true
 
+      # `openhuman_core` is an optional path dependency, so Cargo must resolve
+      # its vendored-crate manifests even for the default build. `submodules:
+      # true` is not recursive, so init the nested crates the `[patch]` entries
+      # reference.
+      - name: Init vendored openhuman crate submodules
+        run: |
+          git -C vendor/openhuman submodule update --init --depth 1 \
+            vendor/tinyflows vendor/tinycortex vendor/tinyjuice \
+            vendor/tinychannels vendor/tinyplace
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify

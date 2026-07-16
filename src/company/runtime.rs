@@ -24,11 +24,29 @@ use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    MemoryStore, SecretStore, ToolProvider,
+    FactStore, InboxStore, MemoryStore, SecretStore, SkillStateStore, TaskStore, ToolProvider,
+    UsageMeter, WorkspaceStore,
 };
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
+
+/// The WS3 console ports, bundled so the runtime constructor stays legible.
+/// Each is an `Arc<dyn …>` keyed by [`CompanyId`], defaulting to the fs backend
+/// and overridden together when a non-fs backend is selected.
+#[derive(Clone)]
+pub struct OpsStores {
+    /// The durable task board.
+    pub tasks: Arc<dyn TaskStore>,
+    /// The durable workspace file tree.
+    pub workspace: Arc<dyn WorkspaceStore>,
+    /// The durable memory-facts view.
+    pub facts: Arc<dyn FactStore>,
+    /// The usage meter (written by the WS4 cost hook, read by WS5).
+    pub usage: Arc<dyn UsageMeter>,
+    /// Operator deltas over the company's skills.
+    pub skills: Arc<dyn SkillStateStore>,
+}
 
 /// A running company: its brain, stores, channels, and policy gate, wired
 /// together behind a serial cycle loop.
@@ -51,12 +69,21 @@ pub struct CompanyRuntime {
     /// Per-company secrets, read by the feedback scrubber (and webhook HMAC
     /// verification, later).
     pub(crate) secrets: Arc<dyn SecretStore>,
+    /// Per-teammate email (inbound + outbound), backing the inbox surface.
+    pub(crate) inbox: Arc<dyn InboxStore>,
+    /// The WS3 console ports (tasks, workspace, facts, usage, skills).
+    pub(crate) ops: OpsStores,
     /// Durable store of feedback items (the "feedback family").
     pub(crate) feedback: Arc<FeedbackStore>,
     /// Filing configuration: the GitHub client, target repo, consent, limiter.
     pub(crate) filer: Arc<FeedbackFiler>,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
+    /// WS4: the embedded openhuman harness pool, when wired via
+    /// [`RuntimeBuilder::with_harness`](crate::runtime::RuntimeBuilder::with_harness).
+    /// Feature-gated so the default build is unaffected.
+    #[cfg(feature = "openhuman")]
+    pub(crate) harness: Option<Arc<crate::harness::HarnessPool>>,
 }
 
 impl CompanyRuntime {
@@ -76,6 +103,8 @@ impl CompanyRuntime {
         approval_gate: Arc<ManifestApprovalGate>,
         journal: Arc<RuntimeJournal>,
         secrets: Arc<dyn SecretStore>,
+        inbox: Arc<dyn InboxStore>,
+        ops: OpsStores,
         feedback: Arc<FeedbackStore>,
         filer: Arc<FeedbackFiler>,
     ) -> Self {
@@ -94,15 +123,78 @@ impl CompanyRuntime {
             approval_gate,
             journal,
             secrets,
+            inbox,
+            ops,
             feedback,
             filer,
             serial: TokioMutex::new(()),
+            #[cfg(feature = "openhuman")]
+            harness: None,
         }
+    }
+
+    /// WS4: attach an embedded harness pool after construction (called by the
+    /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder)).
+    #[cfg(feature = "openhuman")]
+    pub fn set_harness(&mut self, harness: Arc<crate::harness::HarnessPool>) {
+        self.harness = Some(harness);
+    }
+
+    /// WS4: the embedded harness pool, if one is wired. The chat layer (WS3)
+    /// routes desk turns through this when present.
+    #[cfg(feature = "openhuman")]
+    pub fn harness(&self) -> Option<&Arc<crate::harness::HarnessPool>> {
+        self.harness.as_ref()
     }
 
     /// This company's id.
     pub fn id(&self) -> &CompanyId {
         &self.id
+    }
+
+    /// This company's secret store (SMTP creds, OAuth tokens, domain config).
+    pub fn secrets(&self) -> &Arc<dyn SecretStore> {
+        &self.secrets
+    }
+
+    /// This company's event log (append-only audit trail).
+    pub fn events(&self) -> &Arc<dyn EventLog> {
+        &self.events
+    }
+
+    /// This company's durable record store.
+    pub fn store(&self) -> &Arc<dyn CompanyStore> {
+        &self.store
+    }
+
+    /// This company's inbox store (inbound + outbound email).
+    pub fn inbox(&self) -> &Arc<dyn InboxStore> {
+        &self.inbox
+    }
+
+    /// This company's task board.
+    pub fn tasks(&self) -> &Arc<dyn TaskStore> {
+        &self.ops.tasks
+    }
+
+    /// This company's workspace file tree.
+    pub fn workspace(&self) -> &Arc<dyn WorkspaceStore> {
+        &self.ops.workspace
+    }
+
+    /// This company's durable memory-facts view.
+    pub fn facts(&self) -> &Arc<dyn FactStore> {
+        &self.ops.facts
+    }
+
+    /// This company's usage meter (written by the cost hook, read by WS5).
+    pub fn usage(&self) -> &Arc<dyn UsageMeter> {
+        &self.ops.usage
+    }
+
+    /// This company's skill-state deltas.
+    pub fn skills(&self) -> &Arc<dyn SkillStateStore> {
+        &self.ops.skills
     }
 
     /// Whether an agent economy (tiny.place) is wired in.

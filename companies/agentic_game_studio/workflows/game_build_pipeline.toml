@@ -1,0 +1,118 @@
+# Workflow graph: game_build_pipeline
+#
+# Referenced by `[workflows].enabled = ["game_build_pipeline"]` in ../company.toml.
+# A concept goes from world and narrative through build and playtest to a
+# marketed ship. Node kinds mirror the tinyflows model.
+
+id = "game_build_pipeline"
+name = "Game build pipeline"
+description = "A concept becomes a playtested, marketed build."
+
+[[node]]
+id = "concept"
+kind = "trigger"
+name = "New concept"
+summary = "A game or feature concept is greenlit."
+
+[[node]]
+id = "world"
+kind = "agent"
+name = "Build the world"
+summary = "Establish the setting and rules."
+agent = "world_builder"
+
+[[node]]
+id = "narrative"
+kind = "agent"
+name = "Write the narrative"
+summary = "Design the story and characters."
+agent = "narrative_designer"
+
+[[node]]
+id = "gameplay"
+kind = "agent"
+name = "Build gameplay"
+summary = "Implement the mechanics."
+agent = "gameplay_engineer"
+
+[[node]]
+id = "assets"
+kind = "agent"
+name = "Generate assets"
+summary = "Produce art and audio."
+agent = "asset_generator"
+
+[[node]]
+id = "balance"
+kind = "agent"
+name = "Balance the game"
+summary = "Tune difficulty and progression."
+agent = "balance_designer"
+
+[[node]]
+id = "qa"
+kind = "agent"
+name = "Playtest"
+summary = "Test for bugs and feel."
+agent = "qa_tester"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "QA passed?"
+summary = "Ship or send back for rework."
+
+[[node]]
+id = "marketing"
+kind = "agent"
+name = "Market the launch"
+summary = "Promote the build."
+agent = "marketer"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Ship and report"
+summary = "Release behind approval and report back."
+
+[[edge]]
+from = "concept"
+to = "world"
+
+[[edge]]
+from = "world"
+to = "narrative"
+
+[[edge]]
+from = "narrative"
+to = "gameplay"
+
+[[edge]]
+from = "gameplay"
+to = "assets"
+
+[[edge]]
+from = "assets"
+to = "balance"
+
+[[edge]]
+from = "balance"
+to = "qa"
+
+[[edge]]
+from = "qa"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "marketing"
+label = "pass"
+
+[[edge]]
+from = "gate"
+to = "gameplay"
+label = "fail"
+
+[[edge]]
+from = "marketing"
+to = "done"

@@ -46,3 +46,8 @@ description = "Engage and moderate the community."
 id = "sponsorship_outreach"
 role = "Sponsorship Outreach"
 description = "Source and negotiate sponsorships."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["content_pipeline"]

@@ -144,6 +144,50 @@ impl Bundle {
         self.feedback_dir().join("items.jsonl")
     }
 
+    /// Path to the append-only inbox log (all inboxes interleaved, one JSON
+    /// email per line).
+    pub fn inbox_jsonl(&self) -> PathBuf {
+        self.dir.join("inbox.jsonl")
+    }
+
+    /// Path to the inbox metadata map (`key` → non-secret [`InboxMeta`], one
+    /// JSON object per inbox key).
+    pub fn inbox_meta_json(&self) -> PathBuf {
+        self.dir.join("inbox-meta.json")
+    }
+
+    /// Path to the task board (`tasks.json`, the full board as a JSON array).
+    pub fn tasks_json(&self) -> PathBuf {
+        self.dir.join("tasks.json")
+    }
+
+    /// Path to the durable facts log (`facts.jsonl`, one fact per line;
+    /// last-write-wins per id).
+    pub fn facts_jsonl(&self) -> PathBuf {
+        self.dir.join("facts.jsonl")
+    }
+
+    /// Path to the usage-sample log (`usage.jsonl`, one sample per line).
+    pub fn usage_jsonl(&self) -> PathBuf {
+        self.dir.join("usage.jsonl")
+    }
+
+    /// Path to the skill-state deltas (`skills.json`, the full delta set).
+    pub fn skills_json(&self) -> PathBuf {
+        self.dir.join("skills.json")
+    }
+
+    /// The workspace subdirectory holding the seeded/edited file tree.
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.dir.join("workspace")
+    }
+
+    /// Path to the workspace ULID → relative-path index
+    /// (`.workspace-index.json`).
+    pub fn workspace_index_json(&self) -> PathBuf {
+        self.workspace_dir().join(".workspace-index.json")
+    }
+
     /// The per-company secrets subdirectory.
     pub fn secrets_dir(&self) -> PathBuf {
         self.dir.join("secrets")

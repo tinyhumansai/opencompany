@@ -1,0 +1,107 @@
+# Workflow graph: liveops_pipeline
+#
+# Referenced by `[workflows].enabled = ["liveops_pipeline"]` in ../company.toml.
+# The live game's cadence turns data into an event, a monetization pass, and a
+# growth push. Node kinds mirror the tinyflows model.
+
+id = "liveops_pipeline"
+name = "LiveOps pipeline"
+description = "The cadence turns data into an event, offers, and a growth push."
+
+[[node]]
+id = "cadence"
+kind = "trigger"
+name = "LiveOps cadence"
+summary = "The scheduled LiveOps beat fires."
+
+[[node]]
+id = "analytics"
+kind = "agent"
+name = "Read the metrics"
+summary = "Pull engagement and revenue signals."
+agent = "analytics_analyst"
+
+[[node]]
+id = "event"
+kind = "agent"
+name = "Design the event"
+summary = "Plan the next in-game event."
+agent = "liveops_manager"
+
+[[node]]
+id = "monetization"
+kind = "agent"
+name = "Tune the offers"
+summary = "Design the offers around the event."
+agent = "monetization_designer"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Store update?"
+summary = "Branch on whether the store needs a refresh."
+
+[[node]]
+id = "store"
+kind = "agent"
+name = "Refresh the store"
+summary = "Update the store listing and creatives."
+agent = "store_optimizer"
+
+[[node]]
+id = "acquisition"
+kind = "agent"
+name = "Growth push"
+summary = "Run acquisition around the event."
+agent = "user_acquisition"
+
+[[node]]
+id = "community"
+kind = "agent"
+name = "Rally the community"
+summary = "Announce and moderate the event."
+agent = "community_manager"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Launch and report"
+summary = "Go live behind approval and report back."
+
+[[edge]]
+from = "cadence"
+to = "analytics"
+
+[[edge]]
+from = "analytics"
+to = "event"
+
+[[edge]]
+from = "event"
+to = "monetization"
+
+[[edge]]
+from = "monetization"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "store"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "acquisition"
+label = "no"
+
+[[edge]]
+from = "store"
+to = "acquisition"
+
+[[edge]]
+from = "acquisition"
+to = "community"
+
+[[edge]]
+from = "community"
+to = "done"

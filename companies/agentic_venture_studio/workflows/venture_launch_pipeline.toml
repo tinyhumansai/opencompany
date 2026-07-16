@@ -1,0 +1,140 @@
+# Workflow graph: venture_launch_pipeline
+#
+# Referenced by `[workflows].enabled = ["venture_launch_pipeline"]` in ../company.toml.
+# An idea goes from thesis through staffing, build, and legal to a launched,
+# supported venture. Node kinds mirror the tinyflows model.
+
+id = "venture_launch_pipeline"
+name = "Venture launch pipeline"
+description = "An idea becomes a staffed, built, launched, and supported venture."
+
+[[node]]
+id = "idea"
+kind = "trigger"
+name = "New venture idea"
+summary = "An opportunity is proposed for the studio."
+
+[[node]]
+id = "scout"
+kind = "agent"
+name = "Scout the opportunity"
+summary = "Assess the market and the pull."
+agent = "opportunity_scout"
+
+[[node]]
+id = "thesis"
+kind = "agent"
+name = "Shape the thesis"
+summary = "Frame the venture and its bet."
+agent = "founder"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Build it?"
+summary = "Commit to build or shelve the idea."
+
+[[node]]
+id = "staff"
+kind = "agent"
+name = "Staff the venture"
+summary = "Assemble the team to build it."
+agent = "recruiter"
+
+[[node]]
+id = "design"
+kind = "agent"
+name = "Design the product"
+summary = "Design the first version."
+agent = "designer"
+
+[[node]]
+id = "build"
+kind = "agent"
+name = "Build the MVP"
+summary = "Ship the first working product."
+agent = "engineer"
+
+[[node]]
+id = "legal"
+kind = "agent"
+name = "Set up legal"
+summary = "Incorporate and paper the basics."
+agent = "lawyer"
+
+[[node]]
+id = "finance"
+kind = "agent"
+name = "Set up finance"
+summary = "Stand up the books and budget."
+agent = "finance"
+
+[[node]]
+id = "launch"
+kind = "agent"
+name = "Go to market"
+summary = "Launch and acquire the first users."
+agent = "marketer"
+
+[[node]]
+id = "support"
+kind = "agent"
+name = "Support users"
+summary = "Handle the first customers."
+agent = "customer_support"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report to operator"
+summary = "Report the launch and the ask."
+
+[[edge]]
+from = "idea"
+to = "scout"
+
+[[edge]]
+from = "scout"
+to = "thesis"
+
+[[edge]]
+from = "thesis"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "staff"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "no"
+
+[[edge]]
+from = "staff"
+to = "design"
+
+[[edge]]
+from = "design"
+to = "build"
+
+[[edge]]
+from = "build"
+to = "legal"
+
+[[edge]]
+from = "legal"
+to = "finance"
+
+[[edge]]
+from = "finance"
+to = "launch"
+
+[[edge]]
+from = "launch"
+to = "support"
+
+[[edge]]
+from = "support"
+to = "done"

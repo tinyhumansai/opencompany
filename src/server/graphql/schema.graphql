@@ -1,0 +1,889 @@
+"""
+Token totals for one teammate.
+"""
+type AgentTokens {
+	"""
+	The teammate display name.
+	"""
+	name: String!
+	"""
+	Total tokens attributed to them.
+	"""
+	tokens: Float!
+}
+
+"""
+A parked approval awaiting the operator. Mirrors
+[`ApprovalSummary`](crate::runtime::types::ApprovalSummary).
+"""
+type Approval {
+	"""
+	The approval's id.
+	"""
+	id: ID!
+	"""
+	The parked effect's dotted kind.
+	"""
+	kind: String!
+	"""
+	The USD amount involved, if any.
+	"""
+	amountUsd: Float
+	"""
+	Epoch-millis the effect was parked. `Float` round-trips the full u64
+	range that would overflow GraphQL's `Int`.
+	"""
+	atMillis: Float!
+}
+
+"""
+Spend rolled up by category.
+"""
+type CategorySpend {
+	"""
+	The category label.
+	"""
+	category: String!
+	"""
+	The amount spent in it, USD.
+	"""
+	amount: Float!
+}
+
+type Chat {
+	"""
+	The desk id.
+	"""
+	id: ID!
+	"""
+	The desk name.
+	"""
+	name: String!
+	"""
+	An optional description.
+	"""
+	description: String
+	"""
+	The teammate ids on this desk.
+	"""
+	members: [ID!]!
+	"""
+	The desk's message history, most-recent last. `before` is an opaque
+	EventLog cursor (a stringified sequence position); only messages before
+	it are returned.
+	"""
+	history(first: Int! = 50, before: String): MessagePage!
+}
+
+type Company {
+	"""
+	The company id.
+	"""
+	id: ID!
+	"""
+	The display name from the company charter.
+	"""
+	name: String!
+	"""
+	Lifecycle state, e.g. `running`, `paused`, `archived`.
+	"""
+	lifecycle: String!
+	"""
+	The number of approvals currently awaiting the operator.
+	"""
+	pendingApprovals: Int!
+	"""
+	The approvals currently awaiting the operator for this company.
+	"""
+	approvals: [Approval!]!
+	"""
+	The company roster: manifest teammates plus operator-added overlays.
+	"""
+	team: [TeamMember!]!
+	"""
+	The company's desks (group chats).
+	"""
+	chats: [Chat!]!
+	"""
+	One desk by id, or null when unknown.
+	"""
+	chat(id: ID!): Chat
+	"""
+	The per-teammate inboxes.
+	"""
+	inboxes: [Inbox!]!
+	"""
+	The task board, optionally filtered to one column.
+	"""
+	tasks(column: String, first: Int! = 100, offset: Int! = 0): TaskPage!
+	"""
+	The company's installed skills.
+	"""
+	skills: [Skill!]!
+	"""
+	The workspace file tree.
+	"""
+	workspaceTree: [FsNode!]!
+	"""
+	One workspace file by id, with content and backlinks; null when absent.
+	"""
+	workspaceFile(id: ID!): WorkspaceFile
+	"""
+	The company-brain memory facts.
+	"""
+	memory(query: String, kind: MemoryKind, first: Int! = 50, offset: Int! = 0): MemoryFactPage!
+	"""
+	The enabled workflows, as one-line summaries.
+	"""
+	workflows: [WorkflowSummary!]!
+	"""
+	One workflow graph by id; null when unavailable.
+	"""
+	workflow(id: ID!): Workflow
+	"""
+	Token/cost usage over a lookback window.
+	"""
+	usage(range: UsageRange! = D30): Usage!
+	"""
+	The finance surface: balance, budget vs spend, and the transaction journal.
+	"""
+	finances: Finances!
+	"""
+	The third-party connections and their live status.
+	"""
+	connections: [ConnectionState!]!
+	"""
+	Custom-domain status; null when no domain is configured.
+	"""
+	domain: DomainStatus
+	"""
+	SMTP status — host/port/username only, never the password.
+	"""
+	smtp: SmtpStatus!
+}
+
+"""
+One third-party connection's state: manifest intent plus live OAuth status.
+"""
+type ConnectionState {
+	"""
+	The provider id (e.g. `slack`, `gmail`, `github`).
+	"""
+	provider: String!
+	"""
+	Whether an OAuth token is stored for this provider.
+	"""
+	connected: Boolean!
+	"""
+	The connected account label, when known.
+	"""
+	account: String
+	"""
+	The manifest's stated reason for wanting this connection.
+	"""
+	reason: String
+}
+
+"""
+A generated DNS record for custom-domain verification. Mirrors
+[`DnsRecord`](crate::company::dns::DnsRecord).
+"""
+type DnsRecord {
+	"""
+	The record type (`CNAME` | `TXT`).
+	"""
+	type: String!
+	"""
+	The record name/host.
+	"""
+	name: String!
+	"""
+	The record value.
+	"""
+	value: String!
+	"""
+	The record TTL.
+	"""
+	ttl: String!
+}
+
+"""
+Custom-domain status. Mirrors [`DomainStatus`].
+"""
+type DomainStatus {
+	"""
+	The configured domain.
+	"""
+	domain: String!
+	"""
+	Whether the domain's records have been verified.
+	"""
+	verified: Boolean!
+	"""
+	The DNS records the operator must publish.
+	"""
+	records: [DnsRecord!]!
+}
+
+"""
+One email in a teammate inbox. Mirrors [`EmailRecord`].
+"""
+type EmailMessage {
+	"""
+	The message id.
+	"""
+	id: ID!
+	"""
+	The sender's display name (may be empty).
+	"""
+	fromName: String!
+	"""
+	The sender's email address.
+	"""
+	fromEmail: String!
+	"""
+	The subject line.
+	"""
+	subject: String!
+	"""
+	The plain-text body.
+	"""
+	body: String!
+	"""
+	When it arrived / was sent, epoch millis.
+	"""
+	atMillis: Float!
+	"""
+	Whether the message has been read.
+	"""
+	read: Boolean!
+	"""
+	True for a sent message, false for a received one.
+	"""
+	outbound: Boolean!
+}
+
+"""
+A single page of `T`: the requested slice plus the unpaginated total.
+"""
+type EmailPage {
+	"""
+	The items on this page.
+	"""
+	items: [EmailMessage!]!
+	"""
+	The total number of items across all pages (before offset/limit).
+	"""
+	total: Int!
+}
+
+type Finances {
+	"""
+	The current balance, USD.
+	"""
+	balanceUsd: Float!
+	"""
+	The monthly budget, USD.
+	"""
+	budgetUsd: Float!
+	"""
+	Total spend this period, USD.
+	"""
+	spentUsd: Float!
+	"""
+	Total revenue this period, USD.
+	"""
+	revenueUsd: Float!
+	"""
+	Net (revenue − spend), USD.
+	"""
+	netUsd: Float!
+	"""
+	Spend rolled up by category.
+	"""
+	byCategory: [CategorySpend!]!
+	"""
+	A page of the transaction journal, most-recent first.
+	"""
+	transactions(first: Int! = 50, offset: Int! = 0): [Transaction!]!
+}
+
+"""
+One node (folder or file) in the workspace tree. Mirrors [`WorkspaceNode`].
+"""
+type FsNode {
+	"""
+	The node id (stable ULID).
+	"""
+	id: ID!
+	"""
+	The node name.
+	"""
+	name: String!
+	"""
+	`folder` or `file`.
+	"""
+	kind: String!
+	"""
+	The parent node id, or null at the root.
+	"""
+	parentId: ID
+	"""
+	When it was last updated, ISO-8601 UTC.
+	"""
+	updatedAt: String!
+}
+
+type Inbox {
+	"""
+	The teammate local part / slug.
+	"""
+	key: ID!
+	"""
+	The inbox display name.
+	"""
+	name: String!
+	"""
+	The full address (`{key}@{domain}` when a domain is configured).
+	"""
+	address: String!
+	"""
+	The number of unread received messages.
+	"""
+	unread: Int!
+	"""
+	A page of this inbox's messages, oldest first.
+	"""
+	messages(first: Int! = 50, offset: Int! = 0): EmailPage!
+}
+
+"""
+One remembered fact. Mirrors [`FactRecord`].
+"""
+type MemoryFact {
+	"""
+	The fact id.
+	"""
+	id: ID!
+	"""
+	The fact's kind.
+	"""
+	kind: MemoryKind!
+	"""
+	A short title.
+	"""
+	title: String!
+	"""
+	The fact body.
+	"""
+	body: String!
+	"""
+	Which desk/teammate captured it.
+	"""
+	source: String!
+	"""
+	When it was last updated, ISO-8601 UTC.
+	"""
+	updatedAt: String!
+}
+
+"""
+A single page of `T`: the requested slice plus the unpaginated total.
+"""
+type MemoryFactPage {
+	"""
+	The items on this page.
+	"""
+	items: [MemoryFact!]!
+	"""
+	The total number of items across all pages (before offset/limit).
+	"""
+	total: Int!
+}
+
+"""
+The kind of a remembered fact, in the console's memory taxonomy.
+"""
+enum MemoryKind {
+	"""
+	A plain fact.
+	"""
+	FACT
+	"""
+	An operator preference.
+	"""
+	PREFERENCE
+	"""
+	A person the company knows.
+	"""
+	PERSON
+	"""
+	A project the company tracks.
+	"""
+	PROJECT
+	"""
+	A reference document or link.
+	"""
+	REFERENCE
+}
+
+"""
+One message in a desk history. Mirrors `frontend/src/lib/chat.ts`.
+"""
+type Message {
+	"""
+	The message id (its EventLog sequence position).
+	"""
+	id: ID!
+	"""
+	The channel the message came in on.
+	"""
+	channel: String!
+	"""
+	The author label.
+	"""
+	author: String!
+	"""
+	The message text.
+	"""
+	text: String!
+	"""
+	When it was journaled, epoch millis.
+	"""
+	atMillis: Float!
+	"""
+	Whether it is the operator's own message.
+	"""
+	mine: Boolean!
+}
+
+"""
+A single page of `T`: the requested slice plus the unpaginated total.
+"""
+type MessagePage {
+	"""
+	The items on this page.
+	"""
+	items: [Message!]!
+	"""
+	The total number of items across all pages (before offset/limit).
+	"""
+	total: Int!
+}
+
+"""
+Call totals for one provider.
+"""
+type ProviderCalls {
+	"""
+	The provider id.
+	"""
+	provider: String!
+	"""
+	Total calls to it.
+	"""
+	calls: Float!
+}
+
+type Query {
+	"""
+	Every company visible to the caller: all registered companies for the
+	operator / platform-scope principal, or just a tenant's own in platform
+	mode.
+	"""
+	companies: [Company!]!
+	"""
+	One company by id, or — when `id` is omitted in single-company mode — the
+	sole registered company. `null` when no such company is registered.
+	"""
+	company(id: ID): Company
+	"""
+	The repo-level shared skill registry (`skills/*/SKILL.md`), installable
+	into any company. Unscoped — the library is the same for every caller.
+	"""
+	skillRegistry: [RegistrySkill!]!
+}
+
+"""
+One skill in the shared repo-level registry, installable into any company.
+"""
+type RegistrySkill {
+	"""
+	The skill slug.
+	"""
+	id: ID!
+	"""
+	The display name.
+	"""
+	name: String!
+	"""
+	A one-line description.
+	"""
+	description: String!
+	"""
+	The skill category.
+	"""
+	category: String!
+	"""
+	The publisher of the registry skill.
+	"""
+	publisher: String!
+}
+
+"""
+One skill installed in a company. Mirrors `frontend/src/lib/skills.ts`.
+"""
+type Skill {
+	"""
+	The skill slug.
+	"""
+	id: ID!
+	"""
+	The display name.
+	"""
+	name: String!
+	"""
+	A one-line description.
+	"""
+	description: String!
+	"""
+	The skill category (e.g. `Marketing`, `Ops`).
+	"""
+	category: String!
+	"""
+	Provenance: `company` | `registry` | `custom`.
+	"""
+	source: String!
+	"""
+	Whether the skill is enabled for the company.
+	"""
+	enabled: Boolean!
+}
+
+"""
+Non-secret SMTP status: host/port/username only — never the password.
+"""
+type SmtpStatus {
+	"""
+	The SMTP host (empty when unconfigured).
+	"""
+	host: String!
+	"""
+	The SMTP port (0 when unconfigured).
+	"""
+	port: Int!
+	"""
+	The SMTP username (empty when unconfigured).
+	"""
+	username: String!
+	"""
+	Whether SMTP is configured.
+	"""
+	configured: Boolean!
+}
+
+"""
+One card on the company's task board. Mirrors [`TaskRecord`].
+"""
+type Task {
+	"""
+	The task id.
+	"""
+	id: ID!
+	"""
+	The task title.
+	"""
+	title: String!
+	"""
+	An optional longer note.
+	"""
+	note: String
+	"""
+	The board column: `backlog` | `in_progress` | `in_review` | `done`.
+	"""
+	column: String!
+	"""
+	The priority: `low` | `medium` | `high`.
+	"""
+	priority: String!
+	"""
+	The assigned teammate id.
+	"""
+	assignee: String!
+}
+
+"""
+A single page of `T`: the requested slice plus the unpaginated total.
+"""
+type TaskPage {
+	"""
+	The items on this page.
+	"""
+	items: [Task!]!
+	"""
+	The total number of items across all pages (before offset/limit).
+	"""
+	total: Int!
+}
+
+"""
+One roster teammate. Mirrors `frontend/src/lib/team.ts`.
+"""
+type TeamMember {
+	"""
+	The teammate id.
+	"""
+	id: ID!
+	"""
+	The display name; null for a manifest teammate named only by role.
+	"""
+	name: String
+	"""
+	The job title / role.
+	"""
+	role: String!
+	"""
+	An optional description.
+	"""
+	description: String
+	"""
+	Whether this teammate has an enabled inbox.
+	"""
+	inboxEnabled: Boolean!
+}
+
+"""
+One ledger transaction in the finance journal.
+"""
+type Transaction {
+	"""
+	The transaction id.
+	"""
+	id: ID!
+	"""
+	The transaction date, `YYYY-MM-DD`.
+	"""
+	date: String!
+	"""
+	A human description.
+	"""
+	description: String!
+	"""
+	The spend category.
+	"""
+	category: String!
+	"""
+	The amount, USD (a positive magnitude; see `direction`).
+	"""
+	amountUsd: Float!
+	"""
+	`in` for revenue, `out` for spend.
+	"""
+	direction: String!
+}
+
+"""
+The usage read surface for a company.
+"""
+type Usage {
+	"""
+	The daily token series.
+	"""
+	series: [UsagePoint!]!
+	"""
+	Tokens by teammate.
+	"""
+	byAgent: [AgentTokens!]!
+	"""
+	Calls by provider.
+	"""
+	byProvider: [ProviderCalls!]!
+	"""
+	Aggregate totals.
+	"""
+	totals: UsageTotals!
+}
+
+"""
+One day's token totals.
+"""
+type UsagePoint {
+	"""
+	The day, `YYYY-MM-DD`.
+	"""
+	date: String!
+	"""
+	Input tokens that day.
+	"""
+	inputTokens: Float!
+	"""
+	Output tokens that day.
+	"""
+	outputTokens: Float!
+}
+
+"""
+The usage lookback window.
+"""
+enum UsageRange {
+	"""
+	The last 7 days.
+	"""
+	D7
+	"""
+	The last 30 days (the default).
+	"""
+	D30
+	"""
+	The last 90 days.
+	"""
+	D90
+}
+
+"""
+Aggregate usage totals for the window.
+"""
+type UsageTotals {
+	"""
+	Total input tokens.
+	"""
+	inputTokens: Float!
+	"""
+	Total output tokens.
+	"""
+	outputTokens: Float!
+	"""
+	Total tokens (input + output).
+	"""
+	tokens: Float!
+	"""
+	Total inference cost, USD.
+	"""
+	costUsd: Float!
+	"""
+	Total OAuth calls.
+	"""
+	oauthCalls: Float!
+	"""
+	Number of distinct connections used.
+	"""
+	connections: Int!
+}
+
+"""
+A full workflow graph.
+"""
+type Workflow {
+	"""
+	The workflow id.
+	"""
+	id: ID!
+	"""
+	The workflow display name.
+	"""
+	name: String!
+	"""
+	The graph nodes.
+	"""
+	nodes: [WorkflowNode!]!
+	"""
+	The graph edges.
+	"""
+	edges: [WorkflowEdge!]!
+}
+
+"""
+One directed edge in a workflow graph.
+"""
+type WorkflowEdge {
+	"""
+	The source node id.
+	"""
+	from: ID!
+	"""
+	The target node id.
+	"""
+	to: ID!
+	"""
+	An optional edge label.
+	"""
+	label: String
+}
+
+"""
+One node in a workflow graph.
+"""
+type WorkflowNode {
+	"""
+	The node id.
+	"""
+	id: ID!
+	"""
+	The node kind (`trigger`, `agent`, `toolCall`, ...).
+	"""
+	kind: String!
+	"""
+	The node display name.
+	"""
+	name: String!
+	"""
+	An optional one-line summary.
+	"""
+	summary: String
+}
+
+"""
+A one-line workflow summary for the workflows list.
+"""
+type WorkflowSummary {
+	"""
+	The workflow id.
+	"""
+	id: ID!
+	"""
+	The workflow display name.
+	"""
+	name: String!
+	"""
+	Whether the workflow is enabled in the manifest.
+	"""
+	enabled: Boolean!
+}
+
+"""
+A single workspace file with its content and inbound `[[wikilink]]` backlinks.
+"""
+type WorkspaceFile {
+	"""
+	The file id.
+	"""
+	id: ID!
+	"""
+	The file name.
+	"""
+	name: String!
+	"""
+	The file content.
+	"""
+	content: String!
+	"""
+	When it was last updated, ISO-8601 UTC.
+	"""
+	updatedAt: String!
+	"""
+	Other files whose content links to this one via `[[name]]`.
+	"""
+	backlinks: [FsNode!]!
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: Query
+}

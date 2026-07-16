@@ -86,6 +86,22 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Lifecycle changed from {from} to {to}"),
             "lifecycle.changed",
         ),
+        CompanyEvent::AgentReply {
+            chat_id,
+            agent_id,
+            text,
+        } => (
+            Role::Assistant,
+            agent_id.clone(),
+            format!("[{chat_id}] {text}"),
+            "agent.reply",
+        ),
+        CompanyEvent::MemoryFactDeleted { fact_id } => (
+            Role::System,
+            "operator".to_string(),
+            format!("Deleted memory fact {fact_id}"),
+            "memory.fact_deleted",
+        ),
     };
     WireEvent {
         seq,

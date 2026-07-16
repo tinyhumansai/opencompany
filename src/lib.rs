@@ -10,6 +10,14 @@ pub mod company;
 pub mod economy;
 pub mod error;
 pub mod feedback;
+/// WS4: openhuman embedded as a library (the harness). Compiled only under the
+/// `openhuman` feature; the default build links none of it and keeps the
+/// echo-brained, offline behaviour unchanged.
+#[cfg(feature = "openhuman")]
+pub mod harness;
+/// WS5: pure Usage & Finances projections over the runtime's accounting data
+/// (usage samples, ledger, `[budget]`). No I/O; WS2 wraps these in GraphQL.
+pub mod metering;
 pub mod openhuman;
 pub mod policy;
 pub mod ports;

@@ -18,7 +18,7 @@ use crate::brain::medulla::MedullaTransport;
 use crate::brain::medulla::wire::ToolManifestEntry;
 use crate::brain::{EchoBrain, HostedMedullaBrain};
 use crate::company::CompanyManifest;
-use crate::company::runtime::CompanyRuntime;
+use crate::company::runtime::{CompanyRuntime, OpsStores};
 use crate::feedback::github::{GitHubClient, RateLimiter};
 use crate::feedback::service::FeedbackFiler;
 use crate::feedback::store::FeedbackStore;
@@ -29,14 +29,17 @@ use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
-    AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, MemoryStore,
-    SecretStore, ToolProvider,
+    AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
+    InboxStore, MemoryStore, SecretStore, SkillStateStore, TaskStore, ToolProvider, UsageMeter,
+    WorkspaceStore,
 };
 use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::tools::{StubToolProvider, grant_matches};
 use crate::store::paths::Bundle;
-use crate::store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
+use crate::store::{
+    FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsOps, FsSecretStore,
+};
 
 /// Derives a filesystem-and-URL-safe company id from a display name.
 ///
@@ -127,9 +130,20 @@ pub struct RuntimeBuilder {
     approvals: Option<Arc<ManifestApprovalGate>>,
     openhuman: Option<Arc<dyn OpenHumanRpc>>,
     secrets: Option<Arc<dyn SecretStore>>,
+    inbox: Option<Arc<dyn InboxStore>>,
+    tasks: Option<Arc<dyn TaskStore>>,
+    workspace: Option<Arc<dyn WorkspaceStore>>,
+    facts: Option<Arc<dyn FactStore>>,
+    usage: Option<Arc<dyn UsageMeter>>,
+    skills: Option<Arc<dyn SkillStateStore>>,
+    seed_dir: Option<PathBuf>,
     feedback: Option<Arc<FeedbackStore>>,
     github: Option<Arc<dyn GitHubClient>>,
     consent: ConsentMode,
+    /// WS4: the embedded openhuman harness pool. Feature-gated so the default
+    /// build is unaffected; wired through to [`CompanyRuntime`] when present.
+    #[cfg(feature = "openhuman")]
+    harness: Option<Arc<crate::harness::HarnessPool>>,
 }
 
 impl RuntimeBuilder {
@@ -161,9 +175,18 @@ impl RuntimeBuilder {
             approvals: None,
             openhuman: None,
             secrets: None,
+            inbox: None,
+            tasks: None,
+            workspace: None,
+            facts: None,
+            usage: None,
+            skills: None,
+            seed_dir: None,
             feedback: None,
             github: None,
             consent: ConsentMode::default(),
+            #[cfg(feature = "openhuman")]
+            harness: None,
         }
     }
 
@@ -244,12 +267,55 @@ impl RuntimeBuilder {
 
     /// Swaps every durable port at once from one opened storage backend
     /// (see [`crate::store::select`]).
-    pub fn with_stores(self, handles: &crate::store::StorageHandles) -> Self {
+    pub fn with_stores(mut self, handles: &crate::store::StorageHandles) -> Self {
+        self.tasks = Some(handles.tasks.clone());
+        self.workspace = Some(handles.workspace.clone());
+        self.facts = Some(handles.facts.clone());
+        self.usage = Some(handles.usage.clone());
+        self.skills = Some(handles.skills.clone());
         self.with_store(handles.company.clone())
             .with_events(handles.events.clone())
             .with_memory(handles.memory.clone())
             .with_context(handles.context.clone())
             .with_secrets(handles.secrets.clone())
+            .with_inbox(handles.inbox.clone())
+    }
+
+    /// Swaps the task board store (default: fs-backed).
+    pub fn with_tasks(mut self, tasks: Arc<dyn TaskStore>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    /// Swaps the workspace store (default: fs-backed).
+    pub fn with_workspace(mut self, workspace: Arc<dyn WorkspaceStore>) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// Swaps the facts store (default: fs-backed).
+    pub fn with_facts(mut self, facts: Arc<dyn FactStore>) -> Self {
+        self.facts = Some(facts);
+        self
+    }
+
+    /// Swaps the usage meter (default: fs-backed).
+    pub fn with_usage(mut self, usage: Arc<dyn UsageMeter>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Swaps the skill-state store (default: fs-backed).
+    pub fn with_skills(mut self, skills: Arc<dyn SkillStateStore>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    /// Sets the company definition directory (`companies/<name>`) the workspace
+    /// tree is seeded from on first build. Without it, no seeding runs.
+    pub fn with_seed_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.seed_dir = Some(dir.into());
+        self
     }
 
     /// Swaps the tool provider.
@@ -313,10 +379,28 @@ impl RuntimeBuilder {
         self
     }
 
+    /// WS4: attaches the embedded openhuman harness pool. When present, the
+    /// runtime exposes it through [`CompanyRuntime::harness`] so the chat layer
+    /// (WS3) can route desk turns through it; without it the runtime keeps its
+    /// echo/hosted brain path unchanged. Feature-gated — the default build has
+    /// no harness.
+    #[cfg(feature = "openhuman")]
+    pub fn with_harness(mut self, harness: Arc<crate::harness::HarnessPool>) -> Self {
+        self.harness = Some(harness);
+        self
+    }
+
     /// Swaps the secret store (default: fs-backed). The feedback scrubber reads
     /// it to fail closed on secret leaks.
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
         self.secrets = Some(secrets);
+        self
+    }
+
+    /// Swaps the inbox store (default: fs-backed). Holds inbound and outbound
+    /// email for the per-teammate inboxes.
+    pub fn with_inbox(mut self, inbox: Arc<dyn InboxStore>) -> Self {
+        self.inbox = Some(inbox);
         self
     }
 
@@ -379,6 +463,29 @@ impl RuntimeBuilder {
         let secrets: Arc<dyn SecretStore> = self
             .secrets
             .unwrap_or_else(|| Arc::new(FsSecretStore::new(home.clone())));
+        let inbox: Arc<dyn InboxStore> = self
+            .inbox
+            .unwrap_or_else(|| Arc::new(FsInboxStore::new(home.clone())));
+        // The WS3 console ports default to a single shared fs backend.
+        let fs_ops = Arc::new(FsOps::new(home.clone()));
+        let ops = OpsStores {
+            tasks: self.tasks.unwrap_or_else(|| fs_ops.clone()),
+            workspace: self.workspace.unwrap_or_else(|| fs_ops.clone()),
+            facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
+            usage: self.usage.unwrap_or_else(|| fs_ops.clone()),
+            skills: self.skills.unwrap_or_else(|| fs_ops.clone()),
+        };
+
+        // Idempotent workspace seeding: only when the workspace is empty (an
+        // operator's deletions must stick, so a seeded-then-emptied workspace is
+        // never re-seeded). Skills need no seeding — the store holds deltas only
+        // and the effective set unions company-dir skills at read time.
+        if let Some(seed_dir) = &self.seed_dir
+            && ops.workspace.is_empty(&id).await?
+        {
+            seed_workspace(ops.workspace.as_ref(), &id, seed_dir).await?;
+        }
+
         let consent = self.consent;
         let filer = Arc::new(FeedbackFiler {
             client: self.github,
@@ -505,6 +612,13 @@ impl RuntimeBuilder {
             .as_ref()
             .map(|r| r.lifecycle.clone())
             .unwrap_or_else(|| "running".to_string());
+        // Preserve the operator team overlay across rebuilds — a rebuild never
+        // rewrites the version-controlled manifest, and it must not drop
+        // operator-added teammates either.
+        let overlay_agents = existing
+            .as_ref()
+            .map(|r| r.overlay_agents.clone())
+            .unwrap_or_default();
         let ledger = existing.map(|r| r.ledger).unwrap_or_default();
         store
             .save(&CompanyRecord {
@@ -512,6 +626,7 @@ impl RuntimeBuilder {
                 manifest: self.manifest.clone(),
                 ledger,
                 lifecycle,
+                overlay_agents,
             })
             .await?;
 
@@ -550,7 +665,8 @@ impl RuntimeBuilder {
             }
         };
 
-        let runtime = CompanyRuntime::new(
+        #[cfg_attr(not(feature = "openhuman"), allow(unused_mut))]
+        let mut runtime = CompanyRuntime::new(
             id.clone(),
             brain,
             store,
@@ -563,9 +679,17 @@ impl RuntimeBuilder {
             gate,
             journal,
             secrets,
+            inbox,
+            ops,
             feedback,
             filer,
         );
+
+        // WS4: attach the embedded harness pool when one was provided.
+        #[cfg(feature = "openhuman")]
+        if let Some(harness) = self.harness.clone() {
+            runtime.set_harness(harness);
+        }
 
         // Boot lifecycle step 3: going-public. Best-effort and non-blocking —
         // any failure degrades to "private" with a warning and never fails boot.
@@ -580,6 +704,51 @@ impl RuntimeBuilder {
 
         Ok(runtime)
     }
+}
+
+/// Seeds a company's workspace tree from `companies/<name>/workspace/**` using
+/// the WS1 walker. Ids are minted per node; parents are created before children
+/// because [`walk_workspace`](crate::company::workspace_seed::walk_workspace)
+/// returns nodes sorted by relative path.
+async fn seed_workspace(
+    workspace: &dyn WorkspaceStore,
+    id: &CompanyId,
+    seed_dir: &std::path::Path,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use crate::company::workspace_seed::{NodeKind as SeedKind, walk_workspace};
+    use crate::ports::now_millis;
+    use crate::ports::workspace::{NodeKind, WorkspaceNode};
+
+    let nodes = walk_workspace(&seed_dir.join("workspace"))?;
+    let mut path_to_id: HashMap<PathBuf, String> = HashMap::new();
+    for seed in nodes {
+        let name = match seed.rel_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let parent_id = seed
+            .rel_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .and_then(|p| path_to_id.get(p).cloned());
+        let kind = match seed.kind {
+            SeedKind::Folder => NodeKind::Folder,
+            SeedKind::Markdown => NodeKind::File,
+        };
+        let node = WorkspaceNode {
+            id: crate::ports::generate_id(),
+            name,
+            kind,
+            parent_id,
+            updated_at_millis: now_millis(),
+        };
+        workspace.create(id, &node, seed.content.as_deref()).await?;
+        path_to_id.insert(seed.rel_path.clone(), node.id);
+    }
+    Ok(())
 }
 
 /// Auto-wires the tiny.place economy for a discoverable company (feature build).
@@ -797,6 +966,53 @@ mod test {
         assert_eq!(company_id_from_name("Acme Co!").as_ref(), "acme-co");
         assert_eq!(company_id_from_name("  Widgets  ").as_ref(), "widgets");
         assert_eq!(company_id_from_name("***").as_ref(), "company");
+    }
+
+    #[tokio::test]
+    async fn workspace_seeds_once_and_operator_deletions_stick() {
+        let home = std::env::temp_dir().join(format!("oc-seed-{}", crate::ports::generate_id()));
+        // A company definition dir with a workspace subtree.
+        let seed_dir = home.join("def");
+        std::fs::create_dir_all(seed_dir.join("workspace/Brand")).unwrap();
+        std::fs::write(seed_dir.join("workspace/README.md"), "# Root").unwrap();
+        std::fs::write(seed_dir.join("workspace/Brand/voice.md"), "# Voice").unwrap();
+
+        let manifest = parse("[company]\nname=\"Acme\"\n[policy]\nmode=\"full\"\n");
+        let id = CompanyId::new("acme");
+        let runtime = RuntimeBuilder::new(home.clone(), manifest.clone())
+            .with_id(id.clone())
+            .with_seed_dir(seed_dir.clone())
+            .build()
+            .await
+            .unwrap();
+        // Seeded: README.md, Brand/, Brand/voice.md.
+        let tree = runtime.workspace().tree(&id).await.unwrap();
+        assert_eq!(tree.len(), 3);
+        assert!(tree.iter().any(|n| n.name == "voice.md"));
+
+        // Operator deletes a node.
+        let voice = tree.iter().find(|n| n.name == "voice.md").unwrap();
+        runtime.workspace().delete(&id, &voice.id).await.unwrap();
+
+        // Rebuild: the deletion sticks (no re-seed).
+        drop(runtime);
+        let runtime = RuntimeBuilder::new(home.clone(), manifest)
+            .with_id(id.clone())
+            .with_seed_dir(seed_dir)
+            .build()
+            .await
+            .unwrap();
+        let tree = runtime.workspace().tree(&id).await.unwrap();
+        assert_eq!(
+            tree.len(),
+            2,
+            "workspace re-seeded despite operator deletion"
+        );
+        assert!(!tree.iter().any(|n| n.name == "voice.md"));
+        // Sanity: the record store still loads.
+        assert!(runtime.store().load(&id).await.unwrap().is_some());
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     fn parse(toml_src: &str) -> CompanyManifest {
