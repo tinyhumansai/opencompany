@@ -1,0 +1,118 @@
+# Workflow graph: feature_pipeline
+#
+# Referenced by `[workflows].enabled = ["feature_pipeline"]` in ../company.toml.
+# A feature request goes from spec through build and QA to a documented ship.
+# Node kinds mirror the tinyflows model.
+
+id = "feature_pipeline"
+name = "Feature pipeline"
+description = "A feature request goes from spec to a tested, documented ship."
+
+[[node]]
+id = "request"
+kind = "trigger"
+name = "Feature requested"
+summary = "A request lands from a customer or the operator."
+
+[[node]]
+id = "spec"
+kind = "agent"
+name = "Write the spec"
+summary = "Turn the request into a scoped spec."
+agent = "product_manager"
+
+[[node]]
+id = "design"
+kind = "agent"
+name = "Design the UI"
+summary = "Design the interface and flows."
+agent = "designer"
+
+[[node]]
+id = "backend"
+kind = "agent"
+name = "Build the backend"
+summary = "Implement the server and data changes."
+agent = "backend_engineer"
+
+[[node]]
+id = "frontend"
+kind = "agent"
+name = "Build the frontend"
+summary = "Implement the client changes."
+agent = "frontend_engineer"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Security-sensitive?"
+summary = "Branch on whether a security review is needed."
+
+[[node]]
+id = "security"
+kind = "agent"
+name = "Security review"
+summary = "Review the change for risk."
+agent = "security_engineer"
+
+[[node]]
+id = "qa"
+kind = "agent"
+name = "QA the change"
+summary = "Test the feature end to end."
+agent = "qa_engineer"
+
+[[node]]
+id = "docs"
+kind = "agent"
+name = "Document it"
+summary = "Write the user-facing docs."
+agent = "docs_writer"
+
+[[node]]
+id = "ship"
+kind = "output"
+name = "Ship and report"
+summary = "Release behind approval and report back."
+
+[[edge]]
+from = "request"
+to = "spec"
+
+[[edge]]
+from = "spec"
+to = "design"
+
+[[edge]]
+from = "design"
+to = "backend"
+
+[[edge]]
+from = "backend"
+to = "frontend"
+
+[[edge]]
+from = "frontend"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "security"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "qa"
+label = "no"
+
+[[edge]]
+from = "security"
+to = "qa"
+
+[[edge]]
+from = "qa"
+to = "docs"
+
+[[edge]]
+from = "docs"
+to = "ship"

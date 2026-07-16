@@ -1,0 +1,85 @@
+# Workflow graph: discovery_pipeline
+#
+# Referenced by `[workflows].enabled = ["discovery_pipeline"]` in ../company.toml.
+# A target goes from literature through candidate molecules and simulation to a
+# trial plan the lab picks up. Node kinds mirror the tinyflows model.
+
+id = "discovery_pipeline"
+name = "Discovery pipeline"
+description = "A target becomes candidate molecules and a trial plan for the lab."
+
+[[node]]
+id = "target"
+kind = "trigger"
+name = "New target"
+summary = "A biological target is chosen to pursue."
+
+[[node]]
+id = "review"
+kind = "agent"
+name = "Literature review"
+summary = "Survey what is known about the target."
+agent = "literature_reviewer"
+
+[[node]]
+id = "discovery"
+kind = "agent"
+name = "Propose molecules"
+summary = "Generate candidate molecules."
+agent = "molecule_discovery"
+
+[[node]]
+id = "simulation"
+kind = "agent"
+name = "Simulate and screen"
+summary = "Run in-silico screening on the candidates."
+agent = "simulation_agent"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Promising?"
+summary = "Advance to trial planning or report back."
+
+[[node]]
+id = "trial"
+kind = "agent"
+name = "Plan the trial"
+summary = "Design the trial for the lead candidate."
+agent = "trial_planner"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Hand to the lab"
+summary = "Report candidates and plan to the operator."
+
+[[edge]]
+from = "target"
+to = "review"
+
+[[edge]]
+from = "review"
+to = "discovery"
+
+[[edge]]
+from = "discovery"
+to = "simulation"
+
+[[edge]]
+from = "simulation"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "trial"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "no"
+
+[[edge]]
+from = "trial"
+to = "done"
