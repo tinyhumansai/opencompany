@@ -11,6 +11,7 @@ import {
   Plug,
   Settings2,
   ShieldCheck,
+  Sparkles,
   SquareKanban,
   Users,
   Wallet,
@@ -52,6 +53,7 @@ import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
 import { TeamView } from "@/views/TeamView";
+import { SkillsView } from "@/views/SkillsView";
 import { MemoryView } from "@/views/MemoryView";
 import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
@@ -77,6 +79,7 @@ export type View =
   | "conversation"
   | "tasks"
   | "team"
+  | "skills"
   | "workspace"
   | "memory"
   | "approvals"
@@ -106,6 +109,7 @@ const NAV: NavGroup[] = [
       { view: "conversation", label: "Conversation", icon: MessagesSquare },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "team", label: "Team", icon: Users },
+      { view: "skills", label: "Skills", icon: Sparkles },
       { view: "workspace", label: "Workspace", icon: FolderClosed },
       { view: "memory", label: "Memory", icon: Brain },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
@@ -132,6 +136,7 @@ const TITLES: Record<View, string> = {
   conversation: "Conversation",
   tasks: "Tasks",
   team: "Team",
+  skills: "Skills",
   workspace: "Workspace",
   memory: "Memory",
   approvals: "Approvals",
@@ -277,6 +282,7 @@ export function AppShell({
           )}
           {view === "tasks" && <TasksView />}
           {view === "team" && <TeamView client={client} company={company} />}
+          {view === "skills" && <SkillsView company={company} />}
           {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (
             <Suspense
