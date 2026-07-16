@@ -7,12 +7,14 @@
 
 mod manifest;
 pub mod runtime;
+mod skill_file;
 mod types;
 mod workflow_file;
 
 use std::path::Path;
 
 pub use manifest::{LEGACY_MANIFEST_FILE, Located, MANIFEST_FILE, discover};
+pub use skill_file::{SkillDoc, load_dir_skills, parse_skill_md};
 pub use types::{
     Agent, BRAIN_MODES, Brain, Budget, ChannelConfig, Company, CompanyManifest,
     DEFAULT_ALWAYS_APPROVE, KNOWN_CHANNELS, POLICY_MODES, Place, Policy, Schedule, Skill, TIERS,
