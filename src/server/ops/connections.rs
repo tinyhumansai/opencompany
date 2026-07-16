@@ -19,7 +19,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
@@ -28,8 +28,7 @@ use crate::error::OpenCompanyError;
 use crate::ports::now_millis;
 use crate::ports::types::{CompanyId, SecretValue};
 use crate::server::error::ApiError;
-use crate::server::operator::OperatorAuth;
-use crate::server::ops::{oauth_key, resolve, resolve_sole};
+use crate::server::ops::{ScopedCompany, oauth_key, scoped};
 use crate::server::webhook::{DefaultHashSigner, WebhookSigner};
 
 /// How long a signed `state` nonce stays valid.
@@ -37,25 +36,20 @@ const STATE_TTL_MS: u64 = 10 * 60 * 1000;
 
 /// Builds the OAuth route fragment.
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/api/v1/companies/{id}/connections/{provider}/start",
-            post(start),
-        )
-        .route(
-            "/api/v1/companies/{id}/connections/{provider}/disconnect",
+    scoped("/connections/{provider}/start", post(start))
+        .merge(scoped(
+            "/connections/{provider}/disconnect",
             post(disconnect),
-        )
-        .route(
-            "/api/v1/company/connections/{provider}/start",
-            post(start_single),
-        )
-        .route(
-            "/api/v1/company/connections/{provider}/disconnect",
-            post(disconnect_single),
-        )
+        ))
         // The callback is unscoped: the signed `state` carries the company id.
         .route("/api/v1/oauth/callback", get(callback))
+}
+
+/// The provider sub-resource path (`provider`); the scope `id` is consumed by
+/// the [`ScopedCompany`] extractor.
+#[derive(Debug, Deserialize)]
+struct ProviderPath {
+    provider: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,24 +188,13 @@ fn build_authorize(
     Ok(StartResponse { url })
 }
 
-/// `POST /api/v1/companies/{id}/connections/{provider}/start`.
+/// `POST …/connections/{provider}/start` (both scope forms).
 async fn start(
-    _auth: OperatorAuth,
+    company: ScopedCompany,
     State(state): State<AppState>,
-    Path((id, provider)): Path<(String, String)>,
+    Path(ProviderPath { provider }): Path<ProviderPath>,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let runtime = resolve(&state, &id)?;
-    Ok(Json(build_authorize(&state, runtime.id(), &provider)?))
-}
-
-/// `POST /api/v1/company/connections/{provider}/start` (single-company alias).
-async fn start_single(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path(provider): Path<String>,
-) -> Result<Json<StartResponse>, ApiError> {
-    let runtime = resolve_sole(&state)?;
-    Ok(Json(build_authorize(&state, runtime.id(), &provider)?))
+    Ok(Json(build_authorize(&state, company.id(), &provider)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -384,22 +367,12 @@ async fn do_disconnect(
     Ok(Json(json!({ "connected": false, "provider": provider })))
 }
 
-/// `POST /api/v1/companies/{id}/connections/{provider}/disconnect`.
+/// `POST …/connections/{provider}/disconnect` (both scope forms).
 async fn disconnect(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path((id, provider)): Path<(String, String)>,
+    company: ScopedCompany,
+    Path(ProviderPath { provider }): Path<ProviderPath>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    do_disconnect(resolve(&state, &id)?, &provider).await
-}
-
-/// `POST /api/v1/company/connections/{provider}/disconnect` (single-company alias).
-async fn disconnect_single(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path(provider): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    do_disconnect(resolve_sole(&state)?, &provider).await
+    do_disconnect(company.runtime, &provider).await
 }
 
 /// Minimal percent-encoding for URL query values (RFC 3986 unreserved set kept).
