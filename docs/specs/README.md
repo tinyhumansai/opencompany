@@ -33,9 +33,52 @@ Each workstream spec follows one template: **Scope → Design → Subtasks
    yet" and fall back — so every workstream can merge independently.
 6. **Secrets never leave the host.** SMTP credentials and OAuth tokens go to
    `SecretStore` only; responses expose non-secret status.
-7. **Prosumer language everywhere.** Server-authored strings follow the same
-   glossary the console enforces in `frontend/src/lib/language.ts` (desk, not
-   group-chat channel; teammate, not agent tier; approval, not parked effect).
+7. **Prosumer language everywhere.** [`docs/spec/glossary.md`](../spec/glossary.md)
+   is the authoritative vocabulary (its translation table is normative);
+   `frontend/src/lib/language.ts` mirrors it. Server-authored strings never
+   expose runtime internals (desk, not group-chat channel; teammate, not
+   agent tier; approval, not parked effect).
+
+## Relationship to `docs/spec/`
+
+[`docs/spec/`](../spec/README.md) is the normative **target-design** spec;
+`docs/modules/` describes the code as it exists. This folder is the
+**execution plan** that closes the gap, and it adopts the spec's conventions
+(RFC-2119 keywords, ≤500-line files, glossary-first language).
+
+Mapping onto the [roadmap](../spec/roadmap.md):
+
+- WS1–WS3, WS7 deliver the console/API side of **Stage 1** and the
+  platform-mode reads/writes of **Phase 5**.
+- WS4 delivers **Phase 3** (tools, channels, approvals via OpenHuman) — but
+  by a *revised* route: PR #4's decision to embed openhuman as a library
+  supersedes the JSON-RPC seam in
+  [`integrations/openhuman.md`](../spec/integrations/openhuman.md). The
+  "library-crate split" that doc lists as upstream candidate #2 is realized
+  by linking `openhuman_core` directly; the launcher/RPC wire section becomes
+  legacy. WS4 also revises the roadmap non-goal "TinyAgents is the harness".
+- WS5/WS6 extend **Phase 4/5** surfaces (ledger-fed finances, platform
+  webhooks reuse).
+
+Where these specs and `docs/spec/` disagree, these specs win for the work
+planned here — and **WS9 updates `docs/spec/` in the same PR train**:
+`roadmap.md`, `integrations/openhuman.md`, `runtime/api.md` (new write routes
++ the GraphQL read plane), `runtime/ports.md` + `runtime/storage.md` (six new
+ports), `company-brain/memory.md` (FactStore alongside the two existing
+memory ports), and the touched `docs/modules/*` pages.
+
+Alignment notes carried through the workstreams:
+
+- [`runtime/api.md`](../spec/runtime/api.md) already specifies the error
+  envelope `{error, code}`, the dual scoping, webhook ingestion
+  (`POST /hooks/{companyId}/{channel}`), and future SSE surfaces (`/chat`
+  streaming, `/events?since=SEQ` work feed, `/memory/traces`, `/export`).
+  New routes follow it; SSE stays out of scope here (the console is
+  request/response today) but nothing in this plan blocks it.
+- Manifest `[policy].mode` deliberately uses OpenHuman's security-tier words
+  (readonly/supervised/full) — the WS4 approval bridge maps 1:1.
+- The spec's one-key promise holds: every new dependency is feature-gated and
+  the default build stays offline.
 
 ## The specs
 

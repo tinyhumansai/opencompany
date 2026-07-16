@@ -6,7 +6,7 @@ Expand `src/server/graphql.rs` (today: query-only `companies` / `company(id)`
 / `approvals`) into the complete read surface for every console view. Reads
 land in GraphQL first; the existing REST reads (`GET …/team`, `…/chats`,
 `…/connections`, status, approvals) stay as **compat** until the console is
-GraphQL-only — no *new* REST reads.
+GraphQL-only — no _new_ REST reads.
 
 ## Design
 
@@ -38,56 +38,173 @@ request — fix that in the foundation commit.)
 
 ```graphql
 type Query {
-  companies: [Company!]!            # platform: all visible; operator: local
-  company(id: ID): Company          # id optional in single-company mode (registry.sole())
-  skillRegistry: [RegistrySkill!]!  # repo-level skills/ library (unscoped)
+  companies: [Company!]! # platform: all visible; operator: local
+  company(id: ID): Company # id optional in single-company mode (registry.sole())
+  skillRegistry: [RegistrySkill!]! # repo-level skills/ library (unscoped)
 }
 
 type Company {
-  id: ID!  name: String!  lifecycle: String!  pendingApprovals: Int!
+  id: ID!
+  name: String!
+  lifecycle: String!
+  pendingApprovals: Int!
   approvals: [Approval!]!
   team: [TeamMember!]!
-  chats: [Chat!]!  chat(id: ID!): Chat
+  chats: [Chat!]!
+  chat(id: ID!): Chat
   inboxes: [Inbox!]!
   tasks(column: String, first: Int = 100, offset: Int = 0): TaskPage!
   skills: [Skill!]!
-  workspaceTree: [FsNode!]!  workspaceFile(id: ID!): WorkspaceFile
-  memory(query: String, kind: MemoryKind, first: Int = 50, offset: Int = 0): MemoryFactPage!
-  workflows: [WorkflowSummary!]!  workflow(id: ID!): Workflow
+  workspaceTree: [FsNode!]!
+  workspaceFile(id: ID!): WorkspaceFile
+  memory(
+    query: String
+    kind: MemoryKind
+    first: Int = 50
+    offset: Int = 0
+  ): MemoryFactPage!
+  workflows: [WorkflowSummary!]!
+  workflow(id: ID!): Workflow
   usage(range: UsageRange! = D30): Usage!
   finances: Finances!
   connections: [ConnectionState!]!
   domain: DomainStatus
-  smtp: SmtpStatus                  # host/port/username only — never the password
+  smtp: SmtpStatus # host/port/username only — never the password
 }
 
-type TeamMember { id: ID! name: String role: String! description: String inboxEnabled: Boolean! }
-type Chat { id: ID! name: String! description: String members: [ID!]!
-            history(first: Int = 50, before: String): MessagePage! }
-type Message { id: ID! channel: String! author: String! text: String! atMillis: Float! mine: Boolean! }
-type Inbox { key: ID! name: String! address: String! unread: Int!
-             messages(first: Int = 50, offset: Int = 0): EmailPage! }
-type Task { id: ID! title: String! note: String column: String! priority: String! assignee: String! }
-type Skill { id: ID! name: String! description: String! category: String!
-             source: String!  # "built-in" | "library" | "custom"
-             enabled: Boolean! }
-type FsNode { id: ID! name: String! kind: String! parentId: ID updatedAt: String! }
-type WorkspaceFile { id: ID! name: String! content: String! updatedAt: String! backlinks: [FsNode!]! }
-enum MemoryKind { FACT PREFERENCE PERSON PROJECT REFERENCE }
-type MemoryFact { id: ID! kind: MemoryKind! title: String! body: String! source: String! updatedAt: String! }
-type WorkflowSummary { id: ID! name: String! enabled: Boolean! }
-type Workflow { id: ID! name: String! nodes: [WorkflowNode!]! edges: [WorkflowEdge!]! }
-type WorkflowNode { id: ID! kind: String! name: String! summary: String }
-type WorkflowEdge { from: ID! to: ID! label: String }
-enum UsageRange { D7 D30 D90 }
-type Usage { series: [UsagePoint!]! byAgent: [AgentTokens!]! byProvider: [ProviderCalls!]!
-             totals: UsageTotals! }
-type Finances { balanceUsd: Float! budgetUsd: Float! spentUsd: Float! revenueUsd: Float!
-                netUsd: Float! byCategory: [CategorySpend!]!
-                transactions(first: Int = 50, offset: Int = 0): [Transaction!]! }
-type ConnectionState { provider: String! connected: Boolean! account: String reason: String }
-type DomainStatus { domain: String! verified: Boolean! records: [DnsRecord!]! }
-type SmtpStatus { host: String! port: Int! username: String! configured: Boolean! }
+type TeamMember {
+  id: ID!
+  name: String
+  role: String!
+  description: String
+  inboxEnabled: Boolean!
+}
+type Chat {
+  id: ID!
+  name: String!
+  description: String
+  members: [ID!]!
+  history(first: Int = 50, before: String): MessagePage!
+}
+type Message {
+  id: ID!
+  channel: String!
+  author: String!
+  text: String!
+  atMillis: Float!
+  mine: Boolean!
+}
+type Inbox {
+  key: ID!
+  name: String!
+  address: String!
+  unread: Int!
+  messages(first: Int = 50, offset: Int = 0): EmailPage!
+}
+type Task {
+  id: ID!
+  title: String!
+  note: String
+  column: String!
+  priority: String!
+  assignee: String!
+}
+type Skill {
+  id: ID!
+  name: String!
+  description: String!
+  category: String!
+  source: String! # "built-in" | "library" | "custom"
+  enabled: Boolean!
+}
+type FsNode {
+  id: ID!
+  name: String!
+  kind: String!
+  parentId: ID
+  updatedAt: String!
+}
+type WorkspaceFile {
+  id: ID!
+  name: String!
+  content: String!
+  updatedAt: String!
+  backlinks: [FsNode!]!
+}
+enum MemoryKind {
+  FACT
+  PREFERENCE
+  PERSON
+  PROJECT
+  REFERENCE
+}
+type MemoryFact {
+  id: ID!
+  kind: MemoryKind!
+  title: String!
+  body: String!
+  source: String!
+  updatedAt: String!
+}
+type WorkflowSummary {
+  id: ID!
+  name: String!
+  enabled: Boolean!
+}
+type Workflow {
+  id: ID!
+  name: String!
+  nodes: [WorkflowNode!]!
+  edges: [WorkflowEdge!]!
+}
+type WorkflowNode {
+  id: ID!
+  kind: String!
+  name: String!
+  summary: String
+}
+type WorkflowEdge {
+  from: ID!
+  to: ID!
+  label: String
+}
+enum UsageRange {
+  D7
+  D30
+  D90
+}
+type Usage {
+  series: [UsagePoint!]!
+  byAgent: [AgentTokens!]!
+  byProvider: [ProviderCalls!]!
+  totals: UsageTotals!
+}
+type Finances {
+  balanceUsd: Float!
+  budgetUsd: Float!
+  spentUsd: Float!
+  revenueUsd: Float!
+  netUsd: Float!
+  byCategory: [CategorySpend!]!
+  transactions(first: Int = 50, offset: Int = 0): [Transaction!]!
+}
+type ConnectionState {
+  provider: String!
+  connected: Boolean!
+  account: String
+  reason: String
+}
+type DomainStatus {
+  domain: String!
+  verified: Boolean!
+  records: [DnsRecord!]!
+}
+type SmtpStatus {
+  host: String!
+  port: Int!
+  username: String!
+  configured: Boolean!
+}
 ```
 
 Page wrappers (`TaskPage`, `MemoryFactPage`, `EmailPage`, `MessagePage`) are a
@@ -101,7 +218,7 @@ append-only and long.
 - **`Company` is the aggregation root.** Every per-company read hangs off it;
   the only top-level fields are `companies`, `company`, `skillRegistry`.
 - **`Company` is a handle, not a `SimpleObject`**: `CompanyGql { id,
-  runtime: Arc<CompanyRuntime> }` with `#[Object]` async field resolvers, each
+runtime: Arc<CompanyRuntime> }` with `#[Object]` async field resolvers, each
   awaiting the relevant port/parser — no eager loading.
 - **Timestamps**: `atMillis: Float` where the console model uses epoch millis;
   ISO-8601 `String` where it uses `at`/`updatedAt` strings. Match
@@ -129,17 +246,17 @@ reachable through an authorized `Company`.
 
 ### Data sources per field
 
-| Field | Source |
-|---|---|
-| team, chats, connections (state intent), workflows summaries | manifest (`CompanyManifest`) |
-| workflow(id) | WS1 `workflow_file.rs` |
-| skills, skillRegistry | WS1 `skill_file.rs` ∪ WS3 `SkillStateStore` |
-| workspaceTree/File, tasks, memory, inboxes | WS3 ports |
-| chat history | `EventLog` (`OperatorMessage` + new `AgentReply`) |
-| usage | WS5 `UsageMeter` |
-| finances | ledger (`CompanyStore`) + `[budget]` + economy (feature `tinyplace`) |
-| domain/smtp status | `SecretStore` reserved keys (non-secret projection) |
-| connections connected/account | `SecretStore` oauth entries (WS6) |
+| Field                                                        | Source                                                               |
+| ------------------------------------------------------------ | -------------------------------------------------------------------- |
+| team, chats, connections (state intent), workflows summaries | manifest (`CompanyManifest`)                                         |
+| workflow(id)                                                 | WS1 `workflow_file.rs`                                               |
+| skills, skillRegistry                                        | WS1 `skill_file.rs` ∪ WS3 `SkillStateStore`                          |
+| workspaceTree/File, tasks, memory, inboxes                   | WS3 ports                                                            |
+| chat history                                                 | `EventLog` (`OperatorMessage` + new `AgentReply`)                    |
+| usage                                                        | WS5 `UsageMeter`                                                     |
+| finances                                                     | ledger (`CompanyStore`) + `[budget]` + economy (feature `tinyplace`) |
+| domain/smtp status                                           | `SecretStore` reserved keys (non-secret projection)                  |
+| connections connected/account                                | `SecretStore` oauth entries (WS6)                                    |
 
 ### Frontend consumption
 
@@ -158,7 +275,7 @@ graphql-code-generator is a later nicety, not a dependency.
 ## Subtasks (commit-sized)
 
 1. `refactor(graphql): module split, schema-at-startup, GqlAuth context,
-   Page<T>` — port the three existing reads onto the `Company` handle.
+Page<T>` — port the three existing reads onto the `Company` handle.
 2. `feat(graphql): manifest-derived reads` — team, chats, connections,
    workflow summaries (**WS2a**).
 3. `feat(graphql): workflow(id) + skills + skillRegistry` (**WS2b**, needs WS1).

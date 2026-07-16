@@ -5,12 +5,12 @@
 Rust readers for the company-directory files that exist as data-only
 conventions today (established in PR #4) but have no parser:
 
-| File | Feeds |
-|---|---|
-| `companies/<name>/workflows/<id>.toml` | Workflows canvas (GraphQL `workflow(id)`) |
-| `companies/<name>/skills/<slug>/SKILL.md` | Skills view + harness `workflows(...)` |
-| `companies/<name>/workspace/**` | Workspace seeding + backlinks |
-| repo-level `skills/<slug>/SKILL.md` | Shared skill registry (`skillRegistry`) |
+| File                                      | Feeds                                     |
+| ----------------------------------------- | ----------------------------------------- |
+| `companies/<name>/workflows/<id>.toml`    | Workflows canvas (GraphQL `workflow(id)`) |
+| `companies/<name>/skills/<slug>/SKILL.md` | Skills view + harness `workflows(...)`    |
+| `companies/<name>/workspace/**`           | Workspace seeding + backlinks             |
+| repo-level `skills/<slug>/SKILL.md`       | Shared skill registry (`skillRegistry`)   |
 
 These parsers are the format freeze for WS8 (content authoring) and the data
 source for WS2a/b (GraphQL reads) and WS3 (workspace seeding, skill install).
@@ -45,6 +45,7 @@ TOML shape (already shipped in
 top-level `id`/`name`/`description`, repeated `[[node]]` and `[[edge]]`.
 
 Validation (prosumer messages, matching `manifest.rs` style):
+
 - node ids unique; edges reference existing nodes; no self-loop edges;
 - at least one `trigger` node;
 - `kind` limited to the six known kinds; `agent` set only on `agent` nodes.
