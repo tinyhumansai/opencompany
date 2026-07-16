@@ -19,6 +19,9 @@ pub mod domain;
 pub mod inbox;
 pub mod smtp;
 
+#[cfg(feature = "oauth")]
+pub mod connections;
+
 #[cfg(test)]
 mod test;
 
@@ -84,10 +87,19 @@ impl std::fmt::Debug for ConnectionsRuntime {
 
 /// Builds the `ops` route fragment, merged into the main router.
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
         .merge(domain::router())
         .merge(smtp::router())
-        .merge(inbox::router())
+        .merge(inbox::router());
+    #[cfg(feature = "oauth")]
+    let router = router.merge(connections::router());
+    router
+}
+
+/// The SecretStore key holding a provider's stored OAuth tokens.
+#[cfg(feature = "oauth")]
+pub(crate) fn oauth_key(provider: &str) -> String {
+    format!("oauth/{provider}")
 }
 
 /// Resolves a company runtime by id.
