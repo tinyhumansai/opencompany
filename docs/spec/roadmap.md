@@ -26,10 +26,16 @@ An Operator boots a real company from a manifest and works with it daily.
   ingestion plus the Socket.IO effect/device-tool channel. Compressed traces
   land in `MemoryStore`; budget ledger starts. Requires a TinyHumans
   credential ([runtime/config.md](runtime/config.md)).
-- **Phase 3 — Tools, channels, approvals via OpenHuman.** `ToolProvider` and
-  `ChannelAdapter` over JSON-RPC to `openhuman-core serve`; `ApprovalGate`
+- **Phase 3 — Tools, channels, approvals via OpenHuman.** `ApprovalGate`
   mapped to OpenHuman policy tiers; cron schedules; the
   [feedback loop](feedback-loop/README.md) files its first GitHub issues.
+  **Delivered by a revised route:** rather than `ToolProvider`/`ChannelAdapter`
+  over JSON-RPC to `openhuman-core serve`, the harness embeds `openhuman_core`
+  as a **library** (`AgentBuilder`) — one openhuman `Agent` per manifest
+  `[[agent]]`, with memory, inference provider, tools, skills, and approval
+  policy injected through the builder's seams
+  ([integrations/openhuman.md](integrations/openhuman.md)). The JSON-RPC
+  launcher/wire path is legacy (behind `openhuman-rpc`).
 
 ## Stage 2 — Public Company
 
@@ -64,6 +70,37 @@ The product improves itself and companies remember.
 The [AVI vision](vision/README.md): autonomous opportunity discovery, venture
 spawning, compounding knowledge graph. Horizon, not commitment.
 
+## Delivered by the console/API train (WS1–WS8)
+
+The implementation train tracked in [`docs/plans/`](../plans/README.md) landed
+the console-facing surfaces of **Stage 1** plus the platform-mode reads/writes
+that Phases 3/4/5 anticipated. What is now real:
+
+- **Read plane (GraphQL).** Every console view fetches from `/graphql`, rooted
+  at a `Company` aggregation object, built once at startup
+  ([runtime/api.md](runtime/api.md)): team, desks/chats, inboxes, tasks,
+  skills, workspace, memory facts, workflows, usage, finances, connections,
+  domain, and SMTP status.
+- **Write plane (REST).** The `src/server/ops/` router family (dual-scoped
+  `/api/v1/companies/{id}/…` and `/api/v1/company/…`) writes tasks, memory
+  facts, workspace files, skills, team overlays, inbox read-state + ingest,
+  and — under their features — connections (OAuth), custom domain/DNS, and SMTP
+  credentials.
+- **Harness (Phase 3).** `openhuman_core` embedded as a library; approval
+  policy mapped 1:1 onto its security tiers.
+- **Metering (Phase 4/5 surfaces).** A `UsageMeter` port + a pure
+  usage/finances projection back the Usage and Finances views. **Partial:**
+  real inference cost awaits the upstream usage-accessor PR
+  (tinyhumansai/openhuman#4940); until it lands the cost hook records a
+  zero-usage turn ([integrations/openhuman.md](integrations/openhuman.md)).
+- **Storage (Phase 5).** sqlite and mongodb backends implement the full port
+  set; the mongodb backend is the multi-tenant platform store
+  ([runtime/storage.md](runtime/storage.md)).
+
+Still deferred: SSE surfaces (`/chat` streaming, `/events` work feed) remain
+request/response for now; team overlays are roster-only in v1 (operator-added
+teammates get no harness `Agent` yet).
+
 ## Candidate upstream workstreams
 
 Documented here, executed as PRs against the owning repos — never forked
@@ -73,17 +110,20 @@ locally:
   session JWT only); company-scoped orchestration v2 (multi-company routing,
   richer effects, tool namespacing) — see
   [integrations/medulla.md](integrations/medulla.md).
-- **OpenHuman**: headless multi-workspace mode; library-crate split of the
-  tool/channel/credential domains; external approval hook; namespaced
-  credentials; documented `/events` schema — see
-  [integrations/openhuman.md](integrations/openhuman.md).
+- **OpenHuman**: headless multi-workspace mode; ~~library-crate split of the
+  tool/channel/credential domains~~ (**realized** — the harness links
+  `openhuman_core` directly); a **public turn-usage accessor**
+  (tinyhumansai/openhuman#4940) so a host crate can read real token/cost totals
+  after a turn; external approval hook; namespaced credentials; documented
+  `/events` schema — see [integrations/openhuman.md](integrations/openhuman.md).
 
 ## Non-goals
 
 - **Not a model host.** Medulla and all model routing are hosted by
   TinyHumans; no local-LLM or BYO-model support.
-- **Not a general agent framework.** TinyAgents is the harness; OpenCompany
-  grows no graph engine of its own.
+- **Not a general agent framework.** `openhuman_core` (embedded as a library)
+  is the harness; OpenCompany grows no graph engine of its own. (TinyAgents
+  remains an optional `StubBrain` for offline tests only, not the harness.)
 - **Not a fork of OpenHuman.** Gaps go upstream as PRs.
 - **Not multi-human companies.** Exactly one Operator per Company.
 - **Not the AVI venture factory (yet).** No autonomous opportunity discovery
