@@ -1,12 +1,14 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import {
   Flag,
   LayoutDashboard,
   type LucideIcon,
+  MessageSquareWarning,
   MessagesSquare,
   Plug,
   Settings2,
   ShieldCheck,
+  Workflow,
 } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
@@ -33,15 +35,31 @@ import { CompanySwitcher } from "@/components/company-switcher";
 import { FeedbackDialog } from "@/components/feedback-dialog";
 import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { DiscordIcon } from "@/components/discord-icon";
 import { useCompany } from "@/hooks/use-company";
+import { useHashView } from "@/hooks/use-hash-view";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
+import { DISCORD_INVITE_URL } from "@/lib/links";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
+import { FeedbackView } from "@/views/FeedbackView";
 
-export type View = "overview" | "conversation" | "approvals" | "connections" | "settings";
+// React Flow is heavy and only used here — load it on demand.
+const WorkflowsView = lazy(() =>
+  import("@/views/WorkflowsView").then((m) => ({ default: m.WorkflowsView })),
+);
+
+export type View =
+  | "overview"
+  | "conversation"
+  | "approvals"
+  | "workflows"
+  | "connections"
+  | "settings"
+  | "feedback";
 
 interface NavItem {
   view: View;
@@ -61,6 +79,7 @@ const NAV: NavGroup[] = [
       { view: "overview", label: "Overview", icon: LayoutDashboard },
       { view: "conversation", label: "Conversation", icon: MessagesSquare },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
+      { view: "workflows", label: "Workflows", icon: Workflow },
     ],
   },
   {
@@ -70,15 +89,23 @@ const NAV: NavGroup[] = [
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
   },
+  {
+    label: "Support",
+    items: [{ view: "feedback", label: "Feedback", icon: MessageSquareWarning }],
+  },
 ];
 
 const TITLES: Record<View, string> = {
   overview: "Overview",
   conversation: "Conversation",
   approvals: "Approvals",
+  workflows: "Workflows",
   connections: "Connections",
   settings: "Settings",
+  feedback: "Feedback",
 };
+
+const VIEWS = NAV.flatMap((g) => g.items.map((i) => i.view));
 
 interface Props {
   client: OpenCompanyClient;
@@ -98,7 +125,7 @@ export function AppShell({
   onSwitchCompany,
   onBackToPicker,
 }: Props) {
-  const [view, setView] = useState<View>("overview");
+  const [view, setView] = useHashView<View>(VIEWS, "overview");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const feed = useCompany(client, company, initialStatus);
@@ -145,9 +172,12 @@ export function AppShell({
         <SidebarFooter>
           <SidebarMenu>
             <SidebarMenuItem>
-              <SidebarMenuButton tooltip="Flag something" onClick={() => setFeedbackOpen(true)}>
-                <Flag />
-                <span>Flag something</span>
+              <SidebarMenuButton
+                tooltip="Join our Discord"
+                render={<a href={DISCORD_INVITE_URL} target="_blank" rel="noreferrer" />}
+              >
+                <DiscordIcon className="size-4" />
+                <span>Join our Discord</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -203,10 +233,22 @@ export function AppShell({
               onGoToConversation={() => setView("conversation")}
             />
           )}
+          {view === "workflows" && (
+            <Suspense
+              fallback={
+                <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                  Loading canvas…
+                </div>
+              }
+            >
+              <WorkflowsView />
+            </Suspense>
+          )}
           {view === "connections" && <ConnectionsView client={client} company={company} />}
           {view === "settings" && (
             <SettingsView client={client} company={company} feed={feed} onFlag={() => setFeedbackOpen(true)} />
           )}
+          {view === "feedback" && <FeedbackView client={client} company={company} />}
         </main>
       </SidebarInset>
 
