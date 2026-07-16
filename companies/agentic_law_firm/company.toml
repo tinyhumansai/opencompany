@@ -31,3 +31,8 @@ description = "Run and review document discovery."
 id = "compliance_agent"
 role = "Compliance Agent"
 description = "Check regulatory compliance."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["matter_pipeline"]

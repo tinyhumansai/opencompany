@@ -31,3 +31,8 @@ description = "Build financial forecasts and budgets."
 id = "audit_prep"
 role = "Audit Preparer"
 description = "Assemble documentation for audits."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["month_end_close"]

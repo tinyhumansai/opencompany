@@ -36,3 +36,8 @@ description = "Coordinate interview scheduling."
 id = "offer_generator"
 role = "Offer Generator"
 description = "Draft and generate offers."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["hiring_pipeline"]

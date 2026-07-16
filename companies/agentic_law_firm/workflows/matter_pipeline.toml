@@ -1,0 +1,85 @@
+# Workflow graph: matter_pipeline
+#
+# Referenced by `[workflows].enabled = ["matter_pipeline"]` in ../company.toml.
+# A new matter goes from intake through research and drafting to a filing the
+# operator approves. Node kinds mirror the tinyflows model.
+
+id = "matter_pipeline"
+name = "Matter pipeline"
+description = "A new matter goes from intake to a filing ready for approval."
+
+[[node]]
+id = "intake"
+kind = "trigger"
+name = "New matter"
+summary = "A client request or new matter arrives."
+
+[[node]]
+id = "research"
+kind = "agent"
+name = "Legal research"
+summary = "Pull the relevant law and precedent."
+agent = "legal_researcher"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Contract or litigation?"
+summary = "Route by the kind of matter."
+
+[[node]]
+id = "draft"
+kind = "agent"
+name = "Draft the document"
+summary = "Draft the contract or agreement."
+agent = "contract_drafter"
+
+[[node]]
+id = "litigation"
+kind = "agent"
+name = "Litigation prep"
+summary = "Assemble the litigation materials."
+agent = "litigation_support"
+
+[[node]]
+id = "compliance"
+kind = "agent"
+name = "Compliance check"
+summary = "Check the draft against regulation."
+agent = "compliance_agent"
+
+[[node]]
+id = "review"
+kind = "output"
+name = "Park for approval"
+summary = "Send the draft to the operator for sign-off."
+
+[[edge]]
+from = "intake"
+to = "research"
+
+[[edge]]
+from = "research"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "draft"
+label = "contract"
+
+[[edge]]
+from = "gate"
+to = "litigation"
+label = "litigation"
+
+[[edge]]
+from = "draft"
+to = "compliance"
+
+[[edge]]
+from = "litigation"
+to = "compliance"
+
+[[edge]]
+from = "compliance"
+to = "review"

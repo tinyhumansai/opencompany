@@ -1,0 +1,118 @@
+# Workflow graph: engagement_pipeline
+#
+# Referenced by `[workflows].enabled = ["engagement_pipeline"]` in ../company.toml.
+# A client problem goes from research and interviews to a delivered deck and an
+# implementation plan. Node kinds mirror the tinyflows model.
+
+id = "engagement_pipeline"
+name = "Engagement pipeline"
+description = "A client problem becomes a strategy deck and an implementation plan."
+
+[[node]]
+id = "brief"
+kind = "trigger"
+name = "New engagement"
+summary = "A client problem statement arrives."
+
+[[node]]
+id = "research"
+kind = "agent"
+name = "Desk research"
+summary = "Gather the evidence base."
+agent = "researcher"
+
+[[node]]
+id = "interviews"
+kind = "agent"
+name = "Stakeholder interviews"
+summary = "Interview and synthesize stakeholders."
+agent = "interviewer"
+
+[[node]]
+id = "analysis"
+kind = "agent"
+name = "Industry analysis"
+summary = "Analyze the market and competition."
+agent = "industry_analyst"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Model needed?"
+summary = "Branch on whether the case needs a model."
+
+[[node]]
+id = "model"
+kind = "agent"
+name = "Financial model"
+summary = "Build the supporting model."
+agent = "financial_modeler"
+
+[[node]]
+id = "strategy"
+kind = "agent"
+name = "Synthesize strategy"
+summary = "Turn findings into recommendations."
+agent = "strategist"
+
+[[node]]
+id = "deck"
+kind = "agent"
+name = "Build the deck"
+summary = "Produce the client-ready deck."
+agent = "deck_builder"
+
+[[node]]
+id = "plan"
+kind = "agent"
+name = "Implementation plan"
+summary = "Turn strategy into a roadmap."
+agent = "implementation_planner"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Deliver to workshop"
+summary = "Hand the deck and plan to the operator."
+
+[[edge]]
+from = "brief"
+to = "research"
+
+[[edge]]
+from = "research"
+to = "interviews"
+
+[[edge]]
+from = "interviews"
+to = "analysis"
+
+[[edge]]
+from = "analysis"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "model"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "strategy"
+label = "no"
+
+[[edge]]
+from = "model"
+to = "strategy"
+
+[[edge]]
+from = "strategy"
+to = "deck"
+
+[[edge]]
+from = "deck"
+to = "plan"
+
+[[edge]]
+from = "plan"
+to = "done"
