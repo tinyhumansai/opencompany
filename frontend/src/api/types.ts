@@ -61,6 +61,19 @@ export interface FeedbackResponse {
 }
 
 /**
+ * One agent in the company's roster, from `GET .../team`. Forward-looking:
+ * hosts that don't expose the roster yet 404, and the console falls back to a
+ * locally-editable starter team. Mirrors a `company.toml` `[[agent]]` entry.
+ */
+export interface TeamMemberDto {
+  id: string;
+  /** Display name; falls back to the role when a company only names roles. */
+  name?: string;
+  role: string;
+  description?: string;
+}
+
+/**
  * One third-party connection's state, from `GET .../connections`.
  * Forward-looking: hosts that don't expose the connections surface yet simply
  * 404, and the console treats connections as unavailable.

@@ -17,6 +17,7 @@ import {
   type ConnectionState,
   type FeedbackInput,
   type FeedbackResponse,
+  type TeamMemberDto,
   type Verdict,
 } from "./types";
 
@@ -118,6 +119,14 @@ export class OpenCompanyClient {
   /** Capture feedback (optionally preview the exact issue body first). */
   feedback(input: FeedbackInput, company?: string | null): Promise<FeedbackResponse> {
     return this.request<FeedbackResponse>("POST", `${this.scope(company)}/feedback`, input);
+  }
+
+  /**
+   * The company's agent roster (forward-looking surface). Hosts that don't
+   * expose `.../team` yet return 404 — callers fall back to a local roster.
+   */
+  listTeam(company?: string | null): Promise<TeamMemberDto[]> {
+    return this.request<TeamMemberDto[]>("GET", `${this.scope(company)}/team`);
   }
 
   /**

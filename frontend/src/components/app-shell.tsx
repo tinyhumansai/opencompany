@@ -9,6 +9,7 @@ import {
   Settings2,
   ShieldCheck,
   SquareKanban,
+  Users,
   Workflow,
 } from "lucide-react";
 
@@ -46,6 +47,7 @@ import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
+import { TeamView } from "@/views/TeamView";
 import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
 import { FeedbackView } from "@/views/FeedbackView";
@@ -59,6 +61,7 @@ export type View =
   | "overview"
   | "conversation"
   | "tasks"
+  | "team"
   | "approvals"
   | "workflows"
   | "connections"
@@ -83,6 +86,7 @@ const NAV: NavGroup[] = [
       { view: "overview", label: "Overview", icon: LayoutDashboard },
       { view: "conversation", label: "Conversation", icon: MessagesSquare },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
+      { view: "team", label: "Team", icon: Users },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
       { view: "workflows", label: "Workflows", icon: Workflow },
     ],
@@ -104,6 +108,7 @@ const TITLES: Record<View, string> = {
   overview: "Overview",
   conversation: "Conversation",
   tasks: "Tasks",
+  team: "Team",
   approvals: "Approvals",
   workflows: "Workflows",
   connections: "Connections",
@@ -244,6 +249,7 @@ export function AppShell({
             />
           )}
           {view === "tasks" && <TasksView />}
+          {view === "team" && <TeamView client={client} company={company} />}
           {view === "approvals" && (
             <ApprovalsView
               client={client}
