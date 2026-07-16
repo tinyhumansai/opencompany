@@ -5,6 +5,8 @@
 //! report its effective configuration. The cognition kernel (Brain, cycle
 //! loop, stores) lands in later phases; see `docs/spec/roadmap.md`.
 
+#[cfg(test)]
+mod content_test;
 mod manifest;
 pub mod runtime;
 mod skill_file;
