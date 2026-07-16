@@ -76,6 +76,15 @@ The same build works against any host/company. Resolution order (first wins):
   `npx shadcn@latest add <component>`.
 - Base UI composes with the `render` prop (not Radix's `asChild`).
 
+## Architecture & backend contract
+
+The console introduces many surfaces (Team, Skills, Workspace, Memory, Usage,
+Finances, Connections, Inbox, Domain/SMTP, …). Most are built to a **seam +
+client-side fallback** pattern so the host-side APIs can land incrementally.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is the full brief: every surface, its data,
+the proposed endpoint contract, and the company-directory conventions the
+backend should read.
+
 ## Pluggable pieces
 
 Everything is decoupled so you can embed parts elsewhere:
