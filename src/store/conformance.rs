@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
+use crate::ports::inbox::{EmailRecord, InboxStore};
 use crate::ports::memory::MemoryStore;
 use crate::ports::now_millis;
 use crate::ports::store::CompanyStore;
@@ -326,4 +327,61 @@ pub async fn assert_export_totality(
     let hits = context.search(&id, "gamma", usize::MAX).await.unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].snippet.contains("gamma"));
+}
+
+/// Asserts the [`InboxStore`] contract: per-company isolation, per-inbox
+/// filtering, append order, and inbox enumeration.
+pub async fn assert_inbox_store(inbox: Arc<dyn InboxStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+
+    let email = |id: &str, mailbox: &str, outbound: bool, at: u64| EmailRecord {
+        id: id.to_string(),
+        inbox: mailbox.to_string(),
+        from: "sender@example.com".to_string(),
+        to: format!("{mailbox}@acme.test"),
+        subject: format!("subject {id}"),
+        body: format!("body {id}"),
+        outbound,
+        at_millis: at,
+    };
+
+    // alpha has two messages in `ceo` and one outbound in `sales`.
+    inbox
+        .append(&alpha, email("a1", "ceo", false, 1))
+        .await
+        .unwrap();
+    inbox
+        .append(&alpha, email("a2", "sales", true, 2))
+        .await
+        .unwrap();
+    inbox
+        .append(&alpha, email("a3", "ceo", true, 3))
+        .await
+        .unwrap();
+    // beta has an unrelated message; it must never leak into alpha.
+    inbox
+        .append(&beta, email("b1", "ceo", false, 4))
+        .await
+        .unwrap();
+
+    // Per-inbox listing filters and preserves append order.
+    let ceo = inbox.list(&alpha, "ceo").await.unwrap();
+    assert_eq!(ceo.len(), 2);
+    assert_eq!(ceo[0].id, "a1");
+    assert_eq!(ceo[1].id, "a3");
+    assert!(ceo[1].outbound);
+
+    // Isolation: alpha's `ceo` and beta's `ceo` are distinct.
+    let beta_ceo = inbox.list(&beta, "ceo").await.unwrap();
+    assert_eq!(beta_ceo.len(), 1);
+    assert_eq!(beta_ceo[0].id, "b1");
+
+    // Enumeration lists exactly the inboxes with mail.
+    let mut names = inbox.inboxes(&alpha).await.unwrap();
+    names.sort();
+    assert_eq!(names, vec!["ceo".to_string(), "sales".to_string()]);
+
+    // An empty inbox reads back empty.
+    assert!(inbox.list(&alpha, "unknown").await.unwrap().is_empty());
 }

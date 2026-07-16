@@ -115,7 +115,7 @@ impl MongoStore {
                 .options(IndexOptions::builder().unique(true).build())
                 .build()
         };
-        let plans: [(&str, IndexModel); 7] = [
+        let plans: [(&str, IndexModel); 8] = [
             ("companies", unique(doc! {"company_id": 1})),
             ("ledger", unique(doc! {"company_id": 1, "idx": 1})),
             ("events", unique(doc! {"company_id": 1, "seq": 1})),
@@ -123,6 +123,7 @@ impl MongoStore {
             ("memory_tasks", unique(doc! {"company_id": 1, "task_id": 1})),
             ("context_chunks", unique(doc! {"company_id": 1, "addr": 1})),
             ("secrets", unique(doc! {"company_id": 1, "key": 1})),
+            ("inbox", unique(doc! {"company_id": 1, "seq": 1})),
         ];
         for (name, index) in plans {
             self.collection(name)
@@ -617,6 +618,64 @@ impl SecretStore for MongoStore {
 }
 
 // ---------------------------------------------------------------------------
+// InboxStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::inbox::InboxStore for MongoStore {
+    async fn append(
+        &self,
+        company: &CompanyId,
+        record: crate::ports::inbox::EmailRecord,
+    ) -> Result<()> {
+        let record_json = serde_json::to_string(&record)?;
+        let seq = self.next_seq(company, "inbox").await?;
+        self.collection("inbox")
+            .insert_one(doc! {
+                "company_id": company.as_ref(),
+                "seq": seq as i64,
+                "inbox": &record.inbox,
+                "record_json": record_json,
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        company: &CompanyId,
+        inbox: &str,
+    ) -> Result<Vec<crate::ports::inbox::EmailRecord>> {
+        let mut cursor = self
+            .collection("inbox")
+            .find(doc! {"company_id": company.as_ref(), "inbox": inbox})
+            .sort(doc! {"seq": 1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "record_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<String>> {
+        let names = self
+            .collection("inbox")
+            .distinct("inbox", doc! {"company_id": company.as_ref()})
+            .await
+            .map_err(mongo_err)?;
+        let mut out: Vec<String> = names
+            .into_iter()
+            .filter_map(|b| b.as_str().map(|s| s.to_string()))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — env-gated conformance against a real MongoDB
 // ---------------------------------------------------------------------------
 
@@ -680,6 +739,13 @@ mod test {
     async fn conformance_export_totality() {
         let Some(s) = store().await else { return };
         conformance::assert_export_totality(s.clone(), s.clone(), s.clone(), s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_inbox_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_inbox_store(s.clone()).await;
         drop_db(&s).await;
     }
 

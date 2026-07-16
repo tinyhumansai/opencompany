@@ -14,6 +14,7 @@ pub mod channel;
 pub mod context;
 pub mod economy;
 pub mod events;
+pub mod inbox;
 pub mod memory;
 pub mod secrets;
 pub mod store;
@@ -27,6 +28,7 @@ pub use context::ContextStore;
 pub use economy::AgentEconomy;
 pub use events::EventLog;
 pub use ids::{generate_id, now_millis};
+pub use inbox::{EmailRecord, InboxStore};
 pub use memory::MemoryStore;
 pub use secrets::SecretStore;
 pub use store::CompanyStore;
@@ -55,6 +57,7 @@ mod test {
         _economy: &dyn AgentEconomy,
         _approvals: &dyn ApprovalGate,
         _secrets: &dyn SecretStore,
+        _inbox: &dyn crate::ports::inbox::InboxStore,
     ) {
     }
 

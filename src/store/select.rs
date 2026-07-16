@@ -19,6 +19,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
+use crate::ports::inbox::InboxStore;
 use crate::ports::memory::MemoryStore;
 use crate::ports::secrets::SecretStore;
 use crate::ports::store::CompanyStore;
@@ -70,6 +71,7 @@ pub struct StorageHandles {
     pub memory: Arc<dyn MemoryStore>,
     pub context: Arc<dyn ContextStore>,
     pub secrets: Arc<dyn SecretStore>,
+    pub inbox: Arc<dyn InboxStore>,
     /// Present when the backend persists company → tenant ownership.
     pub ownership: Option<Arc<dyn OwnershipStore>>,
 }
@@ -136,7 +138,8 @@ fn open_sqlite(data_dir: &Path) -> Result<Option<StorageHandles>> {
         events: store.clone(),
         memory: store.clone(),
         context: store.clone(),
-        secrets: store,
+        secrets: store.clone(),
+        inbox: store,
         ownership: None,
     }))
 }
@@ -163,6 +166,7 @@ async fn open_mongodb(settings: &StorageSettings) -> Result<Option<StorageHandle
         memory: store.clone(),
         context: store.clone(),
         secrets: store.clone(),
+        inbox: store.clone(),
         ownership: Some(store),
     }))
 }

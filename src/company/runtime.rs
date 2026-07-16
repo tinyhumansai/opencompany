@@ -24,7 +24,7 @@ use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    MemoryStore, SecretStore, ToolProvider,
+    InboxStore, MemoryStore, SecretStore, ToolProvider,
 };
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
@@ -51,6 +51,8 @@ pub struct CompanyRuntime {
     /// Per-company secrets, read by the feedback scrubber (and webhook HMAC
     /// verification, later).
     pub(crate) secrets: Arc<dyn SecretStore>,
+    /// Per-teammate email (inbound + outbound), backing the inbox surface.
+    pub(crate) inbox: Arc<dyn InboxStore>,
     /// Durable store of feedback items (the "feedback family").
     pub(crate) feedback: Arc<FeedbackStore>,
     /// Filing configuration: the GitHub client, target repo, consent, limiter.
@@ -76,6 +78,7 @@ impl CompanyRuntime {
         approval_gate: Arc<ManifestApprovalGate>,
         journal: Arc<RuntimeJournal>,
         secrets: Arc<dyn SecretStore>,
+        inbox: Arc<dyn InboxStore>,
         feedback: Arc<FeedbackStore>,
         filer: Arc<FeedbackFiler>,
     ) -> Self {
@@ -94,6 +97,7 @@ impl CompanyRuntime {
             approval_gate,
             journal,
             secrets,
+            inbox,
             feedback,
             filer,
             serial: TokioMutex::new(()),
@@ -103,6 +107,16 @@ impl CompanyRuntime {
     /// This company's id.
     pub fn id(&self) -> &CompanyId {
         &self.id
+    }
+
+    /// This company's secret store (SMTP creds, OAuth tokens, domain config).
+    pub fn secrets(&self) -> &Arc<dyn SecretStore> {
+        &self.secrets
+    }
+
+    /// This company's inbox store (inbound + outbound email).
+    pub fn inbox(&self) -> &Arc<dyn InboxStore> {
+        &self.inbox
     }
 
     /// Whether an agent economy (tiny.place) is wired in.

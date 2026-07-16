@@ -19,6 +19,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
+use crate::ports::inbox::{EmailRecord, InboxStore};
 use crate::ports::memory::MemoryStore;
 use crate::ports::secrets::SecretStore;
 use crate::ports::store::CompanyStore;
@@ -588,6 +589,62 @@ impl SecretStore for FsSecretStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// InboxStore
+// ---------------------------------------------------------------------------
+
+/// Filesystem [`InboxStore`]: one append-only `inbox.jsonl` per company holding
+/// every inbox's mail interleaved. Reads filter by inbox in memory; the volumes
+/// (a teammate's mail) stay well within a single-file scan.
+#[derive(Clone)]
+pub struct FsInboxStore {
+    root: PathBuf,
+    locks: PathLocks,
+}
+
+impl FsInboxStore {
+    /// Creates an inbox store rooted at `root` (the OpenCompany home).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            locks: PathLocks::default(),
+        }
+    }
+
+    fn bundle(&self, id: &CompanyId) -> Bundle {
+        Bundle::new(self.root.clone(), id)
+    }
+}
+
+#[async_trait]
+impl InboxStore for FsInboxStore {
+    async fn append(&self, company: &CompanyId, record: EmailRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.inbox_jsonl();
+        let line = serde_json::to_string(&record)?;
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        append_line(&path, &line).await
+    }
+
+    async fn list(&self, company: &CompanyId, inbox: &str) -> Result<Vec<EmailRecord>> {
+        let all = read_jsonl::<EmailRecord>(&self.bundle(company).inbox_jsonl()).await?;
+        Ok(all.into_iter().filter(|r| r.inbox == inbox).collect())
+    }
+
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<String>> {
+        let all = read_jsonl::<EmailRecord>(&self.bundle(company).inbox_jsonl()).await?;
+        let mut seen: Vec<String> = Vec::new();
+        for record in all {
+            if !seen.contains(&record.inbox) {
+                seen.push(record.inbox);
+            }
+        }
+        Ok(seen)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -629,6 +686,13 @@ mod test {
     async fn conformance_monotonic_event_seq() {
         let root = tmp_root();
         conformance::assert_monotonic_event_seq(Arc::new(FsEventLog::new(&root))).await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_inbox_store() {
+        let root = tmp_root();
+        conformance::assert_inbox_store(Arc::new(FsInboxStore::new(&root))).await;
         tokio::fs::remove_dir_all(&root).await.ok();
     }
 
