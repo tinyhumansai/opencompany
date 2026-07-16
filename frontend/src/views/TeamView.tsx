@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { MoreHorizontal, Plus, Sparkles, UserPlus } from "lucide-react";
+import { Mail, MoreHorizontal, Plus, Sparkles, UserPlus } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import { Badge } from "@/components/ui/badge";
@@ -22,7 +22,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { isInboxEnabled, loadInboxes, saveInboxes, toggleInbox } from "@/lib/inbox";
 import {
   fromDto,
   initials,
@@ -46,6 +48,15 @@ export function TeamView({ client, company }: Props) {
   const [fromHost, setFromHost] = useState(false);
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [addOpen, setAddOpen] = useState(false);
+  const [inboxes, setInboxes] = useState(() => loadInboxes(company));
+
+  useEffect(() => {
+    saveInboxes(company, inboxes);
+  }, [company, inboxes]);
+
+  function toggleMemberInbox(name: string) {
+    setInboxes((s) => toggleInbox(s, name));
+  }
 
   const boot = useCallback(async () => {
     try {
@@ -69,8 +80,9 @@ export function TeamView({ client, company }: Props) {
     void boot();
   }, [boot]);
 
-  function addMember(fields: { name: string; role: string; description: string }) {
+  function addMember(fields: { name: string; role: string; description: string; inbox?: boolean }) {
     setMembers((m) => [...m, newMember(fields)]);
+    if (fields.inbox) toggleMemberInbox(fields.name);
     setAddOpen(false);
   }
 
@@ -98,7 +110,13 @@ export function TeamView({ client, company }: Props) {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {members.map((m) => (
-              <MemberCard key={m.id} member={m} onRemove={() => setMembers((ms) => ms.filter((x) => x.id !== m.id))} />
+              <MemberCard
+                key={m.id}
+                member={m}
+                inboxOn={isInboxEnabled(inboxes, m.name)}
+                onToggleInbox={() => toggleMemberInbox(m.name)}
+                onRemove={() => setMembers((ms) => ms.filter((x) => x.id !== m.id))}
+              />
             ))}
             <button
               onClick={() => setAddOpen(true)}
@@ -116,7 +134,17 @@ export function TeamView({ client, company }: Props) {
   );
 }
 
-function MemberCard({ member, onRemove }: { member: TeamMember; onRemove: () => void }) {
+function MemberCard({
+  member,
+  inboxOn,
+  onToggleInbox,
+  onRemove,
+}: {
+  member: TeamMember;
+  inboxOn: boolean;
+  onToggleInbox: () => void;
+  onRemove: () => void;
+}) {
   return (
     <Card>
       <CardContent className="flex h-full flex-col gap-3 py-4">
@@ -150,10 +178,15 @@ function MemberCard({ member, onRemove }: { member: TeamMember; onRemove: () => 
         {member.description && (
           <p className="line-clamp-3 text-sm text-muted-foreground">{member.description}</p>
         )}
-        <div className="mt-auto">
+        <div className="mt-auto flex items-center justify-between gap-2 border-t pt-3">
           <Badge variant="secondary" className="gap-1">
             <Sparkles className="size-3" /> Agent
           </Badge>
+          <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+            <Mail className="size-3.5" />
+            Inbox
+            <Switch checked={inboxOn} onCheckedChange={onToggleInbox} aria-label="Give this agent an inbox" />
+          </label>
         </div>
       </CardContent>
     </Card>
@@ -167,21 +200,23 @@ function AddMemberDialog({
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
-  onAdd: (fields: { name: string; role: string; description: string }) => void;
+  onAdd: (fields: { name: string; role: string; description: string; inbox?: boolean }) => void;
 }) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [description, setDescription] = useState("");
+  const [inbox, setInbox] = useState(false);
 
   function reset() {
     setName("");
     setRole("");
     setDescription("");
+    setInbox(false);
   }
 
   function submit() {
     if (!name.trim() || !role.trim()) return;
-    onAdd({ name, role, description });
+    onAdd({ name, role, description, inbox });
     reset();
   }
 
@@ -226,6 +261,12 @@ function AddMemberDialog({
             placeholder="e.g. Runs paid acquisition and reports on ROAS."
           />
         </div>
+        <label className="flex items-center justify-between rounded-lg border p-3">
+          <span className="flex items-center gap-2 text-sm">
+            <Mail className="size-4 text-muted-foreground" /> Give this agent an inbox
+          </span>
+          <Switch checked={inbox} onCheckedChange={setInbox} aria-label="Give this agent an inbox" />
+        </label>
         <DialogFooter>
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Cancel

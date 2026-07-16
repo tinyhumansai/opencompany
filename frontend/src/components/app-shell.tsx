@@ -4,6 +4,7 @@ import {
   ChartColumnBig,
   FolderClosed,
   Flag,
+  Inbox,
   LayoutDashboard,
   type LucideIcon,
   MessageSquareWarning,
@@ -54,6 +55,7 @@ import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
 import { TeamView } from "@/views/TeamView";
 import { SkillsView } from "@/views/SkillsView";
+import { InboxView } from "@/views/InboxView";
 import { MemoryView } from "@/views/MemoryView";
 import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
@@ -77,6 +79,7 @@ const FinancesView = lazy(() =>
 export type View =
   | "overview"
   | "conversation"
+  | "inbox"
   | "tasks"
   | "team"
   | "skills"
@@ -107,6 +110,7 @@ const NAV: NavGroup[] = [
     items: [
       { view: "overview", label: "Overview", icon: LayoutDashboard },
       { view: "conversation", label: "Conversation", icon: MessagesSquare },
+      { view: "inbox", label: "Inbox", icon: Inbox },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "team", label: "Team", icon: Users },
       { view: "skills", label: "Skills", icon: Sparkles },
@@ -134,6 +138,7 @@ const NAV: NavGroup[] = [
 const TITLES: Record<View, string> = {
   overview: "Overview",
   conversation: "Conversation",
+  inbox: "Inbox",
   tasks: "Tasks",
   team: "Team",
   skills: "Skills",
@@ -280,6 +285,7 @@ export function AppShell({
               onReply={() => void feed.refresh()}
             />
           )}
+          {view === "inbox" && <InboxView company={company} />}
           {view === "tasks" && <TasksView />}
           {view === "team" && <TeamView client={client} company={company} />}
           {view === "skills" && <SkillsView company={company} />}
