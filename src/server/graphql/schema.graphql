@@ -1,4 +1,18 @@
 """
+Token totals for one teammate.
+"""
+type AgentTokens {
+	"""
+	The teammate display name.
+	"""
+	name: String!
+	"""
+	Total tokens attributed to them.
+	"""
+	tokens: Float!
+}
+
+"""
 A parked approval awaiting the operator. Mirrors
 [`ApprovalSummary`](crate::runtime::types::ApprovalSummary).
 """
@@ -20,6 +34,20 @@ type Approval {
 	range that would overflow GraphQL's `Int`.
 	"""
 	atMillis: Float!
+}
+
+"""
+Spend rolled up by category.
+"""
+type CategorySpend {
+	"""
+	The category label.
+	"""
+	category: String!
+	"""
+	The amount spent in it, USD.
+	"""
+	amount: Float!
 }
 
 type Chat {
@@ -112,6 +140,14 @@ type Company {
 	One workflow graph by id; null when unavailable.
 	"""
 	workflow(id: ID!): Workflow
+	"""
+	Token/cost usage over a lookback window.
+	"""
+	usage(range: UsageRange! = D30): Usage!
+	"""
+	The finance surface: balance, budget vs spend, and the transaction journal.
+	"""
+	finances: Finances!
 	"""
 	The third-party connections and their live status.
 	"""
@@ -239,6 +275,37 @@ type EmailPage {
 	The total number of items across all pages (before offset/limit).
 	"""
 	total: Int!
+}
+
+type Finances {
+	"""
+	The current balance, USD.
+	"""
+	balanceUsd: Float!
+	"""
+	The monthly budget, USD.
+	"""
+	budgetUsd: Float!
+	"""
+	Total spend this period, USD.
+	"""
+	spentUsd: Float!
+	"""
+	Total revenue this period, USD.
+	"""
+	revenueUsd: Float!
+	"""
+	Net (revenue − spend), USD.
+	"""
+	netUsd: Float!
+	"""
+	Spend rolled up by category.
+	"""
+	byCategory: [CategorySpend!]!
+	"""
+	A page of the transaction journal, most-recent first.
+	"""
+	transactions(first: Int! = 50, offset: Int! = 0): [Transaction!]!
 }
 
 """
@@ -402,6 +469,20 @@ type MessagePage {
 	The total number of items across all pages (before offset/limit).
 	"""
 	total: Int!
+}
+
+"""
+Call totals for one provider.
+"""
+type ProviderCalls {
+	"""
+	The provider id.
+	"""
+	provider: String!
+	"""
+	Total calls to it.
+	"""
+	calls: Float!
 }
 
 type Query {
@@ -569,6 +650,124 @@ type TeamMember {
 	Whether this teammate has an enabled inbox.
 	"""
 	inboxEnabled: Boolean!
+}
+
+"""
+One ledger transaction in the finance journal.
+"""
+type Transaction {
+	"""
+	The transaction id.
+	"""
+	id: ID!
+	"""
+	The transaction date, `YYYY-MM-DD`.
+	"""
+	date: String!
+	"""
+	A human description.
+	"""
+	description: String!
+	"""
+	The spend category.
+	"""
+	category: String!
+	"""
+	The amount, USD (a positive magnitude; see `direction`).
+	"""
+	amountUsd: Float!
+	"""
+	`in` for revenue, `out` for spend.
+	"""
+	direction: String!
+}
+
+"""
+The usage read surface for a company.
+"""
+type Usage {
+	"""
+	The daily token series.
+	"""
+	series: [UsagePoint!]!
+	"""
+	Tokens by teammate.
+	"""
+	byAgent: [AgentTokens!]!
+	"""
+	Calls by provider.
+	"""
+	byProvider: [ProviderCalls!]!
+	"""
+	Aggregate totals.
+	"""
+	totals: UsageTotals!
+}
+
+"""
+One day's token totals.
+"""
+type UsagePoint {
+	"""
+	The day, `YYYY-MM-DD`.
+	"""
+	date: String!
+	"""
+	Input tokens that day.
+	"""
+	inputTokens: Float!
+	"""
+	Output tokens that day.
+	"""
+	outputTokens: Float!
+}
+
+"""
+The usage lookback window.
+"""
+enum UsageRange {
+	"""
+	The last 7 days.
+	"""
+	D7
+	"""
+	The last 30 days (the default).
+	"""
+	D30
+	"""
+	The last 90 days.
+	"""
+	D90
+}
+
+"""
+Aggregate usage totals for the window.
+"""
+type UsageTotals {
+	"""
+	Total input tokens.
+	"""
+	inputTokens: Float!
+	"""
+	Total output tokens.
+	"""
+	outputTokens: Float!
+	"""
+	Total tokens (input + output).
+	"""
+	tokens: Float!
+	"""
+	Total inference cost, USD.
+	"""
+	costUsd: Float!
+	"""
+	Total OAuth calls.
+	"""
+	oauthCalls: Float!
+	"""
+	Number of distinct connections used.
+	"""
+	connections: Int!
 }
 
 """

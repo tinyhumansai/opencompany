@@ -343,6 +343,108 @@ async fn smtp_status_is_unconfigured_without_credentials() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
+#[tokio::test]
+async fn usage_is_empty_without_samples() {
+    let home = home();
+    let app = router(state_with_rich_company(&home).await);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ usage(range: D7){ totals { tokens costUsd connections } series { date } } } }"}"#,
+    )
+    .await;
+    let usage = &value["data"]["company"]["usage"];
+    assert_eq!(usage["totals"]["tokens"], 0.0);
+    assert_eq!(usage["totals"]["connections"], 0);
+    // D7 still yields a zero-filled 7-day series.
+    assert_eq!(usage["series"].as_array().unwrap().len(), 7);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn usage_reflects_recorded_samples() {
+    use crate::ports::usage::{SampleKind, UsageSample};
+    let home = home();
+    let state = state_with_rich_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    let now = super::now_millis();
+    runtime
+        .usage()
+        .record(
+            runtime.id(),
+            &UsageSample {
+                at_millis: now,
+                agent: "maya".into(),
+                provider: "managed".into(),
+                input_tokens: 100,
+                output_tokens: 40,
+                cached_input_tokens: 0,
+                cost_usd: 0.5,
+                kind: SampleKind::Inference,
+            },
+        )
+        .await
+        .unwrap();
+    let app = router(state);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ usage(range: D30){ totals { inputTokens tokens costUsd } byAgent { name tokens } } } }"}"#,
+    )
+    .await;
+    let usage = &value["data"]["company"]["usage"];
+    assert_eq!(usage["totals"]["inputTokens"], 100.0);
+    assert_eq!(usage["totals"]["tokens"], 140.0);
+    assert_eq!(usage["totals"]["costUsd"], 0.5);
+    assert_eq!(usage["byAgent"][0]["tokens"], 140.0);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn finances_fold_the_ledger() {
+    use crate::ports::types::LedgerEntry;
+    let home = home();
+    let state = state_with_rich_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    let now = super::now_millis();
+    runtime
+        .store()
+        .append_ledger(
+            runtime.id(),
+            LedgerEntry {
+                at_millis: now,
+                kind: "inference.spend".into(),
+                amount_usd: -2.0,
+                memo: "tokens".into(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .store()
+        .append_ledger(
+            runtime.id(),
+            LedgerEntry {
+                at_millis: now,
+                kind: "payment.received".into(),
+                amount_usd: 10.0,
+                memo: "invoice".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let app = router(state);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ finances { spentUsd revenueUsd netUsd transactions { id direction amountUsd } byCategory { category amount } } } }"}"#,
+    )
+    .await;
+    let fin = &value["data"]["company"]["finances"];
+    assert_eq!(fin["spentUsd"], 2.0);
+    assert_eq!(fin["revenueUsd"], 10.0);
+    assert_eq!(fin["netUsd"], 8.0);
+    assert_eq!(fin["transactions"].as_array().unwrap().len(), 2);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
 /// The committed SDL snapshot freezes the read contract. Regenerate with
 /// `cargo test -- --ignored regenerate_sdl_snapshot` after any schema change.
 #[test]

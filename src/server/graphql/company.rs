@@ -11,14 +11,18 @@ use std::sync::Arc;
 use async_graphql::{Context, ID, Object, SimpleObject};
 
 use super::connections::{ConnectionStateGql, DomainStatusGql, SmtpStatusGql};
+use super::finances::FinancesGql;
 use super::inbox::InboxGql;
 use super::memory_facts::{MemoryFactGql, MemoryKindGql};
 use super::pagination::Page;
 use super::skills::SkillGql;
 use super::tasks::TaskGql;
+use super::usage::{UsageGql, UsageRangeGql};
 use super::workflows::{WorkflowGql, WorkflowSummaryGql};
 use super::workspace::{FsNodeGql, WorkspaceFileGql};
-use super::{connections, inbox, memory_facts, skills, tasks, workflows, workspace};
+use super::{
+    connections, finances, inbox, memory_facts, skills, tasks, usage, workflows, workspace,
+};
 use crate::company::runtime::CompanyRuntime;
 use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, StoredEvent};
 
@@ -147,6 +151,20 @@ impl CompanyGql {
         id: ID,
     ) -> async_graphql::Result<Option<WorkflowGql>> {
         workflows::resolve_one(ctx, &self.runtime, id.as_str()).await
+    }
+
+    /// Token/cost usage over a lookback window.
+    async fn usage(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default)] range: UsageRangeGql,
+    ) -> async_graphql::Result<UsageGql> {
+        usage::resolve(ctx, &self.runtime, range).await
+    }
+
+    /// The finance surface: balance, budget vs spend, and the transaction journal.
+    async fn finances(&self) -> async_graphql::Result<FinancesGql> {
+        finances::resolve(&self.runtime).await
     }
 
     /// The third-party connections and their live status.

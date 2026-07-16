@@ -11,11 +11,13 @@
 pub mod auth;
 pub mod company;
 pub mod connections;
+pub mod finances;
 pub mod inbox;
 pub mod memory_facts;
 pub mod pagination;
 pub mod skills;
 pub mod tasks;
+pub mod usage;
 pub mod workflows;
 pub mod workspace;
 
@@ -136,6 +138,14 @@ async fn graphiql() -> impl IntoResponse {
 
 /// Milliseconds in one UTC day.
 const MILLIS_PER_DAY: u64 = 86_400_000;
+
+/// The current wall-clock time in epoch millis (UTC).
+pub(crate) fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The `(year, month, day)` of an epoch day, via Hinnant's public-domain
 /// `civil_from_days`. Kept local so the read plane needs no date dependency.
