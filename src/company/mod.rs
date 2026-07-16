@@ -5,6 +5,7 @@
 //! report its effective configuration. The cognition kernel (Brain, cycle
 //! loop, stores) lands in later phases; see `docs/spec/roadmap.md`.
 
+pub mod dns;
 mod manifest;
 pub mod runtime;
 mod types;
