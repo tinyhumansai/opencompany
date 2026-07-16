@@ -268,6 +268,28 @@ fn webhook_config(url: String) -> Option<opencompany::server::webhook::WebhookCo
     })
 }
 
+/// Builds the injected connection seams for the credential surfaces. A real DNS
+/// resolver is wired under the `dns` feature and a real SMTP sender under
+/// `smtp`; the default build injects neither, so those surfaces 404 as
+/// "not wired yet".
+fn connections_runtime() -> opencompany::server::ops::ConnectionsRuntime {
+    #[allow(unused_mut)]
+    let mut connections = opencompany::server::ops::ConnectionsRuntime::new();
+    #[cfg(feature = "dns")]
+    {
+        match opencompany::company::dns::HickoryDnsResolver::from_system() {
+            Ok(resolver) => connections = connections.with_dns(Arc::new(resolver)),
+            Err(err) => eprintln!("dns resolver unavailable: {err}"),
+        }
+    }
+    #[cfg(feature = "smtp")]
+    {
+        connections =
+            connections.with_mail(Arc::new(opencompany::server::ops::smtp::LettreMailSender));
+    }
+    connections
+}
+
 /// Builds the four fs storage ports over `home` as trait objects.
 fn fs_ports(home: &std::path::Path) -> opencompany::store::export::Ports {
     use opencompany::store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore};
@@ -482,6 +504,11 @@ async fn main() -> Result<()> {
             {
                 state = state.with_webhook(webhook);
             }
+            // Connection seams: a real DNS resolver (feature `dns`) enables custom
+            // domain verification; a real SMTP sender (feature `smtp`) enables the
+            // test send and outbound mail. Absent the features these stay `None`
+            // and the surfaces degrade to "not wired yet" (404).
+            state = state.with_connections(connections_runtime());
             // Schedulers stop cleanly when this is notified (Ctrl-C below).
             let shutdown = Arc::new(Notify::new());
             let mut scheduler_handles = Vec::new();
