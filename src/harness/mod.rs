@@ -166,6 +166,23 @@ impl HarnessPool {
         // (see module docs — flagged seam). A zero-usage turn writes nothing, so
         // this is correct-but-inert until a public accessor lands; the mapping is
         // fully wired so it becomes real with a one-line swap.
+        //
+        // FOLLOW-UP(openhuman#4940): once the vendored openhuman submodule
+        // pointer bumps to include the public `Agent::last_turn_usage()`
+        // accessor, replace this line with a read of the real per-turn totals,
+        // e.g.:
+        //     let u = agent.last_turn_usage();
+        //     let turn_cost = TurnUsage {
+        //         input_tokens: u.input_tokens,
+        //         output_tokens: u.output_tokens,
+        //         cached_input_tokens: u.cached_input_tokens,
+        //         cost_usd: u.cost_usd,
+        //         call_count: u.call_count,
+        //     };
+        // The mapping in `cost::usage_sample_for` / `cost::ledger_entry_for` is
+        // already correct, so this swap alone turns on the WS5 Usage/Finances
+        // data stream. Until then the accessor is absent from the pinned
+        // submodule and calling it would not compile under `--features openhuman`.
         let turn_cost = TurnUsage::default();
         record_turn_cost(
             &turn_cost,

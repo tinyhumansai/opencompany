@@ -12,6 +12,24 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::ports::types::CompanyId;
 
+/// How long a [`UsageMeter`] backend retains samples: the console's maximum
+/// window (`UsageRange::D90`). Backends evict samples older than this on write.
+pub const RETENTION_DAYS: u64 = 90;
+
+/// [`RETENTION_DAYS`] expressed in milliseconds.
+pub const RETENTION_MILLIS: u64 = RETENTION_DAYS * 86_400_000;
+
+/// The oldest `at_millis` a backend keeps, given the newest sample it has seen
+/// (typically ~now). Samples strictly older than this are evicted; a sample
+/// exactly [`RETENTION_DAYS`] old is still inside the window and kept.
+///
+/// Anchoring to the newest observed sample (rather than wall-clock now) keeps
+/// eviction deterministic and testable, and never discards a company's only
+/// recent data just because the process clock moved.
+pub fn retention_cutoff(newest_at_millis: u64) -> u64 {
+    newest_at_millis.saturating_sub(RETENTION_MILLIS)
+}
+
 /// What produced a [`UsageSample`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

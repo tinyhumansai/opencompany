@@ -903,6 +903,16 @@ impl crate::ports::usage::UsageMeter for MongoStore {
             })
             .await
             .map_err(mongo_err)?;
+        // Retention: drop samples older than the 90-day window, anchored to the
+        // newest sample just written.
+        let cutoff = crate::ports::usage::retention_cutoff(sample.at_millis);
+        self.collection("usage_samples")
+            .delete_many(doc! {
+                "company_id": company.as_ref(),
+                "at_ms": {"$lt": cutoff as i64},
+            })
+            .await
+            .map_err(mongo_err)?;
         Ok(())
     }
 
@@ -1289,6 +1299,13 @@ mod test {
     async fn conformance_usage_meter() {
         let Some(s) = store().await else { return };
         conformance::assert_usage_meter(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_usage_retention() {
+        let Some(s) = store().await else { return };
+        conformance::assert_usage_retention(s.clone()).await;
         drop_db(&s).await;
     }
 

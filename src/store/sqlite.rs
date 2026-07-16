@@ -933,6 +933,14 @@ impl crate::ports::usage::UsageMeter for SqliteStore {
             params![company.as_ref(), next, sample.at_millis as i64, json],
         )
         .map_err(sql_err)?;
+        // Retention: drop samples older than the 90-day window, anchored to the
+        // newest sample just written.
+        let cutoff = crate::ports::usage::retention_cutoff(sample.at_millis);
+        conn.execute(
+            "DELETE FROM usage_samples WHERE company_id = ?1 AND at_ms < ?2",
+            params![company.as_ref(), cutoff as i64],
+        )
+        .map_err(sql_err)?;
         Ok(())
     }
 
@@ -1311,6 +1319,11 @@ mod test {
     #[tokio::test]
     async fn conformance_usage_meter() {
         conformance::assert_usage_meter(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_usage_retention() {
+        conformance::assert_usage_retention(store()).await;
     }
 
     #[tokio::test]

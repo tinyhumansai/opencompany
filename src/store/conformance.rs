@@ -601,6 +601,49 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     assert_eq!(recent[0].kind, SampleKind::Inference);
 }
 
+/// Asserts the [`UsageMeter`] retention contract: samples older than the 90-day
+/// window are evicted on write, anchored to the newest sample recorded.
+pub async fn assert_usage_retention(usage: Arc<dyn UsageMeter>) {
+    use crate::ports::usage::RETENTION_MILLIS;
+
+    let acme = CompanyId::new("acme");
+    let sample = |at: u64| UsageSample {
+        at_millis: at,
+        agent: "ceo".to_string(),
+        provider: "managed".to_string(),
+        input_tokens: 100,
+        output_tokens: 50,
+        cached_input_tokens: 10,
+        cost_usd: 0.1,
+        kind: SampleKind::Inference,
+    };
+
+    // A fixed base far from epoch 0 so the cutoff math stays positive.
+    let base: u64 = 1_000_000_000_000;
+    let stale = base;
+    let boundary = base + RETENTION_MILLIS; // exactly 90 days newer — kept.
+    let fresh = base + RETENTION_MILLIS + 86_400_000; // 91 days newer.
+
+    // Seed a stale sample, then a boundary sample: nothing evicted yet (the
+    // newest is only 90 days ahead of the stale one).
+    usage.record(&acme, &sample(stale)).await.unwrap();
+    usage.record(&acme, &sample(boundary)).await.unwrap();
+    let all = usage.query(&acme, 0).await.unwrap();
+    assert_eq!(
+        all.len(),
+        2,
+        "boundary write keeps the exactly-90d-old sample"
+    );
+
+    // A fresh write pushes the cutoff past the stale sample, evicting it.
+    usage.record(&acme, &sample(fresh)).await.unwrap();
+    let kept = usage.query(&acme, 0).await.unwrap();
+    let ats: Vec<u64> = kept.iter().map(|s| s.at_millis).collect();
+    assert!(!ats.contains(&stale), "stale sample evicted: {ats:?}");
+    assert!(ats.contains(&boundary), "boundary sample retained: {ats:?}");
+    assert!(ats.contains(&fresh), "fresh sample retained: {ats:?}");
+}
+
 /// Asserts the [`SkillStateStore`] contract: isolation, set/upsert, and remove.
 pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
     let alpha = CompanyId::new("alpha");

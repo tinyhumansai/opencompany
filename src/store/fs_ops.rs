@@ -23,7 +23,7 @@ use crate::ports::now_millis;
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::tasks::{TaskRecord, TaskStore};
 use crate::ports::types::CompanyId;
-use crate::ports::usage::{UsageMeter, UsageSample};
+use crate::ports::usage::{UsageMeter, UsageSample, retention_cutoff};
 use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceStore};
 use crate::store::fs::{PathLocks, append_line, io_err, read_jsonl, read_optional, write_atomic};
 use crate::store::paths::Bundle;
@@ -160,7 +160,24 @@ impl UsageMeter for FsOps {
         let line = serde_json::to_string(sample)?;
         let lock = self.locks.get(&path);
         let _guard = lock.lock().await;
-        append_line(&path, &line).await
+        append_line(&path, &line).await?;
+        // Retention: compact `usage.jsonl` in place when it holds samples older
+        // than the 90-day window. The cutoff anchors to the newest sample seen,
+        // so a fresh write past the boundary evicts stale rows; a quiet company
+        // (or small timestamps in tests) rewrites nothing.
+        let samples = read_jsonl::<UsageSample>(&path).await?;
+        let Some(newest) = samples.iter().map(|s| s.at_millis).max() else {
+            return Ok(());
+        };
+        let cutoff = retention_cutoff(newest);
+        if samples.iter().any(|s| s.at_millis < cutoff) {
+            let kept: Vec<UsageSample> = samples
+                .into_iter()
+                .filter(|s| s.at_millis >= cutoff)
+                .collect();
+            rewrite_jsonl(&path, &kept).await?;
+        }
+        Ok(())
     }
 
     async fn query(&self, company: &CompanyId, since_millis: u64) -> Result<Vec<UsageSample>> {
@@ -572,6 +589,13 @@ mod test {
     async fn conformance_usage_meter() {
         let root = tmp_root();
         conformance::assert_usage_meter(Arc::new(FsOps::new(&root))).await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_usage_retention() {
+        let root = tmp_root();
+        conformance::assert_usage_retention(Arc::new(FsOps::new(&root))).await;
         tokio::fs::remove_dir_all(&root).await.ok();
     }
 
