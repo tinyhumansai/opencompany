@@ -8,6 +8,7 @@ import {
   Plug,
   Settings2,
   ShieldCheck,
+  SquareKanban,
   Workflow,
 } from "lucide-react";
 
@@ -44,6 +45,7 @@ import { defaultThreads } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
+import { TasksView } from "@/views/TasksView";
 import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
 import { FeedbackView } from "@/views/FeedbackView";
@@ -56,6 +58,7 @@ const WorkflowsView = lazy(() =>
 export type View =
   | "overview"
   | "conversation"
+  | "tasks"
   | "approvals"
   | "workflows"
   | "connections"
@@ -79,6 +82,7 @@ const NAV: NavGroup[] = [
     items: [
       { view: "overview", label: "Overview", icon: LayoutDashboard },
       { view: "conversation", label: "Conversation", icon: MessagesSquare },
+      { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
       { view: "workflows", label: "Workflows", icon: Workflow },
     ],
@@ -99,6 +103,7 @@ const NAV: NavGroup[] = [
 const TITLES: Record<View, string> = {
   overview: "Overview",
   conversation: "Conversation",
+  tasks: "Tasks",
   approvals: "Approvals",
   workflows: "Workflows",
   connections: "Connections",
@@ -238,6 +243,7 @@ export function AppShell({
               onReply={() => void feed.refresh()}
             />
           )}
+          {view === "tasks" && <TasksView />}
           {view === "approvals" && (
             <ApprovalsView
               client={client}
