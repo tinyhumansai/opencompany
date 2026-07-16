@@ -57,6 +57,11 @@ pub struct CompanyRuntime {
     pub(crate) filer: Arc<FeedbackFiler>,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
+    /// WS4: the embedded openhuman harness pool, when wired via
+    /// [`RuntimeBuilder::with_harness`](crate::runtime::RuntimeBuilder::with_harness).
+    /// Feature-gated so the default build is unaffected.
+    #[cfg(feature = "openhuman")]
+    pub(crate) harness: Option<Arc<crate::harness::HarnessPool>>,
 }
 
 impl CompanyRuntime {
@@ -97,7 +102,23 @@ impl CompanyRuntime {
             feedback,
             filer,
             serial: TokioMutex::new(()),
+            #[cfg(feature = "openhuman")]
+            harness: None,
         }
+    }
+
+    /// WS4: attach an embedded harness pool after construction (called by the
+    /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder)).
+    #[cfg(feature = "openhuman")]
+    pub fn set_harness(&mut self, harness: Arc<crate::harness::HarnessPool>) {
+        self.harness = Some(harness);
+    }
+
+    /// WS4: the embedded harness pool, if one is wired. The chat layer (WS3)
+    /// routes desk turns through this when present.
+    #[cfg(feature = "openhuman")]
+    pub fn harness(&self) -> Option<&Arc<crate::harness::HarnessPool>> {
+        self.harness.as_ref()
     }
 
     /// This company's id.
