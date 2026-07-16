@@ -8,6 +8,7 @@
 mod manifest;
 pub mod runtime;
 mod types;
+mod workflow_file;
 
 use std::path::Path;
 
@@ -16,6 +17,10 @@ pub use types::{
     Agent, BRAIN_MODES, Brain, Budget, ChannelConfig, Company, CompanyManifest,
     DEFAULT_ALWAYS_APPROVE, KNOWN_CHANNELS, POLICY_MODES, Place, Policy, Schedule, Skill, TIERS,
     TOOL_PROVIDERS, Tools,
+};
+pub use workflow_file::{
+    WORKFLOW_NODE_KINDS, WorkflowEdgeDef, WorkflowFile, WorkflowNodeDef, WorkflowNodeKind,
+    load_company_workflows, parse_workflow,
 };
 
 use crate::{Result, VERSION};

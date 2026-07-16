@@ -54,6 +54,37 @@ pub enum OpenCompanyError {
         problems: Vec<String>,
     },
 
+    /// A company data file (workflow graph, skill doc, workspace note) could
+    /// not be read from disk.
+    #[error("could not read {path}: {source}")]
+    DataRead {
+        /// The data file path that failed to load.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// A company data file could not be parsed (invalid TOML, or a malformed
+    /// SKILL.md frontmatter block).
+    #[error("{path} could not be parsed: {message}")]
+    DataParse {
+        /// The data file path (or synthetic label) that failed to parse.
+        path: PathBuf,
+        /// A human-readable description of the parse failure.
+        message: String,
+    },
+
+    /// A company data file parsed but failed validation. Every message is
+    /// written in prosumer language and lists all problems at once, mirroring
+    /// [`Self::ManifestInvalid`].
+    #[error("{}", format_manifest_problems(.path, .problems))]
+    DataInvalid {
+        /// The data file path that failed validation.
+        path: PathBuf,
+        /// One human-readable problem per line.
+        problems: Vec<String>,
+    },
+
     /// A persistence backend reported a failure that has no more specific
     /// variant.
     #[error("store error: {0}")]
@@ -161,6 +192,9 @@ impl OpenCompanyError {
             Self::ManifestRead { .. } => "manifest_read".to_string(),
             Self::ManifestParse(_, _) => "manifest_parse".to_string(),
             Self::ManifestInvalid { .. } => "manifest_invalid".to_string(),
+            Self::DataRead { .. } => "data_read".to_string(),
+            Self::DataParse { .. } => "data_parse".to_string(),
+            Self::DataInvalid { .. } => "data_invalid".to_string(),
             Self::Store(_) => "store_error".to_string(),
             Self::StoreIo { .. } => "store_io".to_string(),
             Self::Serde(_) => "serialization_error".to_string(),
