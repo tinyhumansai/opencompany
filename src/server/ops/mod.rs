@@ -17,13 +17,25 @@
 
 pub mod domain;
 pub mod inbox;
+pub mod language;
+pub mod mail;
+pub mod memory;
+pub mod scope;
+pub mod skills;
 pub mod smtp;
+pub mod tasks;
+pub mod team;
+pub mod workspace;
 
 #[cfg(feature = "oauth")]
 pub mod connections;
 
+pub(crate) use scope::{ScopedCompany, scoped};
+
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod write_test;
 
 use std::sync::Arc;
 
@@ -90,7 +102,13 @@ pub fn router() -> Router<AppState> {
     let router = Router::new()
         .merge(domain::router())
         .merge(smtp::router())
-        .merge(inbox::router());
+        .merge(inbox::router())
+        .merge(tasks::router())
+        .merge(memory::router())
+        .merge(workspace::router())
+        .merge(skills::router())
+        .merge(team::router())
+        .merge(mail::router());
     #[cfg(feature = "oauth")]
     let router = router.merge(connections::router());
     router
