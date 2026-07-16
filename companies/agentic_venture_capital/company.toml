@@ -36,3 +36,8 @@ description = "Size markets and model opportunity."
 id = "portfolio_support"
 role = "Portfolio Support"
 description = "Support portfolio companies post-investment."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["diligence_pipeline"]

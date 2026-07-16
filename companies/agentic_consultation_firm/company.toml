@@ -41,3 +41,8 @@ description = "Produce client-ready presentations."
 id = "implementation_planner"
 role = "Implementation Planner"
 description = "Turn strategy into an execution roadmap."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["engagement_pipeline"]

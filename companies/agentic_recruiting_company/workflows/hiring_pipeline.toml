@@ -1,0 +1,107 @@
+# Workflow graph: hiring_pipeline
+#
+# Referenced by `[workflows].enabled = ["hiring_pipeline"]` in ../company.toml.
+# An open role goes from sourcing through screening and interviews to an offer
+# the operator approves. Node kinds mirror the tinyflows model.
+
+id = "hiring_pipeline"
+name = "Hiring pipeline"
+description = "An open role goes from sourcing to an offer ready for the operator."
+
+[[node]]
+id = "role"
+kind = "trigger"
+name = "New role opens"
+summary = "A role spec is approved to fill."
+
+[[node]]
+id = "source"
+kind = "agent"
+name = "Source candidates"
+summary = "Find candidates against the spec."
+agent = "candidate_sourcer"
+
+[[node]]
+id = "outreach"
+kind = "agent"
+name = "Personalized outreach"
+summary = "Reach out to the shortlist."
+agent = "outreach_agent"
+
+[[node]]
+id = "screen"
+kind = "agent"
+name = "Screen resumes"
+summary = "Rank fit against the spec."
+agent = "resume_analyst"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Qualified?"
+summary = "Advance or pass on the candidate."
+
+[[node]]
+id = "interview"
+kind = "agent"
+name = "First-round interview"
+summary = "Run the first-round interview."
+agent = "interviewer"
+
+[[node]]
+id = "schedule"
+kind = "agent"
+name = "Schedule follow-up"
+summary = "Coordinate the next round."
+agent = "scheduler"
+
+[[node]]
+id = "offer"
+kind = "agent"
+name = "Draft offer"
+summary = "Generate the offer for approval."
+agent = "offer_generator"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report to operator"
+summary = "Report advances, passes, and the offer."
+
+[[edge]]
+from = "role"
+to = "source"
+
+[[edge]]
+from = "source"
+to = "outreach"
+
+[[edge]]
+from = "outreach"
+to = "screen"
+
+[[edge]]
+from = "screen"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "interview"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "done"
+label = "no"
+
+[[edge]]
+from = "interview"
+to = "schedule"
+
+[[edge]]
+from = "schedule"
+to = "offer"
+
+[[edge]]
+from = "offer"
+to = "done"

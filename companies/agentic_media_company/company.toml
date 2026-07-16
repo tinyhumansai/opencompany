@@ -46,3 +46,8 @@ description = "Publish to the CMS."
 id = "social_distributor"
 role = "Social Distributor"
 description = "Distribute across social channels."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["newsroom_pipeline"]

@@ -31,3 +31,8 @@ description = "Custom illustration and iconography."
 id = "user_researcher"
 role = "User Researcher"
 description = "User testing and design validation."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["design_pipeline"]

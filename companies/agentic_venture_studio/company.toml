@@ -51,3 +51,8 @@ description = "Resolve customer issues and feed insight back to product."
 id = "recruiter"
 role = "Recruiter"
 description = "Source and staff each venture with agents or humans."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["venture_launch_pipeline"]

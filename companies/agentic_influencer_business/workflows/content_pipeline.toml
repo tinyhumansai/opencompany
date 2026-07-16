@@ -1,0 +1,129 @@
+# Workflow graph: content_pipeline
+#
+# Referenced by `[workflows].enabled = ["content_pipeline"]` in ../company.toml.
+# The content cadence turns a trend into a scripted, edited, published video and
+# measures how it did. Node kinds mirror the tinyflows model.
+
+id = "content_pipeline"
+name = "Content pipeline"
+description = "A trend becomes a scripted, edited, published video, then measured."
+
+[[node]]
+id = "cadence"
+kind = "trigger"
+name = "Content cadence"
+summary = "The posting schedule calls for the next piece."
+
+[[node]]
+id = "trends"
+kind = "agent"
+name = "Scout trends"
+summary = "Find the angle worth making now."
+agent = "trend_scout"
+
+[[node]]
+id = "script"
+kind = "agent"
+name = "Write the script"
+summary = "Draft the script and hook."
+agent = "scriptwriter"
+
+[[node]]
+id = "edit"
+kind = "agent"
+name = "Edit the video"
+summary = "Cut the video to the script."
+agent = "video_editor"
+
+[[node]]
+id = "thumb"
+kind = "agent"
+name = "Design the thumbnail"
+summary = "Create the thumbnail and title."
+agent = "thumbnail_designer"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Sponsored?"
+summary = "Branch on whether this piece has a sponsor."
+
+[[node]]
+id = "sponsor"
+kind = "agent"
+name = "Coordinate sponsor"
+summary = "Align the piece with the sponsorship terms."
+agent = "sponsorship_outreach"
+
+[[node]]
+id = "publish"
+kind = "agent"
+name = "Publish"
+summary = "Publish across the channels."
+agent = "publisher"
+
+[[node]]
+id = "community"
+kind = "agent"
+name = "Engage the community"
+summary = "Reply and moderate on launch."
+agent = "community_manager"
+
+[[node]]
+id = "analytics"
+kind = "agent"
+name = "Measure performance"
+summary = "Read how the piece performed."
+agent = "analytics_analyst"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report back"
+summary = "Summarize performance and learnings."
+
+[[edge]]
+from = "cadence"
+to = "trends"
+
+[[edge]]
+from = "trends"
+to = "script"
+
+[[edge]]
+from = "script"
+to = "edit"
+
+[[edge]]
+from = "edit"
+to = "thumb"
+
+[[edge]]
+from = "thumb"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "sponsor"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "publish"
+label = "no"
+
+[[edge]]
+from = "sponsor"
+to = "publish"
+
+[[edge]]
+from = "publish"
+to = "community"
+
+[[edge]]
+from = "community"
+to = "analytics"
+
+[[edge]]
+from = "analytics"
+to = "done"
