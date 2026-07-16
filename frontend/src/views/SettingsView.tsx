@@ -23,6 +23,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { DomainSettings } from "@/components/domain-settings";
 import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
 import type { CompanyFeed } from "@/hooks/use-company";
@@ -82,6 +83,9 @@ export function SettingsView({ client, company, feed, onFlag }: Props) {
             </CardHeader>
           </Card>
         )}
+
+        {/* Domain & email */}
+        <DomainSettings company={company} />
 
         {/* Appearance */}
         <Card>
