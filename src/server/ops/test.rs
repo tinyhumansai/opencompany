@@ -40,6 +40,7 @@ async fn state_with(home: &std::path::Path, connections: ConnectionsRuntime) -> 
             manifest: manifest(),
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
         })
         .await
         .unwrap();
@@ -281,7 +282,7 @@ async fn ingest_bad_hmac_is_401_and_no_mail() {
     assert!(
         runtime
             .inbox()
-            .list(runtime.id(), "ceo")
+            .messages(runtime.id(), "ceo", usize::MAX, 0)
             .await
             .unwrap()
             .is_empty()
@@ -323,9 +324,13 @@ async fn ingest_good_hmac_files_mail() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let value = body_json(response).await;
     assert_eq!(value["inbox"], "ceo");
-    let mail = runtime.inbox().list(runtime.id(), "ceo").await.unwrap();
+    let mail = runtime
+        .inbox()
+        .messages(runtime.id(), "ceo", usize::MAX, 0)
+        .await
+        .unwrap();
     assert_eq!(mail.len(), 1);
-    assert_eq!(mail[0].from, "a@x.test");
+    assert_eq!(mail[0].from_email, "a@x.test");
     assert!(!mail[0].outbound);
     tokio::fs::remove_dir_all(&home).await.ok();
 }

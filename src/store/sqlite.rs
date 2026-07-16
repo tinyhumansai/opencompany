@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS company (
     company_id    TEXT PRIMARY KEY,
     manifest_toml TEXT NOT NULL,
     lifecycle     TEXT NOT NULL,
+    overlay_json  TEXT NOT NULL DEFAULT '[]',
     updated_ms    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ledger (
@@ -104,6 +105,47 @@ CREATE TABLE IF NOT EXISTS inbox (
     inbox       TEXT NOT NULL,
     record_json TEXT NOT NULL,
     PRIMARY KEY (company_id, seq)
+);
+CREATE TABLE IF NOT EXISTS inbox_meta (
+    company_id TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    meta_json  TEXT NOT NULL,
+    PRIMARY KEY (company_id, key)
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    task_json  TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE TABLE IF NOT EXISTS facts (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    fact_json  TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE TABLE IF NOT EXISTS usage_samples (
+    company_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    at_ms      INTEGER NOT NULL,
+    sample_json TEXT NOT NULL,
+    PRIMARY KEY (company_id, seq)
+);
+CREATE TABLE IF NOT EXISTS skill_state (
+    company_id TEXT NOT NULL,
+    slug       TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    PRIMARY KEY (company_id, slug)
+);
+CREATE TABLE IF NOT EXISTS workspace_nodes (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    node_json  TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
 );
 "#;
 
@@ -173,19 +215,20 @@ impl SqliteStore {
 impl CompanyStore for SqliteStore {
     async fn load(&self, id: &CompanyId) -> Result<Option<CompanyRecord>> {
         let conn = self.conn();
-        let row: Option<(String, String)> = conn
+        let row: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT manifest_toml, lifecycle FROM company WHERE company_id = ?1",
+                "SELECT manifest_toml, lifecycle, overlay_json FROM company WHERE company_id = ?1",
                 params![id.as_ref()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(sql_err)?;
-        let Some((manifest_toml, lifecycle)) = row else {
+        let Some((manifest_toml, lifecycle, overlay_json)) = row else {
             return Ok(None);
         };
         let manifest: CompanyManifest = toml::from_str(&manifest_toml)
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
+        let overlay_agents = serde_json::from_str(&overlay_json)?;
 
         let mut stmt = conn
             .prepare("SELECT entry_json FROM ledger WHERE company_id = ?1 ORDER BY idx")
@@ -204,25 +247,29 @@ impl CompanyStore for SqliteStore {
             manifest,
             ledger,
             lifecycle,
+            overlay_agents,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
+        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
         let conn = self.conn();
         // Append-only: `save` upserts the company row and never touches ledger.
         conn.execute(
-            "INSERT INTO company (company_id, manifest_toml, lifecycle, updated_ms) \
-             VALUES (?1, ?2, ?3, ?4) \
+            "INSERT INTO company (company_id, manifest_toml, lifecycle, overlay_json, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(company_id) DO UPDATE SET \
                manifest_toml = excluded.manifest_toml, \
                lifecycle = excluded.lifecycle, \
+               overlay_json = excluded.overlay_json, \
                updated_ms = excluded.updated_ms",
             params![
                 record.id.as_ref(),
                 manifest_toml,
                 record.lifecycle,
+                overlay_json,
                 now_millis() as i64
             ],
         )
@@ -594,12 +641,65 @@ impl SecretStore for SqliteStore {
 
 #[async_trait]
 impl crate::ports::inbox::InboxStore for SqliteStore {
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<crate::ports::inbox::InboxMeta>> {
+        use std::collections::BTreeMap;
+        let conn = self.conn();
+        let mut out: BTreeMap<String, crate::ports::inbox::InboxMeta> = BTreeMap::new();
+        // Explicit metadata first.
+        let mut stmt = conn
+            .prepare("SELECT meta_json FROM inbox_meta WHERE company_id = ?1")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        for row in rows {
+            let meta: crate::ports::inbox::InboxMeta =
+                serde_json::from_str(&row.map_err(sql_err)?)?;
+            out.insert(meta.key.clone(), meta);
+        }
+        // Synthesize a default enabled meta for message-only inboxes.
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT inbox FROM inbox WHERE company_id = ?1")
+            .map_err(sql_err)?;
+        let names = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        for name in names {
+            let key = name.map_err(sql_err)?;
+            out.entry(key.clone())
+                .or_insert_with(|| crate::ports::inbox::InboxMeta {
+                    key: key.clone(),
+                    name: key.clone(),
+                    address: String::new(),
+                    enabled: true,
+                });
+        }
+        Ok(out.into_values().collect())
+    }
+
+    async fn set_enabled(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        meta: &crate::ports::inbox::InboxMeta,
+    ) -> Result<()> {
+        let json = serde_json::to_string(meta)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO inbox_meta (company_id, key, meta_json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(company_id, key) DO UPDATE SET meta_json = excluded.meta_json",
+            params![company.as_ref(), key, json],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
     async fn append(
         &self,
         company: &CompanyId,
-        record: crate::ports::inbox::EmailRecord,
+        msg: &crate::ports::inbox::EmailRecord,
     ) -> Result<()> {
-        let json = serde_json::to_string(&record)?;
+        let json = serde_json::to_string(msg)?;
         let conn = self.conn();
         // Monotonic per-company append seq preserves insertion order.
         let next: i64 = conn
@@ -611,25 +711,31 @@ impl crate::ports::inbox::InboxStore for SqliteStore {
             .map_err(sql_err)?;
         conn.execute(
             "INSERT INTO inbox (company_id, seq, inbox, record_json) VALUES (?1, ?2, ?3, ?4)",
-            params![company.as_ref(), next, record.inbox, json],
+            params![company.as_ref(), next, msg.inbox, json],
         )
         .map_err(sql_err)?;
         Ok(())
     }
 
-    async fn list(
+    async fn messages(
         &self,
         company: &CompanyId,
-        inbox: &str,
+        key: &str,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::ports::inbox::EmailRecord>> {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT record_json FROM inbox WHERE company_id = ?1 AND inbox = ?2 ORDER BY seq",
+                "SELECT record_json FROM inbox WHERE company_id = ?1 AND inbox = ?2 \
+                 ORDER BY seq LIMIT ?3 OFFSET ?4",
             )
             .map_err(sql_err)?;
         let rows = stmt
-            .query_map(params![company.as_ref(), inbox], |r| r.get::<_, String>(0))
+            .query_map(
+                params![company.as_ref(), key, sql_limit(limit), offset as i64],
+                |r| r.get::<_, String>(0),
+            )
             .map_err(sql_err)?;
         let mut out = Vec::new();
         for row in rows {
@@ -638,20 +744,519 @@ impl crate::ports::inbox::InboxStore for SqliteStore {
         Ok(out)
     }
 
-    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<String>> {
+    async fn mark_read(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        ids: Option<&[String]>,
+    ) -> Result<u64> {
+        use crate::ports::inbox::EmailRecord;
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT DISTINCT inbox FROM inbox WHERE company_id = ?1 ORDER BY inbox")
+            .prepare("SELECT seq, record_json FROM inbox WHERE company_id = ?1 AND inbox = ?2")
+            .map_err(sql_err)?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![company.as_ref(), key], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sql_err)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(sql_err)?;
+        let mut unread = 0u64;
+        for (seq, json) in rows {
+            let mut record: EmailRecord = serde_json::from_str(&json)?;
+            let hit = match ids {
+                Some(ids) => ids.iter().any(|id| id == &record.id),
+                None => true,
+            };
+            if hit && !record.read {
+                record.read = true;
+                conn.execute(
+                    "UPDATE inbox SET record_json = ?1 WHERE company_id = ?2 AND seq = ?3",
+                    params![serde_json::to_string(&record)?, company.as_ref(), seq],
+                )
+                .map_err(sql_err)?;
+            }
+            if !record.read {
+                unread += 1;
+            }
+        }
+        Ok(unread)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::tasks::TaskStore for SqliteStore {
+    async fn list(&self, company: &CompanyId) -> Result<Vec<crate::ports::tasks::TaskRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT task_json FROM tasks WHERE company_id = ?1 ORDER BY updated_ms DESC")
             .map_err(sql_err)?;
         let rows = stmt
             .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
             .map_err(sql_err)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(sql_err)?);
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
         }
         Ok(out)
     }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        task: &crate::ports::tasks::TaskRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(task)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO tasks (company_id, id, task_json, updated_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(company_id, id) DO UPDATE SET task_json = excluded.task_json, \
+             updated_ms = excluded.updated_ms",
+            params![
+                company.as_ref(),
+                task.id,
+                json,
+                task.updated_at_millis as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM tasks WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::facts::FactStore for SqliteStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        query: Option<&str>,
+        kind: Option<crate::ports::facts::FactKind>,
+    ) -> Result<Vec<crate::ports::facts::FactRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT fact_json FROM facts WHERE company_id = ?1 ORDER BY updated_ms DESC")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out: Vec<crate::ports::facts::FactRecord> = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        if let Some(kind) = kind {
+            out.retain(|f| f.kind == kind);
+        }
+        if let Some(q) = query.map(str::to_lowercase).filter(|q| !q.is_empty()) {
+            out.retain(|f| {
+                f.title.to_lowercase().contains(&q) || f.body.to_lowercase().contains(&q)
+            });
+        }
+        Ok(out)
+    }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        fact: &crate::ports::facts::FactRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(fact)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO facts (company_id, id, fact_json, updated_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(company_id, id) DO UPDATE SET fact_json = excluded.fact_json, \
+             updated_ms = excluded.updated_ms",
+            params![
+                company.as_ref(),
+                fact.id,
+                json,
+                fact.updated_at_millis as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM facts WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UsageMeter
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::usage::UsageMeter for SqliteStore {
+    async fn record(
+        &self,
+        company: &CompanyId,
+        sample: &crate::ports::usage::UsageSample,
+    ) -> Result<()> {
+        let json = serde_json::to_string(sample)?;
+        let conn = self.conn();
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM usage_samples WHERE company_id = ?1",
+                params![company.as_ref()],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        conn.execute(
+            "INSERT INTO usage_samples (company_id, seq, at_ms, sample_json) VALUES (?1, ?2, ?3, ?4)",
+            params![company.as_ref(), next, sample.at_millis as i64, json],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn query(
+        &self,
+        company: &CompanyId,
+        since_millis: u64,
+    ) -> Result<Vec<crate::ports::usage::UsageSample>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT sample_json FROM usage_samples WHERE company_id = ?1 AND at_ms >= ?2 \
+                 ORDER BY at_ms, seq",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref(), since_millis as i64], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SkillStateStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::skills_state::SkillStateStore for SqliteStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::skills_state::SkillState>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT state_json FROM skill_state WHERE company_id = ?1 ORDER BY slug")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn set(
+        &self,
+        company: &CompanyId,
+        state: &crate::ports::skills_state::SkillState,
+    ) -> Result<()> {
+        let json = serde_json::to_string(state)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO skill_state (company_id, slug, state_json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(company_id, slug) DO UPDATE SET state_json = excluded.state_json",
+            params![company.as_ref(), state.slug, json],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn remove(&self, company: &CompanyId, slug: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM skill_state WHERE company_id = ?1 AND slug = ?2",
+                params![company.as_ref(), slug],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkspaceStore
+// ---------------------------------------------------------------------------
+
+impl SqliteStore {
+    /// Loads every workspace node for a company into an id-keyed map.
+    fn workspace_nodes(
+        &self,
+        conn: &Connection,
+        company: &CompanyId,
+    ) -> Result<HashMap<String, crate::ports::workspace::WorkspaceNode>> {
+        let mut stmt = conn
+            .prepare("SELECT node_json FROM workspace_nodes WHERE company_id = ?1")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let node: crate::ports::workspace::WorkspaceNode =
+                serde_json::from_str(&row.map_err(sql_err)?)?;
+            out.insert(node.id.clone(), node);
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl crate::ports::workspace::WorkspaceStore for SqliteStore {
+    async fn tree(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::workspace::WorkspaceNode>> {
+        let conn = self.conn();
+        Ok(self
+            .workspace_nodes(&conn, company)?
+            .into_values()
+            .collect())
+    }
+
+    async fn read(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<(crate::ports::workspace::WorkspaceNode, String)>> {
+        let conn = self.conn();
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT node_json, content FROM workspace_nodes WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        match row {
+            Some((node_json, content)) => Ok(Some((serde_json::from_str(&node_json)?, content))),
+            None => Ok(None),
+        }
+    }
+
+    async fn write(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        content: &str,
+    ) -> Result<crate::ports::workspace::WorkspaceNode> {
+        use crate::ports::workspace::NodeKind;
+        let conn = self.conn();
+        let node_json: Option<String> = conn
+            .query_row(
+                "SELECT node_json FROM workspace_nodes WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(node_json) = node_json else {
+            return Err(OpenCompanyError::CompanyNotFound(format!(
+                "workspace node {id}"
+            )));
+        };
+        let mut node: crate::ports::workspace::WorkspaceNode = serde_json::from_str(&node_json)?;
+        if node.kind != NodeKind::File {
+            return Err(OpenCompanyError::InvalidRequest(
+                "cannot write content to a folder".to_string(),
+            ));
+        }
+        node.updated_at_millis = now_millis();
+        conn.execute(
+            "UPDATE workspace_nodes SET node_json = ?1, content = ?2, updated_ms = ?3 \
+             WHERE company_id = ?4 AND id = ?5",
+            params![
+                serde_json::to_string(&node)?,
+                content,
+                node.updated_at_millis as i64,
+                company.as_ref(),
+                id
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(node)
+    }
+
+    async fn create(
+        &self,
+        company: &CompanyId,
+        node: &crate::ports::workspace::WorkspaceNode,
+        content: Option<&str>,
+    ) -> Result<()> {
+        use crate::ports::workspace::NodeKind;
+        let conn = self.conn();
+        let nodes = self.workspace_nodes(&conn, company)?;
+        if nodes.contains_key(&node.id) {
+            return Err(OpenCompanyError::Conflict(format!(
+                "workspace node {} already exists",
+                node.id
+            )));
+        }
+        if let Some(parent) = &node.parent_id {
+            match nodes.get(parent) {
+                Some(p) if p.kind == NodeKind::Folder => {}
+                Some(_) => {
+                    return Err(OpenCompanyError::InvalidRequest(
+                        "parent is not a folder".to_string(),
+                    ));
+                }
+                None => {
+                    return Err(OpenCompanyError::InvalidRequest(
+                        "parent folder does not exist".to_string(),
+                    ));
+                }
+            }
+        }
+        conn.execute(
+            "INSERT INTO workspace_nodes (company_id, id, node_json, content, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                company.as_ref(),
+                node.id,
+                serde_json::to_string(node)?,
+                content.unwrap_or(""),
+                node.updated_at_millis as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn rename_move(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        name: Option<&str>,
+        parent: Option<&str>,
+    ) -> Result<crate::ports::workspace::WorkspaceNode> {
+        use crate::ports::workspace::NodeKind;
+        let conn = self.conn();
+        let nodes = self.workspace_nodes(&conn, company)?;
+        if !nodes.contains_key(id) {
+            return Err(OpenCompanyError::CompanyNotFound(format!(
+                "workspace node {id}"
+            )));
+        }
+        if let Some(parent) = parent {
+            if parent == id || workspace_descendants(&nodes, id).contains(parent) {
+                return Err(OpenCompanyError::InvalidRequest(
+                    "cannot move a folder into its own subtree".to_string(),
+                ));
+            }
+            if nodes.get(parent).map(|p| p.kind) != Some(NodeKind::Folder) {
+                return Err(OpenCompanyError::InvalidRequest(
+                    "target parent is not a folder".to_string(),
+                ));
+            }
+        }
+        let mut node = nodes.get(id).cloned().expect("node present");
+        if let Some(name) = name {
+            node.name = name.to_string();
+        }
+        if let Some(parent) = parent {
+            node.parent_id = Some(parent.to_string());
+        }
+        node.updated_at_millis = now_millis();
+        conn.execute(
+            "UPDATE workspace_nodes SET node_json = ?1, updated_ms = ?2 \
+             WHERE company_id = ?3 AND id = ?4",
+            params![
+                serde_json::to_string(&node)?,
+                node.updated_at_millis as i64,
+                company.as_ref(),
+                id
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(node)
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let nodes = self.workspace_nodes(&conn, company)?;
+        if !nodes.contains_key(id) {
+            return Ok(false);
+        }
+        let mut to_remove = workspace_descendants(&nodes, id);
+        to_remove.insert(id.to_string());
+        for node_id in &to_remove {
+            conn.execute(
+                "DELETE FROM workspace_nodes WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), node_id],
+            )
+            .map_err(sql_err)?;
+        }
+        Ok(true)
+    }
+
+    async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
+        let conn = self.conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_nodes WHERE company_id = ?1",
+                params![company.as_ref()],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(count == 0)
+    }
+}
+
+/// Collects the ids of every descendant of `id` (excluding `id`), shared by the
+/// sqlite workspace's cycle check and recursive delete.
+fn workspace_descendants(
+    nodes: &HashMap<String, crate::ports::workspace::WorkspaceNode>,
+    id: &str,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut frontier = vec![id.to_string()];
+    while let Some(current) = frontier.pop() {
+        for (child_id, node) in nodes {
+            if node.parent_id.as_deref() == Some(current.as_str()) && out.insert(child_id.clone()) {
+                frontier.push(child_id.clone());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -694,6 +1299,31 @@ mod test {
     }
 
     #[tokio::test]
+    async fn conformance_task_store() {
+        conformance::assert_task_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_fact_store() {
+        conformance::assert_fact_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_usage_meter() {
+        conformance::assert_usage_meter(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_skill_state_store() {
+        conformance::assert_skill_state_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_workspace_store() {
+        conformance::assert_workspace_store(store()).await;
+    }
+
+    #[tokio::test]
     async fn one_store_serves_every_port_through_arc() {
         // A single Arc<SqliteStore> satisfies all five port trait objects — the
         // shape a platform-mode `build_runtime` injects into every `with_*`.
@@ -714,6 +1344,7 @@ mod test {
                 .unwrap(),
                 ledger: Vec::new(),
                 lifecycle: "running".into(),
+                overlay_agents: Vec::new(),
             })
             .await
             .unwrap();

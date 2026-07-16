@@ -128,14 +128,15 @@ async fn ingest(runtime: Arc<CompanyRuntime>, headers: &HeaderMap, raw: &[u8]) -
     let record = EmailRecord {
         id: generate_id(),
         inbox: inbox.clone(),
-        from: email.from.clone(),
-        to: email.to.clone(),
+        from_name: String::new(),
+        from_email: email.from.clone(),
         subject: email.subject.clone(),
         body: email.body.clone(),
-        outbound: false,
         at_millis: now_millis(),
+        read: false,
+        outbound: false,
     };
-    if let Err(err) = runtime.inbox().append(runtime.id(), record).await {
+    if let Err(err) = runtime.inbox().append(runtime.id(), &record).await {
         return crate::server::error::ApiError(err).into_response();
     }
 

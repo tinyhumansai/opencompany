@@ -13,7 +13,7 @@ pub mod runtime;
 mod skill_file;
 mod types;
 mod workflow_file;
-mod workspace_seed;
+pub mod workspace_seed;
 
 use std::path::Path;
 

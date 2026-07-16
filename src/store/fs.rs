@@ -19,7 +19,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
-use crate::ports::inbox::{EmailRecord, InboxStore};
+use crate::ports::inbox::{EmailRecord, InboxMeta, InboxStore};
 use crate::ports::memory::MemoryStore;
 use crate::ports::secrets::SecretStore;
 use crate::ports::store::CompanyStore;
@@ -36,7 +36,7 @@ use crate::store::paths::Bundle;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn io_err(path: &Path, source: std::io::Error) -> OpenCompanyError {
+pub(crate) fn io_err(path: &Path, source: std::io::Error) -> OpenCompanyError {
     OpenCompanyError::StoreIo {
         path: path.to_path_buf(),
         source,
@@ -46,19 +46,19 @@ fn io_err(path: &Path, source: std::io::Error) -> OpenCompanyError {
 /// A registry of per-path async locks, so appends to the same file serialize
 /// while distinct files stay concurrent.
 #[derive(Clone, Default)]
-struct PathLocks {
+pub(crate) struct PathLocks {
     inner: Arc<StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>>,
 }
 
 impl PathLocks {
-    fn get(&self, path: &Path) -> Arc<TokioMutex<()>> {
+    pub(crate) fn get(&self, path: &Path) -> Arc<TokioMutex<()>> {
         let mut map = self.inner.lock().expect("path-lock map poisoned");
         map.entry(path.to_path_buf()).or_default().clone()
     }
 }
 
 /// Appends one line (a `\n` is added) to `path`, creating the file if absent.
-async fn append_line(path: &Path, line: &str) -> Result<()> {
+pub(crate) async fn append_line(path: &Path, line: &str) -> Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -73,7 +73,7 @@ async fn append_line(path: &Path, line: &str) -> Result<()> {
 }
 
 /// Reads a file to a string, returning an empty string if it does not exist.
-async fn read_optional(path: &Path) -> Result<String> {
+pub(crate) async fn read_optional(path: &Path) -> Result<String> {
     match tokio::fs::read_to_string(path).await {
         Ok(contents) => Ok(contents),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -82,7 +82,7 @@ async fn read_optional(path: &Path) -> Result<String> {
 }
 
 /// Parses every non-empty JSONL line of `path` into `T`, skipping absent files.
-async fn read_jsonl<T>(path: &Path) -> Result<Vec<T>>
+pub(crate) async fn read_jsonl<T>(path: &Path) -> Result<Vec<T>>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -98,7 +98,7 @@ where
 }
 
 /// Atomically writes `contents` to `path` via a temp file + rename.
-async fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+pub(crate) async fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -118,6 +118,9 @@ async fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Meta {
     lifecycle: String,
+    /// The operator team overlay (teammates added outside the manifest).
+    #[serde(default)]
+    overlay_agents: Vec<crate::ports::types::OverlayAgent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,10 +163,11 @@ impl CompanyStore for FsCompanyStore {
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
 
         let meta_src = read_optional(&bundle.meta_json()).await?;
-        let lifecycle = if meta_src.trim().is_empty() {
-            "running".to_string()
+        let (lifecycle, overlay_agents) = if meta_src.trim().is_empty() {
+            ("running".to_string(), Vec::new())
         } else {
-            serde_json::from_str::<Meta>(&meta_src)?.lifecycle
+            let meta: Meta = serde_json::from_str(&meta_src)?;
+            (meta.lifecycle, meta.overlay_agents)
         };
 
         let ledger = read_jsonl::<LedgerEntry>(&bundle.ledger_jsonl()).await?;
@@ -173,6 +177,7 @@ impl CompanyStore for FsCompanyStore {
             manifest,
             ledger,
             lifecycle,
+            overlay_agents,
         }))
     }
 
@@ -186,6 +191,7 @@ impl CompanyStore for FsCompanyStore {
 
         let meta = Meta {
             lifecycle: record.lifecycle.clone(),
+            overlay_agents: record.overlay_agents.clone(),
         };
         write_atomic(&bundle.meta_json(), &serde_json::to_string(&meta)?).await?;
         Ok(())
@@ -616,32 +622,112 @@ impl FsInboxStore {
     }
 }
 
+impl FsInboxStore {
+    /// Loads the `key` → [`InboxMeta`] map, defaulting to empty.
+    async fn load_meta(&self, company: &CompanyId) -> Result<HashMap<String, InboxMeta>> {
+        let path = self.bundle(company).inbox_meta_json();
+        let contents = read_optional(&path).await?;
+        if contents.trim().is_empty() {
+            return Ok(HashMap::new());
+        }
+        Ok(serde_json::from_str(&contents)?)
+    }
+}
+
 #[async_trait]
 impl InboxStore for FsInboxStore {
-    async fn append(&self, company: &CompanyId, record: EmailRecord) -> Result<()> {
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<InboxMeta>> {
+        let meta = self.load_meta(company).await?;
+        let all = read_jsonl::<EmailRecord>(&self.bundle(company).inbox_jsonl()).await?;
+        // Start from explicit metadata, then synthesize a default enabled meta
+        // for any inbox that only has messages.
+        let mut out: HashMap<String, InboxMeta> = meta;
+        for record in all {
+            out.entry(record.inbox.clone())
+                .or_insert_with(|| InboxMeta {
+                    key: record.inbox.clone(),
+                    name: record.inbox.clone(),
+                    address: String::new(),
+                    enabled: true,
+                });
+        }
+        let mut list: Vec<InboxMeta> = out.into_values().collect();
+        list.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(list)
+    }
+
+    async fn set_enabled(&self, company: &CompanyId, key: &str, meta: &InboxMeta) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.inbox_meta_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut map = self.load_meta(company).await?;
+        map.insert(key.to_string(), meta.clone());
+        write_atomic(&path, &serde_json::to_string(&map)?).await
+    }
+
+    async fn messages(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EmailRecord>> {
+        let all = read_jsonl::<EmailRecord>(&self.bundle(company).inbox_jsonl()).await?;
+        Ok(all
+            .into_iter()
+            .filter(|r| r.inbox == key)
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
+    async fn append(&self, company: &CompanyId, msg: &EmailRecord) -> Result<()> {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.inbox_jsonl();
-        let line = serde_json::to_string(&record)?;
+        let line = serde_json::to_string(msg)?;
         let lock = self.locks.get(&path);
         let _guard = lock.lock().await;
         append_line(&path, &line).await
     }
 
-    async fn list(&self, company: &CompanyId, inbox: &str) -> Result<Vec<EmailRecord>> {
-        let all = read_jsonl::<EmailRecord>(&self.bundle(company).inbox_jsonl()).await?;
-        Ok(all.into_iter().filter(|r| r.inbox == inbox).collect())
-    }
-
-    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<String>> {
-        let all = read_jsonl::<EmailRecord>(&self.bundle(company).inbox_jsonl()).await?;
-        let mut seen: Vec<String> = Vec::new();
-        for record in all {
-            if !seen.contains(&record.inbox) {
-                seen.push(record.inbox);
+    async fn mark_read(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        ids: Option<&[String]>,
+    ) -> Result<u64> {
+        let path = self.bundle(company).inbox_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut all = read_jsonl::<EmailRecord>(&path).await?;
+        for record in all.iter_mut() {
+            if record.inbox != key {
+                continue;
+            }
+            let hit = match ids {
+                Some(ids) => ids.iter().any(|id| id == &record.id),
+                None => true,
+            };
+            if hit {
+                record.read = true;
             }
         }
-        Ok(seen)
+        let unread = all.iter().filter(|r| r.inbox == key && !r.read).count() as u64;
+        let body: String = all
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        let body = if body.is_empty() {
+            String::new()
+        } else {
+            format!("{body}\n")
+        };
+        write_atomic(&path, &body).await?;
+        Ok(unread)
     }
 }
 
@@ -735,6 +821,7 @@ mod test {
             manifest: sample_manifest(),
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
         };
         store.save(&record).await.unwrap();
 
@@ -768,6 +855,7 @@ mod test {
                 manifest: sample_manifest(),
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
+                overlay_agents: Vec::new(),
             })
             .await
             .unwrap();

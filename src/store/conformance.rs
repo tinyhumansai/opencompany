@@ -18,13 +18,18 @@ use std::sync::Arc;
 
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
-use crate::ports::inbox::{EmailRecord, InboxStore};
+use crate::ports::facts::{FactKind, FactRecord, FactStore};
+use crate::ports::inbox::{EmailRecord, InboxMeta, InboxStore};
 use crate::ports::memory::MemoryStore;
 use crate::ports::now_millis;
+use crate::ports::skills_state::{SkillSource, SkillState, SkillStateStore};
 use crate::ports::store::CompanyStore;
+use crate::ports::tasks::{TaskRecord, TaskStore};
 use crate::ports::types::{
     CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry,
 };
+use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
+use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceStore};
 
 /// A minimal valid manifest used to seed [`CompanyRecord`]s in the suite.
 fn sample_manifest() -> crate::company::CompanyManifest {
@@ -50,6 +55,7 @@ fn record(id: &CompanyId) -> CompanyRecord {
         manifest: sample_manifest(),
         ledger: Vec::new(),
         lifecycle: "running".to_string(),
+        overlay_agents: Vec::new(),
     }
 }
 
@@ -330,7 +336,7 @@ pub async fn assert_export_totality(
 }
 
 /// Asserts the [`InboxStore`] contract: per-company isolation, per-inbox
-/// filtering, append order, and inbox enumeration.
+/// filtering, append order, pagination, metadata, and read-marking.
 pub async fn assert_inbox_store(inbox: Arc<dyn InboxStore>) {
     let alpha = CompanyId::new("alpha");
     let beta = CompanyId::new("beta");
@@ -338,50 +344,409 @@ pub async fn assert_inbox_store(inbox: Arc<dyn InboxStore>) {
     let email = |id: &str, mailbox: &str, outbound: bool, at: u64| EmailRecord {
         id: id.to_string(),
         inbox: mailbox.to_string(),
-        from: "sender@example.com".to_string(),
-        to: format!("{mailbox}@acme.test"),
+        from_name: "Sender".to_string(),
+        from_email: "sender@example.com".to_string(),
         subject: format!("subject {id}"),
         body: format!("body {id}"),
-        outbound,
         at_millis: at,
+        read: false,
+        outbound,
     };
 
     // alpha has two messages in `ceo` and one outbound in `sales`.
     inbox
-        .append(&alpha, email("a1", "ceo", false, 1))
+        .append(&alpha, &email("a1", "ceo", false, 1))
         .await
         .unwrap();
     inbox
-        .append(&alpha, email("a2", "sales", true, 2))
+        .append(&alpha, &email("a2", "sales", true, 2))
         .await
         .unwrap();
     inbox
-        .append(&alpha, email("a3", "ceo", true, 3))
+        .append(&alpha, &email("a3", "ceo", true, 3))
         .await
         .unwrap();
     // beta has an unrelated message; it must never leak into alpha.
     inbox
-        .append(&beta, email("b1", "ceo", false, 4))
+        .append(&beta, &email("b1", "ceo", false, 4))
         .await
         .unwrap();
 
     // Per-inbox listing filters and preserves append order.
-    let ceo = inbox.list(&alpha, "ceo").await.unwrap();
+    let ceo = inbox.messages(&alpha, "ceo", usize::MAX, 0).await.unwrap();
     assert_eq!(ceo.len(), 2);
     assert_eq!(ceo[0].id, "a1");
     assert_eq!(ceo[1].id, "a3");
     assert!(ceo[1].outbound);
 
+    // Pagination: offset + limit slice the thread.
+    let page = inbox.messages(&alpha, "ceo", 1, 1).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "a3");
+
     // Isolation: alpha's `ceo` and beta's `ceo` are distinct.
-    let beta_ceo = inbox.list(&beta, "ceo").await.unwrap();
+    let beta_ceo = inbox.messages(&beta, "ceo", usize::MAX, 0).await.unwrap();
     assert_eq!(beta_ceo.len(), 1);
     assert_eq!(beta_ceo[0].id, "b1");
 
-    // Enumeration lists exactly the inboxes with mail.
-    let mut names = inbox.inboxes(&alpha).await.unwrap();
+    // Enumeration lists exactly the inboxes with mail (default enabled meta).
+    let mut names: Vec<String> = inbox
+        .inboxes(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .collect();
     names.sort();
     assert_eq!(names, vec!["ceo".to_string(), "sales".to_string()]);
 
+    // Explicit metadata overrides the synthesized default and adds empty inboxes.
+    inbox
+        .set_enabled(
+            &alpha,
+            "support",
+            &InboxMeta {
+                key: "support".to_string(),
+                name: "Support".to_string(),
+                address: "support@acme.test".to_string(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+    let support = inbox
+        .inboxes(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.key == "support")
+        .expect("support meta present");
+    assert_eq!(support.address, "support@acme.test");
+    assert!(support.enabled);
+
+    // mark_read marks the named ids and reports remaining unread.
+    let remaining = inbox
+        .mark_read(&alpha, "ceo", Some(&["a1".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1, "a3 remains unread");
+    let ceo = inbox.messages(&alpha, "ceo", usize::MAX, 0).await.unwrap();
+    assert!(ceo.iter().find(|m| m.id == "a1").unwrap().read);
+    assert!(!ceo.iter().find(|m| m.id == "a3").unwrap().read);
+
+    // mark_read with None marks the whole inbox read.
+    let remaining = inbox.mark_read(&alpha, "ceo", None).await.unwrap();
+    assert_eq!(remaining, 0);
+
     // An empty inbox reads back empty.
-    assert!(inbox.list(&alpha, "unknown").await.unwrap().is_empty());
+    assert!(
+        inbox
+            .messages(&alpha, "unknown", usize::MAX, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Asserts the [`TaskStore`] contract: per-company isolation, upsert semantics,
+/// and delete.
+pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let task = |id: &str, col: &str, at: u64| TaskRecord {
+        id: id.to_string(),
+        title: format!("title {id}"),
+        note: Some(format!("note {id}")),
+        column: col.to_string(),
+        priority: "medium".to_string(),
+        assignee: "Strategy desk".to_string(),
+        updated_at_millis: at,
+    };
+
+    tasks
+        .upsert(&alpha, &task("t1", "backlog", 1))
+        .await
+        .unwrap();
+    tasks
+        .upsert(&alpha, &task("t2", "backlog", 2))
+        .await
+        .unwrap();
+    tasks.upsert(&beta, &task("b1", "done", 3)).await.unwrap();
+
+    // Isolation + newest-first ordering.
+    let list = tasks.list(&alpha).await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].id, "t2");
+    assert!(
+        tasks
+            .list(&beta)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| t.id == "b1")
+    );
+
+    // Upsert replaces in place (a drag moves a card's column).
+    tasks.upsert(&alpha, &task("t1", "done", 5)).await.unwrap();
+    let list = tasks.list(&alpha).await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.iter().find(|t| t.id == "t1").unwrap().column, "done");
+
+    // Delete.
+    assert!(tasks.delete(&alpha, "t1").await.unwrap());
+    assert!(!tasks.delete(&alpha, "t1").await.unwrap());
+    assert_eq!(tasks.list(&alpha).await.unwrap().len(), 1);
+}
+
+/// Asserts the [`FactStore`] contract: isolation, query/kind filtering, upsert,
+/// and delete.
+pub async fn assert_fact_store(facts: Arc<dyn FactStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let fact = |id: &str, kind: FactKind, title: &str, body: &str, at: u64| FactRecord {
+        id: id.to_string(),
+        kind,
+        title: title.to_string(),
+        body: body.to_string(),
+        source: "You".to_string(),
+        updated_at_millis: at,
+    };
+
+    facts
+        .upsert(
+            &alpha,
+            &fact("f1", FactKind::Preference, "Tone", "Warm and direct", 1),
+        )
+        .await
+        .unwrap();
+    facts
+        .upsert(
+            &alpha,
+            &fact("f2", FactKind::Person, "Dana", "Lead designer", 2),
+        )
+        .await
+        .unwrap();
+    facts
+        .upsert(&beta, &fact("b1", FactKind::Fact, "Leak", "secret", 3))
+        .await
+        .unwrap();
+
+    // Isolation.
+    assert_eq!(facts.list(&beta, None, None).await.unwrap().len(), 1);
+
+    // Kind filter.
+    let people = facts
+        .list(&alpha, None, Some(FactKind::Person))
+        .await
+        .unwrap();
+    assert_eq!(people.len(), 1);
+    assert_eq!(people[0].id, "f2");
+
+    // Query filter over title + body (case-insensitive).
+    let hits = facts.list(&alpha, Some("designer"), None).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "f2");
+
+    // Upsert replaces last-write-wins.
+    facts
+        .upsert(
+            &alpha,
+            &fact("f1", FactKind::Preference, "Tone", "Playful", 9),
+        )
+        .await
+        .unwrap();
+    let all = facts.list(&alpha, None, None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, "f1", "newest-first");
+    assert_eq!(all.iter().find(|f| f.id == "f1").unwrap().body, "Playful");
+
+    // Delete + journaling is the caller's job; the store just removes.
+    assert!(facts.delete(&alpha, "f1").await.unwrap());
+    assert!(!facts.delete(&alpha, "f1").await.unwrap());
+    assert_eq!(facts.list(&alpha, None, None).await.unwrap().len(), 1);
+}
+
+/// Asserts the [`UsageMeter`] contract: isolation, record, and windowed query.
+pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let sample = |at: u64, cost: f64| UsageSample {
+        at_millis: at,
+        agent: "ceo".to_string(),
+        provider: "managed".to_string(),
+        input_tokens: 100,
+        output_tokens: 50,
+        cached_input_tokens: 10,
+        cost_usd: cost,
+        kind: SampleKind::Inference,
+    };
+
+    usage.record(&alpha, &sample(100, 0.1)).await.unwrap();
+    usage.record(&alpha, &sample(200, 0.2)).await.unwrap();
+    usage.record(&beta, &sample(150, 9.9)).await.unwrap();
+
+    // Isolation.
+    assert_eq!(usage.query(&beta, 0).await.unwrap().len(), 1);
+
+    // Full window, oldest first.
+    let all = usage.query(&alpha, 0).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].at_millis, 100);
+    assert_eq!(all[1].at_millis, 200);
+
+    // Windowed query honours the `since` lower bound.
+    let recent = usage.query(&alpha, 150).await.unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].at_millis, 200);
+    assert_eq!(recent[0].kind, SampleKind::Inference);
+}
+
+/// Asserts the [`SkillStateStore`] contract: isolation, set/upsert, and remove.
+pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let state = |slug: &str, enabled: bool, source: SkillSource| SkillState {
+        slug: slug.to_string(),
+        enabled,
+        source,
+        custom_doc: None,
+    };
+
+    skills
+        .set(&alpha, &state("web-research", true, SkillSource::Registry))
+        .await
+        .unwrap();
+    skills
+        .set(&beta, &state("leak", true, SkillSource::Custom))
+        .await
+        .unwrap();
+
+    // Isolation.
+    assert_eq!(skills.list(&beta).await.unwrap().len(), 1);
+
+    // Upsert replaces by slug (a disable override).
+    skills
+        .set(&alpha, &state("web-research", false, SkillSource::Registry))
+        .await
+        .unwrap();
+    let list = skills.list(&alpha).await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert!(!list[0].enabled);
+
+    // Custom doc round-trips.
+    skills
+        .set(
+            &alpha,
+            &SkillState {
+                slug: "my-skill".to_string(),
+                enabled: true,
+                source: SkillSource::Custom,
+                custom_doc: Some("---\nname: Mine\n---\nbody".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let custom = skills
+        .list(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.slug == "my-skill")
+        .unwrap();
+    assert!(custom.custom_doc.unwrap().contains("Mine"));
+
+    // Remove.
+    assert!(skills.remove(&alpha, "web-research").await.unwrap());
+    assert!(!skills.remove(&alpha, "web-research").await.unwrap());
+    assert_eq!(skills.list(&alpha).await.unwrap().len(), 1);
+}
+
+/// Asserts the [`WorkspaceStore`] contract: isolation, create/read/write,
+/// rename+move (with cycle rejection), recursive delete, and the seeding gate.
+pub async fn assert_workspace_store(ws: Arc<dyn WorkspaceStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let node = |id: &str, name: &str, kind: NodeKind, parent: Option<&str>| WorkspaceNode {
+        id: id.to_string(),
+        name: name.to_string(),
+        kind,
+        parent_id: parent.map(str::to_string),
+        updated_at_millis: now_millis(),
+    };
+
+    assert!(ws.is_empty(&alpha).await.unwrap());
+
+    ws.create(&alpha, &node("root", "Brand", NodeKind::Folder, None), None)
+        .await
+        .unwrap();
+    ws.create(
+        &alpha,
+        &node("note", "voice.md", NodeKind::File, Some("root")),
+        Some("# Voice"),
+    )
+    .await
+    .unwrap();
+    ws.create(&beta, &node("b1", "Other", NodeKind::Folder, None), None)
+        .await
+        .unwrap();
+
+    // Isolation + seeding gate.
+    assert!(!ws.is_empty(&alpha).await.unwrap());
+    assert_eq!(ws.tree(&alpha).await.unwrap().len(), 2);
+    assert_eq!(ws.tree(&beta).await.unwrap().len(), 1);
+
+    // Read a file's content; a folder yields empty.
+    let (read_node, content) = ws.read(&alpha, "note").await.unwrap().unwrap();
+    assert_eq!(read_node.name, "voice.md");
+    assert_eq!(content, "# Voice");
+    assert_eq!(ws.read(&alpha, "root").await.unwrap().unwrap().1, "");
+
+    // Overwrite content.
+    ws.write(&alpha, "note", "# Voice v2").await.unwrap();
+    assert_eq!(
+        ws.read(&alpha, "note").await.unwrap().unwrap().1,
+        "# Voice v2"
+    );
+
+    // A second folder to move under.
+    ws.create(
+        &alpha,
+        &node("root2", "Campaigns", NodeKind::Folder, None),
+        None,
+    )
+    .await
+    .unwrap();
+    // Cycle rejection: cannot move a folder under its own descendant.
+    ws.create(
+        &alpha,
+        &node("child", "Sub", NodeKind::Folder, Some("root")),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ws.rename_move(&alpha, "root", None, Some("child"))
+            .await
+            .is_err(),
+        "moving a folder under its descendant must be rejected"
+    );
+
+    // Rename + reparent the note under Campaigns.
+    let moved = ws
+        .rename_move(&alpha, "note", Some("voice-final.md"), Some("root2"))
+        .await
+        .unwrap();
+    assert_eq!(moved.name, "voice-final.md");
+    assert_eq!(moved.parent_id.as_deref(), Some("root2"));
+    assert_eq!(
+        ws.read(&alpha, "note").await.unwrap().unwrap().1,
+        "# Voice v2",
+        "content survives the move"
+    );
+
+    // Recursive delete of a folder removes its descendants.
+    assert!(ws.delete(&alpha, "root").await.unwrap());
+    let tree = ws.tree(&alpha).await.unwrap();
+    assert!(tree.iter().all(|n| n.id != "root" && n.id != "child"));
+    assert!(!ws.delete(&alpha, "root").await.unwrap());
 }

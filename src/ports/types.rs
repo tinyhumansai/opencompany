@@ -274,6 +274,12 @@ pub enum CompanyEvent {
         /// The reply text.
         text: String,
     },
+    /// The Operator deleted a durable memory fact. Journaled for the audit trail
+    /// per the Operator-rights section of `docs/spec/company-brain/memory.md`.
+    MemoryFactDeleted {
+        /// The id of the deleted fact.
+        fact_id: String,
+    },
 }
 
 /// A `CompanyEvent` durably appended to the log with its sequence and time.
@@ -638,6 +644,23 @@ pub struct OutboundMessage {
 // Company records
 // ---------------------------------------------------------------------------
 
+/// An operator-added teammate that the version-controlled manifest does not
+/// know about. Persisted as an overlay on the [`CompanyRecord`] and merged into
+/// the roster at read/build time; the `company.toml` is never rewritten.
+/// Roster-only in v1 (no harness `Agent` is minted for an overlay teammate).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayAgent {
+    /// The teammate's stable id.
+    pub id: String,
+    /// The teammate's display name.
+    pub name: String,
+    /// The teammate's role.
+    pub role: String,
+    /// An optional description of the teammate's mandate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// A durable company record: charter/roster (manifest) plus ledger and
 /// lifecycle state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -650,6 +673,9 @@ pub struct CompanyRecord {
     pub ledger: Vec<LedgerEntry>,
     /// Lifecycle state, e.g. `running`, `paused`, `archived`.
     pub lifecycle: String,
+    /// Operator-added teammates not present in the manifest (the team overlay).
+    #[serde(default)]
+    pub overlay_agents: Vec<OverlayAgent>,
 }
 
 /// A compact company listing entry.

@@ -115,7 +115,7 @@ impl MongoStore {
                 .options(IndexOptions::builder().unique(true).build())
                 .build()
         };
-        let plans: [(&str, IndexModel); 8] = [
+        let plans: [(&str, IndexModel); 14] = [
             ("companies", unique(doc! {"company_id": 1})),
             ("ledger", unique(doc! {"company_id": 1, "idx": 1})),
             ("events", unique(doc! {"company_id": 1, "seq": 1})),
@@ -124,6 +124,15 @@ impl MongoStore {
             ("context_chunks", unique(doc! {"company_id": 1, "addr": 1})),
             ("secrets", unique(doc! {"company_id": 1, "key": 1})),
             ("inbox", unique(doc! {"company_id": 1, "seq": 1})),
+            ("inbox_meta", unique(doc! {"company_id": 1, "key": 1})),
+            ("tasks", unique(doc! {"company_id": 1, "task_id": 1})),
+            ("facts", unique(doc! {"company_id": 1, "fact_id": 1})),
+            ("usage_samples", unique(doc! {"company_id": 1, "seq": 1})),
+            ("skill_state", unique(doc! {"company_id": 1, "slug": 1})),
+            (
+                "workspace_nodes",
+                unique(doc! {"company_id": 1, "node_id": 1}),
+            ),
         ];
         for (name, index) in plans {
             self.collection(name)
@@ -243,17 +252,23 @@ impl CompanyStore for MongoStore {
             )?)?);
         }
 
+        let overlay_agents = match company.get_str("overlay_json") {
+            Ok(json) => serde_json::from_str(json)?,
+            Err(_) => Vec::new(),
+        };
         Ok(Some(CompanyRecord {
             id: id.clone(),
             manifest,
             ledger,
             lifecycle: get_str(&company, "lifecycle")?,
+            overlay_agents,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
+        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
         // Append-only: `save` upserts the company document, never the ledger.
         self.collection("companies")
             .update_one(
@@ -261,6 +276,7 @@ impl CompanyStore for MongoStore {
                 doc! {"$set": {
                     "manifest_toml": manifest_toml,
                     "lifecycle": &record.lifecycle,
+                    "overlay_json": overlay_json,
                     "updated_ms": now_millis() as i64,
                 }},
             )
@@ -623,18 +639,71 @@ impl SecretStore for MongoStore {
 
 #[async_trait]
 impl crate::ports::inbox::InboxStore for MongoStore {
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<crate::ports::inbox::InboxMeta>> {
+        use std::collections::BTreeMap;
+        let mut out: BTreeMap<String, crate::ports::inbox::InboxMeta> = BTreeMap::new();
+        // Explicit metadata first.
+        let mut cursor = self
+            .collection("inbox_meta")
+            .find(doc! {"company_id": company.as_ref()})
+            .await
+            .map_err(mongo_err)?;
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            let meta: crate::ports::inbox::InboxMeta =
+                serde_json::from_str(&get_str(&doc, "meta_json")?)?;
+            out.insert(meta.key.clone(), meta);
+        }
+        // Synthesize a default enabled meta for message-only inboxes.
+        let names = self
+            .collection("inbox")
+            .distinct("inbox", doc! {"company_id": company.as_ref()})
+            .await
+            .map_err(mongo_err)?;
+        for name in names
+            .into_iter()
+            .filter_map(|b| b.as_str().map(str::to_string))
+        {
+            out.entry(name.clone())
+                .or_insert_with(|| crate::ports::inbox::InboxMeta {
+                    key: name.clone(),
+                    name: name.clone(),
+                    address: String::new(),
+                    enabled: true,
+                });
+        }
+        Ok(out.into_values().collect())
+    }
+
+    async fn set_enabled(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        meta: &crate::ports::inbox::InboxMeta,
+    ) -> Result<()> {
+        let meta_json = serde_json::to_string(meta)?;
+        self.collection("inbox_meta")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "key": key},
+                doc! {"$set": {"meta_json": meta_json}},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
     async fn append(
         &self,
         company: &CompanyId,
-        record: crate::ports::inbox::EmailRecord,
+        msg: &crate::ports::inbox::EmailRecord,
     ) -> Result<()> {
-        let record_json = serde_json::to_string(&record)?;
+        let record_json = serde_json::to_string(msg)?;
         let seq = self.next_seq(company, "inbox").await?;
         self.collection("inbox")
             .insert_one(doc! {
                 "company_id": company.as_ref(),
                 "seq": seq as i64,
-                "inbox": &record.inbox,
+                "inbox": &msg.inbox,
                 "record_json": record_json,
             })
             .await
@@ -642,17 +711,22 @@ impl crate::ports::inbox::InboxStore for MongoStore {
         Ok(())
     }
 
-    async fn list(
+    async fn messages(
         &self,
         company: &CompanyId,
-        inbox: &str,
+        key: &str,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::ports::inbox::EmailRecord>> {
-        let mut cursor = self
-            .collection("inbox")
-            .find(doc! {"company_id": company.as_ref(), "inbox": inbox})
+        let collection = self.collection("inbox");
+        let mut find = collection
+            .find(doc! {"company_id": company.as_ref(), "inbox": key})
             .sort(doc! {"seq": 1})
-            .await
-            .map_err(mongo_err)?;
+            .skip(offset as u64);
+        if let Some(limit) = find_limit(limit) {
+            find = find.limit(limit);
+        }
+        let mut cursor = find.await.map_err(mongo_err)?;
         let mut out = Vec::new();
         while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
             out.push(serde_json::from_str(&get_str(&doc, "record_json")?)?);
@@ -660,19 +734,467 @@ impl crate::ports::inbox::InboxStore for MongoStore {
         Ok(out)
     }
 
-    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<String>> {
-        let names = self
-            .collection("inbox")
-            .distinct("inbox", doc! {"company_id": company.as_ref()})
+    async fn mark_read(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        ids: Option<&[String]>,
+    ) -> Result<u64> {
+        use crate::ports::inbox::EmailRecord;
+        let coll = self.collection("inbox");
+        let mut cursor = coll
+            .find(doc! {"company_id": company.as_ref(), "inbox": key})
             .await
             .map_err(mongo_err)?;
-        let mut out: Vec<String> = names
-            .into_iter()
-            .filter_map(|b| b.as_str().map(|s| s.to_string()))
-            .collect();
-        out.sort();
+        let mut unread = 0u64;
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            let seq = get_i64(&doc, "seq")?;
+            let mut record: EmailRecord = serde_json::from_str(&get_str(&doc, "record_json")?)?;
+            let hit = match ids {
+                Some(ids) => ids.iter().any(|id| id == &record.id),
+                None => true,
+            };
+            if hit && !record.read {
+                record.read = true;
+                coll.update_one(
+                    doc! {"company_id": company.as_ref(), "seq": seq},
+                    doc! {"$set": {"record_json": serde_json::to_string(&record)?}},
+                )
+                .await
+                .map_err(mongo_err)?;
+            }
+            if !record.read {
+                unread += 1;
+            }
+        }
+        Ok(unread)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::tasks::TaskStore for MongoStore {
+    async fn list(&self, company: &CompanyId) -> Result<Vec<crate::ports::tasks::TaskRecord>> {
+        let mut cursor = self
+            .collection("tasks")
+            .find(doc! {"company_id": company.as_ref()})
+            .sort(doc! {"updated_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "task_json")?)?);
+        }
         Ok(out)
     }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        task: &crate::ports::tasks::TaskRecord,
+    ) -> Result<()> {
+        self.collection("tasks")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "task_id": &task.id},
+                doc! {"$set": {
+                    "task_json": serde_json::to_string(task)?,
+                    "updated_ms": task.updated_at_millis as i64,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("tasks")
+            .delete_one(doc! {"company_id": company.as_ref(), "task_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::facts::FactStore for MongoStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        query: Option<&str>,
+        kind: Option<crate::ports::facts::FactKind>,
+    ) -> Result<Vec<crate::ports::facts::FactRecord>> {
+        let mut cursor = self
+            .collection("facts")
+            .find(doc! {"company_id": company.as_ref()})
+            .sort(doc! {"updated_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out: Vec<crate::ports::facts::FactRecord> = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "fact_json")?)?);
+        }
+        if let Some(kind) = kind {
+            out.retain(|f| f.kind == kind);
+        }
+        if let Some(q) = query.map(str::to_lowercase).filter(|q| !q.is_empty()) {
+            out.retain(|f| {
+                f.title.to_lowercase().contains(&q) || f.body.to_lowercase().contains(&q)
+            });
+        }
+        Ok(out)
+    }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        fact: &crate::ports::facts::FactRecord,
+    ) -> Result<()> {
+        self.collection("facts")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "fact_id": &fact.id},
+                doc! {"$set": {
+                    "fact_json": serde_json::to_string(fact)?,
+                    "updated_ms": fact.updated_at_millis as i64,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("facts")
+            .delete_one(doc! {"company_id": company.as_ref(), "fact_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UsageMeter
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::usage::UsageMeter for MongoStore {
+    async fn record(
+        &self,
+        company: &CompanyId,
+        sample: &crate::ports::usage::UsageSample,
+    ) -> Result<()> {
+        let seq = self.next_seq(company, "usage").await?;
+        self.collection("usage_samples")
+            .insert_one(doc! {
+                "company_id": company.as_ref(),
+                "seq": seq as i64,
+                "at_ms": sample.at_millis as i64,
+                "sample_json": serde_json::to_string(sample)?,
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn query(
+        &self,
+        company: &CompanyId,
+        since_millis: u64,
+    ) -> Result<Vec<crate::ports::usage::UsageSample>> {
+        let mut cursor = self
+            .collection("usage_samples")
+            .find(doc! {"company_id": company.as_ref(), "at_ms": {"$gte": since_millis as i64}})
+            .sort(doc! {"at_ms": 1, "seq": 1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "sample_json")?)?);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SkillStateStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::skills_state::SkillStateStore for MongoStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::skills_state::SkillState>> {
+        let mut cursor = self
+            .collection("skill_state")
+            .find(doc! {"company_id": company.as_ref()})
+            .sort(doc! {"slug": 1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "state_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn set(
+        &self,
+        company: &CompanyId,
+        state: &crate::ports::skills_state::SkillState,
+    ) -> Result<()> {
+        self.collection("skill_state")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "slug": &state.slug},
+                doc! {"$set": {"state_json": serde_json::to_string(state)?}},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn remove(&self, company: &CompanyId, slug: &str) -> Result<bool> {
+        let res = self
+            .collection("skill_state")
+            .delete_one(doc! {"company_id": company.as_ref(), "slug": slug})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkspaceStore
+// ---------------------------------------------------------------------------
+
+impl MongoStore {
+    /// Loads every workspace node for a company into an id-keyed map.
+    async fn workspace_nodes(
+        &self,
+        company: &CompanyId,
+    ) -> Result<HashMap<String, crate::ports::workspace::WorkspaceNode>> {
+        let mut cursor = self
+            .collection("workspace_nodes")
+            .find(doc! {"company_id": company.as_ref()})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = HashMap::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            let node: crate::ports::workspace::WorkspaceNode =
+                serde_json::from_str(&get_str(&doc, "node_json")?)?;
+            out.insert(node.id.clone(), node);
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl crate::ports::workspace::WorkspaceStore for MongoStore {
+    async fn tree(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::workspace::WorkspaceNode>> {
+        Ok(self.workspace_nodes(company).await?.into_values().collect())
+    }
+
+    async fn read(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<(crate::ports::workspace::WorkspaceNode, String)>> {
+        let doc = self
+            .collection("workspace_nodes")
+            .find_one(doc! {"company_id": company.as_ref(), "node_id": id})
+            .await
+            .map_err(mongo_err)?;
+        match doc {
+            Some(doc) => Ok(Some((
+                serde_json::from_str(&get_str(&doc, "node_json")?)?,
+                get_str(&doc, "content")?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    async fn write(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        content: &str,
+    ) -> Result<crate::ports::workspace::WorkspaceNode> {
+        use crate::ports::workspace::NodeKind;
+        let doc = self
+            .collection("workspace_nodes")
+            .find_one(doc! {"company_id": company.as_ref(), "node_id": id})
+            .await
+            .map_err(mongo_err)?;
+        let Some(doc) = doc else {
+            return Err(OpenCompanyError::CompanyNotFound(format!(
+                "workspace node {id}"
+            )));
+        };
+        let mut node: crate::ports::workspace::WorkspaceNode =
+            serde_json::from_str(&get_str(&doc, "node_json")?)?;
+        if node.kind != NodeKind::File {
+            return Err(OpenCompanyError::InvalidRequest(
+                "cannot write content to a folder".to_string(),
+            ));
+        }
+        node.updated_at_millis = now_millis();
+        self.collection("workspace_nodes")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "node_id": id},
+                doc! {"$set": {
+                    "node_json": serde_json::to_string(&node)?,
+                    "content": content,
+                    "updated_ms": node.updated_at_millis as i64,
+                }},
+            )
+            .await
+            .map_err(mongo_err)?;
+        Ok(node)
+    }
+
+    async fn create(
+        &self,
+        company: &CompanyId,
+        node: &crate::ports::workspace::WorkspaceNode,
+        content: Option<&str>,
+    ) -> Result<()> {
+        use crate::ports::workspace::NodeKind;
+        let nodes = self.workspace_nodes(company).await?;
+        if nodes.contains_key(&node.id) {
+            return Err(OpenCompanyError::Conflict(format!(
+                "workspace node {} already exists",
+                node.id
+            )));
+        }
+        if let Some(parent) = &node.parent_id {
+            match nodes.get(parent) {
+                Some(p) if p.kind == NodeKind::Folder => {}
+                Some(_) => {
+                    return Err(OpenCompanyError::InvalidRequest(
+                        "parent is not a folder".to_string(),
+                    ));
+                }
+                None => {
+                    return Err(OpenCompanyError::InvalidRequest(
+                        "parent folder does not exist".to_string(),
+                    ));
+                }
+            }
+        }
+        self.collection("workspace_nodes")
+            .insert_one(doc! {
+                "company_id": company.as_ref(),
+                "node_id": &node.id,
+                "node_json": serde_json::to_string(node)?,
+                "content": content.unwrap_or(""),
+                "updated_ms": node.updated_at_millis as i64,
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn rename_move(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        name: Option<&str>,
+        parent: Option<&str>,
+    ) -> Result<crate::ports::workspace::WorkspaceNode> {
+        use crate::ports::workspace::NodeKind;
+        let nodes = self.workspace_nodes(company).await?;
+        if !nodes.contains_key(id) {
+            return Err(OpenCompanyError::CompanyNotFound(format!(
+                "workspace node {id}"
+            )));
+        }
+        if let Some(parent) = parent {
+            if parent == id || mongo_workspace_descendants(&nodes, id).contains(parent) {
+                return Err(OpenCompanyError::InvalidRequest(
+                    "cannot move a folder into its own subtree".to_string(),
+                ));
+            }
+            if nodes.get(parent).map(|p| p.kind) != Some(NodeKind::Folder) {
+                return Err(OpenCompanyError::InvalidRequest(
+                    "target parent is not a folder".to_string(),
+                ));
+            }
+        }
+        let mut node = nodes.get(id).cloned().expect("node present");
+        if let Some(name) = name {
+            node.name = name.to_string();
+        }
+        if let Some(parent) = parent {
+            node.parent_id = Some(parent.to_string());
+        }
+        node.updated_at_millis = now_millis();
+        self.collection("workspace_nodes")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "node_id": id},
+                doc! {"$set": {
+                    "node_json": serde_json::to_string(&node)?,
+                    "updated_ms": node.updated_at_millis as i64,
+                }},
+            )
+            .await
+            .map_err(mongo_err)?;
+        Ok(node)
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let nodes = self.workspace_nodes(company).await?;
+        if !nodes.contains_key(id) {
+            return Ok(false);
+        }
+        let mut to_remove = mongo_workspace_descendants(&nodes, id);
+        to_remove.insert(id.to_string());
+        let ids: Vec<&String> = to_remove.iter().collect();
+        self.collection("workspace_nodes")
+            .delete_many(doc! {"company_id": company.as_ref(), "node_id": {"$in": ids}})
+            .await
+            .map_err(mongo_err)?;
+        Ok(true)
+    }
+
+    async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
+        let count = self
+            .collection("workspace_nodes")
+            .count_documents(doc! {"company_id": company.as_ref()})
+            .await
+            .map_err(mongo_err)?;
+        Ok(count == 0)
+    }
+}
+
+/// Collects the ids of every descendant of `id` (excluding `id`).
+fn mongo_workspace_descendants(
+    nodes: &HashMap<String, crate::ports::workspace::WorkspaceNode>,
+    id: &str,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut frontier = vec![id.to_string()];
+    while let Some(current) = frontier.pop() {
+        for (child_id, node) in nodes {
+            if node.parent_id.as_deref() == Some(current.as_str()) && out.insert(child_id.clone()) {
+                frontier.push(child_id.clone());
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +1268,41 @@ mod test {
     async fn conformance_inbox_store() {
         let Some(s) = store().await else { return };
         conformance::assert_inbox_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_task_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_task_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_fact_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_fact_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_usage_meter() {
+        let Some(s) = store().await else { return };
+        conformance::assert_usage_meter(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_skill_state_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_skill_state_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_workspace_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_workspace_store(s.clone()).await;
         drop_db(&s).await;
     }
 

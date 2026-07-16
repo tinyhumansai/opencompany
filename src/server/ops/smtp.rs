@@ -294,14 +294,15 @@ async fn record_outbound(runtime: &CompanyRuntime, creds: &SmtpCredentials, emai
     let record = EmailRecord {
         id: generate_id(),
         inbox: local_part(&creds.from_email),
-        from: creds.from_email.clone(),
-        to: email.to.clone(),
+        from_name: creds.from_name.clone(),
+        from_email: creds.from_email.clone(),
         subject: email.subject.clone(),
         body: email.body.clone(),
-        outbound: true,
         at_millis: now_millis(),
+        read: true,
+        outbound: true,
     };
-    if let Err(err) = runtime.inbox().append(runtime.id(), record).await {
+    if let Err(err) = runtime.inbox().append(runtime.id(), &record).await {
         tracing::warn!(company = %runtime.id(), "failed to record outbound email: {err}");
     }
 }

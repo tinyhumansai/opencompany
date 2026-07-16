@@ -120,6 +120,12 @@ pub enum OpenCompanyError {
     #[error("company is {0}")]
     LifecycleConflict(String),
 
+    /// A write conflicts with a durable invariant that is not a lifecycle state
+    /// (e.g. uninstalling a built-in skill, or deleting a manifest-defined
+    /// agent). Renders as `409 Conflict`.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// A request was malformed or internally inconsistent (e.g. an approval
     /// resolution that pairs a `deny` verdict with an amended payload).
     #[error("invalid request: {0}")]
@@ -207,6 +213,7 @@ impl OpenCompanyError {
             Self::ToolNotGranted(_) => "tool_not_granted".to_string(),
             Self::BudgetExceeded(_) => "budget_exceeded".to_string(),
             Self::LifecycleConflict(_) => "lifecycle_conflict".to_string(),
+            Self::Conflict(_) => "conflict".to_string(),
             Self::InvalidRequest(_) => "invalid_request".to_string(),
             Self::Config(_) => "config_error".to_string(),
             Self::Orchestration { code, .. } => code.clone(),

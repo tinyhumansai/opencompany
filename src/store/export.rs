@@ -171,6 +171,7 @@ impl BundleContents {
                 manifest: self.manifest.clone(),
                 ledger: Vec::new(),
                 lifecycle: self.lifecycle.clone(),
+                overlay_agents: Vec::new(),
             })
             .await?;
         for entry in &self.ledger {
@@ -723,6 +724,7 @@ mod test {
             manifest: manifest(),
             ledger: Vec::new(),
             lifecycle: "paused".into(),
+            overlay_agents: Vec::new(),
         })
         .await
         .unwrap();

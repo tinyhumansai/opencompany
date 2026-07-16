@@ -148,10 +148,19 @@ async fn company_status(
 }
 
 /// The operator's chat request body.
+///
+/// WS3 extends the Phase-1 `{text}` body with an optional `chat` desk id
+/// (single-responder in v1): replies are journaled against that desk so the
+/// GraphQL `Chat.history` resolver can read them back. The field is accepted
+/// under either `text` (Phase-1) or `message` (the console) key.
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
     /// The operator's message text.
+    #[serde(alias = "message")]
     text: String,
+    /// The desk the message is addressed to. Defaults to the "General" desk.
+    #[serde(default)]
+    chat: Option<String>,
 }
 
 /// A chat or approval-resolution response: the company's channel replies.
@@ -199,10 +208,31 @@ async fn chat_and_emit(
     runtime: Arc<CompanyRuntime>,
     message: ChatMessage,
 ) -> Result<Json<ChatResponse>, ApiError> {
-    let (report, feedback_note) = run_chat(runtime, message).await?;
+    // The default desk for an unaddressed message. Mirrors the glossary term in
+    // `ops::language::DEFAULT_DESK` (kept in sync; inlined to avoid a module dep).
+    let desk = message
+        .chat
+        .clone()
+        .unwrap_or_else(|| "General".to_string());
+    let (report, feedback_note) = run_chat(runtime.clone(), message).await?;
     emit_cycle_webhooks(state, id, &report).await;
     if let Some(note) = feedback_note {
         emit_feedback_webhook(state, id, &note).await;
+    }
+    // Journal each reply against the addressed desk so desk history can be read
+    // back (GraphQL `Chat.history`, WS2c). Single-responder in v1.
+    for response in &report.responses {
+        let _ = runtime
+            .events()
+            .append(
+                id,
+                CompanyEvent::AgentReply {
+                    chat_id: desk.clone(),
+                    agent_id: response.channel.clone(),
+                    text: response.text.clone(),
+                },
+            )
+            .await;
     }
     Ok(Json(ChatResponse {
         responses: report.responses,
@@ -376,6 +406,7 @@ mod test {
                 manifest: manifest(),
                 ledger: Vec::new(),
                 lifecycle: lifecycle.to_string(),
+                overlay_agents: Vec::new(),
             })
             .await
             .unwrap();

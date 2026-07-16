@@ -187,6 +187,7 @@ mod test {
                 manifest: manifest(),
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
+                overlay_agents: Vec::new(),
             })
             .await
             .unwrap();

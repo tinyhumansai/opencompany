@@ -24,11 +24,29 @@ use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    InboxStore, MemoryStore, SecretStore, ToolProvider,
+    FactStore, InboxStore, MemoryStore, SecretStore, SkillStateStore, TaskStore, ToolProvider,
+    UsageMeter, WorkspaceStore,
 };
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
+
+/// The WS3 console ports, bundled so the runtime constructor stays legible.
+/// Each is an `Arc<dyn …>` keyed by [`CompanyId`], defaulting to the fs backend
+/// and overridden together when a non-fs backend is selected.
+#[derive(Clone)]
+pub struct OpsStores {
+    /// The durable task board.
+    pub tasks: Arc<dyn TaskStore>,
+    /// The durable workspace file tree.
+    pub workspace: Arc<dyn WorkspaceStore>,
+    /// The durable memory-facts view.
+    pub facts: Arc<dyn FactStore>,
+    /// The usage meter (written by the WS4 cost hook, read by WS5).
+    pub usage: Arc<dyn UsageMeter>,
+    /// Operator deltas over the company's skills.
+    pub skills: Arc<dyn SkillStateStore>,
+}
 
 /// A running company: its brain, stores, channels, and policy gate, wired
 /// together behind a serial cycle loop.
@@ -53,6 +71,8 @@ pub struct CompanyRuntime {
     pub(crate) secrets: Arc<dyn SecretStore>,
     /// Per-teammate email (inbound + outbound), backing the inbox surface.
     pub(crate) inbox: Arc<dyn InboxStore>,
+    /// The WS3 console ports (tasks, workspace, facts, usage, skills).
+    pub(crate) ops: OpsStores,
     /// Durable store of feedback items (the "feedback family").
     pub(crate) feedback: Arc<FeedbackStore>,
     /// Filing configuration: the GitHub client, target repo, consent, limiter.
@@ -84,6 +104,7 @@ impl CompanyRuntime {
         journal: Arc<RuntimeJournal>,
         secrets: Arc<dyn SecretStore>,
         inbox: Arc<dyn InboxStore>,
+        ops: OpsStores,
         feedback: Arc<FeedbackStore>,
         filer: Arc<FeedbackFiler>,
     ) -> Self {
@@ -103,6 +124,7 @@ impl CompanyRuntime {
             journal,
             secrets,
             inbox,
+            ops,
             feedback,
             filer,
             serial: TokioMutex::new(()),
@@ -135,9 +157,44 @@ impl CompanyRuntime {
         &self.secrets
     }
 
+    /// This company's event log (append-only audit trail).
+    pub fn events(&self) -> &Arc<dyn EventLog> {
+        &self.events
+    }
+
+    /// This company's durable record store.
+    pub fn store(&self) -> &Arc<dyn CompanyStore> {
+        &self.store
+    }
+
     /// This company's inbox store (inbound + outbound email).
     pub fn inbox(&self) -> &Arc<dyn InboxStore> {
         &self.inbox
+    }
+
+    /// This company's task board.
+    pub fn tasks(&self) -> &Arc<dyn TaskStore> {
+        &self.ops.tasks
+    }
+
+    /// This company's workspace file tree.
+    pub fn workspace(&self) -> &Arc<dyn WorkspaceStore> {
+        &self.ops.workspace
+    }
+
+    /// This company's durable memory-facts view.
+    pub fn facts(&self) -> &Arc<dyn FactStore> {
+        &self.ops.facts
+    }
+
+    /// This company's usage meter (written by the cost hook, read by WS5).
+    pub fn usage(&self) -> &Arc<dyn UsageMeter> {
+        &self.ops.usage
+    }
+
+    /// This company's skill-state deltas.
+    pub fn skills(&self) -> &Arc<dyn SkillStateStore> {
+        &self.ops.skills
     }
 
     /// Whether an agent economy (tiny.place) is wired in.
