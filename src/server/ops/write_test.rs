@@ -201,6 +201,20 @@ async fn workspace_create_write_move_and_cycle_rejection() {
     assert_eq!(status, StatusCode::OK);
     assert!(ack["updatedAt"].is_number());
 
+    // Explicit `"parentId": null` moves the file back to the workspace root.
+    let (status, moved) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/workspace/{file_id}"),
+        Some(json!({"parentId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        moved.get("parentId").is_none(),
+        "node moved to root has no parentId"
+    );
+
     // Cycle rejection: move a folder under its own child.
     let (_, child) = send(
         &state,

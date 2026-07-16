@@ -768,7 +768,7 @@ pub async fn assert_workspace_store(ws: Arc<dyn WorkspaceStore>) {
     .await
     .unwrap();
     assert!(
-        ws.rename_move(&alpha, "root", None, Some("child"))
+        ws.rename_move(&alpha, "root", None, Some(Some("child")))
             .await
             .is_err(),
         "moving a folder under its descendant must be rejected"
@@ -776,7 +776,7 @@ pub async fn assert_workspace_store(ws: Arc<dyn WorkspaceStore>) {
 
     // Rename + reparent the note under Campaigns.
     let moved = ws
-        .rename_move(&alpha, "note", Some("voice-final.md"), Some("root2"))
+        .rename_move(&alpha, "note", Some("voice-final.md"), Some(Some("root2")))
         .await
         .unwrap();
     assert_eq!(moved.name, "voice-final.md");
@@ -785,6 +785,20 @@ pub async fn assert_workspace_store(ws: Arc<dyn WorkspaceStore>) {
         ws.read(&alpha, "note").await.unwrap().unwrap().1,
         "# Voice v2",
         "content survives the move"
+    );
+
+    // Move the note back to the workspace root (`Some(None)` — an explicit
+    // detach, distinct from `None` which would leave the parent unchanged).
+    let to_root = ws
+        .rename_move(&alpha, "note", None, Some(None))
+        .await
+        .unwrap();
+    assert_eq!(to_root.parent_id, None, "explicit null moves to root");
+    // A subsequent `None` leaves the (root) parent unchanged.
+    let unchanged = ws.rename_move(&alpha, "note", None, None).await.unwrap();
+    assert_eq!(
+        unchanged.parent_id, None,
+        "omitted parent leaves it at root"
     );
 
     // Recursive delete of a folder removes its descendants.
