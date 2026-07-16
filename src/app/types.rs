@@ -125,6 +125,9 @@ pub struct AppState {
     /// selected (`OPENCOMPANY_STORAGE`). Provisioning injects these into each
     /// new company's builder; `None` means fs defaults.
     stores: Option<crate::store::StorageHandles>,
+    /// Injected network seams for the credential surfaces (DNS resolver, mail
+    /// sender). Empty by default so the build stays offline.
+    connections: crate::server::ops::ConnectionsRuntime,
     /// Host-global replay-protection cache shared across every inbound A2A
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
@@ -140,6 +143,7 @@ impl AppState {
             home: std::path::PathBuf::from("."),
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
+            connections: crate::server::ops::ConnectionsRuntime::new(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
@@ -160,6 +164,17 @@ impl AppState {
     /// The opened storage backend's handles, if a non-fs backend is selected.
     pub fn stores(&self) -> Option<&crate::store::StorageHandles> {
         self.stores.as_ref()
+    }
+
+    /// Installs the injected connection seams (DNS resolver, mail sender).
+    pub fn with_connections(mut self, connections: crate::server::ops::ConnectionsRuntime) -> Self {
+        self.connections = connections;
+        self
+    }
+
+    /// The injected connection seams for the credential surfaces.
+    pub fn connections(&self) -> &crate::server::ops::ConnectionsRuntime {
+        &self.connections
     }
 
     /// Installs platform (multi-tenant) auth. Mirrors [`Self::with_home`].
