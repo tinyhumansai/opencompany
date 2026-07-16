@@ -10,6 +10,7 @@ pub mod runtime;
 mod skill_file;
 mod types;
 mod workflow_file;
+mod workspace_seed;
 
 use std::path::Path;
 
@@ -24,6 +25,7 @@ pub use workflow_file::{
     WORKFLOW_NODE_KINDS, WorkflowEdgeDef, WorkflowFile, WorkflowNodeDef, WorkflowNodeKind,
     load_company_workflows, parse_workflow,
 };
+pub use workspace_seed::{NodeKind, SeedNode, extract_wikilinks, walk_workspace};
 
 use crate::{Result, VERSION};
 
