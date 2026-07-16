@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::Serialize;
 
 use crate::app::config::{BrainMode, redacted};
+use crate::company::{SkillDoc, load_dir_skills};
 use crate::ports::types::{CompanyId, SecretValue};
 use crate::runtime::CompanyRegistry;
 use crate::server::platform_auth::PlatformAuthConfig;
@@ -125,6 +126,10 @@ pub struct AppState {
     /// selected (`OPENCOMPANY_STORAGE`). Provisioning injects these into each
     /// new company's builder; `None` means fs defaults.
     stores: Option<crate::store::StorageHandles>,
+    /// Cache of the repo-level shared skill registry (`skills/*/SKILL.md`).
+    /// Populated on first read via [`AppState::skill_registry`]; never
+    /// invalidated because the repo's skill library is immutable at runtime.
+    skill_registry: Arc<OnceLock<Arc<[SkillDoc]>>>,
     /// Host-global replay-protection cache shared across every inbound A2A
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
@@ -140,6 +145,7 @@ impl AppState {
             home: std::path::PathBuf::from("."),
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
+            skill_registry: Arc::new(OnceLock::new()),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
@@ -160,6 +166,21 @@ impl AppState {
     /// The opened storage backend's handles, if a non-fs backend is selected.
     pub fn stores(&self) -> Option<&crate::store::StorageHandles> {
         self.stores.as_ref()
+    }
+
+    /// The repo-level shared skill registry, loaded from `dir` and cached.
+    ///
+    /// The first successful call parses `dir/*/SKILL.md` and caches the result;
+    /// later calls return the cached registry and ignore `dir`, since the
+    /// repo's skill library is immutable at runtime.
+    pub fn skill_registry(&self, dir: &Path) -> crate::Result<Arc<[SkillDoc]>> {
+        if let Some(cached) = self.skill_registry.get() {
+            return Ok(cached.clone());
+        }
+        let registry: Arc<[SkillDoc]> = load_dir_skills(dir)?.into();
+        // A concurrent caller may have set it first; keep whichever won.
+        let _ = self.skill_registry.set(registry.clone());
+        Ok(self.skill_registry.get().cloned().unwrap_or(registry))
     }
 
     /// Installs platform (multi-tenant) auth. Mirrors [`Self::with_home`].
@@ -341,6 +362,22 @@ mod tests {
     #[test]
     fn default_config_cannot_run_cycles() {
         assert!(!AppConfig::default().cycles_available());
+    }
+
+    #[test]
+    fn skill_registry_loads_the_repo_library_and_caches() {
+        let state = AppState::new(AppConfig::default());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+
+        let first = state.skill_registry(&dir).expect("registry loads");
+        assert!(first.iter().any(|skill| skill.slug == "web-research"));
+        assert!(first.iter().any(|skill| skill.slug == "weekly-report"));
+
+        // A second call returns the same cached allocation, ignoring the path.
+        let second = state
+            .skill_registry(std::path::Path::new("/nonexistent"))
+            .expect("cached registry");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
