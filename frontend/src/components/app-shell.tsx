@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState } from "react";
 import {
+  ChartColumnBig,
   FolderClosed,
   Flag,
   LayoutDashboard,
@@ -61,6 +62,8 @@ const WorkflowsView = lazy(() =>
 const WorkspaceView = lazy(() =>
   import("@/views/WorkspaceView").then((m) => ({ default: m.WorkspaceView })),
 );
+// Recharts is heavy — load the usage dashboard on demand.
+const UsageView = lazy(() => import("@/views/UsageView").then((m) => ({ default: m.UsageView })));
 
 export type View =
   | "overview"
@@ -70,6 +73,7 @@ export type View =
   | "workspace"
   | "approvals"
   | "workflows"
+  | "usage"
   | "connections"
   | "settings"
   | "feedback";
@@ -101,6 +105,7 @@ const NAV: NavGroup[] = [
   {
     label: "Configure",
     items: [
+      { view: "usage", label: "Usage", icon: ChartColumnBig },
       { view: "connections", label: "Connections", icon: Plug },
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
@@ -119,6 +124,7 @@ const TITLES: Record<View, string> = {
   workspace: "Workspace",
   approvals: "Approvals",
   workflows: "Workflows",
+  usage: "Usage",
   connections: "Connections",
   settings: "Settings",
   feedback: "Feedback",
@@ -287,6 +293,17 @@ export function AppShell({
               }
             >
               <WorkflowsView />
+            </Suspense>
+          )}
+          {view === "usage" && (
+            <Suspense
+              fallback={
+                <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                  Loading usage…
+                </div>
+              }
+            >
+              <UsageView />
             </Suspense>
           )}
           {view === "connections" && <ConnectionsView client={client} company={company} />}
