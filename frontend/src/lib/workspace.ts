@@ -34,6 +34,30 @@ export function nodeById(nodes: FsNode[], id: string | null): FsNode | undefined
   return id ? nodes.find((x) => x.id === id) : undefined;
 }
 
+/** A file's display title — its name without the markdown extension. */
+export function titleOf(node: FsNode): string {
+  return node.name.replace(/\.(md|markdown|txt)$/i, "");
+}
+
+/** Resolve an Obsidian-style `[[wiki link]]` target to a file, by title. */
+export function fileByTitle(nodes: FsNode[], target: string): FsNode | undefined {
+  const want = target.trim().toLowerCase();
+  return nodes.find((x) => x.kind === "file" && titleOf(x).toLowerCase() === want);
+}
+
+/** Files whose body links to `target`'s title via `[[…]]` (backlinks). */
+export function backlinksTo(nodes: FsNode[], target: FsNode): FsNode[] {
+  const title = titleOf(target).toLowerCase();
+  const re = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+  return nodes.filter((x) => {
+    if (x.kind !== "file" || x.id === target.id || !x.content) return false;
+    for (const m of x.content.matchAll(re)) {
+      if (m[1].trim().toLowerCase() === title) return true;
+    }
+    return false;
+  });
+}
+
 /** Ancestor folders (root → current), for breadcrumbs. */
 export function pathOf(nodes: FsNode[], id: string | null): FsNode[] {
   const path: FsNode[] = [];
@@ -144,9 +168,10 @@ function seedWorkspace(): FsNode[] {
       parentId: null,
       updatedAt: now(),
       content:
-        "# Workspace\n\nThe team's shared space. Organize work in **folders**, write in " +
-        "**Markdown**, upload files, and keep everything in one place.\n\n- Create folders and files with the toolbar\n" +
-        "- Click a file to edit it\n- Use the ⋯ menu to rename, move, or delete\n",
+        "# Workspace\n\nThe team's shared space, Obsidian-style. Organize work in **folders**, " +
+        "write in **Markdown**, and link notes with `[[wiki links]]`.\n\n" +
+        "Start here:\n\n- [[Spring launch]] — the campaign in flight\n- [[Brand voice]] — how we sound\n\n" +
+        "Use the explorer on the left to browse, and the backlinks panel to see what links here.\n",
     },
     {
       id: "seed-spring",
@@ -155,7 +180,8 @@ function seedWorkspace(): FsNode[] {
       parentId: "seed-campaigns",
       updatedAt: now(),
       content:
-        "# Spring launch\n\n## Goals\n- Drive signups from the spring push\n- 3 hero taglines in review\n\n## Checklist\n" +
+        "# Spring launch\n\nFollows our [[Brand voice]].\n\n## Goals\n- Drive signups from the spring push\n" +
+        "- 3 hero taglines in review\n\n## Checklist\n" +
         "- [x] Brief approved\n- [ ] Taglines drafted\n- [ ] Hero image\n- [ ] Landing page\n\n> Owner: Creative studio\n",
     },
     {
