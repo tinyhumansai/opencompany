@@ -46,3 +46,48 @@ description = "Measure performance and report."
 id = "brand_strategist"
 role = "Brand Strategist"
 description = "Positioning and brand strategy."
+
+# Group chats — the desks the human talks to. Each pulls in a few agents.
+# Members must be ids from the roster above.
+[[group_chat]]
+id = "strategy"
+name = "Strategy desk"
+description = "Plans, priorities, and direction."
+members = ["brand_strategist", "seo_specialist", "analytics_analyst"]
+
+[[group_chat]]
+id = "creative"
+name = "Creative studio"
+description = "Copy, design, and campaigns."
+members = ["creative_director", "copywriter", "landing_page_builder"]
+
+[[group_chat]]
+id = "growth"
+name = "Growth desk"
+description = "Acquisition and lifecycle."
+members = ["paid_ads_manager", "email_marketer"]
+
+# Integrations to prioritize wiring. Intent only — scopes and why, never
+# secrets. The manager injects real OAuth credentials at runtime.
+[[connection]]
+provider = "slack"
+priority = "high"
+scopes = ["chat:write", "channels:read"]
+reason = "Post campaign updates and take requests."
+
+[[connection]]
+provider = "gmail"
+priority = "high"
+scopes = ["gmail.send", "gmail.readonly"]
+reason = "Send lifecycle email from a connected inbox."
+
+[[connection]]
+provider = "google-analytics"
+priority = "medium"
+scopes = ["analytics.readonly"]
+reason = "Measure campaign performance."
+
+# Workflow graphs to enable. The graphs live in this company's workflows/
+# directory (one file per id), not inline here.
+[workflows]
+enabled = ["campaign_pipeline"]

@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{OpenCompanyError, Result};
 
 use super::types::{
-    BRAIN_MODES, CompanyManifest, KNOWN_CHANNELS, POLICY_MODES, TIERS, TOOL_PROVIDERS,
+    BRAIN_MODES, CONNECTION_PRIORITIES, CompanyManifest, KNOWN_CHANNELS, POLICY_MODES, TIERS,
+    TOOL_PROVIDERS,
 };
 
 /// Preferred manifest filename.
@@ -142,6 +143,73 @@ impl CompanyManifest {
             }
         }
 
+        // Group chats: ids snake_case + unique; every member is a real agent.
+        let mut chat_ids = std::collections::HashSet::new();
+        for (index, chat) in self.group_chats.iter().enumerate() {
+            let label = if chat.id.is_empty() {
+                format!("group chat #{}", index + 1)
+            } else {
+                format!("group chat `{}`", chat.id)
+            };
+
+            if chat.id.trim().is_empty() {
+                problems.push(format!("{label} is missing an `id`."));
+            } else if !is_snake_case(&chat.id) {
+                problems.push(format!(
+                    "{label} has an invalid `id` — use snake_case (lowercase letters, digits, and underscores, starting with a letter)."
+                ));
+            } else if !chat_ids.insert(chat.id.as_str()) {
+                problems.push(format!(
+                    "group chat `id` `{}` is used more than once — ids must be unique.",
+                    chat.id
+                ));
+            }
+
+            if chat.name.trim().is_empty() {
+                problems.push(format!("{label} is missing a `name`."));
+            }
+
+            for member in &chat.members {
+                if !seen.contains(member.as_str()) {
+                    problems.push(format!(
+                        "{label} lists member `{member}`, which is not an agent in the roster."
+                    ));
+                }
+            }
+        }
+
+        // Connections: a provider is required; a stated priority must be known.
+        for (index, connection) in self.connections.iter().enumerate() {
+            let label = if connection.provider.trim().is_empty() {
+                format!("connection #{}", index + 1)
+            } else {
+                format!("connection `{}`", connection.provider)
+            };
+
+            if connection.provider.trim().is_empty() {
+                problems.push(format!("{label} is missing a `provider`."));
+            }
+
+            if let Some(priority) = &connection.priority
+                && !CONNECTION_PRIORITIES.contains(&priority.as_str())
+            {
+                problems.push(one_of(
+                    &format!("{label} `priority`"),
+                    CONNECTION_PRIORITIES,
+                    priority,
+                ));
+            }
+        }
+
+        // Enabled workflows reference `workflows/<id>.toml`; ids must be sane.
+        for id in &self.workflows.enabled {
+            if !is_snake_case(id) {
+                problems.push(format!(
+                    "`[workflows].enabled` has an invalid workflow id `{id}` — use snake_case (a `workflows/{id}.toml` file)."
+                ));
+            }
+        }
+
         if !BRAIN_MODES.contains(&self.brain.mode.as_str()) {
             problems.push(one_of("`[brain].mode`", BRAIN_MODES, &self.brain.mode));
         }
@@ -245,6 +313,23 @@ impl CompanyManifest {
             let _ = writeln!(out, "  • {:<20} {}  [tier: {}]", agent.id, agent.role, tier);
         }
 
+        if !self.group_chats.is_empty() {
+            let _ = writeln!(out, "\nGroup chats ({}):", self.group_chats.len());
+            for chat in &self.group_chats {
+                let _ = writeln!(out, "  • {:<20} {}", chat.id, chat.name);
+            }
+        }
+        if !self.connections.is_empty() {
+            let names: Vec<&str> = self
+                .connections
+                .iter()
+                .map(|c| c.provider.as_str())
+                .collect();
+            let _ = writeln!(out, "\nConnections: {}", names.join(", "));
+        }
+        if !self.workflows.enabled.is_empty() {
+            let _ = writeln!(out, "\nWorkflows: {}", self.workflows.enabled.join(", "));
+        }
         if !self.channels.is_empty() {
             let names: Vec<&str> = self.channels.keys().map(String::as_str).collect();
             let _ = writeln!(out, "\nChannels: {}", names.join(", "));
@@ -415,6 +500,87 @@ mod tests {
         let problems = manifest.validate();
         assert!(problems.iter().any(|p| p.contains("price_usd")));
         assert!(problems.iter().any(|p| p.contains("5 fields")));
+    }
+
+    #[test]
+    fn accepts_group_chats_connections_and_workflows() {
+        let manifest = parse(
+            r#"
+            [company]
+            name = "Agentic Marketing Agency"
+
+            [[agent]]
+            id = "creative_director"
+            role = "Creative Director"
+            [[agent]]
+            id = "copywriter"
+            role = "Copywriter"
+
+            [[group_chat]]
+            id = "creative"
+            name = "Creative studio"
+            description = "Copy, design, and campaigns"
+            members = ["creative_director", "copywriter"]
+
+            [[connection]]
+            provider = "slack"
+            priority = "high"
+            scopes = ["chat:write"]
+            reason = "Post campaign updates"
+
+            [workflows]
+            enabled = ["campaign_pipeline"]
+            "#,
+        );
+        assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+        assert_eq!(manifest.group_chats.len(), 1);
+        assert_eq!(manifest.group_chats[0].members.len(), 2);
+        assert_eq!(manifest.connections[0].provider, "slack");
+        assert_eq!(manifest.workflows.enabled, vec!["campaign_pipeline"]);
+    }
+
+    #[test]
+    fn rejects_unknown_member_bad_priority_and_workflow_id() {
+        let manifest = parse(
+            r#"
+            [company]
+            name = "X"
+            [[agent]]
+            id = "a"
+            role = "A"
+
+            [[group_chat]]
+            id = "team"
+            name = "Team"
+            members = ["ghost"]
+
+            [[connection]]
+            provider = "slack"
+            priority = "urgent"
+
+            [workflows]
+            enabled = ["Bad-Id"]
+            "#,
+        );
+        let problems = manifest.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("ghost") && p.contains("not an agent")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("`priority`") && p.contains("urgent")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("workflow id") && p.contains("Bad-Id")),
+            "{problems:?}"
+        );
     }
 
     #[test]

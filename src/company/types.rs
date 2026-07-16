@@ -35,6 +35,9 @@ pub const KNOWN_CHANNELS: &[&str] = &["operator", "email", "slack", "sms", "web"
 /// Effect kinds gated for approval by default under a `supervised` policy.
 pub const DEFAULT_ALWAYS_APPROVE: &[&str] = &["payment.send", "filing.submit", "external.publish"];
 
+/// Priorities a company may assign to a prioritized `[[connection]]`.
+pub const CONNECTION_PRIORITIES: &[&str] = &["low", "medium", "high"];
+
 /// The on-disk definition of a Company.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompanyManifest {
@@ -43,6 +46,18 @@ pub struct CompanyManifest {
     /// The roster. Renamed from the `[[agent]]` array-of-tables.
     #[serde(default, rename = "agent")]
     pub agents: Vec<Agent>,
+    /// Internal group chats between the human and desks of agents. Renamed from
+    /// the `[[group_chat]]` array-of-tables.
+    #[serde(default, rename = "group_chat")]
+    pub group_chats: Vec<GroupChat>,
+    /// Third-party integrations to prioritize wiring, as intent — never
+    /// secrets. Renamed from the `[[connection]]` array-of-tables.
+    #[serde(default, rename = "connection")]
+    pub connections: Vec<Connection>,
+    /// Which workflow graphs (under the company's `workflows/` directory) to
+    /// enable. The graphs themselves live in their own files, not here.
+    #[serde(default)]
+    pub workflows: Workflows,
     /// Brain selection.
     #[serde(default)]
     pub brain: Brain,
@@ -101,6 +116,47 @@ pub struct Agent {
     /// Per-agent daily spend cap in USD.
     #[serde(default)]
     pub budget_usd_daily: Option<f64>,
+}
+
+/// A `[[group_chat]]` entry — a named conversation with a desk of agents.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupChat {
+    /// snake_case, unique within the manifest's group chats.
+    pub id: String,
+    /// Human-readable chat name, e.g. "Creative studio".
+    pub name: String,
+    /// What the chat is for.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Agent ids in this chat; each must exist in the roster.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+/// A `[[connection]]` entry — an integration to prioritize wiring. This is
+/// declarative intent (provider + scopes + why), never credentials.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Connection {
+    /// Provider id, e.g. `slack`, `gmail`, `github`.
+    pub provider: String,
+    /// `low` | `medium` | `high`; how much to prioritize wiring it.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// OAuth scopes the company expects to need.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Why the company wants this connection.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `[workflows]` — references to the workflow graphs to enable. The graphs live
+/// as separate files under the company's `workflows/` directory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Workflows {
+    /// Workflow ids to enable, each a `workflows/<id>.toml` graph file.
+    #[serde(default)]
+    pub enabled: Vec<String>,
 }
 
 /// `[brain]` — selects the `Brain` implementation.

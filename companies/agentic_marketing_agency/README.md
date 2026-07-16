@@ -27,6 +27,23 @@
 
 Humans keep **campaign review and sign-off**; the agents run everything else. The output of this harness is **campaigns across every channel**.
 
+## Company files
+
+Alongside `company.toml`, a company directory can ship starter data that seeds
+the operator console:
+
+| Path | Seeds |
+| --- | --- |
+| `company.toml` | Identity, `[[agent]]` roster, `[[group_chat]]` desks, `[[connection]]` priorities, `[workflows].enabled` |
+| `workflows/<id>.toml` | A workflow graph enabled in `company.toml` (one file per workflow) |
+| `workspace/**` | The **template workspace** — starter Markdown notes/folders, `[[wiki linked]]` |
+| `skills/<id>/SKILL.md` | A **skill** — YAML frontmatter (`name`, `description`) + a write-up (When to use / Steps / Output) |
+
+Every company can define its own `workspace/` and `skills/`; this one ships a
+Brand / Campaigns / Playbooks workspace and SEO, landing-page, email, and
+brand-positioning skills. Shared, non-company skills live in the repo-level
+[`skills/`](../../skills/) library and can be installed into any company.
+
 ## Run it
 
 ```sh

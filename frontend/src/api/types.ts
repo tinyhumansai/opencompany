@@ -60,6 +60,38 @@ export interface FeedbackResponse {
   deduped: boolean;
 }
 
+/**
+ * One agent in the company's roster, from `GET .../team`. Forward-looking:
+ * hosts that don't expose the roster yet 404, and the console falls back to a
+ * locally-editable starter team. Mirrors a `company.toml` `[[agent]]` entry.
+ */
+export interface TeamMemberDto {
+  id: string;
+  /** Display name; falls back to the role when a company only names roles. */
+  name?: string;
+  role: string;
+  description?: string;
+}
+
+/**
+ * One third-party connection's state, from `GET .../connections`.
+ * Forward-looking: hosts that don't expose the connections surface yet simply
+ * 404, and the console treats connections as unavailable.
+ */
+export interface ConnectionState {
+  /** Provider id, matching the console's connection catalog (e.g. "slack"). */
+  provider: string;
+  connected: boolean;
+  /** The connected account label, when known (e.g. an email or workspace). */
+  account?: string;
+}
+
+/** Response of `POST .../connections/{provider}/start`: where to send the user. */
+export interface ConnectionStart {
+  /** The provider's OAuth authorize URL to redirect the operator to. */
+  url: string;
+}
+
 /** Error envelope shape: `{ error, code }`. */
 export interface ApiErrorBody {
   error: string;

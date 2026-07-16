@@ -1,0 +1,98 @@
+# Workflow graph: campaign_pipeline
+#
+# Referenced by `[workflows].enabled = ["campaign_pipeline"]` in ../company.toml.
+# Graphs live here (one file per workflow) rather than inline in the manifest:
+# they are larger and edited by the Workflow canvas, on their own lifecycle.
+#
+# Node kinds mirror the tinyflows model (trigger / agent / tool_call /
+# http_request / condition / output). This is a data-only definition; the
+# manifest only records that this workflow is enabled.
+
+id = "campaign_pipeline"
+name = "Campaign pipeline"
+description = "A brief goes from intake to a published post."
+
+[[node]]
+id = "brief"
+kind = "trigger"
+name = "New campaign brief"
+summary = "Client drops a brief in the inbox."
+
+[[node]]
+id = "strategist"
+kind = "agent"
+name = "Strategist"
+summary = "Turns the brief into an angle + outline."
+agent = "brand_strategist"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Needs research?"
+summary = "Branch on topic familiarity."
+
+[[node]]
+id = "research"
+kind = "tool_call"
+name = "Web research"
+summary = "Pulls sources and competitor takes."
+
+[[node]]
+id = "copy"
+kind = "agent"
+name = "Copywriter"
+summary = "Drafts the post from the outline."
+agent = "copywriter"
+
+[[node]]
+id = "design"
+kind = "agent"
+name = "Designer"
+summary = "Generates the hero image."
+agent = "creative_director"
+
+[[node]]
+id = "publish"
+kind = "http_request"
+name = "Publish to CMS"
+summary = "POST the approved draft."
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Report back"
+summary = "Summarize what shipped."
+
+[[edge]]
+from = "brief"
+to = "strategist"
+
+[[edge]]
+from = "strategist"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "research"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "copy"
+label = "no"
+
+[[edge]]
+from = "research"
+to = "copy"
+
+[[edge]]
+from = "copy"
+to = "design"
+
+[[edge]]
+from = "design"
+to = "publish"
+
+[[edge]]
+from = "publish"
+to = "done"
