@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState } from "react";
 import {
+  FolderClosed,
   Flag,
   LayoutDashboard,
   type LucideIcon,
@@ -56,12 +57,17 @@ import { FeedbackView } from "@/views/FeedbackView";
 const WorkflowsView = lazy(() =>
   import("@/views/WorkflowsView").then((m) => ({ default: m.WorkflowsView })),
 );
+// Pulls in the markdown renderer — load on demand.
+const WorkspaceView = lazy(() =>
+  import("@/views/WorkspaceView").then((m) => ({ default: m.WorkspaceView })),
+);
 
 export type View =
   | "overview"
   | "conversation"
   | "tasks"
   | "team"
+  | "workspace"
   | "approvals"
   | "workflows"
   | "connections"
@@ -87,6 +93,7 @@ const NAV: NavGroup[] = [
       { view: "conversation", label: "Conversation", icon: MessagesSquare },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "team", label: "Team", icon: Users },
+      { view: "workspace", label: "Workspace", icon: FolderClosed },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
       { view: "workflows", label: "Workflows", icon: Workflow },
     ],
@@ -109,6 +116,7 @@ const TITLES: Record<View, string> = {
   conversation: "Conversation",
   tasks: "Tasks",
   team: "Team",
+  workspace: "Workspace",
   approvals: "Approvals",
   workflows: "Workflows",
   connections: "Connections",
@@ -250,6 +258,17 @@ export function AppShell({
           )}
           {view === "tasks" && <TasksView />}
           {view === "team" && <TeamView client={client} company={company} />}
+          {view === "workspace" && (
+            <Suspense
+              fallback={
+                <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                  Loading workspace…
+                </div>
+              }
+            >
+              <WorkspaceView company={company} />
+            </Suspense>
+          )}
           {view === "approvals" && (
             <ApprovalsView
               client={client}
