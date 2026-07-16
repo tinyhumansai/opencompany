@@ -1,15 +1,34 @@
 # OpenCompany Console
 
 A single, **company-agnostic** operator console for any OpenCompany host —
-built with Vite + React + TypeScript. One build talks to any company on any
-host, discovered at runtime, so it is reused everywhere instead of shipping a
-bespoke UI per example.
+built with **Vite + React + TypeScript + Tailwind v4 + [shadcn/ui]**. One build
+talks to any company on any host, discovered at runtime, so it is reused
+everywhere instead of shipping a bespoke UI per example.
 
-It is an operator surface, not a dashboard of internals: you chat with **the
-company** (one voice), see the few things it parked for **your approval**, and
-**flag** anything that was wrong. Per the spec's language rules, it never
-exposes runtime mechanics ("agent graph", "tier", "dispatch", "cycle") — every
-label goes through [`src/lib/language.ts`](src/lib/language.ts).
+It is an operator surface: you chat with **the company**, see the few things it
+parked for **your approval**, watch its **workflows**, and **flag** anything
+that was wrong. Per the spec's language rules, product text never exposes
+runtime mechanics ("agent graph", "tier", "dispatch", "cycle") — every label
+goes through [`src/lib/language.ts`](src/lib/language.ts).
+
+[shadcn/ui]: https://ui.shadcn.com
+
+## What's inside
+
+A dashboard shell (collapsible sidebar + topbar, light/dark/system theme) wraps
+one company's views. Navigation is **hash-routed** (`#/conversation`), so views
+are linkable and survive a refresh.
+
+| View | What it does |
+|---|---|
+| **Overview** | Status, pending-approval and conversation stat cards, quick actions |
+| **Conversation** | WhatsApp-style two-pane chat: a thread list (company line + desks) on the left, the selected transcript + composer on the right |
+| **Tasks** | A built-in Kanban board (drag cards between columns) |
+| **Approvals** | The inbox of things parked for your decision, with approve/decline |
+| **Workflows** | A read-only [React Flow](https://reactflow.dev) canvas of how work is routed (lazy-loaded) |
+| **Connections** | OAuth connection catalog (Gmail, Slack, GitHub, …); degrades to read-only when the host has no connections surface |
+| **Settings** | Connection details, lifecycle controls (pause/resume/suspend/archive), appearance |
+| **Feedback** | The scrub-then-preview feedback flow, plus a Join-our-Discord nudge |
 
 ## Run it
 
@@ -47,24 +66,35 @@ The same build works against any host/company. Resolution order (first wins):
 - **Multi-company (platform)** hosts: it lists companies and shows a picker;
   `?company=<id>` jumps straight in. Add `?token=` for platform/operator auth.
 
+## Design system
+
+- **Tokens** live in [`src/index.css`](src/index.css) — the shadcn "new-york"
+  neutral theme (OKLCH CSS variables, light + `.dark`). Swap the variables to
+  reskin; theming is driven by `next-themes`.
+- **Primitives** are shadcn/ui on **Base UI** under
+  [`src/components/ui/`](src/components/ui/) — owned in-tree, add more with
+  `npx shadcn@latest add <component>`.
+- Base UI composes with the `render` prop (not Radix's `asChild`).
+
 ## Pluggable pieces
 
 Everything is decoupled so you can embed parts elsewhere:
 
 - [`src/api/client.ts`](src/api/client.ts) — a typed `OpenCompanyClient` with no
-  React dependency; use it from any TS app.
+  React dependency; use it from any TS app. Includes a forward-looking
+  `connections` seam that light hosts can ignore.
 - [`src/api/types.ts`](src/api/types.ts) — the API payload types, mirrored from
   the Rust server.
-- [`src/components/`](src/components/) — `Chat`, `Approvals`, `StatusBar`,
-  `FeedbackDialog`, `CompanyPicker` — prop-driven and reusable.
-- [`src/theme.css`](src/theme.css) — a token-based design system (light/dark);
-  swap the CSS variables to reskin.
+- [`src/views/`](src/views/) and [`src/components/`](src/components/) —
+  prop-driven views and pieces (`Conversation`, `TasksView`, `WorkflowsView`,
+  `FeedbackForm`, …).
 
 ## Build
 
 ```sh
 npm run build     # tsc typecheck + vite bundle -> dist/
 npm run preview   # serve the production build
+npm run typecheck # tsc only
 ```
 
 The `dist/` can be served as static files by any web server (or mounted by the
