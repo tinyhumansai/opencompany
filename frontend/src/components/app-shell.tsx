@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState } from "react";
 import {
+  Brain,
   ChartColumnBig,
   FolderClosed,
   Flag,
@@ -12,6 +13,7 @@ import {
   ShieldCheck,
   SquareKanban,
   Users,
+  Wallet,
   Workflow,
 } from "lucide-react";
 
@@ -50,6 +52,7 @@ import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
 import { TeamView } from "@/views/TeamView";
+import { MemoryView } from "@/views/MemoryView";
 import { ConnectionsView } from "@/views/ConnectionsView";
 import { SettingsView } from "@/views/SettingsView";
 import { FeedbackView } from "@/views/FeedbackView";
@@ -64,6 +67,10 @@ const WorkspaceView = lazy(() =>
 );
 // Recharts is heavy — load the usage dashboard on demand.
 const UsageView = lazy(() => import("@/views/UsageView").then((m) => ({ default: m.UsageView })));
+// Also Recharts-backed — load on demand.
+const FinancesView = lazy(() =>
+  import("@/views/FinancesView").then((m) => ({ default: m.FinancesView })),
+);
 
 export type View =
   | "overview"
@@ -71,9 +78,11 @@ export type View =
   | "tasks"
   | "team"
   | "workspace"
+  | "memory"
   | "approvals"
   | "workflows"
   | "usage"
+  | "finances"
   | "connections"
   | "settings"
   | "feedback";
@@ -98,6 +107,7 @@ const NAV: NavGroup[] = [
       { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "team", label: "Team", icon: Users },
       { view: "workspace", label: "Workspace", icon: FolderClosed },
+      { view: "memory", label: "Memory", icon: Brain },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
       { view: "workflows", label: "Workflows", icon: Workflow },
     ],
@@ -106,6 +116,7 @@ const NAV: NavGroup[] = [
     label: "Configure",
     items: [
       { view: "usage", label: "Usage", icon: ChartColumnBig },
+      { view: "finances", label: "Finances", icon: Wallet },
       { view: "connections", label: "Connections", icon: Plug },
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
@@ -122,9 +133,11 @@ const TITLES: Record<View, string> = {
   tasks: "Tasks",
   team: "Team",
   workspace: "Workspace",
+  memory: "Memory",
   approvals: "Approvals",
   workflows: "Workflows",
   usage: "Usage",
+  finances: "Finances",
   connections: "Connections",
   settings: "Settings",
   feedback: "Feedback",
@@ -264,6 +277,7 @@ export function AppShell({
           )}
           {view === "tasks" && <TasksView />}
           {view === "team" && <TeamView client={client} company={company} />}
+          {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (
             <Suspense
               fallback={
@@ -304,6 +318,17 @@ export function AppShell({
               }
             >
               <UsageView />
+            </Suspense>
+          )}
+          {view === "finances" && (
+            <Suspense
+              fallback={
+                <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                  Loading finances…
+                </div>
+              }
+            >
+              <FinancesView />
             </Suspense>
           )}
           {view === "connections" && <ConnectionsView client={client} company={company} />}
