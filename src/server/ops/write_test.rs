@@ -55,7 +55,20 @@ async fn send(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let request = Request::builder().method(method).uri(uri);
+    send_auth(state, method, uri, body, None).await
+}
+
+async fn send_auth(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
     let request = match body {
         Some(body) => request
             .header("content-type", "application/json")
@@ -187,6 +200,20 @@ async fn workspace_create_write_move_and_cycle_rejection() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(ack["updatedAt"].is_number());
+
+    // Explicit `"parentId": null` moves the file back to the workspace root.
+    let (status, moved) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/workspace/{file_id}"),
+        Some(json!({"parentId": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        moved.get("parentId").is_none(),
+        "node moved to root has no parentId"
+    );
 
     // Cycle rejection: move a folder under its own child.
     let (_, child) = send(
@@ -390,6 +417,63 @@ async fn chat_accepts_desk_id_and_replies() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["responses"].is_array());
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn credential_route_rejects_foreign_tenant() {
+    use crate::server::platform_auth::{
+        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+    };
+    use std::collections::HashSet;
+
+    let home = home();
+    // Platform mode: `acme` is owned by `tenant:acme`.
+    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let state = AppState::new(AppConfig::default())
+        .with_home(home.clone())
+        .with_platform_auth(PlatformAuthConfig::new(verifier));
+    let id = CompanyId::new("acme");
+    let runtime = RuntimeBuilder::new(home.clone(), manifest())
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    state
+        .registry()
+        .insert(id.clone(), std::sync::Arc::new(runtime));
+    state.set_owner(id.clone(), "tenant:acme");
+
+    let token = |tenant: &str| {
+        StaticPlatformVerifier::tenant_token(&PlatformClaims {
+            tenant: tenant.to_string(),
+            scopes: HashSet::from(["operator".to_string()]),
+            companies: None,
+        })
+    };
+
+    // A foreign tenant cannot set acme's domain (credential route is scoped).
+    let (status, _) = send_auth(
+        &state,
+        "PUT",
+        "/api/v1/companies/acme/domain",
+        Some(json!({"domain": "acme.test"})),
+        Some(&token("tenant:evil")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The owning tenant succeeds.
+    let (status, _) = send_auth(
+        &state,
+        "PUT",
+        "/api/v1/companies/acme/domain",
+        Some(json!({"domain": "acme.test"})),
+        Some(&token("tenant:acme")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }

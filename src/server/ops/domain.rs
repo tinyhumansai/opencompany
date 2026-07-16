@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{post, put};
 use axum::{Json, Router};
@@ -23,16 +23,11 @@ use crate::company::dns::{self, DomainStatus};
 use crate::company::runtime::CompanyRuntime;
 use crate::ports::types::SecretValue;
 use crate::server::error::ApiError;
-use crate::server::operator::OperatorAuth;
-use crate::server::ops::{DOMAIN_KEY, resolve, resolve_sole};
+use crate::server::ops::{DOMAIN_KEY, ScopedCompany, scoped};
 
 /// Builds the domain route fragment.
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/companies/{id}/domain", put(put_domain))
-        .route("/api/v1/companies/{id}/domain/verify", post(verify_domain))
-        .route("/api/v1/company/domain", put(put_domain_single))
-        .route("/api/v1/company/domain/verify", post(verify_domain_single))
+    scoped("/domain", put(put_domain)).merge(scoped("/domain/verify", post(verify_domain)))
 }
 
 /// The set-domain request body.
@@ -70,23 +65,12 @@ async fn load_domain(runtime: &CompanyRuntime) -> Result<Option<DomainStatus>, A
     Ok(Some(serde_json::from_str(value.expose())?))
 }
 
-/// `PUT /api/v1/companies/{id}/domain`.
+/// `PUT …/domain` (both scope forms).
 async fn put_domain(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
+    company: ScopedCompany,
     Json(body): Json<SetDomain>,
 ) -> Result<Json<DomainStatus>, ApiError> {
-    store_domain(resolve(&state, &id)?, &body.domain).await
-}
-
-/// `PUT /api/v1/company/domain` (single-company alias).
-async fn put_domain_single(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Json(body): Json<SetDomain>,
-) -> Result<Json<DomainStatus>, ApiError> {
-    store_domain(resolve_sole(&state)?, &body.domain).await
+    store_domain(company.runtime, &body.domain).await
 }
 
 /// Runs a verification pass through the injected resolver and persists it.
@@ -116,23 +100,10 @@ async fn run_verify(
     Ok(Json(status))
 }
 
-/// `POST /api/v1/companies/{id}/domain/verify`.
+/// `POST …/domain/verify` (both scope forms).
 async fn verify_domain(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<DomainStatus>, Response> {
-    use axum::response::IntoResponse;
-    let runtime = resolve(&state, &id).map_err(IntoResponse::into_response)?;
-    run_verify(&state, runtime).await
-}
-
-/// `POST /api/v1/company/domain/verify` (single-company alias).
-async fn verify_domain_single(
-    _auth: OperatorAuth,
+    company: ScopedCompany,
     State(state): State<AppState>,
 ) -> Result<Json<DomainStatus>, Response> {
-    use axum::response::IntoResponse;
-    let runtime = resolve_sole(&state).map_err(IntoResponse::into_response)?;
-    run_verify(&state, runtime).await
+    run_verify(&state, company.runtime).await
 }

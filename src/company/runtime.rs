@@ -10,6 +10,7 @@
 //! the methods here are thin delegations so callers hold a single
 //! `Arc<CompanyRuntime>`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Mutex as TokioMutex;
@@ -77,6 +78,11 @@ pub struct CompanyRuntime {
     pub(crate) feedback: Arc<FeedbackStore>,
     /// Filing configuration: the GitHub client, target repo, consent, limiter.
     pub(crate) filer: Arc<FeedbackFiler>,
+    /// The company's on-disk source definition directory (`companies/<name>`),
+    /// set on the `serve`/CLI path so read resolvers can find the committed
+    /// `skills/` and `workflows/` content. `None` in platform-provisioned mode
+    /// (no source dir), where those resolvers degrade to manifest-derived/empty.
+    pub(crate) source_dir: Option<PathBuf>,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
     /// WS4: the embedded openhuman harness pool, when wired via
@@ -127,10 +133,24 @@ impl CompanyRuntime {
             ops,
             feedback,
             filer,
+            source_dir: None,
             serial: TokioMutex::new(()),
             #[cfg(feature = "openhuman")]
             harness: None,
         }
+    }
+
+    /// Records the company's on-disk source directory (`companies/<name>`), set
+    /// by the [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) on the serve
+    /// path so read resolvers can resolve committed skills/workflows content.
+    pub fn set_source_dir(&mut self, dir: Option<PathBuf>) {
+        self.source_dir = dir;
+    }
+
+    /// The company's on-disk source directory, when built on the serve path.
+    /// `None` in platform-provisioned mode.
+    pub fn source_dir(&self) -> Option<&Path> {
+        self.source_dir.as_deref()
     }
 
     /// WS4: attach an embedded harness pool after construction (called by the

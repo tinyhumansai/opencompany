@@ -15,7 +15,6 @@ use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::company::{SkillDoc, load_dir_skills, parse_skill_md};
 use crate::ports::skills_state::{SkillSource, SkillState};
-use crate::store::Bundle;
 
 /// One skill installed in a company. Mirrors `frontend/src/lib/skills.ts`.
 #[derive(SimpleObject)]
@@ -92,10 +91,14 @@ fn from_doc(doc: &SkillDoc, source: &str, enabled: bool) -> SkillGql {
     }
 }
 
-/// The repo-level skill registry docs, loaded from `{home}/skills`.
+/// The repo-level skill registry docs, loaded from the shared `skills/` library
+/// directory. Empty when no source checkout is present (platform-provisioned
+/// mode), where the registry has nothing to serve.
 fn registry_docs(state: &AppState) -> Arc<[SkillDoc]> {
-    let dir = state.home().join("skills");
-    state.skill_registry(&dir).unwrap_or_else(|_| Arc::from([]))
+    let Some(dir) = state.skills_root() else {
+        return Arc::from([]);
+    };
+    state.skill_registry(dir).unwrap_or_else(|_| Arc::from([]))
 }
 
 /// Resolves `Company.skills`: company-dir docs overlaid with store deltas.
@@ -106,9 +109,13 @@ pub(crate) async fn resolve_company(
     let state = ctx.data::<AppState>()?;
     let registry = registry_docs(state);
 
-    // Base: the company's own on-disk skills, all enabled by default.
-    let company_dir = Bundle::new(state.home(), runtime.id()).dir().join("skills");
-    let mut by_slug: HashMap<String, SkillGql> = load_dir_skills(&company_dir)
+    // Base: the company's own on-disk skills (`companies/<name>/skills`), all
+    // enabled by default. In platform-provisioned mode there is no source dir,
+    // so the base is empty and only the store deltas below contribute.
+    let mut by_slug: HashMap<String, SkillGql> = runtime
+        .source_dir()
+        .map(|dir| dir.join("skills"))
+        .and_then(|dir| load_dir_skills(&dir).ok())
         .unwrap_or_default()
         .iter()
         .map(|doc| (doc.slug.clone(), from_doc(doc, "company", true)))

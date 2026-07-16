@@ -1123,7 +1123,7 @@ impl crate::ports::workspace::WorkspaceStore for MongoStore {
         company: &CompanyId,
         id: &str,
         name: Option<&str>,
-        parent: Option<&str>,
+        parent: Option<Option<&str>>,
     ) -> Result<crate::ports::workspace::WorkspaceNode> {
         use crate::ports::workspace::NodeKind;
         let nodes = self.workspace_nodes(company).await?;
@@ -1132,7 +1132,8 @@ impl crate::ports::workspace::WorkspaceStore for MongoStore {
                 "workspace node {id}"
             )));
         }
-        if let Some(parent) = parent {
+        // A move to root (`Some(None)`) never forms a cycle.
+        if let Some(Some(parent)) = parent {
             if parent == id || mongo_workspace_descendants(&nodes, id).contains(parent) {
                 return Err(OpenCompanyError::InvalidRequest(
                     "cannot move a folder into its own subtree".to_string(),
@@ -1149,7 +1150,7 @@ impl crate::ports::workspace::WorkspaceStore for MongoStore {
             node.name = name.to_string();
         }
         if let Some(parent) = parent {
-            node.parent_id = Some(parent.to_string());
+            node.parent_id = parent.map(str::to_string);
         }
         node.updated_at_millis = now_millis();
         self.collection("workspace_nodes")

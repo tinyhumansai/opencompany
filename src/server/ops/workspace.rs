@@ -74,13 +74,28 @@ struct WriteFile {
 }
 
 /// The rename/move body.
+///
+/// `parent_id` uses a double option so an omitted `parentId` (leave the parent
+/// unchanged) is distinguished from an explicit `"parentId": null` (move the
+/// node back to the workspace root).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RenameMove {
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    parent_id: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    parent_id: Option<Option<String>>,
+}
+
+/// Deserializes into `Some(inner)` when the field is present (so an explicit
+/// `null` becomes `Some(None)`); the `#[serde(default)]` leaves an omitted field
+/// as `None`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// The overwrite-file response.
@@ -146,7 +161,7 @@ async fn rename_move(
             company.id(),
             &node_id,
             body.name.as_deref(),
-            body.parent_id.as_deref(),
+            body.parent_id.as_ref().map(Option::as_deref),
         )
         .await?;
     let content = match node.kind {

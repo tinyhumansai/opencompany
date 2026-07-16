@@ -665,7 +665,6 @@ impl RuntimeBuilder {
             }
         };
 
-        #[cfg_attr(not(feature = "openhuman"), allow(unused_mut))]
         let mut runtime = CompanyRuntime::new(
             id.clone(),
             brain,
@@ -684,6 +683,11 @@ impl RuntimeBuilder {
             feedback,
             filer,
         );
+
+        // The seed dir is the company's on-disk source directory
+        // (`companies/<name>`); record it so read resolvers can find committed
+        // skills/workflows content on the serve path.
+        runtime.set_source_dir(self.seed_dir.clone());
 
         // WS4: attach the embedded harness pool when one was provided.
         #[cfg(feature = "openhuman")]

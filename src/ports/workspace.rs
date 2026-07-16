@@ -63,12 +63,16 @@ pub trait WorkspaceStore: Send + Sync {
     ) -> Result<()>;
     /// Renames and/or reparents a node, returning the updated node. Moving a
     /// folder under its own descendant (a cycle) is rejected.
+    ///
+    /// `parent` distinguishes three intents: `None` leaves the parent
+    /// unchanged, `Some(None)` moves the node to the workspace root, and
+    /// `Some(Some(id))` reparents it under folder `id`.
     async fn rename_move(
         &self,
         company: &CompanyId,
         id: &str,
         name: Option<&str>,
-        parent: Option<&str>,
+        parent: Option<Option<&str>>,
     ) -> Result<WorkspaceNode>;
     /// Deletes a node; folders are removed recursively. Returns whether a node
     /// was removed.

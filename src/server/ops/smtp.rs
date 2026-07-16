@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{post, put};
 use axum::{Json, Router};
@@ -25,8 +25,7 @@ use crate::ports::inbox::EmailRecord;
 use crate::ports::types::SecretValue;
 use crate::ports::{generate_id, now_millis};
 use crate::server::error::ApiError;
-use crate::server::operator::OperatorAuth;
-use crate::server::ops::{SMTP_KEY, resolve, resolve_sole};
+use crate::server::ops::{SMTP_KEY, ScopedCompany, scoped};
 
 /// The SMTP security mode. Mirrors the console's `SmtpSecurity`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -177,11 +176,7 @@ impl MailSender for RecordingMailSender {
 
 /// Builds the SMTP route fragment.
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/companies/{id}/smtp", put(put_smtp))
-        .route("/api/v1/companies/{id}/smtp/test", post(test_smtp))
-        .route("/api/v1/company/smtp", put(put_smtp_single))
-        .route("/api/v1/company/smtp/test", post(test_smtp_single))
+    scoped("/smtp", put(put_smtp)).merge(scoped("/smtp/test", post(test_smtp)))
 }
 
 // -- PUT smtp ---------------------------------------------------------------
@@ -199,23 +194,12 @@ async fn store_credentials(
     Ok(Json(SmtpStatus::from_credentials(&creds)))
 }
 
-/// `PUT /api/v1/companies/{id}/smtp`.
+/// `PUT …/smtp` (both scope forms).
 async fn put_smtp(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
+    company: ScopedCompany,
     Json(creds): Json<SmtpCredentials>,
 ) -> Result<Json<SmtpStatus>, ApiError> {
-    store_credentials(resolve(&state, &id)?, creds).await
-}
-
-/// `PUT /api/v1/company/smtp` (single-company alias).
-async fn put_smtp_single(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Json(creds): Json<SmtpCredentials>,
-) -> Result<Json<SmtpStatus>, ApiError> {
-    store_credentials(resolve_sole(&state)?, creds).await
+    store_credentials(company.runtime, creds).await
 }
 
 // -- POST smtp/test ---------------------------------------------------------
@@ -316,27 +300,18 @@ pub(crate) fn local_part(address: &str) -> String {
         .unwrap_or_else(|| address.to_string())
 }
 
-/// `POST /api/v1/companies/{id}/smtp/test`.
+/// `POST …/smtp/test` (both scope forms).
 async fn test_smtp(
-    _auth: OperatorAuth,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    body: Option<Json<TestSend>>,
-) -> Result<Json<TestResult>, Response> {
-    use axum::response::IntoResponse;
-    let runtime = resolve(&state, &id).map_err(IntoResponse::into_response)?;
-    run_test(&state, runtime, body.map(|b| b.0).unwrap_or_default()).await
-}
-
-/// `POST /api/v1/company/smtp/test` (single-company alias).
-async fn test_smtp_single(
-    _auth: OperatorAuth,
+    company: ScopedCompany,
     State(state): State<AppState>,
     body: Option<Json<TestSend>>,
 ) -> Result<Json<TestResult>, Response> {
-    use axum::response::IntoResponse;
-    let runtime = resolve_sole(&state).map_err(IntoResponse::into_response)?;
-    run_test(&state, runtime, body.map(|b| b.0).unwrap_or_default()).await
+    run_test(
+        &state,
+        company.runtime,
+        body.map(|b| b.0).unwrap_or_default(),
+    )
+    .await
 }
 
 /// The real `lettre` SMTP transport. Gated behind the `smtp` feature so the

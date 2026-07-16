@@ -7,10 +7,8 @@ use std::sync::Arc;
 
 use async_graphql::{Context, ID, SimpleObject};
 
-use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::company::{WorkflowFile, parse_workflow};
-use crate::store::Bundle;
 
 /// A one-line workflow summary for the workflows list.
 #[derive(SimpleObject)]
@@ -92,9 +90,11 @@ impl From<WorkflowFile> for WorkflowGql {
     }
 }
 
-/// Best-effort parse of one workflow graph from a company directory.
-fn load_one(dir: &Path, id: &str) -> Option<WorkflowFile> {
-    let path = dir.join("workflows").join(format!("{id}.toml"));
+/// Best-effort parse of one workflow graph from the company source directory
+/// (`companies/<name>/workflows/<id>.toml`). Yields `None` when the company has
+/// no source dir (platform-provisioned mode) or the file is missing/invalid.
+fn load_one(dir: Option<&Path>, id: &str) -> Option<WorkflowFile> {
+    let path = dir?.join("workflows").join(format!("{id}.toml"));
     let text = std::fs::read_to_string(path).ok()?;
     parse_workflow(&text).ok()
 }
@@ -109,16 +109,15 @@ async fn enabled_ids(runtime: &Arc<CompanyRuntime>) -> async_graphql::Result<Vec
 
 /// Resolves `Company.workflows`.
 pub(crate) async fn resolve_summaries(
-    ctx: &Context<'_>,
+    _ctx: &Context<'_>,
     runtime: &Arc<CompanyRuntime>,
 ) -> async_graphql::Result<Vec<WorkflowSummaryGql>> {
-    let state = ctx.data::<AppState>()?;
-    let dir = Bundle::new(state.home(), runtime.id()).dir().to_path_buf();
+    let dir = runtime.source_dir();
     let ids = enabled_ids(runtime).await?;
     Ok(ids
         .into_iter()
         .map(|id| {
-            let name = load_one(&dir, &id)
+            let name = load_one(dir, &id)
                 .map(|file| file.name)
                 .unwrap_or_else(|| id.clone());
             WorkflowSummaryGql {
@@ -132,11 +131,9 @@ pub(crate) async fn resolve_summaries(
 
 /// Resolves `Company.workflow(id)`, returning null when the graph is unavailable.
 pub(crate) async fn resolve_one(
-    ctx: &Context<'_>,
+    _ctx: &Context<'_>,
     runtime: &Arc<CompanyRuntime>,
     id: &str,
 ) -> async_graphql::Result<Option<WorkflowGql>> {
-    let state = ctx.data::<AppState>()?;
-    let dir = Bundle::new(state.home(), runtime.id()).dir().to_path_buf();
-    Ok(load_one(&dir, id).map(WorkflowGql::from))
+    Ok(load_one(runtime.source_dir(), id).map(WorkflowGql::from))
 }

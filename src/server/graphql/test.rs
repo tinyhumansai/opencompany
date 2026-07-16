@@ -445,6 +445,94 @@ async fn finances_fold_the_ledger() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
+/// On the serve path a company has an on-disk source dir; `Company.skills`,
+/// `Company.workflow`, and the top-level `skillRegistry` resolve their content
+/// from it (and the repo-level `skills/` root) rather than the empty bundle.
+#[tokio::test]
+async fn skills_and_workflows_resolve_from_source_dir() {
+    let home = home();
+    let id = CompanyId::new("acme");
+
+    // A company source directory with a committed skill and workflow.
+    let source_dir = home.join("companies").join("acme");
+    tokio::fs::create_dir_all(source_dir.join("skills/deal-memo"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        source_dir.join("skills/deal-memo/SKILL.md"),
+        "---\nname: Deal Memo\ndescription: Write a deal memo.\ncategory: Research\n---\n# Deal Memo\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(source_dir.join("workflows"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        source_dir.join("workflows/flow.toml"),
+        "id = \"flow\"\nname = \"Test Flow\"\n[[node]]\nid = \"n1\"\nkind = \"trigger\"\nname = \"Start\"\n",
+    )
+    .await
+    .unwrap();
+
+    // A separate repo-level shared skill library backing `skillRegistry`.
+    let skills_root = home.join("skills");
+    tokio::fs::create_dir_all(skills_root.join("web-research"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        skills_root.join("web-research/SKILL.md"),
+        "---\nname: Web Research\ndescription: Research on the web.\ncategory: Research\n---\n# Web Research\n",
+    )
+    .await
+    .unwrap();
+
+    let manifest: CompanyManifest = toml::from_str(
+        "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[workflows]\nenabled = [\"flow\"]\n",
+    )
+    .unwrap();
+    let store = FsCompanyStore::new(home.to_path_buf());
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .with_id(id.clone())
+        .with_seed_dir(source_dir.clone())
+        .build()
+        .await
+        .unwrap();
+    let state = AppState::new(AppConfig::default())
+        .with_home(home.to_path_buf())
+        .with_skills_root(skills_root);
+    state.registry().insert(id, Arc::new(runtime));
+
+    // Company.skills reads the committed source-dir skill.
+    let value = query(
+        router(state.clone()),
+        r#"{"query":"{ company(id:\"acme\"){ skills { id name source } workflow(id:\"flow\"){ id name nodes { id } } } skillRegistry { id name } }"}"#,
+    )
+    .await;
+    let company = &value["data"]["company"];
+    let skills = company["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1, "source-dir skill resolves");
+    assert_eq!(skills[0]["id"], "deal-memo");
+    assert_eq!(skills[0]["source"], "company");
+    // Company.workflow reads the graph from the source dir.
+    assert_eq!(company["workflow"]["name"], "Test Flow");
+    assert_eq!(company["workflow"]["nodes"].as_array().unwrap().len(), 1);
+    // skillRegistry reads the repo-level shared library.
+    let registry = value["data"]["skillRegistry"].as_array().unwrap();
+    assert!(registry.iter().any(|s| s["id"] == "web-research"));
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
 /// The committed SDL snapshot freezes the read contract. Regenerate with
 /// `cargo test -- --ignored regenerate_sdl_snapshot` after any schema change.
 #[test]
