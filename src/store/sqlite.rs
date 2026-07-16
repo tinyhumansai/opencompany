@@ -98,6 +98,13 @@ CREATE TABLE IF NOT EXISTS secrets (
     value      TEXT NOT NULL,
     PRIMARY KEY (company_id, key)
 );
+CREATE TABLE IF NOT EXISTS inbox (
+    company_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    inbox       TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    PRIMARY KEY (company_id, seq)
+);
 "#;
 
 /// Maps a `rusqlite` failure onto the crate error type without a bare `?` on
@@ -581,6 +588,72 @@ impl SecretStore for SqliteStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// InboxStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::inbox::InboxStore for SqliteStore {
+    async fn append(
+        &self,
+        company: &CompanyId,
+        record: crate::ports::inbox::EmailRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(&record)?;
+        let conn = self.conn();
+        // Monotonic per-company append seq preserves insertion order.
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM inbox WHERE company_id = ?1",
+                params![company.as_ref()],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        conn.execute(
+            "INSERT INTO inbox (company_id, seq, inbox, record_json) VALUES (?1, ?2, ?3, ?4)",
+            params![company.as_ref(), next, record.inbox, json],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        company: &CompanyId,
+        inbox: &str,
+    ) -> Result<Vec<crate::ports::inbox::EmailRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT record_json FROM inbox WHERE company_id = ?1 AND inbox = ?2 ORDER BY seq",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref(), inbox], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn inboxes(&self, company: &CompanyId) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT inbox FROM inbox WHERE company_id = ?1 ORDER BY inbox")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql_err)?);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -613,6 +686,11 @@ mod test {
     async fn conformance_export_totality() {
         let s = store();
         conformance::assert_export_totality(s.clone(), s.clone(), s.clone(), s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_inbox_store() {
+        conformance::assert_inbox_store(store()).await;
     }
 
     #[tokio::test]

@@ -23,6 +23,12 @@ impl From<OpenCompanyError> for ApiError {
     }
 }
 
+impl From<serde_json::Error> for ApiError {
+    fn from(error: serde_json::Error) -> Self {
+        Self(OpenCompanyError::from(error))
+    }
+}
+
 impl ApiError {
     /// The HTTP status this error maps to.
     pub fn status(&self) -> StatusCode {

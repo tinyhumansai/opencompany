@@ -29,14 +29,16 @@ use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
-    AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, MemoryStore,
-    SecretStore, ToolProvider,
+    AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, InboxStore,
+    MemoryStore, SecretStore, ToolProvider,
 };
 use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::tools::{StubToolProvider, grant_matches};
 use crate::store::paths::Bundle;
-use crate::store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
+use crate::store::{
+    FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsSecretStore,
+};
 
 /// Derives a filesystem-and-URL-safe company id from a display name.
 ///
@@ -127,6 +129,7 @@ pub struct RuntimeBuilder {
     approvals: Option<Arc<ManifestApprovalGate>>,
     openhuman: Option<Arc<dyn OpenHumanRpc>>,
     secrets: Option<Arc<dyn SecretStore>>,
+    inbox: Option<Arc<dyn InboxStore>>,
     feedback: Option<Arc<FeedbackStore>>,
     github: Option<Arc<dyn GitHubClient>>,
     consent: ConsentMode,
@@ -165,6 +168,7 @@ impl RuntimeBuilder {
             approvals: None,
             openhuman: None,
             secrets: None,
+            inbox: None,
             feedback: None,
             github: None,
             consent: ConsentMode::default(),
@@ -256,6 +260,7 @@ impl RuntimeBuilder {
             .with_memory(handles.memory.clone())
             .with_context(handles.context.clone())
             .with_secrets(handles.secrets.clone())
+            .with_inbox(handles.inbox.clone())
     }
 
     /// Swaps the tool provider.
@@ -337,6 +342,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Swaps the inbox store (default: fs-backed). Holds inbound and outbound
+    /// email for the per-teammate inboxes.
+    pub fn with_inbox(mut self, inbox: Arc<dyn InboxStore>) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
     /// Overrides the feedback store (default: the company bundle's feedback
     /// family).
     pub fn with_feedback(mut self, feedback: Arc<FeedbackStore>) -> Self {
@@ -396,6 +408,9 @@ impl RuntimeBuilder {
         let secrets: Arc<dyn SecretStore> = self
             .secrets
             .unwrap_or_else(|| Arc::new(FsSecretStore::new(home.clone())));
+        let inbox: Arc<dyn InboxStore> = self
+            .inbox
+            .unwrap_or_else(|| Arc::new(FsInboxStore::new(home.clone())));
         let consent = self.consent;
         let filer = Arc::new(FeedbackFiler {
             client: self.github,
@@ -581,6 +596,7 @@ impl RuntimeBuilder {
             gate,
             journal,
             secrets,
+            inbox,
             feedback,
             filer,
         );

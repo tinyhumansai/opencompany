@@ -144,6 +144,12 @@ impl Bundle {
         self.feedback_dir().join("items.jsonl")
     }
 
+    /// Path to the append-only inbox log (all inboxes interleaved, one JSON
+    /// email per line).
+    pub fn inbox_jsonl(&self) -> PathBuf {
+        self.dir.join("inbox.jsonl")
+    }
+
     /// The per-company secrets subdirectory.
     pub fn secrets_dir(&self) -> PathBuf {
         self.dir.join("secrets")

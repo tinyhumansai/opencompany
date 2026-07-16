@@ -84,6 +84,16 @@ mongodb = { version = "3", optional = true }
 # port-driven bundle core works on an unpacked directory without it.
 tar = { version = "0.4", optional = true }
 
+# Recursive DNS resolution for custom-domain verification. Only links under the
+# `dns` feature; the `DnsResolver` trait + offline `StaticDnsResolver` compile
+# without it.
+hickory-resolver = { version = "0.24", optional = true }
+
+# SMTP outbound transport for the test-send and per-teammate outbound mail. Only
+# links under the `smtp` feature; the `MailSender` trait + offline mock compile
+# without it. Pure-Rust rustls TLS so no system libs are required.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
+
 # Offline crypto for the tiny.place economy identity. All three are optional and
 # only link under the `tinyplace` feature; the default build pulls none of them.
 # `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
@@ -152,6 +162,18 @@ sidecar = []
 # port-driven export/import core (unpacked bundle directory) compiles without
 # this; only `pack_tar`/`unpack_tar` are gated here.
 export = ["dep:tar"]
+# Recursive DNS resolution for custom-domain verification. The `DnsResolver`
+# trait, the offline `StaticDnsResolver`, and the pure record generation compile
+# without this; only `HickoryDnsResolver` is gated here.
+dns = ["dep:hickory-resolver"]
+# Real SMTP send for the domain/email surface. The `MailSender` trait and the
+# offline `RecordingMailSender` compile without this; only `LettreMailSender` is
+# gated here.
+smtp = ["dep:lettre"]
+# OAuth connection lifecycle (authorize-url + server-side token exchange). The
+# read-only connections catalog compiles without this; only the token-exchanging
+# write routes are gated here (they need the shared `reqwest` client).
+oauth = ["dep:reqwest"]
 
 [patch.crates-io]
 # opencompany's own vendored tinyagents (1.8.0). Satisfies openhuman's `^1.7`.

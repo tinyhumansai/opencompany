@@ -51,7 +51,9 @@ pub mod tinycortex;
 #[cfg(test)]
 pub mod conformance;
 
-pub use fs::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSecretStore};
+pub use fs::{
+    FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsSecretStore,
+};
 pub use paths::{Bundle, default_home};
 pub use select::{StorageHandles, StorageKind, StorageSettings, open_storage};
 

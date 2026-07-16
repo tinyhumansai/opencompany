@@ -130,6 +130,9 @@ pub struct AppState {
     /// Populated on first read via [`AppState::skill_registry`]; never
     /// invalidated because the repo's skill library is immutable at runtime.
     skill_registry: Arc<OnceLock<Arc<[SkillDoc]>>>,
+    /// Injected network seams for the credential surfaces (DNS resolver, mail
+    /// sender). Empty by default so the build stays offline.
+    connections: crate::server::ops::ConnectionsRuntime,
     /// Host-global replay-protection cache shared across every inbound A2A
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
@@ -146,6 +149,7 @@ impl AppState {
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
             skill_registry: Arc::new(OnceLock::new()),
+            connections: crate::server::ops::ConnectionsRuntime::new(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
@@ -181,6 +185,17 @@ impl AppState {
         // A concurrent caller may have set it first; keep whichever won.
         let _ = self.skill_registry.set(registry.clone());
         Ok(self.skill_registry.get().cloned().unwrap_or(registry))
+    }
+
+    /// Installs the injected connection seams (DNS resolver, mail sender).
+    pub fn with_connections(mut self, connections: crate::server::ops::ConnectionsRuntime) -> Self {
+        self.connections = connections;
+        self
+    }
+
+    /// The injected connection seams for the credential surfaces.
+    pub fn connections(&self) -> &crate::server::ops::ConnectionsRuntime {
+        &self.connections
     }
 
     /// Installs platform (multi-tenant) auth. Mirrors [`Self::with_home`].
