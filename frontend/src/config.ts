@@ -15,7 +15,13 @@ export interface ConsoleConfig {
    * the host's `/api/v1/company/*` aliases for the sole registered company.
    */
   company: string | null;
-  /** Bearer token for operator/platform auth. `null` in local dev mode. */
+  /**
+   * A **platform** bearer token, for the hosting layer.
+   *
+   * `null` for humans, which is the normal case: people sign in and the
+   * session rides in an HttpOnly cookie. The operator token this once carried
+   * no longer exists — there is no shared-secret path into a company.
+   */
   operatorToken: string | null;
 }
 

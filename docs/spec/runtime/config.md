@@ -56,6 +56,7 @@ layer set it, and what is missing for each optional capability.
 | `OPENCOMPANY_MAIL_SECURITY` | `starttls` | `none` \| `starttls` \| `ssl` |
 | `OPENCOMPANY_MAIL_USERNAME` / `_PASSWORD` | — | SMTP auth. Redacted from `Debug` and never logged |
 | `OPENCOMPANY_MAIL_FROM_NAME` | — | Display name on the `From` header |
+| `OPENCOMPANY_CORS_ORIGINS` | — (CORS off) | Comma-separated exact origins allowed to send the session cookie cross-origin, e.g. `http://localhost:5173`. `*` is refused: a wildcard is illegal with credentials |
 
 ### Outbound mail
 
@@ -95,37 +96,47 @@ until the wallet is funded, with a clear operator prompt. Whether TinyHumans
 sponsors handle claims via a delegated signer bundled with the account is an
 open product question ([company-as-agent/identity.md](../company-as-agent/identity.md)).
 
-## Authentication and network exposure
+## Authentication
 
-> **Known limitation.** `opencompany serve` currently authenticates nothing.
-> Anyone who can reach the port has full operator access to every route.
+There are exactly two principals, and **no unauthenticated path**:
 
-`AppConfig::operator_token` gates the operator routes (`OperatorAuth`,
-`resolve_claims`), and when it is `None` those routes allow **every** request —
-the Phase-1 dev-mode convenience. That field is **dead configuration today**:
-no environment variable, CLI flag, or `config.toml` key sets it, and
-`bin/opencompany.rs` builds `AppConfig` without it. It is populated only in
-tests. So the serve path is always in dev mode, and
-[api.md](api.md)'s "local operator token in single-user mode" describes an
-intent, not current behavior.
+| Principal | Credential | Reaches |
+| --- | --- | --- |
+| **Platform** | a platform/tenant bearer, when `platform_auth` is configured | the companies its tenant owns; provisioning and suspension need the `platform` scope |
+| **User** | a human's session cookie ([users.md](users.md)) | their own company only |
 
-Consequently **the only thing isolating a company today is the network**:
+`/healthz` is the sole exception — the manager's wake-on-request proxy blocks
+on it, so it must answer before anyone could authenticate.
 
-- **Hosted mode**: the manager injects `OPENCOMPANY_BIND=0.0.0.0:8080` and no
-  token. The container is reachable only through the manager's wake-on-request
-  proxy on a private Docker/k8s network, which is what keeps tenants apart.
-  Binding `0.0.0.0` is mandatory there — a container must accept traffic from
-  its network — so the bind address is *not* evidence of exposure; port
-  publishing is.
-- **Self-hosting**: `opencompany serve --bind 0.0.0.0:8080` on a routable host
-  publishes chat, tasks, secrets, and provisioning to anyone who can reach it,
-  with no warning. Bind to loopback, or put an authenticating proxy in front.
+Without `platform_auth`, there is no machine credential at all: humans are the
+whole story, and HTTP provisioning is unavailable by construction (load
+companies with `serve --company <dir>`). A company with no admin in its
+manifest's `[users]` cannot be reached until one is listed — that is the
+bootstrap, and it is deliberate.
 
-Per-company [user authentication](users.md) does **not** close this. It adds a
-principal for humans; it does not retire dev mode. Making `operator_token`
-settable and enforcing it on a routable bind is worthwhile, but it is a
-coordinated change with the manager — the guard cannot land in the tenant
-before the manager supplies a token, or every tenant container stops booting.
+### What changed, and why it mattered
+
+There used to be a third principal — `Dev`: with no `operator_token` set, every
+operator route allowed **every** request. And `operator_token` was **dead
+configuration**: no env var, flag, or config key set it, and
+`bin/opencompany.rs` never populated it. Only tests did. So `Dev` was the only
+reachable state, and every deployment served chat, tasks, secrets, and
+provisioning to anyone who could reach the port.
+
+The token is gone rather than made settable, and the routes now require a real
+principal. `?token=` does nothing.
+
+### Network exposure
+
+This is no longer the only thing isolating a company, but it still matters:
+
+- **Hosted mode**: the manager injects `OPENCOMPANY_BIND=0.0.0.0:8080`. Binding
+  `0.0.0.0` is *mandatory* in a container — it must accept traffic from its
+  network — so the bind address is not evidence of exposure; port publishing
+  is. The container is additionally reachable only through the manager's proxy.
+- **Self-hosting**: bind loopback, or put TLS in front. `Secure` is set on the
+  session cookie whenever `public_url` is https, and a login code is never
+  echoed in a response unless the bind is loopback-only.
 
 ## Secrets handling
 

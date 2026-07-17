@@ -192,15 +192,23 @@ the company's. With no transport configured, `auth/request` returns the code in
 a `dev_code` field and logs a warning, so local development works; a host that
 can send mail never echoes it.
 
+## Abuse and exposure
+
+- **Resend throttle**: one link per address per minute. A throttled request
+  returns the same `202` as a sent one (or the throttle is itself a membership
+  oracle) and leaves the live code alone (or anyone could invalidate a victim's
+  link on demand).
+- **Login codes are never echoed** from a host that is reachable from anywhere
+  else. `dev_code` appears only on a loopback-only bind with no mail
+  transport. A routable host with broken mail lets nobody in rather than
+  handing the credential to whoever asked.
+- **CORS** is off unless `OPENCOMPANY_CORS_ORIGINS` lists exact origins, and a
+  wildcard is refused — it is illegal with credentials, and echoing an
+  arbitrary origin would let any site act as the signed-in user. See
+  [config.md](config.md).
+
 ## Known gaps
 
-- **No resend throttle** on `auth/request`. An invited address can be mailed
-  repeatedly as a nuisance. Not an account-takeover path — each link
-  invalidates the last, and only the mailbox owner can read them — and it needs
-  an invited address to aim at. Throttling needs a lookup-by-email on
-  `LoginCodeStore`, a port change across three backends.
-- **No CORS**, so cross-origin dev (`?api=…` from a Vite server on another
-  port) cannot carry the session cookie. Use the Vite proxy.
-- **Dev mode is still open**: with no `operator_token` — which cannot currently
-  be set at all — every operator route allows every request. User auth does not
-  change this. See [config.md](config.md).
+- **`resolve_principal` reads the user record on every request**, so revocation
+  is immediate — at the cost of a second store read per request. On the fs
+  backend that is a whole-file read; use sqlite or mongodb with real users.

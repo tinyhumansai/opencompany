@@ -6,16 +6,12 @@ handlers live as focused groups under `src/server/`, never in the binary.
 
 ## Operator API
 
-Auth: local operator token in single-user mode; platform-issued JWT in
-platform mode (see below).
+Auth: a human's session cookie ([users.md](users.md)), or a platform-issued
+token in platform mode (see below). There is no unauthenticated path and no
+operator token — see [config.md](config.md#authentication).
 
-> The operator token is currently **unsettable**, so the single-user mode
-> described here authenticates nothing in practice — see
-> [config.md](config.md#authentication-and-network-exposure).
->
-> Human sign-in is a separate surface with its own routes and its own
-> principal: see [users.md](users.md). A user session can never reach the
-> operator routes below.
+Provisioning and suspension require the `platform` scope, which no session can
+ever hold.
 
 ```text
 GET    /api/v1/companies                       list running companies
