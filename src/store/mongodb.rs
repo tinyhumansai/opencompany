@@ -46,15 +46,18 @@ use crate::company::CompanyManifest;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
+use crate::ports::login_codes::LoginCodeRecord;
 use crate::ports::memory::MemoryStore;
 use crate::ports::now_millis;
 use crate::ports::secrets::SecretStore;
+use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
     CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
     TaskResult,
 };
+use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
 
 fn mongo_err(e: impl std::fmt::Display) -> OpenCompanyError {
@@ -115,7 +118,10 @@ impl MongoStore {
                 .options(IndexOptions::builder().unique(true).build())
                 .build()
         };
-        let plans: [(&str, IndexModel); 14] = [
+        // Not every index can be unique: a user holds many sessions, and an
+        // address may have several login codes over time.
+        let nonunique = |keys: Document| IndexModel::builder().keys(keys).build();
+        let plans: [(&str, IndexModel); 24] = [
             ("companies", unique(doc! {"company_id": 1})),
             ("ledger", unique(doc! {"company_id": 1, "idx": 1})),
             ("events", unique(doc! {"company_id": 1, "seq": 1})),
@@ -133,6 +139,34 @@ impl MongoStore {
                 "workspace_nodes",
                 unique(doc! {"company_id": 1, "node_id": 1}),
             ),
+            ("users", unique(doc! {"company_id": 1, "user_id": 1})),
+            // Enforces one account per address per company, and backs the login
+            // lookup.
+            ("users", unique(doc! {"company_id": 1, "email": 1})),
+            (
+                "user_invites",
+                unique(doc! {"company_id": 1, "invite_id": 1}),
+            ),
+            ("user_invites", unique(doc! {"company_id": 1, "email": 1})),
+            (
+                "user_sessions",
+                unique(doc! {"company_id": 1, "session_id": 1}),
+            ),
+            // Backs session resolution on every authenticated request.
+            (
+                "user_sessions",
+                unique(doc! {"company_id": 1, "token_hash": 1}),
+            ),
+            (
+                "user_sessions",
+                nonunique(doc! {"company_id": 1, "user_id": 1}),
+            ),
+            ("login_codes", unique(doc! {"company_id": 1, "code_id": 1})),
+            (
+                "login_codes",
+                unique(doc! {"company_id": 1, "code_hash": 1}),
+            ),
+            ("login_codes", nonunique(doc! {"company_id": 1, "email": 1})),
         ];
         for (name, index) in plans {
             self.collection(name)
@@ -821,6 +855,377 @@ impl crate::ports::tasks::TaskStore for MongoStore {
 }
 
 // ---------------------------------------------------------------------------
+// UserStore
+// ---------------------------------------------------------------------------
+
+/// Whether a driver failure is a duplicate-key violation (E11000).
+///
+/// The unique email/token indexes are the real enforcement; this maps the
+/// driver's error onto the crate's `409 Conflict` so every backend reports a
+/// clash identically.
+fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
+    matches!(
+        *e.kind,
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(ref we))
+            if we.code == 11000
+    )
+}
+
+#[async_trait]
+impl crate::ports::users::UserStore for MongoStore {
+    async fn list_users(&self, company: &CompanyId) -> Result<Vec<UserRecord>> {
+        let mut cursor = self
+            .collection("users")
+            .find(doc! {"company_id": company.as_ref()})
+            .sort(doc! {"created_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "user_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_user(&self, company: &CompanyId, id: &str) -> Result<Option<UserRecord>> {
+        let found = self
+            .collection("users")
+            .find_one(doc! {"company_id": company.as_ref(), "user_id": id})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(&doc, "user_json")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_user_by_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<UserRecord>> {
+        // Exact match on the unique email index. Normalization is the caller's
+        // job, so a store never matches an address it was not asked for.
+        let found = self
+            .collection("users")
+            .find_one(doc! {"company_id": company.as_ref(), "email": email})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(&doc, "user_json")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_user(&self, company: &CompanyId, user: &UserRecord) -> Result<()> {
+        self.collection("users")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "user_id": &user.id},
+                doc! {"$set": {
+                    "email": &user.email,
+                    "user_json": serde_json::to_string(user)?,
+                    "created_ms": user.created_at_millis as i64,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(|e| {
+                if is_duplicate_key(&e) {
+                    OpenCompanyError::Conflict(format!(
+                        "another user already has the email {}",
+                        user.email
+                    ))
+                } else {
+                    mongo_err(e)
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn delete_user(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("users")
+            .delete_one(doc! {"company_id": company.as_ref(), "user_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+
+    async fn list_invites(&self, company: &CompanyId) -> Result<Vec<InviteRecord>> {
+        let mut cursor = self
+            .collection("user_invites")
+            .find(doc! {"company_id": company.as_ref()})
+            .sort(doc! {"created_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "invite_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn find_invite_by_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<InviteRecord>> {
+        let found = self
+            .collection("user_invites")
+            .find_one(doc! {"company_id": company.as_ref(), "email": email})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(&doc, "invite_json")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_invite(&self, company: &CompanyId, invite: &InviteRecord) -> Result<()> {
+        self.collection("user_invites")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "invite_id": &invite.id},
+                doc! {"$set": {
+                    "email": &invite.email,
+                    "invite_json": serde_json::to_string(invite)?,
+                    "created_ms": invite.created_at_millis as i64,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(|e| {
+                if is_duplicate_key(&e) {
+                    OpenCompanyError::Conflict(format!("{} is already invited", invite.email))
+                } else {
+                    mongo_err(e)
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn delete_invite(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("user_invites")
+            .delete_one(doc! {"company_id": company.as_ref(), "invite_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::sessions::SessionStore for MongoStore {
+    async fn create(&self, company: &CompanyId, session: &SessionRecord) -> Result<()> {
+        self.collection("user_sessions")
+            .insert_one(doc! {
+                "company_id": company.as_ref(),
+                "session_id": &session.id,
+                "token_hash": &session.token_hash,
+                "user_id": &session.user_id,
+                "session_json": serde_json::to_string(session)?,
+                "created_ms": session.created_at_millis as i64,
+                "expires_ms": session.expires_at_millis as i64,
+            })
+            .await
+            .map_err(|e| {
+                if is_duplicate_key(&e) {
+                    OpenCompanyError::Conflict("that session token already exists".to_string())
+                } else {
+                    mongo_err(e)
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn find_by_token_hash(
+        &self,
+        company: &CompanyId,
+        token_hash: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let found = self
+            .collection("user_sessions")
+            .find_one(doc! {"company_id": company.as_ref(), "token_hash": token_hash})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(&doc, "session_json")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_for_user(
+        &self,
+        company: &CompanyId,
+        user_id: &str,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut cursor = self
+            .collection("user_sessions")
+            .find(doc! {"company_id": company.as_ref(), "user_id": user_id})
+            .sort(doc! {"created_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "session_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()> {
+        let found = self
+            .collection("user_sessions")
+            .find_one(doc! {"company_id": company.as_ref(), "session_id": id})
+            .await
+            .map_err(mongo_err)?;
+        let Some(doc) = found else {
+            // Raced a revoke; the request is being refused elsewhere.
+            return Ok(());
+        };
+        let mut session: SessionRecord = serde_json::from_str(&get_str(&doc, "session_json")?)?;
+        session.last_seen_at_millis = at_millis;
+        self.collection("user_sessions")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "session_id": id},
+                doc! {"$set": {"session_json": serde_json::to_string(&session)?}},
+            )
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("user_sessions")
+            .delete_one(doc! {"company_id": company.as_ref(), "session_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+
+    async fn delete_for_user(&self, company: &CompanyId, user_id: &str) -> Result<u64> {
+        let res = self
+            .collection("user_sessions")
+            .delete_many(doc! {"company_id": company.as_ref(), "user_id": user_id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count)
+    }
+
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
+        // Expiry is exclusive: a session expiring exactly at `now` is dead.
+        let res = self
+            .collection("user_sessions")
+            .delete_many(doc! {
+                "company_id": company.as_ref(),
+                "expires_ms": {"$lte": now_millis as i64},
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LoginCodeStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::login_codes::LoginCodeStore for MongoStore {
+    async fn create(&self, company: &CompanyId, code: &LoginCodeRecord) -> Result<()> {
+        self.collection("login_codes")
+            .insert_one(doc! {
+                "company_id": company.as_ref(),
+                "code_id": &code.id,
+                "code_hash": &code.code_hash,
+                "email": &code.email,
+                "code_json": serde_json::to_string(code)?,
+                "expires_ms": code.expires_at_millis as i64,
+                // Promoted so redeemability is expressible as a query filter,
+                // which is what makes the claim below atomic.
+                "consumed_ms": Option::<i64>::None,
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        company: &CompanyId,
+        code_hash: &str,
+        now_millis: u64,
+    ) -> Result<Option<LoginCodeRecord>> {
+        // Single-use lives or dies here. `findOneAndUpdate` matches and marks in
+        // one atomic server-side operation, so of two requests racing on the
+        // same code exactly one can match `consumed_ms: null` — the loser's
+        // filter no longer matches and it gets `None`.
+        //
+        // `consumed_ms` is promoted out of the payload purely so the filter can
+        // express "unconsumed"; the payload is still the record, and it is
+        // brought back into agreement immediately below.
+        let claimed = self
+            .collection("login_codes")
+            .find_one_and_update(
+                doc! {
+                    "company_id": company.as_ref(),
+                    "code_hash": code_hash,
+                    "consumed_ms": Option::<i64>::None,
+                    "expires_ms": {"$gt": now_millis as i64},
+                },
+                doc! {"$set": {"consumed_ms": now_millis as i64}},
+            )
+            .with_options(
+                FindOneAndUpdateOptions::builder()
+                    .return_document(ReturnDocument::Before)
+                    .build(),
+            )
+            .await
+            .map_err(mongo_err)?;
+        let Some(doc) = claimed else {
+            return Ok(None);
+        };
+        let mut code: LoginCodeRecord = serde_json::from_str(&get_str(&doc, "code_json")?)?;
+        code.consumed_at_millis = Some(now_millis);
+        // Payload fidelity: the claim above already guaranteed single use, so a
+        // failure here cannot hand out a second session — the code is spent
+        // either way.
+        self.collection("login_codes")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "code_hash": code_hash},
+                doc! {"$set": {"code_json": serde_json::to_string(&code)?}},
+            )
+            .await
+            .map_err(mongo_err)?;
+        Ok(Some(code))
+    }
+
+    async fn delete_for_email(&self, company: &CompanyId, email: &str) -> Result<u64> {
+        let res = self
+            .collection("login_codes")
+            .delete_many(doc! {"company_id": company.as_ref(), "email": email})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count)
+    }
+
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
+        let res = self
+            .collection("login_codes")
+            .delete_many(doc! {
+                "company_id": company.as_ref(),
+                "expires_ms": {"$lte": now_millis as i64},
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FactStore
 // ---------------------------------------------------------------------------
 
@@ -1251,6 +1656,27 @@ mod test {
     async fn conformance_isolation_by_company() {
         let Some(s) = store().await else { return };
         conformance::assert_isolation_by_company(s.clone(), s.clone(), s.clone(), s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_user_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_user_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_session_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_session_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_login_code_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_login_code_store(s.clone()).await;
         drop_db(&s).await;
     }
 
