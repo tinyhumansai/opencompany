@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 
+import { verifyCode } from "@/api/auth";
 import { OpenCompanyClient } from "@/api/client";
 import { ApiError, type CompanyStatus } from "@/api/types";
 import { AppShell } from "@/components/app-shell";
 import { CompanyPicker } from "@/components/company-picker";
+import { Login } from "@/views/Login";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { resolveConfig } from "@/config";
@@ -12,6 +14,7 @@ import { resolveConfig } from "@/config";
 type Phase =
   | { kind: "loading" }
   | { kind: "error"; message: string; hint?: string }
+  | { kind: "login"; company: string | null }
   | { kind: "picker"; companies: CompanyStatus[] }
   | {
       kind: "console";
@@ -21,23 +24,66 @@ type Phase =
       canGoBack: boolean;
     };
 
+/**
+ * Pulls `?company=&code=` off a magic-link landing and cleans the URL.
+ *
+ * The code is a single-use credential, so it must not linger in the address
+ * bar, the history, or a `Referer` header once redeemed.
+ */
+function takeMagicLink(): { company: string | null; code: string } | null {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  if (!code) return null;
+  const company = params.get("company");
+  params.delete("code");
+  params.delete("company");
+  const query = params.toString();
+  window.history.replaceState({}, "", window.location.pathname + (query ? `?${query}` : ""));
+  return { company, code };
+}
+
 export function App() {
   const config = useMemo(() => resolveConfig(), []);
   const client = useMemo(() => new OpenCompanyClient(config), [config]);
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
+  // Read once, on the first render, before anything can navigate.
+  const magicLink = useMemo(() => takeMagicLink(), []);
+
+  // An expired or revoked session anywhere in the console drops to sign-in
+  // rather than showing a broken page.
+  useEffect(() => {
+    client.onUnauthorized = () => setPhase({ kind: "login", company: config.company });
+    return () => {
+      client.onUnauthorized = null;
+    };
+  }, [client, config.company]);
 
   useEffect(() => {
     let cancelled = false;
     const set = (p: Phase) => !cancelled && setPhase(p);
 
     async function boot() {
+      // A magic-link landing: redeem it before anything else, so the session
+      // exists by the time the console asks for data.
+      if (magicLink) {
+        const company = magicLink.company ?? config.company;
+        try {
+          await verifyCode(client, company, magicLink.code);
+        } catch {
+          // A dead link is not fatal — fall through to sign-in and let them
+          // ask for another. The reason stays vague on purpose.
+          set({ kind: "login", company });
+          return;
+        }
+      }
+
       // Explicit company wins: go straight to its console.
       if (config.company) {
         try {
           const status = await client.status(config.company);
           set({ kind: "console", company: config.company, status, companies: [status], canGoBack: false });
         } catch (err) {
-          set(connectionError(client, err));
+          set(connectionError(client, err, config.company));
         }
         return;
       }
@@ -63,7 +109,7 @@ export function App() {
           const status = await client.status(null);
           set({ kind: "console", company: null, status, companies: [], canGoBack: false });
         } catch {
-          set(connectionError(client, listErr));
+          set(connectionError(client, listErr, config.company));
         }
       }
     }
@@ -72,7 +118,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, config.company]);
+  }, [client, config.company, magicLink]);
 
   const switchCompany = useCallback(
     async (id: string, companies: CompanyStatus[]) => {
@@ -80,7 +126,7 @@ export function App() {
         const status = await client.status(id);
         setPhase({ kind: "console", company: id, status, companies, canGoBack: true });
       } catch (err) {
-        setPhase(connectionError(client, err));
+        setPhase(connectionError(client, err, id));
       }
     },
     [client],
@@ -98,6 +144,15 @@ export function App() {
             <Loader2 className="size-4 animate-spin" /> Connecting…
           </div>
         </FullScreen>
+      );
+
+    case "login":
+      return (
+        <Login
+          client={client}
+          company={phase.company}
+          onSignedIn={() => window.location.reload()}
+        />
       );
 
     case "error":
@@ -147,14 +202,15 @@ function FullScreen({ children }: { children: React.ReactNode }) {
   );
 }
 
-function connectionError(client: OpenCompanyClient, err: unknown): Phase {
+function connectionError(client: OpenCompanyClient, err: unknown, company: string | null): Phase {
   const where = client.baseUrl || "this origin";
-  if (err instanceof ApiError && err.code === "unauthorized") {
-    return {
-      kind: "error",
-      message: "This host needs an operator token.",
-      hint: "Append ?token=<your-token> to the URL.",
-    };
+  if (err instanceof ApiError && err.status === 401) {
+    // A 401 now usually means "no session", not "no operator token" — humans
+    // sign in. Offering the login view is right for a user and harmless for an
+    // operator, who can still pass ?token=. Returning the error phase here
+    // would also race the client's onUnauthorized hook and win, stranding a
+    // signed-out user on a dead end.
+    return { kind: "login", company };
   }
   return {
     kind: "error",

@@ -40,6 +40,9 @@ export class OpenCompanyClient {
     return id ? `/api/v1/companies/${encodeURIComponent(id)}` : "/api/v1/company";
   }
 
+  /** Called on any 401, so the app can drop to the login view. */
+  onUnauthorized: (() => void) | null = null;
+
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = {};
     if (body !== undefined) headers["content-type"] = "application/json";
@@ -51,6 +54,13 @@ export class OpenCompanyClient {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
+        // The session is an HttpOnly cookie, so it only travels if we ask.
+        // Same-origin (the normal deployment, baseUrl "") this is a no-op.
+        // Cross-origin dev (`?api=http://localhost:8080` from a Vite server on
+        // another port) additionally needs CORS with
+        // Access-Control-Allow-Credentials, which the backend does not have —
+        // use the Vite proxy so the console stays same-origin.
+        credentials: "include",
       });
     } catch (cause) {
       throw new ApiError(0, "network_error", `cannot reach the company host at ${this.baseUrl || "this origin"}`);
@@ -60,6 +70,9 @@ export class OpenCompanyClient {
     const data = text ? safeJson(text) : undefined;
     if (!res.ok) {
       const envelope = data as ApiErrorBody | undefined;
+      // Let the app react to an expired or revoked session. Auth routes opt out
+      // (they 401 as a normal answer) so a failed login cannot loop the view.
+      if (res.status === 401 && !path.includes("/auth/")) this.onUnauthorized?.();
       throw new ApiError(res.status, envelope?.code ?? `http_${res.status}`, envelope?.error ?? res.statusText);
     }
     return data as T;
@@ -68,6 +81,21 @@ export class OpenCompanyClient {
   /** Whether a specific company is being operated (vs single-company mode). */
   get isSingleCompany(): boolean {
     return this.defaultCompany === null;
+  }
+
+  /** The route prefix for `company`, for callers building their own paths. */
+  scopeFor(company: string | null | undefined): string {
+    return this.scope(company);
+  }
+
+  /** A typed GET, for surfaces that live outside this class (e.g. auth). */
+  get<T>(path: string): Promise<T> {
+    return this.request<T>("GET", path);
+  }
+
+  /** A typed POST, for surfaces that live outside this class (e.g. auth). */
+  post<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>("POST", path, body);
   }
 
   /** Liveness probe. */
