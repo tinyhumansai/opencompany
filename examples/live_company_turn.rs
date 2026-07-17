@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         store: Arc::new(FsCompanyStore::new(dir.path())),
         meter: Some(meter.clone()),
         workspace_root: dir.path().to_path_buf(),
+        model_override: Some(default_model.clone()),
     };
 
     let pool = HarnessPool::new();

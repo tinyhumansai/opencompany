@@ -74,6 +74,11 @@ pub struct HarnessDeps {
     /// Root under which per-agent workspace directories are created
     /// (`{root}/{company}/{agent}/workspace`).
     pub workspace_root: PathBuf,
+    /// Optional model/tier applied to every agent, overriding the per-agent
+    /// `tier` → model mapping. Set from the resolved hosted-inference model so
+    /// the whole roster addresses the configured workload (e.g. `chat-v1`).
+    /// `None` keeps each agent's tier-derived default.
+    pub model_override: Option<String>,
 }
 
 /// One live openhuman agent, keyed by its manifest id.
@@ -207,13 +212,15 @@ pub(crate) fn build_roster(
     deps: &HarnessDeps,
 ) -> crate::Result<Vec<Arc<CompanyAgent>>> {
     let policy: &Policy = &company.manifest.policy;
+    let company_name = &company.manifest.company.name;
     company
         .manifest
         .agents
         .iter()
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
-            let agent = build::build_agent(&company.id, manifest_agent, agent_policy, deps)?;
+            let agent =
+                build::build_agent(&company.id, company_name, manifest_agent, agent_policy, deps)?;
             Ok(Arc::new(CompanyAgent {
                 agent_id: manifest_agent.id.clone(),
                 role: manifest_agent.role.clone(),
@@ -392,6 +399,7 @@ description = "Builds the product."
                 store: store.clone(),
                 meter: Some(meter.clone()),
                 workspace_root: dir.path().to_path_buf(),
+                model_override: None,
             },
             store,
             meter,
