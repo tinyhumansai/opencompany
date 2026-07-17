@@ -14,6 +14,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::server::ops::router())
         .merge(crate::server::provision::router())
         .merge(crate::server::feedback::router())
+        .merge(crate::server::users::router())
+        .merge(crate::server::users::admin::router())
         .merge(crate::server::graphql::router());
     // tiny.place A2A inbound + discovery routes, only when the feature is on.
     #[cfg(feature = "tinyplace")]

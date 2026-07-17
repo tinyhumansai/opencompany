@@ -58,6 +58,9 @@ pub struct CompanyManifest {
     /// enable. The graphs themselves live in their own files, not here.
     #[serde(default)]
     pub workflows: Workflows,
+    /// The company's human collaborators — who bootstraps admin access.
+    #[serde(default)]
+    pub users: Users,
     /// Brain selection.
     #[serde(default)]
     pub brain: Brain,
@@ -157,6 +160,32 @@ pub struct Workflows {
     /// Workflow ids to enable, each a `workflows/<id>.toml` graph file.
     #[serde(default)]
     pub enabled: Vec<String>,
+}
+
+/// `[users]` — the company's human collaborators.
+///
+/// Access is invite-only, which raises a bootstrap question: someone has to
+/// send the first invite, and there is no operator token to do it with (see
+/// `docs/spec/runtime/config.md`). This is the answer. Addresses listed here
+/// are treated as standing admin invites, so the manifest — which is the
+/// company's definition, under version control — is the root of trust for who
+/// may administer it.
+///
+/// ```toml
+/// [users]
+/// admins = ["ada@example.com"]
+/// ```
+///
+/// Listing an address does not create an account. It makes that address
+/// *eligible* to log in, at which point redeeming a magic link mints the user
+/// as an admin. Removing an address from the manifest stops it bootstrapping
+/// again but does not delete an account it already created — use the admin
+/// routes for that.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Users {
+    /// Email addresses that may log in as admins without being invited first.
+    #[serde(default)]
+    pub admins: Vec<String>,
 }
 
 /// `[brain]` — selects the `Brain` implementation.

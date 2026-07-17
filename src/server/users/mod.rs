@@ -31,9 +31,17 @@
 //! An admin may instead set a *temporary* password, which revokes the user's
 //! sessions and flags the account so the user is asked to replace it.
 
+pub mod admin;
 pub mod cookie;
 pub mod password;
+pub mod routes;
 pub mod token;
+
+pub(crate) mod scope;
+
+pub use routes::router;
 
 #[cfg(test)]
 mod auth_test;
+#[cfg(test)]
+mod routes_test;
