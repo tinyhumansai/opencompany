@@ -484,6 +484,7 @@ async fn main() -> Result<()> {
                 public_url,
                 ..AppConfig::default()
             })
+            .with_cors(opencompany::server::cors::CorsConfig::from_env()?)
             .with_home(home.clone())
             .with_quota(
                 env_usize("OPENCOMPANY_MAX_COMPANIES"),

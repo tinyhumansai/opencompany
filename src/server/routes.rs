@@ -1,3 +1,5 @@
+use axum::extract::Request;
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -20,7 +22,36 @@ pub fn router(state: AppState) -> Router {
     // tiny.place A2A inbound + discovery routes, only when the feature is on.
     #[cfg(feature = "tinyplace")]
     let router = router.merge(crate::server::a2a::router());
-    router.with_state(state)
+    let router = router.with_state(state.clone());
+
+    // CORS is off unless origins are configured, which is every same-origin
+    // deployment. When it is on, `map_response` cannot see the request, so the
+    // origin is captured per-request in a closure instead — cheap, and it keeps
+    // this to two small pieces rather than a middleware stack the codebase
+    // otherwise has none of.
+    let cors = state.cors().clone();
+    if !cors.is_enabled() {
+        return router;
+    }
+    router.layer(axum::middleware::from_fn(
+        move |request: Request, next: axum::middleware::Next| {
+            let cors = cors.clone();
+            async move {
+                let headers = request.headers().clone();
+                // A preflight never reaches a handler: answer it here.
+                if crate::server::cors::is_preflight(request.method())
+                    && let Some(response) = cors.preflight(&headers)
+                {
+                    return response;
+                }
+                let mut response: Response = next.run(request).await;
+                for (name, value) in cors.headers_for(&headers) {
+                    response.headers_mut().insert(name, value);
+                }
+                response.into_response()
+            }
+        },
+    ))
 }
 
 /// Serves the Axum application.

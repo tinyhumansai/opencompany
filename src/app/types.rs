@@ -178,6 +178,9 @@ pub struct AppState {
     /// Injected network seams for the credential surfaces (DNS resolver, mail
     /// sender). Empty by default so the build stays offline.
     connections: crate::server::ops::ConnectionsRuntime,
+    /// Cross-origin allowlist. Empty (the default) means CORS is off, which is
+    /// correct for every same-origin deployment.
+    cors: crate::server::cors::CorsConfig,
     /// Host-global replay-protection cache shared across every inbound A2A
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
@@ -209,6 +212,7 @@ impl AppState {
             skill_registry: Arc::new(OnceLock::new()),
             schema: crate::server::graphql::build_schema(),
             connections: crate::server::ops::ConnectionsRuntime::new(),
+            cors: crate::server::cors::CorsConfig::default(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
         }
@@ -263,6 +267,17 @@ impl AppState {
     pub fn with_connections(mut self, connections: crate::server::ops::ConnectionsRuntime) -> Self {
         self.connections = connections;
         self
+    }
+
+    /// Sets the cross-origin allowlist. Empty (the default) leaves CORS off.
+    pub fn with_cors(mut self, cors: crate::server::cors::CorsConfig) -> Self {
+        self.cors = cors;
+        self
+    }
+
+    /// The cross-origin allowlist.
+    pub fn cors(&self) -> &crate::server::cors::CorsConfig {
+        &self.cors
     }
 
     /// The injected connection seams for the credential surfaces.
