@@ -35,11 +35,14 @@
 //! offline [`MockProvider`](provider::MockProvider) does not, so test turns stay
 //! inert.
 
+pub mod brain;
 pub mod build;
 pub mod cost;
 pub mod memory;
 pub mod policy;
 pub mod provider;
+
+pub use brain::HarnessBrain;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -219,8 +222,13 @@ pub(crate) fn build_roster(
         .iter()
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
-            let agent =
-                build::build_agent(&company.id, company_name, manifest_agent, agent_policy, deps)?;
+            let agent = build::build_agent(
+                &company.id,
+                company_name,
+                manifest_agent,
+                agent_policy,
+                deps,
+            )?;
             Ok(Arc::new(CompanyAgent {
                 agent_id: manifest_agent.id.clone(),
                 role: manifest_agent.role.clone(),
