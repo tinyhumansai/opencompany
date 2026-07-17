@@ -30,7 +30,7 @@ use axum::{Router, extract::State};
 
 use crate::AppState;
 use crate::ports::types::CompanyId;
-use auth::{GqlAuth, resolve_claims};
+use auth::{GqlAuth, resolve_principal};
 use company::CompanyGql;
 use skills::RegistrySkillGql;
 
@@ -120,7 +120,9 @@ async fn graphql_handler(
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    let auth = match resolve_claims(&headers, &state) {
+    // `None`: the company a query addresses lives in the request body, which is
+    // not available here, so a session cookie selects its own company by name.
+    let auth = match resolve_principal(&headers, &state, None).await {
         Ok(auth) => auth,
         Err(_) => {
             let err = async_graphql::ServerError::new("unauthorized", None);

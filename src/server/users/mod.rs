@@ -17,5 +17,10 @@
 //! Sub-modules:
 //!
 //! - [`token`]: minting and hashing the two secrets.
+//! - [`cookie`]: naming, parsing, and rendering the session cookie.
 
+pub mod cookie;
 pub mod token;
+
+#[cfg(test)]
+mod auth_test;

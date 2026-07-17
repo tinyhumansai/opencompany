@@ -230,6 +230,12 @@ impl FromRequestParts<AppState> for PlatformOrOperatorAuth {
         match resolve_claims(&parts.headers, state) {
             Ok(GqlAuth::Platform(claims)) => Ok(Self(Some(claims))),
             Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(Self(None)),
+            // Unreachable: `resolve_claims` reads machine credentials only and
+            // cannot construct a User. Stated rather than wildcarded so that if
+            // it ever could, this refuses instead of mapping a human onto
+            // `None` — which `authorize_address` reads as "dev/operator, allow
+            // everything". That silent widening is the whole hazard.
+            Ok(GqlAuth::User(_)) => Err(forbidden()),
             Err(_) => Err(unauthorized()),
         }
     }
@@ -252,6 +258,10 @@ impl FromRequestParts<AppState> for PlatformScope {
             Ok(GqlAuth::Platform(claims)) if claims.has_platform_scope() => Ok(Self(Some(claims))),
             Ok(GqlAuth::Platform(_)) => Err(forbidden()),
             Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(Self(None)),
+            // Unreachable today; see `PlatformOrOperatorAuth`. A human must
+            // never hold the platform scope — that is provisioning and
+            // suspension across tenants.
+            Ok(GqlAuth::User(_)) => Err(forbidden()),
             Err(_) => Err(unauthorized()),
         }
     }
