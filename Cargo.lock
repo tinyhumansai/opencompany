@@ -5152,7 +5152,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tinyagents 1.8.0",
  "tokio",
- "toml 0.8.23",
+ "toml 1.1.3+spec-1.1.0",
  "tower",
  "tracing",
  "tracing-subscriber",
