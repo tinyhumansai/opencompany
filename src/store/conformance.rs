@@ -20,8 +20,10 @@ use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
 use crate::ports::inbox::{EmailRecord, InboxMeta, InboxStore};
+use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
 use crate::ports::memory::MemoryStore;
 use crate::ports::now_millis;
+use crate::ports::sessions::{SessionRecord, SessionStore};
 use crate::ports::skills_state::{SkillSource, SkillState, SkillStateStore};
 use crate::ports::store::CompanyStore;
 use crate::ports::tasks::{TaskRecord, TaskStore};
@@ -29,6 +31,7 @@ use crate::ports::types::{
     CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry,
 };
 use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
+use crate::ports::users::{InviteRecord, UserRecord, UserRole, UserStatus, UserStore};
 use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceStore};
 
 /// A minimal valid manifest used to seed [`CompanyRecord`]s in the suite.
@@ -496,6 +499,403 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
     assert!(tasks.delete(&alpha, "t1").await.unwrap());
     assert!(!tasks.delete(&alpha, "t1").await.unwrap());
     assert_eq!(tasks.list(&alpha).await.unwrap().len(), 1);
+}
+
+/// Asserts the [`UserStore`] contract: per-company isolation, email uniqueness,
+/// exact (non-normalizing) email lookup, and invite handling.
+pub async fn assert_user_store(users: Arc<dyn UserStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let user = |id: &str, email: &str, at: u64| UserRecord {
+        id: id.to_string(),
+        email: email.to_string(),
+        display_name: Some(format!("name {id}")),
+        role: UserRole::Member,
+        status: UserStatus::Active,
+        created_at_millis: at,
+        last_seen_at_millis: None,
+        updated_at_millis: at,
+    };
+
+    users
+        .upsert_user(&alpha, &user("u1", "ada@example.com", 1))
+        .await
+        .unwrap();
+    users
+        .upsert_user(&alpha, &user("u2", "bob@example.com", 2))
+        .await
+        .unwrap();
+    users
+        .upsert_user(&beta, &user("b1", "eve@example.com", 3))
+        .await
+        .unwrap();
+
+    // Isolation + newest-first ordering.
+    let list = users.list_users(&alpha).await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].id, "u2");
+    assert_eq!(users.list_users(&beta).await.unwrap().len(), 1);
+
+    // A user of one company is invisible to another, by id and by email.
+    assert!(users.get_user(&beta, "u1").await.unwrap().is_none());
+    assert!(
+        users
+            .find_user_by_email(&beta, "ada@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Email lookup finds the right user.
+    let found = users
+        .find_user_by_email(&alpha, "ada@example.com")
+        .await
+        .unwrap()
+        .expect("ada is a user of alpha");
+    assert_eq!(found.id, "u1");
+
+    // Lookup is exact: stores never normalize on the caller's behalf, so a
+    // caller that forgets `normalize_email` misses rather than silently
+    // matching an address it did not ask for.
+    assert!(
+        users
+            .find_user_by_email(&alpha, "Ada@Example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Upsert replaces in place by id.
+    let mut promoted = user("u1", "ada@example.com", 1);
+    promoted.role = UserRole::Admin;
+    users.upsert_user(&alpha, &promoted).await.unwrap();
+    assert_eq!(users.list_users(&alpha).await.unwrap().len(), 2);
+    assert_eq!(
+        users.get_user(&alpha, "u1").await.unwrap().unwrap().role,
+        UserRole::Admin
+    );
+
+    // Email is unique within a company: a different id may not take a taken
+    // address.
+    let clash = users
+        .upsert_user(&alpha, &user("u3", "ada@example.com", 4))
+        .await;
+    assert!(
+        clash.is_err(),
+        "a second user must not be able to claim ada@example.com"
+    );
+
+    // ...but the same address in another company is a different person.
+    users
+        .upsert_user(&beta, &user("b2", "ada@example.com", 5))
+        .await
+        .expect("alpha's ada must not block beta's ada");
+
+    // Delete.
+    assert!(users.delete_user(&alpha, "u1").await.unwrap());
+    assert!(!users.delete_user(&alpha, "u1").await.unwrap());
+    assert_eq!(users.list_users(&alpha).await.unwrap().len(), 1);
+
+    // --- invites ---
+    let invite = |id: &str, email: &str, at: u64| InviteRecord {
+        id: id.to_string(),
+        email: email.to_string(),
+        role: UserRole::Member,
+        invited_by: "operator".to_string(),
+        created_at_millis: at,
+        expires_at_millis: at + 1_000,
+        accepted_at_millis: None,
+    };
+
+    users
+        .upsert_invite(&alpha, &invite("i1", "carol@example.com", 1))
+        .await
+        .unwrap();
+    users
+        .upsert_invite(&beta, &invite("i2", "dave@example.com", 2))
+        .await
+        .unwrap();
+
+    // Invites are per-company too.
+    assert_eq!(users.list_invites(&alpha).await.unwrap().len(), 1);
+    assert!(
+        users
+            .find_invite_by_email(&beta, "carol@example.com")
+            .await
+            .unwrap()
+            .is_none(),
+        "an invite to alpha must not admit anyone to beta"
+    );
+    assert_eq!(
+        users
+            .find_invite_by_email(&alpha, "carol@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "i1"
+    );
+
+    // One outstanding invite per address.
+    assert!(
+        users
+            .upsert_invite(&alpha, &invite("i9", "carol@example.com", 3))
+            .await
+            .is_err()
+    );
+
+    // Marking an invite redeemed is an in-place upsert.
+    let mut accepted = invite("i1", "carol@example.com", 1);
+    accepted.accepted_at_millis = Some(9);
+    users.upsert_invite(&alpha, &accepted).await.unwrap();
+    assert_eq!(
+        users
+            .find_invite_by_email(&alpha, "carol@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .accepted_at_millis,
+        Some(9)
+    );
+
+    assert!(users.delete_invite(&alpha, "i1").await.unwrap());
+    assert!(!users.delete_invite(&alpha, "i1").await.unwrap());
+    assert!(users.list_invites(&alpha).await.unwrap().is_empty());
+}
+
+/// Asserts the [`SessionStore`] contract: per-company isolation, token-hash
+/// lookup, revocation, and expiry purging.
+pub async fn assert_session_store(sessions: Arc<dyn SessionStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let session = |id: &str, hash: &str, user: &str, expires: u64| SessionRecord {
+        id: id.to_string(),
+        token_hash: hash.to_string(),
+        user_id: user.to_string(),
+        created_at_millis: 1,
+        expires_at_millis: expires,
+        last_seen_at_millis: 1,
+        user_agent: None,
+    };
+
+    sessions
+        .create(&alpha, &session("s1", "hash-1", "u1", 100))
+        .await
+        .unwrap();
+    sessions
+        .create(&alpha, &session("s2", "hash-2", "u1", 100))
+        .await
+        .unwrap();
+    sessions
+        .create(&alpha, &session("s3", "hash-3", "u2", 100))
+        .await
+        .unwrap();
+
+    // Lookup is by token hash — the only session read path.
+    assert_eq!(
+        sessions
+            .find_by_token_hash(&alpha, "hash-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id,
+        "u1"
+    );
+    assert!(
+        sessions
+            .find_by_token_hash(&alpha, "nope")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // THE ISOLATION INVARIANT: a session minted for alpha does not exist for
+    // beta. A stolen or misdirected cookie cannot cross companies, because
+    // there is no row to find — not because a check rejected it.
+    assert!(
+        sessions
+            .find_by_token_hash(&beta, "hash-1")
+            .await
+            .unwrap()
+            .is_none(),
+        "a session for alpha must be invisible to beta"
+    );
+
+    // Per-user listing, newest first, scoped to the company.
+    assert_eq!(sessions.list_for_user(&alpha, "u1").await.unwrap().len(), 2);
+    assert!(
+        sessions
+            .list_for_user(&beta, "u1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Touch records activity without disturbing anything else.
+    sessions.touch(&alpha, "s1", 42).await.unwrap();
+    assert_eq!(
+        sessions
+            .find_by_token_hash(&alpha, "hash-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_seen_at_millis,
+        42
+    );
+    // Touching an unknown session is a no-op, not an error: it raced a revoke.
+    sessions.touch(&alpha, "gone", 43).await.unwrap();
+
+    // Single revocation.
+    assert!(sessions.delete(&alpha, "s1").await.unwrap());
+    assert!(!sessions.delete(&alpha, "s1").await.unwrap());
+    assert!(
+        sessions
+            .find_by_token_hash(&alpha, "hash-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Revoking a user drops every session they hold — the lever behind
+    // suspend/remove.
+    assert_eq!(sessions.delete_for_user(&alpha, "u1").await.unwrap(), 1);
+    assert!(
+        sessions
+            .list_for_user(&alpha, "u1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(sessions.delete_for_user(&alpha, "u1").await.unwrap(), 0);
+    // u2 is untouched.
+    assert_eq!(sessions.list_for_user(&alpha, "u2").await.unwrap().len(), 1);
+
+    // Expiry purging drops only what has actually expired. Expiry is exclusive,
+    // so a session expiring exactly at `now` is already dead.
+    sessions
+        .create(&alpha, &session("s4", "hash-4", "u3", 50))
+        .await
+        .unwrap();
+    assert_eq!(sessions.purge_expired(&alpha, 50).await.unwrap(), 1);
+    assert!(
+        sessions
+            .find_by_token_hash(&alpha, "hash-4")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        sessions
+            .find_by_token_hash(&alpha, "hash-3")
+            .await
+            .unwrap()
+            .is_some(),
+        "a live session must survive a purge"
+    );
+}
+
+/// Asserts the [`LoginCodeStore`] contract: per-company isolation and — the
+/// point of the port — atomic single-use redemption.
+pub async fn assert_login_code_store(codes: Arc<dyn LoginCodeStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let code = |id: &str, hash: &str, email: &str, expires: u64| LoginCodeRecord {
+        id: id.to_string(),
+        code_hash: hash.to_string(),
+        email: email.to_string(),
+        created_at_millis: 1,
+        expires_at_millis: expires,
+        consumed_at_millis: None,
+    };
+
+    codes
+        .create(&alpha, &code("c1", "hash-1", "ada@example.com", 100))
+        .await
+        .unwrap();
+
+    // A code mailed for alpha must not authenticate against beta.
+    assert!(
+        codes.consume(&beta, "hash-1", 10).await.unwrap().is_none(),
+        "a login code for alpha must be invisible to beta"
+    );
+
+    // Redemption returns the record, and binds the session to the address the
+    // code was mailed to — not one supplied by the redeemer.
+    let consumed = codes
+        .consume(&alpha, "hash-1", 10)
+        .await
+        .unwrap()
+        .expect("a live code redeems");
+    assert_eq!(consumed.email, "ada@example.com");
+
+    // SINGLE USE: the second redemption of the same code returns nothing. This
+    // is what stops a forwarded or replayed magic link from minting a second
+    // session.
+    assert!(
+        codes.consume(&alpha, "hash-1", 11).await.unwrap().is_none(),
+        "a code must redeem exactly once"
+    );
+
+    // An unknown hash is indistinguishable from a spent one.
+    assert!(codes.consume(&alpha, "nope", 10).await.unwrap().is_none());
+
+    // Expiry is exclusive and enforced at redemption, not just at read.
+    codes
+        .create(&alpha, &code("c2", "hash-2", "bob@example.com", 50))
+        .await
+        .unwrap();
+    assert!(
+        codes.consume(&alpha, "hash-2", 50).await.unwrap().is_none(),
+        "an expired code must not redeem"
+    );
+
+    // Issuing a new code invalidates any outstanding one for that address.
+    codes
+        .create(&alpha, &code("c3", "hash-3", "carol@example.com", 100))
+        .await
+        .unwrap();
+    assert_eq!(
+        codes
+            .delete_for_email(&alpha, "carol@example.com")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(codes.consume(&alpha, "hash-3", 10).await.unwrap().is_none());
+    assert_eq!(
+        codes
+            .delete_for_email(&alpha, "carol@example.com")
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Purging drops expired codes and leaves live ones. At this point the store
+    // still holds c1 (spent, expires 100) and c2 (expires 50) alongside the two
+    // created here, so purging at 100 collects c1, c2, and c4 — every code whose
+    // expiry has passed, spent or not — and spares only c5.
+    codes
+        .create(&alpha, &code("c4", "hash-4", "dave@example.com", 20))
+        .await
+        .unwrap();
+    codes
+        .create(&alpha, &code("c5", "hash-5", "erin@example.com", 200))
+        .await
+        .unwrap();
+    assert_eq!(codes.purge_expired(&alpha, 100).await.unwrap(), 3);
+    assert_eq!(
+        codes.purge_expired(&alpha, 100).await.unwrap(),
+        0,
+        "purging twice must not double-count"
+    );
+    assert!(
+        codes
+            .consume(&alpha, "hash-5", 100)
+            .await
+            .unwrap()
+            .is_some(),
+        "a live code must survive a purge"
+    );
 }
 
 /// Asserts the [`FactStore`] contract: isolation, query/kind filtering, upsert,

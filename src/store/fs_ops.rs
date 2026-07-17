@@ -1,9 +1,12 @@
 //! Filesystem backends for the WS3 console ports: tasks, facts, usage,
-//! skill-state, and the workspace file tree.
+//! skill-state, the workspace file tree, and the human user directory.
 //!
 //! Each store owns a small file (or subtree) inside the company [`Bundle`]:
 //!
 //! - tasks → `tasks.json` (the whole board as a JSON array)
+//! - users → `users.json`, invites → `user-invites.json`
+//! - sessions → `user-sessions.json`, login codes → `login-codes.json`
+//!   (credential material: token/code *hashes* only, never plaintext)
 //! - facts → `facts.jsonl` (last-write-wins per id, rewritten on mutate)
 //! - usage → `usage.jsonl` (append-only samples)
 //! - skills → `skills.json` (operator deltas)
@@ -19,11 +22,14 @@ use async_trait::async_trait;
 use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
+use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
 use crate::ports::now_millis;
+use crate::ports::sessions::{SessionRecord, SessionStore};
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::tasks::{TaskRecord, TaskStore};
 use crate::ports::types::CompanyId;
 use crate::ports::usage::{UsageMeter, UsageSample, retention_cutoff};
+use crate::ports::users::{InviteRecord, UserRecord, UserStore};
 use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceStore};
 use crate::store::fs::{PathLocks, append_line, io_err, read_jsonl, read_optional, write_atomic};
 use crate::store::paths::Bundle;
@@ -89,6 +95,304 @@ impl TaskStore for FsOps {
         }
         write_atomic(&path, &serde_json::to_string(&tasks)?).await?;
         Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UserStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl UserStore for FsOps {
+    async fn list_users(&self, company: &CompanyId) -> Result<Vec<UserRecord>> {
+        let mut users = load_json_vec::<UserRecord>(&self.bundle(company).users_json()).await?;
+        users.sort_by_key(|u| std::cmp::Reverse(u.created_at_millis));
+        Ok(users)
+    }
+
+    async fn get_user(&self, company: &CompanyId, id: &str) -> Result<Option<UserRecord>> {
+        let users = load_json_vec::<UserRecord>(&self.bundle(company).users_json()).await?;
+        Ok(users.into_iter().find(|u| u.id == id))
+    }
+
+    async fn find_user_by_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<UserRecord>> {
+        let users = load_json_vec::<UserRecord>(&self.bundle(company).users_json()).await?;
+        // Exact match: normalization is the caller's job, so that a store never
+        // silently matches an address the caller did not ask for.
+        Ok(users.into_iter().find(|u| u.email == email))
+    }
+
+    async fn upsert_user(&self, company: &CompanyId, user: &UserRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.users_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut users = load_json_vec::<UserRecord>(&path).await?;
+        // Email is unique per company: a second id holding one address would
+        // make find_user_by_email ambiguous and let one mailbox own two
+        // accounts. The lock makes this check-and-write a single step.
+        if users
+            .iter()
+            .any(|u| u.email == user.email && u.id != user.id)
+        {
+            return Err(OpenCompanyError::Conflict(format!(
+                "another user already has the email {}",
+                user.email
+            )));
+        }
+        match users.iter_mut().find(|u| u.id == user.id) {
+            Some(existing) => *existing = user.clone(),
+            None => users.push(user.clone()),
+        }
+        write_atomic(&path, &serde_json::to_string(&users)?).await
+    }
+
+    async fn delete_user(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let path = self.bundle(company).users_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut users = load_json_vec::<UserRecord>(&path).await?;
+        let before = users.len();
+        users.retain(|u| u.id != id);
+        if users.len() == before {
+            return Ok(false);
+        }
+        write_atomic(&path, &serde_json::to_string(&users)?).await?;
+        Ok(true)
+    }
+
+    async fn list_invites(&self, company: &CompanyId) -> Result<Vec<InviteRecord>> {
+        let mut invites =
+            load_json_vec::<InviteRecord>(&self.bundle(company).user_invites_json()).await?;
+        invites.sort_by_key(|i| std::cmp::Reverse(i.created_at_millis));
+        Ok(invites)
+    }
+
+    async fn find_invite_by_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<InviteRecord>> {
+        let invites =
+            load_json_vec::<InviteRecord>(&self.bundle(company).user_invites_json()).await?;
+        Ok(invites.into_iter().find(|i| i.email == email))
+    }
+
+    async fn upsert_invite(&self, company: &CompanyId, invite: &InviteRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.user_invites_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut invites = load_json_vec::<InviteRecord>(&path).await?;
+        if invites
+            .iter()
+            .any(|i| i.email == invite.email && i.id != invite.id)
+        {
+            return Err(OpenCompanyError::Conflict(format!(
+                "{} is already invited",
+                invite.email
+            )));
+        }
+        match invites.iter_mut().find(|i| i.id == invite.id) {
+            Some(existing) => *existing = invite.clone(),
+            None => invites.push(invite.clone()),
+        }
+        write_atomic(&path, &serde_json::to_string(&invites)?).await
+    }
+
+    async fn delete_invite(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let path = self.bundle(company).user_invites_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut invites = load_json_vec::<InviteRecord>(&path).await?;
+        let before = invites.len();
+        invites.retain(|i| i.id != id);
+        if invites.len() == before {
+            return Ok(false);
+        }
+        write_atomic(&path, &serde_json::to_string(&invites)?).await?;
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl SessionStore for FsOps {
+    async fn create(&self, company: &CompanyId, session: &SessionRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.user_sessions_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
+        // A repeated token hash would mean the CSPRNG repeated (or a caller
+        // reused a token). Refuse rather than overwrite a live session.
+        if sessions.iter().any(|s| s.token_hash == session.token_hash) {
+            return Err(OpenCompanyError::Conflict(
+                "that session token already exists".to_string(),
+            ));
+        }
+        sessions.push(session.clone());
+        write_atomic(&path, &serde_json::to_string(&sessions)?).await
+    }
+
+    async fn find_by_token_hash(
+        &self,
+        company: &CompanyId,
+        token_hash: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let sessions =
+            load_json_vec::<SessionRecord>(&self.bundle(company).user_sessions_json()).await?;
+        Ok(sessions.into_iter().find(|s| s.token_hash == token_hash))
+    }
+
+    async fn list_for_user(
+        &self,
+        company: &CompanyId,
+        user_id: &str,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut sessions =
+            load_json_vec::<SessionRecord>(&self.bundle(company).user_sessions_json()).await?;
+        sessions.retain(|s| s.user_id == user_id);
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at_millis));
+        Ok(sessions)
+    }
+
+    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()> {
+        let path = self.bundle(company).user_sessions_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
+        let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
+            // Touching a revoked session is not an error: the request that
+            // raced the revocation is already being refused elsewhere.
+            return Ok(());
+        };
+        session.last_seen_at_millis = at_millis;
+        write_atomic(&path, &serde_json::to_string(&sessions)?).await
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let path = self.bundle(company).user_sessions_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
+        let before = sessions.len();
+        sessions.retain(|s| s.id != id);
+        if sessions.len() == before {
+            return Ok(false);
+        }
+        write_atomic(&path, &serde_json::to_string(&sessions)?).await?;
+        Ok(true)
+    }
+
+    async fn delete_for_user(&self, company: &CompanyId, user_id: &str) -> Result<u64> {
+        let path = self.bundle(company).user_sessions_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
+        let before = sessions.len();
+        sessions.retain(|s| s.user_id != user_id);
+        let removed = (before - sessions.len()) as u64;
+        if removed > 0 {
+            write_atomic(&path, &serde_json::to_string(&sessions)?).await?;
+        }
+        Ok(removed)
+    }
+
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
+        let path = self.bundle(company).user_sessions_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
+        let before = sessions.len();
+        sessions.retain(|s| s.is_live(now_millis));
+        let removed = (before - sessions.len()) as u64;
+        if removed > 0 {
+            write_atomic(&path, &serde_json::to_string(&sessions)?).await?;
+        }
+        Ok(removed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LoginCodeStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl LoginCodeStore for FsOps {
+    async fn create(&self, company: &CompanyId, code: &LoginCodeRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.login_codes_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
+        codes.push(code.clone());
+        write_atomic(&path, &serde_json::to_string(&codes)?).await
+    }
+
+    async fn consume(
+        &self,
+        company: &CompanyId,
+        code_hash: &str,
+        now_millis: u64,
+    ) -> Result<Option<LoginCodeRecord>> {
+        let path = self.bundle(company).login_codes_json();
+        // The lock is what makes check-and-mark atomic, so two requests racing
+        // on one code cannot both mint a session. This holds within a process;
+        // the fs backend is single-process by construction (one bundle, one
+        // host), which is the same assumption every other fs store makes.
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
+        let Some(code) = codes
+            .iter_mut()
+            .find(|c| c.code_hash == code_hash && c.is_redeemable(now_millis))
+        else {
+            return Ok(None);
+        };
+        code.consumed_at_millis = Some(now_millis);
+        let consumed = code.clone();
+        write_atomic(&path, &serde_json::to_string(&codes)?).await?;
+        Ok(Some(consumed))
+    }
+
+    async fn delete_for_email(&self, company: &CompanyId, email: &str) -> Result<u64> {
+        let path = self.bundle(company).login_codes_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
+        let before = codes.len();
+        codes.retain(|c| c.email != email);
+        let removed = (before - codes.len()) as u64;
+        if removed > 0 {
+            write_atomic(&path, &serde_json::to_string(&codes)?).await?;
+        }
+        Ok(removed)
+    }
+
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
+        let path = self.bundle(company).login_codes_json();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
+        let before = codes.len();
+        codes.retain(|c| now_millis < c.expires_at_millis);
+        let removed = (before - codes.len()) as u64;
+        if removed > 0 {
+            write_atomic(&path, &serde_json::to_string(&codes)?).await?;
+        }
+        Ok(removed)
     }
 }
 
@@ -580,6 +884,27 @@ mod test {
     }
 
     #[tokio::test]
+    async fn conformance_user_store() {
+        let root = tmp_root();
+        conformance::assert_user_store(Arc::new(FsOps::new(&root))).await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_session_store() {
+        let root = tmp_root();
+        conformance::assert_session_store(Arc::new(FsOps::new(&root))).await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_login_code_store() {
+        let root = tmp_root();
+        conformance::assert_login_code_store(Arc::new(FsOps::new(&root))).await;
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
     async fn conformance_fact_store() {
         let root = tmp_root();
         conformance::assert_fact_store(Arc::new(FsOps::new(&root))).await;
@@ -620,7 +945,10 @@ mod test {
         let ops = FsOps::new(&root);
         let company = CompanyId::new("acme");
         let now = now_millis();
-        ops.create(
+        // Qualified: `FsOps` implements `create` for the workspace, session, and
+        // login-code ports, so the concrete receiver needs the trait named.
+        WorkspaceStore::create(
+            &ops,
             &company,
             &WorkspaceNode {
                 id: "f1".into(),
@@ -633,7 +961,8 @@ mod test {
         )
         .await
         .unwrap();
-        ops.create(
+        WorkspaceStore::create(
+            &ops,
             &company,
             &WorkspaceNode {
                 id: "n1".into(),

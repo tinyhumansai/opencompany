@@ -167,6 +167,33 @@ impl Bundle {
         self.dir.join("facts.jsonl")
     }
 
+    /// Path to the human user directory (`users.json`, the full set as a JSON
+    /// array).
+    pub fn users_json(&self) -> PathBuf {
+        self.dir.join("users.json")
+    }
+
+    /// Path to the outstanding user invites (`user-invites.json`).
+    pub fn user_invites_json(&self) -> PathBuf {
+        self.dir.join("user-invites.json")
+    }
+
+    /// Path to the live browser sessions (`user-sessions.json`).
+    ///
+    /// Credential material: holds session token *hashes*. Excluded from
+    /// bundle exports, like `secrets/`.
+    pub fn user_sessions_json(&self) -> PathBuf {
+        self.dir.join("user-sessions.json")
+    }
+
+    /// Path to the pending magic-link codes (`login-codes.json`).
+    ///
+    /// Credential material: holds login code *hashes*. Excluded from bundle
+    /// exports, like `secrets/`.
+    pub fn login_codes_json(&self) -> PathBuf {
+        self.dir.join("login-codes.json")
+    }
+
     /// Path to the usage-sample log (`usage.jsonl`, one sample per line).
     pub fn usage_jsonl(&self) -> PathBuf {
         self.dir.join("usage.jsonl")
