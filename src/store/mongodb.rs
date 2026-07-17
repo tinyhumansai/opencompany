@@ -1153,6 +1153,25 @@ impl crate::ports::login_codes::LoginCodeStore for MongoStore {
         Ok(())
     }
 
+    async fn latest_for_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<LoginCodeRecord>> {
+        // Served by the non-unique (company_id, email) index. `expires_ms`
+        // orders by mint time, since every code for one address shares a TTL.
+        let found = self
+            .collection("login_codes")
+            .find_one(doc! {"company_id": company.as_ref(), "email": email})
+            .sort(doc! {"expires_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(&doc, "code_json")?)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn consume(
         &self,
         company: &CompanyId,

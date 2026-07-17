@@ -873,6 +873,55 @@ pub async fn assert_login_code_store(codes: Arc<dyn LoginCodeStore>) {
     // An unknown hash is indistinguishable from a spent one.
     assert!(codes.consume(&alpha, "nope", 10).await.unwrap().is_none());
 
+    // --- latest_for_email: what the resend throttle asks ---
+    // Isolation holds here too.
+    assert!(
+        codes
+            .latest_for_email(&beta, "ada@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A spent code is still the latest one — the throttle asks "when did we
+    // last mail this address", not "is there a live code".
+    assert_eq!(
+        codes
+            .latest_for_email(&alpha, "ada@example.com")
+            .await
+            .unwrap()
+            .expect("the spent code is still on record")
+            .id,
+        "c1"
+    );
+    assert!(
+        codes
+            .latest_for_email(&alpha, "nobody@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // With several codes for one address, the most recent wins.
+    codes
+        .create(&alpha, &code("older", "hash-old", "zoe@example.com", 60))
+        .await
+        .unwrap();
+    let mut newer = code("newer", "hash-new", "zoe@example.com", 200);
+    newer.created_at_millis = 50;
+    codes.create(&alpha, &newer).await.unwrap();
+    assert_eq!(
+        codes
+            .latest_for_email(&alpha, "zoe@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "newer"
+    );
+    codes
+        .delete_for_email(&alpha, "zoe@example.com")
+        .await
+        .unwrap();
+
     // Expiry is exclusive and enforced at redemption, not just at read.
     codes
         .create(&alpha, &code("c2", "hash-2", "bob@example.com", 50))

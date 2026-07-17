@@ -68,6 +68,22 @@ pub trait LoginCodeStore: Send + Sync {
     /// Inserts a freshly minted code.
     async fn create(&self, company: &CompanyId, code: &LoginCodeRecord) -> Result<()>;
 
+    /// The most recently minted code for an address, spent or not.
+    ///
+    /// Exists for the resend throttle: the login route needs to know *when* it
+    /// last mailed this address, and it cannot ask by hash because it does not
+    /// have the code. Returning the record — not just a timestamp — keeps the
+    /// port from growing a second, narrower question later.
+    ///
+    /// Note this is a lookup by address rather than by secret, so unlike
+    /// [`consume`](Self::consume) it must never be used to authenticate: it
+    /// would let anyone holding an address act on its code.
+    async fn latest_for_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<LoginCodeRecord>>;
+
     /// Atomically redeems a code by its hash.
     ///
     /// Returns the record if — and only if — this call is the one that consumed

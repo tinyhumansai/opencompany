@@ -341,6 +341,19 @@ impl LoginCodeStore for FsOps {
         write_atomic(&path, &serde_json::to_string(&codes)?).await
     }
 
+    async fn latest_for_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<LoginCodeRecord>> {
+        let codes =
+            load_json_vec::<LoginCodeRecord>(&self.bundle(company).login_codes_json()).await?;
+        Ok(codes
+            .into_iter()
+            .filter(|c| c.email == email)
+            .max_by_key(|c| c.created_at_millis))
+    }
+
     async fn consume(
         &self,
         company: &CompanyId,

@@ -44,13 +44,17 @@ use crate::server::users::{cookie, password, token};
 /// materialized. Long, because it is regenerated from the manifest on demand.
 const MANIFEST_INVITE_TTL_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-// KNOWN GAP: there is no resend throttle. Repeated `auth/request` calls for one
-// invited address will mail a link each time, so the route can be pointed at an
-// invited mailbox as a nuisance. It is not an account-takeover path (each link
-// invalidates the last, and only the mailbox owner can read them) and it needs
-// an invited address to aim at, so it is recorded rather than fixed here:
-// throttling needs a lookup-by-email on LoginCodeStore, which is a port change
-// across three backends and belongs in its own slice.
+/// The soonest a second link may be mailed to one address.
+///
+/// Without this, `auth/request` is a mail cannon anyone can aim at an invited
+/// mailbox. Long enough to stop that; short enough that a genuine "it didn't
+/// arrive, send another" is not an ordeal.
+///
+/// Hitting the throttle returns the **same** `202` as sending, and does not
+/// disturb the live code — otherwise the throttle would itself be the
+/// membership oracle the rest of this module refuses to be, and an attacker
+/// could invalidate a victim's link on demand.
+const RESEND_INTERVAL_MILLIS: u64 = 60 * 1000;
 
 /// Builds the user-auth route fragment.
 pub fn router() -> Router<AppState> {
@@ -332,6 +336,24 @@ async fn request_code(
             dev_code: None,
         }));
     };
+
+    // Throttle. Checked after eligibility so an ineligible address never
+    // reaches a store read that an eligible one does — and answered with the
+    // same 202, so the throttle is not itself an oracle. The live code is left
+    // alone: replacing it here would let anyone kill a victim's link at will.
+    if let Some(previous) = runtime
+        .login_codes()
+        .latest_for_email(runtime.id(), &email)
+        .await
+        .map_err(|e| ApiError(e).into_response())?
+        && now.saturating_sub(previous.created_at_millis) < RESEND_INTERVAL_MILLIS
+    {
+        tracing::debug!(company = %runtime.id(), "login link throttled");
+        return Ok(Json(RequestCodeResult {
+            sent: true,
+            dev_code: None,
+        }));
+    }
 
     let plaintext = token::mint_login_code(&token::OsTokens);
     let record = LoginCodeRecord {

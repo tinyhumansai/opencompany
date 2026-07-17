@@ -362,13 +362,31 @@ async fn a_link_is_single_use() {
 }
 
 #[tokio::test]
-async fn requesting_a_new_link_invalidates_the_previous_one() {
+async fn a_second_link_within_the_throttle_window_is_not_sent() {
     let home = home();
     let (state, sender) = state_with_mail(&home).await;
     let first_code = request_code(&state, &sender, "ada@example.com").await;
-    let second_code = request_code(&state, &sender, "ada@example.com").await;
-    assert_ne!(first_code, second_code);
 
+    // Immediately ask again: same acknowledgement, no second mail. Otherwise
+    // this route is a mail cannon pointed at an invited mailbox.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post(
+            "/api/v1/companies/acme/auth/request",
+            serde_json::json!({ "email": "ada@example.com" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        serde_json::json!({ "sent": true }),
+        "a throttled request must answer exactly like a sent one"
+    );
+    assert_eq!(sender.sent().len(), 1, "a second mail went out");
+
+    // The live link still works: throttling must not let anyone invalidate
+    // someone else's link on demand.
     let app = router(state.clone());
     let response = app
         .oneshot(post(
@@ -377,17 +395,64 @@ async fn requesting_a_new_link_invalidates_the_previous_one() {
         ))
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn once_the_window_passes_a_new_link_invalidates_the_previous_one() {
+    use crate::ports::LoginCodeRecord;
+
+    let home = home();
+    let (state, sender) = state_with_mail(&home).await;
+    let id = CompanyId::new("acme");
+    let runtime = state.registry().get(&id).unwrap();
+    let now = crate::ports::now_millis();
+
+    // Seed a code minted well outside the throttle window, standing in for
+    // "they asked a few minutes ago". Clock control is not available here, so
+    // the elapsed time is expressed in the record rather than by waiting.
+    let old_plaintext =
+        crate::server::users::token::mint_login_code(&crate::server::users::token::OsTokens);
+    runtime
+        .login_codes()
+        .create(
+            &id,
+            &LoginCodeRecord {
+                id: "old".into(),
+                code_hash: crate::server::users::token::sha256_hex(&old_plaintext),
+                email: "ada@example.com".into(),
+                created_at_millis: now - 5 * 60 * 1000,
+                expires_at_millis: now + 5 * 60 * 1000,
+                consumed_at_millis: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Past the window, so a fresh link is minted and mailed.
+    let new_code = request_code(&state, &sender, "ada@example.com").await;
+    assert_ne!(new_code, old_plaintext);
+
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post(
+            "/api/v1/companies/acme/auth/verify",
+            serde_json::json!({ "code": old_plaintext }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(
         response.status(),
         StatusCode::UNAUTHORIZED,
-        "an abandoned link must not work later"
+        "an abandoned link must not work once a newer one exists"
     );
 
     let app = router(state.clone());
     let response = app
         .oneshot(post(
             "/api/v1/companies/acme/auth/verify",
-            serde_json::json!({ "code": second_code }),
+            serde_json::json!({ "code": new_code }),
         ))
         .await
         .unwrap();

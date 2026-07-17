@@ -1240,6 +1240,27 @@ impl crate::ports::login_codes::LoginCodeStore for SqliteStore {
         Ok(())
     }
 
+    async fn latest_for_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<LoginCodeRecord>> {
+        let conn = self.conn();
+        // Served by the `login_codes_email` index. `expires_ms` orders by mint
+        // time, since every code for one address shares a TTL.
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT code_json FROM login_codes WHERE company_id = ?1 AND email = ?2 \
+                 ORDER BY expires_ms DESC LIMIT 1",
+                params![company.as_ref(), email],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        json.map(|j| serde_json::from_str(&j).map_err(Into::into))
+            .transpose()
+    }
+
     async fn consume(
         &self,
         company: &CompanyId,
