@@ -65,7 +65,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Real HMAC-SHA256 webhook signing. Pure-Rust, no system libs, no network beyond
 # the shared `reqwest` client used by `HttpWebhookSink`.
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
+
+# Hashing (session/login-code digests) and OS randomness (minting them). Both
+# are unconditional: a build that cannot hash or generate a random token cannot
+# authenticate a human, and user auth is not an optional surface. Both are
+# pure-Rust and offline — `getrandom` is a syscall shim — so the "default build
+# links no network crates" invariant is untouched. Feature-gating them instead
+# would push `#[cfg]` through StorageHandles, three backends, and the
+# conformance suite to defend nothing.
+sha2 = "0.10"
+getrandom = "0.2"
 
 # Real signed per-tenant JWT verification for platform auth.
 jsonwebtoken = { version = "9", optional = true }
@@ -128,7 +137,7 @@ tinyplace = ["dep:reqwest", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core"]
 # Real HTTP POST webhook delivery + HMAC-SHA256 signing. The `WebhookSink` trait,
 # the offline `RecordingWebhookSink`, and the deterministic default signer
 # compile without this; only `HttpWebhookSink`/`HmacSha256Signer` are gated here.
-webhooks = ["dep:reqwest", "dep:hmac", "dep:sha2"]
+webhooks = ["dep:reqwest", "dep:hmac"]
 # Real signed per-tenant JWT verification. The `PlatformVerifier` trait and the
 # offline `StaticPlatformVerifier` compile without this; only the JWT verifier is
 # gated behind it.

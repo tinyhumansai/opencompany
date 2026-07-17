@@ -301,7 +301,7 @@ pub fn acting_tenant(claims: &Option<PlatformClaims>) -> String {
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Encodes bytes as unpadded base64url.
-fn b64url_encode(input: &[u8]) -> String {
+pub(crate) fn b64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;

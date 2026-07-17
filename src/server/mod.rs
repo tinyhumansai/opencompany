@@ -8,6 +8,7 @@ pub mod ops;
 pub mod platform_auth;
 pub mod provision;
 mod routes;
+pub mod users;
 pub mod webhook;
 
 pub use error::ApiError;

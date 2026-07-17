@@ -5132,6 +5132,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "futures",
+ "getrandom 0.2.17",
  "hickory-resolver 0.24.4",
  "hmac 0.12.1",
  "jsonwebtoken",
