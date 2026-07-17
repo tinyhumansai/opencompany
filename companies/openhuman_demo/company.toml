@@ -1,0 +1,39 @@
+# A minimal company for the embedded OpenHuman harness (issue #9).
+#
+# Every [[agent]] becomes one live openhuman agent, wired with memory, an
+# approval policy, and the hosted inference provider. Run it with the harness
+# brain by setting an inference credential in the environment:
+#
+#   TINYHUMANS_API_KEY=<jwt> \
+#   OPENCOMPANY_INFERENCE_URL=https://api.tinyhumans.ai/openai/v1 \
+#   cargo run --features openhuman --bin opencompany -- \
+#     serve --company companies/openhuman_demo
+#
+# Without a credential the same company still boots — it just answers with the
+# offline echo brain instead of a real agent turn.
+
+[company]
+name = "OpenHuman Demo Co"
+output = "Answers, plans, and short written drafts"
+human_role = "Steering the company and approving anything costly"
+
+[policy]
+# `full` lets ordinary turns flow without an approval prompt; costly or
+# external effects still route through the gate. Use `supervised` to approve
+# every agent action, or `readonly` to block mutations entirely.
+mode = "full"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+description = "Sets direction, answers about the company, and delegates the work."
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Explains how things are built and proposes technical plans."
+
+[[agent]]
+id = "writer"
+role = "Writer"
+description = "Turns rough notes into short, clear written drafts."
