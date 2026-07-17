@@ -81,6 +81,48 @@ impl AppConfig {
             None => format!("http://{}", self.bind),
         }
     }
+
+    /// Whether this host is reachable only from this machine.
+    ///
+    /// Gates behavior that is safe on a developer's laptop and unsafe anywhere
+    /// else — chiefly echoing a login code in an HTTP response when no mail
+    /// transport is configured (see the user-auth routes).
+    ///
+    /// Fails **closed**: a host it cannot prove is loopback (a DNS name, an
+    /// empty host, a malformed bind, or any configured `public_url`) is treated
+    /// as routable. A `public_url` means someone expects to reach this from
+    /// elsewhere, which settles it regardless of the bind.
+    pub fn is_local_only(&self) -> bool {
+        if self.public_url.is_some() {
+            return false;
+        }
+        bind_is_loopback(&self.bind)
+    }
+}
+
+/// The host portion of a `host:port` bind string, handling the bracketed IPv6
+/// form (`[::1]:8080`).
+fn bind_host(bind: &str) -> &str {
+    if let Some(rest) = bind.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
+    }
+    match bind.rsplit_once(':') {
+        Some((host, _)) => host,
+        None => bind,
+    }
+}
+
+/// Whether a bind address accepts connections only from this machine.
+fn bind_is_loopback(bind: &str) -> bool {
+    let host = bind_host(bind);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 impl std::fmt::Debug for AppConfig {
@@ -380,6 +422,56 @@ mod tests {
     #[test]
     fn default_config_binds_locally() {
         assert_eq!(AppConfig::default().bind, "127.0.0.1:8080");
+    }
+
+    fn bound_to(bind: &str) -> AppConfig {
+        AppConfig {
+            bind: bind.to_string(),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn loopback_binds_are_local_only() {
+        for bind in [
+            "127.0.0.1:8080",
+            "127.0.0.53:8080",
+            "localhost:8080",
+            "LocalHost:8080",
+            "[::1]:8080",
+        ] {
+            assert!(bound_to(bind).is_local_only(), "{bind} is loopback");
+        }
+    }
+
+    #[test]
+    fn routable_binds_are_not_local_only() {
+        for bind in ["0.0.0.0:8080", "192.168.1.10:8080", "[::]:8080"] {
+            assert!(!bound_to(bind).is_local_only(), "{bind} is routable");
+        }
+    }
+
+    #[test]
+    fn an_unprovable_bind_host_fails_closed() {
+        // A DNS name could resolve anywhere, and a malformed bind is not
+        // evidence of safety. Neither may unlock loopback-only behavior.
+        for bind in ["example.com:8080", ":8080", "garbage", ""] {
+            assert!(
+                !bound_to(bind).is_local_only(),
+                "{bind:?} is not provably loopback and must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_url_settles_it_regardless_of_bind() {
+        // Someone expects to reach this from elsewhere. Whatever the bind says,
+        // this host is not a private laptop.
+        let config = AppConfig {
+            public_url: Some("https://acme.example".into()),
+            ..bound_to("127.0.0.1:8080")
+        };
+        assert!(!config.is_local_only());
     }
 
     #[test]

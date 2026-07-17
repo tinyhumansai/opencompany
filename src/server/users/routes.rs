@@ -76,8 +76,10 @@ struct RequestCodeResult {
     /// Always `true`. Whether a mail was actually sent is deliberately not
     /// reported — that would be the oracle this route exists to avoid.
     sent: bool,
-    /// The login code, echoed **only** in dev mode with no mail transport
-    /// wired. Absent in any deployment that can send mail.
+    /// The login code, echoed **only** when the host binds loopback *and* has
+    /// no mail transport. Absent on any host reachable from elsewhere, even
+    /// when its mail is broken — a credential must never leave in a response
+    /// to whoever asked for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     dev_code: Option<String>,
 }
@@ -356,13 +358,30 @@ async fn request_code(
     // Deliver. A send failure must not change the response — it would report
     // that the address exists.
     let delivered = deliver_code(&state, &runtime, &email, &plaintext).await;
-    let dev_code = (!delivered).then(|| plaintext.clone());
+
+    // Echoing the code makes local development work with no mail server. It is
+    // also, literally, returning a credential in an HTTP response — so it is
+    // gated on the host being unreachable from anywhere else, not merely on
+    // mail being unconfigured. A routable host with broken mail fails to log
+    // people in; it does not hand the credential to whoever asked.
+    let local_only = state.config().is_local_only();
+    let dev_code = (!delivered && local_only).then(|| plaintext.clone());
     if !delivered {
-        tracing::warn!(
-            company = %runtime.id(),
-            "no mail transport configured: the login code is being returned in the \
-             response. Configure OPENCOMPANY_MAIL_* before exposing this host."
-        );
+        if local_only {
+            tracing::warn!(
+                company = %runtime.id(),
+                "no mail transport configured: returning the login code in the response. \
+                 This only happens on a loopback bind. Configure OPENCOMPANY_MAIL_* \
+                 before exposing this host."
+            );
+        } else {
+            tracing::error!(
+                company = %runtime.id(),
+                "no mail transport configured and this host is routable, so the login \
+                 code cannot be delivered and will NOT be echoed. Nobody can sign in \
+                 until OPENCOMPANY_MAIL_* is configured."
+            );
+        }
     }
     Ok(Json(RequestCodeResult {
         sent: true,

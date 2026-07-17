@@ -847,11 +847,51 @@ async fn a_manifest_admin_invite_cannot_be_revoked_through_the_api() {
 #[tokio::test]
 async fn no_mail_transport_still_returns_202_and_echoes_for_dev() {
     let home = home();
-    // No mail wired at all — the default offline build.
+    // No mail wired at all — the default offline build, on the default
+    // loopback bind.
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     assert!(
         request_dev_code(&state, "ada@example.com").await.is_some(),
         "without a transport the code must be echoed so local dev works"
+    );
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn a_routable_host_never_echoes_the_code_even_with_no_mail() {
+    let home = home();
+    let store = crate::store::FsCompanyStore::new(home.clone());
+    let id = CompanyId::new("acme");
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.clone(), manifest())
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    // Routable bind, no mail transport: the code cannot be delivered — and it
+    // must NOT come back in the response instead. Returning a credential to
+    // whoever asked is worse than nobody being able to sign in.
+    let state = AppState::new(AppConfig {
+        bind: "0.0.0.0:8080".into(),
+        ..AppConfig::default()
+    })
+    .with_home(home.clone())
+    .with_connections(ConnectionsRuntime::new());
+    state.registry().insert(id, Arc::new(runtime));
+
+    assert_eq!(
+        request_dev_code(&state, "ada@example.com").await,
+        None,
+        "a routable host must never echo a login code"
     );
     tokio::fs::remove_dir_all(&home).await.ok();
 }
