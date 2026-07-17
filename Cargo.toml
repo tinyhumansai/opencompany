@@ -31,6 +31,15 @@ categories = ["web-programming", "asynchronous"]
 # target of the host crate.
 autoexamples = false
 
+# Live end-to-end smoke for issue #9: one company agent on the embedded
+# OpenHuman runtime, one turn against the hosted brain. Needs a credential, so
+# it is an explicit example gated on the `openhuman` feature — never built by
+# the default `cargo build`/CI.
+[[example]]
+name = "live_company_turn"
+path = "examples/live_company_turn.rs"
+required-features = ["openhuman"]
+
 [dependencies]
 async-graphql = "7"
 async-graphql-axum = "7"
