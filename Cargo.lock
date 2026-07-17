@@ -5150,7 +5150,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
- "tinyagents 1.8.0",
+ "tinyagents 1.9.0",
  "tokio",
  "toml 0.8.23",
  "tower",
@@ -5258,7 +5258,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
- "tinyagents 1.8.0",
+ "tinyagents 1.9.0",
  "tinychannels",
  "tinycortex",
  "tinyflows",
@@ -7821,7 +7821,7 @@ dependencies = [
 
 [[package]]
 name = "tinyagents"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7837,6 +7837,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -7941,7 +7942,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tinyagents 1.8.0",
+ "tinyagents 1.9.0",
  "tracing",
 ]
 

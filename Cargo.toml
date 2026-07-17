@@ -50,8 +50,13 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 
 # WS4: openhuman embedded as a library (the harness). Only links under the
 # `openhuman` feature; the default build pulls none of this enormous native
-# dependency tree. `default-features = false` drops only the treesitter code
-# compressor — openhuman has no other optional heavy deps to shed.
+# dependency tree. `default-features = false` sheds openhuman's whole default
+# set — `tokenjuice-treesitter`, `voice`, `web3`, `media`, `meet`, `skills`,
+# `flows`, `mcp` — none of which a company agent needs; it wants the agent
+# loop, memory, and an inference provider. Keep `vendor/tinyagents` on the
+# same commit openhuman's own `vendor/tinyagents` pins: the two are a
+# lockstep pair, and a skew fails to compile (only under this feature, which
+# CI does not build).
 openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false }
 # The openhuman `Provider`/`Memory` traits return `anyhow::Result` and log via
 # the `log` facade; both only link under the `openhuman` feature.
