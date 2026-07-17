@@ -49,6 +49,35 @@ layer set it, and what is missing for each optional capability.
 | `OPENCOMPANY_OPENHUMAN_URL` | — | Attach to a running `openhuman-core serve` instead of launching |
 | `TINYPLACE_API_URL` | `https://api.tiny.place` | tiny.place base (staging/local override) |
 | `GITHUB_TOKEN` | — | Only for the feedback→issue flow; without it, feedback is stored locally and a prefilled "file it yourself" link is shown |
+| `OPENCOMPANY_MAIL_PROVIDER` | `smtp` when any `OPENCOMPANY_MAIL_*` is set | Host-level outbound mail transport. Supported: `smtp` |
+| `OPENCOMPANY_MAIL_HOST` | — | SMTP submission host. Setting it opts the host into platform mail |
+| `OPENCOMPANY_MAIL_FROM_EMAIL` | — (required with `_HOST`) | Envelope `From` for platform mail |
+| `OPENCOMPANY_MAIL_PORT` | `587` | Submission port |
+| `OPENCOMPANY_MAIL_SECURITY` | `starttls` | `none` \| `starttls` \| `ssl` |
+| `OPENCOMPANY_MAIL_USERNAME` / `_PASSWORD` | — | SMTP auth. Redacted from `Debug` and never logged |
+| `OPENCOMPANY_MAIL_FROM_NAME` | — | Display name on the `From` header |
+
+### Outbound mail
+
+Two credential scopes, deliberately separate:
+
+- **Host-level** (`OPENCOMPANY_MAIL_*`, above): the *platform's* mail identity,
+  used for mail sent on the platform's behalf — login links most of all. One
+  provider per host.
+- **Per-company** (the company's `SecretStore`, written by `PUT …/smtp`): a
+  company's *own* outbound identity, used by the test send and per-teammate
+  mail. A tenant never receives the host-level credential.
+
+Both go through the same provider-agnostic `MailSender` seam
+(`src/server/ops/mailer.rs`). Credentials are a provider-tagged enum, so adding
+a transport is a variant plus a sender behind its own feature — the default
+build still links no network crates. A **partial** `OPENCOMPANY_MAIL_*`
+configuration fails the boot rather than silently disabling mail.
+
+**AWS SES** needs no separate provider: point `OPENCOMPANY_MAIL_HOST` at
+`email-smtp.<region>.amazonaws.com` with SES SMTP credentials. A native SES API
+transport is only worth adding for what the SMTP interface cannot express
+(configuration sets, per-message tags, richer send errors).
 
 ## Optional capabilities and their degradation
 
