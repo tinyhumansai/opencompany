@@ -30,8 +30,8 @@ use crate::policy::ManifestApprovalGate;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
     AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
-    InboxStore, MemoryStore, SecretStore, SkillStateStore, TaskStore, ToolProvider, UsageMeter,
-    WorkspaceStore,
+    InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore, TaskStore,
+    ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
 use crate::runtime::journal::RuntimeJournal;
@@ -136,6 +136,9 @@ pub struct RuntimeBuilder {
     facts: Option<Arc<dyn FactStore>>,
     usage: Option<Arc<dyn UsageMeter>>,
     skills: Option<Arc<dyn SkillStateStore>>,
+    users: Option<Arc<dyn UserStore>>,
+    sessions: Option<Arc<dyn SessionStore>>,
+    login_codes: Option<Arc<dyn LoginCodeStore>>,
     seed_dir: Option<PathBuf>,
     feedback: Option<Arc<FeedbackStore>>,
     github: Option<Arc<dyn GitHubClient>>,
@@ -181,6 +184,9 @@ impl RuntimeBuilder {
             facts: None,
             usage: None,
             skills: None,
+            users: None,
+            sessions: None,
+            login_codes: None,
             seed_dir: None,
             feedback: None,
             github: None,
@@ -273,6 +279,9 @@ impl RuntimeBuilder {
         self.facts = Some(handles.facts.clone());
         self.usage = Some(handles.usage.clone());
         self.skills = Some(handles.skills.clone());
+        self.users = Some(handles.users.clone());
+        self.sessions = Some(handles.sessions.clone());
+        self.login_codes = Some(handles.login_codes.clone());
         self.with_store(handles.company.clone())
             .with_events(handles.events.clone())
             .with_memory(handles.memory.clone())
@@ -284,6 +293,24 @@ impl RuntimeBuilder {
     /// Swaps the task board store (default: fs-backed).
     pub fn with_tasks(mut self, tasks: Arc<dyn TaskStore>) -> Self {
         self.tasks = Some(tasks);
+        self
+    }
+
+    /// Swaps the human user directory (default: fs-backed).
+    pub fn with_users(mut self, users: Arc<dyn UserStore>) -> Self {
+        self.users = Some(users);
+        self
+    }
+
+    /// Swaps the session store (default: fs-backed).
+    pub fn with_sessions(mut self, sessions: Arc<dyn SessionStore>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Swaps the login-code store (default: fs-backed).
+    pub fn with_login_codes(mut self, login_codes: Arc<dyn LoginCodeStore>) -> Self {
+        self.login_codes = Some(login_codes);
         self
     }
 
@@ -474,6 +501,9 @@ impl RuntimeBuilder {
             facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
             usage: self.usage.unwrap_or_else(|| fs_ops.clone()),
             skills: self.skills.unwrap_or_else(|| fs_ops.clone()),
+            users: self.users.unwrap_or_else(|| fs_ops.clone()),
+            sessions: self.sessions.unwrap_or_else(|| fs_ops.clone()),
+            login_codes: self.login_codes.unwrap_or_else(|| fs_ops.clone()),
         };
 
         // Idempotent workspace seeding: only when the workspace is empty (an
@@ -970,6 +1000,121 @@ mod test {
         assert_eq!(company_id_from_name("Acme Co!").as_ref(), "acme-co");
         assert_eq!(company_id_from_name("  Widgets  ").as_ref(), "widgets");
         assert_eq!(company_id_from_name("***").as_ref(), "company");
+    }
+
+    #[tokio::test]
+    async fn user_auth_stores_default_to_fs_and_are_reachable() {
+        use crate::ports::{
+            InviteRecord, LoginCodeRecord, SessionRecord, UserRecord, UserRole, UserStatus,
+        };
+
+        let home = std::env::temp_dir().join(format!("oc-users-{}", crate::ports::generate_id()));
+        let manifest = parse("[company]\nname=\"Acme\"\n[policy]\nmode=\"full\"\n");
+        let id = CompanyId::new("acme");
+        // No with_users/with_sessions/with_login_codes override: the builder must
+        // fall back to the shared fs backend rather than leaving a hole.
+        let runtime = RuntimeBuilder::new(home.clone(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+
+        runtime
+            .users()
+            .upsert_user(
+                &id,
+                &UserRecord {
+                    id: "u1".into(),
+                    email: "ada@example.com".into(),
+                    display_name: None,
+                    role: UserRole::Admin,
+                    status: UserStatus::Active,
+                    created_at_millis: 1,
+                    last_seen_at_millis: None,
+                    updated_at_millis: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .users()
+                .find_user_by_email(&id, "ada@example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "u1"
+        );
+
+        runtime
+            .users()
+            .upsert_invite(
+                &id,
+                &InviteRecord {
+                    id: "i1".into(),
+                    email: "bob@example.com".into(),
+                    role: UserRole::Member,
+                    invited_by: "manifest".into(),
+                    created_at_millis: 1,
+                    expires_at_millis: 10,
+                    accepted_at_millis: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.users().list_invites(&id).await.unwrap().len(), 1);
+
+        runtime
+            .sessions()
+            .create(
+                &id,
+                &SessionRecord {
+                    id: "s1".into(),
+                    token_hash: "hash".into(),
+                    user_id: "u1".into(),
+                    created_at_millis: 1,
+                    expires_at_millis: 10,
+                    last_seen_at_millis: 1,
+                    user_agent: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .sessions()
+                .find_by_token_hash(&id, "hash")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        runtime
+            .login_codes()
+            .create(
+                &id,
+                &LoginCodeRecord {
+                    id: "c1".into(),
+                    code_hash: "codehash".into(),
+                    email: "ada@example.com".into(),
+                    created_at_millis: 1,
+                    expires_at_millis: 10,
+                    consumed_at_millis: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .login_codes()
+                .consume(&id, "codehash", 2)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[tokio::test]

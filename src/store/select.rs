@@ -21,13 +21,16 @@ use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
 use crate::ports::inbox::InboxStore;
+use crate::ports::login_codes::LoginCodeStore;
 use crate::ports::memory::MemoryStore;
 use crate::ports::secrets::SecretStore;
+use crate::ports::sessions::SessionStore;
 use crate::ports::skills_state::SkillStateStore;
 use crate::ports::store::CompanyStore;
 use crate::ports::tasks::TaskStore;
 use crate::ports::types::CompanyId;
 use crate::ports::usage::UsageMeter;
+use crate::ports::users::UserStore;
 use crate::ports::workspace::WorkspaceStore;
 
 /// Which storage backend hosts the durable ports.
@@ -82,6 +85,9 @@ pub struct StorageHandles {
     pub facts: Arc<dyn FactStore>,
     pub usage: Arc<dyn UsageMeter>,
     pub skills: Arc<dyn SkillStateStore>,
+    pub users: Arc<dyn UserStore>,
+    pub sessions: Arc<dyn SessionStore>,
+    pub login_codes: Arc<dyn LoginCodeStore>,
     /// Present when the backend persists company → tenant ownership.
     pub ownership: Option<Arc<dyn OwnershipStore>>,
 }
@@ -154,7 +160,10 @@ fn open_sqlite(data_dir: &Path) -> Result<Option<StorageHandles>> {
         workspace: store.clone(),
         facts: store.clone(),
         usage: store.clone(),
-        skills: store,
+        skills: store.clone(),
+        users: store.clone(),
+        sessions: store.clone(),
+        login_codes: store,
         ownership: None,
     }))
 }
@@ -187,6 +196,9 @@ async fn open_mongodb(settings: &StorageSettings) -> Result<Option<StorageHandle
         facts: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
+        users: store.clone(),
+        sessions: store.clone(),
+        login_codes: store.clone(),
         ownership: Some(store),
     }))
 }

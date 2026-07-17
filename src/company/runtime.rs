@@ -25,8 +25,8 @@ use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    FactStore, InboxStore, MemoryStore, SecretStore, SkillStateStore, TaskStore, ToolProvider,
-    UsageMeter, WorkspaceStore,
+    FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore,
+    TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
@@ -47,6 +47,12 @@ pub struct OpsStores {
     pub usage: Arc<dyn UsageMeter>,
     /// Operator deltas over the company's skills.
     pub skills: Arc<dyn SkillStateStore>,
+    /// The company's human collaborators and their outstanding invites.
+    pub users: Arc<dyn UserStore>,
+    /// Live browser sessions for those users.
+    pub sessions: Arc<dyn SessionStore>,
+    /// Pending magic-link login codes.
+    pub login_codes: Arc<dyn LoginCodeStore>,
 }
 
 /// A running company: its brain, stores, channels, and policy gate, wired
@@ -215,6 +221,21 @@ impl CompanyRuntime {
     /// This company's skill-state deltas.
     pub fn skills(&self) -> &Arc<dyn SkillStateStore> {
         &self.ops.skills
+    }
+
+    /// This company's human collaborators and their invites.
+    pub fn users(&self) -> &Arc<dyn UserStore> {
+        &self.ops.users
+    }
+
+    /// This company's live browser sessions.
+    pub fn sessions(&self) -> &Arc<dyn SessionStore> {
+        &self.ops.sessions
+    }
+
+    /// This company's pending magic-link login codes.
+    pub fn login_codes(&self) -> &Arc<dyn LoginCodeStore> {
+        &self.ops.login_codes
     }
 
     /// Whether an agent economy (tiny.place) is wired in.
