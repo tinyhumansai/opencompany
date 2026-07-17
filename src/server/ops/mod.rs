@@ -19,6 +19,7 @@ pub mod domain;
 pub mod inbox;
 pub mod language;
 pub mod mail;
+pub mod mailer;
 pub mod memory;
 pub mod scope;
 pub mod skills;
@@ -47,7 +48,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::CompanyId;
 use crate::server::error::ApiError;
-use crate::server::ops::smtp::MailSender;
+use crate::server::ops::mailer::{MailCredentials, MailSender};
 
 /// SecretStore key holding the JSON [`DomainStatus`](crate::company::dns::DomainStatus).
 pub(crate) const DOMAIN_KEY: &str = "__domain";
@@ -67,6 +68,12 @@ pub struct ConnectionsRuntime {
     /// Sender used by `POST …/smtp/test` and outbound mail. When `None`,
     /// test-send is "not wired yet" (404).
     pub mail: Option<Arc<dyn MailSender>>,
+    /// Host-level outbound credentials (`OPENCOMPANY_MAIL_*`), used for
+    /// platform mail such as login links — mail sent on the platform's behalf
+    /// rather than a company's. A company's own outbound instead reads its
+    /// `SecretStore`, so a tenant never sees this credential. `None` means the
+    /// host sends no platform mail.
+    pub mail_credentials: Option<MailCredentials>,
 }
 
 impl ConnectionsRuntime {
@@ -86,13 +93,21 @@ impl ConnectionsRuntime {
         self.mail = Some(mail);
         self
     }
+
+    /// Injects the host-level credentials platform mail is sent with.
+    pub fn with_mail_credentials(mut self, creds: MailCredentials) -> Self {
+        self.mail_credentials = Some(creds);
+        self
+    }
 }
 
 impl std::fmt::Debug for ConnectionsRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `MailCredentials`' own Debug redacts the password.
         f.debug_struct("ConnectionsRuntime")
             .field("dns", &self.dns.is_some())
             .field("mail", &self.mail.is_some())
+            .field("mail_credentials", &self.mail_credentials)
             .finish()
     }
 }

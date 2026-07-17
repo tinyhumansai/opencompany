@@ -1,17 +1,23 @@
-//! SMTP credentials + test send.
+//! A company's own SMTP credentials + test send, and the `lettre` transport.
+//!
+//! This is the SMTP-specific half of outbound mail; the provider-agnostic
+//! adapter it plugs into lives in [`mailer`](super::mailer).
 //!
 //! `PUT …/smtp` stores credentials in [`SecretStore`](crate::ports::SecretStore)
 //! under [`SMTP_KEY`](super::SMTP_KEY) and returns a non-secret
 //! [`SmtpStatus`] — the password never appears in any response. `POST …/smtp/test`
-//! sends a test email through the mockable [`MailSender`] seam, pulling the
-//! stored credentials per send, and records the sent mail in the company's
+//! sends a test email through the mockable
+//! [`MailSender`](super::mailer::MailSender) seam, pulling the stored
+//! credentials per send, and records the sent mail in the company's
 //! [`InboxStore`](crate::ports::InboxStore) so the console shows it. The real
 //! `lettre` transport is gated behind the `smtp` feature; without an injected
 //! sender the test route is "not wired yet" (404).
+//!
+//! These are the *company's* credentials, distinct from the host-level ones in
+//! [`MailConfig`](super::mailer::MailConfig) that platform mail uses.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{post, put};
@@ -25,6 +31,7 @@ use crate::ports::inbox::EmailRecord;
 use crate::ports::types::SecretValue;
 use crate::ports::{generate_id, now_millis};
 use crate::server::error::ApiError;
+use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 use crate::server::ops::{SMTP_KEY, ScopedCompany, scoped};
 
 /// The SMTP security mode. Mirrors the console's `SmtpSecurity`.
@@ -117,63 +124,6 @@ impl SmtpStatus {
     }
 }
 
-/// One outbound message handed to a [`MailSender`].
-#[derive(Clone, Debug)]
-pub struct OutboundEmail {
-    /// Recipient address.
-    pub to: String,
-    /// Subject line.
-    pub subject: String,
-    /// Plain-text body.
-    pub body: String,
-}
-
-/// The outbound-send seam. Mockable so the test route is exercised offline; the
-/// real `lettre` transport is gated behind the `smtp` feature.
-#[async_trait]
-pub trait MailSender: Send + Sync {
-    /// Sends `email` using `creds`. An error means the message was not accepted.
-    async fn send(
-        &self,
-        creds: &SmtpCredentials,
-        email: &OutboundEmail,
-    ) -> Result<(), OpenCompanyError>;
-}
-
-/// An offline mock sender that records every send and never fails. Used by
-/// tests and any offline deployment.
-#[derive(Clone, Default)]
-pub struct RecordingMailSender {
-    sent: Arc<Mutex<Vec<(String, OutboundEmail)>>>,
-}
-
-impl RecordingMailSender {
-    /// Creates an empty recording sender.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Every `(from_email, email)` sent so far.
-    pub fn sent(&self) -> Vec<(String, OutboundEmail)> {
-        self.sent.lock().expect("mail sender poisoned").clone()
-    }
-}
-
-#[async_trait]
-impl MailSender for RecordingMailSender {
-    async fn send(
-        &self,
-        creds: &SmtpCredentials,
-        email: &OutboundEmail,
-    ) -> Result<(), OpenCompanyError> {
-        self.sent
-            .lock()
-            .expect("mail sender poisoned")
-            .push((creds.from_email.clone(), email.clone()));
-        Ok(())
-    }
-}
-
 /// Builds the SMTP route fragment.
 pub fn router() -> Router<AppState> {
     scoped("/smtp", put(put_smtp)).merge(scoped("/smtp/test", post(test_smtp)))
@@ -247,7 +197,10 @@ async fn run_test(
         subject: "OpenCompany SMTP test".to_string(),
         body: "This is a test message confirming your outbound email is wired up.".to_string(),
     };
-    match sender.send(&creds, &email).await {
+    // The company's stored credentials are SMTP by construction (the route that
+    // writes them is `PUT …/smtp`), so tag them for the provider-agnostic seam.
+    let tagged = MailCredentials::Smtp(creds.clone());
+    match sender.send(&tagged, &email).await {
         Ok(()) => {
             record_outbound(&runtime, &creds, &email).await;
             Ok(Json(TestResult {
@@ -320,15 +273,20 @@ async fn test_smtp(
 pub struct LettreMailSender;
 
 #[cfg(feature = "smtp")]
-#[async_trait]
-impl MailSender for LettreMailSender {
+#[async_trait::async_trait]
+impl crate::server::ops::mailer::MailSender for LettreMailSender {
     async fn send(
         &self,
-        creds: &SmtpCredentials,
+        creds: &MailCredentials,
         email: &OutboundEmail,
     ) -> Result<(), OpenCompanyError> {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+
+        // Selecting the transport by variant is what makes this an adapter: a
+        // future provider adds a variant, and this match stops compiling until
+        // someone decides what this sender does with it.
+        let MailCredentials::Smtp(creds) = creds;
 
         let from = if creds.from_name.is_empty() {
             creds.from_email.clone()
@@ -404,8 +362,10 @@ mod test {
 
     #[tokio::test]
     async fn recording_sender_captures_send() {
+        use crate::server::ops::mailer::{MailSender, RecordingMailSender};
+
         let sender = RecordingMailSender::new();
-        let creds = SmtpCredentials {
+        let creds = MailCredentials::Smtp(SmtpCredentials {
             host: "h".into(),
             port: 25,
             security: SmtpSecurity::None,
@@ -413,7 +373,7 @@ mod test {
             password: "p".into(),
             from_name: String::new(),
             from_email: "from@x.test".into(),
-        };
+        });
         let email = OutboundEmail {
             to: "to@x.test".into(),
             subject: "s".into(),

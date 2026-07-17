@@ -291,7 +291,11 @@ fn webhook_config(url: String) -> Option<opencompany::server::webhook::WebhookCo
 /// resolver is wired under the `dns` feature and a real SMTP sender under
 /// `smtp`; the default build injects neither, so those surfaces 404 as
 /// "not wired yet".
-fn connections_runtime() -> opencompany::server::ops::ConnectionsRuntime {
+///
+/// Host-level mail credentials (`OPENCOMPANY_MAIL_*`) are resolved here too. A
+/// malformed or half-finished mail configuration is an error rather than a
+/// silent `None`: a deployment that set those vars meant to have working mail.
+fn connections_runtime() -> Result<opencompany::server::ops::ConnectionsRuntime> {
     #[allow(unused_mut)]
     let mut connections = opencompany::server::ops::ConnectionsRuntime::new();
     #[cfg(feature = "dns")]
@@ -306,7 +310,10 @@ fn connections_runtime() -> opencompany::server::ops::ConnectionsRuntime {
         connections =
             connections.with_mail(Arc::new(opencompany::server::ops::smtp::LettreMailSender));
     }
-    connections
+    if let Some(mail) = opencompany::server::ops::mailer::MailConfig::from_env()? {
+        connections = connections.with_mail_credentials(mail.credentials);
+    }
+    Ok(connections)
 }
 
 /// Builds the four fs storage ports over `home` as trait objects.
@@ -527,7 +534,7 @@ async fn main() -> Result<()> {
             // domain verification; a real SMTP sender (feature `smtp`) enables the
             // test send and outbound mail. Absent the features these stay `None`
             // and the surfaces degrade to "not wired yet" (404).
-            state = state.with_connections(connections_runtime());
+            state = state.with_connections(connections_runtime()?);
             // The repo-level shared skill library (`skills/`) sits beside the
             // `companies/` dir; derive it from the first loaded company's source
             // dir so the `skillRegistry` query resolves the committed library.

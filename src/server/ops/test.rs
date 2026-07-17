@@ -17,7 +17,7 @@ use crate::ports::CompanyStore;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::runtime::RuntimeBuilder;
 use crate::server::ops::ConnectionsRuntime;
-use crate::server::ops::smtp::RecordingMailSender;
+use crate::server::ops::mailer::RecordingMailSender;
 use crate::server::router;
 use crate::server::webhook::{DefaultHashSigner, WebhookSigner};
 use crate::{AppConfig, AppState};
