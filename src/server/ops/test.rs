@@ -19,7 +19,9 @@ use crate::runtime::RuntimeBuilder;
 use crate::server::ops::ConnectionsRuntime;
 use crate::server::ops::mailer::RecordingMailSender;
 use crate::server::router;
-use crate::server::webhook::{DefaultHashSigner, WebhookSigner};
+#[cfg(not(feature = "webhooks"))]
+use crate::server::webhook::DefaultHashSigner;
+use crate::server::webhook::WebhookSigner;
 use crate::{AppConfig, AppState};
 
 fn home() -> std::path::PathBuf {
@@ -307,6 +309,13 @@ async fn ingest_good_hmac_files_mail() {
     let app = router(state.clone());
 
     let payload = r#"{"from":"a@x.test","to":"ceo@acme.test","subject":"hi","body":"yo"}"#;
+    // Sign with whatever signer this build actually verifies with, mirroring
+    // `inbox::signer()`. Hardcoding DefaultHashSigner made this test pass only
+    // in the default build and 401 under `--features webhooks`, where the route
+    // verifies with HmacSha256Signer.
+    #[cfg(feature = "webhooks")]
+    let signature = crate::server::webhook::HmacSha256Signer.sign("s3cret", payload.as_bytes());
+    #[cfg(not(feature = "webhooks"))]
     let signature = DefaultHashSigner.sign("s3cret", payload.as_bytes());
 
     let response = app
