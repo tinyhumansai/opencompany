@@ -22,10 +22,15 @@ aborts boot — there is never a silent fallback to the filesystem.
 | `sqlite` | One SQLite file under the data dir | `sqlite` | Single-file, offline |
 | `mongodb` | A MongoDB database on a shared cluster | `mongodb` | The multi-tenant platform backend |
 
-Each backend implements **all eleven** ports. The fs backend keeps the core
+Each backend implements **all fourteen** ports. The fs backend keeps the core
 records as inspectable TOML/JSONL bundles and the WS3 console-surface stores
 under a sibling `ops/` layout (`src/store/fs_ops.rs`); sqlite and mongodb add
 one collection/table per store.
+
+Three of those fourteen — `UserStore`, `SessionStore`, `LoginCodeStore` — back
+[human user authentication](users.md). Sessions and login codes are credential
+material: they hold **hashes only**, and they must never be added to the
+export path below.
 
 MongoDB settings:
 

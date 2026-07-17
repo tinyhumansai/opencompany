@@ -36,6 +36,14 @@ tools = ["docs.*", "email.send"]   # tool grant globs
 budget_usd_daily = 5.0             # per-agent daily spend cap
 
 # ── new tables (all optional) ──────────────────────────────────────────
+[users]
+# Addresses that may sign in as admins without being invited first. This is
+# the bootstrap for invite-only access: someone has to send the first invite,
+# and there is no operator token to do it with. Listing an address does not
+# create an account — it makes the address eligible, and signing in mints the
+# admin. See runtime/users.md.
+admins = ["ada@example.com"]
+
 [brain]
 mode = "hosted"                    # hosted (default) | sidecar
 max_passes = 12                    # passed through to Medulla

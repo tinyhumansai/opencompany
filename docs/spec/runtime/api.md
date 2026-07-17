@@ -9,6 +9,14 @@ handlers live as focused groups under `src/server/`, never in the binary.
 Auth: local operator token in single-user mode; platform-issued JWT in
 platform mode (see below).
 
+> The operator token is currently **unsettable**, so the single-user mode
+> described here authenticates nothing in practice — see
+> [config.md](config.md#authentication-and-network-exposure).
+>
+> Human sign-in is a separate surface with its own routes and its own
+> principal: see [users.md](users.md). A user session can never reach the
+> operator routes below.
+
 ```text
 GET    /api/v1/companies                       list running companies
 POST   /api/v1/companies                       boot from an uploaded manifest (platform)

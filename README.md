@@ -211,6 +211,7 @@ src/brain/              Offline EchoBrain (the default cognition seam)
 src/feedback/           Feedback items, privacy scrubber, GitHub issue filing
 src/runtime/            CompanyRuntime, CycleRunner, cron scheduler, registry
 src/server/             Axum HTTP router and handlers
+src/server/users/       Human sign-in: magic link, passwords, sessions, invites
 src/openhuman/          OpenHuman launcher seams
 src/tiny/               TinyAgents/OpenHuman status surface
 src/bin/opencompany.rs  CLI entrypoint

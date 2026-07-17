@@ -329,6 +329,68 @@ swaps any port. `AppState` holds a `CompanyRegistry` mapping `CompanyId` →
 running `CompanyRuntime`, serving both the single-company prosumer case and
 the multi-tenant platform case with the same type.
 
+### UserStore, SessionStore, LoginCodeStore
+
+The company's human collaborators and their credentials
+(`src/ports/{users,sessions,login_codes}.rs`). Full design in
+[users.md](users.md).
+
+```rust
+#[async_trait]
+pub trait UserStore: Send + Sync {
+    async fn list_users(&self, company: &CompanyId) -> Result<Vec<UserRecord>>;
+    async fn get_user(&self, company: &CompanyId, id: &str) -> Result<Option<UserRecord>>;
+    async fn find_user_by_email(&self, company: &CompanyId, email: &str)
+        -> Result<Option<UserRecord>>;
+    async fn upsert_user(&self, company: &CompanyId, user: &UserRecord) -> Result<()>;
+    async fn delete_user(&self, company: &CompanyId, id: &str) -> Result<bool>;
+
+    async fn list_invites(&self, company: &CompanyId) -> Result<Vec<InviteRecord>>;
+    async fn find_invite_by_email(&self, company: &CompanyId, email: &str)
+        -> Result<Option<InviteRecord>>;
+    async fn upsert_invite(&self, company: &CompanyId, invite: &InviteRecord) -> Result<()>;
+    async fn delete_invite(&self, company: &CompanyId, id: &str) -> Result<bool>;
+}
+
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn create(&self, company: &CompanyId, session: &SessionRecord) -> Result<()>;
+    async fn find_by_token_hash(&self, company: &CompanyId, token_hash: &str)
+        -> Result<Option<SessionRecord>>;
+    async fn list_for_user(&self, company: &CompanyId, user_id: &str)
+        -> Result<Vec<SessionRecord>>;
+    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()>;
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
+    async fn delete_for_user(&self, company: &CompanyId, user_id: &str) -> Result<u64>;
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64>;
+}
+
+#[async_trait]
+pub trait LoginCodeStore: Send + Sync {
+    async fn create(&self, company: &CompanyId, code: &LoginCodeRecord) -> Result<()>;
+    /// Atomically redeems a code. Returns the record only if THIS call consumed
+    /// it; every later call returns `None`.
+    async fn consume(&self, company: &CompanyId, code_hash: &str, now_millis: u64)
+        -> Result<Option<LoginCodeRecord>>;
+    async fn delete_for_email(&self, company: &CompanyId, email: &str) -> Result<u64>;
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64>;
+}
+```
+
+Normative requirements beyond the usual per-company isolation:
+
+- `email` is unique within a company, for users and invites independently.
+  Lookups by email and by token hash are on request-path hot loops and MUST be
+  indexed, not scanned.
+- Email lookup is **exact**. Stores never normalize on the caller's behalf, so
+  a caller that skips `normalize_email` misses rather than silently matching an
+  address it did not ask for.
+- `LoginCodeStore::consume` MUST make its check-and-mark a **single atomic
+  step**. It is the only place single-use is enforced; a read-then-write in a
+  handler would be a check-time/use-time gap.
+- `token_hash` and `code_hash` hold hashes only. Never store, log, or return a
+  plaintext secret.
+
 ## Default implementations
 
 | Port | Default (`src/store/fs.rs` unless noted) | Alternates |
@@ -342,3 +404,4 @@ the multi-tenant platform case with the same type.
 | `ApprovalGate` | manifest `[policy]` evaluator | OpenHuman policy hook |
 | `SecretStore` | fs (encrypted at rest) | OS keychain, operator-supplied |
 | `TaskStore`, `WorkspaceStore`, `FactStore`, `UsageMeter`, `SkillStateStore`, `InboxStore` | fs bundle | sqlite, mongodb |
+| `UserStore`, `SessionStore`, `LoginCodeStore` | fs bundle | sqlite, mongodb |

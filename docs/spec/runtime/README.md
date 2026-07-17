@@ -13,6 +13,8 @@ Supporting docs:
 - [lifecycle.md](lifecycle.md) — company state machine and durability
 - [api.md](api.md) — HTTP routes and auth
 - [config.md](config.md) — configuration and the one-key story
+- [users.md](users.md) — human collaborators: magic-link/password sign-in,
+  sessions, invites, and chat attribution
 
 ## Responsibilities
 
