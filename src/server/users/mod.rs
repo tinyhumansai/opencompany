@@ -16,10 +16,23 @@
 //!
 //! Sub-modules:
 //!
-//! - [`token`]: minting and hashing the two secrets.
+//! - [`token`]: minting and hashing the login/session secrets.
+//! - [`password`]: optional password hashing, verification, and policy.
 //! - [`cookie`]: naming, parsing, and rendering the session cookie.
+//!
+//! ## Passwords are optional
+//!
+//! A user may set a password to skip the round trip through their mailbox, but
+//! the magic link always works and a user who never sets one is unaffected.
+//! There is deliberately **no separate password-reset credential**: "forgot my
+//! password" is a magic-link login followed by setting a new one, which reuses
+//! the path above rather than adding a second emailed secret to get wrong.
+//!
+//! An admin may instead set a *temporary* password, which revokes the user's
+//! sessions and flags the account so the user is asked to replace it.
 
 pub mod cookie;
+pub mod password;
 pub mod token;
 
 #[cfg(test)]

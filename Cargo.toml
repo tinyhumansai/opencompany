@@ -76,6 +76,16 @@ hmac = { version = "0.12", optional = true }
 sha2 = "0.10"
 getrandom = "0.2"
 
+# Argon2id password hashing. Unconditional for the same reason as sha2: a build
+# that cannot verify a password cannot log a human in. Pure-Rust RustCrypto, no
+# system libs, no network. `default-features = false` + "alloc"/"password-hash"
+# drops argon2's own RNG feature — salts come from the crate's TokenSource seam
+# instead, so there is one source of randomness rather than two.
+argon2 = { version = "0.5", default-features = false, features = [
+    "alloc",
+    "password-hash",
+] }
+
 # Real signed per-tenant JWT verification for platform auth.
 jsonwebtoken = { version = "9", optional = true }
 

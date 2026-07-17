@@ -1029,6 +1029,8 @@ mod test {
                     display_name: None,
                     role: UserRole::Admin,
                     status: UserStatus::Active,
+                    password_hash: None,
+                    must_change_password: false,
                     created_at_millis: 1,
                     last_seen_at_millis: None,
                     updated_at_millis: 1,

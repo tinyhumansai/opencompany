@@ -56,9 +56,6 @@ pub enum UserStatus {
 }
 
 /// One human collaborator in a company.
-///
-/// Note there is no password field, and there never will be: authentication is
-/// by emailed single-use code only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserRecord {
@@ -75,6 +72,23 @@ pub struct UserRecord {
     pub role: UserRole,
     /// Whether the user may currently authenticate.
     pub status: UserStatus,
+    /// Argon2id PHC hash of the user's password, if they have set one.
+    ///
+    /// `None` means magic-link only — the common case, and the state every user
+    /// starts in. Never the password itself: see
+    /// [`password`](crate::server::users::password). This field must never be
+    /// serialized into a route response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_hash: Option<String>,
+    /// Whether the user should be asked to replace their password before
+    /// carrying on, set when an admin issues a temporary one.
+    ///
+    /// Advisory: it is surfaced to the console, which drives the change. It is
+    /// not enforced per-route, so it constrains a cooperating client rather
+    /// than an adversarial one — the user is already authenticated either way,
+    /// so this is a nudge, not a boundary.
+    #[serde(default)]
+    pub must_change_password: bool,
     /// Epoch-millis timestamp of when the user redeemed their invite.
     pub created_at_millis: u64,
     /// Epoch-millis timestamp of the user's most recent authenticated request.
@@ -220,6 +234,8 @@ mod test {
             display_name: Some("Ada".to_string()),
             role: UserRole::Admin,
             status: UserStatus::Active,
+            password_hash: None,
+            must_change_password: false,
             created_at_millis: 1,
             last_seen_at_millis: None,
             updated_at_millis: 2,
@@ -230,6 +246,46 @@ mod test {
         assert_eq!(json["status"], "active");
         // Absent optionals stay absent rather than serializing as null.
         assert!(json.get("lastSeenAtMillis").is_none());
+        assert!(
+            json.get("passwordHash").is_none(),
+            "a user with no password must not carry a null hash field"
+        );
+        assert_eq!(serde_json::from_value::<UserRecord>(json).unwrap(), user);
+    }
+
+    #[test]
+    fn a_user_stored_before_passwords_existed_still_loads() {
+        // Records written by the magic-link-only build carry neither field.
+        // They must load as "no password, nothing to change" rather than fail.
+        let json = serde_json::json!({
+            "id": "u1",
+            "email": "ada@example.com",
+            "role": "member",
+            "status": "active",
+            "createdAtMillis": 1,
+            "updatedAtMillis": 2,
+        });
+        let user: UserRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(user.password_hash, None);
+        assert!(!user.must_change_password);
+    }
+
+    #[test]
+    fn a_password_hash_round_trips_when_set() {
+        let user = UserRecord {
+            id: "u1".to_string(),
+            email: "ada@example.com".to_string(),
+            display_name: None,
+            role: UserRole::Member,
+            status: UserStatus::Active,
+            password_hash: Some("$argon2id$v=19$...".to_string()),
+            must_change_password: true,
+            created_at_millis: 1,
+            last_seen_at_millis: None,
+            updated_at_millis: 2,
+        };
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json["mustChangePassword"], true);
         assert_eq!(serde_json::from_value::<UserRecord>(json).unwrap(), user);
     }
 }
