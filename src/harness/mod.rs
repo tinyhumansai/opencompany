@@ -22,16 +22,18 @@
 //!
 //! ## Flagged seams
 //!
-//! * **Live turn cost.** openhuman exposes the completed turn's token/cost
-//!   totals only through a `pub(crate)` accessor
-//!   (`Agent::take_last_turn_usage_totals`), so a host crate cannot read the
-//!   real [`TurnCost`] after `turn()`. Until openhuman adds a public accessor
-//!   (or the harness ships a usage-accumulating provider), [`HarnessPool::run`]
-//!   records a zero-usage turn — which, per the cost contract, writes nothing.
-//!   The [`cost`] mapping itself is complete and tested.
 //! * **Group-chat / desk routing** is opencompany's job (openhuman is
 //!   single-agent). v1 is single-responder; the full ops `chat` handler that
 //!   resolves a desk's members and journals the `AgentReply` is WS3.
+//!
+//! Live turn cost is **wired**: [`CompanyAgent::run`] reads the completed turn's
+//! token/cost totals from openhuman's public
+//! [`Agent::last_turn_usage`](oh::agent::Agent::last_turn_usage) accessor and
+//! [`HarnessPool::run`] records them through [`cost::record_turn_cost`]. Usage
+//! only reaches the ledger/meter when the provider reports it — the
+//! [`HostedProvider`](provider::HostedProvider) parses it off the wire; the
+//! offline [`MockProvider`](provider::MockProvider) does not, so test turns stay
+//! inert.
 
 pub mod build;
 pub mod cost;
@@ -86,13 +88,30 @@ pub struct CompanyAgent {
 }
 
 impl CompanyAgent {
-    /// Runs one turn against this agent, returning its reply text.
-    pub async fn run(&self, message: &str) -> crate::Result<String> {
+    /// Runs one turn against this agent, returning its reply text and the turn's
+    /// token/cost totals.
+    ///
+    /// The usage is read from the just-completed turn via openhuman's public
+    /// [`Agent::last_turn_usage`](oh::agent::Agent::last_turn_usage) accessor
+    /// while the agent lock is still held (so a concurrent turn can't overwrite
+    /// it). An offline provider that reports no usage yields a zero
+    /// [`TurnUsage`], which the cost hook treats as inert.
+    pub async fn run(&self, message: &str) -> crate::Result<(String, TurnUsage)> {
         let mut agent = self.agent.lock().await;
-        agent
+        let reply = agent
             .turn(message)
             .await
-            .map_err(|e| OpenCompanyError::Harness(format!("turn for '{}': {e}", self.agent_id)))
+            .map_err(|e| OpenCompanyError::Harness(format!("turn for '{}': {e}", self.agent_id)))?;
+        let usage = agent
+            .last_turn_usage()
+            .map(|u| TurnUsage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cached_input_tokens: u.cached_input_tokens,
+                cost_usd: u.cost_usd,
+            })
+            .unwrap_or_default();
+        Ok((reply, usage))
     }
 }
 
@@ -159,31 +178,10 @@ impl HarnessPool {
                 })?
         };
 
-        let reply = agent.run(message).await?;
-
-        // Cost accounting. openhuman only exposes the completed turn's usage via
-        // a `pub(crate)` accessor, so we cannot read the real `TurnCost` here yet
-        // (see module docs — flagged seam). A zero-usage turn writes nothing, so
-        // this is correct-but-inert until a public accessor lands; the mapping is
-        // fully wired so it becomes real with a one-line swap.
-        //
-        // FOLLOW-UP(openhuman#4940): once the vendored openhuman submodule
-        // pointer bumps to include the public `Agent::last_turn_usage()`
-        // accessor, replace this line with a read of the real per-turn totals,
-        // e.g.:
-        //     let u = agent.last_turn_usage();
-        //     let turn_cost = TurnUsage {
-        //         input_tokens: u.input_tokens,
-        //         output_tokens: u.output_tokens,
-        //         cached_input_tokens: u.cached_input_tokens,
-        //         cost_usd: u.cost_usd,
-        //         call_count: u.call_count,
-        //     };
-        // The mapping in `cost::usage_sample_for` / `cost::ledger_entry_for` is
-        // already correct, so this swap alone turns on the WS5 Usage/Finances
-        // data stream. Until then the accessor is absent from the pinned
-        // submodule and calling it would not compile under `--features openhuman`.
-        let turn_cost = TurnUsage::default();
+        // Run the turn and record its real cost. `CompanyAgent::run` reads the
+        // turn's token/cost totals from openhuman's public `last_turn_usage()`
+        // accessor; a zero-usage turn (offline provider) writes nothing.
+        let (reply, turn_cost) = agent.run(message).await?;
         record_turn_cost(
             &turn_cost,
             agent_id,
