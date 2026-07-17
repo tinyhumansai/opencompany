@@ -66,6 +66,38 @@ until the wallet is funded, with a clear operator prompt. Whether TinyHumans
 sponsors handle claims via a delegated signer bundled with the account is an
 open product question ([company-as-agent/identity.md](../company-as-agent/identity.md)).
 
+## Authentication and network exposure
+
+> **Known limitation.** `opencompany serve` currently authenticates nothing.
+> Anyone who can reach the port has full operator access to every route.
+
+`AppConfig::operator_token` gates the operator routes (`OperatorAuth`,
+`resolve_claims`), and when it is `None` those routes allow **every** request —
+the Phase-1 dev-mode convenience. That field is **dead configuration today**:
+no environment variable, CLI flag, or `config.toml` key sets it, and
+`bin/opencompany.rs` builds `AppConfig` without it. It is populated only in
+tests. So the serve path is always in dev mode, and
+[api.md](api.md)'s "local operator token in single-user mode" describes an
+intent, not current behavior.
+
+Consequently **the only thing isolating a company today is the network**:
+
+- **Hosted mode**: the manager injects `OPENCOMPANY_BIND=0.0.0.0:8080` and no
+  token. The container is reachable only through the manager's wake-on-request
+  proxy on a private Docker/k8s network, which is what keeps tenants apart.
+  Binding `0.0.0.0` is mandatory there — a container must accept traffic from
+  its network — so the bind address is *not* evidence of exposure; port
+  publishing is.
+- **Self-hosting**: `opencompany serve --bind 0.0.0.0:8080` on a routable host
+  publishes chat, tasks, secrets, and provisioning to anyone who can reach it,
+  with no warning. Bind to loopback, or put an authenticating proxy in front.
+
+Per-company [user authentication](users.md) does **not** close this. It adds a
+principal for humans; it does not retire dev mode. Making `operator_token`
+settable and enforcing it on a routable bind is worthwhile, but it is a
+coordinated change with the manager — the guard cannot land in the tenant
+before the manager supplies a token, or every tenant container stops booting.
+
 ## Secrets handling
 
 The TinyHumans credential and all per-company secrets live in the
