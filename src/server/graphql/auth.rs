@@ -31,6 +31,11 @@ pub struct UserPrincipal {
     pub email: String,
     /// What the user may do inside their company.
     pub role: UserRole,
+    /// Whether an admin issued a temporary password this user must replace.
+    ///
+    /// Carried on the principal so the check is a boundary at the extractor
+    /// rather than a convention the console is trusted to honor.
+    pub must_change_password: bool,
     /// The session's token hash, so logout can revoke exactly this session.
     pub session_token_hash: String,
 }
@@ -44,24 +49,20 @@ impl UserPrincipal {
 
 /// The authenticated principal for a request.
 ///
-/// - `Dev`: prosumer mode with no `operator_token` configured (local dev).
-/// - `Operator`: prosumer mode, the configured operator token matched.
-/// - `Platform`: platform mode, a verified platform/tenant token.
+/// - `Platform`: a verified platform/tenant token — the *machine* credential,
+///   used by the hosting layer.
 /// - `User`: a human collaborator with a session cookie, scoped to one company.
 ///
-/// The first three are *machine* credentials and are what
-/// [`resolve_claims`] returns. `User` can only come from
-/// [`resolve_principal`], which is the property that keeps humans off the
-/// operator write plane — see [`resolve_claims`].
+/// There is no unauthenticated principal. There used to be `Dev` (no operator
+/// token configured ⇒ allow everything) and `Operator` (a shared bearer), but
+/// the operator token could never actually be set, so `Dev` was the only
+/// reachable state and every deployment served every route to anyone. Humans
+/// authenticate as themselves now; nothing is open.
 #[derive(Clone, Debug)]
 pub enum GqlAuth {
-    /// Prosumer dev mode: no operator token configured, every call allowed.
-    Dev,
-    /// Prosumer mode with a matching operator token.
-    Operator,
     /// Platform mode with verified tenant claims.
     Platform(PlatformClaims),
-    /// A human collaborator of exactly one company. Never an operator.
+    /// A human collaborator of exactly one company.
     User(UserPrincipal),
 }
 
@@ -72,34 +73,21 @@ pub struct Unauthorized;
 
 /// Turns an `Authorization` header into a **machine** [`GqlAuth`] principal.
 ///
-/// This is the single claims-resolution path for machine credentials, shared by
-/// the REST extractors and the GraphQL handler:
+/// Only platform mode has machine credentials: the bearer must verify, else
+/// [`Unauthorized`]. Without `platform_auth` configured there is no machine
+/// credential to present, so this always fails and callers must come in as a
+/// human via [`resolve_principal`].
 ///
-/// - Platform mode (`platform_auth` configured): the bearer must verify, else
-///   [`Unauthorized`]. Any valid token (platform-scope or tenant) yields
-///   [`GqlAuth::Platform`].
-/// - Prosumer mode: no `operator_token` → [`GqlAuth::Dev`]; a matching token →
-///   [`GqlAuth::Operator`]; a wrong/missing token when one is configured →
-///   [`Unauthorized`].
-///
-/// **It can never return [`GqlAuth::User`], and that is load-bearing.** Every
-/// operator/platform write route reaches auth through this function (via
-/// `PlatformOrOperatorAuth`, `PlatformScope`, and `ScopedCompany`), so a
-/// session cookie cannot reach any of them no matter what it contains — not
-/// because each route checks, but because the type it receives cannot represent
-/// a human. User-facing routes opt in explicitly by calling
-/// [`resolve_principal`] instead.
+/// **It can never return [`GqlAuth::User`], and that is load-bearing.** Routes
+/// that mean to serve only the hosting layer (provisioning, suspension) resolve
+/// through this and therefore cannot be reached by a session cookie, no matter
+/// what it contains — not because each route checks, but because the type it
+/// receives cannot represent a human.
 pub fn resolve_claims(headers: &HeaderMap, state: &AppState) -> Result<GqlAuth, Unauthorized> {
-    if let Some(platform) = state.config().platform_auth.as_ref() {
-        let token = bearer(headers).ok_or(Unauthorized)?;
-        let claims = platform.verifier.verify(token).map_err(|_| Unauthorized)?;
-        return Ok(GqlAuth::Platform(claims));
-    }
-    match state.config().operator_token.as_deref() {
-        None => Ok(GqlAuth::Dev),
-        Some(expected) if bearer(headers) == Some(expected) => Ok(GqlAuth::Operator),
-        Some(_) => Err(Unauthorized),
-    }
+    let platform = state.config().platform_auth.as_ref().ok_or(Unauthorized)?;
+    let token = bearer(headers).ok_or(Unauthorized)?;
+    let claims = platform.verifier.verify(token).map_err(|_| Unauthorized)?;
+    Ok(GqlAuth::Platform(claims))
 }
 
 /// Resolves the full principal: a valid session cookie wins, else the machine
@@ -191,6 +179,7 @@ async fn resolve_session(
         user_id: user.id,
         email: user.email,
         role: user.role,
+        must_change_password: user.must_change_password,
         session_token_hash: token_hash,
     })
 }
@@ -204,7 +193,6 @@ impl GqlAuth {
     /// Mirrors [`authorize_address`](crate::server::platform_auth::authorize_address).
     pub fn authorize(&self, state: &AppState, company: &CompanyId) -> async_graphql::Result<()> {
         match self {
-            GqlAuth::Dev | GqlAuth::Operator => Ok(()),
             GqlAuth::Platform(claims) => {
                 if claims.has_platform_scope() {
                     return Ok(());
@@ -236,7 +224,6 @@ impl GqlAuth {
     pub fn visible_companies(&self, state: &AppState) -> Vec<CompanyId> {
         let all = state.registry().list();
         match self {
-            GqlAuth::Dev | GqlAuth::Operator => all,
             GqlAuth::Platform(claims) if claims.has_platform_scope() => all,
             GqlAuth::Platform(claims) => all
                 .into_iter()

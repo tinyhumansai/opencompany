@@ -22,9 +22,6 @@ pub struct AppConfig {
     pub bind: String,
     /// Optional sibling OpenHuman checkout used by launcher commands.
     pub openhuman_root: Option<PathBuf>,
-    /// Bearer token required on operator routes. When `None`, Phase-1 dev mode
-    /// allows local operator calls without authentication.
-    pub operator_token: Option<String>,
     /// TinyHumans orchestration API base URL.
     pub api_url: String,
     /// Which brain the runtime drives.
@@ -37,8 +34,12 @@ pub struct AppConfig {
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
     pub tinyhumans_credential: Option<SecretValue>,
     /// Platform (multi-tenant) auth. When set, `{id}` routes honor tenant scopes
-    /// and provisioning/suspension require the `platform` scope. When `None`, the
-    /// prosumer `operator_token` path is used.
+    /// and provisioning/suspension require the `platform` scope.
+    ///
+    /// When `None` there are no machine credentials at all, and every request
+    /// must carry a human's session — see `server::users`. Provisioning over
+    /// HTTP is then unavailable by construction; self-hosters load companies
+    /// with `serve --company <dir>`.
     pub platform_auth: Option<PlatformAuthConfig>,
     /// Global cap on the number of provisioned companies. `None` = unlimited.
     pub max_companies: Option<usize>,
@@ -53,7 +54,6 @@ impl Default for AppConfig {
         Self {
             bind: "127.0.0.1:8080".to_string(),
             openhuman_root: None,
-            operator_token: None,
             api_url: crate::app::config::DEFAULT_API_URL.to_string(),
             brain_mode: BrainMode::Hosted,
             tinyplace_api_url: crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string(),
@@ -130,10 +130,6 @@ impl std::fmt::Debug for AppConfig {
         f.debug_struct("AppConfig")
             .field("bind", &self.bind)
             .field("openhuman_root", &self.openhuman_root)
-            .field(
-                "operator_token",
-                &self.operator_token.as_ref().map(|_| "set"),
-            )
             .field("api_url", &self.api_url)
             .field("brain_mode", &self.brain_mode)
             .field("tinyplace_api_url", &self.tinyplace_api_url)

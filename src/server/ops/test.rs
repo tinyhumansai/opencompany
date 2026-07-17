@@ -55,6 +55,7 @@ async fn state_with(home: &std::path::Path, connections: ConnectionsRuntime) -> 
         .with_home(home.to_path_buf())
         .with_connections(connections);
     state.registry().insert(id, Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
     state
 }
 
@@ -74,6 +75,7 @@ async fn put_domain_returns_records() {
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/company/domain")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"domain":"acme.com"}"#))
                 .unwrap(),
@@ -100,6 +102,7 @@ async fn verify_without_resolver_is_404_not_wired() {
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/company/domain")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"domain":"acme.com"}"#))
                 .unwrap(),
@@ -112,6 +115,7 @@ async fn verify_without_resolver_is_404_not_wired() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/company/domain/verify")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -135,6 +139,7 @@ async fn verify_with_resolver_marks_verified() {
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/company/domain")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"domain":"acme.com"}"#))
                 .unwrap(),
@@ -147,6 +152,7 @@ async fn verify_with_resolver_marks_verified() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/company/domain/verify")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -169,6 +175,7 @@ async fn put_smtp_hides_password() {
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/company/smtp")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"host":"smtp.acme.test","port":587,"security":"starttls","username":"u","password":"top-secret","from_email":"ceo@acme.test"}"#,
@@ -198,6 +205,7 @@ async fn smtp_test_without_sender_is_404() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/company/smtp/test")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -220,6 +228,7 @@ async fn smtp_test_sends_and_records_outbound() {
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/company/smtp")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"host":"smtp.acme.test","port":587,"username":"u","password":"pw","from_email":"ceo@acme.test"}"#,
@@ -234,6 +243,7 @@ async fn smtp_test_sends_and_records_outbound() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/company/smtp/test")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"to":"ops@acme.test"}"#))
                 .unwrap(),
@@ -270,6 +280,7 @@ async fn ingest_bad_hmac_is_401_and_no_mail() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/company/inboxes/ingest")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .header("x-opencompany-signature", "kh1=deadbeef")
                 .body(Body::from(
@@ -323,6 +334,7 @@ async fn ingest_good_hmac_files_mail() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/company/inboxes/ingest")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .header("content-type", "application/json")
                 .header("x-opencompany-signature", signature)
                 .body(Body::from(payload))

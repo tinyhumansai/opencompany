@@ -1,12 +1,15 @@
-//! Platform authentication: a tenant-scoped bearer credential distinct from the
-//! prosumer operator token.
+//! Platform authentication: the hosting layer's tenant-scoped bearer.
 //!
-//! The operator token (`AppConfig::operator_token`) authorizes a single
-//! company's owner. Platform mode adds a *second* surface: a platform-issued
-//! bearer whose verified [`PlatformClaims`] carry a `tenant`, a set of `scopes`,
-//! and an optional company allow-list. Provisioning and suspension require the
-//! `platform` scope; every tenant token is confined to the companies it owns, so
-//! it can never cross tenants.
+//! This is the only *machine* credential. A platform-issued bearer's verified
+//! [`PlatformClaims`] carry a `tenant`, a set of `scopes`, and an optional
+//! company allow-list. Provisioning and suspension require the `platform`
+//! scope; every tenant token is confined to the companies it owns, so it can
+//! never cross tenants.
+//!
+//! Humans do not use this surface — they sign in and carry a session cookie
+//! (see [`server::users`](crate::server::users)). Without `platform_auth`
+//! configured there is no machine credential at all, and a session is the only
+//! way in.
 //!
 //! The verification seam is [`PlatformVerifier`]. The default build ships an
 //! offline [`StaticPlatformVerifier`] (a shared platform secret plus unsigned,
@@ -17,7 +20,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, RawPathParams};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -29,6 +32,7 @@ use serde_json::json;
 use crate::AppState;
 use crate::error::OpenCompanyError;
 use crate::ports::types::CompanyId;
+use crate::server::graphql::auth::GqlAuth;
 
 /// The `platform` scope, required for provisioning and suspension.
 pub const SCOPE_PLATFORM: &str = "platform";
@@ -193,6 +197,32 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+/// Refuses a user who is still carrying an admin-issued temporary password.
+///
+/// An admin who resets a password knows it, and conveys it over some channel
+/// they do not control. So a session opened with one is only good for replacing
+/// it: this returns `403 password_change_required` everywhere except the auth
+/// routes (set-password, logout, me), which deliberately do not call this so
+/// the user can always resolve the situation.
+///
+/// Checked at the extractors rather than surfaced to the console, so it holds
+/// against a client that would rather not honor it.
+pub(crate) fn refuse_until_password_changed(auth: &GqlAuth) -> Option<Response> {
+    match auth {
+        GqlAuth::User(user) if user.must_change_password => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "set a new password before continuing",
+                    "code": "password_change_required",
+                })),
+            )
+                .into_response(),
+        ),
+        _ => None,
+    }
+}
+
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -209,42 +239,57 @@ pub(crate) fn forbidden() -> Response {
         .into_response()
 }
 
-/// An extractor that accepts either a platform token (platform mode) or the
-/// prosumer operator token (prosumer mode).
+/// An extractor for any principal entitled to address a company: a platform
+/// token, or a human's session cookie.
 ///
-/// - Platform mode (`platform_auth` configured): a valid platform/tenant token
-///   yields `Some(claims)`; a missing or invalid token is `401`.
-/// - Prosumer mode: mirrors [`OperatorAuth`](crate::server::operator) — dev mode
-///   (no `operator_token`) allows the call with `None`; a configured token must
-///   match, else `401`.
-pub struct PlatformOrOperatorAuth(pub Option<PlatformClaims>);
+/// Replaces the old `PlatformOrOperatorAuth`, whose `Option<PlatformClaims>`
+/// could not represent a human and whose `None` meant "dev mode, allow
+/// everything". There is no such state now — an unauthenticated request is
+/// `401`.
+///
+/// The extractor resolves the addressed company from the `{id}` path param when
+/// present so a session cookie can be matched to it; on the single-company
+/// alias the sole session cookie selects itself.
+pub struct CompanyAuth(pub GqlAuth);
 
-impl FromRequestParts<AppState> for PlatformOrOperatorAuth {
+impl FromRequestParts<AppState> for CompanyAuth {
     type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        use crate::server::graphql::auth::{GqlAuth, resolve_claims};
-        match resolve_claims(&parts.headers, state) {
-            Ok(GqlAuth::Platform(claims)) => Ok(Self(Some(claims))),
-            Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(Self(None)),
-            // Unreachable: `resolve_claims` reads machine credentials only and
-            // cannot construct a User. Stated rather than wildcarded so that if
-            // it ever could, this refuses instead of mapping a human onto
-            // `None` — which `authorize_address` reads as "dev/operator, allow
-            // everything". That silent widening is the whole hazard.
-            Ok(GqlAuth::User(_)) => Err(forbidden()),
+        use crate::server::graphql::auth::resolve_principal;
+
+        // Sniff `{id}` without consuming it; handlers still extract their own.
+        let company = RawPathParams::from_request_parts(parts, state)
+            .await
+            .ok()
+            .and_then(|params| {
+                params
+                    .iter()
+                    .find(|(key, _)| *key == "id")
+                    .map(|(_, value)| CompanyId::new(value))
+            });
+        match resolve_principal(&parts.headers, state, company.as_ref()).await {
+            Ok(auth) => Ok(Self(auth)),
             Err(_) => Err(unauthorized()),
         }
     }
 }
 
-/// An extractor that requires the `platform` scope in platform mode. In prosumer
-/// mode it falls back to operator-token semantics (the single-tenant operator is
-/// the platform admin).
-pub struct PlatformScope(pub Option<PlatformClaims>);
+/// An extractor requiring the `platform` scope: the hosting layer only.
+///
+/// This gates provisioning and suspension — creating and destroying companies
+/// across tenants. It resolves through [`resolve_claims`], which cannot return
+/// a human, so a session cookie can never reach these routes whatever it
+/// contains.
+///
+/// Without `platform_auth` configured nobody holds the scope, so a self-hosted
+/// deployment has no HTTP provisioning at all and loads companies with
+/// `serve --company <dir>`. That is the intended shape: a prosumer host has no
+/// machine credential to hand out.
+pub struct PlatformScope(pub PlatformClaims);
 
 impl FromRequestParts<AppState> for PlatformScope {
     type Rejection = Response;
@@ -255,12 +300,10 @@ impl FromRequestParts<AppState> for PlatformScope {
     ) -> Result<Self, Self::Rejection> {
         use crate::server::graphql::auth::{GqlAuth, resolve_claims};
         match resolve_claims(&parts.headers, state) {
-            Ok(GqlAuth::Platform(claims)) if claims.has_platform_scope() => Ok(Self(Some(claims))),
+            Ok(GqlAuth::Platform(claims)) if claims.has_platform_scope() => Ok(Self(claims)),
             Ok(GqlAuth::Platform(_)) => Err(forbidden()),
-            Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(Self(None)),
-            // Unreachable today; see `PlatformOrOperatorAuth`. A human must
-            // never hold the platform scope — that is provisioning and
-            // suspension across tenants.
+            // Unreachable: resolve_claims cannot construct a User. Stated
+            // rather than wildcarded so that if it ever could, this refuses.
             Ok(GqlAuth::User(_)) => Err(forbidden()),
             Err(_) => Err(unauthorized()),
         }
@@ -276,31 +319,39 @@ impl FromRequestParts<AppState> for PlatformScope {
 ///
 /// Returns `Some(403 forbidden)` on a cross-tenant or out-of-allow-list attempt,
 /// or `None` when the caller is allowed to address `id`.
-pub fn authorize_address(
-    state: &AppState,
-    claims: &Option<PlatformClaims>,
-    id: &CompanyId,
-) -> Option<Response> {
-    let Some(claims) = claims else {
-        return None;
-    };
-    if claims.has_platform_scope() {
-        return None;
-    }
-    let owner = state.owner_of(id);
-    if owner.as_deref() == Some(claims.tenant.as_str()) && claims.may_address(id) {
-        None
-    } else {
-        Some(forbidden())
+pub fn authorize_address(state: &AppState, auth: &GqlAuth, id: &CompanyId) -> Option<Response> {
+    match auth {
+        GqlAuth::Platform(claims) => {
+            if claims.has_platform_scope() {
+                return None;
+            }
+            let owner = state.owner_of(id);
+            if owner.as_deref() == Some(claims.tenant.as_str()) && claims.may_address(id) {
+                None
+            } else {
+                Some(forbidden())
+            }
+        }
+        // A user belongs to one company. The storage partition already makes a
+        // cross-company session unresolvable; this is the explicit check.
+        GqlAuth::User(user) => {
+            if user.company == *id {
+                None
+            } else {
+                Some(forbidden())
+            }
+        }
     }
 }
 
 /// The tenant a token acts as, for ownership recording. Platform-scope and dev
 /// callers act as the `tenant:platform` account.
-pub fn acting_tenant(claims: &Option<PlatformClaims>) -> String {
-    match claims {
-        Some(claims) => claims.tenant.clone(),
-        None => "tenant:platform".to_string(),
+pub fn acting_tenant(auth: &GqlAuth) -> String {
+    match auth {
+        GqlAuth::Platform(claims) => claims.tenant.clone(),
+        // A human acts for the company they belong to. Ownership records a
+        // tenant, and a self-hosted company's tenant is itself.
+        GqlAuth::User(user) => format!("company:{}", user.company),
     }
 }
 

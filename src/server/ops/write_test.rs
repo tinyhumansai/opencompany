@@ -46,6 +46,9 @@ async fn state_with_company(home: &std::path::Path) -> AppState {
         .unwrap();
     let state = AppState::new(AppConfig::default());
     state.registry().insert(id, std::sync::Arc::new(runtime));
+    // Every route needs a principal now; the harness signs in as an admin so
+    // tests keep asserting write behavior rather than auth.
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
     state
 }
 
@@ -68,6 +71,11 @@ async fn send_auth(
     let mut request = Request::builder().method(method).uri(uri);
     if let Some(token) = token {
         request = request.header("authorization", format!("Bearer {token}"));
+    } else {
+        // No explicit credential: sign in as the harness admin. Every route
+        // needs a principal now, so an unauthenticated request would only ever
+        // assert 401 rather than the behavior under test.
+        request = request.header("cookie", crate::server::test_support::fixed_cookie("acme"));
     }
     let request = match body {
         Some(body) => request

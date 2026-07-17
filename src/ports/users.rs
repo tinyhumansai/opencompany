@@ -80,13 +80,14 @@ pub struct UserRecord {
     /// serialized into a route response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
-    /// Whether the user should be asked to replace their password before
-    /// carrying on, set when an admin issues a temporary one.
+    /// Whether the user must replace their password before doing anything
+    /// else, set when an admin issues a temporary one.
     ///
-    /// Advisory: it is surfaced to the console, which drives the change. It is
-    /// not enforced per-route, so it constrains a cooperating client rather
-    /// than an adversarial one — the user is already authenticated either way,
-    /// so this is a nudge, not a boundary.
+    /// A real boundary, not a hint: the auth extractors refuse a flagged
+    /// session with `403 password_change_required` everywhere except
+    /// set-password, logout, and `me`. An admin who resets a password knows it
+    /// and conveys it over a channel they do not control, so a session opened
+    /// with one is good for exactly one thing.
     #[serde(default)]
     pub must_change_password: bool,
     /// Epoch-millis timestamp of when the user redeemed their invite.

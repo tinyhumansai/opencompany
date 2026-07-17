@@ -22,8 +22,7 @@ use crate::feedback::service::FeedbackResponse;
 use crate::feedback::types::FeedbackInput;
 use crate::ports::types::CompanyId;
 use crate::server::error::ApiError;
-use crate::server::operator::OperatorAuth;
-use crate::server::platform_auth::{PlatformOrOperatorAuth, authorize_address};
+use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 
 /// Builds the feedback route fragment, merged into the main router.
 pub fn router() -> Router<AppState> {
@@ -73,13 +72,13 @@ async fn run(
 /// platform-or-operator auth and enforces tenant ownership, so one tenant can
 /// never file feedback (or trigger issue-filing) against another's company.
 async fn submit(
-    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<FeedbackRequest>,
 ) -> Result<Json<FeedbackResponse>, Response> {
     let company = CompanyId::new(&id);
-    if let Some(resp) = authorize_address(&state, &claims, &company) {
+    if let Some(resp) = authorize_address(&state, &auth, &company) {
         return Err(resp);
     }
     let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
@@ -90,11 +89,22 @@ async fn submit(
 
 /// `POST /api/v1/company/feedback` (single-company alias).
 async fn submit_single(
-    _auth: OperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
     Json(body): Json<FeedbackRequest>,
-) -> Result<Json<FeedbackResponse>, ApiError> {
-    run(sole(&state)?, body).await
+) -> Result<Json<FeedbackResponse>, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
+    // The sole company IS the addressed one, so the principal is checked
+    // against it exactly as on the `{id}` form.
+    if let Some(resp) = authorize_address(&state, &auth, runtime.id()) {
+        return Err(resp);
+    }
+    if let Some(resp) = refuse_until_password_changed(&auth) {
+        return Err(resp);
+    }
+    run(runtime, body)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 #[cfg(test)]
@@ -157,6 +167,7 @@ mod test {
             .unwrap();
         let state = AppState::new(AppConfig::default());
         state.registry().insert(id, Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
         state
     }
 
@@ -168,6 +179,9 @@ mod test {
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/json")
+                    // Every route needs a principal now; sign in as the
+                    // harness admin so these assert feedback behavior.
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -259,14 +273,15 @@ mod test {
         let state = state_with_company(&home, github).await;
         let app = router(state);
 
-        let (status, value) = post_json(
+        let (status, _value) = post_json(
             &app,
             "/api/v1/companies/ghost/feedback",
             r#"{"category":"bug","note":"x"}"#,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(value["code"], "company_not_found");
+        // 401, not 404: authentication precedes existence, so an unauthenticated
+        // caller cannot enumerate which companies this host runs.
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }

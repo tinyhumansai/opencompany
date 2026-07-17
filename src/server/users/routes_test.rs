@@ -882,6 +882,116 @@ async fn an_admin_reset_forces_a_change_and_kills_sessions() {
 }
 
 #[tokio::test]
+async fn a_temporary_password_is_a_boundary_not_a_suggestion() {
+    let home = home();
+    let (state, sender) = state_with_mail(&home).await;
+    let admin = login_via_link(&state, &sender, "ada@example.com").await;
+
+    let app = router(state.clone());
+    app.oneshot(post_with_cookie(
+        "/api/v1/companies/acme/users/invites",
+        serde_json::json!({ "email": "bob@example.com" }),
+        &admin,
+    ))
+    .await
+    .unwrap();
+    login_via_link(&state, &sender, "bob@example.com").await;
+    let bob_id = user_id(&state, &admin, "bob@example.com").await;
+
+    let app = router(state.clone());
+    app.oneshot(post_with_cookie(
+        &format!("/api/v1/companies/acme/users/{bob_id}/password"),
+        serde_json::json!({ "password": "temporary pass phrase" }),
+        &admin,
+    ))
+    .await
+    .unwrap();
+
+    // Bob signs in with the temporary password the admin chose — and knows.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post(
+            "/api/v1/companies/acme/auth/login",
+            serde_json::json!({
+                "email": "bob@example.com",
+                "password": "temporary pass phrase",
+            }),
+        ))
+        .await
+        .unwrap();
+    let temp_cookie = session_cookie(&response);
+
+    // That session is good for exactly one thing: replacing the password. The
+    // admin knows this secret and conveyed it over some channel they do not
+    // control, so it must not be a working session for anything else.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post_with_cookie(
+            "/api/v1/companies/acme/tasks",
+            serde_json::json!({ "title": "work" }),
+            &temp_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_json(response).await["code"],
+        "password_change_required"
+    );
+
+    // Chat too — this is enforced at the extractors, not per-route.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post_with_cookie(
+            "/api/v1/companies/acme/chat",
+            serde_json::json!({ "message": "hi" }),
+            &temp_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // But `me` and set-password stay open, or the user could never escape.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(get_with_cookie(
+            "/api/v1/companies/acme/auth/me",
+            &temp_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post_with_cookie(
+            "/api/v1/companies/acme/auth/password",
+            serde_json::json!({ "password": "his own long secret" }),
+            &temp_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Once replaced, the same session works normally.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(post_with_cookie(
+            "/api/v1/companies/acme/tasks",
+            serde_json::json!({ "title": "work" }),
+            &temp_cookie,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "the flag must clear once the password is replaced, got {}",
+        response.status()
+    );
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
 async fn a_manifest_admin_invite_cannot_be_revoked_through_the_api() {
     let home = home();
     let (state, sender) = state_with_mail(&home).await;

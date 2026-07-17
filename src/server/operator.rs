@@ -9,21 +9,17 @@
 //! the prosumer single-company aliases (`/api/v1/company/...`) resolved through
 //! [`CompanyRegistry::sole`](crate::runtime::CompanyRegistry::sole).
 //!
-//! Auth is a bearer operator token from [`AppConfig`](crate::AppConfig). When
-//! no token is configured, Phase-1 dev mode allows local operator calls;
-//! platform JWT is out of scope for this batch.
+//! Auth is a platform token (hosting layer) or a human's session cookie; there
+//! is no unauthenticated path. See [`server::users`](crate::server::users).
 
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, Path, State};
-use axum::http::header::AUTHORIZATION;
-use axum::http::request::Parts;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
@@ -33,7 +29,7 @@ use crate::ports::types::{
 };
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::error::ApiError;
-use crate::server::platform_auth::{PlatformOrOperatorAuth, authorize_address};
+use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 use crate::server::provision::{emit_cycle_webhooks, emit_feedback_webhook};
 
 /// Builds the operator route fragment, merged into the main router.
@@ -56,36 +52,6 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// A bearer-token guard for operator routes.
-///
-/// In dev mode (`operator_token` unset) every request is allowed. When a token
-/// is configured, the request must carry `Authorization: Bearer <token>`.
-pub struct OperatorAuth;
-
-impl FromRequestParts<AppState> for OperatorAuth {
-    type Rejection = Response;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let Some(expected) = state.config().operator_token.as_deref() else {
-            return Ok(OperatorAuth); // dev mode: no token required
-        };
-        let provided = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
-        if provided == Some(expected) {
-            Ok(OperatorAuth)
-        } else {
-            let body = Json(json!({ "error": "unauthorized", "code": "unauthorized" }));
-            Err((StatusCode::UNAUTHORIZED, body).into_response())
-        }
-    }
-}
-
 fn lookup(state: &AppState, id: &str) -> Result<Arc<CompanyRuntime>, ApiError> {
     state
         .registry()
@@ -101,27 +67,19 @@ fn sole(state: &AppState) -> Result<Arc<CompanyRuntime>, ApiError> {
     })
 }
 
-/// `GET /api/v1/companies` — status of every registered company.
+/// `GET /api/v1/companies` — status of every company this principal may see.
 ///
-/// In platform mode a tenant token without the `platform` scope sees only the
-/// companies it owns; a platform-scope token (and the prosumer operator) sees
-/// all of them.
+/// A platform-scope token sees all of them; a tenant token sees only the
+/// companies it owns; a user sees their own company and nothing else — not even
+/// that others exist on this host.
 async fn list_companies(
-    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CompanyStatus>>, ApiError> {
-    // A scoped tenant is confined to the companies it owns.
-    let tenant_filter = claims
-        .as_ref()
-        .filter(|c| !c.has_platform_scope())
-        .map(|c| c.tenant.clone());
     let mut out = Vec::new();
-    for id in state.registry().list() {
-        if let Some(tenant) = &tenant_filter
-            && state.owner_of(&id).as_deref() != Some(tenant.as_str())
-        {
-            continue;
-        }
+    // `visible_companies` is the one place this filter lives, shared with the
+    // GraphQL root, so REST and GraphQL cannot disagree about who sees what.
+    for id in auth.visible_companies(&state) {
         if let Some(runtime) = state.registry().get(&id) {
             out.push(runtime.status().await?);
         }
@@ -131,12 +89,12 @@ async fn list_companies(
 
 /// `GET /api/v1/companies/{id}` — one company's status.
 async fn company_status(
-    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<CompanyStatus>, Response> {
     let company = CompanyId::new(&id);
-    if let Some(resp) = authorize_address(&state, &claims, &company) {
+    if let Some(resp) = authorize_address(&state, &auth, &company) {
         return Err(resp);
     }
     let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
@@ -246,14 +204,9 @@ async fn chat_and_emit(
 /// Resolves who is sending a chat message.
 ///
 /// Chat is the one surface both machines and humans drive, so it accepts
-/// either. A signed-in user is attributed to themselves; a machine credential
-/// (operator token, platform token, or dev mode) yields `None`, which reads
-/// back as "operator" — there is no person behind it to name.
-///
-/// This is the deliberate opt-in described on
-/// [`resolve_claims`](crate::server::graphql::auth::resolve_claims): the route
-/// asks for the full principal because it means to serve humans. Routes that
-/// do not, do not.
+/// either. A signed-in user is attributed to themselves; a platform credential
+/// yields `None`, which reads back as "operator" — there is no person behind it
+/// to name.
 async fn chat_actor(
     headers: &HeaderMap,
     state: &AppState,
@@ -261,35 +214,22 @@ async fn chat_actor(
 ) -> Result<Option<Actor>, Response> {
     use crate::server::graphql::auth::{GqlAuth, resolve_principal};
 
-    match resolve_principal(headers, state, Some(company)).await {
-        Ok(GqlAuth::User(user)) => {
-            // Defense in depth: the storage partition already makes a
-            // cross-company session unresolvable.
-            if user.company != *company {
-                return Err(forbidden_response());
-            }
-            Ok(Some(Actor {
-                kind: ActorKind::User,
-                id: user.user_id,
-            }))
-        }
-        Ok(GqlAuth::Platform(claims)) => {
-            if let Some(resp) = authorize_address(state, &Some(claims), company) {
-                return Err(resp);
-            }
-            Ok(None)
-        }
-        Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(None),
-        Err(_) => Err(unauthorized_response()),
+    let auth = resolve_principal(headers, state, Some(company))
+        .await
+        .map_err(|_| unauthorized_response())?;
+    if let Some(resp) = authorize_address(state, &auth, company) {
+        return Err(resp);
     }
-}
-
-fn forbidden_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "error": "forbidden", "code": "forbidden" })),
-    )
-        .into_response()
+    if let Some(resp) = refuse_until_password_changed(&auth) {
+        return Err(resp);
+    }
+    Ok(match auth {
+        GqlAuth::User(user) => Some(Actor {
+            kind: ActorKind::User,
+            id: user.user_id,
+        }),
+        GqlAuth::Platform(_) => None,
+    })
 }
 
 fn unauthorized_response() -> Response {
@@ -331,12 +271,12 @@ async fn operator_chat_single(
 
 /// `GET /api/v1/companies/{id}/approvals`.
 async fn list_approvals(
-    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ApprovalSummary>>, Response> {
     let company = CompanyId::new(&id);
-    if let Some(resp) = authorize_address(&state, &claims, &company) {
+    if let Some(resp) = authorize_address(&state, &auth, &company) {
         return Err(resp);
     }
     let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
@@ -345,10 +285,16 @@ async fn list_approvals(
 
 /// `GET /api/v1/company/approvals` (single-company alias).
 async fn list_approvals_single(
-    _auth: OperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
-) -> Result<Json<Vec<ApprovalSummary>>, ApiError> {
-    Ok(Json(sole(&state)?.pending_approvals()))
+) -> Result<Json<Vec<ApprovalSummary>>, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
+    // The sole company IS the addressed one, so the principal is checked
+    // against it exactly as on the `{id}` form.
+    if let Some(resp) = authorize_address(&state, &auth, runtime.id()) {
+        return Err(resp);
+    }
+    Ok(Json(runtime.pending_approvals()))
 }
 
 /// The operator's resolution of a parked approval.
@@ -404,13 +350,13 @@ async fn run_resolve(
 
 /// `POST /api/v1/companies/{id}/approvals/{aid}`.
 async fn resolve_approval(
-    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
     Json(body): Json<ResolveApproval>,
 ) -> Result<Json<ChatResponse>, Response> {
     let company = CompanyId::new(&id);
-    if let Some(resp) = authorize_address(&state, &claims, &company) {
+    if let Some(resp) = authorize_address(&state, &auth, &company) {
         return Err(resp);
     }
     let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
@@ -421,14 +367,22 @@ async fn resolve_approval(
 
 /// `POST /api/v1/company/approvals/{aid}` (single-company alias).
 async fn resolve_approval_single(
-    _auth: OperatorAuth,
+    CompanyAuth(auth): CompanyAuth,
     State(state): State<AppState>,
     Path(aid): Path<String>,
     Json(body): Json<ResolveApproval>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    let runtime = sole(&state)?;
+) -> Result<Json<ChatResponse>, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
     let id = runtime.id().clone();
-    run_resolve(&state, &id, runtime, aid, body).await
+    if let Some(resp) = authorize_address(&state, &auth, &id) {
+        return Err(resp);
+    }
+    if let Some(resp) = refuse_until_password_changed(&auth) {
+        return Err(resp);
+    }
+    run_resolve(&state, &id, runtime, aid, body)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 #[cfg(test)]
@@ -480,6 +434,7 @@ mod test {
             .unwrap();
         let state = AppState::new(config);
         state.registry().insert(id, Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
         state
     }
 
@@ -494,6 +449,7 @@ mod test {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/company/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"text":"hi"}"#))
                     .unwrap(),
@@ -520,6 +476,7 @@ mod test {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/companies/acme/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"text":"yo"}"#))
                     .unwrap(),
@@ -541,17 +498,18 @@ mod test {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/companies/ghost/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"text":"hi"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["code"], "company_not_found");
+        // 401, not 404: the caller holds no credential for `ghost`, and
+        // authentication precedes existence. Answering "no such company" to an
+        // unauthenticated caller would let anyone enumerate which companies a
+        // host runs. A user of `ghost` gets a real 404.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 
@@ -566,6 +524,7 @@ mod test {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/company/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"text":"hi"}"#))
                     .unwrap(),
@@ -587,6 +546,7 @@ mod test {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/companies")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -602,6 +562,7 @@ mod test {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/companies/acme")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -624,6 +585,7 @@ mod test {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/company/approvals")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -650,6 +612,7 @@ mod test {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/company/approvals/missing")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"verdict":"approve","amended_payload":{"text":"edited"}}"#,
@@ -676,6 +639,7 @@ mod test {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/company/approvals/missing")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"verdict":"deny","amended_payload":{"text":"edited"}}"#,
@@ -692,18 +656,15 @@ mod test {
     }
 
     #[tokio::test]
-    async fn operator_token_guards_routes() {
+    async fn a_session_is_required_and_sufficient() {
+        // Replaces `operator_token_guards_routes`. That token could never be
+        // set, so the test only ever proved the guard worked in a state no
+        // deployment could reach; every real host served this route to anyone.
         let home = home();
-        let config = AppConfig {
-            operator_token: Some("s3cret".to_string()),
-            ..AppConfig::default()
-        };
-        let state = build_state(&home, "running", config).await;
-        let app = router(state);
+        let state = build_state(&home, "running", AppConfig::default()).await;
 
-        // Missing bearer token is rejected.
-        let unauthorized = app
-            .clone()
+        // No credential at all: closed.
+        let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/companies")
@@ -712,11 +673,11 @@ mod test {
             )
             .await
             .unwrap();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // Wrong token is rejected.
-        let wrong = app
-            .clone()
+        // A garbage bearer buys nothing either — there is no bearer path in
+        // prosumer mode at all now.
+        let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/companies")
@@ -726,20 +687,22 @@ mod test {
             )
             .await
             .unwrap();
-        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // Correct token is accepted.
-        let ok = app
+        // A signed-in human gets their own company.
+        let cookie = crate::server::test_support::seed_admin(&state, "acme").await;
+        let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/companies")
-                    .header("authorization", "Bearer s3cret")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }

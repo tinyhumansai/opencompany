@@ -153,11 +153,10 @@ async fn a_session_for_one_company_is_refused_for_another() {
     let globex = CompanyId::new("globex");
     // Presenting acme's cookie while addressing globex: the cookie name does
     // not match globex's, so no user resolves at all.
-    let auth = resolve_principal(&headers_with_cookie("acme", &token), &state, Some(&globex))
-        .await
-        .unwrap();
     assert!(
-        !matches!(auth, GqlAuth::User(_)),
+        resolve_principal(&headers_with_cookie("acme", &token), &state, Some(&globex))
+            .await
+            .is_err(),
         "acme's session must not authenticate against globex"
     );
 
@@ -168,11 +167,10 @@ async fn a_session_for_one_company_is_refused_for_another() {
         axum::http::header::COOKIE,
         cookie_header("globex", &token).parse().unwrap(),
     );
-    let auth = resolve_principal(&headers, &state, Some(&globex))
-        .await
-        .unwrap();
     assert!(
-        !matches!(auth, GqlAuth::User(_)),
+        resolve_principal(&headers, &state, Some(&globex))
+            .await
+            .is_err(),
         "a token from another company's partition must not resolve"
     );
     tokio::fs::remove_dir_all(&home).await.ok();
@@ -217,11 +215,10 @@ async fn a_suspended_users_live_session_stops_working_immediately() {
     user.status = UserStatus::Suspended;
     runtime.users().upsert_user(&acme, &user).await.unwrap();
 
-    let auth = resolve_principal(&headers_with_cookie("acme", &token), &state, Some(&acme))
-        .await
-        .unwrap();
     assert!(
-        !matches!(auth, GqlAuth::User(_)),
+        resolve_principal(&headers_with_cookie("acme", &token), &state, Some(&acme))
+            .await
+            .is_err(),
         "suspension must take effect on the next request, not at cookie expiry"
     );
     tokio::fs::remove_dir_all(&home).await.ok();
@@ -271,20 +268,25 @@ async fn an_expired_session_does_not_resolve() {
         .await
         .unwrap();
 
-    let auth = resolve_principal(&headers_with_cookie("acme", &token), &state, Some(&acme))
-        .await
-        .unwrap();
-    assert!(!matches!(auth, GqlAuth::User(_)));
+    assert!(
+        resolve_principal(&headers_with_cookie("acme", &token), &state, Some(&acme))
+            .await
+            .is_err(),
+        "an expired session must not resolve"
+    );
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
-async fn a_stale_or_garbage_cookie_falls_through_to_the_bearer_path() {
+async fn a_stale_or_garbage_cookie_falls_through_to_the_platform_bearer() {
     let home = home();
-    // Prosumer mode with a configured operator token, so the bearer path is
-    // genuinely guarded rather than open via the dev-mode escape hatch.
+    // Platform mode: the hosting layer's machine credential.
     let state = AppState::new(AppConfig {
-        operator_token: Some("s3cret".into()),
+        platform_auth: Some(crate::server::platform_auth::PlatformAuthConfig::new(
+            Arc::new(crate::server::platform_auth::StaticPlatformVerifier::new(
+                "s3cret",
+            )),
+        )),
         ..AppConfig::default()
     })
     .with_home(home.clone());
@@ -296,8 +298,9 @@ async fn a_stale_or_garbage_cookie_falls_through_to_the_bearer_path() {
         .unwrap();
     state.registry().insert(id.clone(), Arc::new(runtime));
 
-    // A junk session cookie alongside a valid operator bearer must not 401 the
-    // operator — otherwise one stale cookie bricks the console on this origin.
+    // A junk session cookie alongside a valid platform bearer must not fail the
+    // request — one stale cookie must not brick the hosting layer on an origin
+    // it shares with the console.
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
         axum::http::header::COOKIE,
@@ -311,34 +314,45 @@ async fn a_stale_or_garbage_cookie_falls_through_to_the_bearer_path() {
         .await
         .unwrap();
     assert!(
-        matches!(auth, GqlAuth::Operator),
+        matches!(auth, GqlAuth::Platform(_)),
         "a bad cookie must degrade to the bearer path, not fail the request"
     );
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
-async fn a_session_cookie_cannot_reach_an_operator_write_route() {
-    // THE ESCALATION TEST. Operator/platform write routes resolve through
-    // `resolve_claims`, which cannot produce a User. A session must therefore
-    // buy nothing on the write plane, even for an admin user.
+async fn an_anonymous_request_reaches_nothing() {
+    // What used to be dev mode. With no principal at all, a write route is
+    // simply closed — previously this was a 200 on every deployment, because
+    // the operator token that would have guarded it could not be set.
     let home = home();
     let state = state_with(&home, &["acme"]).await;
-    let token = seed_session(&state, "acme", UserRole::Admin, UserStatus::Active).await;
 
-    // Prosumer mode with a token configured, so the route is genuinely guarded
-    // rather than open by the dev-mode escape hatch.
-    let guarded = AppState::new(AppConfig {
-        operator_token: Some("s3cret".into()),
-        ..AppConfig::default()
-    })
-    .with_home(home.clone());
-    let acme = CompanyId::new("acme");
-    guarded
-        .registry()
-        .insert(acme.clone(), state.registry().get(&acme).unwrap());
+    let app = router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/companies/acme/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"anon"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
 
-    let app = router(guarded);
+#[tokio::test]
+async fn a_users_session_now_reaches_their_own_companys_write_plane() {
+    // The point of the change: humans are the prosumer auth story, so a member
+    // of the company can drive its console surfaces.
+    let home = home();
+    let state = state_with(&home, &["acme"]).await;
+    let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
+
+    let app = router(state.clone());
     let response = app
         .oneshot(
             Request::builder()
@@ -346,7 +360,38 @@ async fn a_session_cookie_cannot_reach_an_operator_write_route() {
                 .uri("/api/v1/companies/acme/tasks")
                 .header("content-type", "application/json")
                 .header("cookie", cookie_header("acme", &token))
-                .body(Body::from(r#"{"title":"pwn"}"#))
+                .body(Body::from(r#"{"title":"real work"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "a member must be able to use their own company, got {}",
+        response.status()
+    );
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn a_session_cookie_cannot_reach_the_platform_plane() {
+    // THE ESCALATION TEST, now aimed where it still matters. Provisioning and
+    // suspension resolve through `resolve_claims`, which cannot produce a User,
+    // so no session — however admin — can create or destroy companies across
+    // tenants.
+    let home = home();
+    let state = state_with(&home, &["acme"]).await;
+    let token = seed_session(&state, "acme", UserRole::Admin, UserStatus::Active).await;
+
+    let app = router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/companies")
+                .header("content-type", "application/toml")
+                .header("cookie", cookie_header("acme", &token))
+                .body(Body::from("[company]\nname = \"Pwned\"\n"))
                 .unwrap(),
         )
         .await
@@ -354,7 +399,26 @@ async fn a_session_cookie_cannot_reach_an_operator_write_route() {
     assert_eq!(
         response.status(),
         StatusCode::UNAUTHORIZED,
-        "an admin user's session must not authorize an operator write route"
+        "an admin user's session must not provision companies"
+    );
+
+    // And suspension, the other platform-scoped lever.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/companies/acme/suspend")
+                .header("cookie", cookie_header("acme", &token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "an admin user's session must not suspend a company"
     );
     tokio::fs::remove_dir_all(&home).await.ok();
 }
@@ -397,9 +461,8 @@ async fn without_an_addressed_company_ambiguous_cookies_resolve_no_user() {
         .parse()
         .unwrap(),
     );
-    let auth = resolve_principal(&headers, &state, None).await.unwrap();
     assert!(
-        !matches!(auth, GqlAuth::User(_)),
+        resolve_principal(&headers, &state, None).await.is_err(),
         "an ambiguous jar must not silently pick a company"
     );
     tokio::fs::remove_dir_all(&home).await.ok();

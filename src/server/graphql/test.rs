@@ -43,6 +43,9 @@ pub(crate) async fn state_with_company(home: &std::path::Path) -> AppState {
         .unwrap();
     let state = AppState::new(AppConfig::default()).with_home(home.to_path_buf());
     state.registry().insert(id, Arc::new(runtime));
+    // Every route needs a principal now; the harness signs in as an admin so
+    // tests can keep asserting resolver behavior rather than auth.
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
     state
 }
 
@@ -53,6 +56,7 @@ pub(crate) async fn query(app: axum::Router, body: &str) -> serde_json::Value {
                 .method("POST")
                 .uri("/graphql")
                 .header("content-type", "application/json")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -176,6 +180,9 @@ async fn state_with_rich_company(home: &std::path::Path) -> AppState {
         .unwrap();
     let state = AppState::new(AppConfig::default()).with_home(home.to_path_buf());
     state.registry().insert(id, Arc::new(runtime));
+    // Every route needs a principal now; the harness signs in as an admin so
+    // tests can keep asserting resolver behavior rather than auth.
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
     state
 }
 
@@ -511,6 +518,7 @@ async fn skills_and_workflows_resolve_from_source_dir() {
         .with_home(home.to_path_buf())
         .with_skills_root(skills_root);
     state.registry().insert(id, Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
 
     // Company.skills reads the committed source-dir skill.
     let value = query(

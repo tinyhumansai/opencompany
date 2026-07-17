@@ -51,6 +51,7 @@ fn provision_req(token: Option<&str>, toml: &str) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/api/v1/companies")
+        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
         .header("content-type", "text/plain");
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
@@ -81,6 +82,10 @@ fn chat_req(uri: &str, token: Option<&str>, text: &str) -> Request<Body> {
         .header("content-type", "application/json");
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
+    } else {
+        // No explicit credential: sign in as the harness admin, since chat now
+        // requires a principal like everything else.
+        builder = builder.header("cookie", crate::server::test_support::fixed_cookie("acme"));
     }
     builder
         .body(Body::from(format!(r#"{{"text":"{text}"}}"#)))
@@ -143,6 +148,7 @@ async fn provision_accepts_json_envelope_with_explicit_id() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/companies")
+        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {PLATFORM_SECRET}"))
         .body(Body::from(body))
@@ -365,6 +371,7 @@ async fn foreign_tenant_cannot_file_feedback() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/companies/acme/feedback")
+        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {other}"))
         .body(Body::from(r#"{"category":"bug","note":"not yours"}"#))
@@ -585,6 +592,7 @@ async fn webhook_emitted_on_approval_requested() {
     state
         .registry()
         .insert(CompanyId::new("acme"), Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
 
     let app = router(state);
     let chat = app

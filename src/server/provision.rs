@@ -32,9 +32,8 @@ use crate::ports::types::{Actor, ActorKind, CompanyId};
 use crate::runtime::types::CycleReport;
 use crate::runtime::{RuntimeBuilder, company_id_from_name};
 use crate::server::error::ApiError;
-use crate::server::platform_auth::{
-    PlatformClaims, PlatformScope, acting_tenant, authorize_address,
-};
+use crate::server::graphql::auth::GqlAuth;
+use crate::server::platform_auth::{PlatformScope, acting_tenant, authorize_address};
 use crate::server::webhook::{WebhookEvent, WebhookKind};
 
 /// Builds the provisioning + lifecycle route fragment.
@@ -140,7 +139,7 @@ async fn provision(
     }
 
     // Quota: per-tenant then global.
-    let tenant = acting_tenant(&claims);
+    let tenant = acting_tenant(&GqlAuth::Platform(claims.clone()));
     if let Some(max) = state.config().max_companies_per_tenant
         && state.tenant_company_count(&tenant) >= max
     {
@@ -198,10 +197,21 @@ async fn provision(
 // ---------------------------------------------------------------------------
 
 /// The actor recorded for a platform/operator-driven lifecycle transition.
-fn lifecycle_actor(claims: &Option<PlatformClaims>) -> Actor {
-    Actor {
-        kind: ActorKind::Operator,
-        id: acting_tenant(claims),
+/// Who a lifecycle transition is recorded as.
+///
+/// A human is recorded as themselves; a machine credential as the tenant it
+/// acts for. Previously everything was `Operator`, because that was the only
+/// principal that could reach these routes.
+fn lifecycle_actor(auth: &GqlAuth) -> Actor {
+    match auth {
+        GqlAuth::User(user) => Actor {
+            kind: ActorKind::User,
+            id: user.user_id.clone(),
+        },
+        GqlAuth::Platform(_) => Actor {
+            kind: ActorKind::Operator,
+            id: acting_tenant(auth),
+        },
     }
 }
 
@@ -214,16 +224,11 @@ fn reason_is_budget(uri: &Uri) -> bool {
 }
 
 /// Applies a lifecycle transition to `to`, returning the fresh status.
-async fn transition(
-    state: &AppState,
-    claims: &Option<PlatformClaims>,
-    id: &CompanyId,
-    to: &str,
-) -> Response {
+async fn transition(state: &AppState, auth: &GqlAuth, id: &CompanyId, to: &str) -> Response {
     let Some(runtime) = state.registry().get(id) else {
         return not_found(id.as_ref());
     };
-    if let Err(err) = runtime.set_lifecycle(to, lifecycle_actor(claims)).await {
+    if let Err(err) = runtime.set_lifecycle(to, lifecycle_actor(auth)).await {
         return ApiError(err).into_response();
     }
     match runtime.status().await {
@@ -234,16 +239,19 @@ async fn transition(
 
 /// `POST /api/v1/companies/{id}/pause` — stop accepting work (owner-scoped).
 async fn pause(
-    crate::server::platform_auth::PlatformOrOperatorAuth(claims): crate::server::platform_auth::PlatformOrOperatorAuth,
+    crate::server::platform_auth::CompanyAuth(auth): crate::server::platform_auth::CompanyAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     uri: Uri,
 ) -> Response {
     let id = CompanyId::new(id);
-    if let Some(resp) = authorize_address(&state, &claims, &id) {
+    if let Some(resp) = authorize_address(&state, &auth, &id) {
         return resp;
     }
-    let response = transition(&state, &claims, &id, "paused").await;
+    if let Some(resp) = crate::server::platform_auth::refuse_until_password_changed(&auth) {
+        return resp;
+    }
+    let response = transition(&state, &auth, &id, "paused").await;
     // A budget-triggered pause emits the `budget.exhausted` webhook.
     if response.status() == StatusCode::OK && reason_is_budget(&uri) {
         emit_budget_exhausted(&state, &id).await;
@@ -253,20 +261,21 @@ async fn pause(
 
 /// `POST /api/v1/companies/{id}/resume` — resume accepting work (owner-scoped).
 async fn resume(
-    crate::server::platform_auth::PlatformOrOperatorAuth(claims): crate::server::platform_auth::PlatformOrOperatorAuth,
+    crate::server::platform_auth::CompanyAuth(auth): crate::server::platform_auth::CompanyAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
     let id = CompanyId::new(id);
-    if let Some(resp) = authorize_address(&state, &claims, &id) {
+    if let Some(resp) = authorize_address(&state, &auth, &id) {
+        return resp;
+    }
+    if let Some(resp) = crate::server::platform_auth::refuse_until_password_changed(&auth) {
         return resp;
     }
     // `suspended` is a platform-forced pause (billing/abuse); only a
-    // platform-scope caller may lift it. An owner token must not be able to
-    // resume its own suspended company.
-    let platform = claims
-        .as_ref()
-        .is_some_and(PlatformClaims::has_platform_scope);
+    // platform-scope caller may lift it. Neither an owner token nor a company's
+    // own admin may resume a company the platform suspended.
+    let platform = matches!(&auth, GqlAuth::Platform(c) if c.has_platform_scope());
     if !platform {
         match state.registry().get(&id) {
             Some(runtime) => match runtime.status().await {
@@ -279,7 +288,7 @@ async fn resume(
             None => return not_found(id.as_ref()),
         }
     }
-    transition(&state, &claims, &id, "running").await
+    transition(&state, &auth, &id, "running").await
 }
 
 /// `POST /api/v1/companies/{id}/suspend` — park a company (platform-scoped).
@@ -289,10 +298,11 @@ async fn suspend(
     Path(id): Path<String>,
 ) -> Response {
     let id = CompanyId::new(id);
-    if let Some(resp) = authorize_address(&state, &claims, &id) {
+    let auth = GqlAuth::Platform(claims);
+    if let Some(resp) = authorize_address(&state, &auth, &id) {
         return resp;
     }
-    transition(&state, &claims, &id, "suspended").await
+    transition(&state, &auth, &id, "suspended").await
 }
 
 /// `POST /api/v1/companies/{id}/archive` — terminally archive a company and
@@ -303,10 +313,11 @@ async fn archive(
     Path(id): Path<String>,
 ) -> Response {
     let id = CompanyId::new(id);
-    if let Some(resp) = authorize_address(&state, &claims, &id) {
+    let auth = GqlAuth::Platform(claims);
+    if let Some(resp) = authorize_address(&state, &auth, &id) {
         return resp;
     }
-    let response = transition(&state, &claims, &id, "archived").await;
+    let response = transition(&state, &auth, &id, "archived").await;
     if response.status() == StatusCode::OK {
         state.registry().remove(&id);
         state.remove_owner(&id);

@@ -9,6 +9,9 @@ pub mod platform_auth;
 pub mod provision;
 mod routes;
 pub mod users;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod webhook;
 
 pub use error::ApiError;

@@ -6,7 +6,7 @@
 //! target [`CompanyRuntime`] and enforces authorization for whichever form the
 //! request used:
 //!
-//! - `…/companies/{id}` → [`PlatformOrOperatorAuth`] + `authorize_address`
+//! - `…/companies/{id}` → [`CompanyAuth`] + `authorize_address`
 //!   (a tenant token may only address a company it owns).
 //! - `…/company` → [`OperatorAuth`] + [`CompanyRegistry::sole`].
 
@@ -23,8 +23,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::CompanyId;
 use crate::server::error::ApiError;
-use crate::server::operator::OperatorAuth;
-use crate::server::platform_auth::{PlatformOrOperatorAuth, authorize_address};
+use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 
 /// Registers `mr` under both the `{id}` platform form and the single-company
 /// alias. `suffix` is the path after the scope prefix (e.g. `"/tasks"` or
@@ -68,29 +67,30 @@ impl FromRequestParts<AppState> for ScopedCompany {
                     .map(|(_, value)| value.to_string())
             });
 
-        match id {
-            Some(id) => {
-                let PlatformOrOperatorAuth(claims) =
-                    PlatformOrOperatorAuth::from_request_parts(parts, state).await?;
-                let company = CompanyId::new(&id);
-                if let Some(resp) = authorize_address(state, &claims, &company) {
-                    return Err(resp);
-                }
-                let runtime = state.registry().get(&company).ok_or_else(|| {
-                    ApiError(OpenCompanyError::CompanyNotFound(id.clone())).into_response()
-                })?;
-                Ok(ScopedCompany { runtime })
-            }
-            None => {
-                OperatorAuth::from_request_parts(parts, state).await?;
-                let runtime = state.registry().sole().ok_or_else(|| {
-                    ApiError(OpenCompanyError::CompanyNotFound(
-                        "single-company".to_string(),
-                    ))
-                    .into_response()
-                })?;
-                Ok(ScopedCompany { runtime })
-            }
+        // Resolve the company first: on the alias form the sole registered
+        // company IS the addressed one, and the principal must be checked
+        // against it just the same.
+        let runtime = match &id {
+            Some(id) => state.registry().get(&CompanyId::new(id)).ok_or_else(|| {
+                ApiError(OpenCompanyError::CompanyNotFound(id.clone())).into_response()
+            })?,
+            None => state.registry().sole().ok_or_else(|| {
+                ApiError(OpenCompanyError::CompanyNotFound(
+                    "single-company".to_string(),
+                ))
+                .into_response()
+            })?,
+        };
+        let company = runtime.id().clone();
+
+        let CompanyAuth(auth) = CompanyAuth::from_request_parts(parts, state).await?;
+        if let Some(resp) = authorize_address(state, &auth, &company) {
+            return Err(resp);
         }
+        // A temporary password is a boundary, not a suggestion.
+        if let Some(resp) = refuse_until_password_changed(&auth) {
+            return Err(resp);
+        }
+        Ok(ScopedCompany { runtime })
     }
 }
