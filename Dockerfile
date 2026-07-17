@@ -22,6 +22,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi; \
     install -Dm755 target/release/opencompany /out/opencompany
 
+# ── local development ─────────────────────────────────────────────────────
+# Used by docker-compose.dev.yml. The repository is bind-mounted over
+# /workspace; cargo-watch rebuilds and restarts the host after local edits.
+FROM rust:1-slim-bookworm AS development
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-watch --locked
+WORKDIR /workspace
+ENV OPENCOMPANY_BIND=0.0.0.0:8080 \
+    OPENCOMPANY_DATA_DIR=/data
+
 # ── runtime ────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

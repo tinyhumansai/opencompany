@@ -1,0 +1,58 @@
+# Hot-reload overlay used by scripts/launch-demo.sh.
+services:
+  opencompany:
+    build:
+      target: development
+    image: opencompany-dev:local
+    command:
+      - cargo
+      - watch
+      - --poll
+      - "1"
+      - --watch
+      - src
+      - --watch
+      - companies
+      - --watch
+      - Cargo.toml
+      - --watch
+      - Cargo.lock
+      - --watch
+      - scripts/run-demo-backend.sh
+      - --shell
+      - ./scripts/run-demo-backend.sh
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      start_period: 60s
+      retries: 20
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/workspace/target
+      - opencompany-data:/data
+    restart: "no"
+
+  console:
+    build:
+      target: development
+    image: opencompany-console-dev:local
+    command:
+      - /bin/sh
+      - -c
+      - npm install && exec npm run dev -- --host 0.0.0.0 --port 80
+    environment:
+      OC_API_TARGET: http://opencompany:8080
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+    restart: "no"
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  frontend-node-modules:

@@ -157,13 +157,31 @@ cargo build               # the host (the one configurable backend)
 
 ## Run it anywhere (Docker)
 
-One command spins up a company **and** its [operator console](frontend/),
-with a single switch — `OPENCOMPANY_COMPANY` — choosing which company runs:
+One script spins up a company **and** its [operator console](frontend/) in
+development mode. Pass a friendly site name (or any directory name under
+`companies/`) and keep the stack attached to the terminal:
 
 ```sh
-cp .env.example .env          # set OPENCOMPANY_COMPANY (e.g. fund, marketing, software)
-docker compose up --build     # console → :5173, host API → :8080
+./scripts/launch-demo.sh marketing up     # console → :5173, host API → :8080
+# Press Ctrl-C when finished, then destroy its containers and network:
+./scripts/launch-demo.sh marketing down
+# Or destroy the stack and its persistent data volume:
+./scripts/launch-demo.sh marketing down -v
 ```
+
+The launcher bind-mounts the local checkout. Vite hot-updates frontend edits;
+`cargo-watch` rebuilds and restarts the backend when Rust source, Cargo files,
+or company definitions change. The first start builds the development images
+and dependencies; later launches reuse named Cargo and `node_modules` caches.
+
+Use `./scripts/list-demos.sh` to list friendly names and every available
+company. Each company uses a separate Compose project and persistent data
+volume. `down` removes its containers and network but keeps that volume;
+`down -v` deletes the volume and its data too.
+
+For custom ports, credentials, or feature flags, copy `.env.example` to `.env`
+before launching. For production-like images without source mounts or hot
+reload, run `OPENCOMPANY_COMPANY=marketing docker compose up --build` directly.
 
 The same two images deploy to DigitalOcean (App Platform spec in
 [`.do/app.yaml`](.do/app.yaml)), AWS (Fargate task in

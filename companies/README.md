@@ -57,11 +57,17 @@ cargo run --bin opencompany -- check companies/agentic_marketing_agency
 cargo run --bin opencompany -- serve --company companies/agentic_marketing_agency
 ```
 
-Or, with Docker, set the switch and bring up the host + console together:
+Or bring up the host + console together with the attached, hot-reloading Docker
+demo launcher:
 
 ```sh
-OPENCOMPANY_COMPANY=agentic_marketing_agency docker compose up --build
+./scripts/launch-demo.sh marketing up
+./scripts/launch-demo.sh marketing down
+./scripts/launch-demo.sh marketing down -v  # also delete persistent data
 ```
+
+`./scripts/list-demos.sh` lists all accepted company directory names and the
+short aliases for the most common demos.
 
 Initialize the vendored runtime before using deeper integrations:
 

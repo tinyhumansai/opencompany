@@ -8,6 +8,13 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
+# ── local development ─────────────────────────────────────────────────────
+# Source is bind-mounted over /app; node_modules lives in a named volume.
+FROM node:22-slim AS development
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
 # ── serve + proxy the API ──────────────────────────────────────────────────
 # nginx serves the static bundle and proxies the API to the host. The upstream
 # is configurable so the same image works under Compose (service name),
