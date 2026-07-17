@@ -542,6 +542,7 @@ mod test {
         runtime
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "kick off".into(),
+                by: None,
             }])
             .await
             .expect("cycle");
@@ -775,7 +776,10 @@ mod test {
             .expect("build");
         let id = runtime.id().clone();
         runtime
-            .run_cycle(vec![CompanyEvent::OperatorMessage { text: "hi".into() }])
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+            }])
             .await
             .unwrap();
 

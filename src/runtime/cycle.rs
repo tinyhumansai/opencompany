@@ -421,7 +421,7 @@ mod test {
         async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
             let mut responses = Vec::new();
             for event in &req.events {
-                if let CompanyEvent::OperatorMessage { text } = event {
+                if let CompanyEvent::OperatorMessage { text, .. } = event {
                     host.emit_effect(self.effect.clone()).await?;
                     responses.push(OutboundMessage {
                         channel: "operator".into(),
@@ -446,7 +446,10 @@ mod test {
             .unwrap();
 
         let report = rt
-            .run_cycle(vec![CompanyEvent::OperatorMessage { text: "hi".into() }])
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+            }])
             .await
             .unwrap();
 
@@ -464,7 +467,10 @@ mod test {
         assert_eq!(stored.len(), 1);
         assert_eq!(
             stored[0].event,
-            CompanyEvent::OperatorMessage { text: "hi".into() }
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None
+            }
         );
 
         // (c) a compressed trace was persisted.
@@ -530,6 +536,7 @@ mod test {
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "file it".into(),
+                by: None,
             }])
             .await
             .unwrap();
@@ -571,6 +578,7 @@ mod test {
             let report = rt
                 .run_cycle(vec![CompanyEvent::OperatorMessage {
                     text: "file it".into(),
+                    by: None,
                 }])
                 .await
                 .unwrap();
@@ -622,6 +630,7 @@ mod test {
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "file it".into(),
+                by: None,
             }])
             .await
             .unwrap();
@@ -685,6 +694,7 @@ mod test {
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "file it".into(),
+                by: None,
             }])
             .await
             .unwrap();
@@ -772,8 +782,14 @@ mod test {
             .unwrap();
 
         let (ra, rb) = tokio::join!(
-            one.run_cycle(vec![CompanyEvent::OperatorMessage { text: "a".into() }]),
-            two.run_cycle(vec![CompanyEvent::OperatorMessage { text: "b".into() }]),
+            one.run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "a".into(),
+                by: None
+            }]),
+            two.run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "b".into(),
+                by: None
+            }]),
         );
         assert_eq!(ra.unwrap().responses.len(), 1);
         assert_eq!(rb.unwrap().responses.len(), 1);

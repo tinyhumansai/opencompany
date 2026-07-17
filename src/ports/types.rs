@@ -170,6 +170,12 @@ pub enum ActorKind {
     System,
     /// An autonomous agent inside the company.
     Agent,
+    /// A human collaborator of the company. The user's id lives in
+    /// [`Actor::id`].
+    ///
+    /// Fieldless on purpose: `ActorKind` is `Copy`, and a variant carrying a
+    /// `String` would silently take that away from every existing holder.
+    User,
 }
 
 /// An identified actor.
@@ -206,10 +212,22 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum CompanyEvent {
-    /// The operator sent a chat message.
+    /// A human sent a chat message.
     OperatorMessage {
         /// The message text.
         text: String,
+        /// Who sent it.
+        ///
+        /// `None` on events journaled before per-user auth existed, and on
+        /// sends made with an operator/platform credential, which have no
+        /// person behind them. Both are attributed to "operator" on read.
+        ///
+        /// `#[serde(default)]` is what lets every already-persisted event load;
+        /// `skip_serializing_if` is what keeps an unattributed event
+        /// serializing byte-for-byte as it did before this field existed, so
+        /// export/import and the cross-backend round-trip need no migration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
     },
     /// An inbound webhook fired.
     WebhookReceived {
@@ -835,9 +853,68 @@ mod test {
     }
 
     #[test]
+    fn an_operator_message_journaled_before_attribution_still_loads() {
+        // Exactly what is already on disk in every existing company's event
+        // log. If this ever fails, the change needs a migration.
+        let legacy = r#"{"kind":"OperatorMessage","text":"hi"}"#;
+        let event: CompanyEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            event,
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unattributed_message_serializes_exactly_as_it_did_before() {
+        // `skip_serializing_if` keeps the old bytes. This is what lets
+        // export/import and the fs/sqlite/mongo round-trip stay green without
+        // touching a single stored record.
+        let event = CompanyEvent::OperatorMessage {
+            text: "hi".into(),
+            by: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"kind":"OperatorMessage","text":"hi"}"#
+        );
+    }
+
+    #[test]
+    fn an_attributed_message_round_trips_with_its_actor() {
+        let event = CompanyEvent::OperatorMessage {
+            text: "hi".into(),
+            by: Some(Actor {
+                kind: ActorKind::User,
+                id: "u1".into(),
+            }),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["by"]["kind"], "user");
+        assert_eq!(json["by"]["id"], "u1");
+        assert_eq!(serde_json::from_value::<CompanyEvent>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn actor_kind_is_still_copy() {
+        // A `String`-carrying variant would have taken this away from every
+        // existing holder, which is why the User id lives on `Actor` instead.
+        fn assert_copy(kind: ActorKind) -> (ActorKind, ActorKind) {
+            (kind, kind)
+        }
+        let (a, b) = assert_copy(ActorKind::User);
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn company_event_variants_round_trip_tagged() {
         let events = vec![
-            CompanyEvent::OperatorMessage { text: "hi".into() },
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+            },
             CompanyEvent::WebhookReceived {
                 channel: "email".into(),
                 body: serde_json::json!({"subject": "hello"}),

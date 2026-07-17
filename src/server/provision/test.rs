@@ -537,7 +537,7 @@ impl Brain for EffectBrain {
     ) -> crate::Result<CycleResult> {
         let mut responses = Vec::new();
         for event in &req.events {
-            if let CompanyEvent::OperatorMessage { text } = event {
+            if let CompanyEvent::OperatorMessage { text, .. } = event {
                 host.emit_effect(self.effect.clone()).await?;
                 responses.push(OutboundMessage {
                     channel: "operator".into(),

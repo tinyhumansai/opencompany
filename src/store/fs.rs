@@ -887,11 +887,23 @@ mod test {
         let id = CompanyId::new("acme");
 
         let s0 = log
-            .append(&id, CompanyEvent::OperatorMessage { text: "a".into() })
+            .append(
+                &id,
+                CompanyEvent::OperatorMessage {
+                    text: "a".into(),
+                    by: None,
+                },
+            )
             .await
             .unwrap();
         let s1 = log
-            .append(&id, CompanyEvent::OperatorMessage { text: "b".into() })
+            .append(
+                &id,
+                CompanyEvent::OperatorMessage {
+                    text: "b".into(),
+                    by: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(s0, EventSeq::new(0));
@@ -912,13 +924,22 @@ mod test {
         let id = CompanyId::new("acme");
         let mut stream = log.subscribe(&id);
 
-        log.append(&id, CompanyEvent::OperatorMessage { text: "hi".into() })
-            .await
-            .unwrap();
+        log.append(
+            &id,
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+            },
+        )
+        .await
+        .unwrap();
         let received = stream.next().await.expect("event delivered");
         assert_eq!(
             received.event,
-            CompanyEvent::OperatorMessage { text: "hi".into() }
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None
+            }
         );
         tokio::fs::remove_dir_all(&root).await.ok();
     }

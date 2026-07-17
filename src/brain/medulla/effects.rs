@@ -34,7 +34,7 @@ pub(crate) struct EffectOutcome {
 /// Normalizes a [`CompanyEvent`] into the [`WireEvent`] `POST /events` carries.
 pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
     let (role, sender, body, kind) = match event {
-        CompanyEvent::OperatorMessage { text } => (
+        CompanyEvent::OperatorMessage { text, .. } => (
             Role::User,
             "operator".to_string(),
             text.clone(),

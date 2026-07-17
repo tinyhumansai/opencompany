@@ -1838,7 +1838,13 @@ mod test {
             .await
             .unwrap();
         events
-            .append(&id, CompanyEvent::OperatorMessage { text: "hi".into() })
+            .append(
+                &id,
+                CompanyEvent::OperatorMessage {
+                    text: "hi".into(),
+                    by: None,
+                },
+            )
             .await
             .unwrap();
         memory
@@ -1882,13 +1888,22 @@ mod test {
         let s = store();
         let id = CompanyId::new("acme");
         let mut stream = s.subscribe(&id);
-        s.append(&id, CompanyEvent::OperatorMessage { text: "hi".into() })
-            .await
-            .unwrap();
+        s.append(
+            &id,
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+            },
+        )
+        .await
+        .unwrap();
         let received = stream.next().await.expect("event delivered");
         assert_eq!(
             received.event,
-            CompanyEvent::OperatorMessage { text: "hi".into() }
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None
+            }
         );
     }
 
@@ -1971,6 +1986,7 @@ mod test {
                 &id,
                 CompanyEvent::OperatorMessage {
                     text: "persist".into(),
+                    by: None,
                 },
             )
             .await
@@ -1983,7 +1999,8 @@ mod test {
         assert_eq!(
             events[0].event,
             CompanyEvent::OperatorMessage {
-                text: "persist".into()
+                text: "persist".into(),
+                by: None,
             }
         );
     }

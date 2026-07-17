@@ -43,7 +43,7 @@ impl Brain for EchoBrain {
     async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
         let mut channel_responses = Vec::new();
         for event in &req.events {
-            if let CompanyEvent::OperatorMessage { text } = event {
+            if let CompanyEvent::OperatorMessage { text, .. } = event {
                 channel_responses.push(OutboundMessage {
                     channel: "operator".to_string(),
                     text: format!("You said: {text}"),
@@ -125,7 +125,10 @@ mod test {
         let host = RecordingHost::default();
         let result = brain
             .run_cycle(
-                request(vec![CompanyEvent::OperatorMessage { text: "hi".into() }]),
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "hi".into(),
+                    by: None,
+                }]),
                 &host,
             )
             .await

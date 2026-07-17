@@ -87,7 +87,13 @@ pub async fn assert_isolation_by_company(
     store.save(&record(&alpha)).await.unwrap();
     store.append_ledger(&alpha, ledger_entry(0)).await.unwrap();
     events
-        .append(&alpha, CompanyEvent::OperatorMessage { text: "a".into() })
+        .append(
+            &alpha,
+            CompanyEvent::OperatorMessage {
+                text: "a".into(),
+                by: None,
+            },
+        )
         .await
         .unwrap();
     memory
@@ -174,11 +180,23 @@ pub async fn assert_append_only_event_and_ledger(
     assert_eq!(ledger_after, ledger_before, "save() rewrote the ledger");
 
     let s0 = events
-        .append(&id, CompanyEvent::OperatorMessage { text: "e0".into() })
+        .append(
+            &id,
+            CompanyEvent::OperatorMessage {
+                text: "e0".into(),
+                by: None,
+            },
+        )
         .await
         .unwrap();
     let s1 = events
-        .append(&id, CompanyEvent::OperatorMessage { text: "e1".into() })
+        .append(
+            &id,
+            CompanyEvent::OperatorMessage {
+                text: "e1".into(),
+                by: None,
+            },
+        )
         .await
         .unwrap();
     let prefix_before = events
@@ -188,7 +206,13 @@ pub async fn assert_append_only_event_and_ledger(
 
     // Further appends never reorder or rewrite the existing prefix.
     events
-        .append(&id, CompanyEvent::OperatorMessage { text: "e2".into() })
+        .append(
+            &id,
+            CompanyEvent::OperatorMessage {
+                text: "e2".into(),
+                by: None,
+            },
+        )
         .await
         .unwrap();
     let all = events
@@ -218,6 +242,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
                 &alpha,
                 CompanyEvent::OperatorMessage {
                     text: format!("a{expected}"),
+                    by: None,
                 },
             )
             .await
@@ -227,7 +252,13 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
 
     // A second company starts its own sequence at 0.
     let first_beta = events
-        .append(&beta, CompanyEvent::OperatorMessage { text: "b0".into() })
+        .append(
+            &beta,
+            CompanyEvent::OperatorMessage {
+                text: "b0".into(),
+                by: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -276,6 +307,7 @@ pub async fn assert_export_totality(
     for i in 0..4 {
         let ev = CompanyEvent::OperatorMessage {
             text: format!("event {i}"),
+            by: None,
         };
         events.append(&id, ev.clone()).await.unwrap();
         appended.push(ev);

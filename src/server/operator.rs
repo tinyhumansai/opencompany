@@ -16,9 +16,9 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, Path, State};
-use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -176,6 +176,7 @@ struct ChatResponse {
 async fn run_chat(
     runtime: Arc<CompanyRuntime>,
     message: ChatMessage,
+    by: Option<Actor>,
 ) -> Result<(CycleReport, Option<String>), ApiError> {
     runtime.ensure_running().await?;
     // Operator-chat feedback intent: a complaint phrase ("that was wrong — flag
@@ -196,7 +197,10 @@ async fn run_chat(
         None
     };
     let report = runtime
-        .run_cycle(vec![CompanyEvent::OperatorMessage { text: message.text }])
+        .run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: message.text,
+            by,
+        }])
         .await?;
     Ok((report, feedback_note))
 }
@@ -207,14 +211,14 @@ async fn chat_and_emit(
     id: &CompanyId,
     runtime: Arc<CompanyRuntime>,
     message: ChatMessage,
+    by: Option<Actor>,
 ) -> Result<Json<ChatResponse>, ApiError> {
-    // The default desk for an unaddressed message. Mirrors the glossary term in
-    // `ops::language::DEFAULT_DESK` (kept in sync; inlined to avoid a module dep).
+    // The default desk for an unaddressed message.
     let desk = message
         .chat
         .clone()
-        .unwrap_or_else(|| "General".to_string());
-    let (report, feedback_note) = run_chat(runtime.clone(), message).await?;
+        .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string());
+    let (report, feedback_note) = run_chat(runtime.clone(), message, by).await?;
     emit_cycle_webhooks(state, id, &report).await;
     if let Some(note) = feedback_note {
         emit_feedback_webhook(state, id, &note).await;
@@ -239,32 +243,90 @@ async fn chat_and_emit(
     }))
 }
 
+/// Resolves who is sending a chat message.
+///
+/// Chat is the one surface both machines and humans drive, so it accepts
+/// either. A signed-in user is attributed to themselves; a machine credential
+/// (operator token, platform token, or dev mode) yields `None`, which reads
+/// back as "operator" — there is no person behind it to name.
+///
+/// This is the deliberate opt-in described on
+/// [`resolve_claims`](crate::server::graphql::auth::resolve_claims): the route
+/// asks for the full principal because it means to serve humans. Routes that
+/// do not, do not.
+async fn chat_actor(
+    headers: &HeaderMap,
+    state: &AppState,
+    company: &CompanyId,
+) -> Result<Option<Actor>, Response> {
+    use crate::server::graphql::auth::{GqlAuth, resolve_principal};
+
+    match resolve_principal(headers, state, Some(company)).await {
+        Ok(GqlAuth::User(user)) => {
+            // Defense in depth: the storage partition already makes a
+            // cross-company session unresolvable.
+            if user.company != *company {
+                return Err(forbidden_response());
+            }
+            Ok(Some(Actor {
+                kind: ActorKind::User,
+                id: user.user_id,
+            }))
+        }
+        Ok(GqlAuth::Platform(claims)) => {
+            if let Some(resp) = authorize_address(state, &Some(claims), company) {
+                return Err(resp);
+            }
+            Ok(None)
+        }
+        Ok(GqlAuth::Dev | GqlAuth::Operator) => Ok(None),
+        Err(_) => Err(unauthorized_response()),
+    }
+}
+
+fn forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": "forbidden", "code": "forbidden" })),
+    )
+        .into_response()
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "unauthorized", "code": "unauthorized" })),
+    )
+        .into_response()
+}
+
 /// `POST /api/v1/companies/{id}/chat`.
 async fn operator_chat(
-    PlatformOrOperatorAuth(claims): PlatformOrOperatorAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(message): Json<ChatMessage>,
 ) -> Result<Json<ChatResponse>, Response> {
     let company = CompanyId::new(&id);
-    if let Some(resp) = authorize_address(&state, &claims, &company) {
-        return Err(resp);
-    }
+    let by = chat_actor(&headers, &state, &company).await?;
     let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
-    chat_and_emit(&state, &company, runtime, message)
+    chat_and_emit(&state, &company, runtime, message, by)
         .await
         .map_err(IntoResponse::into_response)
 }
 
 /// `POST /api/v1/company/chat` (single-company alias).
 async fn operator_chat_single(
-    _auth: OperatorAuth,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(message): Json<ChatMessage>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    let runtime = sole(&state)?;
+) -> Result<Json<ChatResponse>, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
     let id = runtime.id().clone();
-    chat_and_emit(&state, &id, runtime, message).await
+    let by = chat_actor(&headers, &state, &id).await?;
+    chat_and_emit(&state, &id, runtime, message, by)
+        .await
+        .map_err(IntoResponse::into_response)
 }
 
 /// `GET /api/v1/companies/{id}/approvals`.

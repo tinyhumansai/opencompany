@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_graphql::{Context, ID, Object, SimpleObject};
 
+use super::auth::GqlAuth;
 use super::connections::{ConnectionStateGql, DomainStatusGql, SmtpStatusGql};
 use super::finances::FinancesGql;
 use super::inbox::InboxGql;
@@ -24,7 +25,7 @@ use super::{
     connections, finances, inbox, memory_facts, skills, tasks, usage, workflows, workspace,
 };
 use crate::company::runtime::CompanyRuntime;
-use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, StoredEvent};
+use crate::ports::types::{ActorKind, CompanyEvent, CompanyId, EventSeq, StoredEvent};
 
 /// The synthetic desk pre-threading operator messages are attributed to.
 const GENERAL_DESK: &str = "General";
@@ -342,11 +343,37 @@ impl ChatGql {
         self.desk.members.iter().cloned().map(ID).collect()
     }
 
+    /// User id → the label their messages are attributed to.
+    ///
+    /// Prefers a display name, and falls back to the email's *local part*
+    /// rather than the whole address: a desk history is read by every member,
+    /// and it should not hand each of them everyone else's email.
+    #[graphql(skip)]
+    async fn author_labels(
+        &self,
+    ) -> async_graphql::Result<std::collections::HashMap<String, String>> {
+        let users = self.runtime.users().list_users(self.runtime.id()).await?;
+        Ok(users
+            .into_iter()
+            .map(|user| {
+                let label = user.display_name.unwrap_or_else(|| {
+                    user.email
+                        .split('@')
+                        .next()
+                        .unwrap_or("someone")
+                        .to_string()
+                });
+                (user.id, label)
+            })
+            .collect())
+    }
+
     /// The desk's message history, most-recent last. `before` is an opaque
     /// EventLog cursor (a stringified sequence position); only messages before
     /// it are returned.
     async fn history(
         &self,
+        ctx: &Context<'_>,
         #[graphql(default = 50)] first: i32,
         before: Option<String>,
     ) -> async_graphql::Result<Page<MessageGql>> {
@@ -357,11 +384,19 @@ impl ChatGql {
             .read_from(self.runtime.id(), EventSeq::new(0), usize::MAX)
             .await?;
 
+        let viewer = match ctx.data::<GqlAuth>() {
+            Ok(GqlAuth::User(user)) => Viewer::User(user.user_id.clone()),
+            _ => Viewer::Operator,
+        };
+        // One roster read per history, not one per message: the scan above is
+        // already O(log), and an N+1 on top of it would be worse.
+        let authors = self.author_labels().await?;
+
         let mut messages: Vec<MessageGql> = stored
             .into_iter()
             .filter(|event| self.owns(&event.event))
             .filter(|event| before_seq.is_none_or(|before| event.seq.value() < before))
-            .map(MessageGql::from)
+            .map(|event| MessageGql::project(event, &viewer, &authors))
             .collect();
 
         let total = messages.len() as i32;
@@ -395,8 +430,31 @@ pub struct MessageGql {
     pub mine: bool,
 }
 
-impl From<StoredEvent> for MessageGql {
-    fn from(stored: StoredEvent) -> Self {
+/// Who is reading a desk history. `mine` is relative to this.
+///
+/// There is no `From<StoredEvent> for MessageGql` any more, and there cannot
+/// be: `mine` depends on who is asking, and a `From` has no way to know. With
+/// one operator it was safe to hardcode `true`; with several users it would
+/// mark everyone's messages as everyone else's.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Viewer {
+    /// An operator or platform credential. Legacy unattributed messages are
+    /// theirs, because that is who sent them before users existed.
+    Operator,
+    /// A human collaborator, by user id.
+    User(String),
+}
+
+impl MessageGql {
+    /// Projects a stored event for one viewer.
+    ///
+    /// `authors` maps user id → display label, resolved once per history rather
+    /// than per message.
+    pub fn project(
+        stored: StoredEvent,
+        viewer: &Viewer,
+        authors: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let id = ID(stored.seq.value().to_string());
         let at_millis = stored.at_millis as f64;
         match stored.event {
@@ -408,14 +466,30 @@ impl From<StoredEvent> for MessageGql {
                 at_millis,
                 mine: false,
             },
-            CompanyEvent::OperatorMessage { text } => MessageGql {
-                id,
-                channel: "operator".to_string(),
-                author: "operator".to_string(),
-                text,
-                at_millis,
-                mine: true,
-            },
+            CompanyEvent::OperatorMessage { text, by } => {
+                let (author, mine) = match &by {
+                    // Sent by a signed-in human.
+                    Some(actor) if actor.kind == ActorKind::User => {
+                        let label = authors
+                            .get(&actor.id)
+                            .cloned()
+                            .unwrap_or_else(|| "someone".to_string());
+                        (label, *viewer == Viewer::User(actor.id.clone()))
+                    }
+                    // Sent with a machine credential, or journaled before
+                    // attribution existed. Either way there is no person to
+                    // name, and it belongs to whoever holds that credential.
+                    _ => ("operator".to_string(), matches!(viewer, Viewer::Operator)),
+                };
+                MessageGql {
+                    id,
+                    channel: "operator".to_string(),
+                    author,
+                    text,
+                    at_millis,
+                    mine,
+                }
+            }
             // `owns` never admits other variants into a history.
             other => MessageGql {
                 id,
