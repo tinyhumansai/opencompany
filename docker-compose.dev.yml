@@ -8,7 +8,6 @@ services:
       - cargo
       - watch
       - --poll
-      - "1"
       - --watch
       - src
       - --watch

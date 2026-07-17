@@ -34,6 +34,16 @@ if printf '%s\n' "$up_output" | grep -F -- " -d" >/dev/null; then
     exit 1
 fi
 
+compose_output=$(OPENCOMPANY_COMPANY=agentic_marketing_agency docker compose \
+    --file "${REPO_ROOT}/docker-compose.yml" \
+    --file "${REPO_ROOT}/docker-compose.dev.yml" \
+    config)
+printf '%s\n' "$compose_output" | grep -F -- "- --poll" >/dev/null
+if printf '%s\n' "$compose_output" | grep -A1 -F -- "- --poll" | grep -F -- '- "1"' >/dev/null; then
+    echo "launch-demo test: cargo-watch --poll unexpectedly has a value" >&2
+    exit 1
+fi
+
 down_output=$(run_launcher agentic_software_company down)
 printf '%s\n' "$down_output" | grep -F "company=agentic_software_company" >/dev/null
 printf '%s\n' "$down_output" | grep -F "down --remove-orphans" >/dev/null
