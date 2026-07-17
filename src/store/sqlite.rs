@@ -37,15 +37,18 @@ use crate::company::CompanyManifest;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
+use crate::ports::login_codes::LoginCodeRecord;
 use crate::ports::memory::MemoryStore;
 use crate::ports::now_millis;
 use crate::ports::secrets::SecretStore;
+use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
     CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
     TaskResult,
 };
+use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
 
 /// Schema for every port table. Idempotent: safe to run on each `open`.
@@ -147,6 +150,53 @@ CREATE TABLE IF NOT EXISTS workspace_nodes (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (company_id, id)
 );
+CREATE TABLE IF NOT EXISTS users (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    user_json  TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_email
+    ON users (company_id, email);
+CREATE TABLE IF NOT EXISTS user_invites (
+    company_id  TEXT NOT NULL,
+    id          TEXT NOT NULL,
+    email       TEXT NOT NULL,
+    invite_json TEXT NOT NULL,
+    created_ms  INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS user_invites_email
+    ON user_invites (company_id, email);
+CREATE TABLE IF NOT EXISTS user_sessions (
+    company_id   TEXT NOT NULL,
+    id           TEXT NOT NULL,
+    token_hash   TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    session_json TEXT NOT NULL,
+    created_ms   INTEGER NOT NULL,
+    expires_ms   INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS user_sessions_token
+    ON user_sessions (company_id, token_hash);
+CREATE INDEX IF NOT EXISTS user_sessions_user
+    ON user_sessions (company_id, user_id);
+CREATE TABLE IF NOT EXISTS login_codes (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    code_hash  TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    code_json  TEXT NOT NULL,
+    expires_ms INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS login_codes_hash
+    ON login_codes (company_id, code_hash);
+CREATE INDEX IF NOT EXISTS login_codes_email
+    ON login_codes (company_id, email);
 "#;
 
 /// Maps a `rusqlite` failure onto the crate error type without a bare `?` on
@@ -841,6 +891,416 @@ impl crate::ports::tasks::TaskStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// UserStore
+// ---------------------------------------------------------------------------
+
+/// Whether a `rusqlite` failure is a uniqueness violation.
+///
+/// The email and token-hash unique indexes are the real enforcement of "one
+/// account per address"; this turns the raw sqlite failure into the crate's
+/// `409 Conflict` so callers see the same error the fs backend produces.
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+#[async_trait]
+impl crate::ports::users::UserStore for SqliteStore {
+    async fn list_users(&self, company: &CompanyId) -> Result<Vec<UserRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT user_json FROM users WHERE company_id = ?1 ORDER BY created_ms DESC")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn get_user(&self, company: &CompanyId, id: &str) -> Result<Option<UserRecord>> {
+        let conn = self.conn();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT user_json FROM users WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        json.map(|j| serde_json::from_str(&j).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn find_user_by_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<UserRecord>> {
+        let conn = self.conn();
+        // Served by the `users_email` unique index: the login hot path must not
+        // scan. Comparison is exact — normalization is the caller's job.
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT user_json FROM users WHERE company_id = ?1 AND email = ?2",
+                params![company.as_ref(), email],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        json.map(|j| serde_json::from_str(&j).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn upsert_user(&self, company: &CompanyId, user: &UserRecord) -> Result<()> {
+        let json = serde_json::to_string(user)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO users (company_id, id, email, user_json, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id, id) DO UPDATE SET email = excluded.email, \
+             user_json = excluded.user_json",
+            params![
+                company.as_ref(),
+                user.id,
+                user.email,
+                json,
+                user.created_at_millis as i64
+            ],
+        )
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                OpenCompanyError::Conflict(format!(
+                    "another user already has the email {}",
+                    user.email
+                ))
+            } else {
+                sql_err(e)
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn delete_user(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM users WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+
+    async fn list_invites(&self, company: &CompanyId) -> Result<Vec<InviteRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT invite_json FROM user_invites WHERE company_id = ?1 \
+                 ORDER BY created_ms DESC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn find_invite_by_email(
+        &self,
+        company: &CompanyId,
+        email: &str,
+    ) -> Result<Option<InviteRecord>> {
+        let conn = self.conn();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT invite_json FROM user_invites WHERE company_id = ?1 AND email = ?2",
+                params![company.as_ref(), email],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        json.map(|j| serde_json::from_str(&j).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn upsert_invite(&self, company: &CompanyId, invite: &InviteRecord) -> Result<()> {
+        let json = serde_json::to_string(invite)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO user_invites (company_id, id, email, invite_json, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id, id) DO UPDATE SET email = excluded.email, \
+             invite_json = excluded.invite_json",
+            params![
+                company.as_ref(),
+                invite.id,
+                invite.email,
+                json,
+                invite.created_at_millis as i64
+            ],
+        )
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                OpenCompanyError::Conflict(format!("{} is already invited", invite.email))
+            } else {
+                sql_err(e)
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn delete_invite(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM user_invites WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::sessions::SessionStore for SqliteStore {
+    async fn create(&self, company: &CompanyId, session: &SessionRecord) -> Result<()> {
+        let json = serde_json::to_string(session)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO user_sessions \
+             (company_id, id, token_hash, user_id, session_json, created_ms, expires_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                company.as_ref(),
+                session.id,
+                session.token_hash,
+                session.user_id,
+                json,
+                session.created_at_millis as i64,
+                session.expires_at_millis as i64
+            ],
+        )
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                OpenCompanyError::Conflict("that session token already exists".to_string())
+            } else {
+                sql_err(e)
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn find_by_token_hash(
+        &self,
+        company: &CompanyId,
+        token_hash: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let conn = self.conn();
+        // Served by the `user_sessions_token` unique index: this runs on every
+        // authenticated request.
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT session_json FROM user_sessions \
+                 WHERE company_id = ?1 AND token_hash = ?2",
+                params![company.as_ref(), token_hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        json.map(|j| serde_json::from_str(&j).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn list_for_user(
+        &self,
+        company: &CompanyId,
+        user_id: &str,
+    ) -> Result<Vec<SessionRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_json FROM user_sessions WHERE company_id = ?1 AND user_id = ?2 \
+                 ORDER BY created_ms DESC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref(), user_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()> {
+        // The payload is the source of truth, so read-modify-write it under one
+        // transaction rather than promoting `last_seen` to a column that could
+        // drift from the JSON.
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let json: Option<String> = tx
+            .query_row(
+                "SELECT session_json FROM user_sessions WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(json) = json else {
+            // Raced a revoke; the request is being refused elsewhere.
+            return Ok(());
+        };
+        let mut session: SessionRecord = serde_json::from_str(&json)?;
+        session.last_seen_at_millis = at_millis;
+        tx.execute(
+            "UPDATE user_sessions SET session_json = ?3 WHERE company_id = ?1 AND id = ?2",
+            params![company.as_ref(), id, serde_json::to_string(&session)?],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM user_sessions WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+
+    async fn delete_for_user(&self, company: &CompanyId, user_id: &str) -> Result<u64> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM user_sessions WHERE company_id = ?1 AND user_id = ?2",
+                params![company.as_ref(), user_id],
+            )
+            .map_err(sql_err)?;
+        Ok(n as u64)
+    }
+
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
+        let conn = self.conn();
+        // Expiry is exclusive: a session expiring exactly at `now` is dead.
+        let n = conn
+            .execute(
+                "DELETE FROM user_sessions WHERE company_id = ?1 AND expires_ms <= ?2",
+                params![company.as_ref(), now_millis as i64],
+            )
+            .map_err(sql_err)?;
+        Ok(n as u64)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LoginCodeStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::login_codes::LoginCodeStore for SqliteStore {
+    async fn create(&self, company: &CompanyId, code: &LoginCodeRecord) -> Result<()> {
+        let json = serde_json::to_string(code)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO login_codes \
+             (company_id, id, code_hash, email, code_json, expires_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                company.as_ref(),
+                code.id,
+                code.code_hash,
+                code.email,
+                json,
+                code.expires_at_millis as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        company: &CompanyId,
+        code_hash: &str,
+        now_millis: u64,
+    ) -> Result<Option<LoginCodeRecord>> {
+        // Single-use lives or dies here. The read, the redeemability check, and
+        // the mark are one transaction, so two requests racing on the same code
+        // cannot both come away with a record — the loser either sees the code
+        // already consumed or blocks until the winner commits.
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(sql_err)?;
+        let json: Option<String> = tx
+            .query_row(
+                "SELECT code_json FROM login_codes WHERE company_id = ?1 AND code_hash = ?2",
+                params![company.as_ref(), code_hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let mut code: LoginCodeRecord = serde_json::from_str(&json)?;
+        if !code.is_redeemable(now_millis) {
+            return Ok(None);
+        }
+        code.consumed_at_millis = Some(now_millis);
+        tx.execute(
+            "UPDATE login_codes SET code_json = ?3 WHERE company_id = ?1 AND code_hash = ?2",
+            params![company.as_ref(), code_hash, serde_json::to_string(&code)?],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(Some(code))
+    }
+
+    async fn delete_for_email(&self, company: &CompanyId, email: &str) -> Result<u64> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM login_codes WHERE company_id = ?1 AND email = ?2",
+                params![company.as_ref(), email],
+            )
+            .map_err(sql_err)?;
+        Ok(n as u64)
+    }
+
+    async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM login_codes WHERE company_id = ?1 AND expires_ms <= ?2",
+                params![company.as_ref(), now_millis as i64],
+            )
+            .map_err(sql_err)?;
+        Ok(n as u64)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FactStore
 // ---------------------------------------------------------------------------
 
@@ -1310,6 +1770,21 @@ mod test {
     #[tokio::test]
     async fn conformance_task_store() {
         conformance::assert_task_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_user_store() {
+        conformance::assert_user_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_session_store() {
+        conformance::assert_session_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_login_code_store() {
+        conformance::assert_login_code_store(store()).await;
     }
 
     #[tokio::test]
