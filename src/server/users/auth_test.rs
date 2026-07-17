@@ -97,7 +97,6 @@ async fn seed_session(
                 user_id: "u1".into(),
                 created_at_millis: now,
                 expires_at_millis: now + 60_000,
-                last_seen_at_millis: now,
                 user_agent: None,
             },
         )
@@ -261,7 +260,6 @@ async fn an_expired_session_does_not_resolve() {
                 user_id: "u1".into(),
                 created_at_millis: 0,
                 expires_at_millis: now - 1, // already dead
-                last_seen_at_millis: 0,
                 user_agent: None,
             },
         )

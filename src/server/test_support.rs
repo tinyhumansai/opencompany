@@ -58,7 +58,6 @@ pub(crate) async fn seed_session(state: &AppState, company: &str, role: UserRole
                 user_id,
                 created_at_millis: now,
                 expires_at_millis: now + 60 * 60 * 1000,
-                last_seen_at_millis: now,
                 user_agent: None,
             },
         )
@@ -124,7 +123,6 @@ pub(crate) async fn seed_fixed_admin(state: &AppState, company: &str) {
                 user_id,
                 created_at_millis: now,
                 expires_at_millis: now + 60 * 60 * 1000,
-                last_seen_at_millis: now,
                 user_agent: None,
             },
         )

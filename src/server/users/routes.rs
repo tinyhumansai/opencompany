@@ -271,7 +271,6 @@ async fn mint_session(
         user_id: user.id.clone(),
         created_at_millis: now,
         expires_at_millis: now + token::SESSION_TTL_MILLIS,
-        last_seen_at_millis: now,
         user_agent: headers
             .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
@@ -282,6 +281,16 @@ async fn mint_session(
         .create(company, &session)
         .await
         .map_err(|e| ApiError(e).into_response())?;
+
+    // Record the sign-in on the user. Every session is minted here — link and
+    // password alike — so this is the one place that makes `last_seen` mean
+    // "last signed in" rather than "joined". It is deliberately not updated per
+    // request: that would be a store write on every authenticated call, and
+    // knowing someone signed in an hour ago is not worth that.
+    let mut signed_in = user.clone();
+    signed_in.last_seen_at_millis = Some(now);
+    signed_in.updated_at_millis = now;
+    let _ = runtime.users().upsert_user(company, &signed_in).await;
 
     // Opportunistic cleanup on a cold path, so no background task is needed.
     let _ = runtime.sessions().purge_expired(company, now).await;

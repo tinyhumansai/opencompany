@@ -1150,35 +1150,6 @@ impl crate::ports::sessions::SessionStore for SqliteStore {
         Ok(out)
     }
 
-    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()> {
-        // The payload is the source of truth, so read-modify-write it under one
-        // transaction rather than promoting `last_seen` to a column that could
-        // drift from the JSON.
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(sql_err)?;
-        let json: Option<String> = tx
-            .query_row(
-                "SELECT session_json FROM user_sessions WHERE company_id = ?1 AND id = ?2",
-                params![company.as_ref(), id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(sql_err)?;
-        let Some(json) = json else {
-            // Raced a revoke; the request is being refused elsewhere.
-            return Ok(());
-        };
-        let mut session: SessionRecord = serde_json::from_str(&json)?;
-        session.last_seen_at_millis = at_millis;
-        tx.execute(
-            "UPDATE user_sessions SET session_json = ?3 WHERE company_id = ?1 AND id = ?2",
-            params![company.as_ref(), id, serde_json::to_string(&session)?],
-        )
-        .map_err(sql_err)?;
-        tx.commit().map_err(sql_err)?;
-        Ok(())
-    }
-
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let conn = self.conn();
         let n = conn

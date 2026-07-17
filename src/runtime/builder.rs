@@ -1077,7 +1077,6 @@ mod test {
                     user_id: "u1".into(),
                     created_at_millis: 1,
                     expires_at_millis: 10,
-                    last_seen_at_millis: 1,
                     user_agent: None,
                 },
             )

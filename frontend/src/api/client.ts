@@ -98,6 +98,16 @@ export class OpenCompanyClient {
     return this.request<T>("POST", path, body);
   }
 
+  /** A typed PATCH, for surfaces that live outside this class (e.g. auth). */
+  patch<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>("PATCH", path, body);
+  }
+
+  /** A typed DELETE, for surfaces that live outside this class (e.g. auth). */
+  del<T>(path: string): Promise<T> {
+    return this.request<T>("DELETE", path);
+  }
+
   /** Liveness probe. */
   async healthz(): Promise<boolean> {
     try {

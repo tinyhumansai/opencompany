@@ -92,7 +92,11 @@ pub struct UserRecord {
     pub must_change_password: bool,
     /// Epoch-millis timestamp of when the user redeemed their invite.
     pub created_at_millis: u64,
-    /// Epoch-millis timestamp of the user's most recent authenticated request.
+    /// Epoch-millis timestamp of the user's most recent **sign-in**.
+    ///
+    /// Stamped when a session is minted — by link or by password — not on every
+    /// authenticated request. Tracking activity would cost a store write per
+    /// call, which is not worth knowing someone was here a minute ago.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at_millis: Option<u64>,
     /// Epoch-millis timestamp of the last update to this record.

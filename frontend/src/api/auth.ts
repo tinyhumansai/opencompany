@@ -85,3 +85,128 @@ export async function setPassword(
 export async function logout(client: OpenCompanyClient, company: string | null): Promise<void> {
   await client.post(`${client.scopeFor(company)}/auth/logout`, {});
 }
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+//
+// Every call below needs an admin session; the backend answers 403 otherwise.
+// The UI gates on `me().role` as well, so a member never sees controls that
+// would only fail — but the gate that matters is the server's.
+
+/** Whether a user may currently sign in. */
+export type UserStatus = "active" | "suspended";
+
+/** A person, as an admin sees them. Never carries a password hash. */
+export interface Person {
+  id: string;
+  email: string;
+  displayName?: string;
+  role: UserRole;
+  status: UserStatus;
+  /** Whether they have a password — never what it is. */
+  hasPassword: boolean;
+  mustChangePassword: boolean;
+  createdAtMillis: number;
+  lastSeenAtMillis?: number;
+}
+
+/**
+ * An outstanding invite.
+ *
+ * An id prefixed `manifest:` is synthetic — that address is an admin because
+ * the company manifest says so. It has no stored record, so it cannot be
+ * revoked here; edit `[users].admins` instead.
+ */
+export interface Invite {
+  id: string;
+  email: string;
+  role: UserRole;
+  invitedBy: string;
+  createdAtMillis: number;
+  expiresAtMillis: number;
+  acceptedAtMillis?: number;
+}
+
+/** Whether an invite comes from the manifest rather than a stored record. */
+export function isManifestInvite(invite: Invite): boolean {
+  return invite.id.startsWith("manifest:");
+}
+
+/** The company's people. */
+export async function listPeople(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<Person[]> {
+  return client.get<Person[]>(`${client.scopeFor(company)}/users`);
+}
+
+/** Outstanding invites, including the manifest's standing admins. */
+export async function listInvites(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<Invite[]> {
+  return client.get<Invite[]>(`${client.scopeFor(company)}/users/invites`);
+}
+
+/** Invites an address. */
+export async function invite(
+  client: OpenCompanyClient,
+  company: string | null,
+  email: string,
+  role: UserRole,
+): Promise<Invite> {
+  return client.post<Invite>(`${client.scopeFor(company)}/users/invites`, { email, role });
+}
+
+/** Revokes an invite. */
+export async function revokeInvite(
+  client: OpenCompanyClient,
+  company: string | null,
+  inviteId: string,
+): Promise<void> {
+  await client.del(`${client.scopeFor(company)}/users/invites/${encodeURIComponent(inviteId)}`);
+}
+
+/** Changes a person's role, status, or display name. */
+export async function updatePerson(
+  client: OpenCompanyClient,
+  company: string | null,
+  userId: string,
+  changes: { role?: UserRole; status?: UserStatus; displayName?: string },
+): Promise<Person> {
+  return client.patch<Person>(
+    `${client.scopeFor(company)}/users/${encodeURIComponent(userId)}`,
+    changes,
+  );
+}
+
+/**
+ * Sets a temporary password for someone.
+ *
+ * Revokes their sessions and flags the account, so the next thing they can do
+ * is replace it. The admin must convey the value out of band — which is the
+ * cost of this option, and why the magic link is usually the better answer.
+ */
+export async function resetPassword(
+  client: OpenCompanyClient,
+  company: string | null,
+  userId: string,
+  password: string,
+): Promise<Person> {
+  return client.post<Person>(
+    `${client.scopeFor(company)}/users/${encodeURIComponent(userId)}/password`,
+    { password },
+  );
+}
+
+/** Signs someone out everywhere. */
+export async function revokeSessions(
+  client: OpenCompanyClient,
+  company: string | null,
+  userId: string,
+): Promise<{ revoked: number }> {
+  return client.del<{ revoked: number }>(
+    `${client.scopeFor(company)}/users/${encodeURIComponent(userId)}/sessions`,
+  );
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 
 import { verifyCode } from "@/api/auth";
@@ -25,29 +25,57 @@ type Phase =
     };
 
 /**
- * Pulls `?company=&code=` off a magic-link landing and cleans the URL.
+ * Reads `?company=&code=` off a magic-link landing.
  *
- * The code is a single-use credential, so it must not linger in the address
- * bar, the history, or a `Referer` header once redeemed.
+ * **Pure.** It must stay that way: this runs in a `useMemo`, and StrictMode
+ * double-invokes those. Stripping the URL here — as this once did — meant the
+ * second invocation read an already-cleaned URL and returned nothing, silently
+ * dropping the code and the company. Clearing is a side effect, so it lives in
+ * an effect: see `clearMagicLinkFromUrl`.
  */
-function takeMagicLink(): { company: string | null; code: string } | null {
+function readMagicLink(): { company: string | null; code: string } | null {
   const params = new URLSearchParams(window.location.search);
   const code = params.get("code");
   if (!code) return null;
-  const company = params.get("company");
+  return { company: params.get("company"), code };
+}
+
+/**
+ * Strips the magic link out of the address bar.
+ *
+ * The code is a single-use credential, so it must not linger in the URL, the
+ * history, or a `Referer` header once we hold it.
+ */
+function clearMagicLinkFromUrl(): void {
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has("code")) return;
   params.delete("code");
   params.delete("company");
   const query = params.toString();
   window.history.replaceState({}, "", window.location.pathname + (query ? `?${query}` : ""));
-  return { company, code };
 }
 
 export function App() {
   const config = useMemo(() => resolveConfig(), []);
   const client = useMemo(() => new OpenCompanyClient(config), [config]);
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
-  // Read once, on the first render, before anything can navigate.
-  const magicLink = useMemo(() => takeMagicLink(), []);
+  // A pure read, so StrictMode's double render is harmless.
+  const magicLink = useMemo(() => readMagicLink(), []);
+  /**
+   * The in-flight redemption, so a link is redeemed exactly once.
+   *
+   * StrictMode double-invokes effects, and a login code is single-use: the
+   * second call would spend nothing and 401, bouncing a perfectly good sign-in
+   * to the login screen. Both runs await this one promise instead. A ref rather
+   * than a "done" flag, because the second run must *wait for* the first — not
+   * skip ahead and query with a session that does not exist yet.
+   */
+  const redemption = useRef<Promise<unknown> | null>(null);
+
+  // Now that the code is captured in state, take it out of the URL.
+  useEffect(() => {
+    if (magicLink) clearMagicLinkFromUrl();
+  }, [magicLink]);
 
   // An expired or revoked session anywhere in the console drops to sign-in
   // rather than showing a broken page.
@@ -68,7 +96,8 @@ export function App() {
       if (magicLink) {
         const company = magicLink.company ?? config.company;
         try {
-          await verifyCode(client, company, magicLink.code);
+          redemption.current ??= verifyCode(client, company, magicLink.code);
+          await redemption.current;
         } catch {
           // A dead link is not fatal — fall through to sign-in and let them
           // ask for another. The reason stays vague on purpose.

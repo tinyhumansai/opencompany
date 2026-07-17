@@ -14,6 +14,7 @@ import {
   ShieldCheck,
   Sparkles,
   SquareKanban,
+  UserCog,
   Users,
   Wallet,
   Workflow,
@@ -54,6 +55,7 @@ import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
 import { TeamView } from "@/views/TeamView";
+import { PeopleView } from "@/views/PeopleView";
 import { SkillsView } from "@/views/SkillsView";
 import { InboxView } from "@/views/InboxView";
 import { MemoryView } from "@/views/MemoryView";
@@ -78,6 +80,7 @@ const FinancesView = lazy(() =>
 
 export type View =
   | "overview"
+  | "people"
   | "conversation"
   | "inbox"
   | "tasks"
@@ -126,6 +129,7 @@ const NAV: NavGroup[] = [
       { view: "usage", label: "Usage", icon: ChartColumnBig },
       { view: "finances", label: "Finances", icon: Wallet },
       { view: "connections", label: "Connections", icon: Plug },
+      { view: "people", label: "People", icon: UserCog },
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
   },
@@ -149,6 +153,7 @@ const TITLES: Record<View, string> = {
   usage: "Usage",
   finances: "Finances",
   connections: "Connections",
+  people: "People",
   settings: "Settings",
   feedback: "Feedback",
 };
@@ -288,6 +293,7 @@ export function AppShell({
           {view === "inbox" && <InboxView company={company} />}
           {view === "tasks" && <TasksView />}
           {view === "team" && <TeamView client={client} company={company} />}
+          {view === "people" && <PeopleView client={client} company={company} />}
           {view === "skills" && <SkillsView company={company} />}
           {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (

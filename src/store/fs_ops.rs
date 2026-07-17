@@ -267,20 +267,6 @@ impl SessionStore for FsOps {
         Ok(sessions)
     }
 
-    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()> {
-        let path = self.bundle(company).user_sessions_json();
-        let lock = self.locks.get(&path);
-        let _guard = lock.lock().await;
-        let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
-        let Some(session) = sessions.iter_mut().find(|s| s.id == id) else {
-            // Touching a revoked session is not an error: the request that
-            // raced the revocation is already being refused elsewhere.
-            return Ok(());
-        };
-        session.last_seen_at_millis = at_millis;
-        write_atomic(&path, &serde_json::to_string(&sessions)?).await
-    }
-
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).user_sessions_json();
         let lock = self.locks.get(&path);

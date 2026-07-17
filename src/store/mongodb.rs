@@ -1075,28 +1075,6 @@ impl crate::ports::sessions::SessionStore for MongoStore {
         Ok(out)
     }
 
-    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()> {
-        let found = self
-            .collection("user_sessions")
-            .find_one(doc! {"company_id": company.as_ref(), "session_id": id})
-            .await
-            .map_err(mongo_err)?;
-        let Some(doc) = found else {
-            // Raced a revoke; the request is being refused elsewhere.
-            return Ok(());
-        };
-        let mut session: SessionRecord = serde_json::from_str(&get_str(&doc, "session_json")?)?;
-        session.last_seen_at_millis = at_millis;
-        self.collection("user_sessions")
-            .update_one(
-                doc! {"company_id": company.as_ref(), "session_id": id},
-                doc! {"$set": {"session_json": serde_json::to_string(&session)?}},
-            )
-            .await
-            .map_err(mongo_err)?;
-        Ok(())
-    }
-
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let res = self
             .collection("user_sessions")

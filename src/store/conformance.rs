@@ -708,7 +708,6 @@ pub async fn assert_session_store(sessions: Arc<dyn SessionStore>) {
         user_id: user.to_string(),
         created_at_millis: 1,
         expires_at_millis: expires,
-        last_seen_at_millis: 1,
         user_agent: None,
     };
 
@@ -764,20 +763,6 @@ pub async fn assert_session_store(sessions: Arc<dyn SessionStore>) {
             .unwrap()
             .is_empty()
     );
-
-    // Touch records activity without disturbing anything else.
-    sessions.touch(&alpha, "s1", 42).await.unwrap();
-    assert_eq!(
-        sessions
-            .find_by_token_hash(&alpha, "hash-1")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_seen_at_millis,
-        42
-    );
-    // Touching an unknown session is a no-op, not an error: it raced a revoke.
-    sessions.touch(&alpha, "gone", 43).await.unwrap();
 
     // Single revocation.
     assert!(sessions.delete(&alpha, "s1").await.unwrap());

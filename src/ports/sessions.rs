@@ -40,8 +40,6 @@ pub struct SessionRecord {
     pub created_at_millis: u64,
     /// Epoch-millis timestamp after which the session is refused.
     pub expires_at_millis: u64,
-    /// Epoch-millis timestamp of the session's most recent authenticated request.
-    pub last_seen_at_millis: u64,
     /// The `User-Agent` that minted the session, so a user can recognize a
     /// session when revoking it. Untrusted, display-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +55,11 @@ impl SessionRecord {
 
 /// The company's durable session table. Company A's sessions MUST be invisible
 /// to company B.
+///
+/// Note there is no `touch`/activity tracking: recording a session's last use
+/// would mean a store write on every authenticated request. `UserRecord`'s
+/// `last_seen_at_millis` records sign-ins instead, which costs one write per
+/// login and answers the question anyone actually asks.
 ///
 /// Lookup by token hash is on every authenticated request's hot path and must be
 /// indexed, not scanned.
@@ -77,8 +80,6 @@ pub trait SessionStore: Send + Sync {
     /// Lists a user's live and expired sessions, most-recently-created first.
     async fn list_for_user(&self, company: &CompanyId, user_id: &str)
     -> Result<Vec<SessionRecord>>;
-    /// Records activity on a session, for the console's session list.
-    async fn touch(&self, company: &CompanyId, id: &str, at_millis: u64) -> Result<()>;
     /// Revokes one session by id; returns whether one was removed.
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
     /// Revokes every session belonging to a user; returns how many were removed.
@@ -101,7 +102,6 @@ mod test {
             user_id: "u1".to_string(),
             created_at_millis: 0,
             expires_at_millis: 100,
-            last_seen_at_millis: 0,
             user_agent: None,
         }
     }
