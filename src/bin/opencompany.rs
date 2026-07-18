@@ -182,10 +182,13 @@ async fn register_company(
     // The company's on-disk source directory (`companies/<name>`) seeds the
     // workspace tree on first boot and lets read resolvers find its committed
     // skills/workflows content.
-    let mut builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest))
-        .with_seed_dir(company_source_dir(dir))
-        .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
-        .with_host_base_url(state.config().host_base_url());
+    let mut builder = attach_harness(attach_openhuman(RuntimeBuilder::new(
+        home.to_path_buf(),
+        manifest,
+    )))
+    .with_seed_dir(company_source_dir(dir))
+    .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
+    .with_host_base_url(state.config().host_base_url());
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
@@ -247,6 +250,33 @@ fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
             builder.with_openhuman_rpc(Arc::new(HttpOpenHumanRpc::attach(url, bearer)))
         }
         _ => builder,
+    }
+}
+
+/// Attaches the embedded OpenHuman harness brain when the `openhuman` feature
+/// is enabled and a hosted-inference credential is present in the environment
+/// (`TINYHUMANS_API_KEY` / `OPENCOMPANY_INFERENCE_*`). With it, `/company/chat`
+/// routes each operator message through a live company agent on the hosted
+/// brain; without a credential the runtime keeps its hosted/echo brain.
+///
+/// Without the feature this is the identity function, so the default build is
+/// unaffected.
+#[cfg(not(feature = "openhuman"))]
+fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+}
+
+#[cfg(feature = "openhuman")]
+fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
+    use opencompany::app::config::ProcessEnv;
+    use opencompany::harness::HarnessPool;
+    use opencompany::harness::provider::harness_inference_from_env;
+
+    match harness_inference_from_env(&ProcessEnv) {
+        Some((config, model)) => builder
+            .with_harness(Arc::new(HarnessPool::new()))
+            .with_harness_inference(config, model),
+        None => builder,
     }
 }
 

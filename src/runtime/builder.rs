@@ -24,6 +24,10 @@ use crate::feedback::service::FeedbackFiler;
 use crate::feedback::store::FeedbackStore;
 use crate::feedback::tool::BuiltinToolProvider;
 use crate::feedback::types::ConsentMode;
+#[cfg(feature = "openhuman")]
+use crate::harness::provider::{HostedProvider, HostedProviderConfig};
+#[cfg(feature = "openhuman")]
+use crate::harness::{HarnessBrain, HarnessDeps};
 use crate::openhuman::rpc::OpenHumanRpc;
 use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
@@ -147,6 +151,11 @@ pub struct RuntimeBuilder {
     /// build is unaffected; wired through to [`CompanyRuntime`] when present.
     #[cfg(feature = "openhuman")]
     harness: Option<Arc<crate::harness::HarnessPool>>,
+    /// WS4: hosted-inference config (endpoint + default model) for the harness
+    /// brain. With both this and [`harness`](Self::harness) set — and no
+    /// explicit brain — cognition routes through the embedded openhuman runtime.
+    #[cfg(feature = "openhuman")]
+    harness_inference: Option<(HostedProviderConfig, String)>,
 }
 
 impl RuntimeBuilder {
@@ -193,6 +202,8 @@ impl RuntimeBuilder {
             consent: ConsentMode::default(),
             #[cfg(feature = "openhuman")]
             harness: None,
+            #[cfg(feature = "openhuman")]
+            harness_inference: None,
         }
     }
 
@@ -417,6 +428,21 @@ impl RuntimeBuilder {
         self
     }
 
+    /// WS4: sets the hosted-inference config (endpoint + default model) the
+    /// harness brain drives. Combined with [`with_harness`](Self::with_harness)
+    /// and no explicit brain, cognition routes through the embedded openhuman
+    /// runtime; without it the harness pool stays wired but unused and the
+    /// runtime keeps its hosted/echo brain. Feature-gated.
+    #[cfg(feature = "openhuman")]
+    pub fn with_harness_inference(
+        mut self,
+        config: HostedProviderConfig,
+        default_model: impl Into<String>,
+    ) -> Self {
+        self.harness_inference = Some((config, default_model.into()));
+        self
+    }
+
     /// Swaps the secret store (default: fs-backed). The feedback scrubber reads
     /// it to fail closed on secret leaks.
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
@@ -603,34 +629,72 @@ impl RuntimeBuilder {
             }
         };
 
-        // Brain selection: an explicit brain wins; otherwise hosted mode plus a
-        // credential selects the hosted Medulla brain (over an injected or, under
-        // the `medulla` feature, a networked transport). Every other combination
-        // — no credential, sidecar mode, or a hosted default build with no
-        // transport — degrades to the offline echo brain so the default build
-        // stays green.
+        // Brain selection, in precedence order:
+        //   1. an explicit brain (test injection) always wins;
+        //   2. under the `openhuman` feature, an attached harness pool + a
+        //      hosted-inference config routes cognition through the embedded
+        //      openhuman runtime (a real agent turn per operator message);
+        //   3. otherwise hosted mode plus a credential selects the hosted
+        //      Medulla brain (over an injected or, under `medulla`, a networked
+        //      transport);
+        //   4. every other combination degrades to the offline echo brain so
+        //      the default build stays green.
         let brain: Arc<dyn Brain> = match self.brain {
             Some(brain) => brain,
             None => {
-                let tool_catalog: Vec<ToolManifestEntry> = self
-                    .manifest
-                    .tools
-                    .allow
-                    .iter()
-                    .map(|name| ToolManifestEntry {
-                        name: name.clone(),
-                        description: None,
-                        input_schema: None,
-                    })
-                    .collect();
-                select_hosted_or_echo(
-                    self.brain_mode.unwrap_or(BrainMode::Hosted),
-                    self.credential,
-                    self.transport,
-                    self.api_url,
-                    &id,
-                    tool_catalog,
-                )
+                // Clone the pool so it stays available for the downstream
+                // `CompanyRuntime::harness` wiring — the brain and the runtime
+                // deliberately share one pool.
+                #[cfg(feature = "openhuman")]
+                let harness_brain: Option<Arc<dyn Brain>> =
+                    match (self.harness.clone(), self.harness_inference.clone()) {
+                        (Some(pool), Some((provider_config, model))) => {
+                            let deps = HarnessDeps {
+                                provider: Arc::new(HostedProvider::new(provider_config)),
+                                provider_slug: "managed".to_string(),
+                                context: context.clone(),
+                                store: store.clone(),
+                                meter: Some(fs_ops.clone()),
+                                workspace_root: home.join("harness"),
+                                model_override: Some(model),
+                            };
+                            let record = CompanyRecord {
+                                id: id.clone(),
+                                manifest: self.manifest.clone(),
+                                ledger: Vec::new(),
+                                lifecycle: "running".to_string(),
+                                overlay_agents: Vec::new(),
+                            };
+                            Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
+                        }
+                        _ => None,
+                    };
+                #[cfg(not(feature = "openhuman"))]
+                let harness_brain: Option<Arc<dyn Brain>> = None;
+
+                if let Some(brain) = harness_brain {
+                    brain
+                } else {
+                    let tool_catalog: Vec<ToolManifestEntry> = self
+                        .manifest
+                        .tools
+                        .allow
+                        .iter()
+                        .map(|name| ToolManifestEntry {
+                            name: name.clone(),
+                            description: None,
+                            input_schema: None,
+                        })
+                        .collect();
+                    select_hosted_or_echo(
+                        self.brain_mode.unwrap_or(BrainMode::Hosted),
+                        self.credential,
+                        self.transport,
+                        self.api_url,
+                        &id,
+                        tool_catalog,
+                    )
+                }
             }
         };
 

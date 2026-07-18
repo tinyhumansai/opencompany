@@ -22,22 +22,27 @@
 //!
 //! ## Flagged seams
 //!
-//! * **Live turn cost.** openhuman exposes the completed turn's token/cost
-//!   totals only through a `pub(crate)` accessor
-//!   (`Agent::take_last_turn_usage_totals`), so a host crate cannot read the
-//!   real [`TurnCost`] after `turn()`. Until openhuman adds a public accessor
-//!   (or the harness ships a usage-accumulating provider), [`HarnessPool::run`]
-//!   records a zero-usage turn — which, per the cost contract, writes nothing.
-//!   The [`cost`] mapping itself is complete and tested.
 //! * **Group-chat / desk routing** is opencompany's job (openhuman is
 //!   single-agent). v1 is single-responder; the full ops `chat` handler that
 //!   resolves a desk's members and journals the `AgentReply` is WS3.
+//!
+//! Live turn cost is **wired**: [`CompanyAgent::run`] reads the completed turn's
+//! token/cost totals from openhuman's public
+//! [`Agent::last_turn_usage`](oh::agent::Agent::last_turn_usage) accessor and
+//! [`HarnessPool::run`] records them through [`cost::record_turn_cost`]. Usage
+//! only reaches the ledger/meter when the provider reports it — the
+//! [`HostedProvider`](provider::HostedProvider) parses it off the wire; the
+//! offline [`MockProvider`](provider::MockProvider) does not, so test turns stay
+//! inert.
 
+pub mod brain;
 pub mod build;
 pub mod cost;
 pub mod memory;
 pub mod policy;
 pub mod provider;
+
+pub use brain::HarnessBrain;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -72,6 +77,11 @@ pub struct HarnessDeps {
     /// Root under which per-agent workspace directories are created
     /// (`{root}/{company}/{agent}/workspace`).
     pub workspace_root: PathBuf,
+    /// Optional model/tier applied to every agent, overriding the per-agent
+    /// `tier` → model mapping. Set from the resolved hosted-inference model so
+    /// the whole roster addresses the configured workload (e.g. `chat-v1`).
+    /// `None` keeps each agent's tier-derived default.
+    pub model_override: Option<String>,
 }
 
 /// One live openhuman agent, keyed by its manifest id.
@@ -86,13 +96,30 @@ pub struct CompanyAgent {
 }
 
 impl CompanyAgent {
-    /// Runs one turn against this agent, returning its reply text.
-    pub async fn run(&self, message: &str) -> crate::Result<String> {
+    /// Runs one turn against this agent, returning its reply text and the turn's
+    /// token/cost totals.
+    ///
+    /// The usage is read from the just-completed turn via openhuman's public
+    /// [`Agent::last_turn_usage`](oh::agent::Agent::last_turn_usage) accessor
+    /// while the agent lock is still held (so a concurrent turn can't overwrite
+    /// it). An offline provider that reports no usage yields a zero
+    /// [`TurnUsage`], which the cost hook treats as inert.
+    pub async fn run(&self, message: &str) -> crate::Result<(String, TurnUsage)> {
         let mut agent = self.agent.lock().await;
-        agent
+        let reply = agent
             .turn(message)
             .await
-            .map_err(|e| OpenCompanyError::Harness(format!("turn for '{}': {e}", self.agent_id)))
+            .map_err(|e| OpenCompanyError::Harness(format!("turn for '{}': {e}", self.agent_id)))?;
+        let usage = agent
+            .last_turn_usage()
+            .map(|u| TurnUsage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cached_input_tokens: u.cached_input_tokens,
+                cost_usd: u.cost_usd,
+            })
+            .unwrap_or_default();
+        Ok((reply, usage))
     }
 }
 
@@ -159,31 +186,10 @@ impl HarnessPool {
                 })?
         };
 
-        let reply = agent.run(message).await?;
-
-        // Cost accounting. openhuman only exposes the completed turn's usage via
-        // a `pub(crate)` accessor, so we cannot read the real `TurnCost` here yet
-        // (see module docs — flagged seam). A zero-usage turn writes nothing, so
-        // this is correct-but-inert until a public accessor lands; the mapping is
-        // fully wired so it becomes real with a one-line swap.
-        //
-        // FOLLOW-UP(openhuman#4940): once the vendored openhuman submodule
-        // pointer bumps to include the public `Agent::last_turn_usage()`
-        // accessor, replace this line with a read of the real per-turn totals,
-        // e.g.:
-        //     let u = agent.last_turn_usage();
-        //     let turn_cost = TurnUsage {
-        //         input_tokens: u.input_tokens,
-        //         output_tokens: u.output_tokens,
-        //         cached_input_tokens: u.cached_input_tokens,
-        //         cost_usd: u.cost_usd,
-        //         call_count: u.call_count,
-        //     };
-        // The mapping in `cost::usage_sample_for` / `cost::ledger_entry_for` is
-        // already correct, so this swap alone turns on the WS5 Usage/Finances
-        // data stream. Until then the accessor is absent from the pinned
-        // submodule and calling it would not compile under `--features openhuman`.
-        let turn_cost = TurnUsage::default();
+        // Run the turn and record its real cost. `CompanyAgent::run` reads the
+        // turn's token/cost totals from openhuman's public `last_turn_usage()`
+        // accessor; a zero-usage turn (offline provider) writes nothing.
+        let (reply, turn_cost) = agent.run(message).await?;
         record_turn_cost(
             &turn_cost,
             agent_id,
@@ -204,18 +210,25 @@ impl HarnessPool {
 }
 
 /// Build every roster agent for a company from its manifest.
-fn build_roster(
+pub(crate) fn build_roster(
     company: &CompanyRecord,
     deps: &HarnessDeps,
 ) -> crate::Result<Vec<Arc<CompanyAgent>>> {
     let policy: &Policy = &company.manifest.policy;
+    let company_name = &company.manifest.company.name;
     company
         .manifest
         .agents
         .iter()
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
-            let agent = build::build_agent(&company.id, manifest_agent, agent_policy, deps)?;
+            let agent = build::build_agent(
+                &company.id,
+                company_name,
+                manifest_agent,
+                agent_policy,
+                deps,
+            )?;
             Ok(Arc::new(CompanyAgent {
                 agent_id: manifest_agent.id.clone(),
                 role: manifest_agent.role.clone(),
@@ -223,4 +236,284 @@ fn build_roster(
             }))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+
+    use crate::company::CompanyManifest;
+    use crate::harness::provider::MockProvider;
+    use crate::ports::UsageSample;
+    use crate::ports::types::{
+        ChunkAddr, ChunkHit, ChunkMeta, CompanySummary, ContextChunk, LedgerEntry,
+    };
+
+    /// In-memory `ContextStore` so `OcMemory` has somewhere to land.
+    #[derive(Default)]
+    struct MockContext {
+        chunks: StdMutex<Vec<(ChunkAddr, ContextChunk)>>,
+    }
+
+    #[async_trait]
+    impl ContextStore for MockContext {
+        async fn put(&self, _id: &CompanyId, chunk: ContextChunk) -> crate::Result<ChunkAddr> {
+            let mut guard = self.chunks.lock().unwrap();
+            let addr = ChunkAddr::new(format!("addr-{}", guard.len()));
+            guard.push((addr.clone(), chunk));
+            Ok(addr)
+        }
+        async fn list(&self, _id: &CompanyId, prefix: &str) -> crate::Result<Vec<ChunkMeta>> {
+            let guard = self.chunks.lock().unwrap();
+            Ok(guard
+                .iter()
+                .filter(|(_, c)| c.label.starts_with(prefix))
+                .map(|(addr, c)| ChunkMeta {
+                    addr: addr.clone(),
+                    label: c.label.clone(),
+                    len: c.body.len(),
+                })
+                .collect())
+        }
+        async fn peek(
+            &self,
+            _id: &CompanyId,
+            addr: &ChunkAddr,
+            _range: Option<std::ops::Range<usize>>,
+        ) -> crate::Result<String> {
+            let guard = self.chunks.lock().unwrap();
+            Ok(guard
+                .iter()
+                .find(|(a, _)| a == addr)
+                .map(|(_, c)| c.body.clone())
+                .unwrap_or_default())
+        }
+        async fn search(
+            &self,
+            _id: &CompanyId,
+            query: &str,
+            limit: usize,
+        ) -> crate::Result<Vec<ChunkHit>> {
+            let guard = self.chunks.lock().unwrap();
+            Ok(guard
+                .iter()
+                .filter(|(_, c)| c.body.contains(query))
+                .take(limit)
+                .map(|(addr, c)| ChunkHit {
+                    addr: addr.clone(),
+                    snippet: c.body.clone(),
+                    score: 1.0,
+                })
+                .collect())
+        }
+    }
+
+    /// `CompanyStore` that records what the cost hook appends.
+    #[derive(Default)]
+    struct RecordingStore {
+        ledger: StdMutex<Vec<LedgerEntry>>,
+    }
+
+    #[async_trait]
+    impl CompanyStore for RecordingStore {
+        async fn load(&self, _id: &CompanyId) -> crate::Result<Option<CompanyRecord>> {
+            Ok(None)
+        }
+        async fn save(&self, _record: &CompanyRecord) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn list(&self) -> crate::Result<Vec<CompanySummary>> {
+            Ok(Vec::new())
+        }
+        async fn append_ledger(&self, _id: &CompanyId, entry: LedgerEntry) -> crate::Result<()> {
+            self.ledger.lock().unwrap().push(entry);
+            Ok(())
+        }
+    }
+
+    /// Records usage samples so a zero-usage turn can be asserted inert.
+    #[derive(Default)]
+    struct RecordingMeter {
+        samples: StdMutex<Vec<UsageSample>>,
+    }
+
+    #[async_trait]
+    impl UsageMeter for RecordingMeter {
+        async fn record(&self, _company: &CompanyId, sample: &UsageSample) -> crate::Result<()> {
+            self.samples.lock().unwrap().push(sample.clone());
+            Ok(())
+        }
+        async fn query(
+            &self,
+            _company: &CompanyId,
+            _since: u64,
+        ) -> crate::Result<Vec<UsageSample>> {
+            Ok(self.samples.lock().unwrap().clone())
+        }
+    }
+
+    fn manifest() -> CompanyManifest {
+        toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[policy]
+mode = "full"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+description = "Sets direction."
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Builds the product."
+"#,
+        )
+        .expect("valid manifest")
+    }
+
+    fn record() -> CompanyRecord {
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        }
+    }
+
+    struct Fixture {
+        deps: HarnessDeps,
+        store: Arc<RecordingStore>,
+        meter: Arc<RecordingMeter>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(RecordingStore::default());
+        let meter = Arc::new(RecordingMeter::default());
+        Fixture {
+            deps: HarnessDeps {
+                provider: Arc::new(MockProvider::new("mock: ")),
+                provider_slug: "mock".to_string(),
+                context: Arc::new(MockContext::default()),
+                store: store.clone(),
+                meter: Some(meter.clone()),
+                workspace_root: dir.path().to_path_buf(),
+                model_override: None,
+            },
+            store,
+            meter,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn roster_builds_every_manifest_agent() {
+        let fx = fixture();
+        let roster = build_roster(&record(), &fx.deps).expect("roster builds");
+        let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["ceo", "engineer"]);
+        assert_eq!(roster[0].role, "Chief Executive");
+    }
+
+    #[tokio::test]
+    async fn run_executes_a_turn_on_the_openhuman_runtime() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        let reply = pool
+            .run(&rec.id, "ceo", "hello-marker", &fx.deps)
+            .await
+            .expect("turn runs");
+
+        assert!(
+            reply.contains("hello-marker"),
+            "reply should echo the prompt through the agent: {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_is_idempotent() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("first ensure");
+        pool.ensure(&rec, &fx.deps).await.expect("second ensure");
+        assert_eq!(pool.resident_companies().await, 1);
+    }
+
+    #[tokio::test]
+    async fn turns_are_serialised_and_history_survives() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        pool.run(&rec.id, "ceo", "first", &fx.deps)
+            .await
+            .expect("first turn");
+        let second = pool
+            .run(&rec.id, "ceo", "second", &fx.deps)
+            .await
+            .expect("second turn");
+
+        assert!(second.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn unknown_agent_is_invalid_request() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        let err = pool
+            .run(&rec.id, "nobody", "hi", &fx.deps)
+            .await
+            .expect_err("unknown agent rejected");
+        assert!(
+            matches!(err, OpenCompanyError::InvalidRequest(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_company_is_not_found() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let err = pool
+            .run(&CompanyId::new("ghost"), "ceo", "hi", &fx.deps)
+            .await
+            .expect_err("unknown company rejected");
+        assert!(
+            matches!(err, OpenCompanyError::CompanyNotFound(_)),
+            "{err:?}"
+        );
+    }
+
+    /// Pins the documented inert-metering contract: until the provider reports
+    /// usage, a turn writes neither a ledger entry nor a usage sample.
+    #[tokio::test]
+    async fn zero_usage_turn_writes_nothing() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+        pool.run(&rec.id, "ceo", "hi", &fx.deps)
+            .await
+            .expect("turn");
+
+        assert!(fx.store.ledger.lock().unwrap().is_empty());
+        assert!(fx.meter.samples.lock().unwrap().is_empty());
+    }
 }
