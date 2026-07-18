@@ -465,6 +465,92 @@ mod test {
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 
+    /// End-to-end proof of the WS4 wire: with a [`HarnessBrain`] as the runtime's
+    /// cognition, `POST /company/chat` returns the **agent's** reply rather than
+    /// the echo brain's `"You said: …"`. The mock provider prefixes the routed
+    /// message, so `"mock: hi"` proves the operator message reached an openhuman
+    /// agent turn through the HTTP handler → `run_cycle` → brain path.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn chat_routes_through_the_harness_brain() {
+        use crate::harness::provider::MockProvider;
+        use crate::harness::{HarnessBrain, HarnessDeps, HarnessPool};
+        use crate::ports::CompanyStore;
+        use crate::store::{FsContextStore, FsOps};
+
+        let home = home();
+        let id = CompanyId::new("acme");
+        let manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief Executive\"\n",
+        )
+        .unwrap();
+
+        let record = CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        };
+        FsCompanyStore::new(home.to_path_buf())
+            .save(&record)
+            .await
+            .unwrap();
+
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(home.to_path_buf())),
+            store: Arc::new(FsCompanyStore::new(home.to_path_buf())),
+            meter: Some(Arc::new(FsOps::new(home.to_path_buf()))),
+            workspace_root: home.to_path_buf(),
+            model_override: None,
+        };
+        let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record);
+
+        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+            .with_id(id.clone())
+            .with_brain(Arc::new(brain))
+            .build()
+            .await
+            .unwrap();
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id, Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = value["responses"][0]["text"].as_str().unwrap();
+        // The mock provider's `mock: ` prefix proves the message went through an
+        // openhuman agent turn; the trailing `hi` is the operator message the
+        // agent forwarded (the agent prepends a date/time context line). Crucially
+        // it is NOT the echo brain's `"You said: hi"`.
+        assert!(text.starts_with("mock: "), "not an agent reply: {text:?}");
+        assert!(
+            text.trim_end().ends_with("hi"),
+            "message not forwarded: {text:?}"
+        );
+        assert_ne!(text, "You said: hi", "still routing through the echo brain");
+        assert_eq!(value["responses"][0]["channel"], "operator");
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
     #[tokio::test]
     async fn chat_by_id_matches_registered_company() {
         let home = home();

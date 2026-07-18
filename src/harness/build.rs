@@ -22,6 +22,7 @@ use openhuman_core::openhuman as oh;
 
 use oh::agent::dispatcher::XmlToolDispatcher;
 use oh::agent::{Agent, AgentBuilder};
+use oh::context::prompt::SystemPromptBuilder;
 use oh::tools::Tool;
 
 use crate::company::Agent as ManifestAgent;
@@ -46,9 +47,32 @@ pub fn model_for_tier(tier: Option<&str>) -> String {
     .to_string()
 }
 
+/// The persona system prompt for a company agent.
+///
+/// Frames the agent as its manifest role at the company, in the first person.
+/// This is what makes the agent answer *as* the CEO of Acme rather than falling
+/// back to openhuman's own assistant identity — the harness passes it as the
+/// archetype body with the default identity section omitted.
+pub fn persona_prompt(company_name: &str, agent: &ManifestAgent) -> String {
+    let mut prompt = format!(
+        "You are the {role} at {company}. Speak in the first person as this role.",
+        role = agent.role,
+        company = company_name,
+    );
+    if let Some(description) = agent.description.as_deref() {
+        let description = description.trim();
+        if !description.is_empty() {
+            prompt.push(' ');
+            prompt.push_str(description);
+        }
+    }
+    prompt
+}
+
 /// Build one openhuman [`Agent`] for `manifest_agent` within `company`.
 pub fn build_agent(
     company: &CompanyId,
+    company_name: &str,
     manifest_agent: &ManifestAgent,
     policy: ApprovalPolicy,
     deps: &HarnessDeps,
@@ -69,13 +93,27 @@ pub fn build_agent(
         .join(&manifest_agent.id)
         .join("workspace");
 
+    // Persona over openhuman's own identity: `omit_identity = true` drops the
+    // "you are OpenHuman" preamble so the agent speaks as its company role.
+    let persona = persona_prompt(company_name, manifest_agent);
+    let prompt_builder = SystemPromptBuilder::for_subagent(
+        persona, /* omit_identity */ true, /* omit_safety_preamble */ false,
+        /* omit_skills_catalog */ true,
+    );
+
+    let model = deps
+        .model_override
+        .clone()
+        .unwrap_or_else(|| model_for_tier(manifest_agent.tier.as_deref()));
+
     AgentBuilder::default()
         .provider_arc(deps.provider.clone())
         .memory(Arc::new(memory))
         .tools(tools)
         .tool_dispatcher(Box::new(XmlToolDispatcher))
         .tool_policy(Arc::new(policy))
-        .model_name(model_for_tier(manifest_agent.tier.as_deref()))
+        .prompt_builder(prompt_builder)
+        .model_name(model)
         .workspace_dir(workspace)
         .agent_definition_name(manifest_agent.id.clone())
         .auto_save(false)
@@ -93,5 +131,35 @@ mod tests {
         assert_eq!(model_for_tier(Some("AGENTIC")), "agentic-v1");
         assert_eq!(model_for_tier(None), "chat-v1");
         assert_eq!(model_for_tier(Some("mystery")), "chat-v1");
+    }
+
+    fn manifest_agent(role: &str, description: Option<&str>) -> ManifestAgent {
+        ManifestAgent {
+            id: "ceo".to_string(),
+            role: role.to_string(),
+            description: description.map(str::to_string),
+            tier: None,
+            tools: Vec::new(),
+            budget_usd_daily: None,
+        }
+    }
+
+    #[test]
+    fn persona_frames_role_company_and_description() {
+        let agent = manifest_agent("Chief Executive", Some("Sets direction."));
+        let persona = persona_prompt("Acme", &agent);
+        assert!(persona.contains("Chief Executive"), "{persona}");
+        assert!(persona.contains("Acme"), "{persona}");
+        assert!(persona.contains("first person"), "{persona}");
+        assert!(persona.ends_with("Sets direction."), "{persona}");
+    }
+
+    #[test]
+    fn persona_omits_absent_or_blank_description() {
+        let persona = persona_prompt("Acme", &manifest_agent("Engineer", Some("   ")));
+        assert!(persona.contains("Engineer"));
+        assert!(!persona.contains("   Engineer"));
+        // No trailing description clause.
+        assert!(persona.trim_end().ends_with("role."), "{persona}");
     }
 }
