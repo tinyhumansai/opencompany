@@ -55,6 +55,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
   [company-brain/](company-brain/README.md) →
   [integrations/](integrations/README.md)
 - **Where this is going**: [roadmap.md](roadmap.md) →
+  [feature audit](feature-audit/README.md) →
   [vision/](vision/README.md)
 
 ## Index
@@ -63,6 +64,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | --- | --- |
 | [glossary.md](glossary.md) | Authoritative vocabulary and term bridges |
 | [roadmap.md](roadmap.md) | Stages 0–4, phase mapping, non-goals |
+| [feature-audit/README.md](feature-audit/README.md) | Draft feature families to enrich into future implementation specs |
 | [product/README.md](product/README.md) | Product thesis, personas, surfaces, one-key promise |
 | [product/prosumer.md](product/prosumer.md) | Non-technical operator journey end to end |
 | [product/platform.md](product/platform.md) | Embed mode and hosted multi-tenant mode |
