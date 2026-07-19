@@ -115,8 +115,9 @@ mod test {
 
     use super::*;
     use crate::company::CompanyManifest;
-    use crate::feedback::MockGitHubClient;
+    use crate::feedback::tinyhumans::IngestOutcome;
     use crate::feedback::types::ConsentMode;
+    use crate::feedback::{MockGitHubClient, MockTinyHumansClient};
     use crate::ports::SecretStore;
     use crate::ports::types::SecretValue;
     use crate::runtime::RuntimeBuilder;
@@ -150,6 +151,16 @@ mod test {
     /// Builds state with a company wired for `auto` consent and a mock GitHub
     /// client, plus a seeded secret to exercise the scrub-abort path.
     async fn state_with_company(home: &std::path::Path, github: Arc<MockGitHubClient>) -> AppState {
+        state_with_clients(home, github, None).await
+    }
+
+    /// As [`state_with_company`], but optionally provisioned with a TinyHumans
+    /// hub — the "instance has a credential" case.
+    async fn state_with_clients(
+        home: &std::path::Path,
+        github: Arc<MockGitHubClient>,
+        hub: Option<Arc<MockTinyHumansClient>>,
+    ) -> AppState {
         let id = CompanyId::new("acme");
         // Seed a secret whose value the scrubber must abort on if it appears.
         let secrets = FsSecretStore::new(home.to_path_buf());
@@ -158,13 +169,14 @@ mod test {
             .await
             .unwrap();
 
-        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest())
+        let mut builder = RuntimeBuilder::new(home.to_path_buf(), manifest())
             .with_id(id.clone())
             .with_github(github)
-            .with_feedback_consent(ConsentMode::Auto)
-            .build()
-            .await
-            .unwrap();
+            .with_feedback_consent(ConsentMode::Auto);
+        if let Some(hub) = hub {
+            builder = builder.with_tinyhumans_feedback(hub);
+        }
+        let runtime = builder.build().await.unwrap();
         let state = AppState::new(AppConfig::default());
         state.registry().insert(id, Arc::new(runtime));
         crate::server::test_support::seed_fixed_admin(&state, "acme").await;
@@ -262,6 +274,147 @@ mod test {
         assert_eq!(value["deduped"], true);
         assert_eq!(github.created().len(), 1);
         assert_eq!(github.comments().len(), 1);
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // A provisioned instance forwards to the hub instead of filing, and what
+    // crosses the boundary is the scrubbed body — not the operator's raw words.
+    #[tokio::test]
+    async fn provisioned_instance_forwards_scrubbed_body_and_files_nothing() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new());
+        let state = state_with_clients(&home, github.clone(), Some(hub.clone())).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"wrong-output","note":"email dana@acme.co bounced"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], true);
+        assert_eq!(value["destination"], "tinyhumans");
+        // The hub decides whether an issue exists, so we report no URL.
+        assert!(value["issue_url"].is_null());
+
+        // Nothing was filed from here.
+        assert!(github.created().is_empty());
+        assert!(github.comments().is_empty());
+
+        let forwarded = hub.forwarded();
+        assert_eq!(forwarded.len(), 1);
+        let sent = &forwarded[0];
+        assert!(sent.body.contains("⟨redacted:email⟩"), "got {}", sent.body);
+        assert!(!sent.body.contains("dana@acme.co"));
+        assert!(sent.body.contains("— filed by @acme"));
+        assert_eq!(sent.origin, "acme");
+        assert_eq!(sent.wire_type(), "bug");
+        assert!(!sent.external_ref.is_empty());
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // The scrub gate runs before the destination choice, so a secret is blocked
+    // rather than forwarded.
+    #[tokio::test]
+    async fn scrub_abort_blocks_before_forwarding() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new());
+        let state = state_with_clients(&home, github, Some(hub.clone())).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"token ghp_LEAKEDSECRET broke the run"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["blocked"], true);
+        assert_eq!(value["destination"], "local");
+        assert!(
+            hub.forwarded().is_empty(),
+            "a blocked report must not leave"
+        );
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // An unreachable hub is a degraded success: the note is already stored, so
+    // the operator gets a reason rather than a failed request.
+    #[tokio::test]
+    async fn unreachable_hub_degrades_to_local() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new().with_failure("connection refused"));
+        let state = state_with_clients(&home, github.clone(), Some(hub)).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"the run crashed"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], false);
+        assert_eq!(value["destination"], "local");
+        assert!(value["reason"].is_string());
+        // It must not silently fall back to filing an issue instead.
+        assert!(github.created().is_empty());
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // Moderation rejection is reported as such, not as a transport failure.
+    #[tokio::test]
+    async fn hub_moderation_rejection_is_reported() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(
+            MockTinyHumansClient::new().with_outcome(IngestOutcome::Rejected {
+                reason: "off-topic".to_string(),
+            }),
+        );
+        let state = state_with_clients(&home, github, Some(hub)).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"docs","note":"the docs are thin"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], false);
+        assert_eq!(value["destination"], "tinyhumans");
+        assert_eq!(value["reason"], "off-topic");
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // Without a credential the original GitHub path is untouched.
+    #[tokio::test]
+    async fn unprovisioned_instance_still_files_to_github() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let state = state_with_company(&home, github.clone()).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"the run crashed"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], true);
+        assert_eq!(value["destination"], "github");
+        assert_eq!(github.created().len(), 1);
 
         tokio::fs::remove_dir_all(&home).await.ok();
     }

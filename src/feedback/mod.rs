@@ -17,6 +17,7 @@ pub mod labels;
 pub mod scrub;
 pub mod service;
 pub mod store;
+pub mod tinyhumans;
 pub mod tool;
 pub mod triage;
 pub mod types;
@@ -26,8 +27,9 @@ pub use github::{
     file_feedback, manual_issue_url, sign_body,
 };
 pub use scrub::{CharterTerm, ScrubOutcome, scrub};
-pub use service::{FeedbackFiler, FeedbackResponse};
+pub use service::{FeedbackDestination, FeedbackFiler, FeedbackResponse};
 pub use store::FeedbackStore;
+pub use tinyhumans::{IngestOutcome, IngestRequest, MockTinyHumansClient, TinyHumansClient};
 pub use tool::BuiltinToolProvider;
 pub use triage::{
     ClusterPlan, DedupePlan, EscalationPlan, FeedbackSource, QualityLedger, Severity, TriageAgent,
@@ -37,6 +39,9 @@ pub use types::{ConsentMode, FeedbackCategory, FeedbackInput, FeedbackItem, dete
 
 #[cfg(feature = "github")]
 pub use github::HttpGitHubClient;
+
+#[cfg(feature = "tinyhumans")]
+pub use tinyhumans::HttpTinyHumansClient;
 
 /// The public issue tracker feedback is filed against.
 pub const DEFAULT_REPO: &str = "tinyhumansai/opencompany";
