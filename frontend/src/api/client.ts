@@ -10,6 +10,7 @@ import type { ConsoleConfig } from "../config";
 import {
   ApiError,
   type ApiErrorBody,
+  type AppSpec,
   type ApprovalSummary,
   type ChatResponse,
   type CompanyStatus,
@@ -17,6 +18,7 @@ import {
   type ConnectionState,
   type FeedbackInput,
   type FeedbackResponse,
+  type FeedbackSummary,
   type TeamMemberDto,
   type Verdict,
 } from "./types";
@@ -157,6 +159,20 @@ export class OpenCompanyClient {
   /** Capture feedback (optionally preview the exact issue body first). */
   feedback(input: FeedbackInput, company?: string | null): Promise<FeedbackResponse> {
     return this.request<FeedbackResponse>("POST", `${this.scope(company)}/feedback`, input);
+  }
+
+  /** This company's past reports, newest first. */
+  listFeedback(company?: string | null): Promise<FeedbackSummary[]> {
+    return this.request<FeedbackSummary[]>("GET", `${this.scope(company)}/feedback`);
+  }
+
+  /**
+   * The host's runtime spec. Unauthenticated and company-agnostic, so it sits
+   * outside `scope()`; the console reads `cycles_available` from it to tell
+   * whether this instance is provisioned with a TinyHumans credential.
+   */
+  spec(): Promise<AppSpec> {
+    return this.request<AppSpec>("GET", "/spec");
   }
 
   /**
