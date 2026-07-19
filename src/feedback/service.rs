@@ -1,9 +1,21 @@
 //! The feedback filing flow: capture → scrub → preview → file.
 //!
 //! [`finalize`] runs the scrub-then-preview gate over an already-captured
-//! [`FeedbackItem`] and either previews the exact final body or files it. It is
+//! [`FeedbackItem`] and either previews the exact final body or sends it. It is
 //! driven by the HTTP `POST .../feedback` handler through
 //! [`CompanyRuntime::submit_feedback`](crate::company::runtime::CompanyRuntime::submit_feedback).
+//!
+//! Where a report goes depends on how the instance is provisioned:
+//!
+//! * **With a TinyHumans credential** — forwarded to the hub
+//!   ([`crate::feedback::tinyhumans`]) and recorded on behalf of the credential's
+//!   owner. The hub's enrichment pipeline decides whether an issue is filed, so
+//!   this runtime does not also file one.
+//! * **Without one** — the original path: file a GitHub issue, or degrade to a
+//!   prefilled manual link.
+//!
+//! Both destinations receive the identical scrubbed body, so the scrub-then-
+//! preview gate remains the single exit for operator words.
 
 use std::sync::Arc;
 
@@ -16,6 +28,7 @@ use crate::feedback::github::{
 };
 use crate::feedback::scrub::{CharterTerm, ScrubOutcome, scrub};
 use crate::feedback::store::FeedbackStore;
+use crate::feedback::tinyhumans::{IngestOutcome, IngestRequest, TinyHumansClient};
 use crate::feedback::triage::{FeedbackSource, QualityLedger, Severity, classify_labels};
 use crate::feedback::types::{ConsentMode, FeedbackItem};
 use crate::ports::SecretStore;
@@ -26,6 +39,10 @@ use crate::ports::types::CompanyId;
 pub struct FeedbackFiler {
     /// The GitHub client, or `None` to always degrade to a manual link.
     pub client: Option<Arc<dyn GitHubClient>>,
+    /// The TinyHumans hub client, set only when the instance is provisioned with
+    /// a credential. Its presence *is* the "forward instead of file" signal —
+    /// the credential itself stays in the client and never reaches [`finalize`].
+    pub tinyhumans: Option<Arc<dyn TinyHumansClient>>,
     /// The `owner/repo` issues are filed against.
     pub repo: String,
     /// The standing consent mode.
@@ -41,6 +58,7 @@ impl Default for FeedbackFiler {
     fn default() -> Self {
         Self {
             client: None,
+            tinyhumans: None,
             repo: crate::feedback::DEFAULT_REPO.to_string(),
             consent: ConsentMode::default(),
             limiter: RateLimiter::default(),
@@ -55,8 +73,25 @@ impl std::fmt::Debug for FeedbackFiler {
             .field("repo", &self.repo)
             .field("consent", &self.consent)
             .field("has_client", &self.client.is_some())
+            .field("has_tinyhumans", &self.tinyhumans.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// Where a submitted report ended up.
+///
+/// The console branches its wording on this rather than inferring a destination
+/// from which optional fields happen to be set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedbackDestination {
+    /// Held on this machine only — a preview, a block, or a failed send.
+    #[default]
+    Local,
+    /// Forwarded to the TinyHumans hub, recorded as the credential's owner.
+    Tinyhumans,
+    /// Filed as (or commented onto) a GitHub issue.
+    Github,
 }
 
 /// The response body for a feedback submission, mirroring the api.md envelope.
@@ -64,6 +99,8 @@ impl std::fmt::Debug for FeedbackFiler {
 pub struct FeedbackResponse {
     /// The captured item's id (it persists regardless of filing).
     pub item_id: String,
+    /// Where the report went.
+    pub destination: FeedbackDestination,
     /// Whether an issue was filed (created or commented).
     pub filed: bool,
     /// Whether filing was blocked by the scrubber (fail-closed).
@@ -85,24 +122,38 @@ pub struct FeedbackResponse {
 }
 
 impl FeedbackResponse {
-    fn blocked(item_id: &str, reason: String) -> Self {
+    /// A nothing-happened response for `item_id`: kept local, not filed, not
+    /// blocked. Every other constructor below builds on it with struct-update
+    /// syntax so a new field cannot be silently forgotten on one path.
+    fn local(item_id: &str) -> Self {
         Self {
             item_id: item_id.to_string(),
+            destination: FeedbackDestination::Local,
             filed: false,
-            blocked: true,
-            reason: Some(reason),
+            blocked: false,
+            reason: None,
             preview_body: None,
             prefilled_url: None,
             issue_url: None,
             deduped: false,
         }
     }
+
+    fn blocked(item_id: &str, reason: String) -> Self {
+        Self {
+            blocked: true,
+            reason: Some(reason),
+            ..Self::local(item_id)
+        }
+    }
 }
 
-/// Runs the scrub-then-preview gate for `item` and either previews or files.
+/// Runs the scrub-then-preview gate for `item` and either previews or sends it.
 ///
 /// * A scrub abort → a `blocked` response that never leaks the offending value.
 /// * `preview` → the byte-exact final body plus a prefilled link.
+/// * A configured TinyHumans credential → forward to the hub, recorded as the
+///   credential's owner; no issue is filed from here.
 /// * Otherwise → file through the [`FeedbackFiler`], updating the stored item's
 ///   status on success.
 #[allow(clippy::too_many_arguments)]
@@ -133,15 +184,18 @@ pub async fn finalize(
 
     if preview {
         return Ok(FeedbackResponse {
-            item_id: item.id.clone(),
-            filed: false,
-            blocked: false,
-            reason: None,
             prefilled_url: Some(manual_issue_url(&filer.repo, &title, &scrubbed, &labels)),
             preview_body: Some(scrubbed),
-            issue_url: None,
-            deduped: false,
+            ..FeedbackResponse::local(&item.id)
         });
+    }
+
+    // A provisioned instance forwards to the hub instead of filing its own
+    // issue: the report is attributed to the credential's owner and the hub's
+    // pipeline decides whether it becomes an issue. Note this consumes the same
+    // `scrubbed` body the preview above would have shown.
+    if let Some(hub) = filer.tinyhumans.as_deref() {
+        return forward_to_hub(store, hub, item, &handle, title, scrubbed).await;
     }
 
     // A throttled handle (too many low-quality filings) has its standing Auto
@@ -166,14 +220,10 @@ pub async fn finalize(
             filer.quality.record_filed(&handle);
             store.update_status(&item.id, &url, "open").await?;
             FeedbackResponse {
-                item_id: item.id.clone(),
+                destination: FeedbackDestination::Github,
                 filed: true,
-                blocked: false,
-                reason: None,
-                preview_body: None,
-                prefilled_url: None,
                 issue_url: Some(url),
-                deduped: false,
+                ..FeedbackResponse::local(&item.id)
             }
         }
         FilingOutcome::Deduped { url } => {
@@ -183,37 +233,78 @@ pub async fn finalize(
             filer.quality.record_low_quality(&handle);
             store.update_status(&item.id, &url, "duplicate").await?;
             FeedbackResponse {
-                item_id: item.id.clone(),
+                destination: FeedbackDestination::Github,
                 filed: true,
-                blocked: false,
-                reason: None,
-                preview_body: None,
-                prefilled_url: None,
                 issue_url: Some(url),
                 deduped: true,
+                ..FeedbackResponse::local(&item.id)
             }
         }
         FilingOutcome::RateLimited => FeedbackResponse {
-            item_id: item.id.clone(),
-            filed: false,
-            blocked: false,
             reason: Some("rate limit reached; try later or file manually".to_string()),
-            preview_body: None,
-            prefilled_url: None,
-            issue_url: None,
-            deduped: false,
+            ..FeedbackResponse::local(&item.id)
         },
         FilingOutcome::ManualLink { url } => FeedbackResponse {
-            item_id: item.id.clone(),
-            filed: false,
-            blocked: false,
-            reason: None,
-            preview_body: None,
             prefilled_url: Some(url),
-            issue_url: None,
-            deduped: false,
+            ..FeedbackResponse::local(&item.id)
         },
     })
+}
+
+/// Forwards an already-scrubbed report to the TinyHumans hub.
+///
+/// The item is already persisted locally, so a hub that refuses or cannot be
+/// reached is a degraded success, not a failed request: the operator keeps their
+/// note and gets a plain reason. That mirrors how a GitHub rate-limit behaves.
+async fn forward_to_hub(
+    store: &FeedbackStore,
+    hub: &dyn TinyHumansClient,
+    item: &FeedbackItem,
+    handle: &str,
+    title: String,
+    scrubbed: String,
+) -> Result<FeedbackResponse> {
+    let request = IngestRequest {
+        category: item.category,
+        title,
+        body: scrubbed,
+        origin: handle.to_string(),
+        external_ref: item.id.clone(),
+    };
+
+    match hub.ingest(&request).await {
+        Ok(IngestOutcome::Accepted { remote_id }) => {
+            // The hub decides whether this becomes an issue, so there is no
+            // issue URL to record yet — only that it left this machine.
+            let remote = remote_id.unwrap_or_default();
+            store.update_status(&item.id, &remote, "forwarded").await?;
+            Ok(FeedbackResponse {
+                destination: FeedbackDestination::Tinyhumans,
+                filed: true,
+                ..FeedbackResponse::local(&item.id)
+            })
+        }
+        Ok(IngestOutcome::Rejected { reason }) => Ok(FeedbackResponse {
+            destination: FeedbackDestination::Tinyhumans,
+            reason: Some(reason),
+            ..FeedbackResponse::local(&item.id)
+        }),
+        Ok(IngestOutcome::RateLimited { reason }) => Ok(FeedbackResponse {
+            reason: Some(reason),
+            ..FeedbackResponse::local(&item.id)
+        }),
+        Err(err) => {
+            tracing::warn!(
+                item = %item.id,
+                error = %err,
+                "could not forward feedback to tinyhumans; it stays on this machine"
+            );
+            Ok(FeedbackResponse {
+                reason: Some("could not reach TinyHumans; your note is saved here".to_string()),
+                ..FeedbackResponse::local(&item.id)
+            })
+        }
+    }
 }
 
 /// The roster names/handles to redact (agent ids plus the company `@handle`

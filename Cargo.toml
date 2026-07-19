@@ -151,6 +151,11 @@ openhuman-rpc = ["dep:reqwest"]
 # mock + the whole filing flow compile without this; only `HttpGitHubClient` is
 # gated behind it.
 github = ["dep:reqwest"]
+# Real HTTP forwarding of feedback to the TinyHumans hub, so a provisioned
+# instance records reports against its credential's owner. The
+# `TinyHumansClient` trait + offline mock + the whole routing decision compile
+# without this; only `HttpTinyHumansClient` is gated behind it.
+tinyhumans = ["dep:reqwest"]
 # Real HTTP/Socket.IO transport to hosted Medulla. The wire types + offline
 # MockTransport compile without this; only the networked transport is gated.
 medulla = ["dep:reqwest"]

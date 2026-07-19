@@ -5,7 +5,12 @@
 //! scrub-then-preview gate. The response never leaks a blocked value: a scrub
 //! abort returns `{ blocked: true, reason }`, a `preview` returns the byte-exact
 //! final body, and a satisfied consent returns the filed issue URL (or a
-//! prefilled manual link when no token is configured).
+//! prefilled manual link when no token is configured). `destination` reports
+//! where the report actually went.
+//!
+//! The matching `GET` routes list this company's reports for the console, as
+//! the [`FeedbackSummary`] projection — never the raw item, whose
+//! `operator_words` are local-only.
 
 use std::sync::Arc;
 
@@ -19,7 +24,7 @@ use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::feedback::service::FeedbackResponse;
-use crate::feedback::types::FeedbackInput;
+use crate::feedback::types::{FeedbackInput, FeedbackSummary};
 use crate::ports::types::CompanyId;
 use crate::server::error::ApiError;
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
@@ -27,8 +32,11 @@ use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_
 /// Builds the feedback route fragment, merged into the main router.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/companies/{id}/feedback", post(submit))
-        .route("/api/v1/company/feedback", post(submit_single))
+        .route("/api/v1/companies/{id}/feedback", post(submit).get(list))
+        .route(
+            "/api/v1/company/feedback",
+            post(submit_single).get(list_single),
+        )
 }
 
 /// The feedback submission body: the capture input plus a `preview` flag.
@@ -107,6 +115,43 @@ async fn submit_single(
         .map_err(IntoResponse::into_response)
 }
 
+/// `GET /api/v1/companies/{id}/feedback` — this company's reports, newest first.
+///
+/// Returns the [`FeedbackSummary`] projection, never the raw item: the
+/// operator's own words are local-only and must not cross this boundary.
+async fn list(
+    CompanyAuth(auth): CompanyAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<FeedbackSummary>>, Response> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &auth, &company) {
+        return Err(resp);
+    }
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    runtime
+        .list_feedback()
+        .await
+        .map(Json)
+        .map_err(|e| ApiError(e).into_response())
+}
+
+/// `GET /api/v1/company/feedback` (single-company alias).
+async fn list_single(
+    CompanyAuth(auth): CompanyAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<FeedbackSummary>>, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
+    if let Some(resp) = authorize_address(&state, &auth, runtime.id()) {
+        return Err(resp);
+    }
+    runtime
+        .list_feedback()
+        .await
+        .map(Json)
+        .map_err(|e| ApiError(e).into_response())
+}
+
 #[cfg(test)]
 mod test {
     use axum::body::{Body, to_bytes};
@@ -115,8 +160,9 @@ mod test {
 
     use super::*;
     use crate::company::CompanyManifest;
-    use crate::feedback::MockGitHubClient;
+    use crate::feedback::tinyhumans::IngestOutcome;
     use crate::feedback::types::ConsentMode;
+    use crate::feedback::{MockGitHubClient, MockTinyHumansClient};
     use crate::ports::SecretStore;
     use crate::ports::types::SecretValue;
     use crate::runtime::RuntimeBuilder;
@@ -150,6 +196,16 @@ mod test {
     /// Builds state with a company wired for `auto` consent and a mock GitHub
     /// client, plus a seeded secret to exercise the scrub-abort path.
     async fn state_with_company(home: &std::path::Path, github: Arc<MockGitHubClient>) -> AppState {
+        state_with_clients(home, github, None).await
+    }
+
+    /// As [`state_with_company`], but optionally provisioned with a TinyHumans
+    /// hub — the "instance has a credential" case.
+    async fn state_with_clients(
+        home: &std::path::Path,
+        github: Arc<MockGitHubClient>,
+        hub: Option<Arc<MockTinyHumansClient>>,
+    ) -> AppState {
         let id = CompanyId::new("acme");
         // Seed a secret whose value the scrubber must abort on if it appears.
         let secrets = FsSecretStore::new(home.to_path_buf());
@@ -158,17 +214,37 @@ mod test {
             .await
             .unwrap();
 
-        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest())
+        let mut builder = RuntimeBuilder::new(home.to_path_buf(), manifest())
             .with_id(id.clone())
             .with_github(github)
-            .with_feedback_consent(ConsentMode::Auto)
-            .build()
-            .await
-            .unwrap();
+            .with_feedback_consent(ConsentMode::Auto);
+        if let Some(hub) = hub {
+            builder = builder.with_tinyhumans_feedback(hub);
+        }
+        let runtime = builder.build().await.unwrap();
         let state = AppState::new(AppConfig::default());
         state.registry().insert(id, Arc::new(runtime));
         crate::server::test_support::seed_fixed_admin(&state, "acme").await;
         state
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
     }
 
     async fn post_json(app: &Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
@@ -262,6 +338,207 @@ mod test {
         assert_eq!(value["deduped"], true);
         assert_eq!(github.created().len(), 1);
         assert_eq!(github.comments().len(), 1);
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // A provisioned instance forwards to the hub instead of filing, and what
+    // crosses the boundary is the scrubbed body — not the operator's raw words.
+    #[tokio::test]
+    async fn provisioned_instance_forwards_scrubbed_body_and_files_nothing() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new());
+        let state = state_with_clients(&home, github.clone(), Some(hub.clone())).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"wrong-output","note":"email dana@acme.co bounced"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], true);
+        assert_eq!(value["destination"], "tinyhumans");
+        // The hub decides whether an issue exists, so we report no URL.
+        assert!(value["issue_url"].is_null());
+
+        // Nothing was filed from here.
+        assert!(github.created().is_empty());
+        assert!(github.comments().is_empty());
+
+        let forwarded = hub.forwarded();
+        assert_eq!(forwarded.len(), 1);
+        let sent = &forwarded[0];
+        assert!(sent.body.contains("⟨redacted:email⟩"), "got {}", sent.body);
+        assert!(!sent.body.contains("dana@acme.co"));
+        assert!(sent.body.contains("— filed by @acme"));
+        assert_eq!(sent.origin, "acme");
+        assert_eq!(sent.wire_type(), "bug");
+        assert!(!sent.external_ref.is_empty());
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // The scrub gate runs before the destination choice, so a secret is blocked
+    // rather than forwarded.
+    #[tokio::test]
+    async fn scrub_abort_blocks_before_forwarding() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new());
+        let state = state_with_clients(&home, github, Some(hub.clone())).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"token ghp_LEAKEDSECRET broke the run"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["blocked"], true);
+        assert_eq!(value["destination"], "local");
+        assert!(
+            hub.forwarded().is_empty(),
+            "a blocked report must not leave"
+        );
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // An unreachable hub is a degraded success: the note is already stored, so
+    // the operator gets a reason rather than a failed request.
+    #[tokio::test]
+    async fn unreachable_hub_degrades_to_local() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new().with_failure("connection refused"));
+        let state = state_with_clients(&home, github.clone(), Some(hub)).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"the run crashed"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], false);
+        assert_eq!(value["destination"], "local");
+        assert!(value["reason"].is_string());
+        // It must not silently fall back to filing an issue instead.
+        assert!(github.created().is_empty());
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // Moderation rejection is reported as such, not as a transport failure.
+    #[tokio::test]
+    async fn hub_moderation_rejection_is_reported() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(
+            MockTinyHumansClient::new().with_outcome(IngestOutcome::Rejected {
+                reason: "off-topic".to_string(),
+            }),
+        );
+        let state = state_with_clients(&home, github, Some(hub)).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"docs","note":"the docs are thin"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], false);
+        assert_eq!(value["destination"], "tinyhumans");
+        assert_eq!(value["reason"], "off-topic");
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // Without a credential the original GitHub path is untouched.
+    #[tokio::test]
+    async fn unprovisioned_instance_still_files_to_github() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let state = state_with_company(&home, github.clone()).await;
+        let app = router(state);
+
+        let (status, value) = post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"the run crashed"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["filed"], true);
+        assert_eq!(value["destination"], "github");
+        assert_eq!(github.created().len(), 1);
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // The reports list shows what was reported and where it went, and never the
+    // operator's own words.
+    #[tokio::test]
+    async fn list_returns_summaries_without_operator_words() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let state = state_with_company(&home, github).await;
+        let app = router(state);
+
+        post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"the payroll run crashed","work_ref":"payroll.run"}"#,
+        )
+        .await;
+
+        let (status, value) = get_json(&app, "/api/v1/company/feedback").await;
+        assert_eq!(status, StatusCode::OK);
+        let items = value.as_array().expect("an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["category"], "bug");
+        assert_eq!(items[0]["work_item"], "payroll.run");
+        assert!(items[0]["id"].is_string());
+        assert!(items[0]["at_millis"].is_number());
+
+        // The local-only fields must not be in the payload at all.
+        let raw = value.to_string();
+        assert!(!raw.contains("payroll run crashed"), "got {raw}");
+        assert!(!raw.contains("operator_words"), "got {raw}");
+        assert!(!raw.contains("context_excerpt"), "got {raw}");
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // A forwarded report stores the hub's id, which is not a URL — the list must
+    // not offer it as a link.
+    #[tokio::test]
+    async fn list_omits_a_non_url_reference_for_forwarded_reports() {
+        let home = home();
+        let github = Arc::new(MockGitHubClient::new());
+        let hub = Arc::new(MockTinyHumansClient::new());
+        let state = state_with_clients(&home, github, Some(hub)).await;
+        let app = router(state);
+
+        post_json(
+            &app,
+            "/api/v1/company/feedback",
+            r#"{"category":"bug","note":"the payroll run crashed"}"#,
+        )
+        .await;
+
+        let (_, value) = get_json(&app, "/api/v1/company/feedback").await;
+        let items = value.as_array().expect("an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["issue_status"], "forwarded");
+        assert!(items[0]["filed_issue_url"].is_null());
 
         tokio::fs::remove_dir_all(&home).await.ok();
     }

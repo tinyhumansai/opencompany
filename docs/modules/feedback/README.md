@@ -1,8 +1,8 @@
 # Feedback Module
 
 The feedback module implements the [feedback loop](../../spec/feedback-loop/README.md):
-in-product feedback becomes public GitHub issues, with a non-negotiable privacy
-gate in between.
+in-product feedback reaches the TinyHumans hub or the public issue tracker, with
+a non-negotiable privacy gate in between.
 
 - `types.rs` — the `FeedbackItem` (category, operator words, work item, template
   + runtime version, capped/redacted excerpt) and consent modes
@@ -17,8 +17,15 @@ gate in between.
   rate-limits per company, signs the body with the company `@handle`, and labels
   `source/agent-filed`. Without `GITHUB_TOKEN` it degrades to a prefilled manual
   issue link.
+- the **hub client** (`tinyhumans.rs`) — a mockable `TinyHumansClient` (real
+  HTTP client behind the optional `tinyhumans` feature). On a provisioned
+  instance it forwards the scrubbed report to the backend's
+  `POST /feedback/ingest`, where it is recorded on behalf of the credential's
+  owner, and the filer above is skipped.
 
 The scrub-then-preview gate returns the exact, byte-for-byte final issue body;
-nothing is transmitted without confirmation or standing per-category consent.
-Capture routes: `POST /api/v1/companies/{id}/feedback`, a built-in `feedback`
-tool, and an operator-chat intent.
+nothing is transmitted without confirmation or standing per-category consent,
+and both destinations receive that identical body. Capture routes:
+`POST /api/v1/companies/{id}/feedback`, a built-in `feedback` tool, and an
+operator-chat intent. `GET` on the same path lists past reports as the
+`FeedbackSummary` projection, which omits the operator's local-only words.

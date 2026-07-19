@@ -157,6 +157,17 @@ pub enum OpenCompanyError {
         message: String,
     },
 
+    /// A TinyHumans backend transport or protocol failure. `code` is a stable
+    /// machine-readable token (e.g. `unreachable`, `http_502`); `message` is the
+    /// human-readable detail.
+    #[error("tinyhumans error ({code}): {message}")]
+    TinyHumans {
+        /// A stable, machine-readable failure token.
+        code: String,
+        /// A human-readable description of the failure.
+        message: String,
+    },
+
     /// A port method has no implementation in the current build.
     #[error("port not implemented: {0}")]
     Unimplemented(&'static str),
@@ -218,6 +229,7 @@ impl OpenCompanyError {
             Self::Config(_) => "config_error".to_string(),
             Self::Orchestration { code, .. } => code.clone(),
             Self::Tinyplace { code, .. } => format!("tinyplace_{code}"),
+            Self::TinyHumans { code, .. } => format!("tinyhumans_{code}"),
             Self::Unimplemented(_) => "unimplemented".to_string(),
             #[cfg(feature = "openhuman")]
             Self::Harness(_) => "harness_error".to_string(),
