@@ -49,6 +49,13 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             OpenCompanyError::Tinyplace { .. } => StatusCode::BAD_GATEWAY,
+            // The TinyHumans hub degrades the same way. In practice feedback
+            // forwarding swallows these (the report is already stored locally),
+            // so this mapping only applies if a future caller propagates one.
+            OpenCompanyError::TinyHumans { code, .. } if code == "unreachable" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            OpenCompanyError::TinyHumans { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

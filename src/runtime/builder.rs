@@ -22,6 +22,7 @@ use crate::company::runtime::{CompanyRuntime, OpsStores};
 use crate::feedback::github::{GitHubClient, RateLimiter};
 use crate::feedback::service::FeedbackFiler;
 use crate::feedback::store::FeedbackStore;
+use crate::feedback::tinyhumans::TinyHumansClient;
 use crate::feedback::tool::BuiltinToolProvider;
 use crate::feedback::types::ConsentMode;
 #[cfg(feature = "openhuman")]
@@ -146,6 +147,7 @@ pub struct RuntimeBuilder {
     seed_dir: Option<PathBuf>,
     feedback: Option<Arc<FeedbackStore>>,
     github: Option<Arc<dyn GitHubClient>>,
+    tinyhumans_feedback: Option<Arc<dyn TinyHumansClient>>,
     consent: ConsentMode,
     /// WS4: the embedded openhuman harness pool. Feature-gated so the default
     /// build is unaffected; wired through to [`CompanyRuntime`] when present.
@@ -199,6 +201,7 @@ impl RuntimeBuilder {
             seed_dir: None,
             feedback: None,
             github: None,
+            tinyhumans_feedback: None,
             consent: ConsentMode::default(),
             #[cfg(feature = "openhuman")]
             harness: None,
@@ -470,6 +473,17 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Wires the TinyHumans hub for feedback forwarding (default: none → file
+    /// to GitHub instead).
+    ///
+    /// Set this only on a provisioned instance — one with a TinyHumans
+    /// credential. Its presence redirects feedback to the hub, where it is
+    /// recorded on behalf of the credential's owner.
+    pub fn with_tinyhumans_feedback(mut self, client: Arc<dyn TinyHumansClient>) -> Self {
+        self.tinyhumans_feedback = Some(client);
+        self
+    }
+
     /// Sets the standing feedback consent mode (default: `manual`).
     pub fn with_feedback_consent(mut self, consent: ConsentMode) -> Self {
         self.consent = consent;
@@ -545,6 +559,7 @@ impl RuntimeBuilder {
         let consent = self.consent;
         let filer = Arc::new(FeedbackFiler {
             client: self.github,
+            tinyhumans: self.tinyhumans_feedback,
             repo: crate::feedback::DEFAULT_REPO.to_string(),
             consent,
             limiter: RateLimiter::default(),

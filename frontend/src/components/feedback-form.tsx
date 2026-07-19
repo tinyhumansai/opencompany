@@ -171,20 +171,14 @@ function FeedbackResult({
     );
   }
 
+  const { title, description } = outcomeCopy(result);
+
   return (
     <div className="space-y-4">
       <Alert>
         <CheckCircle2 className="size-4" />
-        <AlertTitle>
-          {result.filed
-            ? result.deduped
-              ? "Added to an existing report"
-              : "Shared — thanks!"
-            : "Captured locally"}
-        </AlertTitle>
-        <AlertDescription>
-          {result.filed ? "You'll hear back if it ships." : "Your note is saved on this machine."}
-        </AlertDescription>
+        <AlertTitle>{title}</AlertTitle>
+        <AlertDescription>{description}</AlertDescription>
       </Alert>
       {result.issue_url && (
         <a
@@ -196,7 +190,12 @@ function FeedbackResult({
           View the report <ExternalLink className="size-3" />
         </a>
       )}
-      {!result.filed && result.prefilled_url && (
+      {/*
+        The prefilled link is a GitHub fallback. On a provisioned instance the
+        report went to TinyHumans and there is no issue for the operator to file
+        themselves, so offering the link would only cause a duplicate.
+      */}
+      {!result.filed && result.destination !== "tinyhumans" && result.prefilled_url && (
         <a
           className="inline-flex items-center gap-1 text-sm font-medium underline underline-offset-4"
           href={result.prefilled_url}
@@ -211,4 +210,33 @@ function FeedbackResult({
       </div>
     </div>
   );
+}
+
+/** What to tell the operator, based on where the report actually went. */
+function outcomeCopy(result: FeedbackResponse): { title: string; description: string } {
+  if (result.destination === "tinyhumans") {
+    // Not filed here means the hub took it but its moderation declined.
+    if (!result.filed) {
+      return {
+        title: "Not added",
+        description: result.reason ?? "It wasn't accepted. Your note is saved on this machine.",
+      };
+    }
+    return {
+      title: "Sent — thanks!",
+      description: "It's on your TinyHumans account. You'll hear back if it ships.",
+    };
+  }
+
+  if (result.filed) {
+    return {
+      title: result.deduped ? "Added to an existing report" : "Shared — thanks!",
+      description: "You'll hear back if it ships.",
+    };
+  }
+
+  return {
+    title: "Captured locally",
+    description: result.reason ?? "Your note is saved on this machine.",
+  };
 }

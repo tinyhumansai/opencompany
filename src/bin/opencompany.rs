@@ -182,10 +182,13 @@ async fn register_company(
     // The company's on-disk source directory (`companies/<name>`) seeds the
     // workspace tree on first boot and lets read resolvers find its committed
     // skills/workflows content.
-    let mut builder = attach_harness(attach_openhuman(RuntimeBuilder::new(
-        home.to_path_buf(),
-        manifest,
-    )))
+    let mut builder = attach_tinyhumans_feedback(
+        attach_harness(attach_openhuman(RuntimeBuilder::new(
+            home.to_path_buf(),
+            manifest,
+        ))),
+        state.config(),
+    )
     .with_seed_dir(company_source_dir(dir))
     .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
     .with_host_base_url(state.config().host_base_url());
@@ -276,6 +279,31 @@ fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
         Some((config, model)) => builder
             .with_harness(Arc::new(HarnessPool::new()))
             .with_harness_inference(config, model),
+        None => builder,
+    }
+}
+
+/// Routes feedback to the TinyHumans hub when this instance is provisioned with
+/// a credential, so reports are recorded on behalf of the credential's owner
+/// instead of being filed as issues from here.
+///
+/// Without the feature this is the identity function, so the default build stays
+/// network-free and keeps the local capture → GitHub/manual-link path.
+#[cfg(not(feature = "tinyhumans"))]
+fn attach_tinyhumans_feedback(builder: RuntimeBuilder, _config: &AppConfig) -> RuntimeBuilder {
+    builder
+}
+
+#[cfg(feature = "tinyhumans")]
+fn attach_tinyhumans_feedback(builder: RuntimeBuilder, config: &AppConfig) -> RuntimeBuilder {
+    use opencompany::feedback::HttpTinyHumansClient;
+
+    match &config.tinyhumans_credential {
+        Some(credential) => builder.with_tinyhumans_feedback(Arc::new(HttpTinyHumansClient::new(
+            config.api_url.clone(),
+            credential.clone(),
+        ))),
+        // Unprovisioned: keep the local path rather than dropping reports.
         None => builder,
     }
 }

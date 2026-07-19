@@ -19,7 +19,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::feedback::service::{FeedbackFiler, FeedbackResponse};
 use crate::feedback::store::FeedbackStore;
-use crate::feedback::types::{FeedbackInput, FeedbackItem};
+use crate::feedback::types::{FeedbackInput, FeedbackItem, FeedbackSummary};
 use crate::policy::ManifestApprovalGate;
 use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
@@ -350,6 +350,18 @@ impl CompanyRuntime {
             preview,
         )
         .await
+    }
+
+    /// Lists this company's captured feedback, newest first, as the
+    /// HTTP-safe [`FeedbackSummary`] projection.
+    ///
+    /// The operator's raw words never appear: they are local-only by
+    /// construction (see [`FeedbackItem::operator_words`]), so the reports list
+    /// shows what was reported and where it went, not what was typed.
+    pub async fn list_feedback(&self) -> Result<Vec<FeedbackSummary>> {
+        let mut items = self.feedback.list().await?;
+        items.sort_by_key(|item| std::cmp::Reverse(item.at_millis));
+        Ok(items.iter().map(FeedbackSummary::from_item).collect())
     }
 
     /// A status snapshot, loading the company record for name and lifecycle.

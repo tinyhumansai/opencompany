@@ -48,9 +48,17 @@ export interface FeedbackInput {
   preview?: boolean;
 }
 
+/**
+ * Where a submitted report ended up. `tinyhumans` means the instance is
+ * provisioned with a credential and the report was recorded against its owner;
+ * `github` is the unprovisioned filing path; `local` means it never left.
+ */
+export type FeedbackDestination = "local" | "tinyhumans" | "github";
+
 /** Response of `/feedback`. */
 export interface FeedbackResponse {
   item_id: string;
+  destination: FeedbackDestination;
   filed: boolean;
   blocked: boolean;
   reason?: string;
@@ -58,6 +66,35 @@ export interface FeedbackResponse {
   prefilled_url?: string;
   issue_url?: string;
   deduped: boolean;
+}
+
+/**
+ * One past report from `GET .../feedback`. Deliberately omits the operator's
+ * own words, which never leave the host that captured them.
+ */
+export interface FeedbackSummary {
+  id: string;
+  category: FeedbackCategory;
+  work_item: string | null;
+  at_millis: number;
+  filed_issue_url: string | null;
+  issue_status: string | null;
+}
+
+/**
+ * `GET /spec` — the host's runtime specification. Unauthenticated, so the
+ * console can read it before (and regardless of) a session.
+ */
+export interface AppSpec {
+  name: string;
+  version: string;
+  api_url: string;
+  /**
+   * Whether hosted cognition can run, which is true exactly when this instance
+   * has a TinyHumans credential and a hosted brain. The console uses it as the
+   * "is this instance provisioned" signal. No secret bytes are surfaced.
+   */
+  cycles_available: boolean;
 }
 
 /**
