@@ -35,7 +35,9 @@ pub use triage::{
     ClusterPlan, DedupePlan, EscalationPlan, FeedbackSource, QualityLedger, Severity, TriageAgent,
     classify_labels, cluster_plans, escalation_for, map_fixed_issues, process_bug_check,
 };
-pub use types::{ConsentMode, FeedbackCategory, FeedbackInput, FeedbackItem, detect_chat_intent};
+pub use types::{
+    ConsentMode, FeedbackCategory, FeedbackInput, FeedbackItem, FeedbackSummary, detect_chat_intent,
+};
 
 #[cfg(feature = "github")]
 pub use github::HttpGitHubClient;
