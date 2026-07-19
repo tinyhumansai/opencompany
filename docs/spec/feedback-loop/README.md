@@ -12,8 +12,10 @@ Supporting docs: [privacy.md](privacy.md) (normative scrubbing rules),
 ## The loop
 
 ```text
-operator reaction ─▶ Feedback Item ─▶ scrub ─▶ preview ─▶ GitHub issue
-        ▲                                                     │
+                                                    ┌─▶ TinyHumans hub  (provisioned)
+operator reaction ─▶ Feedback Item ─▶ scrub ─▶ preview ─┤
+        ▲                                           └─▶ GitHub issue    (otherwise)
+        │                                                     │
         │                                              triage / cluster
         │                                                     │
 "2 things you flagged were fixed in v0.4" ◀── release ◀── roadmap item
@@ -46,6 +48,35 @@ In every mode the **scrub-then-preview** gate of
 [privacy.md](privacy.md) applies: the operator (or their standing consent)
 sees exactly what becomes public. Filing without `GITHUB_TOKEN` degrades to
 the manual prefilled link ([runtime/config.md](../runtime/config.md)).
+
+## Destination: where a report goes
+
+The scrub-then-preview gate is the same everywhere; what differs is the
+destination, decided by whether this instance is **provisioned** — that is,
+whether it has a TinyHumans credential
+([runtime/config.md](../runtime/config.md)).
+
+| Instance | Destination | Behavior |
+| --- | --- | --- |
+| **Provisioned** (credential present) | TinyHumans hub | Forwarded to `POST /feedback/ingest` and recorded on behalf of the credential's **owner**. The hub's enrichment pipeline decides whether an issue is filed, so the runtime files none itself. |
+| **Unprovisioned** | GitHub | The path above: file an issue, or degrade to a prefilled manual link. |
+
+Rules that hold on both paths:
+
+- The forwarded body is the **byte-identical scrubbed body** the preview
+  showed. Forwarding is not a second exit around [privacy.md](privacy.md).
+- The credential travels only as an `Authorization` header. It must never
+  appear in a body, a log line, or a stored item.
+- The local Feedback Item is stored **before** the send, so a hub that is
+  unreachable or refuses is a degraded success — the operator keeps their note
+  and gets a plain reason — never a lost report and never a silent fallback to
+  filing a public issue instead.
+- The report carries `product: opencompany`, the company `@handle` as `origin`,
+  and the local item id as `externalRef`, so a hub item is traceable back
+  without carrying anything private across.
+
+The runtime reports the outcome as `destination` (`tinyhumans` | `github` |
+`local`) so the console can describe what happened rather than infer it.
 
 ## Agent-filed issues
 
