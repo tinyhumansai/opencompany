@@ -111,11 +111,18 @@ pub struct StorageSettings {
     /// MongoDB database name (`OPENCOMPANY_MONGODB_DB`); the hosting layer
     /// sets a per-tenant name (e.g. `oc-<tenant>`) on a shared cluster.
     pub mongodb_db: Option<String>,
+    /// Tenant identity for shared-single-DB deployments
+    /// (`OPENCOMPANY_TENANT_ID`). When set, company ids are namespaced with
+    /// this value so that many tenants sharing one logical database never
+    /// collide on the `companies` unique index. Unset means the id-namespacing
+    /// no-op: single-tenant / db-per-tenant behavior is unchanged.
+    pub tenant_id: Option<String>,
 }
 
 impl StorageSettings {
     /// Reads the CLI-surface storage env vars (`OPENCOMPANY_STORAGE`,
-    /// `OPENCOMPANY_MONGODB_URI`, `OPENCOMPANY_MONGODB_DB`).
+    /// `OPENCOMPANY_MONGODB_URI`, `OPENCOMPANY_MONGODB_DB`,
+    /// `OPENCOMPANY_TENANT_ID`).
     pub fn from_env() -> Result<Self> {
         let kind = match std::env::var("OPENCOMPANY_STORAGE") {
             Ok(raw) => raw.parse()?,
@@ -126,6 +133,7 @@ impl StorageSettings {
             kind,
             mongodb_uri: non_empty("OPENCOMPANY_MONGODB_URI"),
             mongodb_db: non_empty("OPENCOMPANY_MONGODB_DB"),
+            tenant_id: non_empty("OPENCOMPANY_TENANT_ID"),
         })
     }
 }
@@ -247,6 +255,31 @@ mod test {
         let settings = StorageSettings::default();
         let handles = open_storage(&settings, Path::new("/tmp")).await.unwrap();
         assert!(handles.is_none());
+    }
+
+    #[test]
+    fn from_env_reads_tenant_id() {
+        // SAFETY: single-threaded test; restores prior state.
+        let prev = std::env::var("OPENCOMPANY_TENANT_ID").ok();
+
+        unsafe { std::env::set_var("OPENCOMPANY_TENANT_ID", "acme") };
+        assert_eq!(
+            StorageSettings::from_env().unwrap().tenant_id.as_deref(),
+            Some("acme")
+        );
+
+        // An empty value is filtered out, same as the mongodb vars.
+        unsafe { std::env::set_var("OPENCOMPANY_TENANT_ID", "") };
+        assert_eq!(StorageSettings::from_env().unwrap().tenant_id, None);
+
+        // Unset leaves it `None` (the id-namespacing no-op).
+        unsafe { std::env::remove_var("OPENCOMPANY_TENANT_ID") };
+        assert_eq!(StorageSettings::from_env().unwrap().tenant_id, None);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("OPENCOMPANY_TENANT_ID", v) },
+            None => unsafe { std::env::remove_var("OPENCOMPANY_TENANT_ID") },
+        }
     }
 
     #[cfg(feature = "mongodb")]
