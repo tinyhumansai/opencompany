@@ -128,6 +128,18 @@ async fn provision(
         Some(raw) => CompanyId::new(raw),
         None => company_id_from_name(&manifest.company.name),
     };
+    // The tenant this request acts for; also the ownership record below.
+    let tenant = acting_tenant(&GqlAuth::Platform(claims.clone()));
+    // Shared-single-DB mode: namespace the id with the acting tenant so that
+    // API-provisioned companies are globally unique in one logical database
+    // (the same template name under two tenants no longer collides on the
+    // `companies` unique index). A no-op when the workload is not in
+    // tenant-namespace mode; idempotent for an already-prefixed explicit id.
+    let id = if state.config().tenant_namespace.is_some() {
+        crate::app::namespace_company_id(&tenant, id)
+    } else {
+        id
+    };
 
     // Reject a duplicate id.
     if state.registry().get(&id).is_some() {
@@ -139,7 +151,6 @@ async fn provision(
     }
 
     // Quota: per-tenant then global.
-    let tenant = acting_tenant(&GqlAuth::Platform(claims.clone()));
     if let Some(max) = state.config().max_companies_per_tenant
         && state.tenant_company_count(&tenant) >= max
     {

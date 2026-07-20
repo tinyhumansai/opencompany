@@ -39,6 +39,18 @@ fn platform_state(home: &std::path::Path, max_per_tenant: Option<usize>) -> AppS
         .with_quota(None, max_per_tenant)
 }
 
+/// A platform state in shared-single-DB mode: `tenant_namespace` is set, which
+/// turns on id-namespacing by the acting tenant of each provisioning request.
+fn namespaced_state(home: &std::path::Path) -> AppState {
+    let verifier = Arc::new(StaticPlatformVerifier::new(PLATFORM_SECRET));
+    AppState::new(AppConfig {
+        tenant_namespace: Some("shared".to_string()),
+        ..AppConfig::default()
+    })
+    .with_home(home.to_path_buf())
+    .with_platform_auth(PlatformAuthConfig::new(verifier))
+}
+
 fn tenant_token(tenant: &str, scopes: &[&str]) -> String {
     StaticPlatformVerifier::tenant_token(&PlatformClaims {
         tenant: tenant.to_string(),
@@ -243,6 +255,52 @@ async fn duplicate_id_conflicts() {
         .unwrap();
     assert_eq!(dup.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(dup).await["code"], "company_exists");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn provision_namespaces_id_by_acting_tenant() {
+    let home = home();
+    let state = namespaced_state(&home);
+    let app = router(state);
+
+    // A platform-scope token acting as `tenant-a` provisions the Acme template.
+    let token = tenant_token("tenant-a", &["platform", "operator"]);
+    let response = app
+        .oneshot(provision_req(Some(&token), ACME_TOML))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    // The derived id `acme` is namespaced with the acting tenant.
+    assert_eq!(json_body(response).await["id"], "tenant-a--acme");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn same_template_under_two_tenants_does_not_conflict() {
+    let home = home();
+    let state = namespaced_state(&home);
+    let app = router(state);
+
+    // Tenant A provisions the Acme template.
+    let a = tenant_token("tenant-a", &["platform", "operator"]);
+    let first = app
+        .clone()
+        .oneshot(provision_req(Some(&a), ACME_TOML))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(json_body(first).await["id"], "tenant-a--acme");
+
+    // Tenant B provisions the *same* template name — in a shared DB this used
+    // to collide on the derived id `acme`; namespacing keeps them distinct.
+    let b = tenant_token("tenant-b", &["platform", "operator"]);
+    let second = app
+        .oneshot(provision_req(Some(&b), ACME_TOML))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CREATED);
+    assert_eq!(json_body(second).await["id"], "tenant-b--acme");
     std::fs::remove_dir_all(&home).ok();
 }
 
