@@ -17,7 +17,9 @@ use crate::{AppState, Result};
 /// build without that feature), and absent server routes must keep 404ing so
 /// API and external clients can detect an unwired surface instead of receiving
 /// the `index.html` shell with a `200`.
-const RESERVED_PREFIXES: [&str; 6] = ["/api", "/graphql", "/healthz", "/spec", "/tiny", "/a2a"];
+const RESERVED_PREFIXES: [&str; 7] = [
+    "/api", "/graphql", "/healthz", "/spec", "/tiny", "/a2a", "/hooks",
+];
 
 /// True when `path` is server-owned and so must 404 rather than fall through to
 /// the console shell. That is either a path under a reserved prefix — an exact
@@ -276,6 +278,9 @@ mod tests {
     fn reserved_path_matches_prefixes_and_subpaths_only() {
         assert!(is_reserved_path("/api"));
         assert!(is_reserved_path("/api/v1/companies"));
+        // `/hooks/{companyId}/{channel}` inbound webhooks (api.md) — a
+        // server-owned namespace, reserved even before the route is wired.
+        assert!(is_reserved_path("/hooks/acme/slack"));
         assert!(is_reserved_path("/.well-known/agent-card.json"));
         assert!(is_reserved_path("/a2a/handle"));
         // A `.well-known` discovery URI is reserved wherever the segment sits,
