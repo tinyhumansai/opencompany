@@ -62,6 +62,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # directory, so the default build's behavior is byte-for-byte unchanged. Pure
 # Rust, no system libs, no network.
 tower-http = { version = "0.6", features = ["fs"] }
+# `ServiceExt::oneshot` lets the `/` SPA fallback hand a request off to
+# `ServeDir` from inside an axum handler, so reserved server prefixes can 404
+# before the static service ever sees them. Already in the tree via `tower-http`
+# and `axum`, so this is a direct-use declaration, not new compilation.
+tower = { version = "0.5", features = ["util"] }
 
 tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite", "repl"] }
 
@@ -238,4 +243,3 @@ whisper-rs-sys = { git = "https://github.com/tinyhumansai/whisper-rs-sys.git", b
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }

@@ -1,13 +1,43 @@
 use std::path::PathBuf;
 
 use axum::extract::Request;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{AppState, Result};
+
+/// Path prefixes owned by the server's API and discovery surfaces. The console
+/// SPA fallback must never answer these: a request under one of them either
+/// hits a real handler or is genuinely absent (e.g. a feature-gated route in a
+/// build without that feature), and absent server routes must keep 404ing so
+/// API and external clients can detect an unwired surface instead of receiving
+/// the `index.html` shell with a `200`.
+const RESERVED_PREFIXES: [&str; 7] = [
+    "/api",
+    "/graphql",
+    "/healthz",
+    "/spec",
+    "/tiny",
+    "/a2a",
+    "/.well-known",
+];
+
+/// True when `path` falls under a reserved server prefix — either an exact
+/// match (`/spec`) or a sub-path (`/api/v1/...`) — so the SPA fallback should
+/// yield a 404 rather than the console shell.
+fn is_reserved_path(path: &str) -> bool {
+    RESERVED_PREFIXES.iter().any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
 
 /// The directory whose built operator console the host serves at `/`, read from
 /// `OPENCOMPANY_CONSOLE_DIR`. Returns `None` when the variable is unset, empty,
@@ -52,15 +82,30 @@ fn router_with_console(state: AppState, console_dir: Option<PathBuf>) -> Router 
     // always wins. Only when nothing else matches does `ServeDir` answer:
     // asset paths (`/assets/app.js`, `/favicon.ico`) serve their file, and any
     // other unknown path (a client-side SPA route) falls through to
-    // `index.html` so the React router can take over. When no console dir is
-    // configured this is skipped entirely and unknown paths keep 404ing.
+    // `index.html` so the React router can take over. Unmatched paths under a
+    // reserved server prefix (`/api`, `/a2a`, `/.well-known`, ...) are the one
+    // exception: they 404 rather than serve the shell, so a feature-gated or
+    // otherwise absent API/discovery route stays detectable by its callers.
+    // When no console dir is configured this is skipped entirely and unknown
+    // paths keep 404ing.
     let router = match console_dir {
         Some(dir) => {
             let index = dir.join("index.html");
             let serve = ServeDir::new(dir)
                 .append_index_html_on_directories(true)
                 .fallback(ServeFile::new(index));
-            router.fallback_service(serve)
+            router.fallback(move |request: Request| {
+                let serve = serve.clone();
+                async move {
+                    if is_reserved_path(request.uri().path()) {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    match serve.oneshot(request).await {
+                        Ok(response) => response.into_response(),
+                        Err(err) => match err {},
+                    }
+                }
+            })
         }
         None => router,
     };
@@ -201,6 +246,40 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(!body_text(response).await.contains("<title>console</title>"));
+    }
+
+    #[tokio::test]
+    async fn console_does_not_shadow_unmatched_reserved_paths() {
+        let (_guard, dir) = console_fixture();
+        let app = router_with_console(AppState::new(AppConfig::default()), Some(dir));
+
+        // An unmatched path under a reserved API/discovery prefix (e.g. a
+        // feature-gated route in a build without that feature) must 404, not
+        // fall through to the SPA shell, so callers can still detect the
+        // surface as unwired.
+        for path in ["/api/v1/does-not-exist", "/.well-known/agent-card.json"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
+            assert!(!body_text(response).await.contains("<title>console</title>"));
+        }
+    }
+
+    #[test]
+    fn reserved_path_matches_prefixes_and_subpaths_only() {
+        assert!(is_reserved_path("/api"));
+        assert!(is_reserved_path("/api/v1/companies"));
+        assert!(is_reserved_path("/.well-known/agent-card.json"));
+        assert!(is_reserved_path("/a2a/handle"));
+        // A console route that merely shares a prefix substring is not reserved.
+        assert!(!is_reserved_path("/apidocs"));
+        assert!(!is_reserved_path("/tinyplace-console"));
+        assert!(!is_reserved_path("/"));
+        assert!(!is_reserved_path("/some/spa/route"));
     }
 
     #[tokio::test]
