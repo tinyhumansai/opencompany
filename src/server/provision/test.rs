@@ -39,12 +39,15 @@ fn platform_state(home: &std::path::Path, max_per_tenant: Option<usize>) -> AppS
         .with_quota(None, max_per_tenant)
 }
 
-/// A platform state in shared-single-DB mode: `tenant_namespace` is set, which
-/// turns on id-namespacing by the acting tenant of each provisioning request.
-fn namespaced_state(home: &std::path::Path) -> AppState {
+/// A platform state in shared-single-DB mode for the workload tenant
+/// `namespace` (its `OPENCOMPANY_TENANT_ID`). The configured namespace — not the
+/// request's acting tenant — is authoritative for the id prefix and the
+/// ownership record, so ids and owners stay workload-local and survive boot
+/// hydration, which filters the `owners` rows by this same value.
+fn namespaced_state(home: &std::path::Path, namespace: &str) -> AppState {
     let verifier = Arc::new(StaticPlatformVerifier::new(PLATFORM_SECRET));
     AppState::new(AppConfig {
-        tenant_namespace: Some("shared".to_string()),
+        tenant_namespace: Some(namespace.to_string()),
         ..AppConfig::default()
     })
     .with_home(home.to_path_buf())
@@ -259,49 +262,61 @@ async fn duplicate_id_conflicts() {
 }
 
 #[tokio::test]
-async fn provision_namespaces_id_by_acting_tenant() {
+async fn provision_namespaces_id_by_workload_tenant() {
     let home = home();
-    let state = namespaced_state(&home);
+    // Workload tenant is `tenant-a`.
+    let state = namespaced_state(&home, "tenant-a");
+    // Keep a handle on the shared ownership map to inspect what boot hydration
+    // (which filters `owners` rows by the configured namespace) would reload.
+    let observed = state.clone();
     let app = router(state);
 
-    // A platform-scope token acting as `tenant-a` provisions the Acme template.
-    let token = tenant_token("tenant-a", &["platform", "operator"]);
+    // A *full-platform* token provisions the Acme template. Its acting tenant is
+    // `tenant:platform`, not `tenant-a` — yet the id and owner must be keyed to
+    // the workload tenant, or the company is orphaned at reboot.
     let response = app
-        .oneshot(provision_req(Some(&token), ACME_TOML))
+        .oneshot(provision_req(Some(PLATFORM_SECRET), ACME_TOML))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    // The derived id `acme` is namespaced with the acting tenant.
+    // The derived id `acme` is namespaced with the workload tenant, not the
+    // acting `tenant:platform`.
     assert_eq!(json_body(response).await["id"], "tenant-a--acme");
+    // The ownership row records the workload tenant — exactly what boot
+    // hydration filters on — so the company survives a restart.
+    let id = CompanyId::new("tenant-a--acme");
+    assert_eq!(observed.owner_of(&id).as_deref(), Some("tenant-a"));
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
-async fn same_template_under_two_tenants_does_not_conflict() {
-    let home = home();
-    let state = namespaced_state(&home);
-    let app = router(state);
-
-    // Tenant A provisions the Acme template.
+async fn same_template_under_two_tenant_workloads_does_not_conflict() {
+    // Two tenants are two separate workloads (containers), each with its own
+    // `OPENCOMPANY_TENANT_ID`, writing to one shared logical database. In a
+    // shared DB the derived id `acme` used to collide; per-workload namespacing
+    // keeps them distinct.
+    let home_a = home();
+    let app_a = router(namespaced_state(&home_a, "tenant-a"));
     let a = tenant_token("tenant-a", &["platform", "operator"]);
-    let first = app
-        .clone()
+    let first = app_a
         .oneshot(provision_req(Some(&a), ACME_TOML))
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::CREATED);
     assert_eq!(json_body(first).await["id"], "tenant-a--acme");
 
-    // Tenant B provisions the *same* template name — in a shared DB this used
-    // to collide on the derived id `acme`; namespacing keeps them distinct.
+    let home_b = home();
+    let app_b = router(namespaced_state(&home_b, "tenant-b"));
     let b = tenant_token("tenant-b", &["platform", "operator"]);
-    let second = app
+    let second = app_b
         .oneshot(provision_req(Some(&b), ACME_TOML))
         .await
         .unwrap();
     assert_eq!(second.status(), StatusCode::CREATED);
     assert_eq!(json_body(second).await["id"], "tenant-b--acme");
-    std::fs::remove_dir_all(&home).ok();
+
+    std::fs::remove_dir_all(&home_a).ok();
+    std::fs::remove_dir_all(&home_b).ok();
 }
 
 // ---------------------------------------------------------------------------

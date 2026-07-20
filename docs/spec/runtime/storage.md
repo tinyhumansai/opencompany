@@ -81,17 +81,24 @@ pointing all tenants at the shared database name) so the workload can keep its
 records apart:
 
 - **Id namespacing.** Company ids are prefixed with `<tenant>--` before they
-  reach the store (`AppConfig::namespaced_company_id`). The boot path prefixes
-  with the workload's own `OPENCOMPANY_TENANT_ID`; the API provisioning path
-  prefixes with the acting tenant of the request. This keeps the same boot
-  template (`OPENCOMPANY_COMPANY=agentic_software_company` for every tenant)
-  from colliding on the `companies` collection's unique `company_id` index. The
+  reach the store (`AppConfig::namespaced_company_id`). Both the boot path and
+  the API provisioning path prefix with the workload's own
+  `OPENCOMPANY_TENANT_ID` — config, not the request's acting tenant, is
+  authoritative for this workload's data scope. So even a full-platform token
+  provisioning on behalf of another tenant yields a workload-local id rather
+  than one prefixed with a foreign tenant. This keeps the same boot template
+  (`OPENCOMPANY_COMPANY=agentic_software_company` for every tenant) from
+  colliding on the `companies` collection's unique `company_id` index. The
   prefix is idempotent — an already-prefixed id passes through unchanged.
-- **Ownership.** The boot company's `company_id -> tenant_id` mapping is written
-  to the `owners` collection (best-effort), so a shared-DB manager can enumerate
-  and purge a tenant's companies later. Owners hydration at boot filters to rows
-  whose `tenant_id` equals this workload's `OPENCOMPANY_TENANT_ID`, so the
-  in-memory ownership map never carries other tenants' companies.
+- **Ownership.** A provisioned or boot company's `company_id -> tenant_id`
+  mapping is written to the `owners` collection (best-effort) with the
+  workload's own `OPENCOMPANY_TENANT_ID`, so a shared-DB manager can enumerate
+  and purge a tenant's companies later. Recording the same value the id is
+  namespaced with is what lets owners hydration reload it: hydration at boot
+  filters to rows whose `tenant_id` equals this workload's
+  `OPENCOMPANY_TENANT_ID`, so the in-memory ownership map never carries other
+  tenants' companies and no API-provisioned company is orphaned across a
+  restart.
 
 Everything is backwards compatible: with `OPENCOMPANY_TENANT_ID` unset, id
 derivation, ownership recording, and owners hydration behave exactly as before

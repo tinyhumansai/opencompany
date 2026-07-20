@@ -79,8 +79,9 @@ impl Default for AppConfig {
 ///
 /// Idempotent: an id already carrying the `<tenant>--` prefix is returned
 /// unchanged, so applying it more than once — or to an id read back from a
-/// shared DB — never double-prefixes. The boot path uses the workload's own
-/// [`AppConfig::tenant_namespace`]; API provisioning uses the acting tenant.
+/// shared DB — never double-prefixes. Both the boot path and API provisioning
+/// use the workload's own [`AppConfig::tenant_namespace`], so ids stay
+/// workload-local regardless of which tenant a provisioning request acts for.
 pub fn namespace_company_id(tenant: &str, id: CompanyId) -> CompanyId {
     let prefix = format!("{tenant}--");
     if id.as_ref().starts_with(&prefix) {

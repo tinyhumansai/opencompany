@@ -128,18 +128,30 @@ async fn provision(
         Some(raw) => CompanyId::new(raw),
         None => company_id_from_name(&manifest.company.name),
     };
-    // The tenant this request acts for; also the ownership record below.
-    let tenant = acting_tenant(&GqlAuth::Platform(claims.clone()));
-    // Shared-single-DB mode: namespace the id with the acting tenant so that
-    // API-provisioned companies are globally unique in one logical database
-    // (the same template name under two tenants no longer collides on the
-    // `companies` unique index). A no-op when the workload is not in
-    // tenant-namespace mode; idempotent for an already-prefixed explicit id.
-    let id = if state.config().tenant_namespace.is_some() {
-        crate::app::namespace_company_id(&tenant, id)
-    } else {
-        id
-    };
+    // The tenant that owns this company and namespaces its id.
+    //
+    // In shared-single-DB mode the workload's *configured* namespace
+    // (`OPENCOMPANY_TENANT_ID`) is authoritative for its own data scope: config,
+    // not the request's acting tenant, decides where this workload writes. Using
+    // it keeps the id and the ownership record workload-local even when a
+    // full-platform token provisions on behalf of another tenant, and it matches
+    // the filter boot hydration applies to the persisted `owners` rows (also
+    // `AppConfig::tenant_namespace`) — so an API-provisioned company survives a
+    // restart instead of being orphaned by a foreign-tenant prefix.
+    //
+    // Outside shared-single-DB mode the acting tenant is recorded, feeding
+    // per-tenant quota and db-per-tenant / self-hosted ownership as before.
+    let tenant = state
+        .config()
+        .tenant_namespace
+        .clone()
+        .unwrap_or_else(|| acting_tenant(&GqlAuth::Platform(claims.clone())));
+    // Namespace the id with the workload's tenant so API-provisioned companies
+    // are globally unique in one logical database (the same template name under
+    // two tenant workloads no longer collides on the `companies` unique index).
+    // A no-op when tenant-namespace mode is off; idempotent for an already-
+    // prefixed explicit id.
+    let id = state.config().namespaced_company_id(id);
 
     // Reject a duplicate id.
     if state.registry().get(&id).is_some() {
