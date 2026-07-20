@@ -133,8 +133,11 @@ mod tests {
     /// Writes a minimal console tree (just `index.html`) into a temp dir.
     fn console_fixture() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("index.html"), "<!doctype html><title>console</title>")
-            .unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><title>console</title>",
+        )
+        .unwrap();
         let path = dir.path().to_path_buf();
         (dir, path)
     }
