@@ -55,6 +55,14 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Static file serving for the embedded operator console. `ServeDir`/`ServeFile`
+# back the `/` SPA fallback so a hosted tenant serves its own console
+# same-origin without a separate nginx container. Unconditional but inert: the
+# fallback is only mounted when `OPENCOMPANY_CONSOLE_DIR` points at a real
+# directory, so the default build's behavior is byte-for-byte unchanged. Pure
+# Rust, no system libs, no network.
+tower-http = { version = "0.6", features = ["fs"] }
+
 tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite", "repl"] }
 
 # WS4: openhuman embedded as a library (the harness). Only links under the
