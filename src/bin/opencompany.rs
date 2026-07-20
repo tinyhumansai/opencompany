@@ -192,6 +192,12 @@ async fn register_company(
     .with_seed_dir(company_source_dir(dir))
     .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
     .with_host_base_url(state.config().host_base_url());
+    // Shared-single-DB mode: namespace the derived id with this tenant so the
+    // same boot template (`OPENCOMPANY_COMPANY`) does not collide across tenants
+    // in one logical database. A no-op when `tenant_namespace` is unset.
+    let derived = opencompany::runtime::company_id_from_name(&name);
+    let company_id = state.config().namespaced_company_id(derived);
+    builder = builder.with_id(company_id);
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
@@ -199,10 +205,20 @@ async fn register_company(
         builder = builder.with_discoverable(true);
     }
     let runtime = builder.build().await?;
-    let id = runtime.id().as_ref().to_string();
-    state
-        .registry()
-        .insert(runtime.id().clone(), Arc::new(runtime));
+    let company_id = runtime.id().clone();
+    let id = company_id.as_ref().to_string();
+    // Record boot-company ownership so a shared-DB manager can later purge by
+    // tenant. Only meaningful in tenant-namespace mode; otherwise skipped so
+    // db-per-tenant / self-hosted deployments keep their in-memory-only stub.
+    if let Some(tenant) = state.config().tenant_namespace.clone() {
+        state.set_owner(company_id.clone(), tenant.clone());
+        if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
+            && let Err(err) = ownership.set_owner(&company_id, &tenant).await
+        {
+            eprintln!("failed to persist ownership for `{id}`: {err}");
+        }
+    }
+    state.registry().insert(company_id, Arc::new(runtime));
     Ok((id, name, schedules))
 }
 
@@ -535,11 +551,19 @@ async fn main() -> Result<()> {
             let public_url = std::env::var("OPENCOMPANY_PUBLIC_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
+            // Shared-single-DB tenant identity. When set, company ids are
+            // namespaced with this value so many tenants can share one logical
+            // database without colliding on the `companies` unique index. Unset
+            // (db-per-tenant / single-tenant) keeps every id derivation as-is.
+            let tenant_namespace = std::env::var("OPENCOMPANY_TENANT_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
             let mut state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
                 tinyplace_api_url,
                 public_url,
+                tenant_namespace,
                 ..AppConfig::default()
             })
             .with_cors(opencompany::server::cors::CorsConfig::from_env()?)
@@ -557,10 +581,18 @@ async fn main() -> Result<()> {
                 opencompany::store::open_storage(&storage_settings, &home).await?
             {
                 // Shared-database platform mode: restore the durable company →
-                // tenant map so ownership survives restarts.
+                // tenant map so ownership survives restarts. In shared-single-DB
+                // mode the `owners` collection holds every tenant's rows; hydrate
+                // only this tenant's own mappings so the in-memory map never
+                // leaks other tenants' companies (which are unaddressable here
+                // regardless, since the registry only holds locally-loaded ones).
                 if let Some(ownership) = &handles.ownership {
+                    let self_tenant = state.config().tenant_namespace.clone();
                     for (id, tenant) in ownership.owners().await? {
-                        state.set_owner(id, tenant);
+                        match &self_tenant {
+                            Some(me) if &tenant != me => continue,
+                            _ => state.set_owner(id, tenant),
+                        }
                     }
                 }
                 state = state.with_stores(handles);
