@@ -17,20 +17,19 @@ use crate::{AppState, Result};
 /// build without that feature), and absent server routes must keep 404ing so
 /// API and external clients can detect an unwired surface instead of receiving
 /// the `index.html` shell with a `200`.
-const RESERVED_PREFIXES: [&str; 7] = [
-    "/api",
-    "/graphql",
-    "/healthz",
-    "/spec",
-    "/tiny",
-    "/a2a",
-    "/.well-known",
-];
+const RESERVED_PREFIXES: [&str; 6] = ["/api", "/graphql", "/healthz", "/spec", "/tiny", "/a2a"];
 
-/// True when `path` falls under a reserved server prefix — either an exact
-/// match (`/spec`) or a sub-path (`/api/v1/...`) — so the SPA fallback should
-/// yield a 404 rather than the console shell.
+/// True when `path` is server-owned and so must 404 rather than fall through to
+/// the console shell. That is either a path under a reserved prefix — an exact
+/// match (`/spec`) or a sub-path (`/api/v1/...`) — or any `.well-known`
+/// discovery URI (RFC 8615). The latter is reserved wherever the segment
+/// appears, not just at the root: `/companies/{handle}/.well-known/agent-card.json`
+/// is a tiny.place Agent Card endpoint (feature-gated on `tinyplace`), and the
+/// SPA must never masquerade as one for a directory client probing it.
 fn is_reserved_path(path: &str) -> bool {
+    if path.split('/').any(|segment| segment == ".well-known") {
+        return true;
+    }
     RESERVED_PREFIXES.iter().any(|prefix| {
         path == *prefix
             || path
@@ -257,7 +256,11 @@ mod tests {
         // feature-gated route in a build without that feature) must 404, not
         // fall through to the SPA shell, so callers can still detect the
         // surface as unwired.
-        for path in ["/api/v1/does-not-exist", "/.well-known/agent-card.json"] {
+        for path in [
+            "/api/v1/does-not-exist",
+            "/.well-known/agent-card.json",
+            "/companies/acme/.well-known/agent-card.json",
+        ] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -275,9 +278,16 @@ mod tests {
         assert!(is_reserved_path("/api/v1/companies"));
         assert!(is_reserved_path("/.well-known/agent-card.json"));
         assert!(is_reserved_path("/a2a/handle"));
+        // A `.well-known` discovery URI is reserved wherever the segment sits,
+        // including under a company handle the SPA otherwise owns.
+        assert!(is_reserved_path(
+            "/companies/acme/.well-known/agent-card.json"
+        ));
         // A console route that merely shares a prefix substring is not reserved.
         assert!(!is_reserved_path("/apidocs"));
         assert!(!is_reserved_path("/tinyplace-console"));
+        // `/companies/{handle}` client-side console routes still fall through.
+        assert!(!is_reserved_path("/companies/acme"));
         assert!(!is_reserved_path("/"));
         assert!(!is_reserved_path("/some/spa/route"));
     }
