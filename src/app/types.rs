@@ -47,6 +47,13 @@ pub struct AppConfig {
     pub max_companies_per_tenant: Option<usize>,
     /// Outbound webhook delivery configuration. `None` disables webhooks.
     pub webhook: Option<WebhookConfig>,
+    /// Tenant namespace for shared-single-DB deployments
+    /// (`OPENCOMPANY_TENANT_ID`). When set, provisioned/booted company ids are
+    /// prefixed with `<tenant>--` via [`Self::namespaced_company_id`] so many
+    /// tenants sharing one logical database never collide on the `companies`
+    /// unique index. `None` (the default) is a no-op: db-per-tenant and
+    /// single-tenant deployments are unaffected.
+    pub tenant_namespace: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -63,7 +70,23 @@ impl Default for AppConfig {
             max_companies: None,
             max_companies_per_tenant: None,
             webhook: None,
+            tenant_namespace: None,
         }
+    }
+}
+
+/// Prefixes `id` with `<tenant>--` for shared-single-DB namespacing.
+///
+/// Idempotent: an id already carrying the `<tenant>--` prefix is returned
+/// unchanged, so applying it more than once — or to an id read back from a
+/// shared DB — never double-prefixes. The boot path uses the workload's own
+/// [`AppConfig::tenant_namespace`]; API provisioning uses the acting tenant.
+pub fn namespace_company_id(tenant: &str, id: CompanyId) -> CompanyId {
+    let prefix = format!("{tenant}--");
+    if id.as_ref().starts_with(&prefix) {
+        id
+    } else {
+        CompanyId::new(format!("{prefix}{}", id.as_ref()))
     }
 }
 
@@ -71,6 +94,20 @@ impl AppConfig {
     /// True when hosted cognition can run: hosted mode plus a credential.
     pub fn cycles_available(&self) -> bool {
         self.brain_mode == BrainMode::Hosted && self.tinyhumans_credential.is_some()
+    }
+
+    /// Namespaces a company id for shared-single-DB mode.
+    ///
+    /// Returns `<tenant>--<id>` when [`Self::tenant_namespace`] is set and `id`
+    /// is not already prefixed; returns `id` unchanged when the namespace is
+    /// unset (the no-op that keeps db-per-tenant deployments identical).
+    /// Idempotent: an already-prefixed id passes through untouched, so applying
+    /// it twice — or to an id read back from a shared DB — never double-prefixes.
+    pub fn namespaced_company_id(&self, id: CompanyId) -> CompanyId {
+        match &self.tenant_namespace {
+            Some(tenant) => namespace_company_id(tenant, id),
+            None => id,
+        }
     }
 
     /// The host base URL to embed in published Agent Card endpoints: the
@@ -142,6 +179,7 @@ impl std::fmt::Debug for AppConfig {
             .field("max_companies", &self.max_companies)
             .field("max_companies_per_tenant", &self.max_companies_per_tenant)
             .field("webhook", &self.webhook)
+            .field("tenant_namespace", &self.tenant_namespace)
             .finish()
     }
 }
@@ -535,6 +573,38 @@ mod tests {
             .skill_registry(std::path::Path::new("/nonexistent"))
             .expect("cached registry");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn namespaced_company_id_is_noop_when_unset() {
+        let config = AppConfig::default();
+        assert!(config.tenant_namespace.is_none());
+        let id = CompanyId::new("agentic-software-company");
+        assert_eq!(config.namespaced_company_id(id.clone()), id);
+    }
+
+    #[test]
+    fn namespaced_company_id_prefixes_when_set() {
+        let config = AppConfig {
+            tenant_namespace: Some("acme".into()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            config.namespaced_company_id(CompanyId::new("agentic-software-company")),
+            CompanyId::new("acme--agentic-software-company")
+        );
+    }
+
+    #[test]
+    fn namespaced_company_id_is_idempotent() {
+        let config = AppConfig {
+            tenant_namespace: Some("acme".into()),
+            ..AppConfig::default()
+        };
+        let once = config.namespaced_company_id(CompanyId::new("agentic-software-company"));
+        let twice = config.namespaced_company_id(once.clone());
+        assert_eq!(once, twice);
+        assert_eq!(once, CompanyId::new("acme--agentic-software-company"));
     }
 
     #[test]
