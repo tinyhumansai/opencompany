@@ -141,11 +141,17 @@ async fn provision(
     //
     // Outside shared-single-DB mode the acting tenant is recorded, feeding
     // per-tenant quota and db-per-tenant / self-hosted ownership as before.
-    let tenant = state
-        .config()
-        .tenant_namespace
-        .clone()
-        .unwrap_or_else(|| acting_tenant(&GqlAuth::Platform(claims.clone())));
+    // Canonicalized (bare-slug) so the recorded owner, the persisted `owners`
+    // row, and quota counting all key by the same identity that tenant-scoped
+    // auth compares a `tenant:acme` claim against.
+    let tenant = crate::app::canonical_tenant(
+        &state
+            .config()
+            .tenant_namespace
+            .clone()
+            .unwrap_or_else(|| acting_tenant(&GqlAuth::Platform(claims.clone()))),
+    )
+    .to_string();
     // Namespace the id with the workload's tenant so API-provisioned companies
     // are globally unique in one logical database (the same template name under
     // two tenant workloads no longer collides on the `companies` unique index).

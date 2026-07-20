@@ -198,7 +198,9 @@ impl GqlAuth {
                     return Ok(());
                 }
                 let owner = state.owner_of(company);
-                if owner.as_deref() == Some(claims.tenant.as_str()) && claims.may_address(company) {
+                if owner.as_deref() == Some(crate::app::canonical_tenant(&claims.tenant))
+                    && claims.may_address(company)
+                {
                     Ok(())
                 } else {
                     Err(forbidden())
@@ -228,7 +230,8 @@ impl GqlAuth {
             GqlAuth::Platform(claims) => all
                 .into_iter()
                 .filter(|id| {
-                    state.owner_of(id).as_deref() == Some(claims.tenant.as_str())
+                    state.owner_of(id).as_deref()
+                        == Some(crate::app::canonical_tenant(&claims.tenant))
                         && claims.may_address(id)
                 })
                 .collect(),

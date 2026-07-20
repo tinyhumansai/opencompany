@@ -211,6 +211,9 @@ async fn register_company(
     // tenant. Only meaningful in tenant-namespace mode; otherwise skipped so
     // db-per-tenant / self-hosted deployments keep their in-memory-only stub.
     if let Some(tenant) = state.config().tenant_namespace.clone() {
+        // Canonical (bare-slug) form so the persisted `owners` row matches what
+        // tenant-scoped auth compares a `tenant:acme` claim against.
+        let tenant = opencompany::app::canonical_tenant(&tenant).to_string();
         state.set_owner(company_id.clone(), tenant.clone());
         if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
             && let Err(err) = ownership.set_owner(&company_id, &tenant).await
@@ -590,7 +593,15 @@ async fn main() -> Result<()> {
                     let self_tenant = state.config().tenant_namespace.clone();
                     for (id, tenant) in ownership.owners().await? {
                         match &self_tenant {
-                            Some(me) if &tenant != me => continue,
+                            // Compare in canonical (bare-slug) form so a row
+                            // persisted as `tenant:acme` still hydrates under the
+                            // workload's bare `acme` namespace, and vice versa.
+                            Some(me)
+                                if opencompany::app::canonical_tenant(&tenant)
+                                    != opencompany::app::canonical_tenant(me) =>
+                            {
+                                continue;
+                            }
                             _ => state.set_owner(id, tenant),
                         }
                     }

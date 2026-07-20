@@ -91,6 +91,22 @@ pub fn namespace_company_id(tenant: &str, id: CompanyId) -> CompanyId {
     }
 }
 
+/// The canonical form of a tenant identifier for ownership: the bare slug, with
+/// any leading `tenant:` prefix stripped.
+///
+/// The two representations of the *same* tenant must compare equal. A verified
+/// token's [`PlatformClaims::tenant`](crate::server::platform_auth::PlatformClaims)
+/// carries the platform-issued `tenant:acme` form, while the workload's injected
+/// `OPENCOMPANY_TENANT_ID` (and thus [`AppConfig::tenant_namespace`], the id
+/// prefix, and shared-DB `owners` rows) is the bare slug `acme`. Recording
+/// ownership under one form and authorizing against the other would lock a
+/// tenant out of its own companies. Every site that stores, counts, hydrates, or
+/// compares an owning tenant funnels through this one helper so `acme` and
+/// `tenant:acme` are one identity end-to-end.
+pub fn canonical_tenant(tenant: &str) -> &str {
+    tenant.strip_prefix("tenant:").unwrap_or(tenant)
+}
+
 impl AppConfig {
     /// True when hosted cognition can run: hosted mode plus a credential.
     pub fn cycles_available(&self) -> bool {
@@ -357,11 +373,16 @@ impl AppState {
     }
 
     /// Records that `tenant` owns `id`.
+    ///
+    /// The tenant is stored in [`canonical_tenant`] form so the map always keys
+    /// ownership by the bare slug, whatever representation the caller passes
+    /// (a token's `tenant:acme` claim or the workload's bare `acme` namespace).
     pub fn set_owner(&self, id: CompanyId, tenant: impl Into<String>) {
+        let tenant = canonical_tenant(&tenant.into()).to_string();
         self.ownership
             .write()
             .expect("ownership poisoned")
-            .insert(id, tenant.into());
+            .insert(id, tenant);
     }
 
     /// Forgets the ownership record for `id` (used by archive).
@@ -373,7 +394,12 @@ impl AppState {
     }
 
     /// The number of companies owned by `tenant`.
+    ///
+    /// Both the stored owners and the query are compared in [`canonical_tenant`]
+    /// form, so a `tenant:acme` claim and a bare `acme` namespace count the same
+    /// tenant's companies.
     pub fn tenant_company_count(&self, tenant: &str) -> usize {
+        let tenant = canonical_tenant(tenant);
         self.ownership
             .read()
             .expect("ownership poisoned")
@@ -606,6 +632,33 @@ mod tests {
         let twice = config.namespaced_company_id(once.clone());
         assert_eq!(once, twice);
         assert_eq!(once, CompanyId::new("acme--agentic-software-company"));
+    }
+
+    #[test]
+    fn canonical_tenant_strips_prefix() {
+        assert_eq!(canonical_tenant("tenant:acme"), "acme");
+        assert_eq!(canonical_tenant("acme"), "acme");
+        // Only the leading `tenant:` is stripped, and only once.
+        assert_eq!(canonical_tenant("company:acme"), "company:acme");
+        assert_eq!(canonical_tenant("tenant:tenant:x"), "tenant:x");
+    }
+
+    #[test]
+    fn ownership_is_keyed_canonically_across_representations() {
+        let state = AppState::new(AppConfig::default());
+        let id = CompanyId::new("acme--acme");
+
+        // A row stored in the claim shape (as hydration would set it) is keyed by
+        // the bare slug, so a query in either representation finds it.
+        state.set_owner(id.clone(), "tenant:acme");
+        assert_eq!(state.owner_of(&id).as_deref(), Some("acme"));
+        assert_eq!(state.tenant_company_count("acme"), 1);
+        assert_eq!(state.tenant_company_count("tenant:acme"), 1);
+        assert_eq!(state.tenant_company_count("tenant:globex"), 0);
+
+        // Re-recording under the bare form is the same identity, not a second.
+        state.set_owner(id.clone(), "acme");
+        assert_eq!(state.tenant_company_count("tenant:acme"), 1);
     }
 
     #[test]

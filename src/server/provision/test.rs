@@ -319,6 +319,60 @@ async fn same_template_under_two_tenant_workloads_does_not_conflict() {
     std::fs::remove_dir_all(&home_b).ok();
 }
 
+#[tokio::test]
+async fn claim_shaped_tenant_manages_namespaced_company() {
+    // Shared-single-DB workload for tenant slug `acme` (its bare
+    // `OPENCOMPANY_TENANT_ID`). A full-platform token provisions the company; it
+    // is namespaced `acme--acme` and its owner is recorded under the bare slug.
+    let home = home();
+    let state = namespaced_state(&home, "acme");
+    let observed = state.clone();
+    let app = router(state);
+
+    let created = app
+        .clone()
+        .oneshot(provision_req(Some(PLATFORM_SECRET), ACME_TOML))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(json_body(created).await["id"], "acme--acme");
+    // Ownership is recorded canonically (bare slug), matching the namespace.
+    let id = CompanyId::new("acme--acme");
+    assert_eq!(observed.owner_of(&id).as_deref(), Some("acme"));
+
+    // The tenant's own token carries the platform-issued *claim* shape
+    // `tenant:acme`, which differs textually from the bare `acme` owner. It must
+    // still be authorized to address and manage its own company.
+    let claim_shaped = tenant_token("tenant:acme", &["operator"]);
+    let status = app
+        .clone()
+        .oneshot(get_req("/api/v1/companies/acme--acme", Some(&claim_shaped)))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(json_body(status).await["id"], "acme--acme");
+
+    let paused = app
+        .clone()
+        .oneshot(post_req(
+            "/api/v1/companies/acme--acme/pause",
+            Some(&claim_shaped),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    assert_eq!(json_body(paused).await["lifecycle"], "paused");
+
+    // A different tenant — whatever its representation — is still denied.
+    let intruder = tenant_token("tenant:globex", &["operator"]);
+    let denied = app
+        .oneshot(get_req("/api/v1/companies/acme--acme", Some(&intruder)))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    std::fs::remove_dir_all(&home).ok();
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
