@@ -36,6 +36,8 @@ MongoDB settings:
 
 - `OPENCOMPANY_MONGODB_URI` — connection string (required for `mongodb`).
 - `OPENCOMPANY_MONGODB_DB` — database name (default `opencompany`).
+- `OPENCOMPANY_TENANT_ID` — tenant identity for **shared-single-DB** mode
+  (default unset). See [Shared single database](#shared-single-database-mode).
 
 ## MongoDB backend (`src/store/mongodb.rs`)
 
@@ -68,6 +70,44 @@ on each `record` (see [ports.md](ports.md), `UsageMeter`).
    collection makes the company → tenant map durable: `serve` hydrates the
    in-memory `AppState` ownership map from it at boot, and provisioning
    updates it — closing the previous restart-loses-ownership stub.
+
+### Shared single database (`OPENCOMPANY_TENANT_ID`) mode
+
+An operator may run every tenant workload against **one** logical MongoDB
+database instead of one database per tenant (e.g. to stay under a managed
+cluster's database/namespace limits). In this mode the manager injects
+`OPENCOMPANY_TENANT_ID=<tenant-slug>` (alongside `OPENCOMPANY_MONGODB_DB`
+pointing all tenants at the shared database name) so the workload can keep its
+records apart:
+
+- **Id namespacing.** Company ids are prefixed with `<tenant>--` before they
+  reach the store (`AppConfig::namespaced_company_id`). The boot path prefixes
+  with the workload's own `OPENCOMPANY_TENANT_ID`; the API provisioning path
+  prefixes with the acting tenant of the request. This keeps the same boot
+  template (`OPENCOMPANY_COMPANY=agentic_software_company` for every tenant)
+  from colliding on the `companies` collection's unique `company_id` index. The
+  prefix is idempotent — an already-prefixed id passes through unchanged.
+- **Ownership.** The boot company's `company_id -> tenant_id` mapping is written
+  to the `owners` collection (best-effort), so a shared-DB manager can enumerate
+  and purge a tenant's companies later. Owners hydration at boot filters to rows
+  whose `tenant_id` equals this workload's `OPENCOMPANY_TENANT_ID`, so the
+  in-memory ownership map never carries other tenants' companies.
+
+Everything is backwards compatible: with `OPENCOMPANY_TENANT_ID` unset, id
+derivation, ownership recording, and owners hydration behave exactly as before
+(the db-per-tenant and single-tenant paths are unchanged).
+
+#### Isolation tradeoff — read this before enabling shared-single-DB mode
+
+In shared-single-DB mode all tenant workloads hold credentials to the **same**
+logical database. Isolation is **application-layer only** — the `<tenant>--`
+id namespace, the `company_id` filter on every query, and the registry serving
+only locally-loaded companies. A compromised or malicious tenant container that
+reaches the database directly can read and write **every** tenant's documents;
+nothing at the MongoDB auth layer stops it. Database-per-tenant (layer 1 below)
+remains the security-recommended mode and stays the manager default; enable
+shared-single-DB mode only where the operational constraint outweighs this
+weaker isolation.
 
 ### Adding another backend (e.g. DynamoDB)
 
