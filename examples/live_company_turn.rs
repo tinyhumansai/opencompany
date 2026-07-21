@@ -99,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
         workspace_root: dir.path().to_path_buf(),
         model_override: Some(default_model.clone()),
         tasks: None,
+        skills: None,
+        skills_source_dir: None,
     };
 
     let pool = HarnessPool::new();
