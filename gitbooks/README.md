@@ -1,7 +1,7 @@
 ---
 description: Run an entire company with a headcount of one.
 cover: .gitbook/assets/opencompany.png
-coverY: 0
+coverY: 204.2366710013004
 coverHeight: 408
 ---
 
