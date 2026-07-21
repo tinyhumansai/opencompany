@@ -124,6 +124,14 @@ async fn tasks_crud_round_trips_under_both_scopes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(moved["column"], "done");
 
+    // List (GET) reflects the write — the board the console reads.
+    let (status, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = board.as_array().expect("array of cards");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], id);
+    assert_eq!(rows[0]["column"], "done");
+
     // Delete.
     let (status, _) = send(
         &state,

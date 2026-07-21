@@ -7,7 +7,7 @@
 
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::routing::{patch, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,7 @@ use crate::server::ops::{ScopedCompany, scoped};
 
 /// Builds the task route fragment.
 pub fn router() -> Router<AppState> {
-    scoped("/tasks", post(create_task)).merge(scoped(
+    scoped("/tasks", post(create_task).get(list_tasks)).merge(scoped(
         "/tasks/{task_id}",
         patch(patch_task).delete(delete_task),
     ))
@@ -89,6 +89,14 @@ struct PatchTask {
 #[derive(Debug, Deserialize)]
 struct TaskPath {
     task_id: String,
+}
+
+/// `GET …/tasks` — the whole board, newest-updated first. The console reads
+/// this to render the Kanban columns and each card's detail (note, assignee).
+async fn list_tasks(company: ScopedCompany) -> Result<Json<Vec<TaskCard>>, ApiError> {
+    let mut rows = company.runtime.tasks().list(company.id()).await?;
+    rows.sort_by(|a, b| b.updated_at_millis.cmp(&a.updated_at_millis));
+    Ok(Json(rows.into_iter().map(TaskCard::from).collect()))
 }
 
 async fn create_task(
