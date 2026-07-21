@@ -255,6 +255,8 @@ description = "Runs Acme."
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: None,
+            skills: None,
+            skills_source_dir: None,
         };
         HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
     }
@@ -369,6 +371,8 @@ description = "Builds it."
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: Some(tasks.clone()),
+            skills: None,
+            skills_source_dir: None,
         };
         (
             HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_two()),

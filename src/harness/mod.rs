@@ -41,6 +41,7 @@ pub mod cost;
 pub mod memory;
 pub mod policy;
 pub mod provider;
+pub mod skills;
 
 pub use brain::HarnessBrain;
 
@@ -58,6 +59,7 @@ use crate::company::Policy;
 use crate::error::OpenCompanyError;
 use crate::harness::cost::{TurnUsage, record_turn_cost};
 use crate::harness::policy::ApprovalPolicy;
+use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::types::{CompanyId, CompanyRecord};
 use crate::ports::{CompanyStore, ContextStore, TaskStore, UsageMeter};
 
@@ -88,6 +90,18 @@ pub struct HarnessDeps {
     ///
     /// [`TaskDispatched`]: crate::ports::types::CompanyEvent::TaskDispatched
     pub tasks: Option<Arc<dyn TaskStore>>,
+    /// The company's skill-delta store, so a built agent can see its effective
+    /// skill set (company-dir skills ∪ operator deltas ∪ custom docs) as read
+    /// tools + a prompt catalogue. `None` leaves the agent skill-less (the chat
+    /// path off the skills seam builds no skill surface).
+    ///
+    /// See [`skills`](crate::harness::skills) — this is the read-only catalogue
+    /// slice; skill *execution* is deferred.
+    pub skills: Option<Arc<dyn SkillStateStore>>,
+    /// The company's source directory (`companies/<name>`), whose `skills/`
+    /// subtree supplies the committed skill bundles unioned into the effective
+    /// set. `None` surfaces only the operator deltas.
+    pub skills_source_dir: Option<PathBuf>,
 }
 
 /// One live openhuman agent, keyed by its manifest id.
@@ -158,7 +172,14 @@ impl HarnessPool {
                 return Ok(());
             }
         }
-        let roster = build_roster(company, deps)?;
+        // Fetch the operator skill deltas once (async) before building the
+        // roster; `build_roster`/`build_agent` stay synchronous and fold the
+        // deltas into each agent's effective skill set.
+        let skill_deltas = match &deps.skills {
+            Some(store) => store.list(&company.id).await?,
+            None => Vec::new(),
+        };
+        let roster = build_roster(company, deps, &skill_deltas)?;
         let mut guard = self.agents.write().await;
         guard.entry(company.id.clone()).or_insert(roster);
         Ok(())
@@ -216,9 +237,13 @@ impl HarnessPool {
 }
 
 /// Build every roster agent for a company from its manifest.
+///
+/// `skill_deltas` are the company's operator skill overrides (fetched once by
+/// the async caller); every agent folds them into its effective skill set.
 pub(crate) fn build_roster(
     company: &CompanyRecord,
     deps: &HarnessDeps,
+    skill_deltas: &[SkillState],
 ) -> crate::Result<Vec<Arc<CompanyAgent>>> {
     let policy: &Policy = &company.manifest.policy;
     let company_name = &company.manifest.company.name;
@@ -234,6 +259,7 @@ pub(crate) fn build_roster(
                 manifest_agent,
                 agent_policy,
                 deps,
+                skill_deltas,
             )?;
             Ok(Arc::new(CompanyAgent {
                 agent_id: manifest_agent.id.clone(),
@@ -415,6 +441,8 @@ description = "Builds the product."
                 workspace_root: dir.path().to_path_buf(),
                 model_override: None,
                 tasks: None,
+                skills: None,
+                skills_source_dir: None,
             },
             store,
             meter,
@@ -425,10 +453,55 @@ description = "Builds the product."
     #[tokio::test]
     async fn roster_builds_every_manifest_agent() {
         let fx = fixture();
-        let roster = build_roster(&record(), &fx.deps).expect("roster builds");
+        let roster = build_roster(&record(), &fx.deps, &[]).expect("roster builds");
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["ceo", "engineer"]);
         assert_eq!(roster[0].role, "Chief Executive");
+    }
+
+    /// The roster builds end-to-end with the skill read surface wired: the
+    /// effective set materializes, the read tools build, and the catalogue folds
+    /// into the persona — all without error — and the scratch tree lands under
+    /// the agent's workspace root.
+    #[tokio::test]
+    async fn roster_builds_with_skill_surface_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = tempfile::tempdir().expect("source");
+        let skill_dir = source.path().join("skills").join("web-research");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Web Research\ndescription: Answer a question\n---\n\n# Web Research\n",
+        )
+        .unwrap();
+
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(MockContext::default()),
+            store: Arc::new(RecordingStore::default()),
+            meter: None,
+            workspace_root: dir.path().to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: Some(source.path().to_path_buf()),
+        };
+
+        let roster = build_roster(&record(), &deps, &[]).expect("roster builds with skills");
+        assert_eq!(roster.len(), 2);
+        // The scratch skill tree was materialized for the first roster agent.
+        assert!(
+            dir.path()
+                .join("acme")
+                .join("ceo")
+                .join("skill-catalog")
+                .join("skills")
+                .join("web-research")
+                .join("SKILL.md")
+                .is_file(),
+            "the effective skill bundle should be materialized under the agent workspace"
+        );
     }
 
     #[tokio::test]

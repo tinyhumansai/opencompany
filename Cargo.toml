@@ -73,13 +73,18 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # WS4: openhuman embedded as a library (the harness). Only links under the
 # `openhuman` feature; the default build pulls none of this enormous native
 # dependency tree. `default-features = false` sheds openhuman's whole default
-# set — `tokenjuice-treesitter`, `voice`, `web3`, `media`, `meet`, `skills`,
+# set — `tokenjuice-treesitter`, `voice`, `web3`, `media`, `meet`,
 # `flows`, `mcp` — none of which a company agent needs; it wants the agent
-# loop, memory, and an inference provider. Keep `vendor/tinyagents` on the
+# loop, memory, and an inference provider. `skills` is re-enabled: cell #28
+# surfaces a company's effective skill set to its harness agents through
+# OpenHuman's own skill *read* tools (`list_workflows` / `describe_workflow` /
+# `read_workflow_resource`), which live in the gated `openhuman::skills`
+# domain. The feature carries no extra deps (`skills = []` upstream) — it only
+# recompiles the skills domain modules. Keep `vendor/tinyagents` on the
 # same commit openhuman's own `vendor/tinyagents` pins: the two are a
 # lockstep pair, and a skew fails to compile (only under this feature, which
 # CI does not build).
-openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false }
+openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false, features = ["skills"] }
 # The openhuman `Provider`/`Memory` traits return `anyhow::Result` and log via
 # the `log` facade; both only link under the `openhuman` feature.
 anyhow = { version = "1", optional = true }

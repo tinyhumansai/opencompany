@@ -507,6 +507,8 @@ mod test {
             workspace_root: home.to_path_buf(),
             model_override: None,
             tasks: None,
+            skills: None,
+            skills_source_dir: None,
         };
         let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record);
 

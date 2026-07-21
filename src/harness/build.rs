@@ -30,6 +30,8 @@ use crate::error::OpenCompanyError;
 use crate::harness::HarnessDeps;
 use crate::harness::memory::OcMemory;
 use crate::harness::policy::ApprovalPolicy;
+use crate::harness::skills::EffectiveSkills;
+use crate::ports::skills_state::SkillState;
 use crate::ports::types::CompanyId;
 
 /// Map a manifest cognition-tier hint to a hosted model/tier name.
@@ -70,12 +72,18 @@ pub fn persona_prompt(company_name: &str, agent: &ManifestAgent) -> String {
 }
 
 /// Build one openhuman [`Agent`] for `manifest_agent` within `company`.
+///
+/// `skill_deltas` are the company's operator skill overrides. When the harness
+/// is wired to a skills source (a [`SkillStateStore`](crate::ports::SkillStateStore)
+/// and/or a source directory), the agent's effective skill set is materialized
+/// and surfaced as three read tools plus a persona-prompt catalogue.
 pub fn build_agent(
     company: &CompanyId,
     company_name: &str,
     manifest_agent: &ManifestAgent,
     policy: ApprovalPolicy,
     deps: &HarnessDeps,
+    skill_deltas: &[SkillState],
 ) -> crate::Result<Agent> {
     let memory = OcMemory::new(
         company.clone(),
@@ -83,19 +91,41 @@ pub fn build_agent(
         deps.context.clone(),
     );
 
-    // v1: no tools yet (see module docs — WS4 tool-surface seam). The manifest
-    // `tools ∩ agent.tools` intersection lands here.
-    let tools: Vec<Box<dyn Tool>> = Vec::new();
-
     let workspace = deps
         .workspace_root
         .join(company.as_ref())
         .join(&manifest_agent.id)
         .join("workspace");
 
+    // v1: no manifest tools yet (see module docs — WS4 tool-surface seam). The
+    // manifest `tools ∩ agent.tools` intersection lands here.
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
     // Persona over openhuman's own identity: `omit_identity = true` drops the
     // "you are OpenHuman" preamble so the agent speaks as its company role.
-    let persona = persona_prompt(company_name, manifest_agent);
+    let mut persona = persona_prompt(company_name, manifest_agent);
+
+    // Skill read surface (read-only catalogue slice). Only materializes when the
+    // harness is wired to a skills source; otherwise the agent stays skill-less
+    // and the default path is untouched. The catalogue is folded into the
+    // persona body because `omit_skills_catalog` is inert upstream.
+    if deps.skills_source_dir.is_some() || !skill_deltas.is_empty() {
+        let skill_ws = deps
+            .workspace_root
+            .join(company.as_ref())
+            .join(&manifest_agent.id)
+            .join("skill-catalog");
+        let effective = EffectiveSkills::materialize(
+            skill_ws,
+            deps.skills_source_dir.as_deref(),
+            skill_deltas,
+        )?;
+        if !effective.is_empty() {
+            tools.extend(effective.read_tools());
+            persona.push_str(&effective.catalogue());
+        }
+    }
+
     let prompt_builder = SystemPromptBuilder::for_subagent(
         persona, /* omit_identity */ true, /* omit_safety_preamble */ false,
         /* omit_skills_catalog */ true,

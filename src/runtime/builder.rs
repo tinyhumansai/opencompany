@@ -673,6 +673,12 @@ impl RuntimeBuilder {
                                 workspace_root: home.join("harness"),
                                 model_override: Some(model),
                                 tasks: Some(ops.tasks.clone()),
+                                // Skill read surface (#28): the operator delta
+                                // store + the company source dir (`companies/<name>`,
+                                // held as `seed_dir`) whose `skills/` subtree
+                                // supplies the committed bundles.
+                                skills: Some(ops.skills.clone()),
+                                skills_source_dir: self.seed_dir.clone(),
                             };
                             let record = CompanyRecord {
                                 id: id.clone(),
