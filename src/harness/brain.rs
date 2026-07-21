@@ -25,6 +25,7 @@ use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
     TokenUsage,
 };
+use crate::ports::{TaskRecord, now_millis};
 
 /// A [`Brain`] that answers with a live openhuman agent turn.
 pub struct HarnessBrain {
@@ -58,6 +59,79 @@ impl HarnessBrain {
         self.responder = agent_id.into();
         self
     }
+
+    /// Runs one dispatched board task: load the card, route it to its assignee
+    /// (or the default responder) for a single turn, and write the outcome back
+    /// onto the board — moved to `in_review` on success, back to `backlog` with
+    /// the error noted on failure. A missing task store or a card that has since
+    /// vanished is a silent no-op.
+    async fn run_task(&self, task_id: &str) -> Result<()> {
+        let Some(tasks) = self.deps.tasks.as_ref() else {
+            return Ok(());
+        };
+        let Some(mut card) = tasks
+            .list(&self.record.id)
+            .await?
+            .into_iter()
+            .find(|t| t.id == task_id)
+        else {
+            return Ok(());
+        };
+
+        let responder = self.task_responder(&card.assignee);
+        let instruction = task_instruction(&card);
+        match self
+            .pool
+            .run(&self.record.id, &responder, &instruction, &self.deps)
+            .await
+        {
+            Ok(reply) => {
+                card.note = Some(append_result(card.note.as_deref(), &responder, &reply));
+                card.column = "in_review".to_string();
+            }
+            Err(err) => {
+                card.note = Some(append_result(
+                    card.note.as_deref(),
+                    &responder,
+                    &format!("dispatch failed: {err}"),
+                ));
+                card.column = "backlog".to_string();
+            }
+        }
+        card.updated_at_millis = now_millis();
+        tasks.upsert(&self.record.id, &card).await?;
+        Ok(())
+    }
+
+    /// Resolves which roster agent runs a task: its `assignee` when that names a
+    /// roster member, else the brain's default responder.
+    fn task_responder(&self, assignee: &str) -> String {
+        if !assignee.is_empty() && self.record.manifest.agents.iter().any(|a| a.id == assignee) {
+            assignee.to_string()
+        } else {
+            self.responder.clone()
+        }
+    }
+}
+
+/// The turn instruction for a dispatched card: its title, plus its note when it
+/// carries one, framed as a work item to act on.
+fn task_instruction(card: &TaskRecord) -> String {
+    match card.note.as_deref().filter(|n| !n.is_empty()) {
+        Some(note) => format!("Task: {}\n\n{}", card.title, note),
+        None => format!("Task: {}", card.title),
+    }
+}
+
+/// Appends a responder-attributed result block to a card's note, preserving any
+/// prior note above it. Slice 1 has no first-class `TaskRecord.result` field, so
+/// the outcome lives in the note.
+fn append_result(prev: Option<&str>, responder: &str, body: &str) -> String {
+    let block = format!("[{responder}] {body}");
+    match prev.filter(|p| !p.is_empty()) {
+        Some(p) => format!("{p}\n\n{block}"),
+        None => block,
+    }
 }
 
 #[async_trait]
@@ -68,18 +142,24 @@ impl Brain for HarnessBrain {
 
         let mut channel_responses = Vec::new();
         for event in &req.events {
-            if let CompanyEvent::OperatorMessage { text, .. } = event {
-                // `run` executes the turn on the openhuman runtime and meters
-                // its usage into the ledger/meter through `deps`. The reply is
-                // the agent's own text.
-                let reply = self
-                    .pool
-                    .run(&self.record.id, &self.responder, text, &self.deps)
-                    .await?;
-                channel_responses.push(OutboundMessage {
-                    channel: "operator".to_string(),
-                    text: reply,
-                });
+            match event {
+                CompanyEvent::OperatorMessage { text, .. } => {
+                    // `run` executes the turn on the openhuman runtime and meters
+                    // its usage into the ledger/meter through `deps`. The reply is
+                    // the agent's own text.
+                    let reply = self
+                        .pool
+                        .run(&self.record.id, &self.responder, text, &self.deps)
+                        .await?;
+                    channel_responses.push(OutboundMessage {
+                        channel: "operator".to_string(),
+                        text: reply,
+                    });
+                }
+                CompanyEvent::TaskDispatched { task_id } => {
+                    self.run_task(task_id).await?;
+                }
+                _ => {}
             }
         }
         // The runtime requires at least one channel response per cycle.
@@ -174,6 +254,7 @@ description = "Runs Acme."
             meter: Some(Arc::new(FsOps::new(dir))),
             workspace_root: dir.to_path_buf(),
             model_override: None,
+            tasks: None,
         };
         HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
     }
@@ -238,5 +319,184 @@ description = "Runs Acme."
         assert_eq!(brain.responder, "ceo");
         let brain = brain.with_responder("cfo");
         assert_eq!(brain.responder, "cfo");
+    }
+
+    // --- Task dispatch ------------------------------------------------------
+
+    use crate::ports::TaskStore;
+
+    /// A two-agent record so assignee routing has somewhere to route.
+    fn record_two() -> CompanyRecord {
+        let manifest = toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[policy]
+mode = "full"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+description = "Runs Acme."
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Builds it."
+"#,
+        )
+        .expect("valid manifest");
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest,
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        }
+    }
+
+    /// A brain wired to a real task store (shared handle returned for seeding /
+    /// asserting), over the offline mock provider.
+    fn brain_with_tasks(dir: &std::path::Path) -> (HarnessBrain, Arc<FsOps>) {
+        let tasks = Arc::new(FsOps::new(dir));
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: Some(Arc::new(FsOps::new(dir))),
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: Some(tasks.clone()),
+        };
+        (
+            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_two()),
+            tasks,
+        )
+    }
+
+    fn card(id: &str, assignee: &str) -> TaskRecord {
+        TaskRecord {
+            id: id.to_string(),
+            title: "Ship the thing".to_string(),
+            note: None,
+            column: "in_progress".to_string(),
+            priority: "high".to_string(),
+            assignee: assignee.to_string(),
+            updated_at_millis: 0,
+        }
+    }
+
+    async fn only_card(tasks: &Arc<FsOps>) -> TaskRecord {
+        tasks
+            .list(&CompanyId::new("acme"))
+            .await
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("one card")
+    }
+
+    /// A dispatched task runs a turn and moves to `in_review`, its result folded
+    /// into the note under the responder that ran it.
+    #[tokio::test]
+    async fn task_dispatch_runs_and_moves_to_in_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        tasks
+            .upsert(&CompanyId::new("acme"), &card("t1", ""))
+            .await
+            .unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let moved = only_card(&tasks).await;
+        assert_eq!(moved.column, "in_review");
+        let note = moved.note.expect("result written to note");
+        // Default responder (first roster agent) ran it, and the mock provider
+        // echoes the instruction (the card title) back into the reply.
+        assert!(note.contains("[ceo]"), "{note:?}");
+        assert!(note.contains("Ship the thing"), "{note:?}");
+    }
+
+    /// An `assignee` that names a roster member routes the turn to that member.
+    #[tokio::test]
+    async fn task_dispatch_routes_to_assignee() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        tasks
+            .upsert(&CompanyId::new("acme"), &card("t1", "engineer"))
+            .await
+            .unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let note = only_card(&tasks).await.note.expect("note");
+        assert!(note.contains("[engineer]"), "{note:?}");
+    }
+
+    /// An assignee that is not on the roster falls back to the default responder.
+    #[tokio::test]
+    async fn task_dispatch_unknown_assignee_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        tasks
+            .upsert(&CompanyId::new("acme"), &card("t1", "ghost"))
+            .await
+            .unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let note = only_card(&tasks).await.note.expect("note");
+        assert!(note.contains("[ceo]"), "{note:?}");
+    }
+
+    /// A dispatch for a card that no longer exists is a silent no-op, not an
+    /// error.
+    #[tokio::test]
+    async fn task_dispatch_missing_card_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "nope".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs without a card");
+        assert!(
+            tasks
+                .list(&CompanyId::new("acme"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
