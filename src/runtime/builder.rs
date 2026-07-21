@@ -29,6 +29,10 @@ use crate::feedback::types::ConsentMode;
 use crate::harness::provider::{HostedProvider, HostedProviderConfig};
 #[cfg(feature = "openhuman")]
 use crate::harness::{HarnessBrain, HarnessDeps};
+#[cfg(feature = "openhuman")]
+use crate::ports::WorkflowRunner;
+#[cfg(feature = "openhuman")]
+use crate::workflows::HarnessWorkflowRunner;
 use crate::openhuman::rpc::OpenHumanRpc;
 use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
@@ -654,6 +658,10 @@ impl RuntimeBuilder {
         //      transport);
         //   4. every other combination degrades to the offline echo brain so
         //      the default build stays green.
+        // Captured from the harness arm below so the workflow engine (#29) can
+        // reuse the same metered pool/deps the brain runs on.
+        #[cfg(feature = "openhuman")]
+        let mut wf_runner: Option<Arc<dyn WorkflowRunner>> = None;
         let brain: Arc<dyn Brain> = match self.brain {
             Some(brain) => brain,
             None => {
@@ -687,6 +695,14 @@ impl RuntimeBuilder {
                                 lifecycle: "running".to_string(),
                                 overlay_agents: Vec::new(),
                             };
+                            // Workflow agent nodes execute on the same pool as the
+                            // brain — clone before both moves into `HarnessBrain`.
+                            wf_runner = Some(Arc::new(HarnessWorkflowRunner::new(
+                                pool.clone(),
+                                deps.clone(),
+                                record.clone(),
+                            ))
+                                as Arc<dyn WorkflowRunner>);
                             Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
                         }
                         _ => None,
@@ -809,6 +825,13 @@ impl RuntimeBuilder {
         #[cfg(feature = "openhuman")]
         if let Some(harness) = self.harness.clone() {
             runtime.set_harness(harness);
+        }
+
+        // #29: install the workflow runner captured from the harness arm so
+        // `POST /workflows/{wid}/run` executes instead of reporting `not_wired`.
+        #[cfg(feature = "openhuman")]
+        if let Some(wf_runner) = wf_runner {
+            runtime.set_workflow_runner(wf_runner);
         }
 
         // Boot lifecycle step 3: going-public. Best-effort and non-blocking —

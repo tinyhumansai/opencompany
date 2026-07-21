@@ -25,6 +25,11 @@ pub mod runtime;
 pub mod server;
 pub mod store;
 pub mod tiny;
+/// Issue #29 (epic #26): run a company's workflows on the embedded `tinyflows`
+/// engine, with agent nodes executing on the harness pool. Compiled only under
+/// the `openhuman` feature; the default build links none of it.
+#[cfg(feature = "openhuman")]
+pub mod workflows;
 
 pub use app::{AppConfig, AppState};
 pub use brain::EchoBrain;
