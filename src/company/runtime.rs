@@ -98,6 +98,13 @@ pub struct CompanyRuntime {
     /// `skills/` and `workflows/` content. `None` in platform-provisioned mode
     /// (no source dir), where those resolvers degrade to manifest-derived/empty.
     pub(crate) source_dir: Option<PathBuf>,
+    /// Issue #29: the workflow runner, when wired. Executes a company's workflow
+    /// graphs on the embedded `tinyflows` engine (agent nodes on the harness
+    /// pool). The port trait is default-compiled, so this field is always
+    /// present; only the concrete `HarnessWorkflowRunner` is `openhuman`-gated,
+    /// so the default build simply leaves it `None` and the run route reports
+    /// "not wired".
+    pub(crate) workflow_runner: Option<Arc<dyn crate::ports::WorkflowRunner>>,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
     /// WS4: the embedded openhuman harness pool, when wired via
@@ -149,6 +156,7 @@ impl CompanyRuntime {
             feedback,
             filer,
             source_dir: None,
+            workflow_runner: None,
             serial: TokioMutex::new(()),
             #[cfg(feature = "openhuman")]
             harness: None,
@@ -166,6 +174,19 @@ impl CompanyRuntime {
     /// `None` in platform-provisioned mode.
     pub fn source_dir(&self) -> Option<&Path> {
         self.source_dir.as_deref()
+    }
+
+    /// Issue #29: attach the workflow runner after construction. Wired by the
+    /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) under the `openhuman`
+    /// feature; without it the run route reports "not wired".
+    pub fn set_workflow_runner(&mut self, runner: Arc<dyn crate::ports::WorkflowRunner>) {
+        self.workflow_runner = Some(runner);
+    }
+
+    /// The workflow runner, if one is wired. `None` in the default build (and on
+    /// any runtime built without a harness), where workflow execution is inert.
+    pub fn workflow_runner(&self) -> Option<&Arc<dyn crate::ports::WorkflowRunner>> {
+        self.workflow_runner.as_ref()
     }
 
     /// WS4: attach an embedded harness pool after construction (called by the
