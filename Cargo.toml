@@ -90,6 +90,18 @@ openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = 
 anyhow = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
 
+# Issue #29 (epic #26): the tinyflows workflow engine, embedded directly. It is
+# host-agnostic and Config-free — `Capabilities` is a plain struct of trait
+# objects — so a company's workflows run on it without booting any OpenHuman
+# global `Config`/registry. Only links under the `openhuman` feature; the
+# `[patch.crates-io]` entry below already redirects it at the vendored copy
+# (`vendor/openhuman/vendor/tinyflows`, 0.5.x). Its `tinyagents ^1.2` requirement
+# resolves to the already-vendored `vendor/tinyagents`, so this adds no new
+# lockstep.
+# We deliberately do NOT enable openhuman's own `flows` feature: that drags in
+# rhai + the builder tools, defeating the point of running tinyflows directly.
+tinyflows = { version = "0.5", optional = true }
+
 # Optional network client shared by the feature-gated integrations below; the
 # default build links no network crates.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
@@ -161,7 +173,7 @@ tiny = ["tinyagents"]
 # the default build stays offline and echo-brained (byte-for-byte unaffected).
 # `reqwest` is pulled in for the hosted Medulla inference `Provider`; the
 # `MockProvider` and every adapter compile without touching the network.
-openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log"]
+openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:tinyflows"]
 # Real HTTP transport to openhuman-core. The trait + offline mock + providers
 # compile without this; only `HttpOpenHumanRpc` is gated behind it.
 openhuman-rpc = ["dep:reqwest"]
