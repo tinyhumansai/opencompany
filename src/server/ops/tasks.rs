@@ -104,11 +104,7 @@ async fn create_task(
         assignee: body.assignee.unwrap_or_default(),
         updated_at_millis: now_millis(),
     };
-    company
-        .runtime
-        .tasks()
-        .upsert(company.id(), &record)
-        .await?;
+    company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
 }
 
@@ -141,11 +137,7 @@ async fn patch_task(
         record.assignee = assignee;
     }
     record.updated_at_millis = now_millis();
-    company
-        .runtime
-        .tasks()
-        .upsert(company.id(), &record)
-        .await?;
+    company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
 }
 

@@ -26,8 +26,17 @@ use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
     FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore,
-    TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
+    TaskRecord, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
+
+/// The board column a task must enter to be dispatched to its assignee.
+const IN_PROGRESS: &str = "in_progress";
+
+/// Whether an upsert moves a card **into** `in_progress` (the dispatch edge).
+/// A card already in `in_progress` re-saved is not a fresh dispatch.
+fn task_enters_in_progress(prev_column: Option<&str>, next_column: &str) -> bool {
+    next_column == IN_PROGRESS && prev_column != Some(IN_PROGRESS)
+}
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
@@ -201,6 +210,64 @@ impl CompanyRuntime {
     /// This company's task board.
     pub fn tasks(&self) -> &Arc<dyn TaskStore> {
         &self.ops.tasks
+    }
+
+    /// Upserts a board task and edge-fires a dispatch when the write moves the
+    /// card **into** `in_progress` — the drag into `in_progress` is the human
+    /// approval gate. The single write site for REST task mutations, so the
+    /// trigger cannot be bypassed by writing straight to the store.
+    ///
+    /// The dispatch is detached (see [`dispatch_task`](Self::dispatch_task)), so
+    /// the HTTP write returns immediately; the agent turn's result lands back on
+    /// the card asynchronously. Without an attached harness the board stays inert
+    /// — the card simply rests in `in_progress`.
+    pub async fn upsert_task(self: &Arc<Self>, task: &TaskRecord) -> Result<()> {
+        let prev_column = self
+            .ops
+            .tasks
+            .list(&self.id)
+            .await?
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .map(|t| t.column);
+        let dispatch = task_enters_in_progress(prev_column.as_deref(), &task.column);
+        self.ops.tasks.upsert(&self.id, task).await?;
+        if dispatch {
+            self.dispatch_task(task.id.clone());
+        }
+        Ok(())
+    }
+
+    /// Fires the detached [`TaskDispatched`] cycle for a task when a harness is
+    /// attached. Detached (`tokio::spawn`) so the board write returns at once;
+    /// the cycle writes its outcome back onto the card. In the default build (no
+    /// harness) this is a no-op, keeping the board inert.
+    ///
+    /// [`TaskDispatched`]: crate::ports::types::CompanyEvent::TaskDispatched
+    fn dispatch_task(self: &Arc<Self>, task_id: String) {
+        #[cfg(feature = "openhuman")]
+        if self.harness.is_some() {
+            let runtime = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(err) = runtime
+                    .run_cycle(vec![CompanyEvent::TaskDispatched {
+                        task_id: task_id.clone(),
+                    }])
+                    .await
+                {
+                    tracing::warn!(
+                        company = %runtime.id,
+                        task = %task_id,
+                        error = %err,
+                        "task dispatch cycle failed"
+                    );
+                }
+            });
+            return;
+        }
+        // Default build / no harness: the board stays inert. The card rests in
+        // `in_progress` until a harness cycle (or a human) advances it.
+        let _ = task_id;
     }
 
     /// This company's workspace file tree.
@@ -429,5 +496,24 @@ impl std::fmt::Debug for CompanyRuntime {
             .field("channels", &self.channels.len())
             .field("has_economy", &self.economy.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_enters_in_progress;
+
+    #[test]
+    fn dispatch_only_on_entering_in_progress() {
+        // Fresh card created straight into `in_progress` → dispatch.
+        assert!(task_enters_in_progress(None, "in_progress"));
+        // The drag: backlog → in_progress → dispatch.
+        assert!(task_enters_in_progress(Some("backlog"), "in_progress"));
+        // Already in_progress, re-saved (e.g. an edit) → no re-dispatch.
+        assert!(!task_enters_in_progress(Some("in_progress"), "in_progress"));
+        // Any non-in_progress target → no dispatch.
+        assert!(!task_enters_in_progress(Some("in_progress"), "in_review"));
+        assert!(!task_enters_in_progress(None, "backlog"));
+        assert!(!task_enters_in_progress(Some("in_review"), "done"));
     }
 }
