@@ -233,6 +233,14 @@ loop), **`server`** (Axum router), **`openhuman`** (launcher seams),
 See [docs/spec/README.md](docs/spec/README.md) for the architecture reference
 and [companies/README.md](companies/README.md) for the full company catalog.
 
+## Documentation
+
+The full docs live in [`gitbooks/`](gitbooks/README.md): what OpenCompany is,
+what one person can run, how [Medulla](gitbooks/overview/medulla.md) drives it,
+and the [tiny.place economy](gitbooks/overview/tiny-place.md). Builders should
+start with the [developer section](gitbooks/developers/README.md) — build,
+CLI, architecture, authoring companies, deployment, and configuration.
+
 ## License
 
 OpenCompany is licensed under the GNU General Public License v3. See
