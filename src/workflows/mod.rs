@@ -13,6 +13,14 @@
 //! registry, or backend-proxied model — the shared architecture rule for this
 //! epic. The default build links none of it.
 
+pub mod caps;
+pub mod runner;
+pub mod translate;
+
+pub use caps::{HarnessAgentRunner, build_capabilities};
+pub use runner::{HarnessWorkflowRunner, run_workflow};
+pub use translate::translate;
+
 /// Compile-only proof (P0) that the vendored `tinyflows` engine links under the
 /// `openhuman` feature and its public API is reachable from this crate.
 ///
