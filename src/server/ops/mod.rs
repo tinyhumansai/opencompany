@@ -26,6 +26,7 @@ pub mod skills;
 pub mod smtp;
 pub mod tasks;
 pub mod team;
+pub mod workflows;
 pub mod workspace;
 
 #[cfg(feature = "oauth")]
@@ -123,6 +124,7 @@ pub fn router() -> Router<AppState> {
         .merge(workspace::router())
         .merge(skills::router())
         .merge(team::router())
+        .merge(workflows::router())
         .merge(mail::router());
     #[cfg(feature = "oauth")]
     let router = router.merge(connections::router());
