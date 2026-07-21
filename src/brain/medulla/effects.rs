@@ -102,6 +102,12 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Deleted memory fact {fact_id}"),
             "memory.fact_deleted",
         ),
+        CompanyEvent::TaskDispatched { task_id } => (
+            Role::System,
+            "board".to_string(),
+            format!("Dispatched task {task_id}"),
+            "task.dispatched",
+        ),
     };
     WireEvent {
         seq,
