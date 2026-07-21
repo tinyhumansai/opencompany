@@ -7,7 +7,7 @@
 
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
