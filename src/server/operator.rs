@@ -506,6 +506,7 @@ mod test {
             meter: Some(Arc::new(FsOps::new(home.to_path_buf()))),
             workspace_root: home.to_path_buf(),
             model_override: None,
+            tasks: None,
         };
         let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record);
 

@@ -298,6 +298,15 @@ pub enum CompanyEvent {
         /// The id of the deleted fact.
         fact_id: String,
     },
+    /// A board task was moved into `in_progress` and dispatched to its assignee
+    /// for one agent turn on the embedded runtime. Journaled so the dispatch is
+    /// auditable and replayable. Only the `openhuman` `HarnessBrain` acts on it;
+    /// the default build's `EchoBrain` ignores it, so the board stays inert
+    /// without the harness.
+    TaskDispatched {
+        /// The id of the dispatched task card.
+        task_id: String,
+    },
 }
 
 /// A `CompanyEvent` durably appended to the log with its sequence and time.

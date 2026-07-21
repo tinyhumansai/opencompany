@@ -291,7 +291,7 @@ export function AppShell({
             />
           )}
           {view === "inbox" && <InboxView company={company} />}
-          {view === "tasks" && <TasksView />}
+          {view === "tasks" && <TasksView client={client} company={company} />}
           {view === "team" && <TeamView client={client} company={company} />}
           {view === "people" && <PeopleView client={client} company={company} />}
           {view === "skills" && <SkillsView company={company} />}

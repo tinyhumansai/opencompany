@@ -672,6 +672,7 @@ impl RuntimeBuilder {
                                 meter: Some(fs_ops.clone()),
                                 workspace_root: home.join("harness"),
                                 model_override: Some(model),
+                                tasks: Some(ops.tasks.clone()),
                             };
                             let record = CompanyRecord {
                                 id: id.clone(),

@@ -59,7 +59,7 @@ use crate::error::OpenCompanyError;
 use crate::harness::cost::{TurnUsage, record_turn_cost};
 use crate::harness::policy::ApprovalPolicy;
 use crate::ports::types::{CompanyId, CompanyRecord};
-use crate::ports::{CompanyStore, ContextStore, UsageMeter};
+use crate::ports::{CompanyStore, ContextStore, TaskStore, UsageMeter};
 
 /// Shared dependencies every harness-built agent draws on.
 #[derive(Clone)]
@@ -82,6 +82,12 @@ pub struct HarnessDeps {
     /// the whole roster addresses the configured workload (e.g. `chat-v1`).
     /// `None` keeps each agent's tier-derived default.
     pub model_override: Option<String>,
+    /// The company's task board, so a [`TaskDispatched`] cycle can load the
+    /// dispatched card and write its result back. `None` off the task path (the
+    /// chat brain leaves the board untouched).
+    ///
+    /// [`TaskDispatched`]: crate::ports::types::CompanyEvent::TaskDispatched
+    pub tasks: Option<Arc<dyn TaskStore>>,
 }
 
 /// One live openhuman agent, keyed by its manifest id.
@@ -408,6 +414,7 @@ description = "Builds the product."
                 meter: Some(meter.clone()),
                 workspace_root: dir.path().to_path_buf(),
                 model_override: None,
+                tasks: None,
             },
             store,
             meter,

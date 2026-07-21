@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         meter: Some(meter.clone()),
         workspace_root: dir.path().to_path_buf(),
         model_override: Some(default_model.clone()),
+        tasks: None,
     };
 
     let pool = HarnessPool::new();

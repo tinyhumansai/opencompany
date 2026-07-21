@@ -20,7 +20,7 @@ use crate::server::ops::{ScopedCompany, scoped};
 
 /// Builds the task route fragment.
 pub fn router() -> Router<AppState> {
-    scoped("/tasks", post(create_task)).merge(scoped(
+    scoped("/tasks", post(create_task).get(list_tasks)).merge(scoped(
         "/tasks/{task_id}",
         patch(patch_task).delete(delete_task),
     ))
@@ -91,6 +91,14 @@ struct TaskPath {
     task_id: String,
 }
 
+/// `GET …/tasks` — the whole board, newest-updated first. The console reads
+/// this to render the Kanban columns and each card's detail (note, assignee).
+async fn list_tasks(company: ScopedCompany) -> Result<Json<Vec<TaskCard>>, ApiError> {
+    let mut rows = company.runtime.tasks().list(company.id()).await?;
+    rows.sort_by(|a, b| b.updated_at_millis.cmp(&a.updated_at_millis));
+    Ok(Json(rows.into_iter().map(TaskCard::from).collect()))
+}
+
 async fn create_task(
     company: ScopedCompany,
     Json(body): Json<CreateTask>,
@@ -104,11 +112,7 @@ async fn create_task(
         assignee: body.assignee.unwrap_or_default(),
         updated_at_millis: now_millis(),
     };
-    company
-        .runtime
-        .tasks()
-        .upsert(company.id(), &record)
-        .await?;
+    company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
 }
 
@@ -141,11 +145,7 @@ async fn patch_task(
         record.assignee = assignee;
     }
     record.updated_at_millis = now_millis();
-    company
-        .runtime
-        .tasks()
-        .upsert(company.id(), &record)
-        .await?;
+    company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
 }
 
