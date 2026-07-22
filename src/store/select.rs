@@ -171,19 +171,29 @@ pub struct StorageSettings {
     pub memory_backend: MemoryBackend,
 }
 
+/// Parses env var `key` into `T`. Absent → `Ok(None)` (the caller applies its
+/// default); a set-but-non-UTF-8 value is a hard [`OpenCompanyError::Config`]
+/// rather than a silent fallback to the default.
+fn parse_env<T>(key: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr<Err = OpenCompanyError>,
+{
+    match std::env::var(key) {
+        Ok(raw) => Ok(Some(raw.parse()?)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(OpenCompanyError::Config(format!(
+            "{key} is set but is not valid UTF-8"
+        ))),
+    }
+}
+
 impl StorageSettings {
     /// Reads the CLI-surface storage env vars (`OPENCOMPANY_STORAGE`,
     /// `OPENCOMPANY_MONGODB_URI`, `OPENCOMPANY_MONGODB_DB`,
     /// `OPENCOMPANY_TENANT_ID`, `OPENCOMPANY_MEMORY`).
     pub fn from_env() -> Result<Self> {
-        let kind = match std::env::var("OPENCOMPANY_STORAGE") {
-            Ok(raw) => raw.parse()?,
-            Err(_) => StorageKind::Fs,
-        };
-        let memory_backend = match std::env::var("OPENCOMPANY_MEMORY") {
-            Ok(raw) => raw.parse()?,
-            Err(_) => MemoryBackend::Store,
-        };
+        let kind: StorageKind = parse_env("OPENCOMPANY_STORAGE")?.unwrap_or_default();
+        let memory_backend: MemoryBackend = parse_env("OPENCOMPANY_MEMORY")?.unwrap_or_default();
         let non_empty = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
         Ok(Self {
             kind,
