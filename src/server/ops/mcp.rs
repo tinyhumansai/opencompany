@@ -319,10 +319,11 @@ async fn mutation_response(
     let decls = resolve_effective(runtime.id(), &manifest, runtime.secrets().as_ref())
         .await
         .map_err(ApiError)?;
-    let decl = decls
-        .iter()
-        .find(|d| d.name == name)
-        .ok_or_else(|| ApiError(OpenCompanyError::InvalidRequest(format!("`{name}` not found"))))?;
+    let decl = decls.iter().find(|d| d.name == name).ok_or_else(|| {
+        ApiError(OpenCompanyError::InvalidRequest(format!(
+            "`{name}` not found"
+        )))
+    })?;
     Ok(Json(MutationResponse {
         server: dto_from_decl(decl),
         note: REBUILD_NOTE.to_string(),
@@ -335,7 +336,9 @@ fn reject_invalid(label: &str, server: &McpServer) -> Result<(), ApiError> {
     if problems.is_empty() {
         Ok(())
     } else {
-        Err(ApiError(OpenCompanyError::InvalidRequest(problems.join(" "))))
+        Err(ApiError(OpenCompanyError::InvalidRequest(
+            problems.join(" "),
+        )))
     }
 }
 
@@ -349,7 +352,10 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// Gated on the `openhuman` feature (the MCP client + transport live there);
 /// without it the route reports `not_wired` so the console falls back gracefully.
 #[cfg(feature = "openhuman")]
-async fn discover_tools(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
+async fn discover_tools(
+    company: ScopedCompany,
+    Path(NamePath { name }): Path<NamePath>,
+) -> Response {
     use axum::response::IntoResponse;
 
     let runtime = company.runtime.as_ref();
@@ -396,7 +402,10 @@ async fn discover_tools(company: ScopedCompany, Path(NamePath { name }): Path<Na
 /// Without the `openhuman` feature there is no MCP transport, so discovery is
 /// "not wired" (the console falls back to the declared tool lists).
 #[cfg(not(feature = "openhuman"))]
-async fn discover_tools(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
+async fn discover_tools(
+    company: ScopedCompany,
+    Path(NamePath { name }): Path<NamePath>,
+) -> Response {
     let _ = (company, name);
     crate::server::ops::not_wired("mcp tool discovery")
 }

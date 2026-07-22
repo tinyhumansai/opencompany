@@ -606,7 +606,9 @@ async fn mcp_servers_crud_round_trips_and_token_is_write_only() {
 
     // The token must NOT appear anywhere in the add response.
     assert!(
-        !serde_json::to_string(&added).unwrap().contains("sk-write-only-abc"),
+        !serde_json::to_string(&added)
+            .unwrap()
+            .contains("sk-write-only-abc"),
         "add response leaked the token"
     );
 
@@ -648,7 +650,10 @@ async fn mcp_servers_crud_round_trips_and_token_is_write_only() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(updated["server"]["enabled"], false);
-    assert_eq!(updated["server"]["authConfigured"], true, "token survives an update");
+    assert_eq!(
+        updated["server"]["authConfigured"], true,
+        "token survives an update"
+    );
 
     // Delete (runtime server) → 204, then it's gone.
     let (status, _) = send(&state, "DELETE", "/api/v1/company/mcp/servers/notion", None).await;
@@ -696,7 +701,13 @@ async fn mcp_manifest_server_cannot_be_deleted_but_can_be_overridden() {
 async fn mcp_discovery_is_not_wired_without_the_feature() {
     let home = home();
     let state = state_with_manifest(&home, mcp_manifest()).await;
-    let (status, body) = send(&state, "GET", "/api/v1/company/mcp/servers/docs/tools", None).await;
+    let (status, body) = send(
+        &state,
+        "GET",
+        "/api/v1/company/mcp/servers/docs/tools",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "not_wired");
     tokio::fs::remove_dir_all(&home).await.ok();

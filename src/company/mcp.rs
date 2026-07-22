@@ -233,7 +233,13 @@ pub async fn auth_configured(
     server: &McpServer,
     secrets: &dyn SecretStore,
 ) -> Result<bool> {
-    let material = load_auth(company, &server.name, secrets, server.auth_secret.as_deref()).await?;
+    let material = load_auth(
+        company,
+        &server.name,
+        secrets,
+        server.auth_secret.as_deref(),
+    )
+    .await?;
     Ok(material.is_configured())
 }
 
@@ -248,16 +254,14 @@ pub async fn store_bearer(
         token: token.to_string(),
     })
     .map_err(|e| OpenCompanyError::Store(format!("serializing mcp auth: {e}")))?;
-    secrets.set(company, &auth_key(name), SecretValue(raw)).await
+    secrets
+        .set(company, &auth_key(name), SecretValue(raw))
+        .await
 }
 
 /// Clears a server's stored credential (best-effort — the store has no delete,
 /// so an empty value reads back as "not configured").
-pub async fn clear_auth(
-    company: &CompanyId,
-    name: &str,
-    secrets: &dyn SecretStore,
-) -> Result<()> {
+pub async fn clear_auth(company: &CompanyId, name: &str, secrets: &dyn SecretStore) -> Result<()> {
     secrets
         .set(company, &auth_key(name), SecretValue(String::new()))
         .await
@@ -424,7 +428,10 @@ mod tests {
             server("dup", "https://a.example/mcp"),
             server("dup", "https://b.example/mcp"),
         ]);
-        assert!(problems.iter().any(|p| p.contains("more than once")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("more than once")),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -436,7 +443,10 @@ mod tests {
     #[test]
     fn missing_endpoint_is_rejected() {
         let problems = validate_servers(&[server("bare", "")]);
-        assert!(problems.iter().any(|p| p.contains("endpoint")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("endpoint")),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -445,7 +455,9 @@ mod tests {
         s.command = Some("npx some-mcp".into());
         let problems = validate_servers(&[s]);
         assert!(
-            problems.iter().any(|p| p.contains("stdio") && p.contains("hosted v1")),
+            problems
+                .iter()
+                .any(|p| p.contains("stdio") && p.contains("hosted v1")),
             "{problems:?}"
         );
     }
@@ -479,9 +491,13 @@ mod tests {
         let secrets = MemSecrets::default();
 
         // Runtime-add a server + write its token (write-only).
-        save_runtime_index(&company, &secrets, &[server("notion", "https://notion.example/mcp")])
-            .await
-            .unwrap();
+        save_runtime_index(
+            &company,
+            &secrets,
+            &[server("notion", "https://notion.example/mcp")],
+        )
+        .await
+        .unwrap();
         store_bearer(&company, "notion", "sk-secret-123", &secrets)
             .await
             .unwrap();
@@ -493,9 +509,13 @@ mod tests {
 
         // The token is never exposed by the status helper — only a bool.
         assert!(
-            auth_configured(&company, &server("notion", "https://notion.example/mcp"), &secrets)
-                .await
-                .unwrap()
+            auth_configured(
+                &company,
+                &server("notion", "https://notion.example/mcp"),
+                &secrets
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -503,7 +523,9 @@ mod tests {
     async fn cleared_auth_reads_back_as_unconfigured() {
         let company = CompanyId::new("acme");
         let secrets = MemSecrets::default();
-        store_bearer(&company, "notion", "tok", &secrets).await.unwrap();
+        store_bearer(&company, "notion", "tok", &secrets)
+            .await
+            .unwrap();
         clear_auth(&company, "notion", &secrets).await.unwrap();
         let material = load_auth(&company, "notion", &secrets, None).await.unwrap();
         assert_eq!(material, AuthMaterial::None);
