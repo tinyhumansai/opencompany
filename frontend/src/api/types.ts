@@ -17,6 +17,18 @@ export interface OutboundMessage {
   text: string;
 }
 
+/**
+ * `GET {scope}/desks` — one desk (group chat). Mirrors `DeskDto` in
+ * `src/server/operator.rs`. The `id` doubles as the chat thread id; `members[0]`
+ * is the desk's lead.
+ */
+export interface DeskDto {
+  id: string;
+  name: string;
+  description?: string;
+  members: string[];
+}
+
 /** Response of `/chat` and approval-resolution routes. */
 export interface ChatResponse {
   responses: OutboundMessage[];

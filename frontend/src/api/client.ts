@@ -16,6 +16,7 @@ import {
   type CompanyStatus,
   type ConnectionStart,
   type ConnectionState,
+  type DeskDto,
   type FeedbackInput,
   type FeedbackResponse,
   type FeedbackSummary,
@@ -135,9 +136,25 @@ export class OpenCompanyClient {
     return this.request<CompanyStatus>("GET", `${this.scope(company)}`);
   }
 
-  /** Send the operator's message and return the company's reply. */
-  chat(text: string, company?: string | null): Promise<ChatResponse> {
-    return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, { text });
+  /**
+   * Send the operator's message and return the company's reply. `chat` is the
+   * addressed desk / thread id (issue #53): the orchestrator routes an addressed
+   * message to that desk's lead, and an unaddressed one answers itself. Omitted /
+   * unknown ids fall to the orchestrator, so callers can always pass the active
+   * thread id safely.
+   */
+  chat(text: string, company?: string | null, chat?: string | null): Promise<ChatResponse> {
+    const body: { text: string; chat?: string } = { text };
+    if (chat) body.chat = chat;
+    return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, body);
+  }
+
+  /**
+   * The company's desks (group chats). Hosts that don't expose `.../desks` yet
+   * return 404 — callers fall back to the static default threads.
+   */
+  listDesks(company?: string | null): Promise<DeskDto[]> {
+    return this.request<DeskDto[]>("GET", `${this.scope(company)}/desks`);
   }
 
   /** The approvals awaiting the operator. */

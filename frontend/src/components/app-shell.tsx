@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import {
   Brain,
   ChartColumnBig,
@@ -49,7 +49,7 @@ import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { DISCORD_INVITE_URL } from "@/lib/links";
-import { defaultThreads } from "@/lib/threads";
+import { defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -185,6 +185,31 @@ export function AppShell({
   const feed = useCompany(client, company, initialStatus);
 
   const pending = feed.status.pending_approvals;
+
+  // Build the chat threads from the company's real desks (issue #53); keep the
+  // static defaults when the host doesn't expose `/desks` (404) or defines none.
+  // Merges by id so a transcript typed before desks load survives.
+  useEffect(() => {
+    let cancelled = false;
+    client
+      .listDesks(company)
+      .then((desks) => {
+        if (cancelled) return;
+        setThreads((prev) => {
+          const byId = new Map(prev.map((t) => [t.id, t]));
+          return threadsFromDesks(desks).map((t) => {
+            const existing = byId.get(t.id);
+            return existing ? { ...t, messages: existing.messages } : t;
+          });
+        });
+      })
+      .catch(() => {
+        /* host without `/desks`, or offline — keep the current threads */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, company]);
 
   const setThreadMessages = (
     threadId: string,
