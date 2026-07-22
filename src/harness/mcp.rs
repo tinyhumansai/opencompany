@@ -53,9 +53,8 @@ impl McpRuntime {
     /// Loads an installed server, establishing the company-store membership
     /// check before touching OpenHuman's process-global connection registry.
     pub fn get(&self, server_id: &str) -> crate::Result<InstalledServer> {
-        oh::mcp_registry::store::get_server(&self.config, server_id).map_err(|_| {
-            OpenCompanyError::InvalidRequest(format!("MCP server '{server_id}' not found"))
-        })
+        oh::mcp_registry::store::get_server(&self.config, server_id)
+            .map_err(|_| OpenCompanyError::McpServerNotFound(server_id.to_string()))
     }
 
     /// Connects an installed server and returns its advertised tools.

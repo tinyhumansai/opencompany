@@ -31,6 +31,8 @@ pub mod workspace;
 
 #[cfg(feature = "oauth")]
 pub mod connections;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 
 pub(crate) use scope::{ScopedCompany, scoped};
 
@@ -128,6 +130,8 @@ pub fn router() -> Router<AppState> {
         .merge(mail::router());
     #[cfg(feature = "oauth")]
     let router = router.merge(connections::router());
+    #[cfg(feature = "mcp")]
+    let router = router.merge(mcp::router());
     router
 }
 
