@@ -502,9 +502,24 @@ fn default_data_dir_str(env: &dyn EnvSource) -> String {
 /// workspace root. For callers like `serve` and `doctor` that resolve the data
 /// root before (or without) the full [`resolve`] precedence pass.
 pub fn data_dir_from_env() -> PathBuf {
-    match std::env::var_os("OPENCOMPANY_DATA_DIR") {
+    data_dir_from(
+        std::env::var_os("OPENCOMPANY_DATA_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure core of [`data_dir_from_env`]: resolves the data dir from the raw
+/// `OPENCOMPANY_DATA_DIR` and `HOME` values. Empty strings are treated as unset
+/// — an empty `OPENCOMPANY_DATA_DIR` would otherwise resolve to the process
+/// working directory rather than falling back to `$HOME/.opencompany`.
+fn data_dir_from(
+    data_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let non_empty = |v: Option<std::ffi::OsString>| v.filter(|value| !value.is_empty());
+    match non_empty(data_dir) {
         Some(dir) => PathBuf::from(dir),
-        None => match std::env::var_os("HOME") {
+        None => match non_empty(home) {
             Some(home) => PathBuf::from(home).join(".opencompany"),
             None => PathBuf::from(".opencompany"),
         },
@@ -542,6 +557,43 @@ mod test {
         assert_eq!(prov.layer("brain_mode"), Some(ConfigLayer::Manifest));
         assert_eq!(prov.layer("api_url"), Some(ConfigLayer::Default));
         assert_eq!(prov.layer("bind"), Some(ConfigLayer::Default));
+    }
+
+    #[test]
+    fn data_dir_from_treats_empty_as_unset() {
+        use std::ffi::OsString;
+        // An empty OPENCOMPANY_DATA_DIR falls back to $HOME/.opencompany, not cwd.
+        assert_eq!(
+            data_dir_from(Some(OsString::from("")), Some(OsString::from("/home/u"))),
+            PathBuf::from("/home/u/.opencompany")
+        );
+        // A set value is used verbatim.
+        assert_eq!(
+            data_dir_from(
+                Some(OsString::from("/data")),
+                Some(OsString::from("/home/u"))
+            ),
+            PathBuf::from("/data")
+        );
+        // Neither set → the relative default.
+        assert_eq!(data_dir_from(None, None), PathBuf::from(".opencompany"));
+    }
+
+    #[test]
+    fn resolve_propagates_workspace_to_runtime_config() {
+        let env = MapEnv::default();
+        let file = ConfigFile {
+            workspace: WorkspaceSection {
+                clear_tmp_on_startup: Some(false),
+            },
+            ..ConfigFile::default()
+        };
+        let (cfg, _) = resolve(&env, Some(&file), &default_manifest()).unwrap();
+        assert!(!cfg.workspace.clear_tmp_on_startup);
+
+        // An absent `[workspace]` section resolves to the default (clear on boot).
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+        assert!(cfg.workspace.clear_tmp_on_startup);
     }
 
     #[test]

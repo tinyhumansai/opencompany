@@ -19,7 +19,7 @@ pub mod fs;
 pub mod fs_ops;
 /// The canonical per-instance directory layout under `OPENCOMPANY_DATA_DIR`
 /// (`companies/`, `memory/`, `store/`, `files/`, `logs/`, `tmp/`) and the
-/// startup lifecycle that creates them and clears `tmp/`.
+/// startup lifecycle that creates them and, by default, clears `tmp/`.
 pub mod layout;
 pub mod paths;
 

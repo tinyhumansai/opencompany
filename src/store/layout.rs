@@ -5,7 +5,8 @@
 //! instance owns. [`DataLayout`] names the canonical subdirectories so stores,
 //! agents, and tools resolve well-known locations instead of ad-hoc paths, and
 //! owns their lifecycle: [`ensure`](DataLayout::ensure) creates them on boot and
-//! clears the ephemeral `tmp/` scratch so none survives a restart.
+//! — when asked (`[workspace].clear_tmp_on_startup`, on by default) — clears the
+//! ephemeral `tmp/` scratch so none survives a restart.
 //!
 //! Per-company bundles live under [`companies_dir`](DataLayout::companies_dir)
 //! (`companies/<slug>/`), each carrying its own `memory/`/`context/`. The

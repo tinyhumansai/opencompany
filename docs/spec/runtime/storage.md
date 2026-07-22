@@ -47,21 +47,21 @@ instance owns. [`DataLayout`](../../../src/store/layout.rs) names the canonical
 subdirectories under it so stores, agents, and tools resolve well-known
 locations instead of ad-hoc paths:
 
-```
+```text
 <OPENCOMPANY_DATA_DIR>/
   companies/   ← per-company bundles (companies/<slug>/, owned by the fs store)
   memory/      ← instance-shared memory artifacts
   store/       ← instance-shared durable-store artifacts
   files/       ← instance-shared files (exports, attachments)
   logs/        ← instance logs
-  tmp/         ← ephemeral scratch, cleared on startup
+  tmp/         ← ephemeral scratch, cleared on startup by default
 ```
 
 Per-company state (each bundle's own `memory/`/`context/`) lives under
 `companies/<slug>/`; the top-level `memory/`/`store/`/`files/` are the shared,
 instance-level locations. `serve` calls `DataLayout::ensure` at boot: it creates
-the shared subdirectories and empties `tmp/` so no stale scratch survives a
-restart. Because the hosting model runs **one container per tenant** with its
+the shared subdirectories and — unless `[workspace].clear_tmp_on_startup` is
+`false` — empties `tmp/` so no stale scratch survives a restart. Because the hosting model runs **one container per tenant** with its
 own `OPENCOMPANY_DATA_DIR`, this root *is* the per-tenant workspace — no separate
 per-tenant path prefix is needed.
 
