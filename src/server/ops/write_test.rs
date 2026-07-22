@@ -534,3 +534,170 @@ async fn unknown_company_scope_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     tokio::fs::remove_dir_all(&home).await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// MCP servers (issue #50)
+// ---------------------------------------------------------------------------
+
+/// A manifest that declares one committed `[[mcp_server]]` — used to assert the
+/// manifest-server guards (cannot delete; overridable).
+fn mcp_manifest() -> CompanyManifest {
+    toml::from_str(
+        "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n[[mcp_server]]\nname = \"docs\"\nendpoint = \"https://docs.example/mcp\"\n",
+    )
+    .unwrap()
+}
+
+/// Boots an fs-backed company from a caller-supplied manifest (mirrors
+/// `state_with_company`, which pins the default manifest).
+async fn state_with_manifest(home: &std::path::Path, manifest: CompanyManifest) -> AppState {
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let id = CompanyId::new("acme");
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    let state = AppState::new(AppConfig::default());
+    state.registry().insert(id, std::sync::Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+    state
+}
+
+#[tokio::test]
+async fn mcp_servers_crud_round_trips_and_token_is_write_only() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // Cold: no servers.
+    let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 0);
+
+    // Add a runtime server WITH a token.
+    let (status, added) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({
+            "name": "notion",
+            "endpoint": "https://notion.example/mcp",
+            "token": "sk-write-only-abc",
+            "allowedTools": ["search"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(added["server"]["name"], "notion");
+    assert_eq!(added["server"]["source"], "runtime");
+    assert_eq!(added["server"]["authConfigured"], true);
+    assert!(added["note"].as_str().unwrap().contains("rebuild"));
+
+    // The token must NOT appear anywhere in the add response.
+    assert!(
+        !serde_json::to_string(&added).unwrap().contains("sk-write-only-abc"),
+        "add response leaked the token"
+    );
+
+    // GET reflects it, still without the token.
+    let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = serde_json::to_string(&list).unwrap();
+    assert!(body.contains("notion"));
+    assert!(body.contains("\"authConfigured\":true"));
+    assert!(!body.contains("sk-write-only-abc"), "list leaked the token");
+
+    // Duplicate add is a 409.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "notion", "endpoint": "https://notion.example/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Non-http endpoint is a 400.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "bad", "endpoint": "ftp://x/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Disable via PUT.
+    let (status, updated) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/mcp/servers/notion",
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["server"]["enabled"], false);
+    assert_eq!(updated["server"]["authConfigured"], true, "token survives an update");
+
+    // Delete (runtime server) → 204, then it's gone.
+    let (status, _) = send(&state, "DELETE", "/api/v1/company/mcp/servers/notion", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn mcp_manifest_server_cannot_be_deleted_but_can_be_overridden() {
+    let home = home();
+    let state = state_with_manifest(&home, mcp_manifest()).await;
+
+    // The manifest server shows up as `manifest`.
+    let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["name"], "docs");
+    assert_eq!(list[0]["source"], "manifest");
+
+    // Deleting a manifest server is a 409.
+    let (status, _) = send(&state, "DELETE", "/api/v1/company/mcp/servers/docs", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // But it can be disabled via a runtime override — still badged manifest.
+    let (status, updated) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/mcp/servers/docs",
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["server"]["source"], "manifest");
+    assert_eq!(updated["server"]["enabled"], false);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Without the `openhuman` feature there is no MCP transport, so live discovery
+/// is "not wired". (Under the feature it would attempt a real network call.)
+#[cfg(not(feature = "openhuman"))]
+#[tokio::test]
+async fn mcp_discovery_is_not_wired_without_the_feature() {
+    let home = home();
+    let state = state_with_manifest(&home, mcp_manifest()).await;
+    let (status, body) = send(&state, "GET", "/api/v1/company/mcp/servers/docs/tools", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_wired");
+    tokio::fs::remove_dir_all(&home).await.ok();
+}

@@ -20,6 +20,7 @@ pub mod inbox;
 pub mod language;
 pub mod mail;
 pub mod mailer;
+pub mod mcp;
 pub mod memory;
 pub mod scope;
 pub mod skills;
@@ -123,6 +124,7 @@ pub fn router() -> Router<AppState> {
         .merge(memory::router())
         .merge(workspace::router())
         .merge(skills::router())
+        .merge(mcp::router())
         .merge(team::router())
         .merge(workflows::router())
         .merge(mail::router());
