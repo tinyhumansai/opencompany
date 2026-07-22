@@ -5,10 +5,14 @@
 //! [`ApprovalPolicy`] tool policy, and a workspace directory.
 //!
 //! * **Tools**: every agent gets the intrinsic [`memory_tools`] (`memory_store`
-//!   + `memory_recall`) over its own company memory. External/integration tools
-//!   gated on the manifest `tools ∩ agent.tools` allow-list (`web.*`/`docs.*`
-//!   etc.) still need the grant→tool bridge + a security/runtime sandbox — a
-//!   tracked follow-up; the builder accepts the vector so they extend it here.
+//!   + `memory_recall`) over its own company memory. **File tools** (read,
+//!   write, edit, list, grep, glob) are granted per-agent when the effective
+//!   `tools ∩ agent.tools` grants cover the `files`/`docs` namespace, and are
+//!   sandboxed to the agent's own workspace via a `workspace_only`
+//!   [`SecurityPolicy`] ([`file_tools`]). Network (`web.*`) and shell (`shell.*`)
+//!   tools are a tracked follow-up — they need an HTTP domain-allowlist config
+//!   and a runtime/audit sandbox respectively; the builder extends the same
+//!   vector, so they slot in beside the file tools.
 //! * **Workflows/skills** start empty. Parsing enabled `SKILL.md` bodies via
 //!   `openhuman::skills::ops_parse` depends on WS1's skill parsing; the seam is
 //!   the `.workflows(...)` setter.
@@ -16,6 +20,7 @@
 //! The tool dispatcher is the text-based [`XmlToolDispatcher`], which needs no
 //! global tool registry — the harness stays self-contained.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openhuman_core::openhuman as oh;
@@ -26,7 +31,9 @@ use oh::context::prompt::SystemPromptBuilder;
 use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
 use oh::memory::traits::Memory;
 use oh::security::SecurityPolicy;
-use oh::tools::Tool;
+use oh::tools::{
+    EditFileTool, FileReadTool, FileWriteTool, GlobTool, GrepTool, ListFilesTool, Tool,
+};
 
 use crate::company::Agent as ManifestAgent;
 use crate::error::OpenCompanyError;
@@ -86,6 +93,7 @@ pub fn build_agent(
     manifest_agent: &ManifestAgent,
     policy: ApprovalPolicy,
     deps: &HarnessDeps,
+    grants: &[String],
     skill_deltas: &[SkillState],
 ) -> crate::Result<Agent> {
     let memory: Arc<dyn Memory> = Arc::new(OcMemory::new(
@@ -103,9 +111,8 @@ pub fn build_agent(
     // Intrinsic memory tools: every agent can deliberately store and recall over
     // its own company memory, complementing the automatic retrieve→inject→store
     // loop. They are tenant-isolated (an agent's memory is its company's
-    // `ContextStore`) and granted to every agent — unlike the manifest
-    // `[tools]` allow-list, which scopes external/integration tools (the
-    // grant→tool bridge for `web.*`/`docs.*` etc. is a follow-up seam).
+    // `ContextStore`) and granted to every agent — unlike the external tools
+    // below, which are scoped by the manifest `[tools]` allow-list.
     let mut tools: Vec<Box<dyn Tool>> = memory_tools(memory.clone());
     #[cfg(feature = "mcp")]
     {
@@ -113,6 +120,15 @@ pub fn build_agent(
         // installs and lifecycle changes are visible without rebuilding agents.
         tools.push(Box::new(oh::mcp_registry::tools::McpRegistryListToolsTool));
         tools.push(Box::new(oh::mcp_registry::tools::McpRegistryToolCallTool));
+    }
+
+    // Granted file tools, sandboxed to this agent's own workspace directory. An
+    // agent gets them only when its effective grants cover the `files`/`docs`
+    // namespace (`docs.*`, `files.*`, or `*`). The security policy is
+    // `workspace_only`, so a granted agent can read and write within its
+    // workspace and nowhere else on the host.
+    if grants_cover(grants, "files") || grants_cover(grants, "docs") {
+        tools.extend(file_tools(&workspace));
     }
 
     // Persona over openhuman's own identity: `omit_identity = true` drops the
@@ -180,6 +196,44 @@ fn memory_tools(memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
     ]
 }
 
+/// Whether an agent's effective `grants` cover a tool `namespace`.
+///
+/// Matches the bare namespace (`docs`), any glob under it (`docs.*`,
+/// `docs.read`), or the catch-all `*`.
+fn grants_cover(grants: &[String], namespace: &str) -> bool {
+    grants.iter().any(|grant| {
+        grant == "*" || grant == namespace || grant.starts_with(&format!("{namespace}."))
+    })
+}
+
+/// A [`SecurityPolicy`] that sandboxes an agent's file tools to `workspace` and
+/// nowhere else: `workspace_only` with both the workspace and the tool action
+/// root pinned to the agent's own directory.
+fn workspace_security(workspace: &Path) -> SecurityPolicy {
+    let dir: PathBuf = workspace.to_path_buf();
+    SecurityPolicy {
+        workspace_dir: dir.clone(),
+        action_dir: dir,
+        workspace_only: true,
+        ..SecurityPolicy::default()
+    }
+}
+
+/// The file tools granted under the `files`/`docs` namespace, each sandboxed to
+/// the agent's `workspace` by a shared [`workspace_security`] policy: read,
+/// write, edit, list, grep, and glob within the workspace only.
+fn file_tools(workspace: &Path) -> Vec<Box<dyn Tool>> {
+    let security = Arc::new(workspace_security(workspace));
+    vec![
+        Box::new(FileReadTool::new(security.clone())),
+        Box::new(FileWriteTool::new(security.clone())),
+        Box::new(EditFileTool::new(security.clone())),
+        Box::new(ListFilesTool::new(security.clone())),
+        Box::new(GrepTool::new(security.clone())),
+        Box::new(GlobTool::new(security)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +281,33 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"memory_store"), "got {names:?}");
         assert!(names.contains(&"memory_recall"), "got {names:?}");
+    }
+
+    #[test]
+    fn grants_cover_matches_namespace_glob_and_star() {
+        assert!(grants_cover(&["docs.*".into()], "docs"));
+        assert!(grants_cover(&["docs".into()], "docs"));
+        assert!(grants_cover(&["docs.read".into()], "docs"));
+        assert!(grants_cover(&["*".into()], "docs"));
+        assert!(!grants_cover(&["web.*".into()], "docs"));
+        assert!(!grants_cover(&[], "docs"));
+        // A prefix must end on a namespace boundary, not a substring.
+        assert!(!grants_cover(&["documentation.*".into()], "docs"));
+    }
+
+    #[test]
+    fn file_tools_are_sandboxed_to_the_workspace() {
+        let ws = Path::new("/tmp/agent-ws");
+        let policy = workspace_security(ws);
+        assert!(policy.workspace_only, "file tools must be workspace-only");
+        assert_eq!(policy.workspace_dir, ws);
+        assert_eq!(policy.action_dir, ws);
+
+        let tools = file_tools(ws);
+        assert_eq!(tools.len(), 6, "read/write/edit/list/grep/glob");
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"file_read"), "got {names:?}");
+        assert!(names.contains(&"file_write"), "got {names:?}");
     }
 
     #[test]
