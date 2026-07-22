@@ -253,12 +253,17 @@ pub(crate) fn build_roster(
         .iter()
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+            let grants = crate::runtime::builder::agent_effective_grants(
+                &company.manifest.tools.allow,
+                &manifest_agent.tools,
+            );
             let agent = build::build_agent(
                 &company.id,
                 company_name,
                 manifest_agent,
                 agent_policy,
                 deps,
+                &grants,
                 skill_deltas,
             )?;
             Ok(Arc::new(CompanyAgent {

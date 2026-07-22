@@ -101,6 +101,23 @@ pub fn effective_grants(manifest: &CompanyManifest) -> Vec<String> {
     dedup(grants)
 }
 
+/// One agent's effective tool grants: its own `tools` narrowed by the company
+/// `allow`-list, or the full allow-list when the agent lists none. This is the
+/// per-agent slice of [`effective_grants`], used by the harness to decide which
+/// tool families an individual agent receives.
+pub(crate) fn agent_effective_grants(allow: &[String], agent_tools: &[String]) -> Vec<String> {
+    let grants: Vec<String> = if agent_tools.is_empty() {
+        allow.to_vec()
+    } else {
+        agent_tools
+            .iter()
+            .filter(|tool| allow_covers(allow, tool))
+            .cloned()
+            .collect()
+    };
+    dedup(grants)
+}
+
 /// Whether the company allow-list covers an agent-requested grant glob.
 fn allow_covers(allow: &[String], tool: &str) -> bool {
     let literal = tool.strip_suffix('*').unwrap_or(tool);
