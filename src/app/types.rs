@@ -219,6 +219,11 @@ pub struct AppState {
     /// selected (`OPENCOMPANY_STORAGE`). Provisioning injects these into each
     /// new company's builder; `None` means fs defaults.
     stores: Option<crate::store::StorageHandles>,
+    /// The memory engine overlay selected by `OPENCOMPANY_MEMORY`, when it is
+    /// not the base store's own memory. Provisioning and boot apply it after
+    /// `stores` so a dedicated engine (TinyCortex) backs recall on top of any
+    /// base backend. `None` means the base backend's memory is used unchanged.
+    memory_overlay: Option<crate::store::MemoryOverlay>,
     /// The repo-level shared skill library directory (`skills/`), set on the
     /// serve path. `None` in platform-provisioned mode (no repo checkout), where
     /// the `skillRegistry` query degrades to empty.
@@ -263,6 +268,7 @@ impl AppState {
             home: std::path::PathBuf::from("."),
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
+            memory_overlay: None,
             skills_root: None,
             skill_registry: Arc::new(OnceLock::new()),
             schema: crate::server::graphql::build_schema(),
@@ -301,6 +307,17 @@ impl AppState {
     /// The opened storage backend's handles, if a non-fs backend is selected.
     pub fn stores(&self) -> Option<&crate::store::StorageHandles> {
         self.stores.as_ref()
+    }
+
+    /// Installs the memory engine overlay selected by `OPENCOMPANY_MEMORY`.
+    pub fn with_memory_overlay(mut self, overlay: crate::store::MemoryOverlay) -> Self {
+        self.memory_overlay = Some(overlay);
+        self
+    }
+
+    /// The memory engine overlay, if one is selected (`OPENCOMPANY_MEMORY`).
+    pub fn memory_overlay(&self) -> Option<&crate::store::MemoryOverlay> {
+        self.memory_overlay.as_ref()
     }
 
     /// The repo-level shared skill registry, loaded from `dir` and cached.

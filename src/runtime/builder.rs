@@ -308,6 +308,17 @@ impl RuntimeBuilder {
             .with_inbox(handles.inbox.clone())
     }
 
+    /// Overlays just the memory + context ports from a selected memory engine
+    /// (`OPENCOMPANY_MEMORY`, see [`crate::store::select`]).
+    ///
+    /// Applied *after* [`with_stores`](Self::with_stores) (or over the fs
+    /// defaults), so a dedicated memory engine such as TinyCortex backs recall
+    /// while the base backend keeps every other durable port.
+    pub fn with_memory_overlay(self, overlay: &crate::store::MemoryOverlay) -> Self {
+        self.with_memory(overlay.memory.clone())
+            .with_context(overlay.context.clone())
+    }
+
     /// Swaps the task board store (default: fs-backed).
     pub fn with_tasks(mut self, tasks: Arc<dyn TaskStore>) -> Self {
         self.tasks = Some(tasks);
