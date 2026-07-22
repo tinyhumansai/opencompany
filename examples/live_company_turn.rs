@@ -110,12 +110,25 @@ async fn main() -> anyhow::Result<()> {
     let reply = pool.run(&record.id, "ceo", &prompt, &deps).await?;
     println!("── ceo reply ──\n{reply}\n");
 
+    // An empty reply means the turn ran but produced nothing — broken wiring,
+    // not a valid answer. Fail loudly so this smoke never passes silently.
+    if reply.trim().is_empty() {
+        anyhow::bail!("agent returned an empty reply — the turn produced no output");
+    }
+
     match meter.samples.lock().unwrap().last() {
-        Some(s) => println!(
-            "── metered usage ──\nprovider={}  in={}  out={}  cached={}  cost_usd={}",
-            s.provider, s.input_tokens, s.output_tokens, s.cached_input_tokens, s.cost_usd
-        ),
-        None => println!("── metered usage ──\n(provider reported no usage)"),
+        Some(s) => {
+            println!(
+                "── metered usage ──\nprovider={}  in={}  out={}  cached={}  cost_usd={}",
+                s.provider, s.input_tokens, s.output_tokens, s.cached_input_tokens, s.cost_usd
+            );
+            // Zero input tokens means usage was not actually metered back —
+            // the whole point of this smoke is to prove it is.
+            if s.input_tokens == 0 {
+                anyhow::bail!("usage sample recorded zero input tokens — metering is not wired");
+            }
+        }
+        None => anyhow::bail!("provider reported no usage sample — metering is not wired"),
     }
 
     Ok(())

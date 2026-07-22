@@ -561,12 +561,21 @@ async fn main() -> Result<()> {
             let tenant_namespace = std::env::var("OPENCOMPANY_TENANT_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
+            // Hosted-brain credential, resolved with the same precedence the
+            // harness uses (`harness_inference_from_env`) so `/spec`'s
+            // `cycles_available` reflects whether cognition can actually run.
+            let tinyhumans_credential = std::env::var("OPENCOMPANY_INFERENCE_KEY")
+                .or_else(|_| std::env::var("TINYHUMANS_API_KEY"))
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(opencompany::ports::types::SecretValue);
             let mut state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
                 tinyplace_api_url,
                 public_url,
                 tenant_namespace,
+                tinyhumans_credential,
                 ..AppConfig::default()
             })
             .with_cors(opencompany::server::cors::CorsConfig::from_env()?)
