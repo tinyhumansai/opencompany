@@ -74,7 +74,12 @@ export function WorkflowsView({
         const rows = await listWorkflows(client, company);
         if (!live) return;
         setWorkflows(rows);
-        setSelectedId((prev) => prev ?? rows[0]?.id ?? null);
+        // Keep the selection only if it still exists in the freshly loaded list
+        // (this effect also reruns on company change) — otherwise a stale id
+        // from the previous company would fetch the wrong/nonexistent graph.
+        setSelectedId((prev) =>
+          prev && rows.some((r) => r.id === prev) ? prev : (rows[0]?.id ?? null),
+        );
         setError(null);
       } catch (e) {
         if (!live) return;
