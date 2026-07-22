@@ -249,9 +249,19 @@ function RunResultPanel({
             Waiting on: {result.pendingApprovals.join(", ")}
           </p>
         )}
-        <pre className="rounded-lg border bg-muted/40 p-2 font-mono text-[11px] leading-snug">
-          {JSON.stringify(result.output, null, 2)}
-        </pre>
+        {!text && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            The run finished; no final text node — see the raw output below.
+          </p>
+        )}
+        <details open={!text}>
+          <summary className="cursor-pointer text-xs text-muted-foreground">
+            Raw engine output
+          </summary>
+          <pre className="mt-1 rounded-lg border bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+            {JSON.stringify(result.output, null, 2)}
+          </pre>
+        </details>
       </div>
     </div>
   );
