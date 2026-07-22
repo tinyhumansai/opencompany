@@ -201,6 +201,9 @@ async fn register_company(
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
+    if let Some(overlay) = state.memory_overlay() {
+        builder = builder.with_memory_overlay(overlay);
+    }
     if discoverable {
         builder = builder.with_discoverable(true);
     }
@@ -561,12 +564,21 @@ async fn main() -> Result<()> {
             let tenant_namespace = std::env::var("OPENCOMPANY_TENANT_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
+            // Hosted-brain credential, resolved with the same precedence the
+            // harness uses (`harness_inference_from_env`) so `/spec`'s
+            // `cycles_available` reflects whether cognition can actually run.
+            let tinyhumans_credential = std::env::var("OPENCOMPANY_INFERENCE_KEY")
+                .or_else(|_| std::env::var("TINYHUMANS_API_KEY"))
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(opencompany::ports::types::SecretValue);
             let mut state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
                 tinyplace_api_url,
                 public_url,
                 tenant_namespace,
+                tinyhumans_credential,
                 ..AppConfig::default()
             })
             .with_cors(opencompany::server::cors::CorsConfig::from_env()?)
@@ -608,6 +620,14 @@ async fn main() -> Result<()> {
                 }
                 state = state.with_stores(handles);
                 println!("storage backend: {:?}", storage_settings.kind);
+            }
+            // Memory engine overlay (`OPENCOMPANY_MEMORY`): swaps just the
+            // memory + context ports onto a dedicated engine on top of the base
+            // backend. A selected-but-unavailable engine aborts boot, same as
+            // the storage backend.
+            if let Some(overlay) = opencompany::store::open_memory_overlay(&storage_settings)? {
+                state = state.with_memory_overlay(overlay);
+                println!("memory backend: {:?}", storage_settings.memory_backend);
             }
             // Platform (multi-tenant) auth: a shared platform token enables the
             // provisioning/lifecycle surface. Without it the prosumer operator
