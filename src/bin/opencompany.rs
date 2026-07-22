@@ -547,6 +547,17 @@ async fn main() -> Result<()> {
             discoverable,
         }) => {
             let home = home.unwrap_or_else(default_home);
+            // Materialize the canonical data-dir workspace layout and empty the
+            // ephemeral `tmp/` scratch so nothing stale survives a restart. The
+            // `[workspace]` section of `config.toml` (in the data dir) toggles
+            // the tmp clear; absent config keeps the default (clear on startup).
+            let data_root = opencompany::app::config::data_dir_from_env();
+            let workspace_cfg = ConfigFile::load(&data_root)?
+                .map(|c| c.workspace.resolve())
+                .unwrap_or_default();
+            opencompany::store::DataLayout::new(&data_root)
+                .ensure(workspace_cfg.clear_tmp_on_startup)
+                .await?;
             // tiny.place economy + public-card configuration resolved from the
             // environment (with built-in defaults); the a2a routes and boot
             // going-public flow read these off `AppConfig`.
@@ -729,13 +740,7 @@ async fn main() -> Result<()> {
             let env = ProcessEnv;
             // Locate config.toml under the resolved data dir (env override or
             // the default `$HOME/.opencompany`).
-            let config_dir = match std::env::var_os("OPENCOMPANY_DATA_DIR") {
-                Some(dir) => PathBuf::from(dir),
-                None => match std::env::var_os("HOME") {
-                    Some(home) => PathBuf::from(home).join(".opencompany"),
-                    None => PathBuf::from(".opencompany"),
-                },
-            };
+            let config_dir = opencompany::app::config::data_dir_from_env();
             let config_toml = ConfigFile::load(&config_dir)?;
             let manifest = match &company {
                 Some(dir) => CompanyManifest::from_path(dir)?,
