@@ -75,6 +75,31 @@ clear_tmp_on_startup = true   # default; set false to preserve tmp/ across resta
 Disk-quota enforcement and large-file S3 offload are infrastructure concerns of
 the hosting layer (`opencompany-microservice` + `k8s`), not the workload binary.
 
+## Memory engine overlay (`OPENCOMPANY_MEMORY`)
+
+Memory is a separable concern. `OPENCOMPANY_STORAGE` picks the durable base for
+all fourteen ports; `OPENCOMPANY_MEMORY` optionally swaps **just** the two
+knowledge ports — `MemoryStore` + `ContextStore` — onto a dedicated memory
+engine layered on top of that base. The base still owns every other port
+(companies, events, secrets, tasks, …).
+
+| Value | Engine | Feature flag | Notes |
+|---|---|---|---|
+| `store` (default) | The base backend's own memory | — | fs substring recall, or sqlite/mongodb |
+| `tinycortex` | TinyCortex chunk store | `tinycortex` | Ranked token-overlap recall over a compounding store |
+
+This is why TinyCortex is not a `StorageKind`: it implements only memory +
+context, so it cannot be a full backend — it overlays. `serve` and platform
+provisioning build the overlay once (`open_memory_overlay`,
+`src/store/select.rs`) and apply it to each company's `RuntimeBuilder` via
+`with_memory_overlay`, **after** `with_stores`, so the engine's ports win while
+the base keeps the rest. A selected-but-unavailable engine (feature disabled)
+aborts boot, same as the storage backend.
+
+The compiled TinyCortex backend is the offline in-memory client
+(`src/store/tinycortex.rs`); a networked client for true semantic recall is an
+inert seam until the service is reachable through the OpenHuman integration.
+
 ## MongoDB backend (`src/store/mongodb.rs`)
 
 One `MongoStore` wraps a single database and implements all five ports.

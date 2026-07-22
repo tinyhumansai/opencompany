@@ -25,7 +25,9 @@ pub mod paths;
 
 /// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
 /// mongodb) onto opened port implementations, injected once per process into
-/// every company's `RuntimeBuilder`.
+/// every company's `RuntimeBuilder`. `OPENCOMPANY_MEMORY` (store | tinycortex)
+/// selects an optional overlay that swaps just the memory + context ports onto
+/// a dedicated engine on top of that base.
 pub mod select;
 
 #[cfg(feature = "sqlite")]
@@ -64,7 +66,10 @@ pub use fs::{
 pub use fs_ops::FsOps;
 pub use layout::DataLayout;
 pub use paths::{Bundle, default_home};
-pub use select::{StorageHandles, StorageKind, StorageSettings, open_storage};
+pub use select::{
+    MemoryBackend, MemoryOverlay, StorageHandles, StorageKind, StorageSettings,
+    open_memory_overlay, open_storage,
+};
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
