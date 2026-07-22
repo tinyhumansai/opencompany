@@ -1,0 +1,41 @@
+# The end-to-end test harness company.
+#
+# A copy of `companies/openhuman_demo` with one addition: a `[users] admins`
+# list, so the Playwright wiring suite (frontend/test/e2e) can log in through
+# the real magic-link flow and drive the operator console against a running
+# host. See `frontend/test/e2e/wiring.spec.ts`.
+#
+# Every [[agent]] becomes one live openhuman agent when built with the
+# `openhuman` feature and an inference credential is present. Without a
+# credential the same company still boots on the offline echo brain — which is
+# all the load check needs.
+
+[company]
+name = "E2E Harness Co"
+output = "Answers, plans, and short written drafts"
+human_role = "Steering the company and approving anything costly"
+
+[policy]
+# `full` lets ordinary turns flow without an approval prompt; costly or
+# external effects still route through the gate.
+mode = "full"
+
+[users]
+# Standing admin invite: this address may redeem a magic link and administer
+# the company. It is the identity the e2e suite authenticates as.
+admins = ["harness-e2e@tinyhumans.ai"]
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+description = "Sets direction, answers about the company, and delegates the work."
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Explains how things are built and proposes technical plans."
+
+[[agent]]
+id = "writer"
+role = "Writer"
+description = "Turns rough notes into short, clear written drafts."
