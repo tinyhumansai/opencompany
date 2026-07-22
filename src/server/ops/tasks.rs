@@ -95,7 +95,7 @@ struct TaskPath {
 /// this to render the Kanban columns and each card's detail (note, assignee).
 async fn list_tasks(company: ScopedCompany) -> Result<Json<Vec<TaskCard>>, ApiError> {
     let mut rows = company.runtime.tasks().list(company.id()).await?;
-    rows.sort_by(|a, b| b.updated_at_millis.cmp(&a.updated_at_millis));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at_millis));
     Ok(Json(rows.into_iter().map(TaskCard::from).collect()))
 }
 
