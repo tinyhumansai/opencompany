@@ -197,6 +197,9 @@ async fn provision(
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
+    if let Some(overlay) = state.memory_overlay() {
+        builder = builder.with_memory_overlay(overlay);
+    }
     let runtime = match builder.build().await {
         Ok(runtime) => runtime,
         Err(err) => return ApiError(err).into_response(),

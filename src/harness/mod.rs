@@ -41,6 +41,7 @@ pub mod cost;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
+pub mod memory_loop;
 pub mod policy;
 pub mod provider;
 pub mod skills;
@@ -215,10 +216,19 @@ impl HarnessPool {
                 })?
         };
 
+        // Retrieve→inject: pull the top-K prior task outcomes relevant to this
+        // message and prepend them as context. On a cold store this yields no
+        // hits and the message is passed through unchanged.
+        let hits = deps
+            .context
+            .search(company, message, memory_loop::RETRIEVE_TOP_K)
+            .await?;
+        let augmented = memory_loop::inject(message, &hits);
+
         // Run the turn and record its real cost. `CompanyAgent::run` reads the
         // turn's token/cost totals from openhuman's public `last_turn_usage()`
         // accessor; a zero-usage turn (offline provider) writes nothing.
-        let (reply, turn_cost) = agent.run(message).await?;
+        let (reply, turn_cost) = agent.run(&augmented).await?;
         record_turn_cost(
             &turn_cost,
             agent_id,
@@ -228,6 +238,15 @@ impl HarnessPool {
             deps.meter.as_deref(),
         )
         .await?;
+
+        // Store: persist the outcome (original task + reply) so it compounds
+        // into later turns. Without this the harness never writes memory back.
+        deps.context
+            .put(
+                company,
+                memory_loop::outcome_chunk(agent_id, message, &reply),
+            )
+            .await?;
 
         Ok(reply)
     }
@@ -619,6 +638,52 @@ rl.on('line', (line) => {
             reply.contains("hello-marker"),
             "reply should echo the prompt through the agent: {reply:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_stores_outcomes_and_injects_them_into_later_turns() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        // Cold store: nothing to inject on the first turn.
+        let first = pool
+            .run(&rec.id, "ceo", "alpha task", &fx.deps)
+            .await
+            .expect("first turn");
+        assert!(
+            !first.contains("Relevant prior work"),
+            "a cold turn injects nothing: {first:?}"
+        );
+
+        // The outcome was written back under the task-outcome prefix.
+        let stored = fx
+            .deps
+            .context
+            .list(&rec.id, memory_loop::OUTCOME_LABEL_PREFIX)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "the first turn stores its outcome");
+
+        // Second turn: the prior outcome (its body contains "alpha") is
+        // retrieved and injected, so the agent sees the preamble.
+        let second = pool
+            .run(&rec.id, "ceo", "alpha", &fx.deps)
+            .await
+            .expect("second turn");
+        assert!(
+            second.contains("Relevant prior work"),
+            "the second turn injects the retrieved outcome: {second:?}"
+        );
+
+        let stored = fx
+            .deps
+            .context
+            .list(&rec.id, memory_loop::OUTCOME_LABEL_PREFIX)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 2, "the second turn stores its outcome too");
     }
 
     #[tokio::test]

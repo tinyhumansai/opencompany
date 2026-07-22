@@ -299,7 +299,7 @@ export function AppShell({
           {view === "tasks" && <TasksView client={client} company={company} />}
           {view === "team" && <TeamView client={client} company={company} />}
           {view === "people" && <PeopleView client={client} company={company} />}
-          {view === "skills" && <SkillsView company={company} />}
+          {view === "skills" && <SkillsView client={client} company={company} />}
           {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (
             <Suspense
