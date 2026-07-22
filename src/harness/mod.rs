@@ -41,6 +41,7 @@ pub mod cost;
 pub mod mcp;
 pub mod memory;
 pub mod memory_loop;
+pub mod orchestrator;
 pub mod policy;
 pub mod provider;
 pub mod skills;
@@ -61,10 +62,11 @@ use crate::company::Policy;
 use crate::company::mcp::McpServerDecl;
 use crate::error::OpenCompanyError;
 use crate::harness::cost::{TurnUsage, record_turn_cost};
+use crate::harness::orchestrator::DelegationQueue;
 use crate::harness::policy::ApprovalPolicy;
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::types::{CompanyId, CompanyRecord};
-use crate::ports::{CompanyStore, ContextStore, TaskStore, UsageMeter};
+use crate::ports::{CompanyStore, ContextStore, EventLog, FactStore, TaskStore, UsageMeter};
 
 /// Shared dependencies every harness-built agent draws on.
 #[derive(Clone)]
@@ -114,6 +116,21 @@ pub struct HarnessDeps {
     /// builder resolves these ahead of time; each agent then filters the set by
     /// its `mcp:*` tool grants. Empty leaves the agent with no MCP bridge tools.
     pub mcp_servers: Vec<McpServerDecl>,
+    /// The company's durable [`FactStore`], surfaced to the orchestrator agent
+    /// through the `query_company` read tool (issue #53). `None` leaves the
+    /// orchestrator without the facts half of its insight surface (the chat path
+    /// off the orchestrator seam wires nothing).
+    pub facts: Option<Arc<dyn FactStore>>,
+    /// The company's [`EventLog`], surfaced to the orchestrator agent through
+    /// the `query_company` read tool for recent-activity context (issue #53).
+    /// `None` leaves the orchestrator without the recent-events half.
+    pub events: Option<Arc<dyn EventLog>>,
+    /// The shared delegation queue the orchestrator's `spawn_task` /
+    /// `delegate_to_desk` tools push onto and the [`HarnessBrain`] drains after
+    /// an orchestrator turn (issue #53). A [`DelegationQueue`] is a cheap shared
+    /// handle; cloning `HarnessDeps` shares one queue between the tools built
+    /// into the agent and the brain that drains it. Default is an empty queue.
+    pub delegations: DelegationQueue,
 }
 
 /// One live openhuman agent, keyed by its manifest id.
@@ -277,12 +294,16 @@ pub(crate) fn build_roster(
 ) -> crate::Result<Vec<Arc<CompanyAgent>>> {
     let policy: &Policy = &company.manifest.policy;
     let company_name = &company.manifest.company.name;
+    // The orchestrator agent (tier `orchestrator`, else the first agent) receives
+    // the delegating-orchestrator persona + tools (issue #53).
+    let orchestrator = orchestrator::orchestrator_id(&company.manifest.agents);
     company
         .manifest
         .agents
         .iter()
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+            let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
             let agent = build::build_agent(
                 &company.id,
                 company_name,
@@ -290,6 +311,7 @@ pub(crate) fn build_roster(
                 agent_policy,
                 deps,
                 skill_deltas,
+                is_orchestrator,
             )?;
             Ok(Arc::new(CompanyAgent {
                 agent_id: manifest_agent.id.clone(),
@@ -474,6 +496,9 @@ description = "Builds the product."
                 skills: None,
                 skills_source_dir: None,
                 mcp_servers: Vec::new(),
+                facts: None,
+                events: None,
+                delegations: DelegationQueue::default(),
             },
             store,
             meter,
@@ -518,6 +543,9 @@ description = "Builds the product."
             skills: None,
             skills_source_dir: Some(source.path().to_path_buf()),
             mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: DelegationQueue::default(),
         };
 
         let roster = build_roster(&record(), &deps, &[]).expect("roster builds with skills");

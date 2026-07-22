@@ -1835,6 +1835,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "hi".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -1885,6 +1886,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -1894,7 +1896,8 @@ mod test {
             received.event,
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
-                by: None
+                by: None,
+                chat: None
             }
         );
     }
@@ -1979,6 +1982,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "persist".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -1993,6 +1997,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "persist".into(),
                 by: None,
+                chat: None,
             }
         );
     }

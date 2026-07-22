@@ -7,10 +7,13 @@
 //! [`HarnessPool`], so the reply comes from the hosted brain and the turn's
 //! token/cost usage is metered into the company ledger.
 //!
-//! v1 is **single-responder**: one agent (the first on the roster, or the id
-//! given to [`HarnessBrain::with_responder`]) answers every operator message.
-//! Desk routing — resolving which roster member owns a given group chat — is the
-//! WS3 chat handler's job and lands separately.
+//! The default chat responder is the company **orchestrator** (issue #53): the
+//! roster agent tagged `tier = "orchestrator"`, or the first agent when none is
+//! (so a company without an orchestrator behaves exactly as before). An operator
+//! message addressed to a desk (its `chat` field) is answered by that desk's
+//! lead member; an unaddressed message goes to the orchestrator, which may
+//! delegate — the queue its tools fill is drained here after its turn (v1:
+//! synchronous, in-cycle, capped, no sub-agent re-delegation).
 //!
 //! Compiled only under `feature = "openhuman"`.
 
@@ -19,13 +22,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::Result;
+use crate::harness::orchestrator::{self, Delegation};
 use crate::harness::{HarnessDeps, HarnessPool};
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
     TokenUsage,
 };
-use crate::ports::{TaskRecord, now_millis};
+use crate::ports::{TaskRecord, generate_id, now_millis};
 
 /// A [`Brain`] that answers with a live openhuman agent turn.
 pub struct HarnessBrain {
@@ -36,16 +40,12 @@ pub struct HarnessBrain {
 }
 
 impl HarnessBrain {
-    /// Builds a harness brain for `record`, answering with the first roster
-    /// agent. The pool is shared so the roster is built once and reused across
-    /// cycles.
+    /// Builds a harness brain for `record`, answering unaddressed operator
+    /// messages with the company orchestrator (the `tier = "orchestrator"` agent,
+    /// else the first roster agent). The pool is shared so the roster is built
+    /// once and reused across cycles.
     pub fn new(pool: Arc<HarnessPool>, deps: HarnessDeps, record: CompanyRecord) -> Self {
-        let responder = record
-            .manifest
-            .agents
-            .first()
-            .map(|a| a.id.clone())
-            .unwrap_or_default();
+        let responder = orchestrator::orchestrator_id(&record.manifest.agents).unwrap_or_default();
         Self {
             pool,
             deps,
@@ -112,6 +112,81 @@ impl HarnessBrain {
             self.responder.clone()
         }
     }
+
+    /// Resolves which agent answers an operator message. A message addressed to a
+    /// desk (its `chat` field naming a group chat with a lead member) is answered
+    /// by that desk's lead; everything else — including the "General" desk and
+    /// unaddressed messages — goes to the orchestrator (the default responder).
+    fn responder_for(&self, chat: Option<&str>) -> String {
+        match chat.and_then(|desk| self.desk_lead(desk)) {
+            Some(member) => member,
+            None => self.responder.clone(),
+        }
+    }
+
+    /// The lead member of a desk: the first member of the matching group chat
+    /// (by id, or by case-insensitive name) that is a real roster agent. `None`
+    /// when no desk matches or none of its members are on the roster.
+    fn desk_lead(&self, desk: &str) -> Option<String> {
+        let chat = self
+            .record
+            .manifest
+            .group_chats
+            .iter()
+            .find(|c| c.id == desk || c.name.eq_ignore_ascii_case(desk))?;
+        chat.members
+            .iter()
+            .find(|m| self.record.manifest.agents.iter().any(|a| &a.id == *m))
+            .cloned()
+    }
+
+    /// Executes one drained delegation from the orchestrator's turn.
+    ///
+    /// `spawn_task` opens a backlog card through the same
+    /// [`TaskStore::upsert`](crate::ports::TaskStore) path the console uses and
+    /// surfaces nothing extra (a missing task store is a silent no-op).
+    /// `delegate_to_desk` runs a single turn on the desk's lead member and
+    /// returns its reply as its own chat bubble — `channel = <member id>`, the
+    /// distinct-bubble path the console already renders. An unknown desk (no
+    /// roster-backed lead) is a silent no-op. No sub-agent re-delegation in v1:
+    /// desk members carry no delegation tools, so their turns queue nothing.
+    async fn run_delegation(&self, delegation: Delegation) -> Result<Option<OutboundMessage>> {
+        match delegation {
+            Delegation::SpawnTask {
+                title,
+                note,
+                assignee,
+            } => {
+                let Some(tasks) = self.deps.tasks.as_ref() else {
+                    return Ok(None);
+                };
+                let card = TaskRecord {
+                    id: generate_id(),
+                    title,
+                    note,
+                    column: "backlog".to_string(),
+                    priority: "medium".to_string(),
+                    assignee: assignee.unwrap_or_default(),
+                    updated_at_millis: now_millis(),
+                };
+                tasks.upsert(&self.record.id, &card).await?;
+                Ok(None)
+            }
+            Delegation::DelegateToDesk { desk, instruction } => {
+                let Some(member) = self.desk_lead(&desk) else {
+                    return Ok(None);
+                };
+                let reply = self
+                    .pool
+                    .run(&self.record.id, &member, &instruction, &self.deps)
+                    .await?;
+                Ok(Some(OutboundMessage {
+                    channel: member,
+                    text: reply,
+                }))
+            }
+        }
+    }
 }
 
 /// The turn instruction for a dispatched card: its title, plus its note when it
@@ -143,18 +218,30 @@ impl Brain for HarnessBrain {
         let mut channel_responses = Vec::new();
         for event in &req.events {
             match event {
-                CompanyEvent::OperatorMessage { text, .. } => {
-                    // `run` executes the turn on the openhuman runtime and meters
-                    // its usage into the ledger/meter through `deps`. The reply is
-                    // the agent's own text.
+                CompanyEvent::OperatorMessage { text, chat, .. } => {
+                    // Route to the addressed desk's lead, else the orchestrator.
+                    let responder = self.responder_for(chat.as_deref());
+                    // Clear stale delegations so nothing leaks from a prior turn,
+                    // run the turn (metered through `deps`), then drain whatever
+                    // the orchestrator queued (capped; discarded past the cap).
+                    self.deps.delegations.clear();
                     let reply = self
                         .pool
-                        .run(&self.record.id, &self.responder, text, &self.deps)
+                        .run(&self.record.id, &responder, text, &self.deps)
                         .await?;
                     channel_responses.push(OutboundMessage {
                         channel: "operator".to_string(),
                         text: reply,
                     });
+                    for delegation in self
+                        .deps
+                        .delegations
+                        .drain(orchestrator::MAX_DELEGATIONS_PER_TURN)
+                    {
+                        if let Some(message) = self.run_delegation(delegation).await? {
+                            channel_responses.push(message);
+                        }
+                    }
                 }
                 CompanyEvent::TaskDispatched { task_id } => {
                     self.run_task(task_id).await?;
@@ -258,6 +345,9 @@ description = "Runs Acme."
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
         };
         HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
     }
@@ -283,6 +373,7 @@ description = "Runs Acme."
                 request(vec![CompanyEvent::OperatorMessage {
                     text: "status?".into(),
                     by: None,
+                    chat: None,
                 }]),
                 &NoopHost,
             )
@@ -375,6 +466,9 @@ description = "Builds it."
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
         };
         (
             HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_two()),
@@ -504,5 +598,156 @@ description = "Builds it."
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // --- Orchestrator routing + delegation ----------------------------------
+
+    /// A roster with an `orchestrator`-tier agent (not first) and a desk.
+    fn record_with_desk() -> CompanyRecord {
+        let manifest = toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[policy]
+mode = "full"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+description = "Runs Acme."
+
+[[agent]]
+id = "chief"
+role = "Chief of Staff"
+tier = "orchestrator"
+description = "Coordinates the company."
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Builds it."
+
+[[group_chat]]
+id = "eng_desk"
+name = "Engineering"
+members = ["engineer"]
+"#,
+        )
+        .expect("valid manifest");
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest,
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        }
+    }
+
+    /// A brain over the desk-bearing record, wired to a real task store.
+    fn brain_with_desk(dir: &std::path::Path) -> (HarnessBrain, Arc<FsOps>) {
+        let tasks = Arc::new(FsOps::new(dir));
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: Some(Arc::new(FsOps::new(dir))),
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: Some(tasks.clone()),
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
+        };
+        (
+            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_with_desk()),
+            tasks,
+        )
+    }
+
+    /// The default responder is the `orchestrator`-tier agent, even when it is
+    /// not first on the roster.
+    #[test]
+    fn default_responder_is_the_orchestrator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks) = brain_with_desk(dir.path());
+        assert_eq!(brain.responder, "chief");
+    }
+
+    /// An addressed desk routes to its lead member (by id or name); anything else
+    /// — the "General" desk, an unknown id, or no address — falls to the
+    /// orchestrator.
+    #[test]
+    fn responder_for_routes_desk_to_lead_else_orchestrator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks) = brain_with_desk(dir.path());
+        assert_eq!(brain.responder_for(Some("eng_desk")), "engineer");
+        assert_eq!(brain.responder_for(Some("Engineering")), "engineer");
+        assert_eq!(brain.responder_for(Some("General")), "chief");
+        assert_eq!(brain.responder_for(Some("nope")), "chief");
+        assert_eq!(brain.responder_for(None), "chief");
+    }
+
+    /// A `spawn_task` delegation opens a backlog card and surfaces no bubble.
+    #[tokio::test]
+    async fn spawn_task_delegation_opens_a_backlog_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_desk(dir.path());
+        let out = brain
+            .run_delegation(Delegation::SpawnTask {
+                title: "Draft the plan".to_string(),
+                note: Some("by friday".to_string()),
+                assignee: Some("engineer".to_string()),
+            })
+            .await
+            .expect("delegation runs");
+        assert!(out.is_none(), "spawn_task surfaces no chat bubble");
+
+        let cards = tasks.list(&CompanyId::new("acme")).await.unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].title, "Draft the plan");
+        assert_eq!(cards[0].column, "backlog");
+        assert_eq!(cards[0].assignee, "engineer");
+    }
+
+    /// A `delegate_to_desk` delegation runs the desk lead and surfaces its reply
+    /// as its own bubble (`channel = <member id>`); an unknown desk is a no-op.
+    #[tokio::test]
+    async fn delegate_to_desk_delegation_answers_as_the_desk_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks) = brain_with_desk(dir.path());
+        // The pool must have the roster before a member turn can run.
+        brain
+            .pool
+            .ensure(&brain.record, &brain.deps)
+            .await
+            .expect("roster");
+
+        let out = brain
+            .run_delegation(Delegation::DelegateToDesk {
+                desk: "eng_desk".to_string(),
+                instruction: "ship-marker".to_string(),
+            })
+            .await
+            .expect("delegation runs")
+            .expect("desk lead replies");
+        // The reply is its own bubble attributed to the desk lead, and the mock
+        // provider echoes the instruction, proving the member's turn ran.
+        assert_eq!(out.channel, "engineer");
+        assert!(out.text.contains("ship-marker"), "{:?}", out.text);
+
+        // An unknown desk delegates to nobody.
+        let none = brain
+            .run_delegation(Delegation::DelegateToDesk {
+                desk: "ghost".to_string(),
+                instruction: "hello".to_string(),
+            })
+            .await
+            .expect("delegation runs");
+        assert!(none.is_none(), "an unknown desk is a silent no-op");
     }
 }

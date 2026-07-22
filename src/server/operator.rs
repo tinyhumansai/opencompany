@@ -29,6 +29,7 @@ use crate::ports::types::{
 };
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::error::ApiError;
+use crate::server::ops::{ScopedCompany, scoped};
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 use crate::server::provision::{emit_cycle_webhooks, emit_feedback_webhook};
 
@@ -50,6 +51,53 @@ pub fn router() -> Router<AppState> {
             "/api/v1/company/approvals/{aid}",
             post(resolve_approval_single),
         )
+        // The company's desks (group chats), under both scope forms — the
+        // console builds its chat threads from these (issue #53).
+        .merge(scoped("/desks", get(list_desks)))
+}
+
+/// One desk (group chat) as the console renders it. Mirrors `DeskDto` in
+/// `frontend/src/api/types.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeskDto {
+    /// The desk id (the group-chat id; used as the chat thread id).
+    id: String,
+    /// The desk's display name.
+    name: String,
+    /// An optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    /// The teammate ids on this desk; the first is its lead.
+    members: Vec<String>,
+}
+
+/// `GET {scope}/desks` — the company's desks, built from its manifest group
+/// chats. Empty when the company defines none (the console then falls back to
+/// its static default threads).
+async fn list_desks(scope: ScopedCompany) -> Result<Json<Vec<DeskDto>>, Response> {
+    let record = scope
+        .runtime
+        .store()
+        .load(scope.id())
+        .await
+        .map_err(|e| ApiError(e).into_response())?;
+    let desks = record
+        .map(|record| {
+            record
+                .manifest
+                .group_chats
+                .iter()
+                .map(|chat| DeskDto {
+                    id: chat.id.clone(),
+                    name: chat.name.clone(),
+                    description: chat.description.clone(),
+                    members: chat.members.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(desks))
 }
 
 fn lookup(state: &AppState, id: &str) -> Result<Arc<CompanyRuntime>, ApiError> {
@@ -158,6 +206,9 @@ async fn run_chat(
         .run_cycle(vec![CompanyEvent::OperatorMessage {
             text: message.text,
             by,
+            // Thread the addressed desk through so the orchestrator brain can
+            // route to that desk's lead member (issue #53).
+            chat: message.chat,
         }])
         .await?;
     Ok((report, feedback_note))
@@ -510,6 +561,9 @@ mod test {
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: crate::harness::orchestrator::DelegationQueue::default(),
         };
         let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record);
 
@@ -552,6 +606,31 @@ mod test {
         );
         assert_ne!(text, "You said: hi", "still routing through the echo brain");
         assert_eq!(value["responses"][0]["channel"], "operator");
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn desks_route_returns_the_company_desks() {
+        // The default test manifest defines no group chats, so the route answers
+        // 200 with an empty list (the console then falls back to its defaults).
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/desks")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 0);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 

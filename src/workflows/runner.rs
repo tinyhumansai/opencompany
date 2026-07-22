@@ -143,6 +143,9 @@ description = "Runs Acme."
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: crate::harness::orchestrator::DelegationQueue::default(),
         }
     }
 

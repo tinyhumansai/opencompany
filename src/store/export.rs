@@ -543,6 +543,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "kick off".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .expect("cycle");
@@ -779,6 +780,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();

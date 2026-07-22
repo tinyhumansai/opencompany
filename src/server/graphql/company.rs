@@ -466,7 +466,7 @@ impl MessageGql {
                 at_millis,
                 mine: false,
             },
-            CompanyEvent::OperatorMessage { text, by } => {
+            CompanyEvent::OperatorMessage { text, by, .. } => {
                 let (author, mine) = match &by {
                     // Sent by a signed-in human.
                     Some(actor) if actor.kind == ActorKind::User => {
