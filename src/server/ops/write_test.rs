@@ -268,17 +268,30 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     let home = home();
     let state = state_with_company(&home).await;
 
-    // Install from registry.
+    // Install from registry, carrying the entry's metadata so the host persists
+    // a real SKILL.md the agent can act on (not a content-less slug).
     let (status, skill) = send(
         &state,
         "POST",
         "/api/v1/company/skills/web-research/install",
-        None,
+        Some(json!({
+            "name": "Web Research",
+            "description": "Answer a question from multiple sources with citations.",
+            "category": "Research"
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(skill["source"], "registry");
     assert!(skill["enabled"].as_bool().unwrap());
+    // The install response reflects the persisted custom_doc (parsed back), so a
+    // non-empty description proves content was stored — the fix for the agent
+    // never receiving registry skills.
+    assert_eq!(skill["name"], "Web Research");
+    assert_eq!(
+        skill["description"],
+        "Answer a question from multiple sources with citations."
+    );
 
     // Uninstall the registry skill: 204.
     let (status, _) = send(

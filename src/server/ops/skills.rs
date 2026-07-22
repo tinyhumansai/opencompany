@@ -114,6 +114,20 @@ struct SetEnabled {
     enabled: bool,
 }
 
+/// The install body — the registry entry's metadata, so the installed skill
+/// carries a real `SKILL.md` the embedded agent can act on (a bare slug has no
+/// content, so it would never reach the agent's effective set).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallSkill {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+}
+
 /// The custom-skill body.
 #[derive(Debug, Deserialize)]
 struct CreateSkill {
@@ -205,12 +219,23 @@ fn company_bundles(source_dir: Option<&FsPath>) -> Vec<InstalledSkill> {
 async fn install(
     company: ScopedCompany,
     Path(SlugPath { slug }): Path<SlugPath>,
+    body: Option<Json<InstallSkill>>,
 ) -> Result<Json<InstalledSkill>, ApiError> {
+    let meta = body.map(|Json(b)| b).unwrap_or_default();
+    let name = meta
+        .name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| titleize(&slug));
+    let description = meta.description.unwrap_or_default();
+    // The registry ships metadata only. Persist a real `SKILL.md` built from it
+    // (the description doubles as the body) so `EffectiveSkills::materialize`
+    // surfaces the skill to the agent instead of skipping a content-less delta.
+    let doc = skill_md(&name, &description, meta.category.as_deref(), &description);
     let state = SkillState {
         slug,
         enabled: true,
         source: SkillSource::Registry,
-        custom_doc: None,
+        custom_doc: Some(doc),
     };
     company.runtime.skills().set(company.id(), &state).await?;
     Ok(Json(InstalledSkill::from_state(&state)))
@@ -278,7 +303,12 @@ async fn create_custom(
         )));
     }
     let slug = slugify(&body.name);
-    let doc = build_skill_md(&body);
+    let doc = skill_md(
+        &body.name,
+        &body.description,
+        body.category.as_deref(),
+        body.body.as_deref().unwrap_or(""),
+    );
     let state = SkillState {
         slug,
         enabled: true,
@@ -289,18 +319,14 @@ async fn create_custom(
     Ok(Json(InstalledSkill::from_state(&state)))
 }
 
-/// Builds a `SKILL.md` document from the custom-skill fields.
-fn build_skill_md(body: &CreateSkill) -> String {
-    let category = body
-        .category
-        .as_deref()
+/// Builds a `SKILL.md` document from a name, description, optional category, and
+/// body. Shared by custom-skill authoring and registry install (which passes
+/// the description as the body).
+fn skill_md(name: &str, description: &str, category: Option<&str>, content: &str) -> String {
+    let category = category
         .map(|c| format!("category: {c}\n"))
         .unwrap_or_default();
-    let content = body.body.as_deref().unwrap_or("");
-    format!(
-        "---\nname: {}\ndescription: {}\n{category}---\n{content}\n",
-        body.name, body.description
-    )
+    format!("---\nname: {name}\ndescription: {description}\n{category}---\n{content}\n")
 }
 
 /// Turns a display name into a filesystem-and-URL-safe slug.
