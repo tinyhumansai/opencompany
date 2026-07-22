@@ -328,6 +328,10 @@ impl OwnershipStore for crate::store::MongoStore {
 mod test {
     use super::*;
 
+    /// Serializes the tests that mutate process-global env vars, so they never
+    /// race each other (or `from_env`) under the parallel test harness.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parses_storage_kinds() {
         assert_eq!("fs".parse::<StorageKind>().unwrap(), StorageKind::Fs);
@@ -383,7 +387,11 @@ mod test {
 
     #[test]
     fn from_env_reads_memory_backend() {
-        // SAFETY: single-threaded test; restores prior state.
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by ENV_LOCK against other env-mutating tests;
+        // restores prior state.
         let prev = std::env::var("OPENCOMPANY_MEMORY").ok();
 
         unsafe { std::env::set_var("OPENCOMPANY_MEMORY", "tinycortex") };
@@ -458,7 +466,11 @@ mod test {
 
     #[test]
     fn from_env_reads_tenant_id() {
-        // SAFETY: single-threaded test; restores prior state.
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by ENV_LOCK against other env-mutating tests;
+        // restores prior state.
         let prev = std::env::var("OPENCOMPANY_TENANT_ID").ok();
 
         unsafe { std::env::set_var("OPENCOMPANY_TENANT_ID", "acme") };
