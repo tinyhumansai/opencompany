@@ -9,6 +9,7 @@
 mod content_test;
 pub mod dns;
 mod manifest;
+pub mod mcp;
 pub mod runtime;
 mod skill_file;
 mod types;
