@@ -1,7 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
-import { Check, Download, Plus, Search, Sparkles, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Check, Download, Loader2, Plus, Search, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  createSkill,
+  installSkill,
+  listSkills,
+  setSkillEnabled,
+  uninstallSkill,
+  type Skill,
+} from "@/api/skills";
+import type { OpenCompanyClient } from "@/api/client";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -22,51 +32,106 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
   CATEGORY_STYLES,
-  fromRegistry,
-  type InstalledSkill,
-  loadSkills,
-  newSkill,
   type RegistrySkill,
-  saveSkills,
   SKILL_REGISTRY,
   type SkillCategory,
 } from "@/lib/skills";
 
 interface Props {
+  client: OpenCompanyClient;
   company: string | null;
 }
 
 const CATEGORIES: SkillCategory[] = ["Marketing", "Research", "Ops", "Content", "Finance"];
 
-/** The company's skills: view, enable/disable, install from a registry, or add. */
-export function SkillsView({ company }: Props) {
-  const [skills, setSkills] = useState<InstalledSkill[]>(() => loadSkills(company));
+/** Category badge styling, tolerating the host's free-form category strings. */
+function categoryStyle(category: string): string {
+  return (
+    CATEGORY_STYLES[category as SkillCategory] ??
+    "border-muted-foreground/30 bg-muted text-muted-foreground"
+  );
+}
+
+/**
+ * The company's skills: the real effective set read from the host (`…/skills`),
+ * which the operator can enable/disable, install from a registry, uninstall, or
+ * extend with a custom skill. Every mutation writes through the API and updates
+ * optimistically, reverting on error.
+ */
+export function SkillsView({ client, company }: Props) {
+  const [skills, setSkills] = useState<Skill[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const mounted = useRef(true);
+
+  const refresh = useCallback(async () => {
+    try {
+      const rows = await listSkills(client, company);
+      if (!mounted.current) return;
+      setSkills(rows);
+      setError(null);
+    } catch (e) {
+      if (!mounted.current) return;
+      setError(e instanceof Error ? e.message : "could not load skills");
+    } finally {
+      if (mounted.current) setLoading(false);
+    }
+  }, [client, company]);
 
   useEffect(() => {
-    saveSkills(company, skills);
-  }, [company, skills]);
+    mounted.current = true;
+    setLoading(true);
+    void refresh();
+    return () => {
+      mounted.current = false;
+    };
+  }, [refresh]);
 
   const installedIds = useMemo(() => new Set(skills.map((s) => s.id)), [skills]);
   const enabledCount = skills.filter((s) => s.enabled).length;
 
-  function toggle(id: string) {
-    setSkills((all) => all.map((s) => (s.id === id ? { ...s, enabled: !s.enabled } : s)));
+  async function toggle(skill: Skill) {
+    const previous = skills;
+    const next = !skill.enabled;
+    setSkills((all) => all.map((s) => (s.id === skill.id ? { ...s, enabled: next } : s)));
+    try {
+      const saved = await setSkillEnabled(client, company, skill.id, next);
+      setSkills((all) => all.map((s) => (s.id === saved.id ? saved : s)));
+    } catch (e) {
+      setSkills(previous);
+      toast.error(e instanceof Error ? e.message : "could not update the skill");
+    }
   }
-  function uninstall(id: string) {
-    setSkills((all) => all.filter((s) => s.id !== id));
+
+  async function uninstall(skill: Skill) {
+    const previous = skills;
+    setSkills((all) => all.filter((s) => s.id !== skill.id));
+    try {
+      await uninstallSkill(client, company, skill.id);
+    } catch (e) {
+      setSkills(previous);
+      toast.error(e instanceof Error ? e.message : "could not uninstall the skill");
+    }
   }
-  function install(skill: RegistrySkill) {
+
+  async function install(skill: RegistrySkill) {
     if (installedIds.has(skill.id)) return;
-    setSkills((all) => [...all, fromRegistry(skill)]);
-    toast.success(`Installed ${skill.name}.`);
+    try {
+      const saved = await installSkill(client, company, skill.id);
+      setSkills((all) => [...all.filter((s) => s.id !== saved.id), saved]);
+      toast.success(`Installed ${skill.name}.`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "could not install the skill");
+    }
   }
 
   const registry = useMemo(() => {
@@ -91,6 +156,12 @@ export function SkillsView({ company }: Props) {
           </Button>
         </div>
 
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
         <Tabs defaultValue="installed">
           <TabsList>
             <TabsTrigger value="installed">Installed ({skills.length})</TabsTrigger>
@@ -98,7 +169,12 @@ export function SkillsView({ company }: Props) {
           </TabsList>
 
           <TabsContent value="installed" className="mt-4">
-            {skills.length === 0 ? (
+            {loading ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Skeleton className="h-32 rounded-xl" />
+                <Skeleton className="h-32 rounded-xl" />
+              </div>
+            ) : skills.length === 0 ? (
               <Empty label="No skills installed yet." />
             ) : (
               <>
@@ -108,8 +184,8 @@ export function SkillsView({ company }: Props) {
                     <InstalledCard
                       key={s.id}
                       skill={s}
-                      onToggle={() => toggle(s.id)}
-                      onUninstall={() => uninstall(s.id)}
+                      onToggle={() => void toggle(s)}
+                      onUninstall={() => void uninstall(s)}
                     />
                   ))}
                 </div>
@@ -128,7 +204,7 @@ export function SkillsView({ company }: Props) {
                   key={s.id}
                   skill={s}
                   installed={installedIds.has(s.id)}
-                  onInstall={() => install(s)}
+                  onInstall={() => void install(s)}
                 />
               ))}
             </div>
@@ -139,9 +215,15 @@ export function SkillsView({ company }: Props) {
       <AddSkillDialog
         open={addOpen}
         onOpenChange={setAddOpen}
-        onAdd={(fields) => {
-          setSkills((all) => [newSkill(fields), ...all]);
+        onAdd={async (fields) => {
+          const saved = await createSkill(client, company, {
+            name: fields.name.trim(),
+            description: fields.description.trim(),
+            category: fields.category,
+          });
+          setSkills((all) => [saved, ...all.filter((s) => s.id !== saved.id)]);
           setAddOpen(false);
+          toast.success(`Added ${saved.name}.`);
         }}
       />
     </div>
@@ -153,7 +235,7 @@ function InstalledCard({
   onToggle,
   onUninstall,
 }: {
-  skill: InstalledSkill;
+  skill: Skill;
   onToggle: () => void;
   onUninstall: () => void;
 }) {
@@ -170,7 +252,7 @@ function InstalledCard({
         <p className="text-sm text-muted-foreground">{skill.description}</p>
         <div className="flex items-center justify-between pt-1">
           <div className="flex items-center gap-2">
-            <Badge variant="outline" className={cn("capitalize", CATEGORY_STYLES[skill.category])}>
+            <Badge variant="outline" className={cn("capitalize", categoryStyle(skill.category))}>
               {skill.category}
             </Badge>
             <span className="text-xs text-muted-foreground capitalize">{skill.source}</span>
@@ -211,7 +293,7 @@ function RegistryCard({
         <p className="text-sm text-muted-foreground">{skill.description}</p>
         <div className="flex items-center justify-between pt-1">
           <div className="flex items-center gap-2">
-            <Badge variant="outline" className={cn("capitalize", CATEGORY_STYLES[skill.category])}>
+            <Badge variant="outline" className={cn("capitalize", categoryStyle(skill.category))}>
               {skill.category}
             </Badge>
             <span className="text-xs text-muted-foreground">{skill.publisher}</span>
@@ -247,16 +329,29 @@ function AddSkillDialog({
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
-  onAdd: (fields: { name: string; description: string; category: SkillCategory }) => void;
+  onAdd: (fields: { name: string; description: string; category: SkillCategory }) => Promise<void>;
 }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<SkillCategory>("Marketing");
+  const [busy, setBusy] = useState(false);
 
   function reset() {
     setName("");
     setDescription("");
     setCategory("Marketing");
+  }
+
+  async function submit() {
+    if (!name.trim()) return;
+    setBusy(true);
+    try {
+      await onAdd({ name, description, category });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "could not add the skill");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -300,10 +395,11 @@ function AddSkillDialog({
           <Textarea id="skill-desc" rows={3} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="One line on when to use it and what it delivers." />
         </div>
         <DialogFooter>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
-          <Button disabled={!name.trim()} onClick={() => onAdd({ name, description, category })}>
+          <Button disabled={!name.trim() || busy} onClick={() => void submit()}>
+            {busy && <Loader2 className="mr-1.5 size-4 animate-spin" />}
             Add skill
           </Button>
         </DialogFooter>
