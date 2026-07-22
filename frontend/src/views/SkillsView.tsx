@@ -126,7 +126,11 @@ export function SkillsView({ client, company }: Props) {
   async function install(skill: RegistrySkill) {
     if (installedIds.has(skill.id)) return;
     try {
-      const saved = await installSkill(client, company, skill.id);
+      const saved = await installSkill(client, company, skill.id, {
+        name: skill.name,
+        description: skill.description,
+        category: skill.category,
+      });
       setSkills((all) => [...all.filter((s) => s.id !== saved.id), saved]);
       toast.success(`Installed ${skill.name}.`);
     } catch (e) {

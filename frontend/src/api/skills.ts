@@ -31,14 +31,24 @@ export function listSkills(client: OpenCompanyClient, company: string | null): P
   return client.get<Skill[]>(`${client.scopeFor(company)}/skills`);
 }
 
-/** Install a skill from the shared registry by slug. */
+/** The registry entry's metadata, sent on install so the host can persist a
+ * real `SKILL.md` the agent can act on (not just a content-less slug). */
+export interface InstallSkillMeta {
+  name: string;
+  description: string;
+  category?: string;
+}
+
+/** Install a skill from the shared registry by slug, carrying its metadata. */
 export function installSkill(
   client: OpenCompanyClient,
   company: string | null,
   slug: string,
+  meta: InstallSkillMeta,
 ): Promise<Skill> {
   return client.post<Skill>(
     `${client.scopeFor(company)}/skills/${encodeURIComponent(slug)}/install`,
+    meta,
   );
 }
 
