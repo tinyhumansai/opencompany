@@ -148,6 +148,12 @@ async fn get_workflow(
     company: ScopedCompany,
     Path(WorkflowPath { wid }): Path<WorkflowPath>,
 ) -> Result<Json<WorkflowGraph>, ApiError> {
+    // `wid` becomes a filename — reject anything that could escape `workflows/`.
+    if !safe_wid(&wid) {
+        return Err(ApiError(OpenCompanyError::CompanyNotFound(format!(
+            "workflow {wid}"
+        ))));
+    }
     let source_dir = company
         .runtime
         .source_dir()
@@ -189,7 +195,24 @@ fn load_source_workflows(source_dir: Option<&FsPath>) -> Result<Vec<WorkflowFile
         .collect();
     // Stable, deterministic order for the picker.
     ids.sort();
-    load_company_workflows(source_dir, &ids).map_err(ApiError)
+    // Load each id on its own so one malformed `workflows/*.toml` skips only
+    // itself instead of 500-ing the whole picker.
+    let mut files = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match load_company_workflows(source_dir, std::slice::from_ref(id)) {
+            Ok(loaded) => files.extend(loaded),
+            Err(err) => tracing::warn!(workflow = %id, error = %err, "skipping malformed workflow"),
+        }
+    }
+    Ok(files)
+}
+
+/// Whether `wid` is a single safe on-disk filename stem — no path separators,
+/// no `..`, not empty — so it can't escape the `workflows/` directory.
+fn safe_wid(wid: &str) -> bool {
+    use std::path::Component;
+    let mut comps = FsPath::new(wid).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
 }
 
 /// The sub-resource path (`wid`); the scope `id` is consumed by the extractor.
@@ -226,6 +249,13 @@ async fn run_workflow(
     let Some(runner) = company.runtime.workflow_runner() else {
         return Err(super::not_wired("workflow execution"));
     };
+
+    // `wid` becomes a filename — reject anything that could escape `workflows/`.
+    if !safe_wid(&wid) {
+        return Err(
+            ApiError(OpenCompanyError::CompanyNotFound(format!("workflow {wid}"))).into_response(),
+        );
+    }
 
     // Load the saved graph from the company's on-disk source directory. Without
     // one (platform-provisioned mode) there is nothing to run.
@@ -368,5 +398,32 @@ mod tests {
         assert!(done.get("agent").is_none());
         assert!(done.get("summary").is_none());
         assert_eq!(done["kind"], "output");
+    }
+
+    #[test]
+    fn safe_wid_rejects_traversal() {
+        assert!(safe_wid("demo"));
+        assert!(safe_wid("my-workflow_2"));
+        assert!(!safe_wid(""));
+        assert!(!safe_wid(".."));
+        assert!(!safe_wid("."));
+        assert!(!safe_wid("../secrets"));
+        assert!(!safe_wid("a/b"));
+        assert!(!safe_wid("/etc/passwd"));
+        assert!(!safe_wid("foo/../bar"));
+    }
+
+    #[test]
+    fn one_malformed_workflow_does_not_break_the_list() {
+        let dir = seed_demo();
+        // A second, broken workflow file must not 500 the whole picker.
+        std::fs::write(
+            dir.path().join("workflows").join("broken.toml"),
+            "id = \"broken\"\nname = \n[[node]] oops",
+        )
+        .unwrap();
+        let files = load_source_workflows(Some(dir.path())).expect("lists despite a bad file");
+        let ids: Vec<_> = files.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["demo"]);
     }
 }
