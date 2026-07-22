@@ -105,6 +105,10 @@ pub fn effective_grants(manifest: &CompanyManifest) -> Vec<String> {
 /// `allow`-list, or the full allow-list when the agent lists none. This is the
 /// per-agent slice of [`effective_grants`], used by the harness to decide which
 /// tool families an individual agent receives.
+///
+/// Gated to the `openhuman` feature: its only caller is `build_roster`, which is
+/// itself feature-gated, so the default build would otherwise flag it dead.
+#[cfg(feature = "openhuman")]
 pub(crate) fn agent_effective_grants(allow: &[String], agent_tools: &[String]) -> Vec<String> {
     let grants: Vec<String> = if agent_tools.is_empty() {
         allow.to_vec()
