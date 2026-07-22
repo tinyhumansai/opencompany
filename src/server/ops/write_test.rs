@@ -268,17 +268,30 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     let home = home();
     let state = state_with_company(&home).await;
 
-    // Install from registry.
+    // Install from registry, carrying the entry's metadata so the host persists
+    // a real SKILL.md the agent can act on (not a content-less slug).
     let (status, skill) = send(
         &state,
         "POST",
         "/api/v1/company/skills/web-research/install",
-        None,
+        Some(json!({
+            "name": "Web Research",
+            "description": "Answer a question from multiple sources with citations.",
+            "category": "Research"
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(skill["source"], "registry");
     assert!(skill["enabled"].as_bool().unwrap());
+    // The install response reflects the persisted custom_doc (parsed back), so a
+    // non-empty description proves content was stored — the fix for the agent
+    // never receiving registry skills.
+    assert_eq!(skill["name"], "Web Research");
+    assert_eq!(
+        skill["description"],
+        "Answer a question from multiple sources with citations."
+    );
 
     // Uninstall the registry skill: 204.
     let (status, _) = send(
@@ -323,6 +336,19 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!toggled["enabled"].as_bool().unwrap());
+
+    // `GET …/skills` returns the effective set: here (no source dir) that's the
+    // deltas — the custom skill, now disabled.
+    let (status, list) = send(&state, "GET", "/api/v1/company/skills", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = list.as_array().expect("a JSON array of skills");
+    let my_skill = rows
+        .iter()
+        .find(|s| s["id"] == "my-skill")
+        .expect("the custom skill is listed");
+    assert_eq!(my_skill["source"], "custom");
+    assert_eq!(my_skill["name"], "My Skill");
+    assert!(!my_skill["enabled"].as_bool().unwrap());
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
