@@ -26,11 +26,12 @@ use oh::context::prompt::SystemPromptBuilder;
 use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
 use oh::memory::traits::Memory;
 use oh::security::SecurityPolicy;
-use oh::tools::Tool;
+use oh::tools::{McpCallTool, McpListToolsTool, Tool};
 
 use crate::company::Agent as ManifestAgent;
 use crate::error::OpenCompanyError;
 use crate::harness::HarnessDeps;
+use crate::harness::mcp::{OcMcpListServersTool, registry_for_agent};
 use crate::harness::memory::OcMemory;
 use crate::harness::policy::ApprovalPolicy;
 use crate::harness::skills::EffectiveSkills;
@@ -131,6 +132,22 @@ pub fn build_agent(
             tools.extend(effective.read_tools());
             persona.push_str(&effective.catalogue());
         }
+    }
+
+    // MCP bridge (issue #50): if this agent is granted any enabled MCP server
+    // (via its `mcp:*` tool grants), give it the three bridge tools over a
+    // registry scoped to just those servers. The registry reuses OpenHuman's
+    // HTTP transport + injection-safety filter. The credential-redacting
+    // `OcMcpListServersTool` replaces upstream's list-servers tool (which would
+    // serialize bearer tokens into agent-visible output). `mcp_call_tool` takes
+    // a permissive OpenHuman `SecurityPolicy` (Supervised — allows `Act`);
+    // OpenCompany's own `ApprovalPolicy` tool policy below stays the real
+    // per-call gate.
+    if let Some(registry) = registry_for_agent(&deps.mcp_servers, manifest_agent) {
+        let mcp_security = Arc::new(SecurityPolicy::default());
+        tools.push(Box::new(OcMcpListServersTool::new(registry.clone())));
+        tools.push(Box::new(McpListToolsTool::new(registry.clone())));
+        tools.push(Box::new(McpCallTool::new(registry, mcp_security)));
     }
 
     let prompt_builder = SystemPromptBuilder::for_subagent(
