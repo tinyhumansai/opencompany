@@ -29,13 +29,11 @@ use crate::feedback::types::ConsentMode;
 use crate::harness::provider::{HostedProvider, HostedProviderConfig};
 #[cfg(feature = "openhuman")]
 use crate::harness::{HarnessBrain, HarnessDeps};
-#[cfg(feature = "openhuman")]
-use crate::ports::WorkflowRunner;
-#[cfg(feature = "openhuman")]
-use crate::workflows::HarnessWorkflowRunner;
 use crate::openhuman::rpc::OpenHumanRpc;
 use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
+#[cfg(feature = "openhuman")]
+use crate::ports::WorkflowRunner;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
     AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
@@ -49,6 +47,8 @@ use crate::store::paths::Bundle;
 use crate::store::{
     FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsOps, FsSecretStore,
 };
+#[cfg(feature = "openhuman")]
+use crate::workflows::HarnessWorkflowRunner;
 
 /// Derives a filesystem-and-URL-safe company id from a display name.
 ///
