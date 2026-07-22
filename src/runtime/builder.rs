@@ -821,6 +821,17 @@ impl RuntimeBuilder {
         // skills/workflows content on the serve path.
         runtime.set_source_dir(self.seed_dir.clone());
 
+        // MCP uses OpenHuman's process-global live connection registry. Keep a
+        // runtime-owned config for this OpenCompany home so REST and agents see
+        // the same installed servers, and reconnect persisted installs without
+        // delaying company boot.
+        #[cfg(feature = "mcp")]
+        {
+            let mcp = Arc::new(crate::harness::mcp::McpRuntime::new(home.join("mcp")));
+            runtime.set_mcp(mcp.clone());
+            tokio::spawn(async move { mcp.boot().await });
+        }
+
         // WS4: attach the embedded harness pool when one was provided.
         #[cfg(feature = "openhuman")]
         if let Some(harness) = self.harness.clone() {

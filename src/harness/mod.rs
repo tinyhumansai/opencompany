@@ -38,6 +38,8 @@
 pub mod brain;
 pub mod build;
 pub mod cost;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memory;
 pub mod policy;
 pub mod provider;
