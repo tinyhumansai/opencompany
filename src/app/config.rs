@@ -207,6 +207,41 @@ pub struct ConfigFile {
     pub public_url: Option<String>,
     /// GitHub token used by GitHub-backed tools.
     pub github_token: Option<String>,
+    /// The `[workspace]` section: data-dir layout lifecycle knobs.
+    pub workspace: WorkspaceSection,
+}
+
+/// The `[workspace]` section of `config.toml`: lifecycle of the canonical
+/// data-dir layout (see [`DataLayout`](crate::store::DataLayout)).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceSection {
+    /// Empty the ephemeral `tmp/` scratch directory on startup. Default: true.
+    pub clear_tmp_on_startup: Option<bool>,
+}
+
+impl WorkspaceSection {
+    /// Resolves the section against its defaults.
+    pub fn resolve(&self) -> WorkspaceConfig {
+        WorkspaceConfig {
+            clear_tmp_on_startup: self.clear_tmp_on_startup.unwrap_or(true),
+        }
+    }
+}
+
+/// Resolved `[workspace]` configuration.
+#[derive(Clone, Debug)]
+pub struct WorkspaceConfig {
+    /// Whether the ephemeral `tmp/` scratch is cleared on startup.
+    pub clear_tmp_on_startup: bool,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            clear_tmp_on_startup: true,
+        }
+    }
 }
 
 impl ConfigFile {
@@ -257,6 +292,8 @@ pub struct RuntimeConfig {
     pub github_token: Option<SecretValue>,
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
     pub tinyhumans_credential: Option<SecretValue>,
+    /// Resolved `[workspace]` data-dir layout configuration.
+    pub workspace: WorkspaceConfig,
 }
 
 impl RuntimeConfig {
@@ -385,6 +422,10 @@ pub fn resolve(
     )
     .map(SecretValue);
 
+    let workspace = config_toml
+        .map(|c| c.workspace.resolve())
+        .unwrap_or_default();
+
     let config = RuntimeConfig {
         bind,
         data_dir: PathBuf::from(data_dir),
@@ -395,6 +436,7 @@ pub fn resolve(
         public_url,
         github_token,
         tinyhumans_credential,
+        workspace,
     };
     Ok((config, prov))
 }
@@ -452,6 +494,20 @@ fn default_data_dir_str(env: &dyn EnvSource) -> String {
             .to_string_lossy()
             .into_owned(),
         None => PathBuf::from(".opencompany").to_string_lossy().into_owned(),
+    }
+}
+
+/// The data directory read straight off the process environment
+/// (`OPENCOMPANY_DATA_DIR`, else `$HOME/.opencompany`) — the per-instance
+/// workspace root. For callers like `serve` and `doctor` that resolve the data
+/// root before (or without) the full [`resolve`] precedence pass.
+pub fn data_dir_from_env() -> PathBuf {
+    match std::env::var_os("OPENCOMPANY_DATA_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".opencompany"),
+            None => PathBuf::from(".opencompany"),
+        },
     }
 }
 
@@ -638,6 +694,32 @@ mod test {
         let file = ConfigFile::load(&dir).unwrap().unwrap();
         assert_eq!(file.brain_mode.as_deref(), Some("sidecar"));
         assert_eq!(file.api_url.as_deref(), Some("https://x"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_section_defaults_to_clearing_tmp() {
+        // Absent `[workspace]` → default (clear on startup).
+        assert!(WorkspaceSection::default().resolve().clear_tmp_on_startup);
+        // An explicit opt-out is honored.
+        let section = WorkspaceSection {
+            clear_tmp_on_startup: Some(false),
+        };
+        assert!(!section.resolve().clear_tmp_on_startup);
+    }
+
+    #[test]
+    fn config_file_parses_workspace_section() {
+        let dir = std::env::temp_dir().join(format!("oc-cfg-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            "[workspace]\nclear_tmp_on_startup = false\n",
+        )
+        .unwrap();
+        let file = ConfigFile::load(&dir).unwrap().unwrap();
+        assert_eq!(file.workspace.clear_tmp_on_startup, Some(false));
+        assert!(!file.workspace.resolve().clear_tmp_on_startup);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -39,6 +39,42 @@ MongoDB settings:
 - `OPENCOMPANY_TENANT_ID` — tenant identity for **shared-single-DB** mode
   (default unset). See [Shared single database](#shared-single-database-mode).
 
+## Workspace layout (`src/store/layout.rs`)
+
+`OPENCOMPANY_DATA_DIR` (default `$HOME/.opencompany`; `/data` in a hosted tenant
+container) is the per-instance **workspace root** — everything one running
+instance owns. [`DataLayout`](../../../src/store/layout.rs) names the canonical
+subdirectories under it so stores, agents, and tools resolve well-known
+locations instead of ad-hoc paths:
+
+```
+<OPENCOMPANY_DATA_DIR>/
+  companies/   ← per-company bundles (companies/<slug>/, owned by the fs store)
+  memory/      ← instance-shared memory artifacts
+  store/       ← instance-shared durable-store artifacts
+  files/       ← instance-shared files (exports, attachments)
+  logs/        ← instance logs
+  tmp/         ← ephemeral scratch, cleared on startup
+```
+
+Per-company state (each bundle's own `memory/`/`context/`) lives under
+`companies/<slug>/`; the top-level `memory/`/`store/`/`files/` are the shared,
+instance-level locations. `serve` calls `DataLayout::ensure` at boot: it creates
+the shared subdirectories and empties `tmp/` so no stale scratch survives a
+restart. Because the hosting model runs **one container per tenant** with its
+own `OPENCOMPANY_DATA_DIR`, this root *is* the per-tenant workspace — no separate
+per-tenant path prefix is needed.
+
+The `[workspace]` section of `config.toml` (in the data dir) tunes the lifecycle:
+
+```toml
+[workspace]
+clear_tmp_on_startup = true   # default; set false to preserve tmp/ across restarts
+```
+
+Disk-quota enforcement and large-file S3 offload are infrastructure concerns of
+the hosting layer (`opencompany-microservice` + `k8s`), not the workload binary.
+
 ## MongoDB backend (`src/store/mongodb.rs`)
 
 One `MongoStore` wraps a single database and implements all five ports.
