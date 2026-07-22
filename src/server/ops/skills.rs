@@ -8,6 +8,9 @@
 //! built-in skills the name/description are best-effort (the console enriches
 //! from its catalog), while a custom skill's fields come from its `SKILL.md`.
 
+use std::collections::HashMap;
+use std::path::Path as FsPath;
+
 use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::routing::{post, put};
@@ -15,19 +18,22 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::company::parse_skill_md;
+use crate::company::{SkillDoc, parse_skill_md};
 use crate::error::OpenCompanyError;
 use crate::ports::skills_state::{SkillSource, SkillState};
 use crate::server::error::ApiError;
 use crate::server::ops::language;
 use crate::server::ops::{ScopedCompany, scoped};
 
+/// The default category stamped on a skill whose doc carries none.
+const DEFAULT_CATEGORY: &str = "Ops";
+
 /// Builds the skills route fragment.
 pub fn router() -> Router<AppState> {
     scoped("/skills/{slug}/install", post(install))
         .merge(scoped("/skills/{slug}/uninstall", post(uninstall)))
         .merge(scoped("/skills/{slug}", put(set_enabled)))
-        .merge(scoped("/skills", post(create_custom)))
+        .merge(scoped("/skills", post(create_custom).get(list_skills)))
 }
 
 /// An installed skill as the console renders it.
@@ -52,11 +58,21 @@ impl InstalledSkill {
                 Ok(parsed) => (
                     parsed.name,
                     parsed.description,
-                    parsed.category.unwrap_or_else(|| "Ops".to_string()),
+                    parsed
+                        .category
+                        .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
                 ),
-                Err(_) => (titleize(&state.slug), String::new(), "Ops".to_string()),
+                Err(_) => (
+                    titleize(&state.slug),
+                    String::new(),
+                    DEFAULT_CATEGORY.to_string(),
+                ),
             },
-            None => (titleize(&state.slug), String::new(), "Ops".to_string()),
+            None => (
+                titleize(&state.slug),
+                String::new(),
+                DEFAULT_CATEGORY.to_string(),
+            ),
         };
         Self {
             id: state.slug.clone(),
@@ -65,6 +81,23 @@ impl InstalledSkill {
             category,
             source: state.source,
             enabled: state.enabled,
+        }
+    }
+
+    /// Projects a company-bundle `SKILL.md` (`companies/<name>/skills/<slug>`)
+    /// to the console shape. These are [`SkillSource::Company`], enabled unless
+    /// a store delta later overrides the flag.
+    fn from_company_bundle(doc: &SkillDoc, enabled: bool) -> Self {
+        Self {
+            id: doc.slug.clone(),
+            name: doc.name.clone(),
+            description: doc.description.clone(),
+            category: doc
+                .category
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
+            source: SkillSource::Company,
+            enabled,
         }
     }
 }
@@ -90,6 +123,83 @@ struct CreateSkill {
     category: Option<String>,
     #[serde(default)]
     body: Option<String>,
+}
+
+/// `GET …/skills` — the company's **effective** skill set: its on-disk bundles
+/// (`companies/<name>/skills/*/SKILL.md`) unioned with the operator's
+/// [`SkillStateStore`] deltas. The console renders this list; it mirrors the
+/// write-plane semantics (and the GraphQL `Company.skills` resolver).
+async fn list_skills(company: ScopedCompany) -> Result<Json<Vec<InstalledSkill>>, ApiError> {
+    let deltas = company.runtime.skills().list(company.id()).await?;
+    Ok(Json(merge_effective(company.runtime.source_dir(), deltas)))
+}
+
+/// Merges the company-dir bundles with the operator deltas: a delta over a
+/// same-slug bundle wins its `enabled` flag, source, and (if it carries one) its
+/// custom doc; a delta with no bundle appears on its own. Sorted by slug so the
+/// response is deterministic.
+fn merge_effective(source_dir: Option<&FsPath>, deltas: Vec<SkillState>) -> Vec<InstalledSkill> {
+    let mut by_slug: HashMap<String, InstalledSkill> = company_bundles(source_dir)
+        .into_iter()
+        .map(|skill| (skill.id.clone(), skill))
+        .collect();
+
+    for st in deltas {
+        match by_slug.get_mut(&st.slug) {
+            Some(existing) => {
+                existing.enabled = st.enabled;
+                existing.source = st.source;
+                // A delta that carries a doc (a custom override) refreshes the
+                // display fields; a plain enable/disable delta keeps the bundle's.
+                if let Some(doc) = st
+                    .custom_doc
+                    .as_deref()
+                    .and_then(|doc| parse_skill_md(&st.slug, doc).ok())
+                {
+                    existing.name = doc.name;
+                    existing.description = doc.description;
+                    existing.category =
+                        doc.category.unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+                }
+            }
+            None => {
+                by_slug.insert(st.slug.clone(), InstalledSkill::from_state(&st));
+            }
+        }
+    }
+
+    let mut out: Vec<InstalledSkill> = by_slug.into_values().collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Scans `<source_dir>/skills/*/SKILL.md` into console skills. A missing source
+/// dir (platform-provisioned mode) or unreadable directory yields an empty list,
+/// and a missing or malformed `SKILL.md` skips just that bundle — never fails.
+fn company_bundles(source_dir: Option<&FsPath>) -> Vec<InstalledSkill> {
+    let Some(dir) = source_dir.map(|dir| dir.join("skills")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(slug) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(path.join("SKILL.md")) else {
+            continue;
+        };
+        if let Ok(doc) = parse_skill_md(slug, &body) {
+            out.push(InstalledSkill::from_company_bundle(&doc, true));
+        }
+    }
+    out
 }
 
 async fn install(
@@ -227,4 +337,93 @@ fn titleize(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_bundle(root: &FsPath, slug: &str, contents: &str) {
+        let dir = root.join("skills").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), contents).unwrap();
+    }
+
+    #[test]
+    fn merge_unions_bundles_with_deltas_and_skips_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A well-formed company bundle, plus one with no frontmatter that must be
+        // skipped rather than failing the whole scan.
+        write_bundle(
+            root,
+            "onboard",
+            "---\nname: Onboard\ndescription: Get set up\ncategory: Ops\n---\n# Onboard\n",
+        );
+        write_bundle(root, "broken", "no frontmatter here\n");
+
+        let deltas = vec![
+            // Disables the company bundle above (a plain enable/disable delta).
+            SkillState {
+                slug: "onboard".to_string(),
+                enabled: false,
+                source: SkillSource::Company,
+                custom_doc: None,
+            },
+            // A custom skill with no matching company bundle.
+            SkillState {
+                slug: "my-skill".to_string(),
+                enabled: true,
+                source: SkillSource::Custom,
+                custom_doc: Some(
+                    "---\nname: My Skill\ndescription: Does a thing\n---\n# body\n".to_string(),
+                ),
+            },
+        ];
+
+        let out = merge_effective(Some(root), deltas);
+
+        // The company bundle appears, keeps its parsed name, and the delta flips
+        // it disabled.
+        let onboard = out
+            .iter()
+            .find(|s| s.id == "onboard")
+            .expect("company bundle present");
+        assert_eq!(onboard.name, "Onboard");
+        assert_eq!(onboard.source, SkillSource::Company);
+        assert!(!onboard.enabled, "delta flips the bundle disabled");
+
+        // The custom delta appears on its own, enriched from its doc.
+        let custom = out
+            .iter()
+            .find(|s| s.id == "my-skill")
+            .expect("custom delta present");
+        assert_eq!(custom.source, SkillSource::Custom);
+        assert_eq!(custom.name, "My Skill");
+        assert!(custom.enabled);
+
+        // The malformed bundle is skipped, never surfaced.
+        assert!(
+            out.iter().all(|s| s.id != "broken"),
+            "malformed SKILL.md is skipped"
+        );
+
+        // Deterministic order (by slug): my-skill < onboard.
+        let ids: Vec<&str> = out.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["my-skill", "onboard"]);
+    }
+
+    #[test]
+    fn merge_with_no_source_dir_returns_only_deltas() {
+        let deltas = vec![SkillState {
+            slug: "web-research".to_string(),
+            enabled: true,
+            source: SkillSource::Registry,
+            custom_doc: None,
+        }];
+        let out = merge_effective(None, deltas);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "web-research");
+        assert_eq!(out[0].source, SkillSource::Registry);
+    }
 }
