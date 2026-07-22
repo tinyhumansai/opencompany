@@ -100,6 +100,13 @@ pub fn build_agent(
     // v1: no manifest tools yet (see module docs — WS4 tool-surface seam). The
     // manifest `tools ∩ agent.tools` intersection lands here.
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    #[cfg(feature = "mcp")]
+    {
+        // These config-free tools read OpenHuman's live process registry, so
+        // installs and lifecycle changes are visible without rebuilding agents.
+        tools.push(Box::new(oh::mcp_registry::tools::McpRegistryListToolsTool));
+        tools.push(Box::new(oh::mcp_registry::tools::McpRegistryToolCallTool));
+    }
 
     // Persona over openhuman's own identity: `omit_identity = true` drops the
     // "you are OpenHuman" preamble so the agent speaks as its company role.
