@@ -19,12 +19,13 @@ import { expect, test } from '@playwright/test';
 
 const ADMIN_EMAIL = 'harness-e2e@tinyhumans.ai';
 
-test('operator console renders a mocked backend reply end to end', async ({ page, request }) => {
-  // 1. Authenticate through the real magic-link flow. `request` shares the
-  //    page's cookie jar, so the session cookie set here is carried by the
-  //    subsequent navigation. On a loopback bind with no mail transport,
-  //    auth/request echoes the login code as `dev_code`.
-  const requested = await request.post('/api/v1/company/auth/request', {
+test('operator console renders a mocked backend reply end to end', async ({ page }) => {
+  // 1. Authenticate through the real magic-link flow. `page.request` shares
+  //    the page's browser-context cookie jar (the standalone `request` fixture
+  //    does NOT), so the session cookie set here is carried by the subsequent
+  //    navigation. On a loopback bind with no mail transport, auth/request
+  //    echoes the login code as `dev_code`.
+  const requested = await page.request.post('/api/v1/company/auth/request', {
     data: { email: ADMIN_EMAIL },
   });
   expect(requested.ok()).toBeTruthy();
@@ -32,7 +33,7 @@ test('operator console renders a mocked backend reply end to end', async ({ page
   const devCode = requestedBody.dev_code as string | undefined;
   expect(devCode, 'auth/request must echo dev_code on a loopback bind').toBeTruthy();
 
-  const verified = await request.post('/api/v1/company/auth/verify', {
+  const verified = await page.request.post('/api/v1/company/auth/verify', {
     data: { code: devCode },
   });
   expect(verified.ok(), 'auth/verify must accept the dev_code and set a session').toBeTruthy();
