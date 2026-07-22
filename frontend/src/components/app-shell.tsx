@@ -324,7 +324,7 @@ export function AppShell({
                 </div>
               }
             >
-              <WorkflowsView />
+              <WorkflowsView client={client} company={company} />
             </Suspense>
           )}
           {view === "usage" && (
