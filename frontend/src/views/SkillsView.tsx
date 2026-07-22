@@ -71,28 +71,32 @@ export function SkillsView({ client, company }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const mounted = useRef(true);
+  // A generation token so a response from a previous company scope (or after
+  // unmount) can't overwrite the current one.
+  const gen = useRef(0);
 
   const refresh = useCallback(async () => {
+    const mine = ++gen.current;
     try {
       const rows = await listSkills(client, company);
-      if (!mounted.current) return;
+      if (mine !== gen.current) return;
       setSkills(rows);
       setError(null);
     } catch (e) {
-      if (!mounted.current) return;
+      if (mine !== gen.current) return;
       setError(e instanceof Error ? e.message : "could not load skills");
     } finally {
-      if (mounted.current) setLoading(false);
+      if (mine === gen.current) setLoading(false);
     }
   }, [client, company]);
 
   useEffect(() => {
-    mounted.current = true;
     setLoading(true);
+    setSkills([]); // drop the previous scope's skills while the new set loads
     void refresh();
+    // Invalidate any in-flight request on scope change / unmount.
     return () => {
-      mounted.current = false;
+      gen.current++;
     };
   }, [refresh]);
 
@@ -100,25 +104,27 @@ export function SkillsView({ client, company }: Props) {
   const enabledCount = skills.filter((s) => s.enabled).length;
 
   async function toggle(skill: Skill) {
-    const previous = skills;
     const next = !skill.enabled;
     setSkills((all) => all.map((s) => (s.id === skill.id ? { ...s, enabled: next } : s)));
     try {
       const saved = await setSkillEnabled(client, company, skill.id, next);
       setSkills((all) => all.map((s) => (s.id === saved.id ? saved : s)));
     } catch (e) {
-      setSkills(previous);
+      // Revert only this skill, so a concurrent mutation isn't clobbered.
+      setSkills((all) =>
+        all.map((s) => (s.id === skill.id ? { ...s, enabled: skill.enabled } : s)),
+      );
       toast.error(e instanceof Error ? e.message : "could not update the skill");
     }
   }
 
   async function uninstall(skill: Skill) {
-    const previous = skills;
     setSkills((all) => all.filter((s) => s.id !== skill.id));
     try {
       await uninstallSkill(client, company, skill.id);
     } catch (e) {
-      setSkills(previous);
+      // Re-insert only this skill on failure (no whole-list rollback).
+      setSkills((all) => (all.some((s) => s.id === skill.id) ? all : [...all, skill]));
       toast.error(e instanceof Error ? e.message : "could not uninstall the skill");
     }
   }
@@ -347,7 +353,8 @@ function AddSkillDialog({
   }
 
   async function submit() {
-    if (!name.trim()) return;
+    // The host rejects a blank description, so gate on both here.
+    if (!name.trim() || !description.trim()) return;
     setBusy(true);
     try {
       await onAdd({ name, description, category });
@@ -402,7 +409,7 @@ function AddSkillDialog({
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
-          <Button disabled={!name.trim() || busy} onClick={() => void submit()}>
+          <Button disabled={!name.trim() || !description.trim() || busy} onClick={() => void submit()}>
             {busy && <Loader2 className="mr-1.5 size-4 animate-spin" />}
             Add skill
           </Button>
