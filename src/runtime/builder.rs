@@ -683,6 +683,25 @@ impl RuntimeBuilder {
                 let harness_brain: Option<Arc<dyn Brain>> =
                     match (self.harness.clone(), self.harness_inference.clone()) {
                         (Some(pool), Some((provider_config, model))) => {
+                            // Resolve the company's effective MCP servers to
+                            // data (manifest ∪ runtime index, credentials
+                            // materialized) before building sync deps. A corrupt
+                            // runtime index degrades to no MCP servers rather
+                            // than bricking the company boot.
+                            let mcp_servers = crate::company::mcp::resolve_effective(
+                                &id,
+                                &self.manifest.mcp_servers,
+                                secrets.as_ref(),
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                tracing::warn!(
+                                    company = %id,
+                                    error = %err,
+                                    "resolving MCP servers failed; agents get no MCP tools"
+                                );
+                                Vec::new()
+                            });
                             let deps = HarnessDeps {
                                 provider: Arc::new(HostedProvider::new(provider_config)),
                                 provider_slug: "managed".to_string(),
@@ -698,6 +717,7 @@ impl RuntimeBuilder {
                                 // supplies the committed bundles.
                                 skills: Some(ops.skills.clone()),
                                 skills_source_dir: self.seed_dir.clone(),
+                                mcp_servers,
                             };
                             let record = CompanyRecord {
                                 id: id.clone(),

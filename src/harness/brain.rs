@@ -257,6 +257,7 @@ description = "Runs Acme."
             tasks: None,
             skills: None,
             skills_source_dir: None,
+            mcp_servers: Vec::new(),
         };
         HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
     }
@@ -373,6 +374,7 @@ description = "Builds it."
             tasks: Some(tasks.clone()),
             skills: None,
             skills_source_dir: None,
+            mcp_servers: Vec::new(),
         };
         (
             HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_two()),
