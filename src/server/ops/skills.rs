@@ -322,11 +322,23 @@ async fn create_custom(
 /// Builds a `SKILL.md` document from a name, description, optional category, and
 /// body. Shared by custom-skill authoring and registry install (which passes
 /// the description as the body).
+///
+/// The frontmatter parser is line-based (`key: value`), so each scalar is
+/// collapsed to a single line: newlines become spaces. That prevents a
+/// name/description from injecting extra frontmatter fields or emitting a bare
+/// `---` line that would close the block early. (Colons within a value are
+/// safe — the parser splits only on the first one.)
 fn skill_md(name: &str, description: &str, category: Option<&str>, content: &str) -> String {
-    let category = category
-        .map(|c| format!("category: {c}\n"))
-        .unwrap_or_default();
-    format!("---\nname: {name}\ndescription: {description}\n{category}---\n{content}\n")
+    let one_line = |s: &str| s.replace(['\n', '\r'], " ");
+    let mut frontmatter = format!(
+        "name: {}\ndescription: {}\n",
+        one_line(name).trim(),
+        one_line(description).trim()
+    );
+    if let Some(category) = category {
+        frontmatter.push_str(&format!("category: {}\n", one_line(category).trim()));
+    }
+    format!("---\n{frontmatter}---\n{content}\n")
 }
 
 /// Turns a display name into a filesystem-and-URL-safe slug.
@@ -373,6 +385,25 @@ mod tests {
         let dir = root.join("skills").join(slug);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), contents).unwrap();
+    }
+
+    #[test]
+    fn skill_md_frontmatter_resists_injection() {
+        // A name carrying newlines, a stray `---`, and a fake field must not
+        // inject frontmatter or hijack another field: newlines collapse to
+        // spaces, so it all lands as the single `name` value.
+        let nasty_name = "Evil\n---\ninjected: true\nname: hijacked";
+        let doc = skill_md(nasty_name, "a real description", Some("Ops"), "body");
+        let parsed = parse_skill_md("evil", &doc).expect("frontmatter stays valid");
+        assert_eq!(parsed.name, "Evil --- injected: true name: hijacked");
+        // The description was NOT overwritten by the injected `name: hijacked`.
+        assert_eq!(parsed.description, "a real description");
+        // A colon inside a value is preserved (split only on the first colon).
+        let colon = skill_md("Name", "ratio 3:1 outcome", None, "body");
+        assert_eq!(
+            parse_skill_md("c", &colon).unwrap().description,
+            "ratio 3:1 outcome"
+        );
     }
 
     #[test]
