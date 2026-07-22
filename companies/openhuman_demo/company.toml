@@ -27,13 +27,43 @@ mode = "full"
 id = "ceo"
 role = "Chief Executive"
 description = "Sets direction, answers about the company, and delegates the work."
+# The operator↔company chat responder. `orchestrator` makes the CEO answer from
+# whole-company context and delegate to the desks below. `mcp:*` grants the
+# remote MCP tool servers declared in `[[mcp_server]]`.
+tier = "orchestrator"
+tools = ["mcp:*"]
 
 [[agent]]
 id = "engineer"
 role = "Engineer"
 description = "Explains how things are built and proposes technical plans."
+tools = ["mcp:*"]
 
 [[agent]]
 id = "writer"
 role = "Writer"
 description = "Turns rough notes into short, clear written drafts."
+tools = ["mcp:*"]
+
+# Desks (group chats) the orchestrator can hand a turn to. Each desk's first
+# member is its lead; `delegate_to_desk` runs that member's turn.
+[[group_chat]]
+id = "engineering"
+name = "Engineering desk"
+description = "How things are built and technical plans."
+members = ["engineer"]
+
+[[group_chat]]
+id = "content"
+name = "Content desk"
+description = "Written drafts and copy."
+members = ["writer"]
+
+# A real, public, no-auth MCP tool server (DeepWiki — AI docs for GitHub
+# repositories). Its tools (read_wiki_structure / read_wiki_contents /
+# ask_question) reach every agent granted `mcp:*` above. Add credentialed
+# servers at runtime from the console's Connections tab.
+[[mcp_server]]
+name = "deepwiki"
+endpoint = "https://mcp.deepwiki.com/mcp"
+description = "AI-generated documentation and Q&A for public GitHub repositories."
