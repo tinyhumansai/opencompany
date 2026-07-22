@@ -2,13 +2,13 @@
 //!
 //! [`build_agent`] turns one roster entry into a ready-to-run openhuman
 //! [`Agent`], injecting the harness's provider, the [`OcMemory`] adapter, the
-//! [`ApprovalPolicy`] tool policy, and a workspace directory. It is deliberately
-//! minimal for v1:
+//! [`ApprovalPolicy`] tool policy, and a workspace directory.
 //!
-//! * **Tools** start empty. The manifest `tools ∩ agent.tools` intersection and
-//!   the port-backed tool surface are ported from the legacy
-//!   `src/openhuman/tools.rs` in a follow-up (WS4 subtask, tracked seam) — the
-//!   builder accepts the vector so wiring them in is a one-line change.
+//! * **Tools**: every agent gets the intrinsic [`memory_tools`] (`memory_store`
+//!   + `memory_recall`) over its own company memory. External/integration tools
+//!   gated on the manifest `tools ∩ agent.tools` allow-list (`web.*`/`docs.*`
+//!   etc.) still need the grant→tool bridge + a security/runtime sandbox — a
+//!   tracked follow-up; the builder accepts the vector so they extend it here.
 //! * **Workflows/skills** start empty. Parsing enabled `SKILL.md` bodies via
 //!   `openhuman::skills::ops_parse` depends on WS1's skill parsing; the seam is
 //!   the `.workflows(...)` setter.
@@ -23,6 +23,9 @@ use openhuman_core::openhuman as oh;
 use oh::agent::dispatcher::XmlToolDispatcher;
 use oh::agent::{Agent, AgentBuilder};
 use oh::context::prompt::SystemPromptBuilder;
+use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
+use oh::memory::traits::Memory;
+use oh::security::SecurityPolicy;
 use oh::tools::Tool;
 
 use crate::company::Agent as ManifestAgent;
@@ -85,11 +88,11 @@ pub fn build_agent(
     deps: &HarnessDeps,
     skill_deltas: &[SkillState],
 ) -> crate::Result<Agent> {
-    let memory = OcMemory::new(
+    let memory: Arc<dyn Memory> = Arc::new(OcMemory::new(
         company.clone(),
         manifest_agent.id.clone(),
         deps.context.clone(),
-    );
+    ));
 
     let workspace = deps
         .workspace_root
@@ -97,9 +100,13 @@ pub fn build_agent(
         .join(&manifest_agent.id)
         .join("workspace");
 
-    // v1: no manifest tools yet (see module docs — WS4 tool-surface seam). The
-    // manifest `tools ∩ agent.tools` intersection lands here.
-    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    // Intrinsic memory tools: every agent can deliberately store and recall over
+    // its own company memory, complementing the automatic retrieve→inject→store
+    // loop. They are tenant-isolated (an agent's memory is its company's
+    // `ContextStore`) and granted to every agent — unlike the manifest
+    // `[tools]` allow-list, which scopes external/integration tools (the
+    // grant→tool bridge for `web.*`/`docs.*` etc. is a follow-up seam).
+    let mut tools: Vec<Box<dyn Tool>> = memory_tools(memory.clone());
 
     // Persona over openhuman's own identity: `omit_identity = true` drops the
     // "you are OpenHuman" preamble so the agent speaks as its company role.
@@ -138,7 +145,7 @@ pub fn build_agent(
 
     AgentBuilder::default()
         .provider_arc(deps.provider.clone())
-        .memory(Arc::new(memory))
+        .memory(memory)
         .tools(tools)
         .tool_dispatcher(Box::new(XmlToolDispatcher))
         .tool_policy(Arc::new(policy))
@@ -151,9 +158,69 @@ pub fn build_agent(
         .map_err(|e| OpenCompanyError::Harness(format!("build agent '{}': {e}", manifest_agent.id)))
 }
 
+/// The always-on memory tools every embedded agent receives: `memory_store` and
+/// `memory_recall` over the agent's own [`OcMemory`]. Backed by the same
+/// `ContextStore` the automatic loop and `OPENCOMPANY_MEMORY` overlay use, so
+/// deliberate and automatic memory share one store.
+///
+/// `MemoryForgetTool` is deliberately excluded — [`OcMemory`]'s append-only
+/// `ContextStore` cannot delete, so a forget tool would silently no-op.
+fn memory_tools(memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
+    let security = Arc::new(SecurityPolicy::default());
+    vec![
+        Box::new(MemoryStoreTool::new(memory.clone(), security)),
+        Box::new(MemoryRecallTool::new(memory)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_tools_expose_store_and_recall() {
+        use crate::ports::ContextStore;
+        use crate::ports::types::{ChunkAddr, ChunkHit, ChunkMeta, CompanyId, ContextChunk};
+
+        // The memory handle is never exercised here — we only assert the tool
+        // surface — so a no-op context suffices.
+        struct NoopContext;
+        #[async_trait::async_trait]
+        impl ContextStore for NoopContext {
+            async fn put(&self, _: &CompanyId, _: ContextChunk) -> crate::Result<ChunkAddr> {
+                Ok(ChunkAddr::new("x"))
+            }
+            async fn list(&self, _: &CompanyId, _: &str) -> crate::Result<Vec<ChunkMeta>> {
+                Ok(Vec::new())
+            }
+            async fn peek(
+                &self,
+                _: &CompanyId,
+                _: &ChunkAddr,
+                _: Option<std::ops::Range<usize>>,
+            ) -> crate::Result<String> {
+                Ok(String::new())
+            }
+            async fn search(
+                &self,
+                _: &CompanyId,
+                _: &str,
+                _: usize,
+            ) -> crate::Result<Vec<ChunkHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(OcMemory::new(
+            CompanyId::new("acme"),
+            "ceo",
+            Arc::new(NoopContext),
+        ));
+        let tools = memory_tools(memory);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"memory_store"), "got {names:?}");
+        assert!(names.contains(&"memory_recall"), "got {names:?}");
+    }
 
     #[test]
     fn model_for_tier_maps_hints_and_defaults() {

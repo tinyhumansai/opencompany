@@ -29,13 +29,11 @@ use crate::feedback::types::ConsentMode;
 use crate::harness::provider::{HostedProvider, HostedProviderConfig};
 #[cfg(feature = "openhuman")]
 use crate::harness::{HarnessBrain, HarnessDeps};
-#[cfg(feature = "openhuman")]
-use crate::ports::WorkflowRunner;
-#[cfg(feature = "openhuman")]
-use crate::workflows::HarnessWorkflowRunner;
 use crate::openhuman::rpc::OpenHumanRpc;
 use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
+#[cfg(feature = "openhuman")]
+use crate::ports::WorkflowRunner;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
     AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
@@ -49,6 +47,8 @@ use crate::store::paths::Bundle;
 use crate::store::{
     FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsOps, FsSecretStore,
 };
+#[cfg(feature = "openhuman")]
+use crate::workflows::HarnessWorkflowRunner;
 
 /// Derives a filesystem-and-URL-safe company id from a display name.
 ///
@@ -306,6 +306,17 @@ impl RuntimeBuilder {
             .with_context(handles.context.clone())
             .with_secrets(handles.secrets.clone())
             .with_inbox(handles.inbox.clone())
+    }
+
+    /// Overlays just the memory + context ports from a selected memory engine
+    /// (`OPENCOMPANY_MEMORY`, see [`crate::store::select`]).
+    ///
+    /// Applied *after* [`with_stores`](Self::with_stores) (or over the fs
+    /// defaults), so a dedicated memory engine such as TinyCortex backs recall
+    /// while the base backend keeps every other durable port.
+    pub fn with_memory_overlay(self, overlay: &crate::store::MemoryOverlay) -> Self {
+        self.with_memory(overlay.memory.clone())
+            .with_context(overlay.context.clone())
     }
 
     /// Swaps the task board store (default: fs-backed).
