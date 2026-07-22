@@ -22,6 +22,15 @@ use crate::ports::types::{ChunkHit, ContextChunk};
 /// How many prior-outcome chunks to inject before a turn.
 pub const RETRIEVE_TOP_K: usize = 5;
 
+/// Max characters of any single retrieved snippet injected as prior work; longer
+/// snippets are truncated with an ellipsis.
+pub const MAX_SNIPPET_CHARS: usize = 500;
+
+/// Max total characters of the injected "relevant prior work" preamble. Once
+/// reached, remaining hits are dropped so a few large stored replies can't blow
+/// the model's context window or inflate cost.
+pub const MAX_HISTORY_CHARS: usize = 2000;
+
 /// Label prefix for stored task outcomes, so they are listable by prefix and
 /// never collide with the agent's namespaced learned-context entries.
 pub const OUTCOME_LABEL_PREFIX: &str = "task-outcome";
@@ -37,14 +46,40 @@ pub fn inject(message: &str, hits: &[ChunkHit]) -> String {
         return message.to_string();
     }
     let mut out = String::from("## Relevant prior work\n");
+    // Bound both each snippet and the total preamble so a few large stored
+    // replies can't blow the context window (see MAX_* constants).
+    let mut remaining = MAX_HISTORY_CHARS;
+    let mut injected = false;
     for hit in hits {
+        let snippet = truncate_chars(hit.snippet.trim(), MAX_SNIPPET_CHARS);
+        let cost = snippet.chars().count() + 3; // "- " + "\n"
+        if cost > remaining {
+            break;
+        }
         out.push_str("- ");
-        out.push_str(hit.snippet.trim());
+        out.push_str(&snippet);
         out.push('\n');
+        remaining -= cost;
+        injected = true;
+    }
+    // Every hit was empty or over budget — fall back to the bare message so a
+    // cold-equivalent turn stays unchanged.
+    if !injected {
+        return message.to_string();
     }
     out.push_str("\n## Task\n");
     out.push_str(message);
     out
+}
+
+/// Truncates `s` to at most `max` characters (on a char boundary), appending an
+/// ellipsis when anything was dropped.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 /// The context chunk recording one completed turn's outcome, labelled under
@@ -73,6 +108,31 @@ mod test {
     #[test]
     fn inject_with_no_hits_is_unchanged() {
         assert_eq!(inject("do the thing", &[]), "do the thing");
+    }
+
+    #[test]
+    fn inject_truncates_an_oversized_snippet() {
+        let big = "x".repeat(10_000);
+        let out = inject("do it", &[hit(&big)]);
+        // The 10k snippet is capped to MAX_SNIPPET_CHARS, not injected whole.
+        assert!(
+            out.chars().count() < 10_000,
+            "oversized snippet must truncate"
+        );
+        assert!(out.contains('…'), "truncation is marked with an ellipsis");
+        assert!(out.trim_end().ends_with("do it"));
+    }
+
+    #[test]
+    fn inject_stops_at_the_total_history_budget() {
+        // Many mid-size snippets: the injected preamble stays within budget.
+        let hits: Vec<ChunkHit> = (0..50).map(|_| hit(&"y".repeat(400))).collect();
+        let out = inject("go", &hits);
+        let injected = out.chars().count() - "go".chars().count();
+        assert!(
+            injected <= MAX_HISTORY_CHARS + MAX_SNIPPET_CHARS,
+            "history is budget-capped, got {injected} injected chars"
+        );
     }
 
     #[test]
