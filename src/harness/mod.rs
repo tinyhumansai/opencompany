@@ -238,13 +238,25 @@ impl HarnessPool {
         .await?;
 
         // Store: persist the outcome (original task + reply) so it compounds
-        // into later turns. Without this the harness never writes memory back.
-        deps.context
+        // into later turns. The turn and its cost are already committed above, so
+        // a persistence failure must NOT fail `run` — returning `Err` here would
+        // make a caller retry re-run the completed (and billed) task. Best-effort
+        // compounding memory: log the failure and still return the reply.
+        if let Err(e) = deps
+            .context
             .put(
                 company,
                 memory_loop::outcome_chunk(agent_id, message, &reply),
             )
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                company = %company,
+                agent = agent_id,
+                error = %e,
+                "failed to persist task outcome to memory; the turn still succeeded",
+            );
+        }
 
         Ok(reply)
     }
