@@ -324,6 +324,19 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     assert_eq!(status, StatusCode::OK);
     assert!(!toggled["enabled"].as_bool().unwrap());
 
+    // `GET …/skills` returns the effective set: here (no source dir) that's the
+    // deltas — the custom skill, now disabled.
+    let (status, list) = send(&state, "GET", "/api/v1/company/skills", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = list.as_array().expect("a JSON array of skills");
+    let my_skill = rows
+        .iter()
+        .find(|s| s["id"] == "my-skill")
+        .expect("the custom skill is listed");
+    assert_eq!(my_skill["source"], "custom");
+    assert_eq!(my_skill["name"], "My Skill");
+    assert!(!my_skill["enabled"].as_bool().unwrap());
+
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
