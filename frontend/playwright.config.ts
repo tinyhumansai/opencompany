@@ -1,4 +1,6 @@
-import { defineConfig } from '@playwright/test';
+import { defineConfig } from "@playwright/test";
+
+const storageState = process.env.PW_STORAGE_STATE;
 
 /**
  * Playwright config for the operator-console end-to-end suite.
@@ -10,14 +12,16 @@ import { defineConfig } from '@playwright/test';
  * `webServer` is declared here.
  */
 export default defineConfig({
-  testDir: './test/e2e',
+  testDir: "./test/e2e",
+  globalSetup: storageState ? "./test/e2e/global-setup.ts" : undefined,
   fullyParallel: false,
   workers: 1,
   timeout: 60_000,
-  reporter: [['list']],
+  reporter: [["list"]],
   use: {
-    baseURL: process.env.PW_BASE_URL || 'http://127.0.0.1:8080',
-    trace: 'on-first-retry',
-    screenshot: 'only-on-failure',
+    baseURL: process.env.PW_BASE_URL || "http://127.0.0.1:8080",
+    storageState,
+    trace: "on-first-retry",
+    screenshot: "only-on-failure",
   },
 });
