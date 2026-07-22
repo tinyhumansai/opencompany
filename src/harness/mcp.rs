@@ -18,8 +18,10 @@ pub struct McpRuntime {
 impl McpRuntime {
     /// Creates a runtime whose MCP SQLite store lives beneath `workspace_dir`.
     pub fn new(workspace_dir: PathBuf) -> Self {
-        let mut config = oh::config::Config::default();
-        config.workspace_dir = workspace_dir;
+        let config = oh::config::Config {
+            workspace_dir,
+            ..Default::default()
+        };
         Self { config }
     }
 

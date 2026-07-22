@@ -148,7 +148,7 @@ fn empty_object() -> Value {
 }
 
 fn runtime(company: &ScopedCompany) -> Result<&McpRuntime, ApiError> {
-    company.runtime.mcp().map(AsRef::as_ref).ok_or_else(|| {
+    company.runtime.mcp().map(AsRef::as_ref).ok_or({
         ApiError(OpenCompanyError::Unimplemented(
             "MCP is not enabled on this host",
         ))
