@@ -14,6 +14,7 @@ import {
   ShieldCheck,
   Sparkles,
   SquareKanban,
+  Blocks,
   UserCog,
   Users,
   Wallet,
@@ -60,6 +61,7 @@ import { SkillsView } from "@/views/SkillsView";
 import { InboxView } from "@/views/InboxView";
 import { MemoryView } from "@/views/MemoryView";
 import { ConnectionsView } from "@/views/ConnectionsView";
+import { McpServersView } from "@/views/McpServersView";
 import { SettingsView } from "@/views/SettingsView";
 import { FeedbackView } from "@/views/FeedbackView";
 
@@ -93,6 +95,7 @@ export type View =
   | "usage"
   | "finances"
   | "connections"
+  | "mcp"
   | "settings"
   | "feedback";
 
@@ -129,6 +132,7 @@ const NAV: NavGroup[] = [
       { view: "usage", label: "Usage", icon: ChartColumnBig },
       { view: "finances", label: "Finances", icon: Wallet },
       { view: "connections", label: "Connections", icon: Plug },
+      { view: "mcp", label: "MCP Servers", icon: Blocks },
       { view: "people", label: "People", icon: UserCog },
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
@@ -153,6 +157,7 @@ const TITLES: Record<View, string> = {
   usage: "Usage",
   finances: "Finances",
   connections: "Connections",
+  mcp: "MCP Servers",
   people: "People",
   settings: "Settings",
   feedback: "Feedback",
@@ -350,6 +355,7 @@ export function AppShell({
             </Suspense>
           )}
           {view === "connections" && <ConnectionsView client={client} company={company} />}
+          {view === "mcp" && <McpServersView client={client} company={company} />}
           {view === "settings" && (
             <SettingsView client={client} company={company} feed={feed} onFlag={() => setFeedbackOpen(true)} />
           )}
