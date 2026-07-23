@@ -156,9 +156,25 @@ impl CompanyAgent {
     }
 }
 
+/// A company's cached roster together with the skill deltas it was built from.
+///
+/// Caching the deltas is what lets [`HarnessPool::ensure`] tell whether the
+/// operator's effective skill set has moved (a skill authored, enabled, or
+/// disabled in the console *after* the roster was first built) and rebuild only
+/// then — so a fresh skill reaches every agent on the next cycle without a
+/// process restart, and an unchanged set leaves the live agents (and their
+/// conversation state) untouched.
+struct CompanyRoster {
+    /// The live agents, one per manifest `[[agent]]`.
+    agents: Vec<Arc<CompanyAgent>>,
+    /// The skill deltas the agents were built from, sorted by slug so the
+    /// freshness comparison is store-order-agnostic.
+    skill_deltas: Vec<SkillState>,
+}
+
 /// A pool of live agents, one roster per company.
 pub struct HarnessPool {
-    agents: RwLock<HashMap<CompanyId, Vec<Arc<CompanyAgent>>>>,
+    rosters: RwLock<HashMap<CompanyId, CompanyRoster>>,
 }
 
 impl Default for HarnessPool {
@@ -171,30 +187,67 @@ impl HarnessPool {
     /// Builds an empty pool.
     pub fn new() -> Self {
         Self {
-            agents: RwLock::new(HashMap::new()),
+            rosters: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Ensures a company's roster is built and cached. Idempotent: a second call
-    /// for a company already in the pool is a no-op (the roster is rebuilt only
-    /// when absent).
+    /// Ensures a company's roster is built, cached, and **current with the
+    /// operator's skill deltas**.
+    ///
+    /// On every call the current deltas are fetched once (a cheap store `list`,
+    /// sorted by slug so the compare is store-order-agnostic) and matched against
+    /// the deltas the cached roster was built from:
+    ///
+    /// * no cached roster, or the deltas moved → (re)build the roster and cache
+    ///   it alongside the deltas it was built from;
+    /// * deltas unchanged → the cached roster is still current; return it
+    ///   untouched (no rebuild, so each agent's conversation history survives).
+    ///
+    /// This is what makes a skill authored / enabled / disabled in the console
+    /// reach every agent on the **next** cycle — [`HarnessBrain`] calls `ensure`
+    /// at the top of each cycle — rather than only on the first build (the prior
+    /// behaviour cached the roster forever and never re-read the deltas, so a
+    /// skill written after the operator's first turn was invisible until
+    /// restart). A company with no skills store (`deps.skills == None`) compares
+    /// empty-to-empty, so it still builds exactly once.
     pub async fn ensure(&self, company: &CompanyRecord, deps: &HarnessDeps) -> crate::Result<()> {
-        {
-            let guard = self.agents.read().await;
-            if guard.contains_key(&company.id) {
-                return Ok(());
-            }
-        }
-        // Fetch the operator skill deltas once (async) before building the
-        // roster; `build_roster`/`build_agent` stay synchronous and fold the
-        // deltas into each agent's effective skill set.
-        let skill_deltas = match &deps.skills {
+        // Current operator skill deltas, sorted by slug for a store-agnostic
+        // compare. `build_roster`/`build_agent` stay synchronous and fold these
+        // into each agent's effective skill set.
+        let mut skill_deltas = match &deps.skills {
             Some(store) => store.list(&company.id).await?,
             None => Vec::new(),
         };
-        let roster = build_roster(company, deps, &skill_deltas)?;
-        let mut guard = self.agents.write().await;
-        guard.entry(company.id.clone()).or_insert(roster);
+        skill_deltas.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+        // Fast path: a cached roster built from the same deltas is still current.
+        {
+            let guard = self.rosters.read().await;
+            if let Some(roster) = guard.get(&company.id)
+                && roster.skill_deltas == skill_deltas
+            {
+                return Ok(());
+            }
+        }
+
+        // The deltas moved (or there is no roster yet): rebuild. Build outside
+        // the write lock (synchronous but non-trivial), then install under a
+        // double-check so a racing `ensure` that already rebuilt from the same
+        // deltas wins and this build is dropped.
+        let agents = build_roster(company, deps, &skill_deltas)?;
+        let mut guard = self.rosters.write().await;
+        if let Some(existing) = guard.get(&company.id)
+            && existing.skill_deltas == skill_deltas
+        {
+            return Ok(());
+        }
+        guard.insert(
+            company.id.clone(),
+            CompanyRoster {
+                agents,
+                skill_deltas,
+            },
+        );
         Ok(())
     }
 
@@ -211,11 +264,12 @@ impl HarnessPool {
         deps: &HarnessDeps,
     ) -> crate::Result<String> {
         let agent = {
-            let guard = self.agents.read().await;
+            let guard = self.rosters.read().await;
             let roster = guard
                 .get(company)
                 .ok_or_else(|| OpenCompanyError::CompanyNotFound(company.to_string()))?;
             roster
+                .agents
                 .iter()
                 .find(|a| a.agent_id == agent_id)
                 .cloned()
@@ -263,7 +317,7 @@ impl HarnessPool {
 
     /// Number of companies currently resident in the pool (test/observability).
     pub async fn resident_companies(&self) -> usize {
-        self.agents.read().await.len()
+        self.rosters.read().await.len()
     }
 }
 
@@ -422,6 +476,52 @@ mod tests {
             _since: u64,
         ) -> crate::Result<Vec<UsageSample>> {
             Ok(self.samples.lock().unwrap().clone())
+        }
+    }
+
+    /// In-memory [`SkillStateStore`] so a test can author/enable/disable skills
+    /// between `ensure` calls and assert the roster refreshes (or doesn't).
+    #[derive(Default)]
+    struct MockSkillStore {
+        deltas: StdMutex<Vec<SkillState>>,
+    }
+
+    #[async_trait]
+    impl SkillStateStore for MockSkillStore {
+        async fn list(&self, _company: &CompanyId) -> crate::Result<Vec<SkillState>> {
+            Ok(self.deltas.lock().unwrap().clone())
+        }
+        async fn set(&self, _company: &CompanyId, state: &SkillState) -> crate::Result<()> {
+            let mut g = self.deltas.lock().unwrap();
+            g.retain(|d| d.slug != state.slug);
+            g.push(state.clone());
+            Ok(())
+        }
+        async fn remove(&self, _company: &CompanyId, slug: &str) -> crate::Result<bool> {
+            let mut g = self.deltas.lock().unwrap();
+            let before = g.len();
+            g.retain(|d| d.slug != slug);
+            Ok(g.len() != before)
+        }
+    }
+
+    /// A console-authored custom skill delta: a full `SKILL.md` carried inline in
+    /// `custom_doc`, with `body_marker` embedded in the body so a `describe_workflow`
+    /// assertion can prove the *content* (not just the slug) reached the agent.
+    fn custom_skill_delta(
+        slug: &str,
+        name: &str,
+        description: &str,
+        body_marker: &str,
+    ) -> SkillState {
+        use crate::ports::skills_state::SkillSource;
+        SkillState {
+            slug: slug.to_string(),
+            enabled: true,
+            source: SkillSource::Custom,
+            custom_doc: Some(format!(
+                "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n{body_marker}\n"
+            )),
         }
     }
 
@@ -711,6 +811,188 @@ rl.on('line', (line) => {
         pool.ensure(&rec, &fx.deps).await.expect("first ensure");
         pool.ensure(&rec, &fx.deps).await.expect("second ensure");
         assert_eq!(pool.resident_companies().await, 1);
+    }
+
+    // --- Skill freshness (issue #41) ---------------------------------------
+
+    /// Deps wired to an in-memory [`MockSkillStore`] (no company-dir source, so
+    /// only operator deltas drive the effective set) plus the store handle and
+    /// the workspace tempdir so a test can author skills and read back the
+    /// per-agent materialized catalogue.
+    fn skill_fixture() -> (HarnessDeps, Arc<MockSkillStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills = Arc::new(MockSkillStore::default());
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(MockContext::default()),
+            store: Arc::new(RecordingStore::default()),
+            meter: None,
+            workspace_root: dir.path().to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: Some(skills.clone()),
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+        };
+        (deps, skills, dir)
+    }
+
+    /// The first cached agent for `agent_id`, cloned out of the pool so two
+    /// snapshots across `ensure` calls can be compared with [`Arc::ptr_eq`].
+    async fn cached_agent(pool: &HarnessPool, id: &CompanyId, agent_id: &str) -> Arc<CompanyAgent> {
+        let guard = pool.rosters.read().await;
+        guard
+            .get(id)
+            .expect("roster resident")
+            .agents
+            .iter()
+            .find(|a| a.agent_id == agent_id)
+            .expect("agent on roster")
+            .clone()
+    }
+
+    /// A skill the operator authors in the console *after* the roster is already
+    /// live must reach the agent on the next `ensure` — with its BODY, not just
+    /// its name. This is the core #41 regression: the pool used to cache the
+    /// roster on the first build and never re-read the deltas.
+    #[tokio::test]
+    async fn late_authored_skill_reaches_agent_on_next_ensure() {
+        use oh::config::Config;
+        use oh::skills::tools::WorkflowDescribeTool;
+        use oh::tools::Tool;
+        use serde_json::json;
+
+        let (deps, skills, dir) = skill_fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+
+        // First cycle: roster built with no skills yet.
+        pool.ensure(&rec, &deps).await.expect("first ensure");
+
+        // Operator authors a custom skill AFTER the roster exists.
+        skills
+            .set(
+                &rec.id,
+                &custom_skill_delta(
+                    "invoicing",
+                    "Invoicing",
+                    "Draft an invoice for a client",
+                    "STEP-MARKER-total-due",
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Next cycle rebuilds the roster from the moved deltas.
+        pool.ensure(&rec, &deps).await.expect("second ensure");
+
+        // `describe_workflow` over the responder's materialized catalogue returns
+        // the skill's inline body — proving the CONTENT reached the agent, not
+        // merely that a same-named entry exists.
+        let catalog = dir.path().join("acme").join("ceo").join("skill-catalog");
+        let config = Arc::new(Config {
+            workspace_dir: catalog,
+            ..Default::default()
+        });
+        let tool = WorkflowDescribeTool::new(config);
+        let out = tool
+            .execute(json!({ "workflow_id": "invoicing" }))
+            .await
+            .expect("describe the fresh skill");
+        let text = out.output_for_llm(false);
+        assert!(
+            text.contains("STEP-MARKER-total-due"),
+            "the skill body must reach the agent: {text}"
+        );
+        assert!(
+            text.contains("Draft an invoice for a client"),
+            "the skill description must surface: {text}"
+        );
+    }
+
+    /// When the deltas have not moved, a second `ensure` must NOT rebuild — the
+    /// same `Arc<CompanyAgent>` is handed back, so live conversation state is
+    /// preserved and no work is wasted.
+    #[tokio::test]
+    async fn unchanged_deltas_reuse_the_same_roster() {
+        let (deps, skills, _dir) = skill_fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+
+        skills
+            .set(
+                &rec.id,
+                &custom_skill_delta("invoicing", "Invoicing", "Draft an invoice", "BODY-A"),
+            )
+            .await
+            .unwrap();
+        pool.ensure(&rec, &deps).await.expect("first ensure");
+        let before = cached_agent(&pool, &rec.id, "ceo").await;
+
+        // No delta change between the two calls.
+        pool.ensure(&rec, &deps).await.expect("second ensure");
+        let after = cached_agent(&pool, &rec.id, "ceo").await;
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged skill set must not rebuild the roster"
+        );
+    }
+
+    /// Disabling a skill drops it from the effective set on the next `ensure`:
+    /// the roster rebuilds (a new agent instance) and the skill is gone from the
+    /// materialized catalogue.
+    #[tokio::test]
+    async fn disabling_a_skill_drops_it_on_next_ensure() {
+        use crate::ports::skills_state::{SkillSource, SkillState};
+
+        let (deps, skills, dir) = skill_fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+
+        skills
+            .set(
+                &rec.id,
+                &custom_skill_delta("invoicing", "Invoicing", "Draft an invoice", "BODY-A"),
+            )
+            .await
+            .unwrap();
+        pool.ensure(&rec, &deps).await.expect("first ensure");
+        let before = cached_agent(&pool, &rec.id, "ceo").await;
+        let materialized = dir
+            .path()
+            .join("acme")
+            .join("ceo")
+            .join("skill-catalog")
+            .join("skills")
+            .join("invoicing");
+        assert!(materialized.is_dir(), "skill materialized on first build");
+
+        // Operator disables the skill (a custom skill, disabled, drops entirely).
+        skills
+            .set(
+                &rec.id,
+                &SkillState {
+                    slug: "invoicing".to_string(),
+                    enabled: false,
+                    source: SkillSource::Custom,
+                    custom_doc: None,
+                },
+            )
+            .await
+            .unwrap();
+        pool.ensure(&rec, &deps).await.expect("second ensure");
+        let after = cached_agent(&pool, &rec.id, "ceo").await;
+
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a moved skill set must rebuild the roster"
+        );
+        assert!(
+            !materialized.exists(),
+            "the disabled skill must be gone from the materialized catalogue"
+        );
     }
 
     #[tokio::test]
