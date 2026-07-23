@@ -310,9 +310,11 @@ async fn memory_operator_fact_is_injected_into_the_agent_turn() {
     // The harness retrieve step searches the ContextStore; the mirror lands
     // there, so a relevant next-turn message recalls it and `inject` renders it
     // into the augmented prompt — the closed loop, end to end.
+    // The fs ContextStore search is substring-based, so query a token that
+    // appears verbatim in the stored `title\nbody` mirror.
     let hits = runtime
         .context
-        .search(runtime.id(), "ship Friday", memory_loop::RETRIEVE_TOP_K)
+        .search(runtime.id(), "Friday", memory_loop::RETRIEVE_TOP_K)
         .await
         .unwrap();
     assert!(!hits.is_empty(), "the operator note must be retrievable");
