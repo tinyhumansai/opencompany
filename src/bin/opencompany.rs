@@ -278,11 +278,16 @@ fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
     }
 }
 
-/// Attaches the embedded OpenHuman harness brain when the `openhuman` feature
-/// is enabled and a hosted-inference credential is present in the environment
-/// (`TINYHUMANS_API_KEY` / `OPENCOMPANY_INFERENCE_*`). With it, `/company/chat`
-/// routes each operator message through a live company agent on the hosted
-/// brain; without a credential the runtime keeps its hosted/echo brain.
+/// Attaches the embedded OpenHuman harness under the `openhuman` feature.
+///
+/// The harness pool is **always** attached, so cognition routes through a live
+/// company agent whenever *any* inference source is configured — the managed
+/// env default (`TINYHUMANS_API_KEY` / `OPENCOMPANY_INFERENCE_*`), a manifest
+/// `[inference]` section, or a runtime console override (issue #56 — BYOK).
+/// Attaching the pool unconditionally is what unblocks a BYOK-only tenant that
+/// has no platform credential: the builder still constructs the harness brain
+/// from its manifest/runtime config. Without any source, the runtime keeps its
+/// hosted/echo brain.
 ///
 /// Without the feature this is the identity function, so the default build is
 /// unaffected.
@@ -297,10 +302,12 @@ fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
     use opencompany::harness::HarnessPool;
     use opencompany::harness::provider::harness_inference_from_env;
 
+    let builder = builder.with_harness(Arc::new(HarnessPool::new()));
+    // The managed env default is an *optional*, lowest-precedence source; a
+    // BYOK-only tenant supplies none and still gets a harness brain from its
+    // manifest/runtime config.
     match harness_inference_from_env(&ProcessEnv) {
-        Some((config, model)) => builder
-            .with_harness(Arc::new(HarnessPool::new()))
-            .with_harness_inference(config, model),
+        Some((config, model_override)) => builder.with_harness_inference(config, model_override),
         None => builder,
     }
 }

@@ -18,6 +18,8 @@ use crate::brain::medulla::MedullaTransport;
 use crate::brain::medulla::wire::ToolManifestEntry;
 use crate::brain::{EchoBrain, HostedMedullaBrain};
 use crate::company::CompanyManifest;
+#[cfg(feature = "openhuman")]
+use crate::company::inference::{self, EnvDefault};
 use crate::company::runtime::{CompanyRuntime, OpsStores};
 use crate::feedback::github::{GitHubClient, RateLimiter};
 use crate::feedback::service::FeedbackFiler;
@@ -26,7 +28,7 @@ use crate::feedback::tinyhumans::TinyHumansClient;
 use crate::feedback::tool::BuiltinToolProvider;
 use crate::feedback::types::ConsentMode;
 #[cfg(feature = "openhuman")]
-use crate::harness::provider::{HostedProvider, HostedProviderConfig};
+use crate::harness::provider::{HostedProviderConfig, TenantProvider};
 #[cfg(feature = "openhuman")]
 use crate::harness::{HarnessBrain, HarnessDeps};
 use crate::openhuman::rpc::OpenHumanRpc;
@@ -178,11 +180,14 @@ pub struct RuntimeBuilder {
     /// build is unaffected; wired through to [`CompanyRuntime`] when present.
     #[cfg(feature = "openhuman")]
     harness: Option<Arc<crate::harness::HarnessPool>>,
-    /// WS4: hosted-inference config (endpoint + default model) for the harness
-    /// brain. With both this and [`harness`](Self::harness) set — and no
-    /// explicit brain — cognition routes through the embedded openhuman runtime.
+    /// WS4/#56: the platform-injected managed inference default (endpoint +
+    /// credential) and an optional roster-wide model override. This is the
+    /// *lowest-precedence* inference source — a manifest `[inference]` section
+    /// or a runtime console override outranks it. With [`harness`](Self::harness)
+    /// set and any inference source configured, cognition routes through a
+    /// per-tenant [`TenantProvider`](crate::harness::provider::TenantProvider).
     #[cfg(feature = "openhuman")]
-    harness_inference: Option<(HostedProviderConfig, String)>,
+    harness_inference: Option<(HostedProviderConfig, Option<String>)>,
 }
 
 impl RuntimeBuilder {
@@ -467,18 +472,20 @@ impl RuntimeBuilder {
         self
     }
 
-    /// WS4: sets the hosted-inference config (endpoint + default model) the
-    /// harness brain drives. Combined with [`with_harness`](Self::with_harness)
-    /// and no explicit brain, cognition routes through the embedded openhuman
-    /// runtime; without it the harness pool stays wired but unused and the
-    /// runtime keeps its hosted/echo brain. Feature-gated.
+    /// WS4/#56: sets the platform-injected managed inference default (endpoint +
+    /// credential) and an optional roster-wide model override
+    /// (`OPENCOMPANY_INFERENCE_MODEL`). This is the lowest-precedence inference
+    /// source; a manifest `[inference]` section or a runtime console override
+    /// wins over it. Combined with [`with_harness`](Self::with_harness) and any
+    /// configured inference source, cognition routes through a per-tenant
+    /// [`TenantProvider`](crate::harness::provider::TenantProvider). Feature-gated.
     #[cfg(feature = "openhuman")]
     pub fn with_harness_inference(
         mut self,
         config: HostedProviderConfig,
-        default_model: impl Into<String>,
+        model_override: Option<String>,
     ) -> Self {
-        self.harness_inference = Some((config, default_model.into()));
+        self.harness_inference = Some((config, model_override));
         self
     }
 
@@ -701,14 +708,53 @@ impl RuntimeBuilder {
                 // `CompanyRuntime::harness` wiring — the brain and the runtime
                 // deliberately share one pool.
                 #[cfg(feature = "openhuman")]
-                let harness_brain: Option<Arc<dyn Brain>> =
-                    match (self.harness.clone(), self.harness_inference.clone()) {
-                        (Some(pool), Some((provider_config, model))) => {
-                            // Resolve the company's effective MCP servers to
-                            // data (manifest ∪ runtime index, credentials
-                            // materialized) before building sync deps. A corrupt
-                            // runtime index degrades to no MCP servers rather
-                            // than bricking the company boot.
+                let harness_brain: Option<Arc<dyn Brain>> = match self.harness.clone() {
+                    Some(pool) => {
+                        // The platform-injected managed default (endpoint +
+                        // credential) is the lowest-precedence inference source.
+                        let env_default =
+                            self.harness_inference
+                                .as_ref()
+                                .map(|(config, _)| EnvDefault {
+                                    base_url: config.base_url.clone(),
+                                    api_key: config.api_key.clone(),
+                                });
+                        // An explicit `OPENCOMPANY_INFERENCE_MODEL` flattens the
+                        // whole roster to one workload; otherwise each agent keeps
+                        // its tier-derived model and the tenant
+                        // `[inference].models` table maps it (`None` = no override).
+                        let model_override = self
+                            .harness_inference
+                            .as_ref()
+                            .and_then(|(_, model)| model.clone());
+
+                        // Is any inference source configured — a runtime console
+                        // override, a manifest `[inference]` section, or the
+                        // managed env default? A corrupt runtime config degrades
+                        // to "unconfigured" (managed/echo brain) rather than
+                        // bricking boot.
+                        let configured = inference::resolve_effective(
+                            &id,
+                            &self.manifest.inference,
+                            env_default.as_ref(),
+                            secrets.as_ref(),
+                        )
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                company = %id,
+                                error = %err,
+                                "resolving inference config failed; keeping the managed/echo brain"
+                            );
+                            None
+                        })
+                        .is_some();
+
+                        if configured {
+                            // Resolve the company's effective MCP servers to data
+                            // (manifest ∪ runtime index, credentials materialized)
+                            // before building sync deps. A corrupt index degrades
+                            // to no MCP servers rather than bricking boot.
                             let mcp_servers = crate::company::mcp::resolve_effective(
                                 &id,
                                 &self.manifest.mcp_servers,
@@ -724,13 +770,24 @@ impl RuntimeBuilder {
                                 Vec::new()
                             });
                             let deps = HarnessDeps {
-                                provider: Arc::new(HostedProvider::new(provider_config)),
+                                // A per-tenant provider that re-resolves the
+                                // effective inference config on every turn, so a
+                                // console BYOK switch takes effect next turn with
+                                // no rebuild.
+                                provider: Arc::new(TenantProvider::new(
+                                    id.clone(),
+                                    secrets.clone(),
+                                    self.manifest.inference.clone(),
+                                    env_default,
+                                )),
+                                // Static fallback only; `HarnessPool::run` reads
+                                // the live slug from the provider per turn.
                                 provider_slug: "managed".to_string(),
                                 context: context.clone(),
                                 store: store.clone(),
                                 meter: Some(fs_ops.clone()),
                                 workspace_root: home.join("harness"),
-                                model_override: Some(model),
+                                model_override,
                                 tasks: Some(ops.tasks.clone()),
                                 // Skill read surface (#28): the operator delta
                                 // store + the company source dir (`companies/<name>`,
@@ -772,9 +829,12 @@ impl RuntimeBuilder {
                             ))
                                 as Arc<dyn WorkflowRunner>);
                             Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
+                        } else {
+                            None
                         }
-                        _ => None,
-                    };
+                    }
+                    None => None,
+                };
                 #[cfg(not(feature = "openhuman"))]
                 let harness_brain: Option<Arc<dyn Brain>> = None;
 

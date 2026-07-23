@@ -68,15 +68,16 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "Introduce yourself in one sentence.".to_string());
 
-    let (cfg, default_model) = harness_inference_from_env(&ProcessEnv).ok_or_else(|| {
+    let (cfg, model_override) = harness_inference_from_env(&ProcessEnv).ok_or_else(|| {
         anyhow::anyhow!(
             "no inference credential — set TINYHUMANS_API_KEY (or OPENCOMPANY_INFERENCE_KEY), \
              optionally OPENCOMPANY_INFERENCE_URL / _MODEL"
         )
     })?;
     eprintln!(
-        "[live] endpoint={}  default_model={}",
-        cfg.base_url, default_model
+        "[live] endpoint={}  model_override={}",
+        cfg.base_url,
+        model_override.as_deref().unwrap_or("<per-agent tier>")
     );
 
     let manifest: CompanyManifest = toml::from_str(MANIFEST)?;
@@ -97,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         store: Arc::new(FsCompanyStore::new(dir.path())),
         meter: Some(meter.clone()),
         workspace_root: dir.path().to_path_buf(),
-        model_override: Some(default_model.clone()),
+        model_override,
         tasks: None,
         skills: None,
         skills_source_dir: None,

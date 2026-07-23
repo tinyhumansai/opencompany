@@ -401,11 +401,16 @@ impl HarnessPool {
         // wrapper retried once). A zero-usage attempt (offline provider) writes
         // nothing, so the inert-metering contract holds.
         let (reply, turn_costs) = agent.run(&augmented).await?;
+        // Attribute cost to the provider this turn actually resolved to. With a
+        // per-tenant [`TenantProvider`](crate::harness::provider::TenantProvider)
+        // a console BYOK switch changes the slug between turns, so read it live
+        // rather than trusting the static `deps.provider_slug` baked at build.
+        let provider_slug = deps.provider.telemetry_provider_id();
         for turn_cost in &turn_costs {
             record_turn_cost(
                 turn_cost,
                 agent_id,
-                &deps.provider_slug,
+                &provider_slug,
                 company,
                 deps.store.as_ref(),
                 deps.meter.as_deref(),
