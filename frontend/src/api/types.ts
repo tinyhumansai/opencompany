@@ -129,6 +129,38 @@ export interface ConnectionStart {
   url: string;
 }
 
+/**
+ * One effective MCP tool server (issue #50), as `.../mcp/servers` returns it.
+ * The credential is never present — only the non-secret `authConfigured` flag.
+ */
+export interface McpServer {
+  name: string;
+  endpoint: string;
+  description?: string;
+  /** `manifest` (committed in company.toml) or `runtime` (console-added). */
+  source: "manifest" | "runtime";
+  enabled: boolean;
+  allowedTools: string[];
+  disallowedTools: string[];
+  timeoutSecs: number;
+  /** Whether an outbound credential is stored — never the credential itself. */
+  authConfigured: boolean;
+}
+
+/** A mutating MCP response: the resulting server plus a rebuild reminder. */
+export interface McpMutationResponse {
+  server: McpServer;
+  note: string;
+}
+
+/** One remote tool advertised by an MCP server (live discovery). */
+export interface McpToolInfo {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema: unknown;
+}
+
 /** Error envelope shape: `{ error, code }`. */
 export interface ApiErrorBody {
   error: string;

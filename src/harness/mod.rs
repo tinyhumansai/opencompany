@@ -59,6 +59,7 @@ use oh::agent::Agent;
 use oh::inference::provider::Provider;
 
 use crate::company::Policy;
+use crate::company::mcp::McpServerDecl;
 use crate::error::OpenCompanyError;
 use crate::harness::cost::{TurnUsage, record_turn_cost};
 use crate::harness::policy::ApprovalPolicy;
@@ -105,6 +106,15 @@ pub struct HarnessDeps {
     /// subtree supplies the committed skill bundles unioned into the effective
     /// set. `None` surfaces only the operator deltas.
     pub skills_source_dir: Option<PathBuf>,
+    /// The company's effective MCP servers (issue #50), resolved to **data**
+    /// (manifest `[[mcp_server]]` ∪ the runtime index, with each server's
+    /// outbound credential materialized to
+    /// [`AuthMaterial`](crate::company::mcp::AuthMaterial)) before deps
+    /// construction. `build_agent` is synchronous but the
+    /// [`SecretStore`](crate::ports::SecretStore) is async, so the runtime
+    /// builder resolves these ahead of time; each agent then filters the set by
+    /// its `mcp:*` tool grants. Empty leaves the agent with no MCP bridge tools.
+    pub mcp_servers: Vec<McpServerDecl>,
 }
 
 /// One live openhuman agent, keyed by its manifest id.
@@ -471,6 +481,7 @@ description = "Builds the product."
                 tasks: None,
                 skills: None,
                 skills_source_dir: None,
+                mcp_servers: Vec::new(),
             },
             store,
             meter,
@@ -609,6 +620,7 @@ rl.on('line', (line) => {
             tasks: None,
             skills: None,
             skills_source_dir: Some(source.path().to_path_buf()),
+            mcp_servers: Vec::new(),
         };
 
         let roster = build_roster(&record(), &deps, &[]).expect("roster builds with skills");

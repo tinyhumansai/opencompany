@@ -142,6 +142,7 @@ description = "Runs Acme."
             tasks: None,
             skills: None,
             skills_source_dir: None,
+            mcp_servers: Vec::new(),
         }
     }
 

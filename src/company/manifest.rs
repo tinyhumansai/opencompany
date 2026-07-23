@@ -201,6 +201,9 @@ impl CompanyManifest {
             }
         }
 
+        // MCP servers: unique names, an `http(s)://` endpoint, no stdio in v1.
+        problems.extend(super::mcp::validate_servers(&self.mcp_servers));
+
         // Enabled workflows reference `workflows/<id>.toml`; ids must be sane.
         for id in &self.workflows.enabled {
             if !is_snake_case(id) {
@@ -579,6 +582,37 @@ mod tests {
             problems
                 .iter()
                 .any(|p| p.contains("workflow id") && p.contains("Bad-Id")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_http_mcp_server_and_rejects_stdio() {
+        let ok = parse(
+            r#"
+            [company]
+            name = "X"
+            [[mcp_server]]
+            name = "notion"
+            endpoint = "https://notion.example/mcp"
+            "#,
+        );
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+
+        let bad = parse(
+            r#"
+            [company]
+            name = "X"
+            [[mcp_server]]
+            name = "local"
+            command = "npx some-mcp"
+            "#,
+        );
+        let problems = bad.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("stdio") && p.contains("hosted v1")),
             "{problems:?}"
         );
     }

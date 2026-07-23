@@ -20,6 +20,7 @@ pub mod inbox;
 pub mod language;
 pub mod mail;
 pub mod mailer;
+pub mod mcp;
 pub mod memory;
 pub mod scope;
 pub mod skills;
@@ -31,8 +32,6 @@ pub mod workspace;
 
 #[cfg(feature = "oauth")]
 pub mod connections;
-#[cfg(feature = "mcp")]
-pub mod mcp;
 
 pub(crate) use scope::{ScopedCompany, scoped};
 
@@ -125,13 +124,12 @@ pub fn router() -> Router<AppState> {
         .merge(memory::router())
         .merge(workspace::router())
         .merge(skills::router())
+        .merge(mcp::router())
         .merge(team::router())
         .merge(workflows::router())
         .merge(mail::router());
     #[cfg(feature = "oauth")]
     let router = router.merge(connections::router());
-    #[cfg(feature = "mcp")]
-    let router = router.merge(mcp::router());
     router
 }
 

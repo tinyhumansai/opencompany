@@ -74,9 +74,13 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # `openhuman` feature; the default build pulls none of this enormous native
 # dependency tree. `default-features = false` sheds openhuman's whole default
 # set — `tokenjuice-treesitter`, `voice`, `web3`, `media`, `meet`,
-# `flows`, and `mcp`. A company agent wants the agent loop, memory, and an
-# inference provider by default; MCP is re-enabled separately through the
-# opt-in OpenCompany `mcp` feature below. `skills` is re-enabled: cell #28
+# `flows` — none of which a company agent needs; it wants the agent
+# loop, memory, and an inference provider. `mcp` is re-enabled (issue #50):
+# per-tenant MCP tool servers reuse OpenHuman's `mcp_client` registry + HTTP
+# transport + injection-safety filter and the `mcp_list_servers` /
+# `mcp_list_tools` / `mcp_call_tool` bridge tools. Upstream `mcp = []` carries
+# no extra crates — it only recompiles the MCP client/registry modules.
+# `skills` is re-enabled: cell #28
 # surfaces a company's effective skill set to its harness agents through
 # OpenHuman's own skill *read* tools (`list_workflows` / `describe_workflow` /
 # `read_workflow_resource`), which live in the gated `openhuman::skills`
@@ -85,7 +89,7 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # same commit openhuman's own `vendor/tinyagents` pins: the two are a
 # lockstep pair, and a skew fails to compile (only under this feature, which
 # CI does not build).
-openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false, features = ["skills"] }
+openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false, features = ["skills", "mcp"] }
 # The openhuman `Provider`/`Memory` traits return `anyhow::Result` and log via
 # the `log` facade; both only link under the `openhuman` feature.
 anyhow = { version = "1", optional = true }

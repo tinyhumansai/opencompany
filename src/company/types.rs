@@ -54,6 +54,12 @@ pub struct CompanyManifest {
     /// secrets. Renamed from the `[[connection]]` array-of-tables.
     #[serde(default, rename = "connection")]
     pub connections: Vec<Connection>,
+    /// Per-tenant MCP tool servers exposed to the company's agents (issue #50).
+    /// Declarative intent — an HTTP endpoint, a tool allow/deny list, and an
+    /// optional *named* secret key — **never** inline credentials. Renamed from
+    /// the `[[mcp_server]]` array-of-tables.
+    #[serde(default, rename = "mcp_server")]
+    pub mcp_servers: Vec<McpServer>,
     /// Which workflow graphs (under the company's `workflows/` directory) to
     /// enable. The graphs themselves live in their own files, not here.
     #[serde(default)]
@@ -151,6 +157,62 @@ pub struct Connection {
     /// Why the company wants this connection.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// A `[[mcp_server]]` entry — a remote MCP tool server the company's agents may
+/// reach through the generic MCP bridge tools (issue #50).
+///
+/// This is declarative intent, shaped like [`Connection`]: it names an HTTP
+/// endpoint and (optionally) which remote tools to allow, but it **never**
+/// carries a credential. When a server needs auth, `auth_secret` names a
+/// [`SecretStore`](crate::ports::SecretStore) key holding the token, which the
+/// operator writes through the console (write-only). Hosted v1 supports the
+/// **HTTP transport only** — a `command` (stdio/subprocess) server is rejected
+/// by [`validate`](super::CompanyManifest::validate).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct McpServer {
+    /// Stable slug used by the bridge tools and the console; unique per company.
+    pub name: String,
+    /// MCP endpoint URL. Must be `http(s)://` — the only transport hosted v1
+    /// supports.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Optional human-readable description shown in the console + bridge output.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A stdio/subprocess command. **Unsupported in hosted v1** — its presence
+    /// is a validation error (agents run in a shared multi-tenant container;
+    /// spawning per-tenant subprocesses is out of scope). Kept as a field so the
+    /// error can name the problem instead of a confusing "missing endpoint".
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Exact remote tool names to allow. Empty means all remote tools are
+    /// allowed unless listed in `disallowed_tools`.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Exact remote tool names to always hide/block (takes precedence).
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+    /// Per-request timeout in seconds.
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Whether this server is exposed to agents. Defaults to on.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional name of the [`SecretStore`](crate::ports::SecretStore) key that
+    /// holds this server's outbound credential. Names a key — never the token.
+    /// When unset, the runtime resolves the canonical per-server key
+    /// (`mcp/<name>/auth`) written by the console.
+    #[serde(default)]
+    pub auth_secret: Option<String>,
+}
+
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `[workflows]` — references to the workflow graphs to enable. The graphs live

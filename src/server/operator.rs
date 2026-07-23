@@ -509,6 +509,7 @@ mod test {
             tasks: None,
             skills: None,
             skills_source_dir: None,
+            mcp_servers: Vec::new(),
         };
         let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record);
 
