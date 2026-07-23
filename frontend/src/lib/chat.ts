@@ -1,3 +1,5 @@
+import type { TurnStep } from "@/api/types";
+
 /** One line in the conversation with the company. */
 export interface ChatMessage {
   id: string;
@@ -10,6 +12,12 @@ export interface ChatMessage {
    * side by sender: a distinct channel reads as its own agent in the chat.
    */
   channel?: string;
+  /**
+   * The scrubbed processing steps behind a company reply (tool calls, thinking,
+   * surfaced failures), rendered as a timeline above the bubble. Absent/empty
+   * on your own messages and on tool-less replies.
+   */
+  steps?: TurnStep[];
 }
 
 let seq = 0;
@@ -19,7 +27,14 @@ const nextId = () => `m${seq++}`;
 export function makeMessage(
   from: ChatMessage["from"],
   text: string,
-  opts: { channel?: string; at?: number } = {},
+  opts: { channel?: string; at?: number; steps?: TurnStep[] } = {},
 ): ChatMessage {
-  return { id: nextId(), from, text, at: opts.at ?? Date.now(), channel: opts.channel };
+  return {
+    id: nextId(),
+    from,
+    text,
+    at: opts.at ?? Date.now(),
+    channel: opts.channel,
+    steps: opts.steps,
+  };
 }

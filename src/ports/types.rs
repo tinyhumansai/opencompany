@@ -691,6 +691,78 @@ pub struct OutboundMessage {
     pub channel: String,
     /// The message text.
     pub text: String,
+    /// The visible processing steps behind this bubble — the agent's tool calls,
+    /// thinking runs, and any surfaced MCP failures — folded and scrubbed from
+    /// the turn's progress stream (see [`crate::harness::steps`] under the
+    /// `openhuman` feature). Per-bubble ownership: the operator bubble carries the
+    /// orchestrator's steps; a delegated desk bubble carries that desk lead's
+    /// steps.
+    ///
+    /// Additive and non-secret: the field is omitted on the wire when empty, so
+    /// every prior producer (and every non-harness brain, which emits none)
+    /// round-trips byte-identically. Never carries raw tool arguments, tool
+    /// output, or call ids — only the scrubbed [`TurnStep`] shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TurnStep>,
+}
+
+/// One visible step in an agent turn's processing timeline, surfaced in the
+/// operator chat.
+///
+/// The point of the timeline: a failed tool call becomes visible (instead of a
+/// vague acknowledgement), and a memory-served answer — which runs **zero**
+/// steps — is distinguishable from a tool-backed one. Folded from the harness
+/// progress stream by [`crate::harness::steps`] (compiled under the `openhuman`
+/// feature); every field is scrubbed there before it reaches this shape.
+///
+/// The wire form is additive and camelCase (`elapsedMs`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStep {
+    /// What kind of step this is (drives the icon in the UI).
+    pub kind: TurnStepKind,
+    /// How the step ended.
+    pub status: TurnStepStatus,
+    /// A short, human label (e.g. "Reading messages", "Thinking"). Derived from
+    /// the tool's server-computed `display_label`, else its tool name — never
+    /// from tool arguments or output.
+    pub label: String,
+    /// An optional muted detail: whitelisted, scrubbed enrichment (e.g. an MCP
+    /// `server · tool`, a delegated desk, a task title) or a plain-language
+    /// failure cause. **Never** raw tool output or arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// How long the step took in milliseconds, when known (tool calls report it;
+    /// thinking/note steps do not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+/// The kind of a [`TurnStep`], driving its icon in the timeline. Serialized in
+/// `snake_case` (`tool_call` / `thinking` / `note`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepKind {
+    /// A tool call (a paired started/completed pair, or an unmatched one).
+    ToolCall,
+    /// A run of the model's reasoning, coalesced to a single "Thinking" step.
+    Thinking,
+    /// A standalone note — e.g. a surfaced MCP failure or the cap-omission
+    /// marker.
+    Note,
+}
+
+/// How a [`TurnStep`] ended. Serialized in `snake_case` (`ok` / `error` /
+/// `running`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepStatus {
+    /// Completed successfully (or an informational step).
+    Ok,
+    /// Failed — rendered in the destructive tone.
+    Error,
+    /// Started but no completion was observed by the end of the turn.
+    Running,
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +957,82 @@ mod test {
     {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    /// The `TurnStep` wire shape is camelCase with snake_case enum values:
+    /// `{kind, status, label, detail?, elapsedMs?}`. Locks the contract the
+    /// console `TurnStep` mirror in `frontend/src/api/types.ts` depends on.
+    #[test]
+    fn turn_step_wire_shape_is_camel_case_with_snake_case_enums() {
+        let step = TurnStep {
+            kind: TurnStepKind::ToolCall,
+            status: TurnStepStatus::Error,
+            label: "Searching the web".to_string(),
+            detail: Some("brave · search".to_string()),
+            elapsed_ms: Some(1234),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["kind"], "tool_call");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["label"], "Searching the web");
+        assert_eq!(json["detail"], "brave · search");
+        assert_eq!(json["elapsedMs"], 1234);
+        assert_eq!(round_trip(&step), step);
+    }
+
+    /// A step with no detail/elapsed omits both keys, and every kind/status
+    /// value serializes to its documented snake_case token.
+    #[test]
+    fn turn_step_omits_absent_fields_and_covers_every_variant() {
+        let bare = TurnStep {
+            kind: TurnStepKind::Thinking,
+            status: TurnStepStatus::Ok,
+            label: "Thinking".to_string(),
+            detail: None,
+            elapsed_ms: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(json["kind"], "thinking");
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("detail").is_none(), "absent detail is omitted");
+        assert!(json.get("elapsedMs").is_none(), "absent elapsed is omitted");
+
+        assert_eq!(serde_json::to_value(TurnStepKind::Note).unwrap(), "note");
+        assert_eq!(
+            serde_json::to_value(TurnStepStatus::Running).unwrap(),
+            "running"
+        );
+    }
+
+    /// `OutboundMessage.steps` is additive: an empty timeline is omitted from
+    /// the wire entirely (so every prior producer round-trips byte-identically),
+    /// and a legacy `{channel, text}` payload still loads with an empty `steps`.
+    #[test]
+    fn outbound_message_steps_are_additive_and_omitted_when_empty() {
+        let no_steps = OutboundMessage {
+            channel: "operator".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+        };
+        let json = serde_json::to_string(&no_steps).unwrap();
+        assert_eq!(json, r#"{"channel":"operator","text":"hi"}"#);
+
+        let legacy: OutboundMessage =
+            serde_json::from_str(r#"{"channel":"operator","text":"hi"}"#).unwrap();
+        assert!(legacy.steps.is_empty());
+
+        let with_steps = OutboundMessage {
+            channel: "operator".to_string(),
+            text: "done".to_string(),
+            steps: vec![TurnStep {
+                kind: TurnStepKind::Note,
+                status: TurnStepStatus::Error,
+                label: "MCP: brave unavailable".to_string(),
+                detail: Some("server rejected the call".to_string()),
+                elapsed_ms: None,
+            }],
+        };
+        assert_eq!(round_trip(&with_steps), with_steps);
     }
 
     #[test]

@@ -69,6 +69,7 @@ mod test {
             .send(OutboundMessage {
                 channel: "email".into(),
                 text: "hello".into(),
+                steps: Vec::new(),
             })
             .await
             .unwrap();
@@ -95,6 +96,7 @@ mod test {
             .send(OutboundMessage {
                 channel: "email".into(),
                 text: "hi".into(),
+                steps: Vec::new(),
             })
             .await
             .unwrap_err();

@@ -92,14 +92,16 @@ impl AgentRunner for HarnessAgentRunner {
             agent = agent_ref,
             "workflow agent node: routing to harness pool"
         );
-        let reply = self
+        let outcome = self
             .pool
             .run(&self.company, agent_ref, &message, &self.deps)
             .await
             .map_err(|e| EngineError::Capability(format!("harness agent '{agent_ref}': {e}")))?;
         // Mirror the engine's `{ json, text, raw }` envelope shape: expose the
-        // reply as `text` so a downstream `=item.text` binding resolves.
-        Ok(json!({ "text": reply, "agent_ref": agent_ref }))
+        // reply as `text` so a downstream `=item.text` binding resolves. A
+        // workflow node carries no chat bubble, so the turn's steps are dropped
+        // here (they surface only on operator/desk chat replies).
+        Ok(json!({ "text": outcome.reply, "agent_ref": agent_ref }))
     }
 }
 

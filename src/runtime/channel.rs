@@ -75,6 +75,7 @@ mod test {
             .send(OutboundMessage {
                 channel: "operator".into(),
                 text: "hello".into(),
+                steps: Vec::new(),
             })
             .await
             .unwrap();
