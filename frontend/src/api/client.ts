@@ -212,6 +212,27 @@ export class OpenCompanyClient {
   }
 
   /**
+   * Add an operator-defined teammate (a "team overlay" agent). Persists on the
+   * host and shows up in `listTeam` afterwards — never returned by the write
+   * itself, so callers should refetch. Hosts without the write plane 404;
+   * callers fall back to a local-only add.
+   */
+  addTeamMember(
+    input: { name: string; role: string; description?: string },
+    company?: string | null,
+  ): Promise<TeamMemberDto> {
+    return this.request<TeamMemberDto>("POST", `${this.scope(company)}/team`, input);
+  }
+
+  /** Remove an operator-added teammate. 409s for a manifest teammate (can't be removed here). */
+  removeTeamMember(agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/team/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
    * Third-party connections for a company (forward-looking surface). Hosts
    * that don't expose it yet return 404 — callers treat that as "unavailable".
    */
