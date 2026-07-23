@@ -12,20 +12,25 @@
 //! Auth is a platform token (hosting layer) or a human's session cookie; there
 //! is no unauthenticated path. See [`server::users`](crate::server::users).
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::{
-    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, Verdict,
+    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, StoredEvent, Verdict,
 };
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::error::ApiError;
@@ -54,6 +59,10 @@ pub fn router() -> Router<AppState> {
         // The company's desks (group chats), under both scope forms — the
         // console builds its chat threads from these (issue #53).
         .merge(scoped("/desks", get(list_desks)))
+        // The company → operator attention feed (issue #66): a live SSE stream of
+        // the attention-worthy events already on the company's event log, under
+        // both scope forms.
+        .merge(scoped("/events", get(company_events)))
 }
 
 /// One desk (group chat) as the console renders it. Mirrors `DeskDto` in
@@ -98,6 +107,134 @@ async fn list_desks(scope: ScopedCompany) -> Result<Json<Vec<DeskDto>>, Response
         })
         .unwrap_or_default();
     Ok(Json(desks))
+}
+
+/// Logs SSE stream teardown when the subscriber disconnects. Held inside the
+/// projection closure so it drops exactly when the response body is dropped.
+struct SseStreamGuard(CompanyId);
+
+impl Drop for SseStreamGuard {
+    fn drop(&mut self) {
+        tracing::debug!(company = %self.0, "operator SSE stream closed");
+    }
+}
+
+/// `GET {scope}/events` — the company → operator attention feed (issue #66).
+///
+/// Subscribes to the company's [`EventLog`](crate::ports::EventLog) and streams a
+/// **safe projection** of each attention-worthy [`CompanyEvent`] to the console
+/// as Server-Sent Events. Only domain fields already present on the event reach
+/// the wire — never a token, secret, credential, or raw webhook/tool payload —
+/// and events that carry no attention signal (or that carry raw internal state)
+/// are dropped entirely (see [`project_event`]). Auth rides the same
+/// [`ScopedCompany`] guard as every other company-scoped route: the browser's
+/// `EventSource` sends the session cookie same-origin, so no new auth path is
+/// introduced.
+async fn company_events(
+    scope: ScopedCompany,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let company = scope.id().clone();
+    tracing::debug!(company = %company, "operator SSE stream opening");
+    let guard = SseStreamGuard(company.clone());
+    let stream = scope
+        .runtime
+        .events()
+        .subscribe(&company)
+        .filter_map(move |stored| {
+            // Keep the teardown guard alive for the life of the stream.
+            let _ = &guard;
+            let event =
+                project_event(&stored).map(|value| Ok(Event::default().data(value.to_string())));
+            std::future::ready(event)
+        });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// Projects a stored event into the safe SSE wire shape, or `None` to drop it.
+///
+/// The projection is deny-by-default: every emitted object carries only
+/// domain fields that already exist on the [`CompanyEvent`], and any variant not
+/// explicitly listed — `OperatorMessage` (the operator's own echo),
+/// `WebhookReceived` / `A2aTaskReceived` (raw third-party payloads),
+/// `ScheduleFired`, `FeedbackFiled`, `MemoryFactDeleted` — is dropped so nothing
+/// unexpected (or secret-bearing) ever reaches the console. The actor (`by`) on
+/// `ApprovalResolved` / `LifecycleChanged` is intentionally omitted: the console
+/// renders the attention item without it, and it can carry a user id.
+fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
+    use serde_json::json;
+
+    let envelope = |ty: &str| {
+        json!({
+            "type": ty,
+            "seq": stored.seq.value(),
+            "atMillis": stored.at_millis,
+        })
+    };
+
+    let value = match &stored.event {
+        CompanyEvent::AgentReply {
+            chat_id,
+            agent_id,
+            text,
+        } => {
+            let mut o = envelope("agent_reply");
+            o["chatId"] = json!(chat_id);
+            o["agentId"] = json!(agent_id);
+            o["text"] = json!(text);
+            o
+        }
+        CompanyEvent::TaskDispatched { task_id } => {
+            let mut o = envelope("task_dispatched");
+            o["taskId"] = json!(task_id);
+            o
+        }
+        // `message` is scrubbed at the source (`OcMcpCallTool` → `HarnessBrain`
+        // drain), so it can never carry a credential, response body, or URL query
+        // string — safe to forward verbatim. See `CompanyEvent::McpCallFailed`.
+        CompanyEvent::McpCallFailed {
+            server,
+            tool,
+            status,
+            message,
+        } => {
+            let mut o = envelope("mcp_call_failed");
+            o["server"] = json!(server);
+            o["tool"] = json!(tool);
+            o["status"] = json!(status);
+            o["message"] = json!(message);
+            o
+        }
+        CompanyEvent::ApprovalResolved {
+            approval_id,
+            verdict,
+            ..
+        } => {
+            let mut o = envelope("approval_resolved");
+            o["approvalId"] = json!(approval_id.as_ref());
+            o["verdict"] = json!(verdict);
+            o
+        }
+        CompanyEvent::LifecycleChanged { from, to, .. } => {
+            let mut o = envelope("lifecycle_changed");
+            o["from"] = json!(from);
+            o["to"] = json!(to);
+            o
+        }
+        CompanyEvent::PaymentReceived { amount_usd, memo } => {
+            let mut o = envelope("payment_received");
+            o["amountUsd"] = json!(amount_usd);
+            o["memo"] = json!(memo);
+            o
+        }
+        // Not an attention signal, or carries a raw payload we never put on the
+        // wire — dropped.
+        _ => return None,
+    };
+    Some(value)
 }
 
 fn lookup(state: &AppState, id: &str) -> Result<Arc<CompanyRuntime>, ApiError> {
@@ -874,6 +1011,201 @@ mod test {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // ---- issue #66: the operator attention SSE feed ----
+
+    use crate::ports::types::{EventSeq, StoredEvent};
+
+    fn stored(event: CompanyEvent) -> StoredEvent {
+        StoredEvent {
+            seq: EventSeq::new(7),
+            company: CompanyId::new("acme"),
+            event,
+            at_millis: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn projects_agent_reply_with_only_chat_fields() {
+        let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            chat_id: "General".into(),
+            agent_id: "ceo".into(),
+            text: "shipped it".into(),
+        }))
+        .expect("agent_reply is an attention signal");
+        assert_eq!(v["type"], "agent_reply");
+        assert_eq!(v["seq"], 7);
+        assert_eq!(v["atMillis"], 1_700_000_000_000_u64);
+        assert_eq!(v["chatId"], "General");
+        assert_eq!(v["agentId"], "ceo");
+        assert_eq!(v["text"], "shipped it");
+    }
+
+    #[test]
+    fn projects_task_dispatched() {
+        let v = super::project_event(&stored(CompanyEvent::TaskDispatched {
+            task_id: "t-42".into(),
+        }))
+        .expect("task_dispatched is an attention signal");
+        assert_eq!(v["type"], "task_dispatched");
+        assert_eq!(v["taskId"], "t-42");
+    }
+
+    #[test]
+    fn projects_mcp_call_failed_with_scrubbed_message() {
+        let v = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            server: "browserbase".into(),
+            tool: "browse".into(),
+            status: "tool_call_rejected".into(),
+            message: "server rejected the call".into(),
+        }))
+        .expect("mcp_call_failed is an attention signal");
+        assert_eq!(v["type"], "mcp_call_failed");
+        assert_eq!(v["server"], "browserbase");
+        assert_eq!(v["tool"], "browse");
+        assert_eq!(v["status"], "tool_call_rejected");
+        // The message is already scrubbed at the source; we forward exactly it.
+        assert_eq!(v["message"], "server rejected the call");
+    }
+
+    #[test]
+    fn projects_approval_resolved_without_the_actor() {
+        let v = super::project_event(&stored(CompanyEvent::ApprovalResolved {
+            approval_id: ApprovalId::new("ap-1"),
+            verdict: Verdict::Approve,
+            by: Actor {
+                kind: ActorKind::User,
+                // A user id must never reach the wire via the attention feed.
+                id: "secret-user-id".into(),
+            },
+        }))
+        .expect("approval_resolved is an attention signal");
+        assert_eq!(v["type"], "approval_resolved");
+        assert_eq!(v["approvalId"], "ap-1");
+        assert_eq!(v["verdict"], "approve");
+        // The actor is intentionally dropped — the projection carries no `by`,
+        // and the serialized bytes never mention the user id.
+        assert!(v.get("by").is_none(), "actor must not be projected");
+        assert!(
+            !v.to_string().contains("secret-user-id"),
+            "user id leaked onto the wire"
+        );
+    }
+
+    #[test]
+    fn projects_lifecycle_changed_without_the_actor() {
+        let v = super::project_event(&stored(CompanyEvent::LifecycleChanged {
+            from: "running".into(),
+            to: "paused".into(),
+            by: Actor {
+                kind: ActorKind::Operator,
+                id: "operator".into(),
+            },
+        }))
+        .expect("lifecycle_changed is an attention signal");
+        assert_eq!(v["type"], "lifecycle_changed");
+        assert_eq!(v["from"], "running");
+        assert_eq!(v["to"], "paused");
+        assert!(v.get("by").is_none(), "actor must not be projected");
+    }
+
+    #[test]
+    fn projects_payment_received() {
+        let v = super::project_event(&stored(CompanyEvent::PaymentReceived {
+            amount_usd: 25.0,
+            memo: "invoice #1".into(),
+        }))
+        .expect("payment_received is an attention signal");
+        assert_eq!(v["type"], "payment_received");
+        assert_eq!(v["amountUsd"], 25.0);
+        assert_eq!(v["memo"], "invoice #1");
+    }
+
+    #[test]
+    fn drops_non_attention_and_raw_payload_events() {
+        // The operator's own message, and every variant that carries a raw
+        // third-party payload or is audit-only, is dropped so nothing unexpected
+        // (or secret-bearing) ever reaches the console.
+        let dropped = [
+            CompanyEvent::OperatorMessage {
+                text: "hi".into(),
+                by: None,
+                chat: None,
+            },
+            CompanyEvent::WebhookReceived {
+                channel: "email".into(),
+                body: serde_json::json!({"authorization": "Bearer sk-secret"}),
+            },
+            CompanyEvent::A2aTaskReceived {
+                from: "@peer".into(),
+                task: serde_json::json!({"token": "sk-secret"}),
+            },
+            CompanyEvent::ScheduleFired {
+                cron: "0 9 * * *".into(),
+                prompt: "daily standup".into(),
+            },
+            CompanyEvent::FeedbackFiled {
+                note: "too slow".into(),
+            },
+            CompanyEvent::MemoryFactDeleted {
+                fact_id: "f-1".into(),
+            },
+        ];
+        for event in dropped {
+            assert!(
+                super::project_event(&stored(event.clone())).is_none(),
+                "event should be dropped from the SSE feed: {event:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn events_route_streams_text_event_stream() {
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/events")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The SSE head is returned immediately; the body streams indefinitely, so
+        // we assert the status + content-type without draining it.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn events_route_requires_a_session() {
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }
