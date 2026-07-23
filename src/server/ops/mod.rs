@@ -15,6 +15,7 @@
 //! mocks in tests, real impls when a feature is on); the OAuth write routes are
 //! compiled only under the `oauth` feature and 404 otherwise.
 
+pub mod channels;
 pub mod domain;
 pub mod inbox;
 pub mod inference;
@@ -33,7 +34,6 @@ pub mod workspace;
 
 #[cfg(feature = "oauth")]
 pub mod connections;
-pub mod channels;
 
 pub(crate) use scope::{ScopedCompany, scoped};
 
