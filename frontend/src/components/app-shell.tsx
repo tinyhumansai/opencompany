@@ -9,6 +9,7 @@ import {
   type LucideIcon,
   MessageSquareWarning,
   MessagesSquare,
+  PanelsTopLeft,
   Plug,
   Settings2,
   ShieldCheck,
@@ -56,6 +57,7 @@ import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
 import { TeamView } from "@/views/TeamView";
+import { DesksView } from "@/views/DesksView";
 import { PeopleView } from "@/views/PeopleView";
 import { SkillsView } from "@/views/SkillsView";
 import { InboxView } from "@/views/InboxView";
@@ -87,6 +89,7 @@ export type View =
   | "inbox"
   | "tasks"
   | "team"
+  | "desks"
   | "skills"
   | "workspace"
   | "memory"
@@ -119,6 +122,7 @@ const NAV: NavGroup[] = [
       { view: "inbox", label: "Inbox", icon: Inbox },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "team", label: "Team", icon: Users },
+      { view: "desks", label: "Desks", icon: PanelsTopLeft },
       { view: "skills", label: "Skills", icon: Sparkles },
       { view: "workspace", label: "Workspace", icon: FolderClosed },
       { view: "memory", label: "Brain", icon: Brain },
@@ -149,6 +153,7 @@ const TITLES: Record<View, string> = {
   inbox: "Inbox",
   tasks: "Tasks",
   team: "Team",
+  desks: "Desks",
   skills: "Skills",
   workspace: "Workspace",
   memory: "Brain",
@@ -323,6 +328,7 @@ export function AppShell({
           {view === "inbox" && <InboxView company={company} />}
           {view === "tasks" && <TasksView client={client} company={company} />}
           {view === "team" && <TeamView client={client} company={company} />}
+          {view === "desks" && <DesksView client={client} company={company} />}
           {view === "people" && <PeopleView client={client} company={company} />}
           {view === "skills" && <SkillsView client={client} company={company} />}
           {view === "memory" && <MemoryView client={client} company={company} />}

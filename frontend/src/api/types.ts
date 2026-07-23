@@ -55,7 +55,14 @@ export interface DeskDto {
   id: string;
   name: string;
   description?: string;
+  /** Effective members: manifest members unioned with overlay additions. */
   members: string[];
+  /**
+   * The subset of `members` added through the operator overlay (issue #72).
+   * Only these can be removed at runtime; manifest members are part of the
+   * company blueprint. Omitted (undefined) when there are none.
+   */
+  overlayMembers?: string[];
 }
 
 /** Response of `/chat` and approval-resolution routes. */
