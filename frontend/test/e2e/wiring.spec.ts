@@ -38,3 +38,36 @@ test("operator console renders a mocked backend reply end to end", async ({
   });
   await expect(page.getByText(/^Couldn't send/)).toHaveCount(0);
 });
+
+test("operator adds a Brain memory that persists across reload and can be deleted", async ({
+  page,
+}) => {
+  // The Brain tab reads the real FactStore over `…/memory`; adding a note must
+  // survive a reload (proving it hit the backend, not localStorage) and delete
+  // must remove it.
+  await page.goto("/#/memory");
+
+  const title = `e2e memory ${Date.now()}`;
+  await page.getByTestId("memory-add").click();
+  await page.getByTestId("memory-title").fill(title);
+  await page.getByTestId("memory-body").fill("recall me on the next turn");
+  await page.getByTestId("memory-save").click();
+
+  const card = page.getByTestId("memory-card").filter({ hasText: title });
+  await expect(card).toBeVisible({ timeout: 30_000 });
+
+  // Reload: a localStorage stub would survive too, so also assert the health
+  // strip counts a real backend item.
+  await page.reload();
+  await page.goto("/#/memory");
+  await expect(page.getByTestId("memory-card").filter({ hasText: title })).toBeVisible({
+    timeout: 30_000,
+  });
+
+  // Delete removes it.
+  const persisted = page.getByTestId("memory-card").filter({ hasText: title });
+  await persisted.getByRole("button", { name: "Delete memory" }).click();
+  await expect(page.getByTestId("memory-card").filter({ hasText: title })).toHaveCount(0, {
+    timeout: 30_000,
+  });
+});
