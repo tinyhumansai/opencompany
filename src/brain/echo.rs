@@ -12,7 +12,7 @@ use crate::Result;
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
     CompanyEvent, CompressedTrace, CycleRequest, CycleResult, Effect, EffectGroup, OutboundMessage,
-    TokenUsage,
+    ReplyTo, TokenUsage,
 };
 
 /// The offline echo brain: turns operator messages into acknowledgements.
@@ -49,6 +49,34 @@ impl Brain for EchoBrain {
                     text: format!("You said: {text}"),
                     steps: Vec::new(),
                     reply_to: None,
+                });
+            }
+            if let CompanyEvent::WebhookReceived { channel, body } = event {
+                let (text, reply_to) = if channel == "telegram" {
+                    let chat_id = body
+                        .get("message")
+                        .and_then(|m| m.get("chat"))
+                        .and_then(|c| c.get("id"))
+                        .and_then(|id| id.as_i64());
+                    let user_text = body
+                        .get("message")
+                        .and_then(|m| m.get("text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    (
+                        format!("You said: {user_text}"),
+                        chat_id.map(|id| ReplyTo {
+                            chat_id: id.to_string(),
+                        }),
+                    )
+                } else {
+                    (format!("webhook on {channel}"), None)
+                };
+                channel_responses.push(OutboundMessage {
+                    channel: channel.clone(),
+                    text,
+                    steps: Vec::new(),
+                    reply_to,
                 });
             }
         }
