@@ -140,6 +140,37 @@ impl HarnessBrain {
             .cloned()
     }
 
+    /// Drains the MCP failure queue and surfaces each failure: an
+    /// operator-visible warning bubble (the Activity-trace cell will re-skin it
+    /// as a warning step later), plus a scrubbed
+    /// [`CompanyEvent::McpCallFailed`] audit event when the event log is wired.
+    /// Every string was already scrubbed at the source (`OcMcpCallTool`).
+    async fn surface_mcp_failures(&self, responses: &mut Vec<OutboundMessage>) -> Result<()> {
+        for failure in self.deps.mcp_failures.drain() {
+            responses.push(OutboundMessage {
+                channel: "operator".to_string(),
+                text: format!(
+                    "⚠️ MCP tool issue on '{}': {}",
+                    failure.server, failure.scrubbed_message
+                ),
+            });
+            if let Some(events) = self.deps.events.as_ref() {
+                events
+                    .append(
+                        &self.record.id,
+                        CompanyEvent::McpCallFailed {
+                            server: failure.server,
+                            tool: failure.tool,
+                            status: failure.status,
+                            message: failure.scrubbed_message,
+                        },
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Executes one drained delegation from the orchestrator's turn.
     ///
     /// `spawn_task` opens a backlog card through the same
@@ -221,10 +252,12 @@ impl Brain for HarnessBrain {
                 CompanyEvent::OperatorMessage { text, chat, .. } => {
                     // Route to the addressed desk's lead, else the orchestrator.
                     let responder = self.responder_for(chat.as_deref());
-                    // Clear stale delegations so nothing leaks from a prior turn,
-                    // run the turn (metered through `deps`), then drain whatever
-                    // the orchestrator queued (capped; discarded past the cap).
+                    // Clear stale delegations + MCP failures so nothing leaks from
+                    // a prior turn, run the turn (metered through `deps`), then
+                    // drain whatever the orchestrator queued (capped; discarded
+                    // past the cap).
                     self.deps.delegations.clear();
+                    self.deps.mcp_failures.clear();
                     let reply = self
                         .pool
                         .run(&self.record.id, &responder, text, &self.deps)
@@ -242,6 +275,9 @@ impl Brain for HarnessBrain {
                             channel_responses.push(message);
                         }
                     }
+                    // Surface any MCP tool-call failures the turn (or a delegated
+                    // desk turn) recorded.
+                    self.surface_mcp_failures(&mut channel_responses).await?;
                 }
                 CompanyEvent::TaskDispatched { task_id } => {
                     self.run_task(task_id).await?;
@@ -348,6 +384,8 @@ description = "Runs Acme."
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            secrets: None,
         };
         HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
     }
@@ -469,6 +507,8 @@ description = "Builds it."
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            secrets: None,
         };
         (
             HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_two()),
@@ -662,6 +702,8 @@ members = ["engineer"]
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            secrets: None,
         };
         (
             HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_with_desk()),
@@ -749,5 +791,80 @@ members = ["engineer"]
             .await
             .expect("delegation runs");
         assert!(none.is_none(), "an unknown desk is a silent no-op");
+    }
+
+    // --- MCP failure drain --------------------------------------------------
+
+    /// A recorded MCP failure surfaces as an operator bubble AND a scrubbed
+    /// `McpCallFailed` audit event when the event log is wired.
+    #[tokio::test]
+    async fn mcp_failures_surface_as_bubble_and_event() {
+        use crate::harness::mcp_probe::McpFailure;
+        use crate::ports::EventLog;
+        use crate::ports::types::EventSeq;
+        use crate::store::FsEventLog;
+
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventLog> = Arc::new(FsEventLog::new(dir.path()));
+        let failures = crate::harness::mcp_probe::McpFailureQueue::default();
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir.path())),
+            store: Arc::new(FsCompanyStore::new(dir.path())),
+            meter: None,
+            workspace_root: dir.path().to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: Some(events.clone()),
+            delegations: orchestrator::DelegationQueue::default(),
+            mcp_failures: failures.clone(),
+            secrets: None,
+        };
+        let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record());
+
+        // A failure recorded during the turn (its message already scrubbed).
+        failures.push(McpFailure {
+            server: "browserbase".into(),
+            tool: "browse".into(),
+            status: "tool_call_rejected".into(),
+            hint: None,
+            scrubbed_message: "server rejected the call".into(),
+        });
+
+        let mut responses = Vec::new();
+        brain
+            .surface_mcp_failures(&mut responses)
+            .await
+            .expect("drain surfaces failures");
+
+        assert_eq!(responses.len(), 1, "one warning bubble");
+        assert!(
+            responses[0].text.contains("browserbase"),
+            "{:?}",
+            responses[0].text
+        );
+        assert!(
+            responses[0].text.contains("rejected the call"),
+            "{:?}",
+            responses[0].text
+        );
+
+        let logged = events
+            .read_from(&CompanyId::new("acme"), EventSeq::new(0), usize::MAX)
+            .await
+            .expect("read events");
+        assert!(
+            logged.iter().any(|e| matches!(
+                &e.event,
+                CompanyEvent::McpCallFailed { server, status, .. }
+                    if server == "browserbase" && status == "tool_call_rejected"
+            )),
+            "an McpCallFailed audit event was journaled"
+        );
     }
 }

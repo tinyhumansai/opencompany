@@ -39,6 +39,15 @@ pub fn auth_key(name: &str) -> String {
     format!("mcp/{name}/auth")
 }
 
+/// The per-server health key. Holds the last probe outcome as a JSON
+/// [`McpHealth`]. **Invariant**: the value written here is always scrubbed — it
+/// is a non-secret status record and MUST NEVER carry a credential (see
+/// [`save_health`]). Distinct from [`auth_key`], which holds the write-only
+/// credential and is never read back out.
+pub fn health_key(name: &str) -> String {
+    format!("mcp/{name}/health")
+}
+
 /// Where an effective server declaration came from — drives the console's source
 /// badge and the delete-guard (a manifest server cannot be deleted, only
 /// disabled/overridden).
@@ -66,6 +75,14 @@ pub enum AuthMaterial {
     Bearer(String),
     /// A single custom request header.
     Header { name: String, value: String },
+    /// A credential carried as a URL query parameter (`?<name>=<value>`), the
+    /// BrowserBase / Parallel-Search style. The upstream transport already
+    /// applies this via `request.query()` (`mcp_client/client.rs`), so wiring it
+    /// needs zero vendor changes — but it means the credential ends up in the
+    /// request URL, which is exactly why the error-surfacing seams strip query
+    /// strings before persisting or emitting anything (see
+    /// [`crate::harness::mcp_probe::scrub`]).
+    QueryParam { name: String, value: String },
 }
 
 impl AuthMaterial {
@@ -73,6 +90,18 @@ impl AuthMaterial {
     /// `auth_configured` status field). Never reveals the value.
     pub fn is_configured(&self) -> bool {
         !matches!(self, AuthMaterial::None)
+    }
+
+    /// The concrete credential substrings this material carries, for the
+    /// scrubber's known-secret set. Never surfaced to any caller that
+    /// serializes — used only to feed [`crate::harness::mcp_probe::scrub`].
+    pub fn secret_values(&self) -> Vec<String> {
+        match self {
+            AuthMaterial::None => Vec::new(),
+            AuthMaterial::Bearer(token) => vec![token.clone()],
+            AuthMaterial::Header { value, .. } => vec![value.clone()],
+            AuthMaterial::QueryParam { value, .. } => vec![value.clone()],
+        }
     }
 }
 
@@ -83,6 +112,7 @@ impl AuthMaterial {
 enum StoredAuth {
     Bearer { token: String },
     Header { name: String, value: String },
+    QueryParam { name: String, value: String },
 }
 
 impl From<StoredAuth> for AuthMaterial {
@@ -90,6 +120,7 @@ impl From<StoredAuth> for AuthMaterial {
         match stored {
             StoredAuth::Bearer { token } => AuthMaterial::Bearer(token),
             StoredAuth::Header { name, value } => AuthMaterial::Header { name, value },
+            StoredAuth::QueryParam { name, value } => AuthMaterial::QueryParam { name, value },
         }
     }
 }
@@ -258,20 +289,55 @@ pub async fn auth_configured(
     Ok(material.is_configured())
 }
 
-/// Writes a server's bearer token (write-only intake).
+/// Writes a server's outbound credential (write-only intake). The credential is
+/// serialized to the canonical [`auth_key`] and never read back out over any
+/// API — only [`load_auth`] (harness-build + probe) crosses that boundary.
+pub async fn store_auth(
+    company: &CompanyId,
+    name: &str,
+    material: &AuthMaterial,
+    secrets: &dyn SecretStore,
+) -> Result<()> {
+    let stored = match material {
+        AuthMaterial::None => {
+            // Nothing to store — clear instead so the read-back is "unset".
+            return clear_auth(company, name, secrets).await;
+        }
+        AuthMaterial::Bearer(token) => StoredAuth::Bearer {
+            token: token.clone(),
+        },
+        AuthMaterial::Header { name, value } => StoredAuth::Header {
+            name: name.clone(),
+            value: value.clone(),
+        },
+        AuthMaterial::QueryParam { name, value } => StoredAuth::QueryParam {
+            name: name.clone(),
+            value: value.clone(),
+        },
+    };
+    let raw = serde_json::to_string(&stored)
+        .map_err(|e| OpenCompanyError::Store(format!("serializing mcp auth: {e}")))?;
+    secrets
+        .set(company, &auth_key(name), SecretValue(raw))
+        .await
+}
+
+/// Writes a server's bearer token (write-only intake). Thin back-compat wrapper
+/// over [`store_auth`]; new callers should build an [`AuthMaterial`] and use
+/// [`store_auth`] directly so custom-header / query-param intake share one path.
 pub async fn store_bearer(
     company: &CompanyId,
     name: &str,
     token: &str,
     secrets: &dyn SecretStore,
 ) -> Result<()> {
-    let raw = serde_json::to_string(&StoredAuth::Bearer {
-        token: token.to_string(),
-    })
-    .map_err(|e| OpenCompanyError::Store(format!("serializing mcp auth: {e}")))?;
-    secrets
-        .set(company, &auth_key(name), SecretValue(raw))
-        .await
+    store_auth(
+        company,
+        name,
+        &AuthMaterial::Bearer(token.to_string()),
+        secrets,
+    )
+    .await
 }
 
 /// Clears a server's stored credential (best-effort — the store has no delete,
@@ -279,6 +345,111 @@ pub async fn store_bearer(
 pub async fn clear_auth(company: &CompanyId, name: &str, secrets: &dyn SecretStore) -> Result<()> {
     secrets
         .set(company, &auth_key(name), SecretValue(String::new()))
+        .await
+}
+
+/// Clears a server's stored health (best-effort — an empty value reads back as
+/// "never probed"). Called when a runtime server is deleted so a later server of
+/// the same name never inherits a stale badge.
+pub async fn clear_health(
+    company: &CompanyId,
+    name: &str,
+    secrets: &dyn SecretStore,
+) -> Result<()> {
+    secrets
+        .set(company, &health_key(name), SecretValue(String::new()))
+        .await
+}
+
+/// The coarse health status of an MCP server, shown as the console badge.
+///
+/// Serialized `snake_case`; the frontend maps it to a green/amber/red tier. Kept
+/// deliberately small — a single actionable status plus an operator-facing
+/// (scrubbed) message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpStatus {
+    /// Reached the server and listed its tools — fully working.
+    Ok,
+    /// The server is reachable but needs a credential the operator hasn't
+    /// supplied (401 with no/rejected credential, or an OAuth challenge). A
+    /// valid, expected resting state for a just-added server — never a rollback.
+    NeedsConfig,
+    /// The server could not be used: unreachable, wrong URL, not an MCP
+    /// endpoint, a 5xx, a TLS failure, or a rejected call.
+    Error,
+    /// The probe did not run (non-`openhuman` build, or never attempted).
+    Unknown,
+}
+
+impl McpStatus {
+    /// The stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpStatus::Ok => "ok",
+            McpStatus::NeedsConfig => "needs_config",
+            McpStatus::Error => "error",
+            McpStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// The last probe outcome for one MCP server.
+///
+/// **Security invariant**: `message` is always scrubbed before it reaches this
+/// struct (via [`crate::harness::mcp_probe::scrub`]) and this struct is the only
+/// thing [`save_health`] persists — so a credential can never land in the health
+/// key, the console, or an API response. `auth_hint` is a stable reason code
+/// (`oauth_required` / `token_rejected` / `credential_required`), never a URL or
+/// raw challenge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpHealth {
+    /// The coarse status tier.
+    pub status: McpStatus,
+    /// A short, scrubbed, operator-facing message.
+    pub message: String,
+    /// How many tools the server advertised on a successful probe.
+    pub tool_count: u32,
+    /// Epoch-millis timestamp of the probe.
+    pub checked_at_millis: u64,
+    /// Stable auth-failure reason code, when the status is a credential problem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_hint: Option<String>,
+}
+
+/// Loads a server's last recorded health, or `None` when it has never been
+/// probed (missing/empty key). A malformed record degrades to `None` rather than
+/// erroring — a stale badge is never worth bricking a status read.
+pub async fn load_health(
+    company: &CompanyId,
+    name: &str,
+    secrets: &dyn SecretStore,
+) -> Result<Option<McpHealth>> {
+    let Some(SecretValue(raw)) = secrets.get(company, &health_key(name)).await? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(&raw).ok())
+}
+
+/// Persists a server's probe outcome under [`health_key`].
+///
+/// The caller is responsible for having scrubbed `health.message` first; this
+/// function does not re-scrub (the scrubber needs the known-secret set, which
+/// lives at the probe seam). Nothing secret should ever reach here.
+pub async fn save_health(
+    company: &CompanyId,
+    name: &str,
+    health: &McpHealth,
+    secrets: &dyn SecretStore,
+) -> Result<()> {
+    let raw = serde_json::to_string(health)
+        .map_err(|e| OpenCompanyError::Store(format!("serializing mcp health: {e}")))?;
+    secrets
+        .set(company, &health_key(name), SecretValue(raw))
         .await
 }
 
@@ -359,6 +530,14 @@ pub fn validate_one(label: &str, server: &McpServer) -> Vec<String> {
         problems.push(format!(
             "{label} `endpoint` must be an `http://` or `https://` URL — you wrote `{endpoint}`."
         ));
+    } else if has_userinfo(endpoint) {
+        // A `user:pass@host` endpoint smuggles a credential into the URL, which
+        // then leaks into every log line and transport error. Reject it — the
+        // operator should use a token / custom-header / query-parameter
+        // credential (stored write-only) instead.
+        problems.push(format!(
+            "{label} `endpoint` must not embed credentials in the URL (the `user:pass@host` form) — leave the endpoint credential-free and set a token or query-parameter credential instead."
+        ));
     }
 
     problems
@@ -368,6 +547,44 @@ pub fn validate_one(label: &str, server: &McpServer) -> Vec<String> {
 fn is_http_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Whether an endpoint's authority carries a `user[:pass]@` userinfo section.
+/// Uses the same cheap authority-splitting as [`crate::harness::mcp_probe::scrub`]
+/// so a `?email=a@b` query never trips it.
+fn has_userinfo(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority.contains('@')
+}
+
+/// A **non-blocking** advisory when an endpoint's query string carries a
+/// key-ish parameter (`apiKey` / `token` / `secret` / …).
+///
+/// This is not an error: some providers legitimately put a *non-secret* id in
+/// the URL (BrowserBase's `projectId`). But a real secret in the endpoint URL
+/// leaks into logs and transport errors, so the ops layer surfaces this as a
+/// gentle nudge toward the write-only query-parameter credential intake. Returns
+/// `None` when nothing key-ish is present.
+pub fn endpoint_secret_advisory(endpoint: &str) -> Option<String> {
+    let (_, query) = endpoint.split_once('?')?;
+    const KEYISH: [&str; 8] = [
+        "apikey", "token", "secret", "password", "passwd", "access", "auth", "key",
+    ];
+    let hit = query
+        .split(['&', ';'])
+        .filter_map(|kv| kv.split('=').next())
+        .any(|param| {
+            let param = param.trim().to_ascii_lowercase();
+            KEYISH.iter().any(|needle| param.contains(needle))
+        });
+    hit.then(|| {
+        "the endpoint URL looks like it carries a secret in its query string — a credential in the URL can leak into logs and errors, so prefer the write-only query-parameter credential (only a non-secret id like a project id belongs in the URL)."
+            .to_string()
+    })
 }
 
 /// De-dupes and trims a tool-name list, dropping blanks.
@@ -544,5 +761,127 @@ mod tests {
         clear_auth(&company, "notion", &secrets).await.unwrap();
         let material = load_auth(&company, "notion", &secrets, None).await.unwrap();
         assert_eq!(material, AuthMaterial::None);
+    }
+
+    // ---- query-param auth (BrowserBase style) -----------------------------
+
+    #[tokio::test]
+    async fn store_and_resolve_query_param_auth_round_trips() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        save_runtime_index(
+            &company,
+            &secrets,
+            &[server(
+                "browserbase",
+                "https://api.browserbase.com/mcp?projectId=pid",
+            )],
+        )
+        .await
+        .unwrap();
+        store_auth(
+            &company,
+            "browserbase",
+            &AuthMaterial::QueryParam {
+                name: "apiKey".into(),
+                value: "qp-secret".into(),
+            },
+            &secrets,
+        )
+        .await
+        .unwrap();
+
+        let decls = resolve_effective(&company, &[], &secrets).await.unwrap();
+        assert_eq!(
+            decls[0].auth,
+            AuthMaterial::QueryParam {
+                name: "apiKey".into(),
+                value: "qp-secret".into(),
+            }
+        );
+        // The non-secret project id stays in the endpoint URL, unchanged.
+        assert!(decls[0].endpoint.contains("projectId=pid"));
+    }
+
+    #[test]
+    fn secret_values_lists_the_credential_for_scrubbing() {
+        assert_eq!(
+            AuthMaterial::Bearer("tok".into()).secret_values(),
+            vec!["tok".to_string()]
+        );
+        assert_eq!(
+            AuthMaterial::QueryParam {
+                name: "apiKey".into(),
+                value: "qp".into(),
+            }
+            .secret_values(),
+            vec!["qp".to_string()]
+        );
+        assert!(AuthMaterial::None.secret_values().is_empty());
+    }
+
+    // ---- health persistence -----------------------------------------------
+
+    #[tokio::test]
+    async fn health_round_trips_and_clears() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        assert_eq!(
+            load_health(&company, "notion", &secrets).await.unwrap(),
+            None
+        );
+
+        let health = McpHealth {
+            status: McpStatus::Ok,
+            message: "8 tools available".into(),
+            tool_count: 8,
+            checked_at_millis: 123,
+            auth_hint: None,
+        };
+        save_health(&company, "notion", &health, &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_health(&company, "notion", &secrets).await.unwrap(),
+            Some(health)
+        );
+
+        clear_health(&company, "notion", &secrets).await.unwrap();
+        assert_eq!(
+            load_health(&company, "notion", &secrets).await.unwrap(),
+            None
+        );
+    }
+
+    // ---- endpoint validation ----------------------------------------------
+
+    #[test]
+    fn userinfo_endpoint_is_rejected() {
+        let problems = validate_servers(&[server("creds", "https://user:pass@host/mcp")]);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("must not embed credentials")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn email_in_query_is_not_mistaken_for_userinfo() {
+        // The '@' lives in the query, not the authority — must stay valid.
+        assert!(validate_servers(&[server("ok", "https://host/mcp?to=a@b.com")]).is_empty());
+    }
+
+    #[test]
+    fn secret_in_query_is_a_non_blocking_advisory() {
+        // A key-ish query param yields an advisory but NOT a validation error.
+        assert!(endpoint_secret_advisory("https://host/mcp?apiKey=sk-123").is_some());
+        assert!(
+            validate_servers(&[server("browserbase", "https://host/mcp?apiKey=sk-123")]).is_empty()
+        );
+        // A non-secret id (BrowserBase's projectId) is fine — no advisory.
+        assert!(endpoint_secret_advisory("https://host/mcp?projectId=pid").is_none());
+        // No query string at all — no advisory.
+        assert!(endpoint_secret_advisory("https://host/mcp").is_none());
     }
 }

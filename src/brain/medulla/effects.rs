@@ -108,6 +108,17 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Dispatched task {task_id}"),
             "task.dispatched",
         ),
+        CompanyEvent::McpCallFailed {
+            server,
+            tool,
+            status,
+            message,
+        } => (
+            Role::System,
+            "mcp".to_string(),
+            format!("MCP call to {server}/{tool} failed ({status}): {message}"),
+            "mcp.call_failed",
+        ),
     };
     WireEvent {
         seq,

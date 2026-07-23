@@ -10,7 +10,10 @@
 // the shared client), so no change to `OpenCompanyClient` is needed.
 
 import type { OpenCompanyClient } from "./client";
-import type { McpMutationResponse, McpServer, McpToolInfo } from "./types";
+import type { McpHealth, McpMutationResponse, McpServer, McpToolInfo } from "./types";
+
+/** The auth scheme a write-only credential is stored under. */
+export type McpAuthKind = "bearer" | "header" | "query_param";
 
 /** The company's effective MCP servers. */
 export function listMcpServers(
@@ -20,7 +23,11 @@ export function listMcpServers(
   return client.get<McpServer[]>(`${client.scopeFor(company)}/mcp/servers`);
 }
 
-/** The add-a-runtime-server body. `token` is write-only (never returned). */
+/**
+ * The add-a-runtime-server body. `token` is write-only (never returned).
+ * `authKind` selects how it's stored: `bearer` (default), a custom `header`
+ * (with `headerName`), or a `query_param` (with `paramName`).
+ */
 export interface AddMcpServer {
   name: string;
   endpoint: string;
@@ -29,6 +36,9 @@ export interface AddMcpServer {
   disallowedTools?: string[];
   timeoutSecs?: number;
   token?: string;
+  authKind?: McpAuthKind;
+  headerName?: string;
+  paramName?: string;
 }
 
 /** Add a runtime MCP server (optionally with an outbound token). */
@@ -48,8 +58,11 @@ export interface UpdateMcpServer {
   allowedTools?: string[];
   disallowedTools?: string[];
   timeoutSecs?: number;
-  /** Rotate the outbound token (write-only). Omit to leave it unchanged. */
+  /** Rotate the outbound credential (write-only). Omit to leave it unchanged. */
   token?: string;
+  authKind?: McpAuthKind;
+  headerName?: string;
+  paramName?: string;
 }
 
 /** Update a server (enable/disable, tool lists, endpoint, or rotate token). */
@@ -84,5 +97,20 @@ export function discoverMcpTools(
 ): Promise<McpToolInfo[]> {
   return client.get<McpToolInfo[]>(
     `${client.scopeFor(company)}/mcp/servers/${encodeURIComponent(name)}/tools`,
+  );
+}
+
+/**
+ * Probe a server on demand and return its (scrubbed) health. 404 `not_wired`
+ * when the harness is off.
+ */
+export function testMcpServer(
+  client: OpenCompanyClient,
+  company: string | null,
+  name: string,
+): Promise<McpHealth> {
+  return client.post<McpHealth>(
+    `${client.scopeFor(company)}/mcp/servers/${encodeURIComponent(name)}/test`,
+    {},
   );
 }

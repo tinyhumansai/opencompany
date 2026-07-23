@@ -942,3 +942,149 @@ async fn mcp_discovery_is_not_wired_without_the_feature() {
     assert_eq!(body["code"], "not_wired");
     tokio::fs::remove_dir_all(&home).await.ok();
 }
+
+/// A `user:pass@host` endpoint smuggles a credential into the URL — rejected as
+/// a 400 (the error-hardening cell's validate-on-add).
+#[tokio::test]
+async fn mcp_userinfo_endpoint_is_rejected() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "creds", "endpoint": "https://user:pass@host/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// A query-parameter credential (BrowserBase style) round-trips write-only:
+/// `authConfigured` flips true, the value never appears in the response, and a
+/// non-secret id left in the endpoint URL raises the non-blocking advisory.
+#[tokio::test]
+async fn mcp_query_param_auth_round_trips_write_only_with_advisory() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    let (status, added) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({
+            "name": "browserbase",
+            // A secret-looking query param triggers the advisory; the real
+            // credential rides write-only as a query-parameter auth.
+            "endpoint": "https://api.browserbase.com/mcp?apiKey=leftover",
+            "authKind": "query_param",
+            "paramName": "apiKey",
+            "token": "qp-secret-xyz"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(added["server"]["authConfigured"], true);
+    assert!(
+        added["warning"].as_str().is_some(),
+        "a secret-looking endpoint query raises the advisory: {added}"
+    );
+    assert!(
+        !serde_json::to_string(&added)
+            .unwrap()
+            .contains("qp-secret-xyz"),
+        "the query-parameter credential leaked into the response"
+    );
+
+    // A query_param auth WITHOUT a paramName is a 400.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({
+            "name": "noparam",
+            "endpoint": "https://host/mcp",
+            "authKind": "query_param",
+            "token": "x"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Without the `openhuman` feature the on-demand Test route is "not wired".
+#[cfg(not(feature = "openhuman"))]
+#[tokio::test]
+async fn mcp_test_route_is_not_wired_without_the_feature() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "notion", "endpoint": "https://notion.example/mcp" })),
+    )
+    .await;
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers/notion/test",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_wired");
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Under the `openhuman` feature, adding a server probes it — and a probe that
+/// fails (dead endpoint) is **never** rolled back: the server stays added, and
+/// its scrubbed health is returned as `test` and persisted onto the GET shape.
+#[cfg(feature = "openhuman")]
+#[tokio::test]
+async fn mcp_add_probes_without_rollback_and_persists_health() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // A syntactically valid but unreachable endpoint (nothing listening).
+    let (status, added) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "dead", "endpoint": "http://127.0.0.1:1/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // No rollback — the server is present despite the failed probe.
+    assert_eq!(added["server"]["name"], "dead");
+    // The probe result is echoed and the status is a non-ok tier.
+    assert!(added["test"].is_object(), "probe result echoed: {added}");
+    assert_ne!(added["test"]["status"], "ok");
+
+    // The health is persisted onto the GET shape too.
+    let (_, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    let server = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "dead")
+        .expect("server present");
+    assert!(server["health"].is_object(), "health persisted: {server}");
+
+    // On-demand Test re-probes and returns health.
+    let (status, health) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers/dead/test",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        health["status"].is_string(),
+        "test returns health: {health}"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}

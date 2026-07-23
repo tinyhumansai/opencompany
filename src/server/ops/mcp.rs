@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::McpServer;
 use crate::company::mcp::{
-    self, McpSource, clear_auth, load_runtime_index, resolve_effective, save_runtime_index,
-    store_bearer, validate_one,
+    self, AuthMaterial, McpHealth, McpSource, clear_auth, clear_health, endpoint_secret_advisory,
+    load_health, load_runtime_index, resolve_effective, save_runtime_index, store_auth,
+    validate_one,
 };
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
@@ -44,10 +45,12 @@ pub fn router() -> Router<AppState> {
             put(update_server).delete(delete_server),
         ))
         .merge(scoped("/mcp/servers/{name}/tools", get(discover_tools)))
+        .merge(scoped("/mcp/servers/{name}/test", post(test_server)))
 }
 
 /// One effective MCP server as the console renders it. **Never** carries a
-/// credential — only a non-secret `authConfigured` flag.
+/// credential — only a non-secret `authConfigured` flag and the last (scrubbed)
+/// probe `health`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct McpServerDto {
@@ -62,17 +65,42 @@ struct McpServerDto {
     timeout_secs: u64,
     /// Whether an outbound credential is stored — never the credential itself.
     auth_configured: bool,
+    /// The last recorded probe outcome (scrubbed), or `None` when never probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<McpHealth>,
 }
 
-/// A mutating response: the resulting server plus the rebuild reminder.
+/// A mutating response: the resulting server, the rebuild reminder, the live
+/// probe result (`None` on a non-`openhuman` build), and any non-blocking
+/// endpoint advisory.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MutationResponse {
     server: McpServerDto,
     note: String,
+    /// The result of probing the server right after the mutation. `None` when
+    /// probing isn't wired (default build). The server is **never** rolled back
+    /// on a failed probe — a needs-config result is a valid resting state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test: Option<McpHealth>,
+    /// A non-blocking advisory (e.g. a secret-looking query string in the URL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
-/// Add-server body. `token` is write-only intake.
+/// The auth scheme an intake body selects. `bearer` (default) uses `token` as
+/// an `Authorization: Bearer`; `header` uses `headerName` + `token`;
+/// `query_param` uses `paramName` + `token` (the BrowserBase style).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AuthKind {
+    #[default]
+    Bearer,
+    Header,
+    QueryParam,
+}
+
+/// Add-server body. Credential fields are write-only intake.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddServer {
@@ -86,9 +114,20 @@ struct AddServer {
     disallowed_tools: Vec<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
-    /// The outbound bearer token, stored write-only. Omit to leave auth unset.
+    /// The outbound credential value, stored write-only. Omit to leave auth
+    /// unset. Interpreted per [`AuthKind`].
     #[serde(default)]
     token: Option<String>,
+    /// The auth scheme; defaults to `bearer` (back-compat — a bare `token` is a
+    /// bearer token exactly as before).
+    #[serde(default)]
+    auth_kind: AuthKind,
+    /// The header name, when `authKind == header`.
+    #[serde(default)]
+    header_name: Option<String>,
+    /// The query-parameter name, when `authKind == query_param`.
+    #[serde(default)]
+    param_name: Option<String>,
 }
 
 /// Update-server body — every field optional (only set fields are applied).
@@ -107,9 +146,59 @@ struct UpdateServer {
     disallowed_tools: Option<Vec<String>>,
     #[serde(default)]
     timeout_secs: Option<u64>,
-    /// Rotate the outbound token (write-only). Omit to leave it unchanged.
+    /// Rotate the outbound credential (write-only). Omit to leave it unchanged.
     #[serde(default)]
     token: Option<String>,
+    /// The auth scheme for a rotated credential; defaults to `bearer`.
+    #[serde(default)]
+    auth_kind: AuthKind,
+    /// The header name, when `authKind == header`.
+    #[serde(default)]
+    header_name: Option<String>,
+    /// The query-parameter name, when `authKind == query_param`.
+    #[serde(default)]
+    param_name: Option<String>,
+}
+
+/// Builds the [`AuthMaterial`] a write-only intake describes, or `None` when no
+/// credential value was supplied (leave auth unchanged). Returns a 400 when a
+/// scheme is missing its companion field.
+fn auth_material_from(
+    token: Option<&str>,
+    kind: AuthKind,
+    header_name: Option<&str>,
+    param_name: Option<&str>,
+) -> Result<Option<AuthMaterial>, ApiError> {
+    let Some(value) = non_empty(token) else {
+        return Ok(None);
+    };
+    let value = value.to_string();
+    let material = match kind {
+        AuthKind::Bearer => AuthMaterial::Bearer(value),
+        AuthKind::Header => {
+            let name = non_empty(header_name).ok_or_else(|| {
+                ApiError(OpenCompanyError::InvalidRequest(
+                    "a custom-header credential needs a `headerName`.".to_string(),
+                ))
+            })?;
+            AuthMaterial::Header {
+                name: name.to_string(),
+                value,
+            }
+        }
+        AuthKind::QueryParam => {
+            let name = non_empty(param_name).ok_or_else(|| {
+                ApiError(OpenCompanyError::InvalidRequest(
+                    "a query-parameter credential needs a `paramName`.".to_string(),
+                ))
+            })?;
+            AuthMaterial::QueryParam {
+                name: name.to_string(),
+                value,
+            }
+        }
+    };
+    Ok(Some(material))
 }
 
 /// The sub-resource path (`name`).
@@ -125,8 +214,9 @@ async fn manifest_servers(runtime: &CompanyRuntime) -> Result<Vec<McpServer>, Ap
 }
 
 /// Projects an effective decl (already merged + auth-resolved) to the console
-/// DTO, reducing the resolved credential to a boolean.
-fn dto_from_decl(decl: &mcp::McpServerDecl) -> McpServerDto {
+/// DTO, reducing the resolved credential to a boolean and attaching the last
+/// (scrubbed) probe health.
+fn dto_from_decl(decl: &mcp::McpServerDecl, health: Option<McpHealth>) -> McpServerDto {
     McpServerDto {
         name: decl.name.clone(),
         endpoint: decl.endpoint.clone(),
@@ -137,17 +227,26 @@ fn dto_from_decl(decl: &mcp::McpServerDecl) -> McpServerDto {
         disallowed_tools: decl.disallowed_tools.clone(),
         timeout_secs: decl.timeout_secs,
         auth_configured: decl.auth.is_configured(),
+        health,
     }
 }
 
-/// `GET …/mcp/servers` — the company's effective MCP servers.
+/// `GET …/mcp/servers` — the company's effective MCP servers, each with its last
+/// recorded (scrubbed) probe health.
 async fn list_servers(company: ScopedCompany) -> Result<Json<Vec<McpServerDto>>, ApiError> {
     let runtime = company.runtime.as_ref();
     let manifest = manifest_servers(runtime).await?;
     let decls = resolve_effective(runtime.id(), &manifest, runtime.secrets().as_ref())
         .await
         .map_err(ApiError)?;
-    Ok(Json(decls.iter().map(dto_from_decl).collect()))
+    let mut out = Vec::with_capacity(decls.len());
+    for decl in &decls {
+        let health = load_health(runtime.id(), &decl.name, runtime.secrets().as_ref())
+            .await
+            .map_err(ApiError)?;
+        out.push(dto_from_decl(decl, health));
+    }
+    Ok(Json(out))
 }
 
 /// `POST …/mcp/servers` — add a runtime MCP server (+ optional token).
@@ -192,14 +291,20 @@ async fn add_server(
         .await
         .map_err(ApiError)?;
 
-    // Persist the token write-only, if supplied.
-    if let Some(token) = non_empty(body.token.as_deref()) {
-        store_bearer(runtime.id(), &name, token, runtime.secrets().as_ref())
+    // Persist the credential write-only, if supplied (bearer / header / query).
+    if let Some(material) = auth_material_from(
+        body.token.as_deref(),
+        body.auth_kind,
+        body.header_name.as_deref(),
+        body.param_name.as_deref(),
+    )? {
+        store_auth(runtime.id(), &name, &material, runtime.secrets().as_ref())
             .await
             .map_err(ApiError)?;
     }
 
-    mutation_response(runtime, &name).await
+    let warning = endpoint_secret_advisory(&server.endpoint);
+    mutation_response(runtime, &name, warning).await
 }
 
 /// `PUT …/mcp/servers/{name}` — update a server (enable/disable, tool lists,
@@ -255,6 +360,8 @@ async fn update_server(
     server.command = None;
     server.auth_secret = None;
     reject_invalid(&format!("mcp server `{name}`"), &server)?;
+    // Capture the advisory before the value moves into the index.
+    let warning = endpoint_secret_advisory(&server.endpoint);
 
     match position {
         Some(i) => index[i] = server,
@@ -264,13 +371,18 @@ async fn update_server(
         .await
         .map_err(ApiError)?;
 
-    if let Some(token) = non_empty(patch.token.as_deref()) {
-        store_bearer(runtime.id(), &name, token, runtime.secrets().as_ref())
+    if let Some(material) = auth_material_from(
+        patch.token.as_deref(),
+        patch.auth_kind,
+        patch.header_name.as_deref(),
+        patch.param_name.as_deref(),
+    )? {
+        store_auth(runtime.id(), &name, &material, runtime.secrets().as_ref())
             .await
             .map_err(ApiError)?;
     }
 
-    mutation_response(runtime, &name).await
+    mutation_response(runtime, &name, warning).await
 }
 
 /// `DELETE …/mcp/servers/{name}` — remove a runtime server (409 for a manifest
@@ -302,19 +414,32 @@ async fn delete_server(
     save_runtime_index(runtime.id(), runtime.secrets().as_ref(), &index)
         .await
         .map_err(ApiError)?;
-    // Best-effort credential wipe (the store has no delete; empty reads as unset).
+    // Best-effort credential + health wipe (the store has no delete; an empty
+    // value reads as unset, so a later server of the same name never inherits a
+    // stale credential or badge).
     clear_auth(runtime.id(), &name, runtime.secrets().as_ref())
+        .await
+        .map_err(ApiError)?;
+    clear_health(runtime.id(), &name, runtime.secrets().as_ref())
         .await
         .map_err(ApiError)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Builds the mutation response by re-resolving the named server's effective
-/// projection (so the response reflects manifest/runtime merge + auth status).
+/// projection (so the response reflects manifest/runtime merge + auth status),
+/// then probing it once. The probe **never** rolls the mutation back — a
+/// needs-config result is a valid resting state; the outcome is persisted as
+/// (scrubbed) health and echoed as `test`.
 async fn mutation_response(
     runtime: &CompanyRuntime,
     name: &str,
+    warning: Option<String>,
 ) -> Result<Json<MutationResponse>, ApiError> {
+    // Probe first (persists scrubbed health), then read the health back into the
+    // DTO so the response and a later `GET` agree.
+    let test = probe_and_persist(runtime, name).await;
+
     let manifest = manifest_servers(runtime).await?;
     let decls = resolve_effective(runtime.id(), &manifest, runtime.secrets().as_ref())
         .await
@@ -324,10 +449,40 @@ async fn mutation_response(
             "`{name}` not found"
         )))
     })?;
+    let health = load_health(runtime.id(), name, runtime.secrets().as_ref())
+        .await
+        .map_err(ApiError)?;
     Ok(Json(MutationResponse {
-        server: dto_from_decl(decl),
+        server: dto_from_decl(decl, health),
         note: REBUILD_NOTE.to_string(),
+        test,
+        warning,
     }))
+}
+
+/// Probe the named server and persist the (scrubbed) outcome as health, returning
+/// it. Under the `openhuman` feature this dials the server through the same
+/// registry the agent uses (auth INCLUDED); without it there is no MCP transport,
+/// so no probe runs and the console falls back to the declared shape.
+#[cfg(feature = "openhuman")]
+async fn probe_and_persist(runtime: &CompanyRuntime, name: &str) -> Option<McpHealth> {
+    let manifest = manifest_servers(runtime).await.ok()?;
+    let decls = resolve_effective(runtime.id(), &manifest, runtime.secrets().as_ref())
+        .await
+        .ok()?;
+    let decl = decls.iter().find(|d| d.name == name)?;
+    // `probe_server` already scrubs its message; persist that scrubbed health.
+    let health = crate::harness::mcp_probe::probe_server(decl).await;
+    let _ = mcp::save_health(runtime.id(), name, &health, runtime.secrets().as_ref()).await;
+    Some(health)
+}
+
+/// Without the `openhuman` feature there is no MCP transport, so probing is a
+/// no-op (the console falls back gracefully — same `not_wired` posture as
+/// discovery).
+#[cfg(not(feature = "openhuman"))]
+async fn probe_and_persist(_runtime: &CompanyRuntime, _name: &str) -> Option<McpHealth> {
+    None
 }
 
 /// Rejects an invalid server declaration as a `400`.
@@ -385,29 +540,80 @@ async fn discover_tools(
             })),
         )
             .into_response(),
-        Some(_) => {
-            #[cfg(feature = "mcp")]
-            {
-                match crate::harness::mcp::discover_tools(&decls, &name).await {
-                    Ok(tools) => return Json(tools).into_response(),
-                    Err(err) => {
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("MCP discovery failed: {err}"),
-                                "code": "discovery_failed",
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
+        Some(decl) => match crate::harness::mcp::discover_tools(&decls, &name).await {
+            Ok(tools) => Json(tools).into_response(),
+            Err(err) => {
+                // NEVER surface the raw error — it can carry a response body or a
+                // full request URL (with a query-parameter credential). Classify,
+                // scrub against this server's known secrets, and persist the
+                // scrubbed outcome as health.
+                use crate::harness::mcp_probe;
+                let secrets = decl.auth.secret_values();
+                let class = mcp_probe::classify_mcp_error(&err, decl.auth.is_configured(), false);
+                let message =
+                    mcp_probe::scrub(&mcp_probe::operator_message(&name, &class, &err), &secrets);
+                let health = McpHealth {
+                    status: class.status,
+                    message: message.clone(),
+                    tool_count: 0,
+                    checked_at_millis: crate::ports::now_millis(),
+                    auth_hint: class.auth_hint.clone(),
+                };
+                let _ = mcp::save_health(runtime.id(), &name, &health, runtime.secrets().as_ref())
+                    .await;
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": message,
+                        "code": class.code(),
+                    })),
+                )
+                    .into_response()
             }
-            #[cfg(not(feature = "mcp"))]
-            {
-                return crate::server::ops::not_wired("mcp tool discovery");
-            }
-        }
+        },
     }
+}
+
+/// `POST …/mcp/servers/{name}/test` — probe a server on demand and return its
+/// (scrubbed) health. Gated on the `openhuman` feature; without it the route
+/// reports `not_wired` so the console's Test button degrades gracefully.
+#[cfg(feature = "openhuman")]
+async fn test_server(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
+    use axum::response::IntoResponse;
+
+    let runtime = company.runtime.as_ref();
+    let name = name.trim().to_string();
+    // A server that doesn't exist can't be tested.
+    let manifest = match manifest_servers(runtime).await {
+        Ok(m) => m,
+        Err(err) => return err.into_response(),
+    };
+    let decls = match resolve_effective(runtime.id(), &manifest, runtime.secrets().as_ref()).await {
+        Ok(d) => d,
+        Err(err) => return ApiError(err).into_response(),
+    };
+    if !decls.iter().any(|d| d.name == name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no MCP server named `{name}`"),
+                "code": "not_found",
+            })),
+        )
+            .into_response();
+    }
+    match probe_and_persist(runtime, &name).await {
+        Some(health) => Json(health).into_response(),
+        None => crate::server::ops::not_wired("mcp probe"),
+    }
+}
+
+/// Without the `openhuman` feature there is no MCP transport, so on-demand
+/// testing is "not wired" (the console falls back to the declared shape).
+#[cfg(not(feature = "openhuman"))]
+async fn test_server(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
+    let _ = (company, name);
+    crate::server::ops::not_wired("mcp probe")
 }
 
 /// Without the `openhuman` feature there is no MCP transport, so discovery is
