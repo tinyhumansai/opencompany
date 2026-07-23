@@ -70,10 +70,18 @@ The `[workspace]` section of `config.toml` (in the data dir) tunes the lifecycle
 ```toml
 [workspace]
 clear_tmp_on_startup = true   # default; set false to preserve tmp/ across restarts
+storage_quota_gb = 5          # soft whole-workspace quota; omit or <= 0 = unlimited
+tmp_quota_gb = 1              # soft tmp/ quota; omit or <= 0 = unlimited
 ```
 
-Disk-quota enforcement and large-file S3 offload are infrastructure concerns of
-the hosting layer (`opencompany-microservice` + `k8s`), not the workload binary.
+**Quotas are soft/advisory in the binary.** At boot `serve` measures the
+workspace (and `tmp/`) and emits an operator-visible `tracing::warn` when either
+exceeds its configured quota. **Hard enforcement** — blocking writes at the
+limit — is the container/StorageClass layer's job (an EFS access point cap or a
+k8s `ResourceQuota`), which is where the deploy manifests wire it; the binary
+surfaces the condition rather than intercepting every write.
+
+Large-file S3 offload remains a follow-up (needs an S3 client + credentials).
 
 ## Memory engine overlay (`OPENCOMPANY_MEMORY`)
 

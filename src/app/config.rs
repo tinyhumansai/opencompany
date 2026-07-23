@@ -218,6 +218,14 @@ pub struct ConfigFile {
 pub struct WorkspaceSection {
     /// Empty the ephemeral `tmp/` scratch directory on startup. Default: true.
     pub clear_tmp_on_startup: Option<bool>,
+    /// Soft quota on the whole workspace, in gibibytes. Absent or `<= 0` means
+    /// unlimited. Surfaced as an operator alert when exceeded; hard enforcement
+    /// is the container/StorageClass layer's job (EFS access point / k8s
+    /// `ResourceQuota`).
+    pub storage_quota_gb: Option<f64>,
+    /// Soft quota on the `tmp/` scratch directory, in gibibytes. Absent or
+    /// `<= 0` means unlimited.
+    pub tmp_quota_gb: Option<f64>,
 }
 
 impl WorkspaceSection {
@@ -225,8 +233,17 @@ impl WorkspaceSection {
     pub fn resolve(&self) -> WorkspaceConfig {
         WorkspaceConfig {
             clear_tmp_on_startup: self.clear_tmp_on_startup.unwrap_or(true),
+            storage_quota_bytes: gib_to_bytes(self.storage_quota_gb),
+            tmp_quota_bytes: gib_to_bytes(self.tmp_quota_gb),
         }
     }
+}
+
+/// Converts an optional gibibyte quota to bytes, treating absent / non-positive
+/// values as "unlimited" (`None`).
+fn gib_to_bytes(gb: Option<f64>) -> Option<u64> {
+    gb.filter(|g| *g > 0.0)
+        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as u64)
 }
 
 /// Resolved `[workspace]` configuration.
@@ -234,12 +251,18 @@ impl WorkspaceSection {
 pub struct WorkspaceConfig {
     /// Whether the ephemeral `tmp/` scratch is cleared on startup.
     pub clear_tmp_on_startup: bool,
+    /// Soft whole-workspace quota in bytes; `None` is unlimited.
+    pub storage_quota_bytes: Option<u64>,
+    /// Soft `tmp/` quota in bytes; `None` is unlimited.
+    pub tmp_quota_bytes: Option<u64>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             clear_tmp_on_startup: true,
+            storage_quota_bytes: None,
+            tmp_quota_bytes: None,
         }
     }
 }
@@ -585,6 +608,7 @@ mod test {
         let file = ConfigFile {
             workspace: WorkspaceSection {
                 clear_tmp_on_startup: Some(false),
+                ..WorkspaceSection::default()
             },
             ..ConfigFile::default()
         };
@@ -756,8 +780,26 @@ mod test {
         // An explicit opt-out is honored.
         let section = WorkspaceSection {
             clear_tmp_on_startup: Some(false),
+            ..WorkspaceSection::default()
         };
         assert!(!section.resolve().clear_tmp_on_startup);
+    }
+
+    #[test]
+    fn workspace_section_parses_quotas() {
+        let section = WorkspaceSection {
+            storage_quota_gb: Some(2.0),
+            tmp_quota_gb: Some(0.0), // non-positive → unlimited
+            ..WorkspaceSection::default()
+        };
+        let cfg = section.resolve();
+        assert_eq!(cfg.storage_quota_bytes, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(cfg.tmp_quota_bytes, None);
+        // Absent → unlimited.
+        assert_eq!(
+            WorkspaceSection::default().resolve().storage_quota_bytes,
+            None
+        );
     }
 
     #[test]

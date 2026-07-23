@@ -106,6 +106,52 @@ impl DataLayout {
         }
         Ok(())
     }
+
+    /// Total size in bytes of everything under the workspace root, for the
+    /// soft-quota check. Used by `serve` to alert when a workspace exceeds its
+    /// configured `[workspace].storage_quota_gb`.
+    pub async fn usage_bytes(&self) -> Result<u64> {
+        dir_bytes(self.root.clone()).await
+    }
+
+    /// Size in bytes of the ephemeral `tmp/` scratch directory.
+    pub async fn tmp_bytes(&self) -> Result<u64> {
+        dir_bytes(self.tmp_dir()).await
+    }
+}
+
+/// Recursively sums the byte size of regular files under `dir`. A missing
+/// directory is `0`, not an error. Symlinks are not followed (an iterative
+/// stack walk, so no recursion depth limit and no symlink loops).
+async fn dir_bytes(dir: PathBuf) -> Result<u64> {
+    let read_err = |p: &Path, e: std::io::Error| {
+        OpenCompanyError::Store(format!("measuring {}: {e}", p.display()))
+    };
+    let mut total = 0u64;
+    let mut stack = vec![dir];
+    while let Some(path) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&path).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(read_err(&path, e)),
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(|e| read_err(&path, e))? {
+            // `DirEntry::metadata` does not follow symlinks, so a symlink is
+            // neither dir nor file here and is simply skipped.
+            let meta = match entry.metadata().await {
+                Ok(meta) => meta,
+                // A file removed mid-walk (e.g. tmp churn) just isn't counted.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(read_err(&entry.path(), e)),
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -156,6 +202,32 @@ mod test {
             layout.tmp_dir().is_dir(),
             "tmp/ is recreated after clearing"
         );
+
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn usage_bytes_sums_files_recursively() {
+        let root = scratch_root("usage");
+        let layout = DataLayout::new(&root);
+        layout.ensure(true).await.unwrap();
+        tokio::fs::write(layout.files_dir().join("a.bin"), vec![0u8; 1000])
+            .await
+            .unwrap();
+        tokio::fs::write(layout.tmp_dir().join("scratch.bin"), vec![0u8; 500])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            layout.usage_bytes().await.unwrap(),
+            1500,
+            "root sums all files"
+        );
+        assert_eq!(layout.tmp_bytes().await.unwrap(), 500, "tmp/ subtree only");
+
+        // A missing workspace measures zero, not an error.
+        let absent = DataLayout::new(scratch_root("absent"));
+        assert_eq!(absent.usage_bytes().await.unwrap(), 0);
 
         tokio::fs::remove_dir_all(&root).await.ok();
     }
