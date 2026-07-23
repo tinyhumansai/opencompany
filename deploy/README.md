@@ -78,14 +78,29 @@ aws ecs create-service --cluster <cluster> --service-name opencompany \
 Change the company by editing `OPENCOMPANY_COMPANY` in the task definition and
 re-registering.
 
+**Workspace persistence.** The container's data dir is `/data`
+(`OPENCOMPANY_DATA_DIR`, set in the image) — the per-instance workspace root
+(`companies/`, `memory/`, `store/`, `files/`, `logs/`, `tmp/`; see
+[`storage.md`](../docs/spec/runtime/storage.md)). On Fargate this is ephemeral
+unless backed by a volume, so the task definition mounts an **EFS** volume at
+`/data`: fill `fileSystemId` (`fs-…`) and `accessPointId` (`fsap-…`) in the
+`volumes` block. Give each tenant its **own EFS access point with a storage
+cap** — that access-point quota is the *hard* enforcement of
+`[workspace].storage_quota_gb` (the workload only alerts when over).
+
 ### EC2
 
 Same as any Docker host — run the Compose file on an EC2 instance with Docker.
 
 ## Kubernetes / other
 
-The images are plain and stateless except the host's `/data` volume (the
-company bundle). Any orchestrator works: run the host with `OPENCOMPANY_COMPANY`
-set and a persistent volume at `/data`, and the console with `OC_UPSTREAM`
-pointed at the host. The host also honours `TINYHUMANS_API_KEY` (live cognition)
-and `OPENCOMPANY_DISCOVERABLE=true` (tiny.place, needs the `tinyplace` feature).
+The images are plain and stateless except the host's `/data` volume — the
+per-instance workspace root (`companies/`, `memory/`, `store/`, `files/`,
+`logs/`, `tmp/`; see [`storage.md`](../docs/spec/runtime/storage.md)). Any
+orchestrator works: run the host with `OPENCOMPANY_COMPANY` set and a persistent
+volume at `/data`, and the console with `OC_UPSTREAM` pointed at the host. On
+Kubernetes, back `/data` with a PVC (one tenant per pod, or a shared PVC with a
+`subPath` per tenant) and cap it with a `ResourceQuota` / StorageClass quota —
+that quota is the hard enforcement of `[workspace].storage_quota_gb`. The host
+also honours `TINYHUMANS_API_KEY` (live cognition) and
+`OPENCOMPANY_DISCOVERABLE=true` (tiny.place, needs the `tinyplace` feature).
