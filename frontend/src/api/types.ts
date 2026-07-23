@@ -58,6 +58,21 @@ export interface DeskDto {
   members: string[];
 }
 
+/**
+ * `GET {scope}/chat/history` — one persisted transcript message. Mirrors
+ * `ChatHistoryMessageDto` in `src/server/operator.rs`. Shares its filter +
+ * projection logic with the GraphQL `Chat.history` resolver, so the two can
+ * never disagree about a desk's history (issue #65).
+ */
+export interface ChatHistoryMessageDto {
+  id: string;
+  channel: string;
+  author: string;
+  text: string;
+  atMillis: number;
+  mine: boolean;
+}
+
 /** Response of `/chat` and approval-resolution routes. */
 export interface ChatResponse {
   responses: OutboundMessage[];
