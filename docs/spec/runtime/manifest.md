@@ -48,6 +48,15 @@ admins = ["ada@example.com"]
 mode = "hosted"                    # hosted (default) | sidecar
 max_passes = 12                    # passed through to Medulla
 
+[inference]                        # NEW: per-tenant Bring-Your-Own-Key (#56)
+provider = "openrouter"            # managed (default) | openrouter | openai_compatible | ollama
+# base_url = "https://openrouter.ai/api/v1"  # required for ollama/openai_compatible; defaulted otherwise
+# api_key_secret = "byo/openrouter"          # names a secret-store KEY — never the token itself
+
+[inference.models]                 # abstract tier → concrete provider model id
+"chat-v1" = "deepseek/deepseek-chat"
+"reasoning-v1" = "deepseek/deepseek-r1"
+
 [channels.operator]
 enabled = true                     # built-in chat; default true
 
@@ -87,6 +96,17 @@ prompt = "Weekly review and operator digest"
   `[tools].allow` and `[budget]` — the most restrictive wins.
 - **`[brain]`** selects the `Brain` implementation. `hosted` requires a
   TinyHumans credential at runtime; `sidecar` requires the `sidecar` feature.
+- **`[inference]`** (issue #56 — BYOK) routes the company's agents through a
+  chosen model provider. Absent (the default) keeps the managed TinyHumans
+  brain. `provider` is one of `managed` / `openrouter` / `openai_compatible` /
+  `ollama`; `base_url` is required for the latter two. `api_key_secret` names a
+  **secret-store key** — never the token, which is written write-only through
+  the console (Connections → Inference). `[inference.models]` maps an abstract
+  cognition tier (`chat-v1`, `reasoning-v1`, `agentic-v1`, `vision-v1`) to a
+  concrete provider model id; an unmapped tier passes through verbatim.
+  Precedence is **runtime console override > manifest `[inference]` > managed
+  default**, and a per-tenant provider re-resolves it every turn — so a console
+  switch takes effect on the agents' next turn with **no restart**.
 - **`[channels.*]`** enables `ChannelAdapter`s. Unknown channels are a
   validation error; disabled OpenHuman means non-operator channels degrade
   with a boot warning, never a failure.

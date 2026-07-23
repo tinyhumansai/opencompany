@@ -74,3 +74,24 @@ Initialize the vendored runtime before using deeper integrations:
 ```sh
 git submodule update --init --recursive
 ```
+
+## Bring your own inference (BYOK)
+
+By default a company thinks with the managed TinyHumans brain. To route its
+agents through your own provider — OpenRouter, any OpenAI-compatible endpoint,
+or a local Ollama server — add an `[inference]` section to `company.toml` (see
+[`openhuman_demo`](openhuman_demo/company.toml) for a commented example), or
+switch live from the operator console under **Connections → Inference**:
+
+```toml
+[inference]
+provider = "openrouter"            # managed | openrouter | openai_compatible | ollama
+
+[inference.models]                 # abstract tier → concrete provider model id
+"chat-v1" = "deepseek/deepseek-chat"
+"reasoning-v1" = "deepseek/deepseek-r1"
+```
+
+The credential is **never** written in the manifest — set it write-only from
+the console, or name a secret-store key with `api_key_secret`. Switching
+providers takes effect on the agents' next turn with no restart.
