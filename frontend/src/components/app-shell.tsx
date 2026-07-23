@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import {
   Brain,
   ChartColumnBig,
@@ -47,6 +47,7 @@ import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { DiscordIcon } from "@/components/discord-icon";
 import { useCompany } from "@/hooks/use-company";
+import { type AgentReplyEvent, useEvents } from "@/hooks/use-events";
 import { useHashView } from "@/hooks/use-hash-view";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { DISCORD_INVITE_URL } from "@/lib/links";
@@ -227,6 +228,39 @@ export function AppShell({
   // Approval decisions and other events land in the active thread's transcript.
   const noteSystem = (line: string) =>
     setThreadMessages(activeThreadId, (m) => [...m, makeMessage("system", line)]);
+
+  // Inject an `AgentReply` pushed over the SSE feed (issue #66) into its desk
+  // thread's transcript. Dedupe against our own optimistic echo: the backend
+  // journals an `AgentReply` for the operator's own chat turn too, and
+  // Conversation already rendered that reply locally. Local message ids are
+  // ephemeral counters (not content-addressed), so we key the dedupe on an
+  // identical company line already present in the thread's recent tail. Only
+  // desks that exist as a thread receive an injection; an unmatched chatId is a
+  // no-op rather than polluting the wrong thread.
+  const injectAgentReply = useCallback((event: AgentReplyEvent) => {
+    setThreads((ts) =>
+      ts.map((t) => {
+        if (t.id !== event.chatId) return t;
+        const dup = t.messages
+          .slice(-8)
+          .some((m) => m.from === "company" && m.text === event.text);
+        if (dup) return t;
+        return {
+          ...t,
+          messages: [...t.messages, makeMessage("company", event.text, { channel: event.agentId })],
+        };
+      }),
+    );
+  }, []);
+
+  // The active push half of the attention surface: SSE-driven toasts + chat
+  // injection, plus a rising-edge "needs a sign-off" toast off the poll's
+  // pending count. Degrades silently to the `useCompany` poll when the host has
+  // no `/events` route.
+  useEvents(client, company, {
+    pendingApprovals: pending,
+    onAgentReply: injectAgentReply,
+  });
 
   return (
     <SidebarProvider>
