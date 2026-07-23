@@ -1034,6 +1034,7 @@ mod test {
             channel: "operator".to_string(),
             text: "hi".to_string(),
             steps: Vec::new(),
+            reply_to: None,
         };
         let json = serde_json::to_string(&no_steps).unwrap();
         assert_eq!(json, r#"{"channel":"operator","text":"hi"}"#);
@@ -1052,6 +1053,7 @@ mod test {
                 detail: Some("server rejected the call".to_string()),
                 elapsed_ms: None,
             }],
+            reply_to: None,
         };
         assert_eq!(round_trip(&with_steps), with_steps);
     }
