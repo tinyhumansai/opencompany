@@ -3,6 +3,7 @@ pub mod a2a;
 pub mod cors;
 mod error;
 pub mod feedback;
+pub mod hooks;
 pub mod graphql;
 pub mod operator;
 pub mod ops;

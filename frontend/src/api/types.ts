@@ -44,6 +44,26 @@ export interface OutboundMessage {
    * from a tool-backed one.
    */
   steps?: TurnStep[];
+  /** Channel-specific reply addressing (Telegram). Absent on operator messages. */
+  replyTo?: ReplyTo;
+}
+
+/** Channel-specific reply addressing. Mirrors `ReplyTo` in `src/ports/types.rs`. */
+export interface ReplyTo {
+  /** The chat/thread id to deliver back to. */
+  chatId: string;
+}
+
+/** Telegram channel configuration status (no secrets). */
+export interface TelegramChannelStatus {
+  /** Whether the channel is fully configured (both token + secret stored). */
+  configured: boolean;
+  /** Whether a bot token is stored (never the token itself). */
+  tokenSet: boolean;
+  /** Whether a webhook secret is stored (never the secret itself). */
+  secretSet: boolean;
+  /** The public webhook URL to register with setWebhook. */
+  webhookUrl: string;
 }
 
 /**

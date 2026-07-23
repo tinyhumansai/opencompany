@@ -48,6 +48,7 @@ impl Brain for EchoBrain {
                     channel: "operator".to_string(),
                     text: format!("You said: {text}"),
                     steps: Vec::new(),
+                    reply_to: None,
                 });
             }
         }
@@ -56,6 +57,7 @@ impl Brain for EchoBrain {
                 channel: "operator".to_string(),
                 text: "Acknowledged.".to_string(),
                 steps: Vec::new(),
+                reply_to: None,
             });
         }
 

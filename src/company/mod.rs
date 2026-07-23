@@ -11,6 +11,7 @@ pub mod dns;
 pub mod inference;
 mod manifest;
 pub mod mcp;
+pub mod telegram;
 pub mod runtime;
 mod skill_file;
 mod types;

@@ -684,6 +684,20 @@ pub struct InboundMessage {
     pub from: Actor,
 }
 
+/// Channel-specific reply addressing for an [`OutboundMessage`].
+///
+/// Carries the chat/thread a reply must be delivered back to on channels whose
+/// messages are addressed to a specific conversation — chiefly Telegram, where
+/// the reply has to land in the same `chat.id` the inbound update came from.
+/// The operator channel is a single implicit surface and needs none of this.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyTo {
+    /// The chat/thread id to deliver back to. Rendered as a string so it stays
+    /// channel-agnostic (Telegram's numeric `chat.id`, a future channel's
+    /// opaque thread key) without widening the type per channel.
+    pub chat_id: String,
+}
+
 /// A message the company emits on a channel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutboundMessage {
@@ -704,6 +718,13 @@ pub struct OutboundMessage {
     /// output, or call ids — only the scrubbed [`TurnStep`] shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<TurnStep>,
+    /// Where to deliver the reply, for channels addressed to a specific
+    /// chat/thread (Telegram). `None` on the operator channel and on every
+    /// message emitted before this field existed; `skip_serializing_if` keeps
+    /// such a message byte-identical on the wire, so no stored record migrates
+    /// (same `by`/`chat`/`McpCallFailed` additive precedent above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyTo>,
 }
 
 /// One visible step in an agent turn's processing timeline, surfaced in the
