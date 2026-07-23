@@ -71,6 +71,10 @@ type Chat {
 	The desk's message history, most-recent last. `before` is an opaque
 	EventLog cursor (a stringified sequence position); only messages before
 	it are returned.
+	
+	Filtering + projection is shared with the REST `GET .../chat/history`
+	route via [`chat_history::history_for_desk`] (issue #65) so the two
+	surfaces can never disagree about a desk's transcript.
 	"""
 	history(first: Int! = 50, before: String): MessagePage!
 }
