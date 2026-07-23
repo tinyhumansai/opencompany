@@ -17,6 +17,17 @@
 //! read tools then scan that tree (its `skills/` root is the legacy skill root,
 //! scanned without a trust marker) so an agent can **see and read** its skills.
 //!
+//! ## Freshness
+//!
+//! The effective set is recomputed from the current deltas on **every** build,
+//! and the scratch tree is rebuilt from scratch each time (a dropped skill
+//! disappears). The harness re-drives this whenever the operator's deltas move:
+//! [`HarnessPool::ensure`](crate::harness::HarnessPool::ensure) fetches the
+//! deltas at the top of each cycle and rebuilds the roster when they differ, so
+//! a skill authored / enabled / disabled in the console surfaces to every agent
+//! on the next cycle — no process restart. An unchanged delta set is a no-op:
+//! the cached roster (and each agent's conversation state) is left in place.
+//!
 //! This is deliberately **read-only**: skill *execution* (`run_workflow`) is not
 //! wired here. `RunWorkflowTool` reaches for the global `Config::load_or_init()`
 //! and bypasses the harness's metering, so it needs an upstream injection seam
@@ -411,6 +422,81 @@ mod tests {
         );
         // The tools point at the materialized scratch dir.
         assert_eq!(eff.workspace_dir(), ws.path());
+    }
+
+    /// The console writes custom + registry skills as `SkillState` rows carrying
+    /// the full `SKILL.md` inline in `custom_doc` (the registry path since PR
+    /// #47). Both shapes must materialize and surface their **content** through
+    /// the agent's read tools — a green build isn't enough, the body has to be
+    /// readable. Also covers a frontmatter-only (empty-body) custom skill.
+    #[tokio::test]
+    async fn console_custom_docs_surface_content_through_read_tools() {
+        use serde_json::json;
+
+        let ws = tempfile::tempdir().unwrap();
+
+        // Registry-install shape: source = Registry, full SKILL.md in custom_doc.
+        let registry = SkillState {
+            slug: "web-research".to_string(),
+            enabled: true,
+            source: SkillSource::Registry,
+            custom_doc: Some(
+                "---\nname: Web Research\ndescription: Research a topic online\n---\n\n\
+                 # Web Research\n\nBODY-RESEARCH-MARKER\n"
+                    .to_string(),
+            ),
+        };
+        // Console-authored custom skill with an empty body (frontmatter only).
+        let empty_body = SkillState {
+            slug: "quick-note".to_string(),
+            enabled: true,
+            source: SkillSource::Custom,
+            custom_doc: Some(
+                "---\nname: Quick Note\ndescription: Jot a quick note\n---\n".to_string(),
+            ),
+        };
+
+        let eff =
+            EffectiveSkills::materialize(ws.path().to_path_buf(), None, &[registry, empty_body])
+                .unwrap();
+        assert_eq!(eff.docs.len(), 2, "both console deltas materialize");
+
+        let tools = eff.read_tools();
+        let list = tools
+            .iter()
+            .find(|t| t.name() == "list_workflows")
+            .expect("list tool");
+        let listed = list
+            .execute(json!({}))
+            .await
+            .expect("list")
+            .output_for_llm(false);
+        // Both enumerate, each carrying its parsed description (content).
+        assert!(listed.contains("web-research"), "{listed}");
+        assert!(listed.contains("Research a topic online"), "{listed}");
+        assert!(listed.contains("quick-note"), "{listed}");
+
+        let describe = tools
+            .iter()
+            .find(|t| t.name() == "describe_workflow")
+            .expect("describe tool");
+
+        // The registry skill's inline body is readable — content, not just name.
+        let desc = describe
+            .execute(json!({ "workflow_id": "web-research" }))
+            .await
+            .expect("describe registry skill")
+            .output_for_llm(false);
+        assert!(desc.contains("BODY-RESEARCH-MARKER"), "{desc}");
+        assert!(desc.contains("Research a topic online"), "{desc}");
+
+        // The empty-body custom skill still describes cleanly (frontmatter → def).
+        let desc_empty = describe
+            .execute(json!({ "workflow_id": "quick-note" }))
+            .await
+            .expect("describe empty-body skill")
+            .output_for_llm(false);
+        assert!(desc_empty.contains("Jot a quick note"), "{desc_empty}");
     }
 
     #[tokio::test]
