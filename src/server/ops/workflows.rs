@@ -1,12 +1,22 @@
-//! Workflow surfaces: read the company's saved graphs (`GET /workflows`,
-//! `GET /workflows/{wid}`) and run one (`POST /workflows/{wid}/run`) under both
-//! scope forms.
+//! Workflow surfaces: create a graph (`POST /workflows`), read the company's
+//! saved graphs (`GET /workflows`, `GET /workflows/{wid}`), and run one
+//! (`POST /workflows/{wid}/run`) — under both scope forms.
 //!
 //! Graphs are loaded from the company's on-disk source directory
 //! (`companies/<name>/workflows/<wid>.toml`) via
 //! [`load_company_workflows`](crate::company::load_company_workflows), which
 //! takes an explicit id list (it never scans) — so `list_workflows` enumerates
 //! the `workflows/` directory itself to build that list.
+//!
+//! Creation (issue #69) writes a new `workflows/<id>.toml` into that same
+//! source directory — reusing [`parse_workflow`](crate::company::parse_workflow)
+//! to validate the graph a caller posts before anything touches disk — and
+//! records the id as enabled on the operator's live [`CompanyRecord`], mirroring
+//! the team overlay convention: the version-controlled `company.toml` is never
+//! rewritten (see `crate::server::ops::team`). A deployment with no source
+//! directory (platform-provisioned mode with nothing seeded on disk yet) has
+//! nowhere to write the graph file, so creation is refused with a 4xx rather
+//! than crashing.
 //!
 //! Execution is dependency-inverted behind the [`WorkflowRunner`] port: when no
 //! runner is wired (the default build, or a runtime built without a harness) the
@@ -15,6 +25,7 @@
 //! parse the committed graph files, so the console can list and render workflows
 //! even on a build that cannot execute them.
 
+use std::collections::HashSet;
 use std::path::Path as FsPath;
 
 use axum::extract::Path;
@@ -25,14 +36,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::AppState;
-use crate::company::{WorkflowEdgeDef, WorkflowFile, WorkflowNodeDef, load_company_workflows};
+use crate::company::{
+    RawEdge, RawNode, RawWorkflow, WorkflowEdgeDef, WorkflowFile, WorkflowNodeDef,
+    load_company_workflows, parse_workflow, render_workflow,
+};
 use crate::error::OpenCompanyError;
 use crate::server::error::ApiError;
+use crate::server::ops::language;
 use crate::server::ops::{ScopedCompany, scoped};
 
-/// Builds the workflow route fragment: list + graph reads and the run write.
+/// Builds the workflow route fragment: create + list, one graph read, and the
+/// run write.
 pub fn router() -> Router<AppState> {
-    scoped("/workflows", get(list_workflows))
+    scoped("/workflows", post(create_workflow).get(list_workflows))
         .merge(scoped("/workflows/{wid}", get(get_workflow)))
         .merge(scoped("/workflows/{wid}/run", post(run_workflow)))
 }
@@ -171,6 +187,198 @@ async fn get_workflow(
         .into_iter()
         .next()
         .ok_or_else(|| ApiError(OpenCompanyError::CompanyNotFound(format!("workflow {wid}"))))?;
+    Ok(Json(WorkflowGraph::from(file)))
+}
+
+/// The create-workflow body — the same camelCase graph shape the GET routes
+/// return (`id`/`name`/`description?`/`nodes`/`edges`), so the console's
+/// creator can post exactly what it would otherwise read back.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateWorkflowBody {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    nodes: Vec<CreateNode>,
+    #[serde(default)]
+    edges: Vec<CreateEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateNode {
+    id: String,
+    kind: String,
+    name: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateEdge {
+    from: String,
+    to: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+impl From<CreateWorkflowBody> for RawWorkflow {
+    fn from(body: CreateWorkflowBody) -> Self {
+        Self {
+            id: body.id,
+            name: body.name,
+            description: body.description,
+            nodes: body
+                .nodes
+                .into_iter()
+                .map(|n| RawNode {
+                    id: n.id,
+                    kind: n.kind,
+                    name: n.name,
+                    summary: n.summary,
+                    agent: n.agent,
+                })
+                .collect(),
+            edges: body
+                .edges
+                .into_iter()
+                .map(|e| RawEdge {
+                    from: e.from,
+                    to: e.to,
+                    label: e.label,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `POST …/workflows` — authors a new workflow graph (issue #69): the console's
+/// form creator, or any direct API caller, posts the graph shape and it lands
+/// as a new `workflows/<id>.toml` in the company's source directory.
+///
+/// Order of checks, each returning an actionable 4xx before anything is
+/// written: the id must be a safe filename, the deployment must have a source
+/// directory to write into, the id must not already be taken (409), every
+/// `agent` node must name a real roster teammate, and the graph must pass the
+/// same structural validation ([`parse_workflow`]) a hand-authored file would
+/// (at least one trigger, unique node ids, edges that reference real nodes, no
+/// stray `agent` field on a non-agent node).
+async fn create_workflow(
+    company: ScopedCompany,
+    Json(body): Json<CreateWorkflowBody>,
+) -> Result<Json<WorkflowGraph>, ApiError> {
+    if !safe_wid(&body.id) {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            language::WORKFLOW_ID_INVALID.to_string(),
+        )));
+    }
+
+    let source_dir = company.runtime.source_dir().ok_or_else(|| {
+        ApiError(OpenCompanyError::InvalidRequest(
+            language::WORKFLOW_NEEDS_SOURCE_DIR.to_string(),
+        ))
+    })?;
+
+    let workflows_dir = source_dir.join("workflows");
+    let path = workflows_dir.join(format!("{}.toml", body.id));
+    if path.is_file() {
+        return Err(ApiError(OpenCompanyError::Conflict(format!(
+            "A workflow named `{}` already exists.",
+            body.id
+        ))));
+    }
+
+    // `parse_workflow` only rejects zero triggers (a saved graph may legally
+    // have more, e.g. multiple entry points); the creator is stricter — a
+    // freshly authored graph must name exactly one starting point.
+    let trigger_count = body.nodes.iter().filter(|n| n.kind == "trigger").count();
+    if trigger_count != 1 {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+            "a workflow needs exactly one `trigger` node to say what starts it (found {trigger_count})."
+        ))));
+    }
+
+    // Cross-check every `agent` node against the company's effective roster
+    // (manifest agents + operator overlay teammates) before writing anything.
+    // `parse_workflow` validates the graph's own shape but has no roster to
+    // check names against.
+    let mut record = company
+        .runtime
+        .store()
+        .load(company.id())
+        .await?
+        .ok_or_else(|| OpenCompanyError::CompanyNotFound(company.id().to_string()))?;
+    let roster: HashSet<&str> = record
+        .manifest
+        .agents
+        .iter()
+        .map(|a| a.id.as_str())
+        .chain(record.overlay_agents.iter().map(|a| a.id.as_str()))
+        .collect();
+    for node in &body.nodes {
+        if node.kind != "agent" {
+            continue;
+        }
+        match node.agent.as_deref() {
+            Some(agent_id) if roster.contains(agent_id) => {}
+            Some(agent_id) => {
+                return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                    "node `{}` names teammate `{agent_id}`, which is not on this company's roster.",
+                    node.id
+                ))));
+            }
+            None => {
+                return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                    "node `{}` is an agent node but names no teammate.",
+                    node.id
+                ))));
+            }
+        }
+    }
+
+    // Render the candidate graph to TOML and reuse `parse_workflow` to
+    // validate its structure end to end — the same rules a hand-authored
+    // `workflows/<id>.toml` must satisfy. Any problem becomes a 400, never the
+    // 500 a malformed on-disk file gets from the read routes.
+    let toml_src = render_workflow(&body.into())?;
+    let file = parse_workflow(&toml_src).map_err(|err| match err {
+        OpenCompanyError::DataInvalid { problems, .. } => {
+            ApiError(OpenCompanyError::InvalidRequest(problems.join(" ")))
+        }
+        OpenCompanyError::DataParse { message, .. } => {
+            ApiError(OpenCompanyError::InvalidRequest(message))
+        }
+        other => ApiError(other),
+    })?;
+
+    std::fs::create_dir_all(&workflows_dir).map_err(|source| {
+        ApiError(OpenCompanyError::StoreIo {
+            path: workflows_dir.clone(),
+            source,
+        })
+    })?;
+    std::fs::write(&path, &toml_src)
+        .map_err(|source| ApiError(OpenCompanyError::StoreIo { path, source }))?;
+
+    // Record the id as enabled on the operator's live copy of the manifest —
+    // mirrors the team overlay: the version-controlled `company.toml` on disk
+    // is never rewritten (see `crate::server::ops::team`).
+    if !record
+        .manifest
+        .workflows
+        .enabled
+        .iter()
+        .any(|e| e == &file.id)
+    {
+        record.manifest.workflows.enabled.push(file.id.clone());
+        company.runtime.store().save(&record).await?;
+    }
+
     Ok(Json(WorkflowGraph::from(file)))
 }
 
