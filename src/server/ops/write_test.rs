@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::company::CompanyManifest;
+use crate::ports::facts::{FactKind, FactRecord};
 use crate::ports::types::{CompanyId, CompanyRecord};
 use crate::runtime::RuntimeBuilder;
 use crate::server::router;
@@ -178,6 +179,233 @@ async fn memory_create_and_delete_journals_event() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn memory_list_filters_stats_and_dual_write() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // Seed three facts with controlled, distinct timestamps so newest-first is
+    // deterministic (the HTTP create path stamps `now_millis`, which can tie
+    // across rapid inserts). Seeding straight into the FactStore also means
+    // these do NOT create ContextStore mirrors — only the HTTP create path does.
+    let seed = [
+        ("f-old", FactKind::Fact, "Alpha channel report", 1_000u64),
+        ("f-mid", FactKind::Preference, "Warm tone", 2_000),
+        ("f-new", FactKind::Person, "Priya contact", 3_000),
+    ];
+    for (id, kind, title, ts) in seed {
+        runtime
+            .facts()
+            .upsert(
+                runtime.id(),
+                &FactRecord {
+                    id: id.into(),
+                    kind,
+                    title: title.into(),
+                    body: "detail".into(),
+                    source: "Seed".into(),
+                    updated_at_millis: ts,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // List reflects the store, newest-first.
+    let (status, rows) = send(&state, "GET", "/api/v1/company/memory", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["id"], "f-new");
+    assert_eq!(rows[2]["id"], "f-old");
+
+    // `?kind=` narrows to one taxonomy.
+    let (status, pref) = send(
+        &state,
+        "GET",
+        "/api/v1/company/memory?kind=preference",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let pref = pref.as_array().unwrap();
+    assert_eq!(pref.len(), 1);
+    assert_eq!(pref[0]["id"], "f-mid");
+
+    // `?query=` is a case-insensitive substring over title + body.
+    let (status, hit) = send(&state, "GET", "/api/v1/company/memory?query=priya", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hit = hit.as_array().unwrap();
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0]["id"], "f-new");
+
+    // Stats over the seeded facts: 3 facts, freshest timestamp, no agent chunks
+    // yet (seeding bypassed the mirror), 0 task outcomes.
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["facts"], 3);
+    assert_eq!(stats["factsUpdatedAtMillis"], 3_000);
+    assert_eq!(stats["agentChunks"], 0);
+    assert_eq!(stats["taskOutcomes"], 0);
+
+    // Dual-write: the HTTP create path mirrors the fact into the ContextStore so
+    // the agent can recall it. A direct search finds the mirrored text — the
+    // fix that closes the operator manual-ingest loop.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/memory",
+        Some(json!({"kind": "fact", "title": "Launch date", "body": "ships on Friday"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = runtime
+        .context
+        .search(runtime.id(), "Friday", 5)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.snippet.contains("ships on Friday")),
+        "an operator fact must be mirrored into the ContextStore for agent recall"
+    );
+
+    // Stats now count that mirror as an agent chunk (not a task outcome).
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["facts"], 4);
+    assert_eq!(stats["agentChunks"], 1);
+    assert_eq!(stats["taskOutcomes"], 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// End-to-end proof that the dual-write closes the manual-ingest loop: an
+/// operator note written over HTTP is retrieved by the harness's ContextStore
+/// search and rendered by `memory_loop::inject` into the augmented prompt. Gated
+/// on `openhuman` because `memory_loop` is only compiled under that feature.
+#[cfg(feature = "openhuman")]
+#[tokio::test]
+async fn memory_operator_fact_is_injected_into_the_agent_turn() {
+    use crate::harness::memory_loop;
+
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // Operator adds a note through the console write path.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/memory",
+        Some(json!({"kind": "reference", "title": "Launch plan", "body": "we ship on Friday at noon"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The harness retrieve step searches the ContextStore; the mirror lands
+    // there, so a relevant next-turn message recalls it and `inject` renders it
+    // into the augmented prompt — the closed loop, end to end.
+    let hits = runtime
+        .context
+        .search(runtime.id(), "ship Friday", memory_loop::RETRIEVE_TOP_K)
+        .await
+        .unwrap();
+    assert!(!hits.is_empty(), "the operator note must be retrievable");
+    let augmented = memory_loop::inject("when do we ship?", &hits);
+    assert!(augmented.contains("Relevant prior work"));
+    assert!(augmented.contains("we ship on Friday at noon"));
+    assert!(augmented.trim_end().ends_with("when do we ship?"));
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Two-company isolation over HTTP: company B never sees company A's facts, and
+/// a tenant token may not address a company it does not own (403) — the same
+/// scoped-auth boundary the credential route enforces.
+#[tokio::test]
+async fn memory_is_isolated_between_companies() {
+    use crate::server::platform_auth::{
+        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+    };
+    use std::collections::HashSet;
+
+    let home = home();
+    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let state = AppState::new(AppConfig::default())
+        .with_home(home.clone())
+        .with_platform_auth(PlatformAuthConfig::new(verifier));
+
+    for name in ["a", "b"] {
+        let id = CompanyId::new(name);
+        let runtime = RuntimeBuilder::new(home.clone(), manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        state
+            .registry()
+            .insert(id.clone(), std::sync::Arc::new(runtime));
+        state.set_owner(id.clone(), format!("tenant:{name}"));
+    }
+
+    let token = |tenant: &str| {
+        StaticPlatformVerifier::tenant_token(&PlatformClaims {
+            tenant: tenant.to_string(),
+            scopes: HashSet::from(["operator".to_string()]),
+            companies: None,
+        })
+    };
+
+    // Company A's owner writes a fact to A.
+    let (status, _) = send_auth(
+        &state,
+        "POST",
+        "/api/v1/companies/a/memory",
+        Some(json!({"kind": "fact", "title": "A secret", "body": "A body"})),
+        Some(&token("tenant:a")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Company B's owner sees an empty memory — A's fact is invisible to B.
+    let (status, list_b) = send_auth(
+        &state,
+        "GET",
+        "/api/v1/companies/b/memory",
+        None,
+        Some(&token("tenant:b")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list_b.as_array().unwrap().len(), 0);
+
+    // A's own memory holds exactly the one fact.
+    let (status, list_a) = send_auth(
+        &state,
+        "GET",
+        "/api/v1/companies/a/memory",
+        None,
+        Some(&token("tenant:a")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list_a.as_array().unwrap().len(), 1);
+
+    // A's token may not address B's memory at all — 403 (scoped auth).
+    let (status, _) = send_auth(
+        &state,
+        "GET",
+        "/api/v1/companies/b/memory",
+        None,
+        Some(&token("tenant:a")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
