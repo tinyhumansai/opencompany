@@ -786,6 +786,60 @@ pub struct OverlayAgent {
     pub description: Option<String>,
 }
 
+/// An operator-added desk membership that the version-controlled manifest does
+/// not know about. Persisted as an overlay on the [`CompanyRecord`] and merged
+/// into a desk's effective membership at read/resolve time; the `company.toml`
+/// is never rewritten. Only additions are modelled — a manifest-declared desk
+/// member is part of the blueprint and cannot be removed through the overlay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayDeskMember {
+    /// The desk (group-chat) id this addition targets.
+    pub desk_id: String,
+    /// The teammate id added to the desk. Resolves to a manifest agent or an
+    /// [`OverlayAgent`].
+    pub agent_id: String,
+}
+
+/// The operator overlays persisted as a single JSON blob by the string-column
+/// stores (sqlite + mongodb `overlay_json`). The filesystem store keeps the two
+/// collections as typed fields on its own `Meta` instead.
+///
+/// [`Self::parse`] accepts both the current object form and the legacy bare
+/// array (`overlay_json` held only `Vec<OverlayAgent>` before desk overlays
+/// existed), so existing rows load without a migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OverlayBlob {
+    /// The operator team overlay.
+    #[serde(default)]
+    pub agents: Vec<OverlayAgent>,
+    /// The operator desk-membership overlay.
+    #[serde(default)]
+    pub desk_members: Vec<OverlayDeskMember>,
+}
+
+impl OverlayBlob {
+    /// Builds a blob from a record's two overlay collections.
+    pub fn from_record(record: &CompanyRecord) -> Self {
+        Self {
+            agents: record.overlay_agents.clone(),
+            desk_members: record.overlay_desk_members.clone(),
+        }
+    }
+
+    /// Parses the persisted blob, accepting both the current object form
+    /// (`{"agents":[…],"desk_members":[…]}`) and the legacy bare-array form
+    /// (`[…]`, the pre-desk-overlay value that held only agents).
+    pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        match serde_json::from_str::<OverlayBlob>(json) {
+            Ok(blob) => Ok(blob),
+            Err(_) => Ok(Self {
+                agents: serde_json::from_str::<Vec<OverlayAgent>>(json)?,
+                desk_members: Vec::new(),
+            }),
+        }
+    }
+}
+
 /// A durable company record: charter/roster (manifest) plus ledger and
 /// lifecycle state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -801,6 +855,45 @@ pub struct CompanyRecord {
     /// Operator-added teammates not present in the manifest (the team overlay).
     #[serde(default)]
     pub overlay_agents: Vec<OverlayAgent>,
+    /// Operator-added desk memberships not present in the manifest (the desk
+    /// overlay). Merged into a desk's effective membership at read time.
+    #[serde(default)]
+    pub overlay_desk_members: Vec<OverlayDeskMember>,
+}
+
+impl CompanyRecord {
+    /// The effective member ids of a desk: the manifest's declared members
+    /// first, then any operator-overlay additions for that desk, in order and
+    /// deduplicated on id.
+    ///
+    /// This is the single source of truth for "who is on a desk", shared by the
+    /// REST `list_desks` handler and the harness `desk_lead` resolver so the two
+    /// cannot drift. Ordering rule: manifest order is preserved, overlay members
+    /// are appended in insertion order — so the manifest's first member stays the
+    /// lead, and an overlay lead only applies to a desk the manifest left empty.
+    pub fn effective_desk_members(&self, desk_id: &str) -> Vec<String> {
+        let mut members: Vec<String> = self
+            .manifest
+            .group_chats
+            .iter()
+            .find(|c| c.id == desk_id)
+            .map(|c| c.members.clone())
+            .unwrap_or_default();
+        for add in &self.overlay_desk_members {
+            if add.desk_id == desk_id && !members.contains(&add.agent_id) {
+                members.push(add.agent_id.clone());
+            }
+        }
+        members
+    }
+
+    /// Whether `agent_id` names a roster teammate — a manifest agent or an
+    /// operator-overlay teammate. The desk overlay may only add ids that resolve
+    /// here.
+    pub fn is_roster_agent(&self, agent_id: &str) -> bool {
+        self.manifest.agents.iter().any(|a| a.id == agent_id)
+            || self.overlay_agents.iter().any(|a| a.id == agent_id)
+    }
 }
 
 /// A compact company listing entry.
@@ -1239,6 +1332,95 @@ mod test {
             }],
         };
         assert_eq!(round_trip(&card), card);
+    }
+
+    fn desk_record(toml_src: &str, overlay: Vec<OverlayDeskMember>) -> CompanyRecord {
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest: toml::from_str(toml_src).expect("parse manifest"),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: overlay,
+        }
+    }
+
+    /// The effective membership is the manifest members first, then overlay
+    /// additions in insertion order, deduplicated — the shared rule the REST
+    /// list and the harness desk-lead resolver both read.
+    #[test]
+    fn effective_desk_members_unions_manifest_and_overlay_deduped() {
+        let manifest = "[company]\nname = \"Acme\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n\
+             [[group_chat]]\nid = \"studio\"\nname = \"Studio\"\nmembers = [\"ceo\"]\n";
+        let record = desk_record(
+            manifest,
+            vec![
+                OverlayDeskMember {
+                    desk_id: "studio".into(),
+                    agent_id: "eng".into(),
+                },
+                // A duplicate of a manifest member is not added twice.
+                OverlayDeskMember {
+                    desk_id: "studio".into(),
+                    agent_id: "ceo".into(),
+                },
+                // An addition for a different desk is ignored here.
+                OverlayDeskMember {
+                    desk_id: "other".into(),
+                    agent_id: "eng".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            record.effective_desk_members("studio"),
+            vec!["ceo".to_string(), "eng".to_string()]
+        );
+        // An unknown desk with only an overlay addition still resolves it.
+        assert_eq!(
+            record.effective_desk_members("other"),
+            vec!["eng".to_string()]
+        );
+    }
+
+    /// `is_roster_agent` accepts both manifest agents and overlay teammates, and
+    /// rejects an unknown id — the validation the desk-add route relies on.
+    #[test]
+    fn is_roster_agent_covers_manifest_and_overlay() {
+        let manifest = "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n";
+        let mut record = desk_record(manifest, Vec::new());
+        record.overlay_agents.push(OverlayAgent {
+            id: "nova".into(),
+            name: "Nova".into(),
+            role: "Growth".into(),
+            description: None,
+        });
+        assert!(record.is_roster_agent("ceo"));
+        assert!(record.is_roster_agent("nova"));
+        assert!(!record.is_roster_agent("ghost"));
+    }
+
+    /// The persisted overlay blob reads both the current object form and the
+    /// legacy bare-`overlay_agents`-array form, so existing sqlite/mongo rows
+    /// load without a migration.
+    #[test]
+    fn overlay_blob_parses_object_and_legacy_array() {
+        let object = r#"{"agents":[{"id":"a","name":"A","role":"r"}],"desk_members":[{"desk_id":"d","agent_id":"a"}]}"#;
+        let blob = OverlayBlob::parse(object).expect("object");
+        assert_eq!(blob.agents.len(), 1);
+        assert_eq!(blob.desk_members.len(), 1);
+
+        // Legacy: overlay_json used to hold a bare Vec<OverlayAgent>.
+        let legacy = r#"[{"id":"a","name":"A","role":"r"}]"#;
+        let blob = OverlayBlob::parse(legacy).expect("legacy array");
+        assert_eq!(blob.agents.len(), 1);
+        assert!(blob.desk_members.is_empty());
+
+        // The empty-array default persisted by fresh schema.
+        let blob = OverlayBlob::parse("[]").expect("empty array");
+        assert!(blob.agents.is_empty());
+        assert!(blob.desk_members.is_empty());
     }
 
     #[test]

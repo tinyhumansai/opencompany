@@ -54,8 +54,8 @@ use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
-    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
-    TaskResult,
+    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, OverlayBlob, SecretValue,
+    StoredEvent, TaskResult,
 };
 use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
@@ -286,23 +286,24 @@ impl CompanyStore for MongoStore {
             )?)?);
         }
 
-        let overlay_agents = match company.get_str("overlay_json") {
-            Ok(json) => serde_json::from_str(json)?,
-            Err(_) => Vec::new(),
+        let overlay = match company.get_str("overlay_json") {
+            Ok(json) => OverlayBlob::parse(json)?,
+            Err(_) => OverlayBlob::default(),
         };
         Ok(Some(CompanyRecord {
             id: id.clone(),
             manifest,
             ledger,
             lifecycle: get_str(&company, "lifecycle")?,
-            overlay_agents,
+            overlay_agents: overlay.agents,
+            overlay_desk_members: overlay.desk_members,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
-        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
+        let overlay_json = serde_json::to_string(&OverlayBlob::from_record(record))?;
         // Append-only: `save` upserts the company document, never the ledger.
         self.collection("companies")
             .update_one(
@@ -1677,6 +1678,7 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".into(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             };
             // Same template name under two tenants: distinct namespaced ids, no
             // `companies` unique-index conflict.

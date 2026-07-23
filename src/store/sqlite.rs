@@ -45,8 +45,8 @@ use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
-    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
-    TaskResult,
+    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, OverlayBlob, SecretValue,
+    StoredEvent, TaskResult,
 };
 use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
@@ -278,7 +278,7 @@ impl CompanyStore for SqliteStore {
         };
         let manifest: CompanyManifest = toml::from_str(&manifest_toml)
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
-        let overlay_agents = serde_json::from_str(&overlay_json)?;
+        let overlay = OverlayBlob::parse(&overlay_json)?;
 
         let mut stmt = conn
             .prepare("SELECT entry_json FROM ledger WHERE company_id = ?1 ORDER BY idx")
@@ -297,14 +297,15 @@ impl CompanyStore for SqliteStore {
             manifest,
             ledger,
             lifecycle,
-            overlay_agents,
+            overlay_agents: overlay.agents,
+            overlay_desk_members: overlay.desk_members,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
-        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
+        let overlay_json = serde_json::to_string(&OverlayBlob::from_record(record))?;
         let conn = self.conn();
         // Append-only: `save` upserts the company row and never touches ledger.
         conn.execute(
@@ -1826,6 +1827,7 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".into(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             })
             .await
             .unwrap();
