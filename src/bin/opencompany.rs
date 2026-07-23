@@ -555,9 +555,33 @@ async fn main() -> Result<()> {
             let workspace_cfg = ConfigFile::load(&data_root)?
                 .map(|c| c.workspace.resolve())
                 .unwrap_or_default();
-            opencompany::store::DataLayout::new(&data_root)
-                .ensure(workspace_cfg.clear_tmp_on_startup)
-                .await?;
+            let layout = opencompany::store::DataLayout::new(&data_root);
+            layout.ensure(workspace_cfg.clear_tmp_on_startup).await?;
+            // Soft disk-quota alerting. Hard enforcement is the container /
+            // StorageClass layer's job (EFS access point, k8s ResourceQuota);
+            // here we surface an operator-visible warning when a workspace
+            // exceeds its configured `[workspace]` quota.
+            if let Some(limit) = workspace_cfg.storage_quota_bytes {
+                let used = layout.usage_bytes().await?;
+                if used > limit {
+                    tracing::warn!(
+                        used_bytes = used,
+                        quota_bytes = limit,
+                        data_dir = %data_root.display(),
+                        "workspace storage over quota — enforce hard limits at the container/StorageClass layer",
+                    );
+                }
+            }
+            if let Some(limit) = workspace_cfg.tmp_quota_bytes {
+                let used = layout.tmp_bytes().await?;
+                if used > limit {
+                    tracing::warn!(
+                        used_bytes = used,
+                        quota_bytes = limit,
+                        "workspace tmp/ scratch over quota",
+                    );
+                }
+            }
             // tiny.place economy + public-card configuration resolved from the
             // environment (with built-in defaults); the a2a routes and boot
             // going-public flow read these off `AppConfig`.
