@@ -385,17 +385,28 @@ async fn discover_tools(
             })),
         )
             .into_response(),
-        Some(_) => match crate::harness::mcp::discover_tools(&decls, &name).await {
-            Ok(tools) => Json(tools).into_response(),
-            Err(err) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("MCP discovery failed: {err}"),
-                    "code": "discovery_failed",
-                })),
-            )
-                .into_response(),
-        },
+        Some(_) => {
+            #[cfg(feature = "mcp")]
+            {
+                match crate::harness::mcp::discover_tools(&decls, &name).await {
+                    Ok(tools) => return Json(tools).into_response(),
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": format!("MCP discovery failed: {err}"),
+                                "code": "discovery_failed",
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            #[cfg(not(feature = "mcp"))]
+            {
+                return crate::server::ops::not_wired("mcp tool discovery");
+            }
+        }
     }
 }
 
