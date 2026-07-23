@@ -553,12 +553,19 @@ pub(crate) fn build_roster(
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
             let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
+            // This agent's effective tool grants: its own `tools` narrowed by the
+            // company `[tools].allow`-list (full allow-list when it lists none).
+            let grants = crate::runtime::builder::agent_effective_grants(
+                &company.manifest.tools.allow,
+                &manifest_agent.tools,
+            );
             let agent = build::build_agent(
                 &company.id,
                 company_name,
                 manifest_agent,
                 agent_policy,
                 deps,
+                &grants,
                 skill_deltas,
                 is_orchestrator,
             )?;
