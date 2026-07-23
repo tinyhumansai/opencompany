@@ -45,7 +45,7 @@ use crate::harness::mcp::{
     OcMcpCallTool, OcMcpListServersTool, capability_brief, granted_secrets, registry_for_agent,
 };
 use crate::harness::memory::OcMemory;
-use crate::harness::orchestrator::{self, QueryCompanyTool};
+use crate::harness::orchestrator;
 use crate::harness::policy::ApprovalPolicy;
 use crate::harness::skills::EffectiveSkills;
 use crate::ports::skills_state::SkillState;
@@ -203,19 +203,25 @@ pub fn build_agent(
         persona.push_str(&capability_brief());
     }
 
-    // Orchestrator seam (issue #53): the company's orchestrator agent additionally
-    // gets the delegating-orchestrator persona + tools. `query_company` reads the
-    // company's facts + recent events; `spawn_task` / `delegate_to_desk` push onto
-    // the shared delegation queue the brain drains after the turn. Additive beside
-    // the MCP block above.
+    // Orchestrator seam (issues #53 + #67): the company's orchestrator agent
+    // additionally gets the delegating-orchestrator persona + tools. `query_company`
+    // reads the company's facts + recent events; `spawn_task` / `delegate_to_desk`
+    // push onto the shared delegation queue the brain drains after the turn;
+    // `run_workflow` executes one of the company's saved workflows by id through
+    // the shared runner handle (so a task waiting on a workflow can be run to
+    // completion). Additive beside the MCP block above.
     if is_orchestrator {
         persona.push_str(&orchestrator::orchestrator_brief());
-        tools.push(Box::new(QueryCompanyTool::new(
+        tools.extend(orchestrator::orchestrator_tools(
             company.clone(),
             deps.facts.clone(),
             deps.events.clone(),
-        )));
-        tools.extend(orchestrator::delegation_tools(&deps.delegations));
+            &deps.delegations,
+            // The company source dir (`companies/<name>`) also houses `workflows/`,
+            // which the `run_workflow` tool loads graphs from.
+            deps.skills_source_dir.clone(),
+            deps.workflow_runner.clone(),
+        ));
     }
 
     let prompt_builder = SystemPromptBuilder::for_subagent(

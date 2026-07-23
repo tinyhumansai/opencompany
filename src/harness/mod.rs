@@ -136,6 +136,16 @@ pub struct HarnessDeps {
     /// handle; cloning `HarnessDeps` shares one queue between the tools built
     /// into the agent and the brain that drains it. Default is an empty queue.
     pub delegations: DelegationQueue,
+    /// The shared handle to the company's [`WorkflowRunner`](crate::ports::WorkflowRunner),
+    /// so the orchestrator's `run_workflow` tool can reach the runner that is
+    /// itself built *from* these deps (issue #67). The runtime builder threads an
+    /// empty handle here, builds the [`HarnessWorkflowRunner`](crate::workflows::HarnessWorkflowRunner)
+    /// from a deps clone, then fills the shared cell — so the orchestrator agent
+    /// (built later from a clone of these deps) reaches it at turn time. The cell
+    /// holds a [`Weak`](std::sync::Weak), so deps↔runner is not a strong cycle.
+    /// Default (and any build with no runner) leaves it empty and the tool
+    /// reports workflow execution is not wired.
+    pub workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle,
     /// The shared MCP failure queue the `OcMcpCallTool` decorator pushes onto and
     /// the [`HarnessBrain`] drains after a turn (the error-hardening cell). Same
     /// cheap-shared-handle pattern as [`Self::delegations`]; every string it
@@ -755,6 +765,7 @@ description = "Builds the product."
                 facts: None,
                 events: None,
                 delegations: DelegationQueue::default(),
+                workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
                 mcp_failures: McpFailureQueue::default(),
                 secrets: None,
             },
@@ -804,6 +815,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: None,
         };
@@ -1027,6 +1039,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: None,
         };
@@ -1144,6 +1157,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: Some(secrets.clone()),
         };

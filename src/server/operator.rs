@@ -564,6 +564,7 @@ mod test {
             facts: None,
             events: None,
             delegations: crate::harness::orchestrator::DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
