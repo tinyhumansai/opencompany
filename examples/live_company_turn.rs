@@ -102,6 +102,9 @@ async fn main() -> anyhow::Result<()> {
         skills: None,
         skills_source_dir: None,
         mcp_servers: Vec::new(),
+        facts: None,
+        events: None,
+        delegations: opencompany::harness::orchestrator::DelegationQueue::default(),
     };
 
     let pool = HarnessPool::new();

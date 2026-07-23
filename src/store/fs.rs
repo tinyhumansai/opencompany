@@ -934,6 +934,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "a".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -944,6 +945,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "b".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -971,6 +973,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -980,7 +983,8 @@ mod test {
             received.event,
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
-                by: None
+                by: None,
+                chat: None
             }
         );
         tokio::fs::remove_dir_all(&root).await.ok();

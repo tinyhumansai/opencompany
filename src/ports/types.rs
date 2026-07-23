@@ -228,6 +228,15 @@ pub enum CompanyEvent {
         /// export/import and the cross-backend round-trip need no migration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
+        /// The desk / chat thread the message targets (issue #53), so the
+        /// orchestrator brain can route an addressed message to that desk's lead
+        /// member and journal replies against it. `None` on an unaddressed
+        /// message (routed to the orchestrator) and on every event journaled
+        /// before this field existed. Like `by`, `skip_serializing_if` keeps a
+        /// pre-existing event byte-identical, so no stored record needs
+        /// migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<String>,
     },
     /// An inbound webhook fired.
     WebhookReceived {
@@ -872,6 +881,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }
         );
     }
@@ -884,6 +894,7 @@ mod test {
         let event = CompanyEvent::OperatorMessage {
             text: "hi".into(),
             by: None,
+            chat: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
@@ -899,6 +910,7 @@ mod test {
                 kind: ActorKind::User,
                 id: "u1".into(),
             }),
+            chat: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["by"]["kind"], "user");
@@ -923,6 +935,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
             CompanyEvent::WebhookReceived {
                 channel: "email".into(),

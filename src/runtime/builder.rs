@@ -739,6 +739,14 @@ impl RuntimeBuilder {
                                 skills: Some(ops.skills.clone()),
                                 skills_source_dir: self.seed_dir.clone(),
                                 mcp_servers,
+                                // Orchestrator read surface + delegation queue
+                                // (#53): the company's facts + event log ground
+                                // `query_company`; a fresh queue per company backs
+                                // the delegation tools the brain drains.
+                                facts: Some(ops.facts.clone()),
+                                events: Some(events.clone()),
+                                delegations: crate::harness::orchestrator::DelegationQueue::default(
+                                ),
                             };
                             let record = CompanyRecord {
                                 id: id.clone(),

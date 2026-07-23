@@ -449,6 +449,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();
@@ -469,7 +470,8 @@ mod test {
             stored[0].event,
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
-                by: None
+                by: None,
+                chat: None
             }
         );
 
@@ -537,6 +539,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "file it".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();
@@ -579,6 +582,7 @@ mod test {
                 .run_cycle(vec![CompanyEvent::OperatorMessage {
                     text: "file it".into(),
                     by: None,
+                    chat: None,
                 }])
                 .await
                 .unwrap();
@@ -631,6 +635,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "file it".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();
@@ -695,6 +700,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "file it".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();
@@ -784,11 +790,13 @@ mod test {
         let (ra, rb) = tokio::join!(
             one.run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "a".into(),
-                by: None
+                by: None,
+                chat: None
             }]),
             two.run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "b".into(),
-                by: None
+                by: None,
+                chat: None
             }]),
         );
         assert_eq!(ra.unwrap().responses.len(), 1);

@@ -180,6 +180,14 @@ impl ToolPolicy for ApprovalPolicy {
 /// the bridge only the tool name and arguments, not the tool's own
 /// external-effect flag. Unknown tools are treated as external (fail-safe).
 fn is_external_effect(tool_name: &str) -> bool {
+    // The orchestrator's in-cycle delegation tools (`spawn_task`,
+    // `delegate_to_desk`) enqueue internal work the harness brain drains this
+    // turn — a task card or a hand-off to a desk's lead — never an external
+    // effect. Without this, the default `supervised` policy would park them and
+    // `readonly` would deny them, breaking in-cycle delegation. (Issue #53.)
+    if crate::harness::orchestrator::is_delegation_tool(tool_name) {
+        return false;
+    }
     // An MCP tool call can perform any effect advertised by a third-party
     // server. Treat it as external even if future prefix rules become broader.
     if tool_name.eq_ignore_ascii_case("mcp_registry_tool_call") {

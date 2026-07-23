@@ -43,6 +43,7 @@ use crate::harness::HarnessDeps;
 #[cfg(feature = "mcp")]
 use crate::harness::mcp::{OcMcpListServersTool, registry_for_agent};
 use crate::harness::memory::OcMemory;
+use crate::harness::orchestrator::{self, QueryCompanyTool};
 use crate::harness::policy::ApprovalPolicy;
 use crate::harness::skills::EffectiveSkills;
 use crate::ports::skills_state::SkillState;
@@ -55,6 +56,9 @@ use crate::ports::types::CompanyId;
 /// resolves. Unknown / absent tiers fall back to the conversational `chat-v1`.
 pub fn model_for_tier(tier: Option<&str>) -> String {
     match tier.map(|t| t.trim().to_ascii_lowercase()).as_deref() {
+        // The orchestrator answers from whole-company context and drives tool
+        // use (query/delegate), so it maps to the capable agentic workload.
+        Some("orchestrator") => "agentic-v1",
         Some("reasoning") => "reasoning-v1",
         Some("agentic") => "agentic-v1",
         Some("vision") => "vision-v1",
@@ -91,6 +95,10 @@ pub fn persona_prompt(company_name: &str, agent: &ManifestAgent) -> String {
 /// is wired to a skills source (a [`SkillStateStore`](crate::ports::SkillStateStore)
 /// and/or a source directory), the agent's effective skill set is materialized
 /// and surfaced as three read tools plus a persona-prompt catalogue.
+///
+/// `is_orchestrator` marks the company's orchestrator agent (issue #53): it
+/// additionally receives the delegating-orchestrator persona brief and the
+/// `query_company` / `spawn_task` / `delegate_to_desk` tools.
 pub fn build_agent(
     company: &CompanyId,
     company_name: &str,
@@ -99,6 +107,7 @@ pub fn build_agent(
     deps: &HarnessDeps,
     grants: &[String],
     skill_deltas: &[SkillState],
+    is_orchestrator: bool,
 ) -> crate::Result<Agent> {
     let memory: Arc<dyn Memory> = Arc::new(OcMemory::new(
         company.clone(),
@@ -175,6 +184,21 @@ pub fn build_agent(
         tools.push(Box::new(OcMcpListServersTool::new(registry.clone())));
         tools.push(Box::new(McpListToolsTool::new(registry.clone())));
         tools.push(Box::new(McpCallTool::new(registry, mcp_security)));
+    }
+
+    // Orchestrator seam (issue #53): the company's orchestrator agent additionally
+    // gets the delegating-orchestrator persona + tools. `query_company` reads the
+    // company's facts + recent events; `spawn_task` / `delegate_to_desk` push onto
+    // the shared delegation queue the brain drains after the turn. Additive beside
+    // the MCP block above.
+    if is_orchestrator {
+        persona.push_str(&orchestrator::orchestrator_brief());
+        tools.push(Box::new(QueryCompanyTool::new(
+            company.clone(),
+            deps.facts.clone(),
+            deps.events.clone(),
+        )));
+        tools.extend(orchestrator::delegation_tools(&deps.delegations));
     }
 
     let prompt_builder = SystemPromptBuilder::for_subagent(

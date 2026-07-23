@@ -128,6 +128,7 @@ mod test {
                 request(vec![CompanyEvent::OperatorMessage {
                     text: "hi".into(),
                     by: None,
+                    chat: None,
                 }]),
                 &host,
             )

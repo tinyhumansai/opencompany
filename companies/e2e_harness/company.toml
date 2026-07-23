@@ -29,13 +29,34 @@ admins = ["harness-e2e@tinyhumans.ai"]
 id = "ceo"
 role = "Chief Executive"
 description = "Sets direction, answers about the company, and delegates the work."
+tier = "orchestrator"
+tools = ["mcp:*"]
 
 [[agent]]
 id = "engineer"
 role = "Engineer"
 description = "Explains how things are built and proposes technical plans."
+tools = ["mcp:*"]
 
 [[agent]]
 id = "writer"
 role = "Writer"
 description = "Turns rough notes into short, clear written drafts."
+tools = ["mcp:*"]
+
+[[group_chat]]
+id = "engineering"
+name = "Engineering desk"
+description = "How things are built and technical plans."
+members = ["engineer"]
+
+[[group_chat]]
+id = "content"
+name = "Content desk"
+description = "Written drafts and copy."
+members = ["writer"]
+
+[[mcp_server]]
+name = "deepwiki"
+endpoint = "https://mcp.deepwiki.com/mcp"
+description = "AI-generated documentation and Q&A for public GitHub repositories."

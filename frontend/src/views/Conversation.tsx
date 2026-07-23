@@ -145,7 +145,9 @@ function ChatPane({
     setMessages(thread.id, (m) => [...m, makeMessage("you", text)]);
     setSending(true);
     try {
-      const reply = await client.chat(text, company);
+      // Address the active desk thread (issue #53). "main" and any id the
+      // company doesn't define fall to the orchestrator on the backend.
+      const reply = await client.chat(text, company, thread.id);
       const replies = reply.responses.length
         ? reply.responses.map((r) => makeMessage("company", r.text, { channel: r.channel }))
         : [makeMessage("system", "(no reply)")];
