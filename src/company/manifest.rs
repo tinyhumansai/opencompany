@@ -204,6 +204,11 @@ impl CompanyManifest {
         // MCP servers: unique names, an `http(s)://` endpoint, no stdio in v1.
         problems.extend(super::mcp::validate_servers(&self.mcp_servers));
 
+        // Inference (issue #56 — BYOK): provider kind, base_url rules, and a
+        // key *name* (never an inline credential). Inert when the section is
+        // absent.
+        problems.extend(super::inference::validate_inference(&self.inference));
+
         // Enabled workflows reference `workflows/<id>.toml`; ids must be sane.
         for id in &self.workflows.enabled {
             if !is_snake_case(id) {
@@ -614,6 +619,43 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("stdio") && p.contains("hosted v1")),
             "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_byok_inference_and_rejects_bad_provider() {
+        let ok = parse(
+            r#"
+            [company]
+            name = "X"
+            [inference]
+            provider = "openrouter"
+            [inference.models]
+            "chat-v1" = "deepseek/deepseek-chat"
+            "#,
+        );
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+        assert_eq!(ok.inference.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            ok.inference.models.get("chat-v1").map(String::as_str),
+            Some("deepseek/deepseek-chat")
+        );
+
+        let bad = parse(
+            r#"
+            [company]
+            name = "X"
+            [inference]
+            provider = "ollama"
+            "#,
+        );
+        // Ollama needs a base_url.
+        assert!(
+            bad.validate()
+                .iter()
+                .any(|p| p.contains("base_url") && p.contains("required")),
+            "{:?}",
+            bad.validate()
         );
     }
 
