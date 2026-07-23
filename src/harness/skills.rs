@@ -171,8 +171,10 @@ impl EffectiveSkills {
     pub fn read_tools(&self) -> Vec<Box<dyn Tool>> {
         // `Config` has private fields, so build from `Default` and set the one
         // field the read tools read rather than a struct literal.
-        let mut config = Config::default();
-        config.workspace_dir = self.workspace_dir.clone();
+        let config = Config {
+            workspace_dir: self.workspace_dir.clone(),
+            ..Default::default()
+        };
         let config = Arc::new(config);
         vec![
             Box::new(WorkflowListTool::new(config.clone())),

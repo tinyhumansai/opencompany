@@ -94,6 +94,7 @@ openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = 
 # the `log` facade; both only link under the `openhuman` feature.
 anyhow = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 # Issue #29 (epic #26): the tinyflows workflow engine, embedded directly. It is
 # host-agnostic and Config-free — `Capabilities` is a plain struct of trait
@@ -179,6 +180,10 @@ tiny = ["tinyagents"]
 # `reqwest` is pulled in for the hosted Medulla inference `Provider`; the
 # `MockProvider` and every adapter compile without touching the network.
 openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:tinyflows"]
+# MCP server management and agent tools share OpenHuman's in-process registry.
+# Enabling it necessarily enables the embedded harness and OpenHuman MCP
+# domain, while the default build remains unchanged.
+mcp = ["openhuman", "openhuman_core/mcp", "dep:uuid"]
 # Real HTTP transport to openhuman-core. The trait + offline mock + providers
 # compile without this; only `HttpOpenHumanRpc` is gated behind it.
 openhuman-rpc = ["dep:reqwest"]
