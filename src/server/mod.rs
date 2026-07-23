@@ -1,5 +1,6 @@
 #[cfg(feature = "tinyplace")]
 pub mod a2a;
+pub mod chat_history;
 pub mod cors;
 mod error;
 pub mod feedback;
