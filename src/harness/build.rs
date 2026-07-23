@@ -32,13 +32,15 @@ use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
 use oh::memory::traits::Memory;
 use oh::security::SecurityPolicy;
 use oh::tools::{
-    EditFileTool, FileReadTool, FileWriteTool, GlobTool, GrepTool, ListFilesTool, McpCallTool,
-    McpListToolsTool, Tool,
+    EditFileTool, FileReadTool, FileWriteTool, GlobTool, GrepTool, ListFilesTool, Tool,
 };
+#[cfg(feature = "mcp")]
+use oh::tools::{McpCallTool, McpListToolsTool};
 
 use crate::company::Agent as ManifestAgent;
 use crate::error::OpenCompanyError;
 use crate::harness::HarnessDeps;
+#[cfg(feature = "mcp")]
 use crate::harness::mcp::{OcMcpListServersTool, registry_for_agent};
 use crate::harness::memory::OcMemory;
 use crate::harness::policy::ApprovalPolicy;
@@ -167,7 +169,8 @@ pub fn build_agent(
     // a permissive OpenHuman `SecurityPolicy` (Supervised — allows `Act`);
     // OpenCompany's own `ApprovalPolicy` tool policy below stays the real
     // per-call gate.
-    if let Some(registry) = registry_for_agent(&deps.mcp_servers, manifest_agent) {
+    #[cfg(feature = "mcp")]
+    if let Some(registry) = registry_for_agent(&deps.mcp_servers, grants) {
         let mcp_security = Arc::new(SecurityPolicy::default());
         tools.push(Box::new(OcMcpListServersTool::new(registry.clone())));
         tools.push(Box::new(McpListToolsTool::new(registry.clone())));

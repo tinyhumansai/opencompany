@@ -204,9 +204,11 @@ pub async fn save_runtime_index(
 
 /// Reads a server's stored credential and resolves it to [`AuthMaterial`].
 ///
-/// `override_key` (a manifest server's `auth_secret`) is consulted first; the
-/// canonical [`auth_key`] is the fallback. A missing/empty value resolves to
-/// [`AuthMaterial::None`].
+/// The canonical [`auth_key`] (`mcp/{name}/auth`) is tried first — the API
+/// (`PUT /mcp/servers/{name}`) writes rotated tokens there. When the canonical
+/// key is empty/missing, `override_key` (a manifest server's `auth_secret`)
+/// is the fallback for the initial commit-time credential. If neither holds a
+/// non-empty value, the result is [`AuthMaterial::None`].
 pub async fn load_auth(
     company: &CompanyId,
     name: &str,
@@ -214,8 +216,21 @@ pub async fn load_auth(
     override_key: Option<&str>,
 ) -> Result<AuthMaterial> {
     let canonical = auth_key(name);
-    let key = override_key.unwrap_or(&canonical);
-    let Some(SecretValue(raw)) = secrets.get(company, key).await? else {
+    // Try the canonical key first — the API writes rotated tokens there.
+    let mut raw = None;
+    if let Some(SecretValue(r)) = secrets.get(company, &canonical).await?
+        && !r.trim().is_empty()
+    {
+        raw = Some(r);
+    }
+    // Fall back to the manifest's override key when the canonical key is cold.
+    if raw.is_none()
+        && let Some(ov) = override_key
+        && let Some(SecretValue(r)) = secrets.get(company, ov).await?
+    {
+        raw = Some(r);
+    }
+    let Some(raw) = raw else {
         return Ok(AuthMaterial::None);
     };
     if raw.trim().is_empty() {
