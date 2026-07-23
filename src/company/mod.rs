@@ -30,6 +30,10 @@ pub use workflow_file::{
     WORKFLOW_NODE_KINDS, WorkflowEdgeDef, WorkflowFile, WorkflowNodeDef, WorkflowNodeKind,
     load_company_workflows, parse_workflow,
 };
+// Crate-internal only: the workflow creator (issue #69) builds a `RawWorkflow`
+// from its request body, renders it to TOML, and re-parses it through
+// `parse_workflow` above for validation before writing to disk.
+pub(crate) use workflow_file::{RawEdge, RawNode, RawWorkflow, render_workflow};
 pub use workspace_seed::{NodeKind, SeedNode, extract_wikilinks, walk_workspace};
 
 use crate::{Result, VERSION};

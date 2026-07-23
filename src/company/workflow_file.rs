@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{OpenCompanyError, Result};
 
@@ -108,42 +108,61 @@ pub struct WorkflowEdgeDef {
 
 /// Serde-facing shape of the workflow TOML. Enum-like `kind` is read as a plain
 /// string and validated so errors read in prosumer language, not serde traces.
-#[derive(Deserialize)]
-struct RawWorkflow {
+///
+/// Also carries `Serialize` (`pub(crate)` fields) so the workflow creator
+/// (issue #69) can render a candidate graph straight back to this same shape
+/// and re-parse it through [`parse_workflow`] for validation before writing
+/// anything to disk — see [`render_workflow`].
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RawWorkflow {
     #[serde(default)]
-    id: String,
+    pub(crate) id: String,
     #[serde(default)]
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
     #[serde(default, rename = "node")]
-    nodes: Vec<RawNode>,
+    pub(crate) nodes: Vec<RawNode>,
     #[serde(default, rename = "edge")]
-    edges: Vec<RawEdge>,
+    pub(crate) edges: Vec<RawEdge>,
 }
 
-#[derive(Deserialize)]
-struct RawNode {
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RawNode {
     #[serde(default)]
-    id: String,
+    pub(crate) id: String,
     #[serde(default)]
-    kind: String,
+    pub(crate) kind: String,
     #[serde(default)]
-    name: String,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    agent: Option<String>,
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct RawEdge {
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RawEdge {
     #[serde(default)]
-    from: String,
+    pub(crate) from: String,
     #[serde(default)]
-    to: String,
-    #[serde(default)]
-    label: Option<String>,
+    pub(crate) to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+}
+
+/// Renders a candidate graph as on-disk workflow TOML — the inverse of
+/// [`parse_workflow`]. Used by the console's workflow creator (issue #69): the
+/// caller builds a [`RawWorkflow`] from the create-workflow request body,
+/// renders it here, then re-parses the result through [`parse_workflow`] to
+/// get the exact same structural validation (trigger count, duplicate/dangling
+/// node ids, unknown kinds, stray `agent` fields) a hand-authored
+/// `workflows/<id>.toml` must pass — before anything is written to disk.
+pub(crate) fn render_workflow(raw: &RawWorkflow) -> Result<String> {
+    toml::to_string(raw).map_err(|err| OpenCompanyError::DataParse {
+        path: PathBuf::from(format!("{}.toml", raw.id)),
+        message: err.to_string(),
+    })
 }
 
 /// Parses one workflow graph from TOML source, validating it in full.
@@ -311,6 +330,67 @@ fn validate(raw: &RawWorkflow) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_workflow_round_trips_through_parse_workflow() {
+        let raw = RawWorkflow {
+            id: "wf".to_string(),
+            name: "WF".to_string(),
+            description: Some("A test graph.".to_string()),
+            nodes: vec![
+                RawNode {
+                    id: "start".to_string(),
+                    kind: "trigger".to_string(),
+                    name: "Start".to_string(),
+                    summary: None,
+                    agent: None,
+                },
+                RawNode {
+                    id: "worker".to_string(),
+                    kind: "agent".to_string(),
+                    name: "Worker".to_string(),
+                    summary: Some("Does the thing.".to_string()),
+                    agent: Some("ceo".to_string()),
+                },
+            ],
+            edges: vec![RawEdge {
+                from: "start".to_string(),
+                to: "worker".to_string(),
+                label: Some("ok".to_string()),
+            }],
+        };
+        let toml_src = render_workflow(&raw).expect("renders");
+        let file = parse_workflow(&toml_src).expect("re-parses the rendered graph");
+        assert_eq!(file.id, "wf");
+        assert_eq!(file.nodes.len(), 2);
+        assert_eq!(file.edges.len(), 1);
+        let worker = file.nodes.iter().find(|n| n.id == "worker").unwrap();
+        assert_eq!(worker.agent.as_deref(), Some("ceo"));
+        assert_eq!(file.edges[0].label.as_deref(), Some("ok"));
+    }
+
+    /// A rendered graph that fails structural validation (no trigger) surfaces
+    /// the same prosumer-language problem `parse_workflow` gives a hand-authored
+    /// file — the create endpoint relies on this to turn a bad graph into a 4xx.
+    #[test]
+    fn render_workflow_of_an_invalid_graph_fails_reparse() {
+        let raw = RawWorkflow {
+            id: "wf".to_string(),
+            name: "WF".to_string(),
+            description: None,
+            nodes: vec![RawNode {
+                id: "only".to_string(),
+                kind: "output".to_string(),
+                name: "Only".to_string(),
+                summary: None,
+                agent: None,
+            }],
+            edges: vec![],
+        };
+        let toml_src = render_workflow(&raw).expect("renders even though invalid");
+        let err = parse_workflow(&toml_src).unwrap_err();
+        assert!(err.to_string().contains("trigger"), "{err}");
+    }
 
     const CAMPAIGN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
