@@ -124,6 +124,44 @@ pub trait ChannelAdapter: Send + Sync {
 }
 ```
 
+### OutboundMessage steps (activity trace)
+
+An `OutboundMessage` carries an additive, scrubbed `steps: Vec<TurnStep>` — the
+visible processing behind that bubble (tool calls, thinking runs, surfaced MCP
+failures), folded from the harness turn's progress stream:
+
+```rust
+// src/ports/types.rs
+pub struct OutboundMessage {
+    pub channel: String,
+    pub text: String,
+    // Omitted on the wire when empty (serde skip_serializing_if).
+    pub steps: Vec<TurnStep>,
+}
+
+pub struct TurnStep {
+    pub kind: TurnStepKind,      // tool_call | thinking | note
+    pub status: TurnStepStatus,  // ok | error | running
+    pub label: String,           // display_label, else the tool name
+    pub detail: Option<String>,  // whitelisted enrichment, or a scrubbed cause
+    pub elapsed_ms: Option<u64>,
+}
+```
+
+Per-bubble ownership: the operator bubble carries the orchestrator's steps; a
+delegated desk bubble carries that desk lead's steps. **Zero steps is
+meaningful** — a memory-served or tool-less answer runs none, which is how the
+console distinguishes it from a tool-backed one, and how a silently-failed MCP
+call becomes visible (surfaced as an `error` step on the operator bubble rather
+than a vague acknowledgement).
+
+Security: `steps` never carry raw tool arguments, tool output, or call ids —
+only a safe label, a whitelisted/scrubbed detail, and an elapsed time. They are
+never written to the memory store (`memory_loop::outcome_chunk` stays
+text-only), so a step detail can never be retrieved and re-injected into a later
+turn. The fold + scrub lives in `src/harness/steps.rs` (compiled under the
+`openhuman` feature). Non-harness brains (echo, medulla) emit no steps.
+
 ## ToolProvider
 
 Tool catalog + invocation, scoped per company. Backed by OpenHuman JSON-RPC
