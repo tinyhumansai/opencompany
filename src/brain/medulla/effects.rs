@@ -201,7 +201,11 @@ pub(crate) fn channel_message_from_effect(effect: &Effect) -> Option<OutboundMes
         .or_else(|| payload_str(payload, "body"))
         .or_else(|| payload_str(payload, "message"))?
         .to_string();
-    Some(OutboundMessage { channel, text })
+    Some(OutboundMessage {
+        channel,
+        text,
+        steps: Vec::new(),
+    })
 }
 
 /// Records a ledger delta for an executed effect that moved money.

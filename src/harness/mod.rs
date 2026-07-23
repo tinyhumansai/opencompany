@@ -46,6 +46,7 @@ pub mod orchestrator;
 pub mod policy;
 pub mod provider;
 pub mod skills;
+pub mod steps;
 
 pub use brain::HarnessBrain;
 
@@ -67,7 +68,7 @@ use crate::harness::mcp_probe::McpFailureQueue;
 use crate::harness::orchestrator::DelegationQueue;
 use crate::harness::policy::ApprovalPolicy;
 use crate::ports::skills_state::{SkillState, SkillStateStore};
-use crate::ports::types::{CompanyId, CompanyRecord};
+use crate::ports::types::{CompanyId, CompanyRecord, TurnStep};
 use crate::ports::{
     CompanyStore, ContextStore, EventLog, FactStore, SecretStore, TaskStore, UsageMeter,
 };
@@ -164,8 +165,8 @@ pub struct CompanyAgent {
 /// class twice — so chat never shows a bare "Couldn't send" for a model hiccup.
 const GRACEFUL_EMPTY_REPLY: &str = "Sorry — I hit a temporary model hiccup and couldn't produce a reply. Please resend your message.";
 
-/// The outcome of a single `agent.turn`, classified for the retry wrapper.
-enum TurnOutcome {
+/// The classification of a single `agent.turn` attempt, for the retry wrapper.
+enum AttemptOutcome {
     /// A non-empty reply.
     Reply(String),
     /// The transient empty-response class (an empty/blank reply, or the model's
@@ -173,6 +174,23 @@ enum TurnOutcome {
     Empty,
     /// A hard error (budget/auth/build/etc.) — propagated loudly, never swallowed.
     Hard(OpenCompanyError),
+}
+
+/// The result of a completed turn: the reply text plus the scrubbed
+/// [`TurnStep`] timeline folded from the turn's progress stream.
+///
+/// The steps are per-bubble: the operator bubble carries the orchestrator's
+/// steps, a delegated desk bubble carries that desk lead's steps. They ride the
+/// wire on [`OutboundMessage::steps`](crate::ports::types::OutboundMessage) and
+/// are **never** written to memory ([`HarnessPool::run`] persists
+/// `outcome.reply` only).
+#[derive(Debug, Clone)]
+pub struct TurnOutcome {
+    /// The agent's reply text.
+    pub reply: String,
+    /// The scrubbed, folded processing steps (empty for a memory-served or
+    /// tool-less turn — the zero-steps tell).
+    pub steps: Vec<TurnStep>,
 }
 
 impl CompanyAgent {
@@ -193,40 +211,76 @@ impl CompanyAgent {
     /// [`Agent::last_turn_usage`](oh::agent::Agent::last_turn_usage) accessor
     /// while the agent lock is still held. An offline provider that reports no
     /// usage yields a zero [`TurnUsage`], which the cost hook treats as inert.
-    pub async fn run(&self, message: &str) -> crate::Result<(String, Vec<TurnUsage>)> {
+    ///
+    /// **Activity-trace**: this is the one site holding `&mut Agent`, so it is
+    /// where the turn's [`AgentProgress`](oh::agent::progress::AgentProgress)
+    /// stream is captured. A per-turn `mpsc` channel is attached via
+    /// [`Agent::set_on_progress`](oh::agent::Agent::set_on_progress); an
+    /// always-draining collector task buffers every event so the turn loop never
+    /// blocks on a full channel; and after the turn (both attempts share the one
+    /// channel) the sink is detached, the collector joined, and the events folded
+    /// into the scrubbed [`TurnOutcome::steps`] by
+    /// [`steps::fold_steps`](crate::harness::steps::fold_steps). The sink is
+    /// per-turn *local* — deliberately not a [`HarnessDeps`] field — so parallel
+    /// turns never collide.
+    pub async fn run(&self, message: &str) -> crate::Result<(TurnOutcome, Vec<TurnUsage>)> {
+        // Per-turn progress sink + an always-draining collector, so a burst of
+        // events never blocks the turn loop on a full channel.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<oh::agent::progress::AgentProgress>(1024);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+
         let mut agent = self.agent.lock().await;
+        agent.set_on_progress(Some(tx));
         let mut usages: Vec<TurnUsage> = Vec::new();
 
-        // Attempt 1.
+        // Attempt 1, falling through to a single retry only on the transient
+        // empty-response class. Both attempts feed the one progress channel.
         let first = agent.turn(message).await;
         usages.push(read_turn_usage(&agent));
-        match self.classify_turn(first) {
-            TurnOutcome::Reply(reply) => return Ok((reply, usages)),
-            TurnOutcome::Hard(err) => return Err(err),
-            TurnOutcome::Empty => {} // fall through to a single retry
-        }
+        let reply: crate::Result<String> = match self.classify_turn(first) {
+            AttemptOutcome::Reply(reply) => Ok(reply),
+            AttemptOutcome::Hard(err) => Err(err),
+            AttemptOutcome::Empty => {
+                // Attempt 2 (retry once).
+                let second = agent.turn(message).await;
+                usages.push(read_turn_usage(&agent));
+                match self.classify_turn(second) {
+                    AttemptOutcome::Reply(reply) => Ok(reply),
+                    // Still empty → graceful, scrubbed text (never an `Err`).
+                    AttemptOutcome::Empty => {
+                        Ok(crate::harness::mcp_probe::scrub(GRACEFUL_EMPTY_REPLY, &[]))
+                    }
+                    AttemptOutcome::Hard(err) => Err(err),
+                }
+            }
+        };
 
-        // Attempt 2 (retry once).
-        let second = agent.turn(message).await;
-        usages.push(read_turn_usage(&agent));
-        match self.classify_turn(second) {
-            TurnOutcome::Reply(reply) => Ok((reply, usages)),
-            // Still empty → graceful, scrubbed text (never an `Err`).
-            TurnOutcome::Empty => Ok((
-                crate::harness::mcp_probe::scrub(GRACEFUL_EMPTY_REPLY, &[]),
-                usages,
-            )),
-            TurnOutcome::Hard(err) => Err(err),
-        }
+        // Detach the sink (drops the only remaining `Sender`, closing the
+        // channel), release the agent lock, then drain + fold. A `Hard` error
+        // still runs this cleanup before propagating, so the collector never
+        // leaks.
+        agent.set_on_progress(None);
+        drop(agent);
+        let events = collector.await.unwrap_or_default();
+        let steps = steps::fold_steps(events);
+
+        let reply = reply?;
+        Ok((TurnOutcome { reply, steps }, usages))
     }
 
     /// Classify one `agent.turn` result for the retry wrapper.
-    fn classify_turn(&self, result: anyhow::Result<String>) -> TurnOutcome {
+    fn classify_turn(&self, result: anyhow::Result<String>) -> AttemptOutcome {
         match result {
-            Ok(reply) if reply.trim().is_empty() => TurnOutcome::Empty,
-            Ok(reply) => TurnOutcome::Reply(reply),
-            Err(err) if is_transient_empty_response(&err) => TurnOutcome::Empty,
-            Err(err) => TurnOutcome::Hard(OpenCompanyError::Harness(format!(
+            Ok(reply) if reply.trim().is_empty() => AttemptOutcome::Empty,
+            Ok(reply) => AttemptOutcome::Reply(reply),
+            Err(err) if is_transient_empty_response(&err) => AttemptOutcome::Empty,
+            Err(err) => AttemptOutcome::Hard(OpenCompanyError::Harness(format!(
                 "turn for '{}': {err}",
                 self.agent_id
             ))),
@@ -369,7 +423,7 @@ impl HarnessPool {
         agent_id: &str,
         message: &str,
         deps: &HarnessDeps,
-    ) -> crate::Result<String> {
+    ) -> crate::Result<TurnOutcome> {
         let agent = {
             let guard = self.agents.read().await;
             let roster = guard
@@ -400,7 +454,7 @@ impl HarnessPool {
         // accessor and returns one entry per attempt (two when the empty-response
         // wrapper retried once). A zero-usage attempt (offline provider) writes
         // nothing, so the inert-metering contract holds.
-        let (reply, turn_costs) = agent.run(&augmented).await?;
+        let (outcome, turn_costs) = agent.run(&augmented).await?;
         // Attribute cost to the provider this turn actually resolved to. With a
         // per-tenant [`TenantProvider`](crate::harness::provider::TenantProvider)
         // a console BYOK switch changes the slug between turns, so read it live
@@ -420,14 +474,17 @@ impl HarnessPool {
 
         // Store: persist the outcome (original task + reply) so it compounds
         // into later turns. Without this the harness never writes memory back.
+        // SECURITY: the reply **text only** — the scrubbed `outcome.steps` never
+        // enter the memory store, so a step detail can never be retrieved and
+        // re-injected into a later turn.
         deps.context
             .put(
                 company,
-                memory_loop::outcome_chunk(agent_id, message, &reply),
+                memory_loop::outcome_chunk(agent_id, message, &outcome.reply),
             )
             .await?;
 
-        Ok(reply)
+        Ok(outcome)
     }
 
     /// Number of companies currently resident in the pool (test/observability).
@@ -770,7 +827,8 @@ description = "Builds the product."
         let reply = pool
             .run(&rec.id, "ceo", "hello-marker", &fx.deps)
             .await
-            .expect("turn runs");
+            .expect("turn runs")
+            .reply;
 
         assert!(
             reply.contains("hello-marker"),
@@ -789,7 +847,8 @@ description = "Builds the product."
         let first = pool
             .run(&rec.id, "ceo", "alpha task", &fx.deps)
             .await
-            .expect("first turn");
+            .expect("first turn")
+            .reply;
         assert!(
             !first.contains("Relevant prior work"),
             "a cold turn injects nothing: {first:?}"
@@ -809,7 +868,8 @@ description = "Builds the product."
         let second = pool
             .run(&rec.id, "ceo", "alpha", &fx.deps)
             .await
-            .expect("second turn");
+            .expect("second turn")
+            .reply;
         assert!(
             second.contains("Relevant prior work"),
             "the second turn injects the retrieved outcome: {second:?}"
@@ -847,7 +907,8 @@ description = "Builds the product."
         let second = pool
             .run(&rec.id, "ceo", "second", &fx.deps)
             .await
-            .expect("second turn");
+            .expect("second turn")
+            .reply;
 
         assert!(second.contains("second"));
     }
@@ -974,8 +1035,12 @@ description = "Builds the product."
     #[tokio::test]
     async fn turn_wrapper_retries_empty_then_recovers() {
         let (agent, _deps) = scripted_agent(vec![Ok(String::new()), Ok("recovered".into())]);
-        let (reply, usages) = agent.run("hi").await.expect("wrapper recovers");
-        assert!(reply.contains("recovered"), "got {reply:?}");
+        let (outcome, usages) = agent.run("hi").await.expect("wrapper recovers");
+        assert!(
+            outcome.reply.contains("recovered"),
+            "got {:?}",
+            outcome.reply
+        );
         assert_eq!(usages.len(), 2, "both attempts' usage is returned");
     }
 
@@ -984,10 +1049,14 @@ description = "Builds the product."
     #[tokio::test]
     async fn turn_wrapper_empty_twice_is_graceful() {
         let (agent, _deps) = scripted_agent(vec![Ok(String::new()), Ok(String::new())]);
-        let (reply, usages) = agent.run("hi").await.expect("graceful, not an Err");
+        let (outcome, usages) = agent.run("hi").await.expect("graceful, not an Err");
         assert!(
-            reply.to_lowercase().contains("temporary model hiccup"),
-            "got {reply:?}"
+            outcome
+                .reply
+                .to_lowercase()
+                .contains("temporary model hiccup"),
+            "got {:?}",
+            outcome.reply
         );
         assert_eq!(usages.len(), 2);
     }

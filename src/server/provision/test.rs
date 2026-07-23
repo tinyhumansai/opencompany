@@ -676,6 +676,7 @@ impl Brain for EffectBrain {
                 responses.push(OutboundMessage {
                     channel: "operator".into(),
                     text: format!("handled: {text}"),
+                    steps: Vec::new(),
                 });
             }
         }

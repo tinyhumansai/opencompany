@@ -114,8 +114,16 @@ async fn main() -> anyhow::Result<()> {
     pool.ensure(&record, &deps).await?;
 
     println!("── prompt → ceo ──\n{prompt}\n");
-    let reply = pool.run(&record.id, "ceo", &prompt, &deps).await?;
+    let outcome = pool.run(&record.id, "ceo", &prompt, &deps).await?;
+    let reply = outcome.reply;
     println!("── ceo reply ──\n{reply}\n");
+    if !outcome.steps.is_empty() {
+        println!("── steps ({}) ──", outcome.steps.len());
+        for step in &outcome.steps {
+            println!("  · {:?} {} [{:?}]", step.status, step.label, step.kind);
+        }
+        println!();
+    }
 
     // An empty reply means the turn ran but produced nothing — broken wiring,
     // not a valid answer. Fail loudly so this smoke never passes silently.

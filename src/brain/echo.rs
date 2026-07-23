@@ -47,6 +47,7 @@ impl Brain for EchoBrain {
                 channel_responses.push(OutboundMessage {
                     channel: "operator".to_string(),
                     text: format!("You said: {text}"),
+                    steps: Vec::new(),
                 });
             }
         }
@@ -54,6 +55,7 @@ impl Brain for EchoBrain {
             channel_responses.push(OutboundMessage {
                 channel: "operator".to_string(),
                 text: "Acknowledged.".to_string(),
+                steps: Vec::new(),
             });
         }
 
