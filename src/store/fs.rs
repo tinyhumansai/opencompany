@@ -58,6 +58,12 @@ impl PathLocks {
 }
 
 /// Appends one line (a `\n` is added) to `path`, creating the file if absent.
+///
+/// The line and its terminating newline are written in a **single** `write_all`
+/// so the whole record lands as one `O_APPEND` write. Splitting it into two
+/// writes let concurrent appends to the same JSONL file interleave as
+/// `{a}{b}\n\n` — two JSON objects on one physical line — which surfaces later as
+/// a `serde_json` "trailing characters" parse error in [`read_jsonl`].
 pub(crate) async fn append_line(path: &Path, line: &str) -> Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -65,10 +71,12 @@ pub(crate) async fn append_line(path: &Path, line: &str) -> Result<()> {
         .open(path)
         .await
         .map_err(|e| io_err(path, e))?;
-    file.write_all(line.as_bytes())
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    file.write_all(record.as_bytes())
         .await
         .map_err(|e| io_err(path, e))?;
-    file.write_all(b"\n").await.map_err(|e| io_err(path, e))?;
     Ok(())
 }
 
@@ -739,6 +747,40 @@ mod test {
 
     fn tmp_root() -> PathBuf {
         std::env::temp_dir().join(format!("opencompany-test-{}", generate_id()))
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_stay_one_record_per_line() {
+        // Many tasks appending to the same JSONL file must never interleave a
+        // record with another's newline (the `{a}{b}\n\n` corruption that
+        // `read_jsonl` reports as a "trailing characters" parse error). The
+        // single-write `append_line` makes each record one atomic O_APPEND
+        // write, so this holds deterministically.
+        let root = tmp_root();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("log.jsonl");
+
+        const N: u64 = 64;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let path = path.clone();
+            set.spawn(async move {
+                let line = serde_json::to_string(&serde_json::json!({ "i": i })).unwrap();
+                append_line(&path, &line).await.unwrap();
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+
+        // Every record parses (no merged lines) and all N are present once.
+        let rows: Vec<serde_json::Value> = read_jsonl(&path).await.expect("no corrupt lines");
+        assert_eq!(rows.len() as u64, N, "every append is its own line");
+        let mut seen: Vec<u64> = rows.iter().map(|r| r["i"].as_u64().unwrap()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..N).collect::<Vec<_>>(), "all records intact");
+
+        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     // The fs backend runs the identical port-conformance suite the sqlite

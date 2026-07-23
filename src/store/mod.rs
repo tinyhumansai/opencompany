@@ -17,6 +17,10 @@ pub mod fs;
 /// Filesystem backends for the WS3 console ports (tasks, facts, usage,
 /// skill-state, workspace tree) over the same [`Bundle`](paths::Bundle) layout.
 pub mod fs_ops;
+/// The canonical per-instance directory layout under `OPENCOMPANY_DATA_DIR`
+/// (`companies/`, `memory/`, `store/`, `files/`, `logs/`, `tmp/`) and the
+/// startup lifecycle that creates them and, by default, clears `tmp/`.
+pub mod layout;
 pub mod paths;
 
 /// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
@@ -60,6 +64,7 @@ pub use fs::{
     FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsSecretStore,
 };
 pub use fs_ops::FsOps;
+pub use layout::DataLayout;
 pub use paths::{Bundle, default_home};
 pub use select::{
     MemoryBackend, MemoryOverlay, StorageHandles, StorageKind, StorageSettings,

@@ -107,6 +107,11 @@ pub enum OpenCompanyError {
     #[error("company not found: {0}")]
     CompanyNotFound(String),
 
+    /// No MCP install exists in the addressed company's registry store.
+    #[cfg(feature = "mcp")]
+    #[error("MCP server not found: {0}")]
+    McpServerNotFound(String),
+
     /// A tool was invoked outside the manifest grant.
     #[error("tool not granted: {0}")]
     ToolNotGranted(String),
@@ -221,6 +226,8 @@ impl OpenCompanyError {
             Self::StoreIo { .. } => "store_io".to_string(),
             Self::Serde(_) => "serialization_error".to_string(),
             Self::CompanyNotFound(_) => "company_not_found".to_string(),
+            #[cfg(feature = "mcp")]
+            Self::McpServerNotFound(_) => "mcp_server_not_found".to_string(),
             Self::ToolNotGranted(_) => "tool_not_granted".to_string(),
             Self::BudgetExceeded(_) => "budget_exceeded".to_string(),
             Self::LifecycleConflict(_) => "lifecycle_conflict".to_string(),

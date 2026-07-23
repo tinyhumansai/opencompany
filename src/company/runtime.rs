@@ -112,6 +112,11 @@ pub struct CompanyRuntime {
     /// Feature-gated so the default build is unaffected.
     #[cfg(feature = "openhuman")]
     pub(crate) harness: Option<Arc<crate::harness::HarnessPool>>,
+    /// MCP installs and live connections for this runtime. The wrapper owns a
+    /// company-home-scoped OpenHuman config while the live registry remains
+    /// shared in-process with harness agents.
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp: Option<Arc<crate::harness::mcp::McpRuntime>>,
 }
 
 impl CompanyRuntime {
@@ -160,6 +165,8 @@ impl CompanyRuntime {
             serial: TokioMutex::new(()),
             #[cfg(feature = "openhuman")]
             harness: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         }
     }
 
@@ -201,6 +208,18 @@ impl CompanyRuntime {
     #[cfg(feature = "openhuman")]
     pub fn harness(&self) -> Option<&Arc<crate::harness::HarnessPool>> {
         self.harness.as_ref()
+    }
+
+    /// Attaches the embedded MCP runtime used by REST and harness agents.
+    #[cfg(feature = "mcp")]
+    pub fn set_mcp(&mut self, mcp: Arc<crate::harness::mcp::McpRuntime>) {
+        self.mcp = Some(mcp);
+    }
+
+    /// Returns this company's embedded MCP runtime when the feature is enabled.
+    #[cfg(feature = "mcp")]
+    pub fn mcp(&self) -> Option<&Arc<crate::harness::mcp::McpRuntime>> {
+        self.mcp.as_ref()
     }
 
     /// This company's id.

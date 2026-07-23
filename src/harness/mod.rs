@@ -38,6 +38,7 @@
 pub mod brain;
 pub mod build;
 pub mod cost;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
 pub mod memory_loop;
@@ -304,12 +305,17 @@ pub(crate) fn build_roster(
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
             let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
+            let grants = crate::runtime::builder::agent_effective_grants(
+                &company.manifest.tools.allow,
+                &manifest_agent.tools,
+            );
             let agent = build::build_agent(
                 &company.id,
                 company_name,
                 manifest_agent,
                 agent_policy,
                 deps,
+                &grants,
                 skill_deltas,
                 is_orchestrator,
             )?;
@@ -328,6 +334,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
+    #[cfg(feature = "mcp")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::company::CompanyManifest;
     use crate::harness::provider::MockProvider;
@@ -504,6 +512,101 @@ description = "Builds the product."
             meter,
             _dir: dir,
         }
+    }
+
+    #[cfg(feature = "mcp")]
+    struct McpToolCallProvider {
+        server_id: String,
+        calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "mcp")]
+    #[async_trait]
+    impl Provider for McpToolCallProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(format!(
+                    "<tool_call>{{\"name\":\"mcp_registry_tool_call\",\"arguments\":{{\"server_id\":\"{}\",\"tool_name\":\"echo\",\"arguments\":{{\"text\":\"agent-mcp\"}}}}}}</tool_call>",
+                    self.server_id
+                ))
+            } else {
+                Ok(format!("__MOCK_LLM__ {message}"))
+            }
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn agent_executes_connected_mcp_tool() {
+        use std::collections::HashMap;
+        use std::process::Command;
+
+        use oh::mcp_registry::types::{CommandKind, InstalledServer, Transport};
+
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("skipping MCP agent test because node is unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("agent-mcp-stub.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+const send = (v) => process.stdout.write(JSON.stringify(v) + '\n');
+rl.on('line', (line) => {
+  const r = JSON.parse(line); if (!r.id) return;
+  if (r.method === 'initialize') send({jsonrpc:'2.0',id:r.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'agent-test',version:'1'}}});
+  else if (r.method === 'tools/list') send({jsonrpc:'2.0',id:r.id,result:{tools:[{name:'echo',description:'Echo text',inputSchema:{type:'object'}}]}});
+  else if (r.method === 'tools/call') send({jsonrpc:'2.0',id:r.id,result:{content:[{type:'text',text:'echo: ' + r.params.arguments.text}]}});
+});
+"#,
+        )
+        .expect("write stub");
+
+        let mcp = crate::harness::mcp::McpRuntime::new(dir.path().join("mcp"));
+        let server = InstalledServer {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            qualified_name: "agent-test".to_string(),
+            display_name: "Agent Test".to_string(),
+            description: None,
+            icon_url: None,
+            command_kind: CommandKind::Binary,
+            command: "node".to_string(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env_keys: vec![],
+            config: None,
+            installed_at: 0,
+            last_connected_at: None,
+            transport: Transport::Stdio,
+            enabled: true,
+        };
+        mcp.install(&server, &HashMap::new()).expect("install");
+        mcp.connect(&server.server_id).await.expect("connect");
+
+        let mut fx = fixture();
+        fx.deps.provider = Arc::new(McpToolCallProvider {
+            server_id: server.server_id.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+        let reply = pool
+            .run(&rec.id, "ceo", "use the MCP echo tool", &fx.deps)
+            .await
+            .expect("agent turn");
+        assert!(reply.contains("__MOCK_LLM__"), "{reply}");
+        assert!(reply.contains("echo: agent-mcp"), "{reply}");
+
+        mcp.disconnect(&server.server_id).await.expect("disconnect");
     }
 
     #[tokio::test]

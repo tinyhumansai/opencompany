@@ -7,6 +7,12 @@
 //     and calls use `/api/v1/companies/{id}/*`.
 
 import type { ConsoleConfig } from "../config";
+import type {
+  InstallMcpServerInput,
+  McpCallResult,
+  McpServer,
+  McpTool,
+} from "../lib/mcp";
 import {
   ApiError,
   type ApiErrorBody,
@@ -226,6 +232,68 @@ export class OpenCompanyClient {
     return this.request<void>(
       "POST",
       `${this.scope(company)}/connections/${encodeURIComponent(provider)}/disconnect`,
+    );
+  }
+
+  /** Installed MCP servers plus their live connection state. */
+  listMcpServers(company?: string | null): Promise<{ servers: McpServer[] }> {
+    return this.request<{ servers: McpServer[] }>("GET", `${this.scope(company)}/mcp/servers`);
+  }
+
+  /** Persist a manual stdio or streamable-HTTP MCP server install. */
+  installMcpServer(
+    input: InstallMcpServerInput,
+    company?: string | null,
+  ): Promise<{ server_id: string }> {
+    return this.request<{ server_id: string }>("POST", `${this.scope(company)}/mcp/servers`, input);
+  }
+
+  /** Connect an installed server and return its advertised tools. */
+  connectMcpServer(serverId: string, company?: string | null): Promise<{ tools: McpTool[] }> {
+    return this.request<{ tools: McpTool[] }>(
+      "POST",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/connect`,
+    );
+  }
+
+  /** Stop an installed server's live connection. */
+  disconnectMcpServer(
+    serverId: string,
+    company?: string | null,
+  ): Promise<{ disconnected: boolean }> {
+    return this.request<{ disconnected: boolean }>(
+      "POST",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/disconnect`,
+    );
+  }
+
+  /** Disconnect and remove an MCP install. */
+  uninstallMcpServer(serverId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}`,
+    );
+  }
+
+  /** Cached tools advertised by a connected MCP server. */
+  listMcpTools(serverId: string, company?: string | null): Promise<{ tools: McpTool[] }> {
+    return this.request<{ tools: McpTool[] }>(
+      "GET",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/tools`,
+    );
+  }
+
+  /** Invoke one tool through a connected MCP server. */
+  callMcpTool(
+    serverId: string,
+    tool: string,
+    arguments_: Record<string, unknown>,
+    company?: string | null,
+  ): Promise<McpCallResult> {
+    return this.request<McpCallResult>(
+      "POST",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(tool)}/call`,
+      { arguments: arguments_ },
     );
   }
 

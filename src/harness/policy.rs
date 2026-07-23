@@ -188,6 +188,11 @@ fn is_external_effect(tool_name: &str) -> bool {
     if crate::harness::orchestrator::is_delegation_tool(tool_name) {
         return false;
     }
+    // An MCP tool call can perform any effect advertised by a third-party
+    // server. Treat it as external even if future prefix rules become broader.
+    if tool_name.eq_ignore_ascii_case("mcp_registry_tool_call") {
+        return true;
+    }
     const READ_ONLY_PREFIXES: &[&str] = &[
         "read",
         "list",
@@ -208,7 +213,9 @@ fn is_external_effect(tool_name: &str) -> bool {
 /// Map a tool name onto the supervised [`EffectGroup`] taxonomy.
 fn classify_group(tool_name: &str) -> EffectGroup {
     let name = tool_name.to_ascii_lowercase();
-    if name.contains("pay") || name.contains("transfer") || name.starts_with("spend") {
+    if name == "mcp_registry_tool_call" {
+        EffectGroup::Other
+    } else if name.contains("pay") || name.contains("transfer") || name.starts_with("spend") {
         EffectGroup::Spend
     } else if name.contains("email") || name.contains("send") || name.contains("message") {
         EffectGroup::Send
@@ -280,6 +287,25 @@ mod tests {
         assert_eq!(
             p.check(&request("read_file", serde_json::json!({}))).await,
             ToolPolicyDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_parks_mcp_tool_calls_as_external_other_effects() {
+        let p = policy("supervised", &[], None);
+        let args = serde_json::json!({
+            "server_id": "server-1",
+            "tool_name": "echo",
+            "arguments": {"text": "hello"}
+        });
+        assert!(matches!(
+            p.check(&request("mcp_registry_tool_call", args.clone()))
+                .await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert_eq!(
+            p.effect_for("mcp_registry_tool_call", &args).group,
+            EffectGroup::Other
         );
     }
 

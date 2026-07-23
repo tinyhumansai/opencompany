@@ -209,6 +209,49 @@ fn append_result(prev: Option<&str>, responder: &str, body: &str) -> String {
     }
 }
 
+/// Desk-routes an operator message to the roster member it addresses.
+///
+/// A leading `@mention` matching a roster member's id or role (case- and
+/// separator-insensitive — `@Creative-Director`, `@creative_director`, and the
+/// role "Creative Director" all match) routes to that member, and the mention is
+/// stripped from the message. Anything else — no mention, or a mention that
+/// names no roster member — falls back to `responder` with the message intact.
+///
+/// Returns `(agent_id, message)` ready for [`HarnessPool::run`].
+fn resolve_address(agents: &[ManifestAgent], responder: &str, text: &str) -> (String, String) {
+    if let Some(rest) = text.trim_start().strip_prefix('@') {
+        let (mention, remainder) = match rest.split_once(char::is_whitespace) {
+            Some((m, r)) => (m, r.trim_start()),
+            None => (rest, ""),
+        };
+        let target = normalize_mention(mention);
+        if !target.is_empty()
+            && let Some(agent) = agents.iter().find(|a| {
+                normalize_mention(&a.id) == target || normalize_mention(&a.role) == target
+            })
+        {
+            // Strip the mention; keep the original text if nothing else remains
+            // (a bare "@creative_director" still addresses that agent).
+            let message = if remainder.is_empty() {
+                text.to_string()
+            } else {
+                remainder.to_string()
+            };
+            return (agent.id.clone(), message);
+        }
+    }
+    (responder.to_string(), text.to_string())
+}
+
+/// Normalizes a mention / agent id / role for matching: lowercased, ASCII
+/// alphanumerics only, so separators (`-`, `_`, spaces) are ignored.
+fn normalize_mention(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 #[async_trait]
 impl Brain for HarnessBrain {
     async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
@@ -285,6 +328,49 @@ mod tests {
         CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, ToolCall, ToolResult,
     };
     use crate::store::{FsCompanyStore, FsContextStore, FsOps};
+
+    fn agent(id: &str, role: &str) -> ManifestAgent {
+        ManifestAgent {
+            id: id.to_string(),
+            role: role.to_string(),
+            description: None,
+            tier: None,
+            tools: Vec::new(),
+            budget_usd_daily: None,
+        }
+    }
+
+    #[test]
+    fn resolve_address_routes_mentions_and_falls_back() {
+        let roster = [
+            agent("creative_director", "Creative Director"),
+            agent("ceo", "Chief Executive"),
+        ];
+
+        // @id — separator/case-insensitive, mention stripped from the message.
+        let (who, msg) = resolve_address(&roster, "ceo", "@Creative-Director draft the copy");
+        assert_eq!(who, "creative_director");
+        assert_eq!(msg, "draft the copy");
+
+        // @role — "Creative Director" normalizes to "creativedirector".
+        let (who, _) = resolve_address(&roster, "ceo", "@creativedirector hi");
+        assert_eq!(who, "creative_director");
+
+        // No mention → default responder, message untouched.
+        let (who, msg) = resolve_address(&roster, "ceo", "just do it");
+        assert_eq!(who, "ceo");
+        assert_eq!(msg, "just do it");
+
+        // Unknown mention → default responder, message left intact (not stripped).
+        let (who, msg) = resolve_address(&roster, "ceo", "@nobody hello");
+        assert_eq!(who, "ceo");
+        assert_eq!(msg, "@nobody hello");
+
+        // Bare mention with no remainder → routes, keeps the original text.
+        let (who, msg) = resolve_address(&roster, "ceo", "@creative_director");
+        assert_eq!(who, "creative_director");
+        assert_eq!(msg, "@creative_director");
+    }
 
     /// A `CycleHost` that auto-executes anything the brain asks for; the harness
     /// brain v1 makes no host calls, so it stays inert.
