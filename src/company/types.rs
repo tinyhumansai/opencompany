@@ -22,6 +22,22 @@ pub const TIERS: &[&str] = &[
 /// Brain implementations selectable in `[brain].mode`.
 pub const BRAIN_MODES: &[&str] = &["hosted", "sidecar"];
 
+/// Inference providers selectable in `[inference].provider` (issue #56 — BYOK).
+///
+/// * `managed` — the hosted TinyHumans / Medulla brain (the default path).
+/// * `openrouter` — OpenRouter's OpenAI-compatible aggregator (needs a key +
+///   the `HTTP-Referer` / `X-Title` attribution headers).
+/// * `openai_compatible` — any OpenAI-compatible endpoint the tenant runs
+///   (needs a `base_url`, usually a key).
+/// * `ollama` — a local Ollama server's OpenAI-compatible surface (needs a
+///   `base_url`; no key).
+pub const INFERENCE_PROVIDERS: &[&str] = &["managed", "openrouter", "openai_compatible", "ollama"];
+
+/// The abstract cognition tiers the tenant `[inference].models` table maps to
+/// concrete provider model ids. These are the workload names the harness
+/// addresses; an unmapped tier passes through to the provider verbatim.
+pub const INFERENCE_TIERS: &[&str] = &["chat-v1", "reasoning-v1", "agentic-v1", "vision-v1"];
+
 /// Tool providers selectable in `[tools].provider`.
 pub const TOOL_PROVIDERS: &[&str] = &["openhuman", "builtin"];
 
@@ -70,6 +86,13 @@ pub struct CompanyManifest {
     /// Brain selection.
     #[serde(default)]
     pub brain: Brain,
+    /// Per-tenant Bring-Your-Own-Key inference routing (issue #56). Declarative
+    /// intent — a provider kind, an OpenAI-compatible `base_url`, an optional
+    /// *named* secret key (`api_key_secret`), and an abstract-tier → model map.
+    /// **Never** an inline credential. Absent (the default) keeps the managed
+    /// hosted brain. An anchor of its own, kept append-only.
+    #[serde(default)]
+    pub inference: Inference,
     /// Channel adapters, keyed by channel name.
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelConfig>,
@@ -272,6 +295,51 @@ impl Default for Brain {
 
 fn default_brain_mode() -> String {
     "hosted".to_string()
+}
+
+/// `[inference]` — per-tenant Bring-Your-Own-Key inference routing (issue #56).
+///
+/// This is declarative intent, shaped like [`McpServer`]: it names a provider
+/// kind, an OpenAI-compatible `base_url`, and (optionally) which
+/// [`SecretStore`](crate::ports::SecretStore) key holds the outbound
+/// credential, but it **never** carries a token. When a provider needs auth,
+/// `api_key_secret` names a key holding it, which the operator writes through
+/// the console (write-only). An absent section (`provider = None`) keeps the
+/// managed hosted brain.
+///
+/// The `models` table maps an abstract cognition tier (`chat-v1`,
+/// `reasoning-v1`, `agentic-v1`, `vision-v1`) to a concrete provider model id
+/// (e.g. `deepseek/deepseek-chat`). An unmapped tier passes through verbatim.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Inference {
+    /// Provider kind — one of [`INFERENCE_PROVIDERS`]. `None` (absent section)
+    /// keeps the managed hosted brain.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Base URL of the OpenAI-compatible chat-completions API. Required for
+    /// `openai_compatible` and `ollama`; defaulted for `managed`/`openrouter`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// The name of the [`SecretStore`](crate::ports::SecretStore) key holding
+    /// this provider's outbound credential. Names a key — **never** the token.
+    /// When unset, the runtime resolves the canonical key (`inference/key`)
+    /// written by the console.
+    #[serde(default)]
+    pub api_key_secret: Option<String>,
+    /// Abstract-tier → concrete provider model id. An unmapped tier passes
+    /// through to the provider unchanged.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+}
+
+impl Inference {
+    /// Whether this manifest section names a provider — i.e. it meaningfully
+    /// configures inference (an absent `[inference]` leaves `provider` `None`).
+    pub fn is_set(&self) -> bool {
+        self.provider
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+    }
 }
 
 /// A `[channels.*]` entry.

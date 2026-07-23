@@ -60,3 +60,15 @@ members = ["writer"]
 name = "deepwiki"
 endpoint = "https://mcp.deepwiki.com/mcp"
 description = "AI-generated documentation and Q&A for public GitHub repositories."
+
+# Bring-Your-Own-Key inference — commented so the harness keeps the
+# managed/echo brain. Uncomment + set a key from the console to route agents
+# through your own provider. Switching is live (no restart) via the per-tenant
+# provider that re-resolves this config each turn.
+#
+# [inference]
+# provider = "ollama"
+# base_url = "http://localhost:11434/v1"
+#
+# [inference.models]
+# "chat-v1" = "llama3.1"

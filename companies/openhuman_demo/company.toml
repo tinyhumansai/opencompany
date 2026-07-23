@@ -67,3 +67,18 @@ members = ["writer"]
 name = "deepwiki"
 endpoint = "https://mcp.deepwiki.com/mcp"
 description = "AI-generated documentation and Q&A for public GitHub repositories."
+
+# Bring-Your-Own-Key inference. Uncomment to route this company's
+# agents through your own provider instead of the managed TinyHumans brain.
+# Omitting the section (the default) keeps the managed brain. The credential is
+# NEVER written here — set it write-only from the console's Connections tab, or
+# name a secret-store key with `api_key_secret`. You can also switch providers
+# live from the console (Connections → Inference) with no restart.
+#
+# [inference]
+# provider = "openrouter"          # managed | openrouter | openai_compatible | ollama
+# # base_url = "https://openrouter.ai/api/v1"   # defaulted for openrouter/managed
+#
+# [inference.models]               # abstract tier → concrete provider model id
+# "chat-v1" = "deepseek/deepseek-chat"
+# "reasoning-v1" = "deepseek/deepseek-r1"

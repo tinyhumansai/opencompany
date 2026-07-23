@@ -32,6 +32,27 @@ live cognition is gated.
 
 The CLI mirrors several of these as flags — see the [CLI reference](cli.md).
 
+## Inference: managed or bring-your-own (BYOK)
+
+By default agents think with the managed TinyHumans brain, keyed by
+`TINYHUMANS_API_KEY`. The managed default is also tunable by env:
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENCOMPANY_INFERENCE_KEY` | Per-tenant override for `TINYHUMANS_API_KEY`. |
+| `OPENCOMPANY_INFERENCE_URL` | Managed base URL override. |
+| `OPENCOMPANY_INFERENCE_MODEL` | Pins the **whole roster** to one workload; unset keeps each agent's tier. |
+
+A company can instead **bring its own key** (issue #56) — OpenRouter, any
+OpenAI-compatible endpoint, or a local Ollama server — via a manifest
+`[inference]` section (see [manifest spec](../../docs/spec/runtime/manifest.md))
+or, live from the operator console under **Connections → Inference**. The
+outbound key is **write-only**: it is stored server-side and never returned in
+any status/API response. Precedence is **console override > manifest
+`[inference]` > managed default**, and a switch takes effect on the agents'
+next turn with no restart. A BYOK-only tenant needs no `TINYHUMANS_API_KEY` at
+all.
+
 ## Storage backends
 
 Storage is DB-agnostic behind ports. The default is **file-based** (a folder —
