@@ -105,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
         facts: None,
         events: None,
         delegations: opencompany::harness::orchestrator::DelegationQueue::default(),
+        mcp_failures: opencompany::harness::mcp_probe::McpFailureQueue::default(),
+        secrets: None,
     };
 
     let pool = HarnessPool::new();

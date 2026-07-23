@@ -141,9 +141,27 @@ export interface ConnectionStart {
   url: string;
 }
 
+/** The coarse health tier of an MCP server, from a probe. */
+export type McpStatus = "ok" | "needs_config" | "error" | "unknown";
+
+/**
+ * The last (scrubbed) probe outcome for an MCP server. `message` is always
+ * scrubbed on the host — it can never carry a credential, response body, or URL
+ * query string.
+ */
+export interface McpHealth {
+  status: McpStatus;
+  message: string;
+  toolCount: number;
+  checkedAtMillis: number;
+  /** A stable auth-failure reason code, when the status is a credential problem. */
+  authHint?: string;
+}
+
 /**
  * One effective MCP tool server (issue #50), as `.../mcp/servers` returns it.
- * The credential is never present — only the non-secret `authConfigured` flag.
+ * The credential is never present — only the non-secret `authConfigured` flag
+ * and the last (scrubbed) probe `health`.
  */
 export interface McpServer {
   name: string;
@@ -157,12 +175,22 @@ export interface McpServer {
   timeoutSecs: number;
   /** Whether an outbound credential is stored — never the credential itself. */
   authConfigured: boolean;
+  /** The last recorded (scrubbed) probe outcome, when the server has been probed. */
+  health?: McpHealth;
 }
 
-/** A mutating MCP response: the resulting server plus a rebuild reminder. */
+/**
+ * A mutating MCP response: the resulting server, a rebuild reminder, the live
+ * probe result (absent on a non-`openhuman` host), and any non-blocking
+ * endpoint advisory.
+ */
 export interface McpMutationResponse {
   server: McpServer;
   note: string;
+  /** The probe result from right after the mutation (the server is never rolled back). */
+  test?: McpHealth;
+  /** A non-blocking advisory (e.g. a secret-looking query string in the URL). */
+  warning?: string;
 }
 
 /** One remote tool advertised by an MCP server (live discovery). */

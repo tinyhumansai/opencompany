@@ -288,6 +288,9 @@ fn summarize_event(event: &CompanyEvent) -> String {
         CompanyEvent::PaymentReceived { amount_usd, .. } => format!("payment ${amount_usd:.2}"),
         CompanyEvent::LifecycleChanged { from, to, .. } => format!("lifecycle {from} → {to}"),
         CompanyEvent::MemoryFactDeleted { .. } => "memory fact deleted".to_string(),
+        CompanyEvent::McpCallFailed { server, tool, .. } => {
+            format!("MCP call failed: {server}/{tool}")
+        }
     }
 }
 

@@ -41,7 +41,9 @@ use crate::company::Agent as ManifestAgent;
 use crate::error::OpenCompanyError;
 use crate::harness::HarnessDeps;
 #[cfg(feature = "mcp")]
-use crate::harness::mcp::{OcMcpListServersTool, registry_for_agent};
+use crate::harness::mcp::{
+    OcMcpCallTool, OcMcpListServersTool, capability_brief, granted_secrets, registry_for_agent,
+};
 use crate::harness::memory::OcMemory;
 use crate::harness::orchestrator::{self, QueryCompanyTool};
 use crate::harness::policy::ApprovalPolicy;
@@ -181,9 +183,24 @@ pub fn build_agent(
     #[cfg(feature = "mcp")]
     if let Some(registry) = registry_for_agent(&deps.mcp_servers, grants) {
         let mcp_security = Arc::new(SecurityPolicy::default());
+        // The known-secret set for the scrubber: every credential the agent's
+        // granted servers carry, so no configured token can leak into an
+        // agent-visible MCP error (the error-hardening cell).
+        let secrets = granted_secrets(&deps.mcp_servers, manifest_agent);
         tools.push(Box::new(OcMcpListServersTool::new(registry.clone())));
         tools.push(Box::new(McpListToolsTool::new(registry.clone())));
-        tools.push(Box::new(McpCallTool::new(registry, mcp_security)));
+        // `OcMcpCallTool` replaces upstream's `McpCallTool`: same name/schema,
+        // but it classifies + scrubs failures, rewrites the agent-facing text,
+        // and records each failure on the shared queue the brain drains.
+        tools.push(Box::new(OcMcpCallTool::new(
+            registry,
+            mcp_security,
+            secrets,
+            deps.mcp_failures.clone(),
+        )));
+        // Stale-memory mitigation: direct the agent to answer capability
+        // questions from a live `mcp_list_servers` call, never from memory.
+        persona.push_str(&capability_brief());
     }
 
     // Orchestrator seam (issue #53): the company's orchestrator agent additionally

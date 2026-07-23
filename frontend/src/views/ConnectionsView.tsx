@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, ChevronDown, Info, Loader2, Plug, Plus, Server, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  Info,
+  Loader2,
+  Plug,
+  Plus,
+  Server,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
@@ -7,10 +17,18 @@ import {
   addMcpServer,
   discoverMcpTools,
   listMcpServers,
+  type McpAuthKind,
   removeMcpServer,
+  testMcpServer,
   updateMcpServer,
 } from "@/api/mcp";
-import { ApiError, type ConnectionState, type McpServer, type McpToolInfo } from "@/api/types";
+import {
+  ApiError,
+  type ConnectionState,
+  type McpHealth,
+  type McpServer,
+  type McpToolInfo,
+} from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -245,11 +263,18 @@ function McpServersSection({
   const [servers, setServers] = useState<McpServer[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [tools, setTools] = useState<Record<string, ToolsState>>({});
+  // Live health from an on-demand Test, overriding the persisted badge per row.
+  const [tested, setTested] = useState<Record<string, McpHealth>>({});
 
   // Add-server form.
   const [name, setName] = useState("");
   const [endpoint, setEndpoint] = useState("");
   const [token, setToken] = useState("");
+  const [authKind, setAuthKind] = useState<McpAuthKind>("bearer");
+  const [authFieldName, setAuthFieldName] = useState("");
+  // The add flow's failure is a PERSISTENT inline alert (not a transient toast):
+  // a silent-fail auth error is exactly the bug this cell fixes.
+  const [addError, setAddError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -267,24 +292,63 @@ function McpServersSection({
 
   async function add() {
     if (busy) return;
+    setAddError(null);
     if (!name.trim() || !endpoint.trim()) {
-      toast.error("A server needs a name and an https endpoint.");
+      setAddError("A server needs a name and an https endpoint.");
+      return;
+    }
+    if (authKind !== "bearer" && token.trim() && !authFieldName.trim()) {
+      setAddError(
+        authKind === "header"
+          ? "A custom-header credential needs a header name."
+          : "A query-parameter credential needs a parameter name.",
+      );
       return;
     }
     setBusy("add");
     try {
-      await addMcpServer(client, company, {
+      const res = await addMcpServer(client, company, {
         name: name.trim(),
         endpoint: endpoint.trim(),
         token: token.trim() || undefined,
+        authKind,
+        headerName: authKind === "header" ? authFieldName.trim() || undefined : undefined,
+        paramName: authKind === "query_param" ? authFieldName.trim() || undefined : undefined,
       });
-      toast.success(`Added ${name.trim()}. Agents pick it up on the next rebuild.`);
+      // A probe that lands "needs config" or "error" is NOT a rollback — the
+      // server is added — but surface it inline so the operator acts on it.
+      if (res.test && res.test.status !== "ok") {
+        setAddError(res.test.message);
+      } else if (res.warning) {
+        setAddError(res.warning);
+      } else {
+        toast.success(`Added ${name.trim()}. Agents pick it up on the next rebuild.`);
+      }
       setName("");
       setEndpoint("");
       setToken("");
+      setAuthFieldName("");
       await refresh();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Couldn't add the server.");
+      // Persistent, not a toast: the operator must see why the add failed.
+      setAddError(err instanceof ApiError ? err.message : "Couldn't add the server.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function test(server: McpServer) {
+    if (busy) return;
+    setBusy(server.name);
+    try {
+      const health = await testMcpServer(client, company, server.name);
+      setTested((t) => ({ ...t, [server.name]: health }));
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "not_wired") {
+        toast.message("Live testing isn't enabled in this build (the agent harness is off).");
+      } else {
+        toast.error(err instanceof ApiError ? err.message : "Couldn't test the server.");
+      }
     } finally {
       setBusy(null);
     }
@@ -366,99 +430,202 @@ function McpServersSection({
               <p className="text-sm text-muted-foreground">No MCP servers yet.</p>
             ) : (
               <ul className="divide-y divide-border">
-                {servers.map((server) => (
-                  <li key={server.name} className="space-y-2 py-3 first:pt-0 last:pb-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-medium">{server.name}</span>
-                      <Badge variant={server.source === "manifest" ? "secondary" : "outline"}>
-                        {server.source}
-                      </Badge>
-                      {server.authConfigured && (
-                        <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
-                          <Check className="size-3" /> auth set
-                        </span>
-                      )}
-                      <span className="ml-auto flex items-center gap-2">
-                        <Switch
-                          checked={server.enabled}
-                          disabled={busy === server.name}
-                          onCheckedChange={(v) => void toggle(server, v)}
-                          aria-label={`Enable ${server.name}`}
-                        />
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={busy === server.name}
-                          onClick={() => void discover(server)}
-                        >
-                          <ChevronDown className="size-4" /> Tools
-                        </Button>
-                        {server.source === "runtime" && (
+                {servers.map((server) => {
+                  const health = tested[server.name] ?? server.health;
+                  return (
+                    <li key={server.name} className="space-y-2 py-3 first:pt-0 last:pb-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{server.name}</span>
+                        <Badge variant={server.source === "manifest" ? "secondary" : "outline"}>
+                          {server.source}
+                        </Badge>
+                        <McpHealthBadge health={health} authConfigured={server.authConfigured} />
+                        <span className="ml-auto flex items-center gap-2">
+                          <Switch
+                            checked={server.enabled}
+                            disabled={busy === server.name}
+                            onCheckedChange={(v) => void toggle(server, v)}
+                            aria-label={`Enable ${server.name}`}
+                          />
                           <Button
                             variant="ghost"
                             size="sm"
                             disabled={busy === server.name}
-                            onClick={() => void remove(server)}
-                            aria-label={`Remove ${server.name}`}
+                            onClick={() => void test(server)}
                           >
-                            <Trash2 className="size-4" />
+                            {busy === server.name ? (
+                              <Loader2 className="size-4 animate-spin" />
+                            ) : (
+                              <Plug className="size-4" />
+                            )}{" "}
+                            Test
                           </Button>
-                        )}
-                      </span>
-                    </div>
-                    <p className="truncate text-xs text-muted-foreground">{server.endpoint}</p>
-                    <McpToolsList state={tools[server.name] ?? { kind: "idle" }} />
-                  </li>
-                ))}
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={busy === server.name}
+                            onClick={() => void discover(server)}
+                          >
+                            <ChevronDown className="size-4" /> Tools
+                          </Button>
+                          {server.source === "runtime" && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              disabled={busy === server.name}
+                              onClick={() => void remove(server)}
+                              aria-label={`Remove ${server.name}`}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          )}
+                        </span>
+                      </div>
+                      <p className="truncate text-xs text-muted-foreground">{server.endpoint}</p>
+                      {health && health.status !== "ok" && health.message && (
+                        <p className="text-xs text-muted-foreground">{health.message}</p>
+                      )}
+                      <McpToolsList state={tools[server.name] ?? { kind: "idle" }} />
+                    </li>
+                  );
+                })}
               </ul>
             )}
 
-            <div className="grid gap-2 border-t border-border pt-3 sm:grid-cols-[1fr_1.5fr_1fr_auto] sm:items-end">
-              <div className="space-y-1">
-                <Label htmlFor="mcp-name" className="text-xs">
-                  Name
-                </Label>
-                <Input
-                  id="mcp-name"
-                  value={name}
-                  placeholder="notion"
-                  onChange={(e) => setName(e.target.value)}
-                />
+            <div className="space-y-2 border-t border-border pt-3">
+              {addError && (
+                <Alert variant="destructive">
+                  <AlertTriangle className="size-4" />
+                  <AlertTitle>Couldn&apos;t add the server</AlertTitle>
+                  <AlertDescription>{addError}</AlertDescription>
+                </Alert>
+              )}
+              <div className="grid gap-2 sm:grid-cols-2 sm:items-end">
+                <div className="space-y-1">
+                  <Label htmlFor="mcp-name" className="text-xs">
+                    Name
+                  </Label>
+                  <Input
+                    id="mcp-name"
+                    value={name}
+                    placeholder="notion"
+                    onChange={(e) => setName(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="mcp-endpoint" className="text-xs">
+                    Endpoint
+                  </Label>
+                  <Input
+                    id="mcp-endpoint"
+                    value={endpoint}
+                    placeholder="https://host/mcp"
+                    onChange={(e) => setEndpoint(e.target.value)}
+                  />
+                </div>
               </div>
-              <div className="space-y-1">
-                <Label htmlFor="mcp-endpoint" className="text-xs">
-                  Endpoint
-                </Label>
-                <Input
-                  id="mcp-endpoint"
-                  value={endpoint}
-                  placeholder="https://host/mcp"
-                  onChange={(e) => setEndpoint(e.target.value)}
-                />
+              <div className="grid gap-2 sm:grid-cols-[auto_1fr_1fr_auto] sm:items-end">
+                <div className="space-y-1">
+                  <Label htmlFor="mcp-auth-kind" className="text-xs">
+                    Auth
+                  </Label>
+                  <select
+                    id="mcp-auth-kind"
+                    value={authKind}
+                    onChange={(e) => setAuthKind(e.target.value as McpAuthKind)}
+                    className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-xs"
+                  >
+                    <option value="bearer">Bearer token</option>
+                    <option value="header">Custom header</option>
+                    <option value="query_param">Query parameter</option>
+                  </select>
+                </div>
+                {authKind !== "bearer" && (
+                  <div className="space-y-1">
+                    <Label htmlFor="mcp-auth-field" className="text-xs">
+                      {authKind === "header" ? "Header name" : "Parameter name"}
+                    </Label>
+                    <Input
+                      id="mcp-auth-field"
+                      value={authFieldName}
+                      placeholder={authKind === "header" ? "X-Api-Key" : "apiKey"}
+                      autoComplete="off"
+                      onChange={(e) => setAuthFieldName(e.target.value)}
+                    />
+                  </div>
+                )}
+                <div className="space-y-1">
+                  <Label htmlFor="mcp-token" className="text-xs">
+                    {authKind === "bearer" ? "Token (optional)" : "Credential value"}
+                  </Label>
+                  <Input
+                    id="mcp-token"
+                    type="password"
+                    value={token}
+                    placeholder="write-only"
+                    autoComplete="off"
+                    onChange={(e) => setToken(e.target.value)}
+                  />
+                </div>
+                <Button disabled={busy === "add"} onClick={() => void add()}>
+                  {busy === "add" ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Plus className="size-4" />
+                  )}
+                  Add
+                </Button>
               </div>
-              <div className="space-y-1">
-                <Label htmlFor="mcp-token" className="text-xs">
-                  Token (optional)
-                </Label>
-                <Input
-                  id="mcp-token"
-                  type="password"
-                  value={token}
-                  placeholder="write-only"
-                  autoComplete="off"
-                  onChange={(e) => setToken(e.target.value)}
-                />
-              </div>
-              <Button disabled={busy === "add"} onClick={() => void add()}>
-                {busy === "add" ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
-                Add
-              </Button>
             </div>
           </CardContent>
         </Card>
       )}
     </section>
   );
+}
+
+/**
+ * The per-server health badge: green `ok · N tools`, amber `needs config`, red
+ * `error`. Falls back to a plain "auth set" hint when the server has never been
+ * probed (no `health`).
+ */
+function McpHealthBadge({
+  health,
+  authConfigured,
+}: {
+  health?: McpHealth;
+  authConfigured: boolean;
+}) {
+  if (!health) {
+    // Never probed — show only the non-secret auth hint (unchanged behavior).
+    return authConfigured ? (
+      <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
+        <Check className="size-3" /> auth set
+      </span>
+    ) : null;
+  }
+  if (health.status === "ok") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
+        <Check className="size-3" /> ok · {health.toolCount} tool{health.toolCount === 1 ? "" : "s"}
+      </span>
+    );
+  }
+  if (health.status === "needs_config") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+        <AlertTriangle className="size-3" /> needs config
+      </span>
+    );
+  }
+  if (health.status === "error") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-destructive">
+        <AlertTriangle className="size-3" /> error
+      </span>
+    );
+  }
+  return null;
 }
 
 /** Renders the live-discovered tool list for one server. */

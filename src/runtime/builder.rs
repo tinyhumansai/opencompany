@@ -747,6 +747,14 @@ impl RuntimeBuilder {
                                 events: Some(events.clone()),
                                 delegations: crate::harness::orchestrator::DelegationQueue::default(
                                 ),
+                                // Error-hardening cell: a fresh MCP-failure queue
+                                // the `OcMcpCallTool` decorator fills and the brain
+                                // drains; and a LIVE secret-store handle so
+                                // `HarnessPool::ensure` can re-resolve the effective
+                                // MCP set each turn (MCP-freshness) rather than the
+                                // snapshot frozen here at boot.
+                                mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+                                secrets: Some(secrets.clone()),
                             };
                             let record = CompanyRecord {
                                 id: id.clone(),

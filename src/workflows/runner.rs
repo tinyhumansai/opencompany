@@ -146,6 +146,8 @@ description = "Runs Acme."
             facts: None,
             events: None,
             delegations: crate::harness::orchestrator::DelegationQueue::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            secrets: None,
         }
     }
 

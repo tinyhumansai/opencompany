@@ -316,6 +316,23 @@ pub enum CompanyEvent {
         /// The id of the dispatched task card.
         task_id: String,
     },
+    /// An agent's MCP tool call failed during a turn, journaled by the harness
+    /// so the operator has an audit trail of which server/tool broke and why.
+    /// The `message` is always **scrubbed** at the source (the
+    /// `OcMcpCallTool` → `HarnessBrain` drain path), so this record can never
+    /// carry a credential, response body, or URL query string. Additive: old
+    /// logs never contain it, and its presence doesn't change how any existing
+    /// variant serializes (same `by`/`chat` precedent).
+    McpCallFailed {
+        /// The MCP server the failing call targeted.
+        server: String,
+        /// The remote tool the agent tried to call.
+        tool: String,
+        /// A stable status code (e.g. `credential_required`, `tool_call_rejected`).
+        status: String,
+        /// A short, scrubbed, operator-facing message.
+        message: String,
+    },
 }
 
 /// A `CompanyEvent` durably appended to the log with its sequence and time.
@@ -973,6 +990,23 @@ mod test {
         let json = serde_json::to_value(&events[0]).unwrap();
         assert_eq!(json["kind"], "OperatorMessage");
         assert_eq!(json["text"], "hi");
+    }
+
+    #[test]
+    fn mcp_call_failed_round_trips_and_is_byte_stable() {
+        let event = CompanyEvent::McpCallFailed {
+            server: "browserbase".into(),
+            tool: "browse".into(),
+            status: "tool_call_rejected".into(),
+            message: "server rejected the call".into(),
+        };
+        assert_eq!(round_trip(&event), event);
+        // The tag is emitted under `kind`, and the field set is fixed — a byte
+        // guard so a later field addition is a deliberate, tested change.
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"kind":"McpCallFailed","server":"browserbase","tool":"browse","status":"tool_call_rejected","message":"server rejected the call"}"#
+        );
     }
 
     #[test]
