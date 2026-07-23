@@ -121,7 +121,7 @@ const NAV: NavGroup[] = [
       { view: "team", label: "Team", icon: Users },
       { view: "skills", label: "Skills", icon: Sparkles },
       { view: "workspace", label: "Workspace", icon: FolderClosed },
-      { view: "memory", label: "Memory", icon: Brain },
+      { view: "memory", label: "Brain", icon: Brain },
       { view: "approvals", label: "Approvals", icon: ShieldCheck },
       { view: "workflows", label: "Workflows", icon: Workflow },
     ],
@@ -151,7 +151,7 @@ const TITLES: Record<View, string> = {
   team: "Team",
   skills: "Skills",
   workspace: "Workspace",
-  memory: "Memory",
+  memory: "Brain",
   approvals: "Approvals",
   workflows: "Workflows",
   usage: "Usage",
@@ -300,7 +300,7 @@ export function AppShell({
           {view === "team" && <TeamView client={client} company={company} />}
           {view === "people" && <PeopleView client={client} company={company} />}
           {view === "skills" && <SkillsView client={client} company={company} />}
-          {view === "memory" && <MemoryView company={company} />}
+          {view === "memory" && <MemoryView client={client} company={company} />}
           {view === "workspace" && (
             <Suspense
               fallback={
