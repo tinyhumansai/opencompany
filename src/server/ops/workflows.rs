@@ -8,6 +8,17 @@
 //! takes an explicit id list (it never scans) — so `list_workflows` enumerates
 //! the `workflows/` directory itself to build that list.
 //!
+//! A platform-provisioned tenant has no source directory, so there is nothing
+//! to scan — but it can still declare `[workflows].enabled` ids in its
+//! manifest. `list_workflows` unions those manifest-enabled ids in (deduped by
+//! id) so the console's picker isn't empty just because the deployment has no
+//! `workflows/*.toml` files on disk, mirroring the `Company.workflows`
+//! GraphQL resolver. Where the definition body isn't available to load (no
+//! source directory, or the id has no matching file), the summary falls back
+//! to the id as its name — the same fallback the GraphQL resolver uses. Full
+//! graphs (`GET …/workflows/{wid}`) still require a source directory, since
+//! there is currently no other place a graph body can come from.
+//!
 //! Creation (issue #69) writes a new `workflows/<id>.toml` into that same
 //! source directory — reusing [`parse_workflow`](crate::company::parse_workflow)
 //! to validate the graph a caller posts before anything touches disk — and
@@ -26,6 +37,7 @@
 //! even on a build that cannot execute them.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::Path as FsPath;
 
 use axum::extract::Path;
@@ -149,11 +161,45 @@ impl From<WorkflowEdgeDef> for WorkflowEdge {
 /// The loader takes an explicit id list rather than scanning, so this reads the
 /// company's `workflows/` directory to collect the `*.toml` file stems as ids,
 /// then loads and summarizes them. No source directory (platform-provisioned
-/// mode) or no `workflows/` directory yields an empty list — a `200`, not an
-/// error, so the console renders "no workflows yet" rather than a failure.
+/// mode) or no `workflows/` directory yields an empty filesystem scan — but not
+/// necessarily an empty response: the manifest's `[workflows].enabled` ids are
+/// unioned in (deduped against the filesystem scan by id), falling back to the
+/// id as the name when there's no file to load a real name from. Only when
+/// both the scan and the manifest are empty does this return `200 []`, so the
+/// console renders "no workflows yet" rather than a failure.
 async fn list_workflows(company: ScopedCompany) -> Result<Json<Vec<WorkflowSummary>>, ApiError> {
-    let files = load_source_workflows(company.runtime.source_dir())?;
-    Ok(Json(files.into_iter().map(WorkflowSummary::from).collect()))
+    let source_dir = company.runtime.source_dir();
+    let files = load_source_workflows(source_dir)?;
+    let mut seen: HashSet<String> = files.iter().map(|f| f.id.clone()).collect();
+    let mut summaries: Vec<WorkflowSummary> =
+        files.into_iter().map(WorkflowSummary::from).collect();
+
+    let enabled_ids = company
+        .runtime
+        .enabled_workflow_ids()
+        .await
+        .map_err(ApiError)?;
+    for id in enabled_ids {
+        // Already present from the filesystem scan — skip so hosted mode
+        // (source dir present, manifest also lists the same ids) doesn't
+        // double-list.
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let loaded = source_dir
+            .and_then(|dir| load_company_workflows(dir, std::slice::from_ref(&id)).ok())
+            .and_then(|mut files| files.pop());
+        summaries.push(match loaded {
+            Some(file) => WorkflowSummary::from(file),
+            None => WorkflowSummary {
+                id: id.clone(),
+                name: id,
+                description: None,
+            },
+        });
+    }
+
+    Ok(Json(summaries))
 }
 
 /// `GET …/workflows/{wid}` — the full graph for one workflow.
@@ -286,12 +332,13 @@ async fn create_workflow(
 
     let workflows_dir = source_dir.join("workflows");
     let path = workflows_dir.join(format!("{}.toml", body.id));
-    if path.is_file() {
-        return Err(ApiError(OpenCompanyError::Conflict(format!(
-            "A workflow named `{}` already exists.",
-            body.id
-        ))));
-    }
+
+    std::fs::create_dir_all(&workflows_dir).map_err(|source| {
+        ApiError(OpenCompanyError::StoreIo {
+            path: workflows_dir.clone(),
+            source,
+        })
+    })?;
 
     // `parse_workflow` only rejects zero triggers (a saved graph may legally
     // have more, e.g. multiple entry points); the creator is stricter — a
@@ -341,6 +388,9 @@ async fn create_workflow(
         }
     }
 
+    // Save `body.id` before `body` is consumed by `Into<RawWorkflow>` below.
+    let body_id = body.id.clone();
+
     // Render the candidate graph to TOML and reuse `parse_workflow` to
     // validate its structure end to end — the same rules a hand-authored
     // `workflows/<id>.toml` must satisfy. Any problem becomes a 400, never the
@@ -356,19 +406,37 @@ async fn create_workflow(
         other => ApiError(other),
     })?;
 
-    std::fs::create_dir_all(&workflows_dir).map_err(|source| {
+    // Write the file atomically: `create_new(true)` fails if the path already
+    // exists, closing the TOCTOU gap between a separate `is_file()` check and
+    // `fs::write`. Also, save the store record **after** the file lands so a
+    // store failure doesn't orphan a file — if the save fails the file is
+    // cleaned up and the caller can retry.
+    let mut wf_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => ApiError(OpenCompanyError::Conflict(format!(
+                "A workflow named `{}` already exists.",
+                body_id
+            ))),
+            _ => ApiError(OpenCompanyError::StoreIo {
+                path: path.clone(),
+                source: e,
+            }),
+        })?;
+    wf_file.write_all(toml_src.as_bytes()).map_err(|source| {
         ApiError(OpenCompanyError::StoreIo {
-            path: workflows_dir.clone(),
+            path: path.clone(),
             source,
         })
     })?;
-    std::fs::write(&path, &toml_src)
-        .map_err(|source| ApiError(OpenCompanyError::StoreIo { path, source }))?;
+    drop(wf_file);
 
     // Record the id as enabled on the operator's live copy of the manifest —
     // mirrors the team overlay: the version-controlled `company.toml` on disk
     // is never rewritten (see `crate::server::ops::team`).
-    if !record
+    let save_result = if !record
         .manifest
         .workflows
         .enabled
@@ -376,7 +444,16 @@ async fn create_workflow(
         .any(|e| e == &file.id)
     {
         record.manifest.workflows.enabled.push(file.id.clone());
-        company.runtime.store().save(&record).await?;
+        company.runtime.store().save(&record).await
+    } else {
+        Ok(())
+    };
+
+    // If the store save failed, remove the file we just wrote so a retry can
+    // succeed without admin intervention.
+    if let Err(e) = save_result {
+        let _ = std::fs::remove_file(&path);
+        return Err(ApiError(e));
     }
 
     Ok(Json(WorkflowGraph::from(file)))
@@ -633,5 +710,104 @@ mod tests {
         let files = load_source_workflows(Some(dir.path())).expect("lists despite a bad file");
         let ids: Vec<_> = files.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, vec!["demo"]);
+    }
+
+    // HTTP-level: a hosted tenant has no source directory to scan, so these
+    // exercise the manifest-enabled union path end to end via the router.
+    mod hosted_mode {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        use crate::company::CompanyManifest;
+        use crate::ports::CompanyStore;
+        use crate::ports::types::{CompanyId, CompanyRecord};
+        use crate::runtime::RuntimeBuilder;
+        use crate::server::router;
+        use crate::store::FsCompanyStore;
+        use crate::{AppConfig, AppState};
+
+        fn home() -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "oc-workflows-hosted-{}",
+                crate::ports::generate_id()
+            ))
+        }
+
+        /// A manifest declaring one enabled workflow — mirrors what a
+        /// platform tenant provisions with, minus any `workflows/` directory
+        /// on disk (there isn't one: hosted tenants have no source dir).
+        fn manifest_with_enabled() -> CompanyManifest {
+            toml::from_str(
+                "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[workflows]\nenabled = [\"demo\"]\n",
+            )
+            .unwrap()
+        }
+
+        /// Builds a running company whose runtime has **no source directory**
+        /// (built without `with_seed_dir`, matching how the platform builds a
+        /// provisioned tenant) but whose persisted record declares an enabled
+        /// workflow — the exact hosted-mode gap #70 reports.
+        async fn state_with_hosted_company(home: &std::path::Path) -> AppState {
+            let store = FsCompanyStore::new(home.to_path_buf());
+            let id = CompanyId::new("acme");
+            store
+                .save(&CompanyRecord {
+                    id: id.clone(),
+                    manifest: manifest_with_enabled(),
+                    ledger: Vec::new(),
+                    lifecycle: "running".to_string(),
+                    overlay_agents: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest_with_enabled())
+                .with_id(id.clone())
+                .build()
+                .await
+                .unwrap();
+            assert!(
+                runtime.source_dir().is_none(),
+                "test setup must simulate hosted mode: no source dir"
+            );
+            let state = AppState::new(AppConfig::default());
+            state.registry().insert(id, std::sync::Arc::new(runtime));
+            crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+            state
+        }
+
+        #[tokio::test]
+        async fn manifest_enabled_workflow_lists_with_no_source_dir() {
+            let home = home();
+            let state = state_with_hosted_company(&home).await;
+
+            let response = router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/company/workflows")
+                        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            // Regression for #70: the REST list used to scan the filesystem
+            // only, so a hosted tenant with no source dir always got `[]`
+            // here even though its manifest declared an enabled workflow.
+            let items = body.as_array().expect("array response");
+            assert_eq!(items.len(), 1, "body: {body}");
+            assert_eq!(items[0]["id"], "demo");
+            // No file to load a real name from, so the id is the fallback
+            // name — same fallback the GraphQL `Company.workflows` resolver
+            // uses for the same case.
+            assert_eq!(items[0]["name"], "demo");
+
+            std::fs::remove_dir_all(&home).ok();
+        }
     }
 }

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Mail, MoreHorizontal, Plus, Sparkles, UserPlus } from "lucide-react";
+import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { ApiError } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -66,10 +68,12 @@ export function TeamView({ client, company }: Props) {
         setFromHost(true);
       } else {
         setMembers(starterTeam());
+        setFromHost(false);
       }
     } catch {
       // No roster surface on this host yet — start from an editable team.
       setMembers(starterTeam());
+      setFromHost(false);
     } finally {
       setLoad("ready");
     }
@@ -80,10 +84,42 @@ export function TeamView({ client, company }: Props) {
     void boot();
   }, [boot]);
 
-  function addMember(fields: { name: string; role: string; description: string; inbox?: boolean }) {
-    setMembers((m) => [...m, newMember(fields)]);
+  async function addMember(fields: { name: string; role: string; description: string; inbox?: boolean }) {
+    try {
+      await client.addTeamMember(
+        { name: fields.name, role: fields.role, description: fields.description || undefined },
+        company,
+      );
+      // Persisted on the host — refetch so the card reflects the real record
+      // (id, merge order) rather than a locally-guessed one.
+      await boot();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        // No team write plane on this host — keep the edit local-only.
+        setMembers((m) => [...m, newMember(fields)]);
+      } else {
+        toast.error(error instanceof Error ? error.message : "Couldn't add teammate.");
+        return;
+      }
+    }
     if (fields.inbox) toggleMemberInbox(fields.name);
     setAddOpen(false);
+  }
+
+  async function removeMember(member: TeamMember) {
+    try {
+      await client.removeTeamMember(member.id, company);
+      await boot();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        // No team write plane on this host — drop it from local state only.
+        setMembers((ms) => ms.filter((x) => x.id !== member.id));
+      } else if (error instanceof ApiError && error.status === 409) {
+        toast.error("This teammate is defined in the company manifest and can't be removed here.");
+      } else {
+        toast.error(error instanceof Error ? error.message : "Couldn't remove teammate.");
+      }
+    }
   }
 
   return (
@@ -115,7 +151,7 @@ export function TeamView({ client, company }: Props) {
                 member={m}
                 inboxOn={isInboxEnabled(inboxes, m.name)}
                 onToggleInbox={() => toggleMemberInbox(m.name)}
-                onRemove={() => setMembers((ms) => ms.filter((x) => x.id !== m.id))}
+                onRemove={() => void removeMember(m)}
               />
             ))}
             <button
