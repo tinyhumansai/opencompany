@@ -9,7 +9,7 @@
 //! first agent when none is tagged (so a company without an orchestrator behaves
 //! exactly as before).
 //!
-//! It reaches four tools, all wired only onto the orchestrator agent:
+//! It reaches five tools, all wired only onto the orchestrator agent:
 //!
 //! * [`QueryCompanyTool`] — a read surface over the company's [`FactStore`] and
 //!   recent [`EventLog`] history.
@@ -25,11 +25,16 @@
 //!   task waiting on a workflow can actually be run to completion. Unlike the
 //!   delegation tools it runs the graph inline and returns a concise summary of
 //!   the run rather than enqueuing deferred work.
+//! * [`AddAgentTool`] (issue #71) — writes a new [`OverlayAgent`] through the
+//!   same store path the console `POST .../team` route uses, so the
+//!   orchestrator can bring on a teammate mid-chat.
 //!
 //! Compiled only under `feature = "openhuman"` (the whole `harness` module is).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+use crate::ports::store::company_write_lock;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -39,10 +44,11 @@ use openhuman_core::openhuman as oh;
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
 
 use crate::company::{Agent as ManifestAgent, WorkflowFile, load_company_workflows};
+use crate::error::OpenCompanyError;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
-use crate::ports::types::{CompanyEvent, CompanyId, EventSeq};
-use crate::ports::{WorkflowRun, WorkflowRunner};
+use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, OverlayAgent};
+use crate::ports::{CompanyStore, WorkflowRun, WorkflowRunner, generate_id};
 
 /// The manifest cognition-tier that marks the orchestrator agent.
 pub const ORCHESTRATOR_TIER: &str = "orchestrator";
@@ -63,8 +69,10 @@ pub const QUERY_COMPANY_TOOL: &str = "query_company";
 pub const SPAWN_TASK_TOOL: &str = "spawn_task";
 /// The `delegate_to_desk` tool name.
 pub const DELEGATE_TO_DESK_TOOL: &str = "delegate_to_desk";
-/// The `run_workflow` tool name.
+/// The `run_workflow` tool name (issue #67).
 pub const RUN_WORKFLOW_TOOL: &str = "run_workflow";
+/// The `add_agent` tool name (issue #71 — Active Runtime Teammates).
+pub const ADD_AGENT_TOOL: &str = "add_agent";
 
 /// The id of the orchestrator agent for a roster: the first agent tagged
 /// `tier = "orchestrator"`, else the first roster agent, else `None` (empty
@@ -78,14 +86,16 @@ pub fn orchestrator_id(agents: &[ManifestAgent]) -> Option<String> {
         .map(|a| a.id.clone())
 }
 
-/// Whether `tool` is one of the orchestrator's in-cycle delegation tools.
+/// Whether `tool` is one of the orchestrator's in-cycle delegation / roster-write
+/// tools.
 ///
 /// These enqueue internal work drained by the harness brain (a task card, or a
-/// hand-off to a desk's lead member) rather than reaching an external
-/// counterparty, so the [`ApprovalPolicy`](crate::harness::policy::ApprovalPolicy)
-/// classifies them as internal — never an external effect to park or deny.
+/// hand-off to a desk's lead member) or write to the company's own store (adding
+/// a teammate), rather than reaching an external counterparty, so the
+/// [`ApprovalPolicy`](crate::harness::policy::ApprovalPolicy) classifies them as
+/// internal — never an external effect to park or deny.
 pub fn is_delegation_tool(tool: &str) -> bool {
-    tool == SPAWN_TASK_TOOL || tool == DELEGATE_TO_DESK_TOOL
+    tool == SPAWN_TASK_TOOL || tool == DELEGATE_TO_DESK_TOOL || tool == ADD_AGENT_TOOL
 }
 
 /// The orchestrator persona brief, appended to the orchestrator agent's persona.
@@ -94,10 +104,13 @@ pub fn orchestrator_brief() -> String {
 Answer from whole-company context, and when a request belongs to a specialist desk or should be \
 tracked as work, delegate instead of guessing. Use `query_company` to ground answers in the \
 company's durable facts and recent activity, `delegate_to_desk` to hand a turn to a desk's lead \
-member, `spawn_task` to open a tracked task card, and `run_workflow` to execute one of the \
+member, `spawn_task` to open a tracked task card, `run_workflow` to execute one of the \
 company's saved workflows by id (for example to advance or finish a task that is waiting on a \
-workflow run) — you can run workflows yourself; never claim the run_workflow tool is unavailable. \
-Delegate only when it genuinely helps — otherwise answer directly and concisely."
+workflow run) — you can run workflows yourself; never claim the run_workflow tool is unavailable — \
+and `add_agent` to bring on a new teammate (a name, role, and optional mandate) when the company \
+genuinely needs one — it becomes a real, addressable member of the team starting next turn. \
+Delegate, run a workflow, or add a teammate only when it genuinely helps — otherwise answer \
+directly and concisely."
         .to_string()
 }
 
@@ -455,17 +468,153 @@ pub fn delegation_tools(queue: &DelegationQueue) -> Vec<Box<dyn Tool>> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// add_agent (issue #71)
+// ---------------------------------------------------------------------------
+
+/// A tool that lets the orchestrator bring on a new teammate mid-chat (issue
+/// #71 — Active Runtime Teammates, the minimal slice): it writes an
+/// [`OverlayAgent`] through the exact same load → push → save path the console
+/// `POST .../team` route uses (`crate::server::ops::team::add_member`), so a
+/// teammate added from chat is persisted identically to one added from the
+/// operator's Team tab. The teammate becomes a real, addressable roster agent
+/// on the company's next [`HarnessPool::ensure`](crate::harness::HarnessPool::ensure)
+/// call (the overlay-agent freshness gate) — no restart needed.
+///
+/// No lifecycle states, budgets, or workspace/memory namespaces here — those
+/// stay future work per the design doc; this tool only ever appends a roster
+/// entry with the standard company-wide tool grant.
+///
+/// Writes are serialised per-company through a shared static mutex map, so the
+/// orchestrator's `add_agent` and the console `POST .../team` route can never
+/// clobber each other's `overlay_agents` list with concurrent load→push→save
+/// cycles (the CodeRabbit concurrency finding).
+///
+/// The tool also guards against accidental duplicates: calling `add_agent` with
+/// a `name` that already exists in the overlay set is a clean error, not a
+/// silent duplicate that would surface two indistinguishable teammates in the
+/// roster and Team view (the Greptile deduplication finding).
+pub struct AddAgentTool {
+    company: CompanyId,
+    store: Arc<dyn CompanyStore>,
+}
+
+impl AddAgentTool {
+    /// Builds the tool over the company id and its store handle
+    /// ([`HarnessDeps::store`](crate::harness::HarnessDeps::store)).
+    pub fn new(company: CompanyId, store: Arc<dyn CompanyStore>) -> Self {
+        Self { company, store }
+    }
+}
+
+#[async_trait]
+impl Tool for AddAgentTool {
+    fn name(&self) -> &str {
+        ADD_AGENT_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "Add a new teammate to the company. Provide a `name`, a `role` (job title), and an optional `description` of their mandate. The teammate becomes a real, addressable member of the roster starting next turn."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "The new teammate's display name." },
+                "role": { "type": "string", "description": "The new teammate's job title." },
+                "description": { "type": "string", "description": "An optional description of the teammate's mandate." }
+            },
+            "required": ["name", "role"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("`name` is required"))?
+            .to_string();
+        let role = args
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("`role` is required"))?
+            .to_string();
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+
+        // Serialize per-company writes so the orchestrator's add_agent and the
+        // console `POST .../team` route can never clobber each other's
+        // `overlay_agents` list with concurrent load→push→save cycles.
+        let _lock = company_write_lock(&self.company).lock().await;
+
+        // Same write path as the console `POST .../team` route: load, push the
+        // overlay entry, save. Never rewrites the version-controlled manifest.
+        let mut record = self
+            .store
+            .load(&self.company)
+            .await?
+            .ok_or_else(|| OpenCompanyError::CompanyNotFound(self.company.to_string()))?;
+
+        // Deduplication guard: reject a call whose `name` already names an
+        // existing overlay teammate, so a trigger-happy orchestrator can't
+        // accumulate indistinguishable duplicates. Matching on name alone is
+        // intentional — the orchestrator supplies display names, and an id
+        // collision with a manifest agent is handled by `build_roster`.
+        let name_lower = name.to_ascii_lowercase();
+        if record
+            .overlay_agents
+            .iter()
+            .any(|a| a.name.to_ascii_lowercase() == name_lower)
+        {
+            return Ok(ToolResult::error(format!(
+                "A teammate named \"{name}\" already exists. Pick a different name, or remove the existing one first."
+            )));
+        }
+        let agent = OverlayAgent {
+            id: generate_id(),
+            name: name.clone(),
+            role: role.clone(),
+            description,
+        };
+        record.overlay_agents.push(agent);
+        self.store.save(&record).await?;
+
+        Ok(ToolResult::success(format!(
+            "Added {name} as {role} to the team. They'll be reachable as a teammate starting next turn."
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// orchestrator_tools — the complete tool set (issues #53, #67, #71)
+// ---------------------------------------------------------------------------
+
 /// The complete tool set wired onto the company's orchestrator agent (issues
-/// #53 and #67), in order: the `query_company` read surface, the `spawn_task`
-/// and `delegate_to_desk` delegation tools, and the `run_workflow` execution
-/// tool.
+/// #53, #67, and #71), in order: the `query_company` read surface, the
+/// `spawn_task` and `delegate_to_desk` delegation tools, the `run_workflow`
+/// execution tool, and the `add_agent` roster-write tool.
 ///
 /// [`build_agent`](crate::harness::build::build_agent) extends the orchestrator
 /// agent's tools with exactly this vector, so a test over this function is the
 /// registration check for the orchestrator's tool list. `workflow_source_dir` is
 /// the company source directory (`companies/<name>`) whose `workflows/` subtree
 /// holds the graphs; `workflow_runner` is the shared handle the runtime builder
-/// fills once the runner is built.
+/// fills once the runner is built. `store` is the company store the `add_agent`
+/// tool writes through.
 pub fn orchestrator_tools(
     company: CompanyId,
     facts: Option<Arc<dyn FactStore>>,
@@ -473,6 +622,7 @@ pub fn orchestrator_tools(
     queue: &DelegationQueue,
     workflow_source_dir: Option<PathBuf>,
     workflow_runner: WorkflowRunnerHandle,
+    store: Arc<dyn CompanyStore>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(QueryCompanyTool::new(
         company.clone(),
@@ -481,10 +631,11 @@ pub fn orchestrator_tools(
     ))];
     tools.extend(delegation_tools(queue));
     tools.push(Box::new(RunWorkflowTool::new(
-        company,
+        company.clone(),
         workflow_source_dir,
         workflow_runner,
     )));
+    tools.push(Box::new(AddAgentTool::new(company, store)));
     tools
 }
 
@@ -768,6 +919,9 @@ fn preview_item(item: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    use crate::ports::types::{CompanyRecord, CompanySummary, LedgerEntry};
 
     fn agent(id: &str, tier: Option<&str>) -> ManifestAgent {
         ManifestAgent {
@@ -805,6 +959,7 @@ mod tests {
     fn delegation_tool_names_are_classified_internal() {
         assert!(is_delegation_tool(SPAWN_TASK_TOOL));
         assert!(is_delegation_tool(DELEGATE_TO_DESK_TOOL));
+        assert!(is_delegation_tool(ADD_AGENT_TOOL));
         // The read tool is NOT a delegation tool.
         assert!(!is_delegation_tool(QUERY_COMPANY_TOOL));
         assert!(!is_delegation_tool("send_email"));
@@ -899,6 +1054,124 @@ mod tests {
         assert!(out.contains("No recent activity"), "{out}");
     }
 
+    // --- add_agent (issue #71) ----------------------------------------------
+
+    /// An in-memory `CompanyStore` so `AddAgentTool` can be exercised without a
+    /// filesystem, mirroring `crate::server::ops::team`'s `add_member` write
+    /// path (load → push overlay → save).
+    #[derive(Default)]
+    struct MemStore {
+        record: StdMutex<Option<CompanyRecord>>,
+    }
+
+    impl MemStore {
+        fn seeded(record: CompanyRecord) -> Self {
+            Self {
+                record: StdMutex::new(Some(record)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CompanyStore for MemStore {
+        async fn load(&self, _id: &CompanyId) -> crate::Result<Option<CompanyRecord>> {
+            Ok(self.record.lock().unwrap().clone())
+        }
+        async fn save(&self, record: &CompanyRecord) -> crate::Result<()> {
+            *self.record.lock().unwrap() = Some(record.clone());
+            Ok(())
+        }
+        async fn list(&self) -> crate::Result<Vec<CompanySummary>> {
+            Ok(Vec::new())
+        }
+        async fn append_ledger(&self, _id: &CompanyId, _entry: LedgerEntry) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn empty_manifest() -> crate::company::CompanyManifest {
+        toml::from_str("[company]\nname = \"Acme\"\n").expect("valid manifest")
+    }
+
+    fn seeded_record(id: &CompanyId) -> CompanyRecord {
+        CompanyRecord {
+            id: id.clone(),
+            manifest: empty_manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_agent_tool_persists_an_overlay_teammate() {
+        let company = CompanyId::new("acme");
+        let store = Arc::new(MemStore::seeded(seeded_record(&company)));
+        let tool = AddAgentTool::new(company.clone(), store.clone());
+
+        let result = tool
+            .execute(json!({
+                "name": "Jamie",
+                "role": "Growth Lead",
+                "description": "Owns acquisition experiments."
+            }))
+            .await
+            .expect("execute");
+        assert!(!result.is_error, "add_agent should succeed");
+
+        let record = store
+            .load(&company)
+            .await
+            .unwrap()
+            .expect("record persisted");
+        assert_eq!(record.overlay_agents.len(), 1);
+        let added = &record.overlay_agents[0];
+        assert_eq!(added.name, "Jamie");
+        assert_eq!(added.role, "Growth Lead");
+        assert_eq!(
+            added.description.as_deref(),
+            Some("Owns acquisition experiments.")
+        );
+        assert!(!added.id.is_empty(), "a stable id must be minted");
+    }
+
+    #[tokio::test]
+    async fn add_agent_tool_requires_name_and_role() {
+        let company = CompanyId::new("acme");
+        let store = Arc::new(MemStore::seeded(seeded_record(&company)));
+        let tool = AddAgentTool::new(company.clone(), store.clone());
+
+        assert!(
+            tool.execute(json!({ "role": "Growth Lead" }))
+                .await
+                .is_err(),
+            "missing `name` must be rejected"
+        );
+        assert!(
+            tool.execute(json!({ "name": "Jamie" })).await.is_err(),
+            "missing `role` must be rejected"
+        );
+        let record = store.load(&company).await.unwrap().expect("record");
+        assert!(
+            record.overlay_agents.is_empty(),
+            "a rejected call must not persist a half-formed teammate"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_agent_tool_reports_company_not_found() {
+        let company = CompanyId::new("ghost");
+        let store: Arc<dyn CompanyStore> = Arc::new(MemStore::default());
+        let tool = AddAgentTool::new(company, store);
+
+        let err = tool
+            .execute(json!({ "name": "Jamie", "role": "Growth Lead" }))
+            .await
+            .expect_err("no record for this company id");
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
     // ---- run_workflow (issue #67) ----
 
     /// A valid trigger → agent → output graph, mirroring the REST route's fixture.
@@ -950,7 +1223,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait::async_trait]
     impl WorkflowRunner for StubRunner {
         async fn run(
             &self,
@@ -996,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_tools_includes_run_workflow_and_the_rest() {
+    fn orchestrator_tools_includes_all_five() {
         let queue = DelegationQueue::default();
         let tools = orchestrator_tools(
             CompanyId::new("acme"),
@@ -1005,9 +1278,11 @@ mod tests {
             &queue,
             None,
             WorkflowRunnerHandle::default(),
+            Arc::new(MemStore::default()),
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&RUN_WORKFLOW_TOOL), "got {names:?}");
+        assert!(names.contains(&ADD_AGENT_TOOL), "got {names:?}");
         assert!(names.contains(&QUERY_COMPANY_TOOL), "got {names:?}");
         assert!(names.contains(&SPAWN_TASK_TOOL), "got {names:?}");
         assert!(names.contains(&DELEGATE_TO_DESK_TOOL), "got {names:?}");

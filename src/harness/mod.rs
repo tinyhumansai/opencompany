@@ -50,7 +50,7 @@ pub mod steps;
 
 pub use brain::HarnessBrain;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,6 +60,7 @@ use tokio::sync::{Mutex, RwLock};
 use oh::agent::Agent;
 use oh::inference::provider::Provider;
 
+use crate::company::Agent as ManifestAgent;
 use crate::company::Policy;
 use crate::company::mcp::McpServerDecl;
 use crate::error::OpenCompanyError;
@@ -68,10 +69,11 @@ use crate::harness::mcp_probe::McpFailureQueue;
 use crate::harness::orchestrator::DelegationQueue;
 use crate::harness::policy::ApprovalPolicy;
 use crate::ports::skills_state::{SkillState, SkillStateStore};
-use crate::ports::types::{CompanyId, CompanyRecord, TurnStep};
+use crate::ports::types::{CompanyId, CompanyRecord, OverlayAgent, TurnStep};
 use crate::ports::{
     CompanyStore, ContextStore, EventLog, FactStore, SecretStore, TaskStore, UsageMeter,
 };
+use crate::runtime::builder::agent_effective_grants;
 
 /// Shared dependencies every harness-built agent draws on.
 #[derive(Clone)]
@@ -328,6 +330,12 @@ pub struct HarnessPool {
     /// from, keyed by company. Drives MCP-freshness: [`ensure`](Self::ensure)
     /// rebuilds the roster whenever the fingerprint changes.
     mcp_fingerprints: RwLock<HashMap<CompanyId, u64>>,
+    /// Fingerprint of the overlay-agent set (issue #71 — Active Runtime
+    /// Teammates) the cached roster was built from, keyed by company. Drives
+    /// overlay-agent freshness: [`ensure`](Self::ensure) rebuilds the roster
+    /// whenever an operator- or orchestrator-added teammate is added/removed,
+    /// mirroring the MCP-freshness fingerprint above.
+    overlay_fingerprints: RwLock<HashMap<CompanyId, u64>>,
 }
 
 impl Default for HarnessPool {
@@ -342,6 +350,7 @@ impl HarnessPool {
         Self {
             agents: RwLock::new(HashMap::new()),
             mcp_fingerprints: RwLock::new(HashMap::new()),
+            overlay_fingerprints: RwLock::new(HashMap::new()),
         }
     }
 
@@ -356,16 +365,29 @@ impl HarnessPool {
     /// company restart (the "Parallel Search / BrowserBase" bug). When nothing
     /// changed, the cached roster is reused (the common fast path), exactly as
     /// before.
+    ///
+    /// **Overlay-agent freshness (issue #71)**: the live overlay-agent set is
+    /// re-resolved and fingerprinted the same way, from [`HarnessDeps::store`]
+    /// rather than the (possibly stale) `company` snapshot passed in — so a
+    /// teammate added through the console `POST .../team` route or the
+    /// orchestrator's `add_agent` tool becomes a real, addressable roster agent
+    /// on the company's **next** `ensure` call, with no restart.
     pub async fn ensure(&self, company: &CompanyRecord, deps: &HarnessDeps) -> crate::Result<()> {
         // Re-resolve + fingerprint the effective MCP set (cheap; no rebuild yet).
         let effective_mcp = self.resolve_effective_mcp(company, deps).await;
-        let fingerprint = mcp_fingerprint(&effective_mcp);
+        let mcp_fp = mcp_fingerprint(&effective_mcp);
+
+        // Re-resolve + fingerprint the live overlay-agent set the same way.
+        let overlay_agents = self.resolve_effective_overlay(company, deps).await;
+        let overlay_fp = overlay_fingerprint(&overlay_agents);
 
         {
             let agents = self.agents.read().await;
-            let fingerprints = self.mcp_fingerprints.read().await;
+            let mcp_fingerprints = self.mcp_fingerprints.read().await;
+            let overlay_fingerprints = self.overlay_fingerprints.read().await;
             if agents.contains_key(&company.id)
-                && fingerprints.get(&company.id) == Some(&fingerprint)
+                && mcp_fingerprints.get(&company.id) == Some(&mcp_fp)
+                && overlay_fingerprints.get(&company.id) == Some(&overlay_fp)
             {
                 return Ok(());
             }
@@ -383,14 +405,23 @@ impl HarnessPool {
         // shares every Arc / queue handle — only `mcp_servers` is overridden.
         let mut fresh_deps = deps.clone();
         fresh_deps.mcp_servers = effective_mcp;
-        let roster = build_roster(company, &fresh_deps, &skill_deltas)?;
+        // Same treatment for the overlay-agent set: `company` may be a stale
+        // boot-time snapshot (e.g. `HarnessBrain::record`), so the roster is
+        // built from the live-resolved overlay set, not `company.overlay_agents`.
+        let mut fresh_company = company.clone();
+        fresh_company.overlay_agents = overlay_agents;
+        let roster = build_roster(&fresh_company, &fresh_deps, &skill_deltas)?;
 
         let mut agents = self.agents.write().await;
         agents.insert(company.id.clone(), roster);
         self.mcp_fingerprints
             .write()
             .await
-            .insert(company.id.clone(), fingerprint);
+            .insert(company.id.clone(), mcp_fp);
+        self.overlay_fingerprints
+            .write()
+            .await
+            .insert(company.id.clone(), overlay_fp);
         Ok(())
     }
 
@@ -415,11 +446,36 @@ impl HarnessPool {
         }
     }
 
+    /// Re-resolves the company's live overlay-agent set (issue #71): reloads the
+    /// [`CompanyRecord`] from [`HarnessDeps::store`] so a teammate added through
+    /// the console `POST .../team` route or the orchestrator's `add_agent` tool
+    /// reaches the roster on the company's next `ensure` call — the same
+    /// live-re-resolution pattern as [`Self::resolve_effective_mcp`]. A missing
+    /// record or a store error degrades to the `company` snapshot passed in
+    /// (never worse than the pre-#71 always-static behaviour).
+    async fn resolve_effective_overlay(
+        &self,
+        company: &CompanyRecord,
+        deps: &HarnessDeps,
+    ) -> Vec<OverlayAgent> {
+        match deps.store.load(&company.id).await {
+            Ok(Some(record)) => record.overlay_agents,
+            _ => company.overlay_agents.clone(),
+        }
+    }
+
     /// The current MCP fingerprint for a company (test-only), so a freshness test
     /// can assert a rebuild happened without introspecting agent internals.
     #[cfg(test)]
     pub async fn mcp_fingerprint_of(&self, company: &CompanyId) -> Option<u64> {
         self.mcp_fingerprints.read().await.get(company).copied()
+    }
+
+    /// The current overlay-agent fingerprint for a company (test-only), mirroring
+    /// [`Self::mcp_fingerprint_of`].
+    #[cfg(test)]
+    pub async fn overlay_fingerprint_of(&self, company: &CompanyId) -> Option<u64> {
+        self.overlay_fingerprints.read().await.get(company).copied()
     }
 
     /// Routes a message to one agent and returns its reply, recording the turn's
@@ -542,7 +598,37 @@ fn auth_kind(material: &crate::company::mcp::AuthMaterial) -> u8 {
     }
 }
 
-/// Build every roster agent for a company from its manifest.
+/// A stable fingerprint of an overlay-agent set (issue #71), used to detect a
+/// teammate add/remove/edit between [`HarnessPool::ensure`] calls. Mirrors
+/// [`mcp_fingerprint`]'s shape; no secrets are involved here so there is
+/// nothing to scrub — an [`OverlayAgent`] is display data.
+fn overlay_fingerprint(agents: &[OverlayAgent]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    agents.len().hash(&mut hasher);
+    for agent in agents {
+        agent.id.hash(&mut hasher);
+        agent.name.hash(&mut hasher);
+        agent.role.hash(&mut hasher);
+        agent.description.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Build every roster agent for a company: every manifest `[[agent]]`, plus
+/// every operator- or orchestrator-added [`OverlayAgent`] (issue #71 — Active
+/// Runtime Teammates) that does not collide with a manifest agent id.
+///
+/// Overlay teammates were presentation-only before this cell (listed in the
+/// console Team tab but never addressable); this promotes each one into a real
+/// [`CompanyAgent`] with the same shape [`build::build_agent`] gives a manifest
+/// agent — a standard (company-wide) tool grant, no cognition tier (the
+/// default `chat-v1` model), and never the orchestrator. A manifest agent
+/// always wins an id collision: the version-controlled roster is authoritative,
+/// and [`orchestrator::orchestrator_id`] only ever looks at `manifest.agents`,
+/// so an overlay teammate can never become the orchestrator.
 ///
 /// `skill_deltas` are the company's operator skill overrides (fetched once by
 /// the async caller); every agent folds them into its effective skill set.
@@ -553,10 +639,39 @@ pub(crate) fn build_roster(
 ) -> crate::Result<Vec<Arc<CompanyAgent>>> {
     let policy: &Policy = &company.manifest.policy;
     let company_name = &company.manifest.company.name;
+    let allow = &company.manifest.tools.allow;
     // The orchestrator agent (tier `orchestrator`, else the first agent) receives
     // the delegating-orchestrator persona + tools (issue #53).
     let orchestrator = orchestrator::orchestrator_id(&company.manifest.agents);
-    company
+
+    let mut roster =
+        Vec::with_capacity(company.manifest.agents.len() + company.overlay_agents.len());
+
+    for manifest_agent in &company.manifest.agents {
+        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+        let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
+        let grants = agent_effective_grants(allow, &manifest_agent.tools);
+        let agent = build::build_agent(
+            &company.id,
+            company_name,
+            manifest_agent,
+            agent_policy,
+            deps,
+            &grants,
+            skill_deltas,
+            is_orchestrator,
+        )?;
+        roster.push(Arc::new(CompanyAgent {
+            agent_id: manifest_agent.id.clone(),
+            role: manifest_agent.role.clone(),
+            agent: Mutex::new(agent),
+        }));
+    }
+
+    // Issue #71 — Active Runtime Teammates (minimal slice): promote every
+    // operator/orchestrator-added overlay teammate into a real roster agent
+    // too, skipping any id already claimed by a manifest agent.
+    let manifest_ids: HashSet<&str> = company
         .manifest
         .agents
         .iter()
@@ -565,10 +680,7 @@ pub(crate) fn build_roster(
             let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
             // This agent's effective tool grants: its own `tools` narrowed by the
             // company `[tools].allow`-list (full allow-list when it lists none).
-            let grants = crate::runtime::builder::agent_effective_grants(
-                &company.manifest.tools.allow,
-                &manifest_agent.tools,
-            );
+            let grants = agent_effective_grants(allow, &manifest_agent.tools);
             let agent = build::build_agent(
                 &company.id,
                 company_name,
@@ -585,7 +697,65 @@ pub(crate) fn build_roster(
                 agent: Mutex::new(agent),
             }))
         })
-        .collect()
+        .collect::<crate::Result<Vec<_>>>()?;
+    roster.extend(manifest_roster);
+
+    // Issue #71 — Active Runtime Teammates (minimal slice): promote every
+    // operator/orchestrator-added overlay teammate into a real roster agent
+    // too, skipping any id already claimed by a manifest agent.
+    let manifest_ids: HashSet<&str> = company
+        .manifest
+        .agents
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect();
+    for overlay in &company.overlay_agents {
+        if manifest_ids.contains(overlay.id.as_str()) {
+            continue;
+        }
+        let manifest_agent = overlay_agent_to_manifest(overlay);
+        // No per-teammate budget cap or cognition-tier hint in v1 — see
+        // `overlay_agent_to_manifest`.
+        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+        let grants = agent_effective_grants(allow, &manifest_agent.tools);
+        let agent = build::build_agent(
+            &company.id,
+            company_name,
+            &manifest_agent,
+            agent_policy,
+            deps,
+            &grants,
+            skill_deltas,
+            /* is_orchestrator */ false,
+        )?;
+        roster.push(Arc::new(CompanyAgent {
+            agent_id: manifest_agent.id.clone(),
+            role: manifest_agent.role.clone(),
+            agent: Mutex::new(agent),
+        }));
+    }
+
+    Ok(roster)
+}
+
+/// Converts an operator-added [`OverlayAgent`] into the manifest agent shape
+/// [`build::build_agent`] consumes: an empty `tools` list (so
+/// [`agent_effective_grants`] falls back to the full company `[tools].allow`
+/// — the "standard tool grant"), no cognition tier (→ the default `chat-v1`
+/// model), and no per-agent budget cap. The overlay's `name` is a display
+/// label only — already surfaced through
+/// [`crate::metering::roster_display_names`] — so the persona is framed from
+/// `role`/`description` alone, exactly like a manifest teammate
+/// ([`build::persona_prompt`]).
+fn overlay_agent_to_manifest(overlay: &OverlayAgent) -> ManifestAgent {
+    ManifestAgent {
+        id: overlay.id.clone(),
+        role: overlay.role.clone(),
+        description: overlay.description.clone(),
+        tier: None,
+        tools: Vec::new(),
+        budget_usd_daily: None,
+    }
 }
 
 #[cfg(test)]
@@ -834,6 +1004,55 @@ description = "Builds the product."
                 .join("SKILL.md")
                 .is_file(),
             "the effective skill bundle should be materialized under the agent workspace"
+        );
+    }
+
+    /// Issue #71 — an operator/orchestrator-added overlay teammate is promoted
+    /// into a real, addressable roster agent (not just a console row).
+    #[tokio::test]
+    async fn overlay_agent_is_built_as_a_real_roster_agent() {
+        let fx = fixture();
+        let mut rec = record();
+        rec.overlay_agents.push(OverlayAgent {
+            id: "growth".into(),
+            name: "Jamie".into(),
+            role: "Growth Lead".into(),
+            description: Some("Owns acquisition experiments.".into()),
+        });
+
+        let roster = build_roster(&rec, &fx.deps, &[]).expect("roster builds");
+        let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["ceo", "engineer", "growth"], "got {ids:?}");
+        let overlay_agent = roster
+            .iter()
+            .find(|a| a.agent_id == "growth")
+            .expect("overlay teammate present in roster");
+        assert_eq!(overlay_agent.role, "Growth Lead");
+    }
+
+    /// A manifest agent always wins an id collision with an overlay teammate —
+    /// the version-controlled roster is authoritative.
+    #[tokio::test]
+    async fn overlay_agent_id_colliding_with_manifest_agent_is_skipped() {
+        let fx = fixture();
+        let mut rec = record();
+        rec.overlay_agents.push(OverlayAgent {
+            id: "ceo".into(),
+            name: "Impostor".into(),
+            role: "Shadow CEO".into(),
+            description: None,
+        });
+
+        let roster = build_roster(&rec, &fx.deps, &[]).expect("roster builds");
+        let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ceo", "engineer"],
+            "the manifest agent wins the id collision, not a duplicate"
+        );
+        assert_eq!(
+            roster[0].role, "Chief Executive",
+            "the manifest role survives, not the overlay's"
         );
     }
 
@@ -1207,5 +1426,116 @@ description = "Builds the product."
         // A third ensure with no change is a no-op (fingerprint stable).
         pool.ensure(&rec, &deps).await.expect("third ensure");
         assert_eq!(pool.mcp_fingerprint_of(&rec.id).await, Some(after));
+    }
+
+    // --- Overlay-agent freshness (issue #71) --------------------------------
+
+    /// A `CompanyStore` backed by a live, mutable record — so a test can mutate
+    /// it between two `ensure` calls the same way the console `POST .../team`
+    /// route or the orchestrator's `add_agent` tool would, and observe the
+    /// freshness gate react.
+    #[derive(Default)]
+    struct LiveStore {
+        record: StdMutex<Option<CompanyRecord>>,
+    }
+
+    #[async_trait]
+    impl CompanyStore for LiveStore {
+        async fn load(&self, _id: &CompanyId) -> crate::Result<Option<CompanyRecord>> {
+            Ok(self.record.lock().unwrap().clone())
+        }
+        async fn save(&self, record: &CompanyRecord) -> crate::Result<()> {
+            *self.record.lock().unwrap() = Some(record.clone());
+            Ok(())
+        }
+        async fn list(&self) -> crate::Result<Vec<CompanySummary>> {
+            Ok(Vec::new())
+        }
+        async fn append_ledger(&self, _id: &CompanyId, _entry: LedgerEntry) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An overlay teammate added through the live company store (the same path
+    /// the console `POST .../team` route and the orchestrator's `add_agent` tool
+    /// both write through) reaches the roster on the company's NEXT `ensure` —
+    /// no restart — mirroring `ensure_rebuilds_when_a_runtime_mcp_server_is_added`.
+    #[tokio::test]
+    async fn ensure_rebuilds_when_an_overlay_agent_is_added() {
+        let live_store = Arc::new(LiveStore::default());
+        let rec = record();
+        live_store.save(&rec).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(MockContext::default()),
+            store: live_store.clone(),
+            meter: None,
+            workspace_root: dir.path().to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: DelegationQueue::default(),
+            mcp_failures: McpFailureQueue::default(),
+            secrets: None,
+        };
+        let pool = HarnessPool::new();
+
+        pool.ensure(&rec, &deps).await.expect("first ensure");
+        let before = pool
+            .overlay_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert_eq!(pool.resident_companies().await, 1);
+        // The roster is not addressable under "growth" yet.
+        assert!(
+            pool.run(&rec.id, "growth", "hi", &deps).await.is_err(),
+            "the overlay teammate must not exist before it is added"
+        );
+
+        // Add a teammate directly through the live store — the same write path
+        // `AddAgentTool` and the console `POST .../team` route both use.
+        let mut updated = rec.clone();
+        updated.overlay_agents.push(OverlayAgent {
+            id: "growth".into(),
+            name: "Jamie".into(),
+            role: "Growth Lead".into(),
+            description: None,
+        });
+        live_store.save(&updated).await.unwrap();
+
+        // Next ensure re-resolves the live store → fingerprint changes → roster
+        // rebuilt, so the new teammate reaches the company without a restart.
+        pool.ensure(&rec, &deps).await.expect("second ensure");
+        let after = pool
+            .overlay_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert_ne!(
+            before, after,
+            "adding a teammate must change the overlay fingerprint"
+        );
+        assert_eq!(
+            pool.resident_companies().await,
+            1,
+            "same company, rebuilt in place"
+        );
+
+        let reply = pool
+            .run(&rec.id, "growth", "hello-marker", &deps)
+            .await
+            .expect("the new teammate is addressable on the very next turn")
+            .reply;
+        assert!(reply.contains("hello-marker"), "got {reply:?}");
+
+        // A third ensure with no further change is a no-op (fingerprint stable).
+        pool.ensure(&rec, &deps).await.expect("third ensure");
+        assert_eq!(pool.overlay_fingerprint_of(&rec.id).await, Some(after));
     }
 }

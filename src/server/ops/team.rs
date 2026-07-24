@@ -19,6 +19,7 @@ use crate::company::dns::DomainStatus;
 use crate::error::OpenCompanyError;
 use crate::ports::generate_id;
 use crate::ports::inbox::InboxMeta;
+use crate::ports::store::company_write_lock;
 use crate::ports::types::OverlayAgent;
 use crate::server::error::ApiError;
 use crate::server::ops::language;
@@ -108,6 +109,11 @@ async fn add_member(
     company: ScopedCompany,
     Json(body): Json<AddMember>,
 ) -> Result<Json<TeamMemberDto>, ApiError> {
+    // Serialize per-company writes so concurrent console POST /team and
+    // orchestrator add_agent calls can't clobber each other's overlay_agents.
+    let write_lock = company_write_lock(company.id());
+    let _lock = write_lock.lock().await;
+
     let mut record = company
         .runtime
         .store()
@@ -134,6 +140,10 @@ async fn remove_member(
     company: ScopedCompany,
     Path(AgentPath { agent_id }): Path<AgentPath>,
 ) -> Result<StatusCode, ApiError> {
+    // Serialize so a concurrent add_agent / add_member doesn't clobber.
+    let write_lock = company_write_lock(company.id());
+    let _lock = write_lock.lock().await;
+
     let mut record = company
         .runtime
         .store()
