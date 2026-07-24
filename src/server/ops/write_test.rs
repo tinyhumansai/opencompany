@@ -588,6 +588,16 @@ async fn team_overlay_add_delete_and_manifest_delete_conflict() {
     let home = home();
     let state = state_with_company(&home).await;
 
+    // The manifest teammate shows up on the read side before any overlay add,
+    // named `null` (the console falls back to the role).
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let roster = roster.as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["id"], "ceo");
+    assert_eq!(roster[0]["role"], "Chief");
+    assert!(roster[0]["name"].is_null());
+
     // Add an overlay teammate.
     let (status, member) = send(
         &state,
@@ -599,6 +609,15 @@ async fn team_overlay_add_delete_and_manifest_delete_conflict() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(member["role"], "Designer");
     let id = member["id"].as_str().unwrap().to_string();
+
+    // The read side now merges in the overlay teammate, named this time.
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let roster = roster.as_array().unwrap();
+    assert_eq!(roster.len(), 2);
+    let dana = roster.iter().find(|m| m["id"] == id).unwrap();
+    assert_eq!(dana["name"], "Dana");
+    assert_eq!(dana["role"], "Designer");
 
     // Deleting a manifest teammate is a 409.
     let (status, body) = send(&state, "DELETE", "/api/v1/company/team/ceo", None).await;
@@ -614,6 +633,13 @@ async fn team_overlay_add_delete_and_manifest_delete_conflict() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The removed overlay teammate is gone from the read side too.
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let roster = roster.as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["id"], "ceo");
 
     // Toggle an inbox on.
     let (status, ack) = send(
