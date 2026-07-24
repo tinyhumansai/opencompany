@@ -44,6 +44,26 @@ export interface OutboundMessage {
    * from a tool-backed one.
    */
   steps?: TurnStep[];
+  /** Channel-specific reply addressing (Telegram). Absent on operator messages. */
+  replyTo?: ReplyTo;
+}
+
+/** Channel-specific reply addressing. Mirrors `ReplyTo` in `src/ports/types.rs`. */
+export interface ReplyTo {
+  /** The chat/thread id to deliver back to. */
+  chatId: string;
+}
+
+/** Telegram channel configuration status (no secrets). */
+export interface TelegramChannelStatus {
+  /** Whether the channel is fully configured (both token + secret stored). */
+  configured: boolean;
+  /** Whether a bot token is stored (never the token itself). */
+  tokenSet: boolean;
+  /** Whether a webhook secret is stored (never the secret itself). */
+  secretSet: boolean;
+  /** The public webhook URL to register with setWebhook. */
+  webhookUrl: string;
 }
 
 /**
@@ -63,6 +83,21 @@ export interface DeskDto {
    * company blueprint. Omitted (undefined) when there are none.
    */
   overlayMembers?: string[];
+}
+
+/**
+ * `GET {scope}/chat/history` — one persisted transcript message. Mirrors
+ * `ChatHistoryMessageDto` in `src/server/operator.rs`. Shares its filter +
+ * projection logic with the GraphQL `Chat.history` resolver, so the two can
+ * never disagree about a desk's history (issue #65).
+ */
+export interface ChatHistoryMessageDto {
+  id: string;
+  channel: string;
+  author: string;
+  text: string;
+  atMillis: number;
+  mine: boolean;
 }
 
 /** Response of `/chat` and approval-resolution routes. */

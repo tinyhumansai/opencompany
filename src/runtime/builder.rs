@@ -804,6 +804,12 @@ impl RuntimeBuilder {
                                 events: Some(events.clone()),
                                 delegations: crate::harness::orchestrator::DelegationQueue::default(
                                 ),
+                                // Issue #67: an empty runner handle, filled just
+                                // below once the `HarnessWorkflowRunner` is built,
+                                // so the orchestrator's `run_workflow` tool reaches
+                                // the runner without a construction cycle.
+                                workflow_runner:
+                                    crate::harness::orchestrator::WorkflowRunnerHandle::default(),
                                 // Error-hardening cell: a fresh MCP-failure queue
                                 // the `OcMcpCallTool` decorator fills and the brain
                                 // drains; and a LIVE secret-store handle so
@@ -823,12 +829,20 @@ impl RuntimeBuilder {
                             };
                             // Workflow agent nodes execute on the same pool as the
                             // brain — clone before both moves into `HarnessBrain`.
-                            wf_runner = Some(Arc::new(HarnessWorkflowRunner::new(
-                                pool.clone(),
-                                deps.clone(),
-                                record.clone(),
-                            ))
-                                as Arc<dyn WorkflowRunner>);
+                            let runner: Arc<dyn WorkflowRunner> =
+                                Arc::new(HarnessWorkflowRunner::new(
+                                    pool.clone(),
+                                    deps.clone(),
+                                    record.clone(),
+                                ));
+                            // Issue #67: fill the shared handle on `deps` (a clone
+                            // of which the runner holds, and which moves into the
+                            // brain below) so the orchestrator's `run_workflow` tool
+                            // reaches this runner. The handle stores a `Weak`; the
+                            // strong ref lives on the runtime via
+                            // `set_workflow_runner`, so this is not a strong cycle.
+                            deps.workflow_runner.set(&runner);
+                            wf_runner = Some(runner);
                             Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
                         } else {
                             None

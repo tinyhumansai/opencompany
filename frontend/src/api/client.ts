@@ -18,6 +18,7 @@ import {
   type ApiErrorBody,
   type AppSpec,
   type ApprovalSummary,
+  type ChatHistoryMessageDto,
   type ChatResponse,
   type CompanyStatus,
   type ConnectionStart,
@@ -188,6 +189,21 @@ export class OpenCompanyClient {
     );
   }
 
+  /**
+   * A desk's persisted transcript (issue #65), so the console can rehydrate a
+   * thread on login/reload instead of always starting empty. `desk` is the
+   * thread id (as passed to {@link chat}); omitted reads the operator/General
+   * line. Hosts that don't expose `.../chat/history` yet return 404 — callers
+   * fall back to an empty transcript.
+   */
+  getChatHistory(desk?: string | null, company?: string | null): Promise<ChatHistoryMessageDto[]> {
+    const qs = desk ? `?desk=${encodeURIComponent(desk)}` : "";
+    return this.request<ChatHistoryMessageDto[]>(
+      "GET",
+      `${this.scope(company)}/chat/history${qs}`,
+    );
+  }
+
   /** The approvals awaiting the operator. */
   approvals(company?: string | null): Promise<ApprovalSummary[]> {
     return this.request<ApprovalSummary[]>("GET", `${this.scope(company)}/approvals`);
@@ -234,6 +250,27 @@ export class OpenCompanyClient {
    */
   listTeam(company?: string | null): Promise<TeamMemberDto[]> {
     return this.request<TeamMemberDto[]>("GET", `${this.scope(company)}/team`);
+  }
+
+  /**
+   * Add an operator-defined teammate (a "team overlay" agent). Persists on the
+   * host and shows up in `listTeam` afterwards — never returned by the write
+   * itself, so callers should refetch. Hosts without the write plane 404;
+   * callers fall back to a local-only add.
+   */
+  addTeamMember(
+    input: { name: string; role: string; description?: string },
+    company?: string | null,
+  ): Promise<TeamMemberDto> {
+    return this.request<TeamMemberDto>("POST", `${this.scope(company)}/team`, input);
+  }
+
+  /** Remove an operator-added teammate. 409s for a manifest teammate (can't be removed here). */
+  removeTeamMember(agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/team/${encodeURIComponent(agentId)}`,
+    );
   }
 
   /**

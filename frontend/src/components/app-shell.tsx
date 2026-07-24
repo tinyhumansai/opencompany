@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import {
   Brain,
   ChartColumnBig,
@@ -48,8 +48,9 @@ import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { DiscordIcon } from "@/components/discord-icon";
 import { useCompany } from "@/hooks/use-company";
+import { type AgentReplyEvent, useEvents } from "@/hooks/use-events";
 import { useHashView } from "@/hooks/use-hash-view";
-import { type ChatMessage, makeMessage } from "@/lib/chat";
+import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
 import { DISCORD_INVITE_URL } from "@/lib/links";
 import { defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
@@ -199,23 +200,57 @@ export function AppShell({
   // Build the chat threads from the company's real desks (issue #53); keep the
   // static defaults when the host doesn't expose `/desks` (404) or defines none.
   // Merges by id so a transcript typed before desks load survives.
+  //
+  // Once the thread list is known, rehydrate each thread's transcript from the
+  // backend's persisted history (issue #65): the server journals every
+  // operator message and agent reply to the EventLog, but the console used to
+  // always start every thread empty. Merges by message id so a line typed
+  // locally before its thread's history lands isn't lost — hydration can race
+  // the operator's first message on a fresh page load.
   useEffect(() => {
     let cancelled = false;
+
+    const hydrate = (threadId: string) => {
+      client
+        .getChatHistory(threadId, company)
+        .then((entries) => {
+          if (cancelled || entries.length === 0) return;
+          const hydrated = fromHistory(entries);
+          setThreads((ts) =>
+            ts.map((t) => {
+              if (t.id !== threadId) return t;
+              const known = new Set(t.messages.map((m) => m.id));
+              const fresh = hydrated.filter((m) => !known.has(m.id));
+              return fresh.length === 0 ? t : { ...t, messages: [...fresh, ...t.messages] };
+            }),
+          );
+        })
+        .catch(() => {
+          /* host without `/chat/history`, or offline — thread stays empty */
+        });
+    };
+
     client
       .listDesks(company)
       .then((desks) => {
         if (cancelled) return;
+        const resolved = threadsFromDesks(desks);
         setThreads((prev) => {
           const byId = new Map(prev.map((t) => [t.id, t]));
-          return threadsFromDesks(desks).map((t) => {
+          return resolved.map((t) => {
             const existing = byId.get(t.id);
             return existing ? { ...t, messages: existing.messages } : t;
           });
         });
+        resolved.forEach((t) => hydrate(t.id));
       })
       .catch(() => {
-        /* host without `/desks`, or offline — keep the current threads */
+        // Host without `/desks`, or offline — keep the static default
+        // threads, but the operator/General line still deserves a
+        // rehydration attempt (it's the one every deployment has).
+        defaultThreads().forEach((t) => hydrate(t.id));
       });
+
     return () => {
       cancelled = true;
     };
@@ -232,6 +267,39 @@ export function AppShell({
   // Approval decisions and other events land in the active thread's transcript.
   const noteSystem = (line: string) =>
     setThreadMessages(activeThreadId, (m) => [...m, makeMessage("system", line)]);
+
+  // Inject an `AgentReply` pushed over the SSE feed (issue #66) into its desk
+  // thread's transcript. Dedupe against our own optimistic echo: the backend
+  // journals an `AgentReply` for the operator's own chat turn too, and
+  // Conversation already rendered that reply locally. Local message ids are
+  // ephemeral counters (not content-addressed), so we key the dedupe on an
+  // identical company line already present in the thread's recent tail. Only
+  // desks that exist as a thread receive an injection; an unmatched chatId is a
+  // no-op rather than polluting the wrong thread.
+  const injectAgentReply = useCallback((event: AgentReplyEvent) => {
+    setThreads((ts) =>
+      ts.map((t) => {
+        if (t.id !== event.chatId) return t;
+        const dup = t.messages
+          .slice(-8)
+          .some((m) => m.from === "company" && m.text === event.text);
+        if (dup) return t;
+        return {
+          ...t,
+          messages: [...t.messages, makeMessage("company", event.text, { channel: event.agentId })],
+        };
+      }),
+    );
+  }, []);
+
+  // The active push half of the attention surface: SSE-driven toasts + chat
+  // injection, plus a rising-edge "needs a sign-off" toast off the poll's
+  // pending count. Degrades silently to the `useCompany` poll when the host has
+  // no `/events` route.
+  useEvents(client, company, {
+    pendingApprovals: pending,
+    onAgentReply: injectAgentReply,
+  });
 
   return (
     <SidebarProvider>

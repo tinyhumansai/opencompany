@@ -136,6 +136,16 @@ pub struct HarnessDeps {
     /// handle; cloning `HarnessDeps` shares one queue between the tools built
     /// into the agent and the brain that drains it. Default is an empty queue.
     pub delegations: DelegationQueue,
+    /// The shared handle to the company's [`WorkflowRunner`](crate::ports::WorkflowRunner),
+    /// so the orchestrator's `run_workflow` tool can reach the runner that is
+    /// itself built *from* these deps (issue #67). The runtime builder threads an
+    /// empty handle here, builds the [`HarnessWorkflowRunner`](crate::workflows::HarnessWorkflowRunner)
+    /// from a deps clone, then fills the shared cell — so the orchestrator agent
+    /// (built later from a clone of these deps) reaches it at turn time. The cell
+    /// holds a [`Weak`](std::sync::Weak), so deps↔runner is not a strong cycle.
+    /// Default (and any build with no runner) leaves it empty and the tool
+    /// reports workflow execution is not wired.
+    pub workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle,
     /// The shared MCP failure queue the `OcMcpCallTool` decorator pushes onto and
     /// the [`HarnessBrain`] drains after a turn (the error-hardening cell). Same
     /// cheap-shared-handle pattern as [`Self::delegations`]; every string it
@@ -553,12 +563,19 @@ pub(crate) fn build_roster(
         .map(|manifest_agent| {
             let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
             let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
+            // This agent's effective tool grants: its own `tools` narrowed by the
+            // company `[tools].allow`-list (full allow-list when it lists none).
+            let grants = crate::runtime::builder::agent_effective_grants(
+                &company.manifest.tools.allow,
+                &manifest_agent.tools,
+            );
             let agent = build::build_agent(
                 &company.id,
                 company_name,
                 manifest_agent,
                 agent_policy,
                 deps,
+                &grants,
                 skill_deltas,
                 is_orchestrator,
             )?;
@@ -749,6 +766,7 @@ description = "Builds the product."
                 facts: None,
                 events: None,
                 delegations: DelegationQueue::default(),
+                workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
                 mcp_failures: McpFailureQueue::default(),
                 secrets: None,
             },
@@ -798,6 +816,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: None,
         };
@@ -1021,6 +1040,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: None,
         };
@@ -1138,6 +1158,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: Some(secrets.clone()),
         };
