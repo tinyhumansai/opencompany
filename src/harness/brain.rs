@@ -234,6 +234,7 @@ impl HarnessBrain {
                     channel: member,
                     text: outcome.reply,
                     steps: outcome.steps,
+                    reply_to: None,
                 }))
             }
         }
@@ -307,6 +308,7 @@ impl Brain for HarnessBrain {
                         channel: "operator".to_string(),
                         text: outcome.reply,
                         steps: operator_steps,
+                        reply_to: None,
                     });
                     channel_responses.extend(delegated);
                 }
