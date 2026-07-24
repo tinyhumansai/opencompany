@@ -559,7 +559,8 @@ impl Tool for AddAgentTool {
         // Serialize per-company writes so the orchestrator's add_agent and the
         // console `POST .../team` route can never clobber each other's
         // `overlay_agents` list with concurrent load→push→save cycles.
-        let _lock = company_write_lock(&self.company).lock().await;
+        let write_lock = company_write_lock(&self.company);
+        let _lock = write_lock.lock().await;
 
         // Same write path as the console `POST .../team` route: load, push the
         // overlay entry, save. Never rewrites the version-controlled manifest.
