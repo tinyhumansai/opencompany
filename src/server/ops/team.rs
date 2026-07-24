@@ -111,7 +111,8 @@ async fn add_member(
 ) -> Result<Json<TeamMemberDto>, ApiError> {
     // Serialize per-company writes so concurrent console POST /team and
     // orchestrator add_agent calls can't clobber each other's overlay_agents.
-    let _lock = company_write_lock(company.id()).lock().await;
+    let write_lock = company_write_lock(company.id());
+    let _lock = write_lock.lock().await;
 
     let mut record = company
         .runtime
@@ -140,7 +141,8 @@ async fn remove_member(
     Path(AgentPath { agent_id }): Path<AgentPath>,
 ) -> Result<StatusCode, ApiError> {
     // Serialize so a concurrent add_agent / add_member doesn't clobber.
-    let _lock = company_write_lock(company.id()).lock().await;
+    let write_lock = company_write_lock(company.id());
+    let _lock = write_lock.lock().await;
 
     let mut record = company
         .runtime

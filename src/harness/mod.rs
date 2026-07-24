@@ -756,6 +756,7 @@ fn overlay_agent_to_manifest(overlay: &OverlayAgent) -> ManifestAgent {
         tools: Vec::new(),
         budget_usd_daily: None,
     }
+}
 
 #[cfg(test)]
 mod tests {
