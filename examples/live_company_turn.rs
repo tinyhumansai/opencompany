@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         ledger: Vec::new(),
         lifecycle: "running".to_string(),
         overlay_agents: Vec::new(),
+        overlay_desk_members: Vec::new(),
     };
 
     let dir = tempfile::tempdir()?;
