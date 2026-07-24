@@ -26,11 +26,13 @@ pub const MAIN_THREAD_ID: &str = "main";
 /// Whether a stored event belongs to the desk identified by `desk_id` /
 /// `desk_name`.
 ///
-/// `AgentReply`s match on the desk id or name verbatim, plus — only for the
-/// General/operator desk — the console's `"main"` thread id and an empty chat
-/// id, so no historical reply is orphaned by the id it happened to be
-/// journaled under (issue #65). Pre-threading `OperatorMessage`s carry no chat
-/// id at all and have always belonged to the General desk unconditionally.
+/// Both `AgentReply`s and `OperatorMessage`s match on the desk id or name
+/// verbatim, plus — only for the General/operator desk — the console's `"main"`
+/// thread id and an empty chat id, so no historical message is orphaned by the
+/// id it happened to be journaled under (issue #65). An operator message routes
+/// by its stored `chat` id symmetrically with an agent reply's `chat_id`; only
+/// a legacy operator message with no stored chat id (empty/`None`) falls back
+/// to belonging to the General desk.
 pub fn owns(desk_id: &str, desk_name: &str, event: &CompanyEvent) -> bool {
     let is_general_desk =
         desk_id.eq_ignore_ascii_case(GENERAL_DESK) || desk_name.eq_ignore_ascii_case(GENERAL_DESK);
@@ -41,7 +43,13 @@ pub fn owns(desk_id: &str, desk_name: &str, event: &CompanyEvent) -> bool {
                 || (is_general_desk
                     && (chat_id.is_empty() || chat_id.eq_ignore_ascii_case(MAIN_THREAD_ID)))
         }
-        CompanyEvent::OperatorMessage { .. } => is_general_desk,
+        CompanyEvent::OperatorMessage { chat, .. } => {
+            let chat = chat.as_deref().unwrap_or_default();
+            chat == desk_id
+                || chat == desk_name
+                || (is_general_desk
+                    && (chat.is_empty() || chat.eq_ignore_ascii_case(MAIN_THREAD_ID)))
+        }
         _ => false,
     }
 }
@@ -253,6 +261,45 @@ mod test {
                 id: "u1".to_string(),
             }),
             chat: Some(MAIN_THREAD_ID.to_string()),
+        };
+        assert!(owns(GENERAL_DESK, GENERAL_DESK, &event));
+        assert!(!owns("strategy", "Strategy desk", &event));
+    }
+
+    // Regression: issue — operator messages vanished on reload because the read
+    // filter ignored the stored chat id.
+    #[test]
+    fn main_thread_owns_operator_messages_it_stored() {
+        let event = CompanyEvent::OperatorMessage {
+            text: "hi".to_string(),
+            by: None,
+            chat: Some(MAIN_THREAD_ID.to_string()),
+        };
+        // The console queries the main thread with desk = ("main", "main").
+        assert!(owns(MAIN_THREAD_ID, MAIN_THREAD_ID, &event));
+        // And it is still owned when read under the General desk's own id/name.
+        assert!(owns(GENERAL_DESK, GENERAL_DESK, &event));
+        // But it must not leak into an unrelated desk.
+        assert!(!owns("strategy", "Strategy desk", &event));
+    }
+
+    #[test]
+    fn desk_addressed_operator_message_belongs_to_that_desk() {
+        let event = CompanyEvent::OperatorMessage {
+            text: "hi".to_string(),
+            by: None,
+            chat: Some("strategy".to_string()),
+        };
+        assert!(owns("strategy", "Strategy desk", &event));
+        assert!(!owns(MAIN_THREAD_ID, MAIN_THREAD_ID, &event));
+    }
+
+    #[test]
+    fn legacy_operator_message_without_chat_stays_on_general() {
+        let event = CompanyEvent::OperatorMessage {
+            text: "hi".to_string(),
+            by: None,
+            chat: None,
         };
         assert!(owns(GENERAL_DESK, GENERAL_DESK, &event));
         assert!(!owns("strategy", "Strategy desk", &event));
