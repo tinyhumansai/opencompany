@@ -675,38 +675,6 @@ pub(crate) fn build_roster(
         .manifest
         .agents
         .iter()
-        .map(|manifest_agent| {
-            let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
-            let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
-            // This agent's effective tool grants: its own `tools` narrowed by the
-            // company `[tools].allow`-list (full allow-list when it lists none).
-            let grants = agent_effective_grants(allow, &manifest_agent.tools);
-            let agent = build::build_agent(
-                &company.id,
-                company_name,
-                manifest_agent,
-                agent_policy,
-                deps,
-                &grants,
-                skill_deltas,
-                is_orchestrator,
-            )?;
-            Ok(Arc::new(CompanyAgent {
-                agent_id: manifest_agent.id.clone(),
-                role: manifest_agent.role.clone(),
-                agent: Mutex::new(agent),
-            }))
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    roster.extend(manifest_roster);
-
-    // Issue #71 — Active Runtime Teammates (minimal slice): promote every
-    // operator/orchestrator-added overlay teammate into a real roster agent
-    // too, skipping any id already claimed by a manifest agent.
-    let manifest_ids: HashSet<&str> = company
-        .manifest
-        .agents
-        .iter()
         .map(|a| a.id.as_str())
         .collect();
     for overlay in &company.overlay_agents {
@@ -1482,6 +1450,7 @@ description = "Builds the product."
             facts: None,
             events: None,
             delegations: DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             secrets: None,
         };
