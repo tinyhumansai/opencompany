@@ -10,7 +10,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useTheme } from "next-themes";
-import { Loader2, Play } from "lucide-react";
+import { Loader2, Play, Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowNode } from "@/components/workflow-node";
+import { WorkflowCreateDialog } from "@/views/WorkflowCreateDialog";
 import { nodeKindMeta, type WorkflowNodeData } from "@/lib/workflow-sample";
 
 const NODE_TYPES = { oc: WorkflowNode };
@@ -65,6 +66,7 @@ export function WorkflowsView({
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<WorkflowRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
 
   // Load the workflow list once, and auto-select the first entry.
   useEffect(() => {
@@ -135,6 +137,19 @@ export function WorkflowsView({
     }
   }, [client, company, selectedId]);
 
+  // The creator posts the full graph back, so the new entry can be spliced
+  // straight into the list and selected — no extra round trip to re-list.
+  const handleCreated = useCallback((created: WorkflowGraph) => {
+    setWorkflows((prev) => {
+      const rest = prev.filter((w) => w.id !== created.id);
+      return [...rest, { id: created.id, name: created.name, description: created.description }].sort(
+        (a, b) => a.name.localeCompare(b.name),
+      );
+    });
+    setSelectedId(created.id);
+    toast.success("Workflow created.");
+  }, []);
+
   const { nodes, edges } = useMemo(() => (graph ? layout(graph) : { nodes: [], edges: [] }), [graph]);
 
   const selected = workflows.find((w) => w.id === selectedId) ?? null;
@@ -176,6 +191,10 @@ export function WorkflowsView({
             )}
             Run
           </Button>
+          <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+            <Plus className="mr-1.5 size-4" />
+            New workflow
+          </Button>
         </div>
       </div>
 
@@ -193,8 +212,12 @@ export function WorkflowsView({
             <Skeleton className="h-full w-full rounded-xl" />
           </div>
         ) : !selectedId ? (
-          <div className="flex h-full items-center justify-center px-4 text-center text-sm text-muted-foreground">
-            This company has no saved workflows yet.
+          <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-muted-foreground">
+            <p>This company has no saved workflows yet.</p>
+            <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+              <Plus className="mr-1.5 size-4" />
+              New workflow
+            </Button>
           </div>
         ) : (
           <ReactFlow
@@ -217,6 +240,14 @@ export function WorkflowsView({
       </div>
 
       {result && <RunResultPanel result={result} onClose={() => setResult(null)} />}
+
+      <WorkflowCreateDialog
+        client={client}
+        company={company}
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={handleCreated}
+      />
     </div>
   );
 }
