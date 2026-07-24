@@ -46,6 +46,7 @@ pub fn router() -> Router<AppState> {
         ))
         .merge(scoped("/mcp/servers/{name}/tools", get(discover_tools)))
         .merge(scoped("/mcp/servers/{name}/test", post(test_server)))
+        .merge(scoped("/mcp/servers/{name}/oauth/start", post(start_oauth)))
 }
 
 /// One effective MCP server as the console renders it. **Never** carries a
@@ -614,6 +615,60 @@ async fn test_server(company: ScopedCompany, Path(NamePath { name }): Path<NameP
 async fn test_server(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
     let _ = (company, name);
     crate::server::ops::not_wired("mcp probe")
+}
+
+/// `POST …/mcp/servers/{name}/oauth/start` — begin the browser OAuth flow for a
+/// server that advertises OAuth sign-in (issue #90).
+///
+/// Resolves the server's effective endpoint, discovers its authorization server,
+/// dynamically registers a client (RFC 7591) + generates PKCE, parks the pending
+/// state on [`AppState`] keyed by the opaque `state`, and returns
+/// `{ "authorizeUrl": … }` for the console to open in a browser tab. The redirect
+/// URI is derived from the host's public URL (or bind) so it matches what DCR
+/// registered — see [`crate::company::mcp_oauth::callback_redirect_uri`].
+///
+/// A `400` with a clean operator message is returned when the server does not
+/// support dynamic client registration (it can't do console OAuth — the operator
+/// should paste a static token instead).
+#[cfg(feature = "mcp")]
+async fn start_oauth(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    company: ScopedCompany,
+    Path(NamePath { name }): Path<NamePath>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::company::mcp_oauth;
+
+    let runtime = company.runtime.as_ref();
+    let name = name.trim().to_string();
+
+    // Resolve the effective server so OAuth uses the same endpoint agents will.
+    let manifest = manifest_servers(runtime).await?;
+    let decls = resolve_effective(runtime.id(), &manifest, runtime.secrets().as_ref())
+        .await
+        .map_err(ApiError)?;
+    let decl = decls
+        .iter()
+        .find(|d| d.name == name)
+        .ok_or_else(|| ApiError(OpenCompanyError::McpServerNotFound(name.clone())))?;
+
+    let redirect_uri = mcp_oauth::callback_redirect_uri(&state.config().host_base_url());
+    let begun = mcp_oauth::begin(&decl.endpoint, runtime.id(), &name, &redirect_uri)
+        .await
+        .map_err(ApiError)?;
+
+    // Park the pending flow; the unauthenticated callback route reclaims it.
+    state.park_oauth(begun.state.clone(), begun.pending);
+    Ok(Json(
+        serde_json::json!({ "authorizeUrl": begun.authorize_url }),
+    ))
+}
+
+/// Without the `mcp` feature there is no OAuth transport, so starting a sign-in
+/// is "not wired" (the console's Sign in button degrades gracefully).
+#[cfg(not(feature = "mcp"))]
+async fn start_oauth(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
+    let _ = (company, name);
+    crate::server::ops::not_wired("mcp oauth")
 }
 
 /// Without the `openhuman` feature there is no MCP transport, so discovery is

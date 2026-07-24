@@ -17,8 +17,8 @@ use crate::{AppState, Result};
 /// build without that feature), and absent server routes must keep 404ing so
 /// API and external clients can detect an unwired surface instead of receiving
 /// the `index.html` shell with a `200`.
-const RESERVED_PREFIXES: [&str; 7] = [
-    "/api", "/graphql", "/healthz", "/spec", "/tiny", "/a2a", "/hooks",
+const RESERVED_PREFIXES: [&str; 8] = [
+    "/api", "/graphql", "/healthz", "/spec", "/tiny", "/a2a", "/hooks", "/oauth",
 ];
 
 /// True when `path` is server-owned and so must 404 rather than fall through to
@@ -77,6 +77,9 @@ fn router_with_console(state: AppState, console_dir: Option<PathBuf>) -> Router 
     // tiny.place A2A inbound + discovery routes, only when the feature is on.
     #[cfg(feature = "tinyplace")]
     let router = router.merge(crate::server::a2a::router());
+    // Unauthenticated console MCP OAuth callback (issue #90), only under `mcp`.
+    #[cfg(feature = "mcp")]
+    let router = router.merge(crate::server::mcp_oauth::router());
     let router = router.with_state(state.clone());
 
     // Operator console: the lowest-priority fallback. Every real route above —

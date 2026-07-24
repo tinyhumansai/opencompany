@@ -435,13 +435,19 @@ impl HarnessPool {
         deps: &HarnessDeps,
     ) -> Vec<McpServerDecl> {
         match &deps.secrets {
-            Some(secrets) => crate::company::mcp::resolve_effective(
-                &company.id,
-                &company.manifest.mcp_servers,
-                secrets.as_ref(),
-            )
-            .await
-            .unwrap_or_else(|_| deps.mcp_servers.clone()),
+            Some(secrets) => {
+                let mut decls = crate::company::mcp::resolve_effective(
+                    &company.id,
+                    &company.manifest.mcp_servers,
+                    secrets.as_ref(),
+                )
+                .await
+                .unwrap_or_else(|_| deps.mcp_servers.clone());
+                // Refresh any near-expiry console-OAuth credential before the
+                // registry is built, so an agent never sends a stale bearer.
+                refresh_oauth_decls(&company.id, &mut decls, secrets.as_ref()).await;
+                decls
+            }
             None => deps.mcp_servers.clone(),
         }
     }
@@ -595,7 +601,49 @@ fn auth_kind(material: &crate::company::mcp::AuthMaterial) -> u8 {
         Bearer(_) => 1,
         Header { .. } => 2,
         QueryParam { .. } => 3,
+        OAuth { .. } => 4,
     }
+}
+
+/// Refreshes any near-expiry console-OAuth credential in `decls` before the
+/// registry is built, re-persisting the rotated token **write-only** so agents
+/// never send an expired bearer. Per-tenant analogue of OpenHuman's
+/// `mcp_registry::oauth::refresh_if_expired`. A refresh failure is non-fatal —
+/// the old token is kept and the next `401` re-prompts sign-in.
+#[cfg(feature = "mcp")]
+async fn refresh_oauth_decls(
+    company: &CompanyId,
+    decls: &mut [McpServerDecl],
+    secrets: &dyn SecretStore,
+) {
+    use crate::company::mcp_oauth;
+
+    for decl in decls.iter_mut() {
+        if !mcp_oauth::needs_refresh(&decl.auth, 60) {
+            continue;
+        }
+        let Some(new_material) = mcp_oauth::refresh(&decl.auth).await else {
+            continue;
+        };
+        match crate::company::mcp::store_auth(company, &decl.name, &new_material, secrets).await {
+            Ok(()) => decl.auth = new_material,
+            Err(err) => log::warn!(
+                "[mcp-oauth] failed to persist refreshed token for `{}`: {}",
+                decl.name,
+                err.code()
+            ),
+        }
+    }
+}
+
+/// Without the `mcp` feature there is no OAuth credential to refresh, so this is
+/// a no-op (keeps `resolve_effective_mcp` uniform across the two builds).
+#[cfg(not(feature = "mcp"))]
+async fn refresh_oauth_decls(
+    _company: &CompanyId,
+    _decls: &mut [McpServerDecl],
+    _secrets: &dyn SecretStore,
+) {
 }
 
 /// A stable fingerprint of an overlay-agent set (issue #71), used to detect a

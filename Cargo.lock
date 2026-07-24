@@ -5382,6 +5382,7 @@ dependencies = [
  "async-graphql-axum",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bs58",
  "clap",
  "ed25519-dalek",
@@ -5411,6 +5412,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid 1.23.5",
 ]
 

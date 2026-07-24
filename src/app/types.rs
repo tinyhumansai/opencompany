@@ -245,6 +245,21 @@ pub struct AppState {
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
     nonce: std::sync::Arc<crate::economy::NonceCache>,
+    /// In-flight console MCP OAuth flows, keyed by the opaque `state` the browser
+    /// round-trips (issue #90). The `/mcp/servers/{name}/oauth/start` route parks
+    /// a [`PendingOAuth`](crate::company::mcp_oauth::PendingOAuth) here; the
+    /// unauthenticated `/oauth/mcp/callback` route takes it back out by `state`.
+    /// Gated behind `mcp` so the default build links none of the OAuth path.
+    /// Each entry carries the [`Instant`](std::time::Instant) it was parked so
+    /// abandoned flows (closed tab, double-click, pre-callback error) can be
+    /// swept — they hold a `client_secret` + `code_verifier` that must not live
+    /// in memory forever.
+    #[cfg(feature = "mcp")]
+    oauth_pending: Arc<
+        std::sync::Mutex<
+            HashMap<String, (std::time::Instant, crate::company::mcp_oauth::PendingOAuth)>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for AppState {
@@ -276,6 +291,8 @@ impl AppState {
             cors: crate::server::cors::CorsConfig::default(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
+            #[cfg(feature = "mcp")]
+            oauth_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -456,6 +473,55 @@ impl AppState {
         &self.nonce
     }
 
+    /// How long a parked OAuth flow stays reclaimable before it's swept. Longer
+    /// than any realistic operator round-trip through the authorization server,
+    /// short enough that an abandoned flow's secrets don't linger.
+    #[cfg(feature = "mcp")]
+    const OAUTH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Parks an in-flight console MCP OAuth flow keyed by its opaque `state`, to
+    /// be reclaimed by the callback route. See issue #90. Sweeps flows older than
+    /// [`OAUTH_PENDING_TTL`](Self::OAUTH_PENDING_TTL) on every park so an
+    /// abandoned sign-in (closed tab, double-click, pre-callback error) can't
+    /// retain its `client_secret`/`code_verifier` for the life of the process.
+    #[cfg(feature = "mcp")]
+    pub fn park_oauth(&self, state: String, pending: crate::company::mcp_oauth::PendingOAuth) {
+        let mut guard = self.oauth_pending.lock().expect("oauth pending poisoned");
+        guard.retain(|_, (parked_at, _)| parked_at.elapsed() < Self::OAUTH_PENDING_TTL);
+        guard.insert(state, (std::time::Instant::now(), pending));
+    }
+
+    /// Takes (removes) a parked console MCP OAuth flow by its `state`. `None` when
+    /// the state is unknown, already consumed (single-use, so a replayed
+    /// callback can't re-exchange), or swept as stale past
+    /// [`OAUTH_PENDING_TTL`](Self::OAUTH_PENDING_TTL).
+    #[cfg(feature = "mcp")]
+    pub fn take_oauth(&self, state: &str) -> Option<crate::company::mcp_oauth::PendingOAuth> {
+        let mut guard = self.oauth_pending.lock().expect("oauth pending poisoned");
+        let entry = guard.remove(state)?;
+        let (parked_at, pending) = entry;
+        // A flow that outlived its TTL is treated as expired, not reclaimable.
+        if parked_at.elapsed() >= Self::OAUTH_PENDING_TTL {
+            return None;
+        }
+        Some(pending)
+    }
+
+    /// Test-only: park a flow with an explicit parked-at instant so the TTL
+    /// expiry + sweep paths can be exercised without waiting real time.
+    #[cfg(all(test, feature = "mcp"))]
+    fn park_oauth_at(
+        &self,
+        state: String,
+        pending: crate::company::mcp_oauth::PendingOAuth,
+        parked_at: std::time::Instant,
+    ) {
+        self.oauth_pending
+            .lock()
+            .expect("oauth pending poisoned")
+            .insert(state, (parked_at, pending));
+    }
+
     /// Returns a serializable system specification snapshot.
     pub fn spec(&self) -> AppSpec {
         AppSpec {
@@ -573,6 +639,62 @@ mod tests {
 
         assert_eq!(spec.framework, "axum");
         assert!(spec.modules.contains(&"server"));
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn parked_oauth_flow_is_single_use() {
+        use crate::company::mcp_oauth::PendingOAuth;
+        use crate::ports::types::CompanyId;
+
+        let state = AppState::new(AppConfig::default());
+        let pending = PendingOAuth {
+            company_id: CompanyId::new("acme"),
+            server_name: "notion".into(),
+            code_verifier: "verifier".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            token_endpoint: "https://as.example/token".into(),
+            redirect_uri: "https://acme.example/oauth/mcp/callback".into(),
+        };
+
+        state.park_oauth("state-1".into(), pending.clone());
+        // First take reclaims it; a replayed callback finds nothing (single-use).
+        assert!(state.take_oauth("state-1").is_some());
+        assert!(state.take_oauth("state-1").is_none());
+        // An unknown state is always None.
+        assert!(state.take_oauth("never-parked").is_none());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn parked_oauth_flow_expires_and_is_swept() {
+        use crate::company::mcp_oauth::PendingOAuth;
+        use crate::ports::types::CompanyId;
+        use std::time::{Duration, Instant};
+
+        let state = AppState::new(AppConfig::default());
+        let pending = |server: &str| PendingOAuth {
+            company_id: CompanyId::new("acme"),
+            server_name: server.into(),
+            code_verifier: "verifier".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            token_endpoint: "https://as.example/token".into(),
+            redirect_uri: "https://acme.example/oauth/mcp/callback".into(),
+        };
+        let stale_at = Instant::now() - (AppState::OAUTH_PENDING_TTL + Duration::from_secs(1));
+
+        // Stale-on-read: an entry parked past its TTL is rejected (and removed).
+        state.park_oauth_at("expired".into(), pending("notion"), stale_at);
+        assert!(state.take_oauth("expired").is_none());
+
+        // Sweep-on-park: parking a fresh flow evicts any stale sibling first, so
+        // an abandoned flow's secrets can't outlive the TTL even if never taken.
+        state.park_oauth_at("stale".into(), pending("slack"), stale_at);
+        state.park_oauth("fresh".into(), pending("github"));
+        assert!(state.take_oauth("stale").is_none());
+        assert!(state.take_oauth("fresh").is_some());
     }
 
     #[test]

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
   ChevronDown,
   Info,
   Loader2,
+  LogIn,
   Plug,
   Plus,
   Server,
@@ -19,6 +20,7 @@ import {
   listMcpServers,
   type McpAuthKind,
   removeMcpServer,
+  startMcpOAuth,
   testMcpServer,
   updateMcpServer,
 } from "@/api/mcp";
@@ -271,6 +273,11 @@ function McpServersSection({
   const [tools, setTools] = useState<Record<string, ToolsState>>({});
   // Live health from an on-demand Test, overriding the persisted badge per row.
   const [tested, setTested] = useState<Record<string, McpHealth>>({});
+  // In-flight OAuth sign-in poll timers, keyed by server name. A row with a live
+  // timer is still "signing in" even after its `busy` flag clears, so a repeat
+  // click can't spawn a second overlapping poll. Cleared on unmount so stale
+  // callbacks don't fire against a gone component.
+  const pollTimers = useRef<Record<string, number>>({});
 
   // Add-server form.
   const [name, setName] = useState("");
@@ -295,6 +302,15 @@ function McpServersSection({
     setLoad("loading");
     void refresh();
   }, [refresh]);
+
+  // Cancel any in-flight sign-in polls when the view unmounts so their timers
+  // don't fire against a torn-down component.
+  useEffect(() => {
+    const timers = pollTimers.current;
+    return () => {
+      for (const id of Object.values(timers)) window.clearTimeout(id);
+    };
+  }, []);
 
   async function add() {
     if (busy) return;
@@ -323,7 +339,10 @@ function McpServersSection({
       });
       // A probe that lands "needs config" or "error" is NOT a rollback — the
       // server is added — but surface it inline so the operator acts on it.
-      if (res.test && res.test.status !== "ok") {
+      // Exception: an OAuth-required result is not an error to shout about — the
+      // amber "needs config" badge carries a Sign in button, so a red alert here
+      // would be redundant and misleading.
+      if (res.test && res.test.status !== "ok" && res.test.authHint !== "oauth_required") {
         setAddError(res.test.message);
       } else if (res.warning) {
         setAddError(res.warning);
@@ -354,6 +373,54 @@ function McpServersSection({
         toast.message("Live testing isn't enabled in this build (the agent harness is off).");
       } else {
         toast.error(err instanceof ApiError ? err.message : "Couldn't test the server.");
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Browser OAuth sign-in (issue #90): open the authorization URL in a new tab,
+  // then poll the server's health until it flips to `ok` (the host stores the
+  // token on its callback route) so the amber badge turns green on its own.
+  async function signIn(server: McpServer) {
+    // Guard both the shared `busy` flag and a per-server poll already in flight:
+    // the poll outlives `busy`, so without the second check a repeat click would
+    // spawn a second overlapping sign-in (duplicate token exchange + toasts).
+    if (busy || pollTimers.current[server.name] !== undefined) return;
+    setBusy(server.name);
+    try {
+      const { authorizeUrl } = await startMcpOAuth(client, company, server.name);
+      window.open(authorizeUrl, "_blank", "noopener,noreferrer");
+      toast.message(`Complete sign-in for ${server.name} in the new tab.`);
+      // Poll for completion for up to ~2 minutes; stop as soon as it's healthy.
+      const deadline = Date.now() + 120_000;
+      const poll = async () => {
+        delete pollTimers.current[server.name];
+        if (Date.now() > deadline) {
+          toast.message(
+            `Sign-in for ${server.name} timed out. Try again if it didn't complete.`,
+          );
+          return;
+        }
+        try {
+          const health = await testMcpServer(client, company, server.name);
+          setTested((t) => ({ ...t, [server.name]: health }));
+          if (health.status === "ok") {
+            toast.success(`Signed in to ${server.name}.`);
+            await refresh();
+            return;
+          }
+        } catch {
+          // Ignore transient probe errors while the operator finishes sign-in.
+        }
+        pollTimers.current[server.name] = window.setTimeout(() => void poll(), 2_000);
+      };
+      pollTimers.current[server.name] = window.setTimeout(() => void poll(), 2_000);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "not_wired") {
+        toast.message("OAuth sign-in isn't enabled in this build (the agent harness is off).");
+      } else {
+        toast.error(err instanceof ApiError ? err.message : "Couldn't start sign-in.");
       }
     } finally {
       setBusy(null);
@@ -453,6 +520,21 @@ function McpServersSection({
                             onCheckedChange={(v) => void toggle(server, v)}
                             aria-label={`Enable ${server.name}`}
                           />
+                          {health?.authHint === "oauth_required" && (
+                            <Button
+                              variant="default"
+                              size="sm"
+                              disabled={busy === server.name}
+                              onClick={() => void signIn(server)}
+                            >
+                              {busy === server.name ? (
+                                <Loader2 className="size-4 animate-spin" />
+                              ) : (
+                                <LogIn className="size-4" />
+                              )}{" "}
+                              Sign in
+                            </Button>
+                          )}
                           <Button
                             variant="ghost"
                             size="sm"

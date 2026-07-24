@@ -6,6 +6,10 @@ mod error;
 pub mod feedback;
 pub mod graphql;
 pub mod hooks;
+// Console MCP OAuth callback (issue #90): the unauthenticated browser-redirect
+// landing route. Gated on `mcp` (it needs the OAuth token-exchange path).
+#[cfg(feature = "mcp")]
+pub mod mcp_oauth;
 pub mod operator;
 pub mod ops;
 pub mod platform_auth;
