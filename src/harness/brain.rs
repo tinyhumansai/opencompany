@@ -233,6 +233,7 @@ impl HarnessBrain {
                 Ok(Some(OutboundMessage {
                     channel: member,
                     text: outcome.reply,
+                    reply_to: None,
                     steps: outcome.steps,
                 }))
             }
@@ -306,6 +307,7 @@ impl Brain for HarnessBrain {
                     channel_responses.push(OutboundMessage {
                         channel: "operator".to_string(),
                         text: outcome.reply,
+                        reply_to: None,
                         steps: operator_steps,
                     });
                     channel_responses.extend(delegated);

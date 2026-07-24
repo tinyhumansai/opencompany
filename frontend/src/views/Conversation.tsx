@@ -40,7 +40,7 @@ export function Conversation({ client, company, threads, activeId, onSelect, set
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("chat");
 
   return (
-    <div className="flex flex-1 overflow-hidden">
+    <div className="flex min-h-0 flex-1 overflow-hidden">
       <ThreadList
         threads={threads}
         activeId={active.id}
@@ -78,7 +78,7 @@ function ThreadList({
   className?: string;
 }) {
   return (
-    <aside className={cn("w-full shrink-0 flex-col border-r bg-card/40 md:w-80", className)}>
+    <aside className={cn("min-h-0 w-full shrink-0 flex-col border-r bg-card/40 md:w-80", className)}>
       <div className="flex items-center justify-between px-4 py-3">
         <h2 className="text-sm font-semibold">Chats</h2>
         <Button variant="ghost" size="icon" className="size-8" aria-label="New chat" disabled>
@@ -181,7 +181,7 @@ function ChatPane({
   }
 
   return (
-    <section className={cn("flex-1 flex-col overflow-hidden", className)}>
+    <section className={cn("min-h-0 flex-1 flex-col overflow-hidden", className)}>
       {/* Contact header */}
       <div className="flex items-center gap-3 border-b px-4 py-2.5">
         <Button

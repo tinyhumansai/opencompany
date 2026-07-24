@@ -31,11 +31,11 @@ use oh::context::prompt::SystemPromptBuilder;
 use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
 use oh::memory::traits::Memory;
 use oh::security::SecurityPolicy;
+#[cfg(feature = "mcp")]
+use oh::tools::McpListToolsTool;
 use oh::tools::{
     EditFileTool, FileReadTool, FileWriteTool, GlobTool, GrepTool, ListFilesTool, Tool,
 };
-#[cfg(feature = "mcp")]
-use oh::tools::{McpCallTool, McpListToolsTool};
 
 use crate::company::Agent as ManifestAgent;
 use crate::error::OpenCompanyError;
