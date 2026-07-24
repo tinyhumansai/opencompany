@@ -1063,6 +1063,7 @@ async fn state_with_source_dir(
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();
