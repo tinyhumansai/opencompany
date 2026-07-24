@@ -11,6 +11,11 @@ pub mod dns;
 pub mod inference;
 mod manifest;
 pub mod mcp;
+// Console MCP OAuth (issue #90): discovery + PKCE + DCR + token exchange for the
+// per-tenant browser sign-in flow. Needs the vendored `oh::mcp_client` discovery
+// primitive + `uuid`/`base64`/`url`, so it links only under the `mcp` feature.
+#[cfg(feature = "mcp")]
+pub mod mcp_oauth;
 pub mod runtime;
 mod skill_file;
 pub mod telegram;

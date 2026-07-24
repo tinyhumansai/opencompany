@@ -160,6 +160,14 @@ fn auth_config(material: &AuthMaterial) -> McpAuthConfig {
             name: name.clone(),
             value: value.clone(),
         },
+        // The whole trick behind console OAuth: an OAuth credential resolves to
+        // exactly the bearer path the static registry already knows how to send.
+        // The freshness of `access_token` is the caller's responsibility — the
+        // harness builder refreshes an expired token before this mapping runs
+        // (see `crate::company::mcp_oauth::refresh` + `resolve_effective`).
+        AuthMaterial::OAuth { access_token, .. } => McpAuthConfig::BearerToken {
+            token: access_token.clone(),
+        },
     }
 }
 

@@ -83,6 +83,32 @@ pub enum AuthMaterial {
     /// strings before persisting or emitting anything (see
     /// [`crate::harness::mcp_probe::scrub`]).
     QueryParam { name: String, value: String },
+    /// An OAuth 2.0 (authorization-code + PKCE) credential obtained through the
+    /// console's browser sign-in flow ([`crate::company::mcp_oauth`]). The
+    /// resolved `access_token` is sent to the transport as an
+    /// `Authorization: Bearer` (the harness `auth_config` mapping); the
+    /// remaining fields are the bookkeeping the OAuth refresh path needs to mint
+    /// a fresh access token without another browser round-trip.
+    ///
+    /// **Security**: every token field is enumerated by [`Self::secret_values`],
+    /// so the access token, the refresh token, and any confidential
+    /// `client_secret` all feed the scrubber and can never survive into an
+    /// agent-visible error, health record, or API response.
+    OAuth {
+        /// The bearer access token sent to the server (short-lived, ≈1h).
+        access_token: String,
+        /// The refresh token, when the authorization server issued one. Absent
+        /// servers force a fresh browser sign-in once the access token expires.
+        refresh_token: Option<String>,
+        /// The dynamically-registered client id (RFC 7591).
+        client_id: String,
+        /// The confidential client secret, when the server issued one.
+        client_secret: Option<String>,
+        /// The token endpoint a refresh POSTs to.
+        token_endpoint: String,
+        /// Unix seconds when `access_token` expires (best-effort).
+        expires_at: u64,
+    },
 }
 
 impl AuthMaterial {
@@ -101,6 +127,25 @@ impl AuthMaterial {
             AuthMaterial::Bearer(token) => vec![token.clone()],
             AuthMaterial::Header { value, .. } => vec![value.clone()],
             AuthMaterial::QueryParam { value, .. } => vec![value.clone()],
+            // CRITICAL: every OAuth token substring must feed the scrubber —
+            // the access token (sent as the bearer), the refresh token, and any
+            // confidential client secret. Missing one would let it survive into
+            // an error/health/agent-visible surface.
+            AuthMaterial::OAuth {
+                access_token,
+                refresh_token,
+                client_secret,
+                ..
+            } => {
+                let mut out = vec![access_token.clone()];
+                if let Some(refresh) = refresh_token {
+                    out.push(refresh.clone());
+                }
+                if let Some(secret) = client_secret {
+                    out.push(secret.clone());
+                }
+                out
+            }
         }
     }
 }
@@ -110,9 +155,30 @@ impl AuthMaterial {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredAuth {
-    Bearer { token: String },
-    Header { name: String, value: String },
-    QueryParam { name: String, value: String },
+    Bearer {
+        token: String,
+    },
+    Header {
+        name: String,
+        value: String,
+    },
+    QueryParam {
+        name: String,
+        value: String,
+    },
+    /// The persisted OAuth bundle: the access token plus everything a silent
+    /// refresh needs. Written by the callback exchange and the refresh path;
+    /// read only by [`load_auth`] at harness-build / probe time.
+    Oauth {
+        access_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refresh_token: Option<String>,
+        client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret: Option<String>,
+        token_endpoint: String,
+        expires_at: u64,
+    },
 }
 
 impl From<StoredAuth> for AuthMaterial {
@@ -121,6 +187,21 @@ impl From<StoredAuth> for AuthMaterial {
             StoredAuth::Bearer { token } => AuthMaterial::Bearer(token),
             StoredAuth::Header { name, value } => AuthMaterial::Header { name, value },
             StoredAuth::QueryParam { name, value } => AuthMaterial::QueryParam { name, value },
+            StoredAuth::Oauth {
+                access_token,
+                refresh_token,
+                client_id,
+                client_secret,
+                token_endpoint,
+                expires_at,
+            } => AuthMaterial::OAuth {
+                access_token,
+                refresh_token,
+                client_id,
+                client_secret,
+                token_endpoint,
+                expires_at,
+            },
         }
     }
 }
@@ -313,6 +394,21 @@ pub async fn store_auth(
         AuthMaterial::QueryParam { name, value } => StoredAuth::QueryParam {
             name: name.clone(),
             value: value.clone(),
+        },
+        AuthMaterial::OAuth {
+            access_token,
+            refresh_token,
+            client_id,
+            client_secret,
+            token_endpoint,
+            expires_at,
+        } => StoredAuth::Oauth {
+            access_token: access_token.clone(),
+            refresh_token: refresh_token.clone(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+            token_endpoint: token_endpoint.clone(),
+            expires_at: *expires_at,
         },
     };
     let raw = serde_json::to_string(&stored)
