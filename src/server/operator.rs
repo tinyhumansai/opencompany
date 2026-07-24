@@ -36,7 +36,7 @@ use crate::ports::types::{
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::chat_history::{MessageView, Viewer, history_for_desk};
 use crate::server::error::ApiError;
-use crate::server::ops::language;
+use crate::server::ops::language::{self, DEFAULT_DESK};
 use crate::server::ops::{ScopedCompany, scoped};
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 use crate::server::provision::{emit_cycle_webhooks, emit_feedback_webhook};
