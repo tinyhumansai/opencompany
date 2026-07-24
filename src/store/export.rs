@@ -172,6 +172,7 @@ impl BundleContents {
                 ledger: Vec::new(),
                 lifecycle: self.lifecycle.clone(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             })
             .await?;
         for entry in &self.ledger {
@@ -727,6 +728,7 @@ mod test {
             ledger: Vec::new(),
             lifecycle: "paused".into(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();

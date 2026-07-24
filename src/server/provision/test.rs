@@ -677,6 +677,7 @@ impl Brain for EffectBrain {
                     channel: "operator".into(),
                     text: format!("handled: {text}"),
                     steps: Vec::new(),
+                    reply_to: None,
                 });
             }
         }

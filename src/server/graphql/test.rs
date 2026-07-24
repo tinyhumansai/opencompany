@@ -33,6 +33,7 @@ pub(crate) async fn state_with_company(home: &std::path::Path) -> AppState {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();
@@ -170,6 +171,7 @@ async fn state_with_rich_company(home: &std::path::Path) -> AppState {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();
@@ -216,6 +218,61 @@ async fn chats_list_the_manifest_desks() {
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0]["id"], "general");
     assert_eq!(chats[0]["members"][0], "maya");
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Issue #65: `AgentReply`s answering the console's default thread are
+/// journaled with `chat_id == "main"` (the frontend's thread id), not
+/// `"General"`. The General desk's `Chat.history` must still find them
+/// alongside a reply journaled the "canonical" way, so the operator
+/// transcript is never split by which id a given turn happened to use.
+#[tokio::test]
+async fn chat_history_finds_agent_replies_under_general_and_main() {
+    let home = home();
+    let state = state_with_rich_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    runtime
+        .events()
+        .append(
+            runtime.id(),
+            crate::ports::types::CompanyEvent::AgentReply {
+                chat_id: "General".to_string(),
+                agent_id: "maya".to_string(),
+                text: "canonical id".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .events()
+        .append(
+            runtime.id(),
+            crate::ports::types::CompanyEvent::AgentReply {
+                chat_id: "main".to_string(),
+                agent_id: "maya".to_string(),
+                text: "console default-thread id".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ chat(id:\"general\"){ history(first: 10) { items { text } } } } }"}"#,
+    )
+    .await;
+    let texts: Vec<&str> = value["data"]["company"]["chat"]["history"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert!(texts.contains(&"canonical id"), "missing: {texts:?}");
+    assert!(
+        texts.contains(&"console default-thread id"),
+        "missing: {texts:?}"
+    );
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
@@ -505,6 +562,7 @@ async fn skills_and_workflows_resolve_from_source_dir() {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();

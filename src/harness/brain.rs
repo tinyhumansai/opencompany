@@ -130,8 +130,15 @@ impl HarnessBrain {
     }
 
     /// The lead member of a desk: the first member of the matching group chat
-    /// (by id, or by case-insensitive name) that is a real roster agent. `None`
-    /// when no desk matches or none of its members are on the roster.
+    /// (by id, or by case-insensitive name) that is a real roster teammate.
+    /// `None` when no desk matches or none of its members are on the roster.
+    ///
+    /// Membership is the desk's **effective** roster — the manifest members
+    /// unioned with operator-added overlay members (issue #72) — resolved through
+    /// the same [`CompanyRecord::effective_desk_members`] the REST `list_desks`
+    /// handler uses, so the two cannot drift. A roster teammate is a manifest
+    /// agent or a team-overlay teammate, so an overlay-added lead is reachable on
+    /// a desk the manifest left empty.
     fn desk_lead(&self, desk: &str) -> Option<String> {
         let chat = self
             .record
@@ -139,10 +146,10 @@ impl HarnessBrain {
             .group_chats
             .iter()
             .find(|c| c.id == desk || c.name.eq_ignore_ascii_case(desk))?;
-        chat.members
-            .iter()
-            .find(|m| self.record.manifest.agents.iter().any(|a| &a.id == *m))
-            .cloned()
+        self.record
+            .effective_desk_members(&chat.id)
+            .into_iter()
+            .find(|m| self.record.is_roster_agent(m))
     }
 
     /// Drains the MCP failure queue **onto the operator bubble's step timeline**
@@ -315,6 +322,7 @@ impl Brain for HarnessBrain {
                 channel: "operator".to_string(),
                 text: "Acknowledged.".to_string(),
                 steps: Vec::new(),
+                reply_to: None,
             });
         }
 
@@ -390,6 +398,7 @@ description = "Runs Acme."
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         }
     }
 
@@ -409,6 +418,7 @@ description = "Runs Acme."
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
@@ -518,6 +528,7 @@ description = "Builds it."
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         }
     }
 
@@ -540,6 +551,7 @@ description = "Builds it."
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
@@ -714,11 +726,12 @@ members = ["engineer"]
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         }
     }
 
-    /// A brain over the desk-bearing record, wired to a real task store.
-    fn brain_with_desk(dir: &std::path::Path) -> (HarnessBrain, Arc<FsOps>) {
+    /// A brain over `record`, wired to a real task store.
+    fn brain_over(dir: &std::path::Path, record: CompanyRecord) -> (HarnessBrain, Arc<FsOps>) {
         let tasks = Arc::new(FsOps::new(dir));
         let deps = HarnessDeps {
             provider: Arc::new(MockProvider::new("mock: ")),
@@ -735,13 +748,19 @@ members = ["engineer"]
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
         (
-            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_with_desk()),
+            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record),
             tasks,
         )
+    }
+
+    /// A brain over the desk-bearing record, wired to a real task store.
+    fn brain_with_desk(dir: &std::path::Path) -> (HarnessBrain, Arc<FsOps>) {
+        brain_over(dir, record_with_desk())
     }
 
     /// The default responder is the `orchestrator`-tier agent, even when it is
@@ -765,6 +784,54 @@ members = ["engineer"]
         assert_eq!(brain.responder_for(Some("General")), "chief");
         assert_eq!(brain.responder_for(Some("nope")), "chief");
         assert_eq!(brain.responder_for(None), "chief");
+    }
+
+    /// An operator-added overlay member is resolved as a desk's lead (issue #72):
+    /// on a desk the manifest left empty, the overlay addition becomes the lead,
+    /// and an addressed message routes to it. Proves `desk_lead`/`responder_for`
+    /// read the effective (manifest ∪ overlay) membership.
+    #[test]
+    fn overlay_member_resolves_as_desk_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        // `design` is a manifest desk with no declared members; the operator adds
+        // `engineer` to it through the overlay.
+        let manifest = toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[policy]
+mode = "full"
+
+[[agent]]
+id = "chief"
+role = "Chief of Staff"
+tier = "orchestrator"
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+
+[[group_chat]]
+id = "design"
+name = "Design"
+"#,
+        )
+        .expect("valid manifest");
+        let record = CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest,
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: vec![crate::ports::types::OverlayDeskMember {
+                desk_id: "design".to_string(),
+                agent_id: "engineer".to_string(),
+            }],
+        };
+        let (brain, _tasks) = brain_over(dir.path(), record);
+        assert_eq!(brain.desk_lead("design"), Some("engineer".to_string()));
+        assert_eq!(brain.responder_for(Some("design")), "engineer");
     }
 
     /// A `spawn_task` delegation opens a backlog card and surfaces no bubble.
@@ -856,6 +923,7 @@ members = ["engineer"]
             facts: None,
             events: Some(events.clone()),
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: failures.clone(),
             secrets: None,
         };

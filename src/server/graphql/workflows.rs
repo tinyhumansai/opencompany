@@ -101,10 +101,7 @@ fn load_one(dir: Option<&Path>, id: &str) -> Option<WorkflowFile> {
 
 /// The enabled workflow ids from the company manifest.
 async fn enabled_ids(runtime: &Arc<CompanyRuntime>) -> async_graphql::Result<Vec<String>> {
-    let record = runtime.store().load(runtime.id()).await?;
-    Ok(record
-        .map(|record| record.manifest.workflows.enabled)
-        .unwrap_or_default())
+    Ok(runtime.enabled_workflow_ids().await?)
 }
 
 /// Resolves `Company.workflows`.

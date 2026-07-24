@@ -133,6 +133,9 @@ struct Meta {
     /// The operator team overlay (teammates added outside the manifest).
     #[serde(default)]
     overlay_agents: Vec<crate::ports::types::OverlayAgent>,
+    /// The operator desk-membership overlay (agents added to desks at runtime).
+    #[serde(default)]
+    overlay_desk_members: Vec<crate::ports::types::OverlayDeskMember>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,11 +178,15 @@ impl CompanyStore for FsCompanyStore {
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
 
         let meta_src = read_optional(&bundle.meta_json()).await?;
-        let (lifecycle, overlay_agents) = if meta_src.trim().is_empty() {
-            ("running".to_string(), Vec::new())
+        let (lifecycle, overlay_agents, overlay_desk_members) = if meta_src.trim().is_empty() {
+            ("running".to_string(), Vec::new(), Vec::new())
         } else {
             let meta: Meta = serde_json::from_str(&meta_src)?;
-            (meta.lifecycle, meta.overlay_agents)
+            (
+                meta.lifecycle,
+                meta.overlay_agents,
+                meta.overlay_desk_members,
+            )
         };
 
         let ledger = read_jsonl::<LedgerEntry>(&bundle.ledger_jsonl()).await?;
@@ -190,6 +197,7 @@ impl CompanyStore for FsCompanyStore {
             ledger,
             lifecycle,
             overlay_agents,
+            overlay_desk_members,
         }))
     }
 
@@ -204,6 +212,7 @@ impl CompanyStore for FsCompanyStore {
         let meta = Meta {
             lifecycle: record.lifecycle.clone(),
             overlay_agents: record.overlay_agents.clone(),
+            overlay_desk_members: record.overlay_desk_members.clone(),
         };
         write_atomic(&bundle.meta_json(), &serde_json::to_string(&meta)?).await?;
         Ok(())
@@ -868,6 +877,7 @@ mod test {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         };
         store.save(&record).await.unwrap();
 
@@ -902,6 +912,7 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             })
             .await
             .unwrap();

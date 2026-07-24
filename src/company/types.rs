@@ -46,7 +46,7 @@ pub const TOOL_PROVIDERS: &[&str] = &["openhuman", "builtin"];
 pub const POLICY_MODES: &[&str] = &["readonly", "supervised", "full"];
 
 /// Channels the runtime knows how to enable under `[channels.*]`.
-pub const KNOWN_CHANNELS: &[&str] = &["operator", "email", "slack", "sms", "web"];
+pub const KNOWN_CHANNELS: &[&str] = &["operator", "email", "slack", "sms", "web", "telegram"];
 
 /// Effect kinds gated for approval by default under a `supervised` policy.
 pub const DEFAULT_ALWAYS_APPROVE: &[&str] = &["payment.send", "filing.submit", "external.publish"];

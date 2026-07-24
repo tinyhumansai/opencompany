@@ -127,6 +127,7 @@ description = "Runs Acme."
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         }
     }
 
@@ -146,6 +147,7 @@ description = "Runs Acme."
             facts: None,
             events: None,
             delegations: crate::harness::orchestrator::DelegationQueue::default(),
+            workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         }
