@@ -31,3 +31,12 @@ pub const WORKSPACE_CYCLE: &str = "You can't move a folder into itself.";
 
 /// Error shown when a custom skill is missing its required fields.
 pub const SKILL_FIELDS_REQUIRED: &str = "A skill needs a name and a description.";
+
+/// Error shown when creating a workflow on a deployment with no writable
+/// company source directory (hosted/platform mode without one provisioned).
+pub const WORKFLOW_NEEDS_SOURCE_DIR: &str =
+    "Workflow creation needs a company source directory, and this deployment doesn't have one yet.";
+
+/// Error shown when a workflow id is not safe to use as a filename.
+pub const WORKFLOW_ID_INVALID: &str =
+    "A workflow id can't be empty or contain slashes or `..` — use a plain name.";

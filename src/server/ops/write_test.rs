@@ -1041,6 +1041,231 @@ async fn mcp_query_param_auth_round_trips_write_only_with_advisory() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
+// ---------------------------------------------------------------------------
+// Workflow creator (issue #69)
+// ---------------------------------------------------------------------------
+
+/// Boots an fs-backed company with a writable source directory (a `seed_dir`)
+/// — the workflow creator writes `workflows/<id>.toml` under it, mirroring how
+/// a real `companies/<name>` checkout is wired via `--company`.
+async fn state_with_source_dir(
+    home: &std::path::Path,
+    seed_dir: &std::path::Path,
+    manifest: CompanyManifest,
+) -> AppState {
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let id = CompanyId::new("acme");
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .with_id(id.clone())
+        .with_seed_dir(seed_dir.to_path_buf())
+        .build()
+        .await
+        .unwrap();
+    let state = AppState::new(AppConfig::default());
+    state.registry().insert(id, std::sync::Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+    state
+}
+
+/// A valid graph body: a trigger → an agent node naming the roster's `ceo` →
+/// an output. `$id` becomes both the workflow id and its display name.
+fn workflow_body(id: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "description": "A tiny test graph.",
+        "nodes": [
+            {"id": "start", "kind": "trigger", "name": "Start"},
+            {"id": "worker", "kind": "agent", "name": "Worker", "agent": "ceo"},
+            {"id": "done", "kind": "output", "name": "Done"},
+        ],
+        "edges": [
+            {"from": "start", "to": "worker"},
+            {"from": "worker", "to": "done", "label": "ok"},
+        ],
+    })
+}
+
+#[tokio::test]
+async fn workflow_create_writes_file_appends_enabled_and_is_listed() {
+    let home = home();
+    let seed_dir = home.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let state = state_with_source_dir(&home, &seed_dir, manifest()).await;
+
+    let (status, created) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["id"], "greet");
+    assert_eq!(created["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(created["edges"].as_array().unwrap().len(), 2);
+
+    // The graph landed on disk as TOML under the seed dir.
+    let path = seed_dir.join("workflows").join("greet.toml");
+    assert!(path.is_file(), "workflow file was written to {path:?}");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("id = \"greet\""));
+    assert!(on_disk.contains("agent = \"ceo\""));
+
+    // The operator's live manifest record gained the id in `[workflows].enabled`
+    // — the version-controlled seed dir's own `company.toml` was never touched
+    // (there isn't one here; only the store's copy is checked).
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let record = store.load(&CompanyId::new("acme")).await.unwrap().unwrap();
+    assert_eq!(record.manifest.workflows.enabled, vec!["greet".to_string()]);
+
+    // `GET …/workflows` (which scans the seed dir) now lists it.
+    let (status, list) = send(&state, "GET", "/api/v1/company/workflows", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "greet");
+
+    // `GET …/workflows/{wid}` round-trips the full graph too.
+    let (status, graph) = send(&state, "GET", "/api/v1/company/workflows/greet", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(graph["name"], "greet");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn workflow_create_duplicate_id_is_conflict() {
+    let home = home();
+    let seed_dir = home.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let state = state_with_source_dir(&home, &seed_dir, manifest()).await;
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "conflict");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn workflow_create_rejects_bad_edges_missing_agent_and_no_trigger() {
+    let home = home();
+    let seed_dir = home.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let state = state_with_source_dir(&home, &seed_dir, manifest()).await;
+
+    // An edge referencing a node id that doesn't exist.
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(json!({
+            "id": "bad-edge",
+            "name": "Bad edge",
+            "nodes": [{"id": "start", "kind": "trigger", "name": "Start"}],
+            "edges": [{"from": "start", "to": "ghost"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+
+    // An agent node naming a teammate not on the roster.
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(json!({
+            "id": "bad-agent",
+            "name": "Bad agent",
+            "nodes": [
+                {"id": "start", "kind": "trigger", "name": "Start"},
+                {"id": "worker", "kind": "agent", "name": "Worker", "agent": "ghost"},
+            ],
+            "edges": [{"from": "start", "to": "worker"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+    assert!(body["error"].as_str().unwrap().contains("roster"), "{body}");
+
+    // No trigger node at all.
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(json!({
+            "id": "no-trigger",
+            "name": "No trigger",
+            "nodes": [{"id": "only", "kind": "output", "name": "Only"}],
+            "edges": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+
+    // None of the rejected attempts left a file behind.
+    assert!(
+        !seed_dir.join("workflows").is_dir() || {
+            std::fs::read_dir(seed_dir.join("workflows"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)
+        }
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn workflow_create_without_source_dir_is_bad_request() {
+    let home = home();
+    // `state_with_company` boots with no `seed_dir`, so the company has no
+    // writable source directory — the platform-provisioned-mode case.
+    let state = state_with_company(&home).await;
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
 /// Without the `openhuman` feature the on-demand Test route is "not wired".
 #[cfg(not(feature = "openhuman"))]
 #[tokio::test]
