@@ -245,6 +245,13 @@ pub struct AppState {
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
     nonce: std::sync::Arc<crate::economy::NonceCache>,
+    /// In-flight console MCP OAuth flows, keyed by the opaque `state` the browser
+    /// round-trips (issue #90). The `/mcp/servers/{name}/oauth/start` route parks
+    /// a [`PendingOAuth`](crate::company::mcp_oauth::PendingOAuth) here; the
+    /// unauthenticated `/oauth/mcp/callback` route takes it back out by `state`.
+    /// Gated behind `mcp` so the default build links none of the OAuth path.
+    #[cfg(feature = "mcp")]
+    oauth_pending: Arc<std::sync::Mutex<HashMap<String, crate::company::mcp_oauth::PendingOAuth>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -276,6 +283,8 @@ impl AppState {
             cors: crate::server::cors::CorsConfig::default(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
+            #[cfg(feature = "mcp")]
+            oauth_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -454,6 +463,27 @@ impl AppState {
     #[cfg(feature = "tinyplace")]
     pub fn nonce(&self) -> &std::sync::Arc<crate::economy::NonceCache> {
         &self.nonce
+    }
+
+    /// Parks an in-flight console MCP OAuth flow keyed by its opaque `state`, to
+    /// be reclaimed by the callback route. See issue #90.
+    #[cfg(feature = "mcp")]
+    pub fn park_oauth(&self, state: String, pending: crate::company::mcp_oauth::PendingOAuth) {
+        self.oauth_pending
+            .lock()
+            .expect("oauth pending poisoned")
+            .insert(state, pending);
+    }
+
+    /// Takes (removes) a parked console MCP OAuth flow by its `state`. `None` when
+    /// the state is unknown or already consumed (single-use, so a replayed
+    /// callback can't re-exchange).
+    #[cfg(feature = "mcp")]
+    pub fn take_oauth(&self, state: &str) -> Option<crate::company::mcp_oauth::PendingOAuth> {
+        self.oauth_pending
+            .lock()
+            .expect("oauth pending poisoned")
+            .remove(state)
     }
 
     /// Returns a serializable system specification snapshot.
