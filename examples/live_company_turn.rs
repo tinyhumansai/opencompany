@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         facts: None,
         events: None,
         delegations: opencompany::harness::orchestrator::DelegationQueue::default(),
+        workflow_runner: opencompany::harness::orchestrator::WorkflowRunnerHandle::default(),
         mcp_failures: opencompany::harness::mcp_probe::McpFailureQueue::default(),
         secrets: None,
     };
