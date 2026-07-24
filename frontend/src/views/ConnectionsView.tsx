@@ -44,6 +44,7 @@ import {
 } from "@/lib/connections";
 import { cn } from "@/lib/utils";
 import { InferenceSection } from "@/views/connections/InferenceSection";
+import { ChannelsSection } from "./connections/ChannelsSection";
 
 interface Props {
   client: OpenCompanyClient;
@@ -131,6 +132,8 @@ export function ConnectionsView({ client, company }: Props) {
         <McpServersSection client={client} company={company} />
 
         <InferenceSection client={client} company={company} />
+
+        <ChannelsSection client={client} company={company} />
 
         {load === "loading" ? (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

@@ -4,6 +4,7 @@ pub mod cors;
 mod error;
 pub mod feedback;
 pub mod graphql;
+pub mod hooks;
 pub mod operator;
 pub mod ops;
 pub mod platform_auth;

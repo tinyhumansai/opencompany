@@ -315,6 +315,7 @@ impl Brain for HarnessBrain {
                 channel: "operator".to_string(),
                 text: "Acknowledged.".to_string(),
                 steps: Vec::new(),
+                reply_to: None,
             });
         }
 
