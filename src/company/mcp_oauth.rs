@@ -155,6 +155,91 @@ fn http() -> reqwest::Client {
         .expect("reqwest client must build")
 }
 
+/// SSRF guard for a **discovery-supplied** OAuth endpoint. The MCP server we're
+/// signing into advertises its own registration/token/authorize URLs, and
+/// `begin` / `complete` / `refresh` then POST to them **server-side** — so an
+/// unvalidated endpoint is a server-side request-forgery primitive a hostile
+/// server can aim at internal services or the cloud metadata endpoint
+/// (`169.254.169.254`). Reject anything that isn't `https` or whose host
+/// resolves to a loopback/private/link-local/unspecified address. Ported (kept
+/// decoupled from OpenHuman's `url_guard`, which is `pub(super)` and unreachable
+/// here) so the console path validates every outbound OAuth target itself.
+fn guard_endpoint(raw: &str, what: &str) -> Result<()> {
+    let url = url::Url::parse(raw).map_err(|e| {
+        OpenCompanyError::InvalidRequest(format!("{what} endpoint is not a valid URL: {e}"))
+    })?;
+    if url.scheme() != "https" {
+        return Err(OpenCompanyError::InvalidRequest(format!(
+            "{what} endpoint must use https (got `{}`)",
+            url.scheme()
+        )));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| OpenCompanyError::InvalidRequest(format!("{what} endpoint has no host")))?;
+
+    // An IP-literal host is checked directly — no DNS round-trip needed.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return if is_blocked_ip(&ip) {
+            Err(OpenCompanyError::InvalidRequest(format!(
+                "{what} endpoint resolves to a disallowed address"
+            )))
+        } else {
+            Ok(())
+        };
+    }
+
+    // Resolve the hostname and reject if it fails to resolve or if ANY resolved
+    // address is in a blocked range (a single blocked A/AAAA record is enough —
+    // this also blunts DNS-rebinding to an internal address).
+    let port = url.port_or_known_default().unwrap_or(443);
+    let mut resolved = false;
+    for addr in std::net::ToSocketAddrs::to_socket_addrs(&(host, port)).map_err(|e| {
+        OpenCompanyError::InvalidRequest(format!("{what} endpoint host does not resolve: {e}"))
+    })? {
+        resolved = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err(OpenCompanyError::InvalidRequest(format!(
+                "{what} endpoint resolves to a disallowed address"
+            )));
+        }
+    }
+    if !resolved {
+        return Err(OpenCompanyError::InvalidRequest(format!(
+            "{what} endpoint host does not resolve"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an IP is in a range we refuse to POST OAuth material to (loopback,
+/// RFC 1918 / unique-local, link-local incl. the `169.254.169.254` metadata
+/// address, unspecified, broadcast, documentation, multicast).
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || v4.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(&std::net::IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
 /// RFC 7591 dynamic client registration. Requests `client_secret_post`; servers
 /// that issue a confidential client return a `client_secret` we keep for the
 /// token exchange. Returns `(client_id, client_secret?)`.
@@ -162,6 +247,7 @@ async fn register_client(
     registration_endpoint: &str,
     redirect_uri: &str,
 ) -> Result<(String, Option<String>)> {
+    guard_endpoint(registration_endpoint, "registration")?;
     let body = json!({
         "client_name": "OpenCompany",
         "redirect_uris": [redirect_uri],
@@ -272,6 +358,12 @@ pub async fn begin(
         ))
     })?;
 
+    // Fail fast on unsafe discovery-supplied targets before any outbound call or
+    // before parking a pending flow whose stored `token_endpoint` refresh would
+    // later replay. `register_client` / `post_token_form` re-guard at call time.
+    guard_endpoint(&authorization_endpoint, "authorization")?;
+    guard_endpoint(&token_endpoint, "token")?;
+
     let (client_id, client_secret) = register_client(&registration_endpoint, redirect_uri).await?;
     let (code_verifier, code_challenge) = gen_pkce();
     let state = uuid::Uuid::new_v4().to_string();
@@ -316,6 +408,11 @@ struct TokenResponse {
 /// without echoing the raw body — a token endpoint's success body carries the
 /// access token, so we never surface it).
 async fn post_token_form(endpoint: &str, form: &[(&str, &str)]) -> Result<Value> {
+    // Every token exchange + refresh POST funnels through here, so validating the
+    // target at this choke point guards both `complete` and `refresh` — and
+    // re-checks at call time (not just at `begin`), blunting a rebind between
+    // discovery and exchange.
+    guard_endpoint(endpoint, "token")?;
     let resp = http()
         .post(endpoint)
         .form(form)
@@ -567,6 +664,37 @@ mod tests {
         assert!(needs_refresh(&stale, 60));
         // A non-OAuth material never needs refresh.
         assert!(!needs_refresh(&AuthMaterial::Bearer("t".into()), 60));
+    }
+
+    #[test]
+    fn guard_blocks_non_https_and_local_targets() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // Scheme: plain http is refused outright (SSRF loves cleartext localhost).
+        assert!(guard_endpoint("http://as.example/token", "token").is_err());
+        // IP-literal hosts in blocked ranges are rejected without DNS.
+        assert!(guard_endpoint("https://127.0.0.1/token", "token").is_err());
+        assert!(guard_endpoint("https://10.0.0.5/register", "registration").is_err());
+        assert!(guard_endpoint("https://192.168.1.1/token", "token").is_err());
+        // The cloud metadata endpoint — the canonical SSRF target — is link-local.
+        assert!(guard_endpoint("https://169.254.169.254/latest/meta-data", "token").is_err());
+        assert!(guard_endpoint("https://[::1]/token", "token").is_err());
+        // A syntactically bad URL is a clean rejection, not a panic.
+        assert!(guard_endpoint("not a url", "token").is_err());
+
+        // The IP-classification helper covers v4 + v6 ranges directly.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_blocked_ip(&IpAddr::V6("fc00::1".parse().unwrap())));
+        assert!(is_blocked_ip(&IpAddr::V6("fe80::1".parse().unwrap())));
+        // A routable public address passes the classifier.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+        assert!(!is_blocked_ip(&IpAddr::V6(
+            "2606:2800:220:1::1".parse().unwrap()
+        )));
     }
 
     #[tokio::test]
