@@ -297,7 +297,7 @@ pub fn operator_message(server: &str, class: &ProbeClass, err: &anyhow::Error) -
             "MCP server '{server}' needs a credential. Add its API token (or query-parameter key) in Connections, then Test again."
         ),
         FailureKind::OauthRequired => format!(
-            "MCP server '{server}' uses OAuth sign-in, which isn't supported yet — a pasted token won't be accepted."
+            "MCP server '{server}' needs OAuth sign-in — click Sign in on the server in Connections to authorize it."
         ),
         FailureKind::TokenRejected => format!(
             "MCP server '{server}' rejected the credential — it's wrong or expired. Update it and Test again."
@@ -440,9 +440,99 @@ fn utf8_truncate(s: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::company::mcp::{AuthMaterial, McpServerDecl, McpSource};
 
     fn anyhow_str(msg: &str) -> anyhow::Error {
         anyhow::anyhow!("{}", msg.to_string())
+    }
+
+    fn oauth_decl(name: &str, endpoint: &str, access_token: &str) -> McpServerDecl {
+        McpServerDecl {
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            description: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            timeout_secs: 30,
+            enabled: true,
+            source: McpSource::Runtime,
+            auth: AuthMaterial::OAuth {
+                access_token: access_token.to_string(),
+                refresh_token: Some("rt-oauth-secret".to_string()),
+                client_id: "client-abc".to_string(),
+                client_secret: Some("cs-oauth-secret".to_string()),
+                token_endpoint: "https://as.example/token".to_string(),
+                expires_at: u64::MAX,
+            },
+        }
+    }
+
+    /// SECURITY: an OAuth access token planted as the credential must NEVER
+    /// appear in a probed server's health message — even when the server
+    /// reflects the `Authorization` header back in an error body. This is the
+    /// regression guard for issue #90's "OAuth tokens are write-only, never in
+    /// any status/health/error response" invariant, driven through the REAL
+    /// vendored transport + the OAuth→bearer mapping.
+    #[tokio::test]
+    async fn oauth_token_never_leaks_into_probed_health() {
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use serde_json::Value;
+
+        // Reflect the Authorization header back in a 500 on `initialize` — the
+        // hostile shape that would leak the bearer through the raw error. `Json`
+        // is last so it consumes the body after the header read.
+        async fn handler(
+            State(()): State<()>,
+            headers: HeaderMap,
+            _body: Json<Value>,
+        ) -> axum::response::Response {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("boom — received {auth}"),
+            )
+                .into_response()
+        }
+
+        let app = Router::new().route("/mcp", post(handler)).with_state(());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        const ACCESS: &str = "at-oauth-CANARY-9999";
+        let endpoint = format!("http://{addr}/mcp");
+        let decl = oauth_decl("oauthy", &endpoint, ACCESS);
+
+        let health = probe_server(&decl).await;
+
+        // The health message is surfaced to the operator — it must carry none of
+        // the OAuth secrets (access token reflected by the server, and neither
+        // the refresh token nor the client secret which feed the scrubber set).
+        assert!(
+            !health.message.contains(ACCESS),
+            "probed health leaked the OAuth access token: {}",
+            health.message
+        );
+        assert!(
+            !health.message.contains("rt-oauth-secret"),
+            "{}",
+            health.message
+        );
+        assert!(
+            !health.message.contains("cs-oauth-secret"),
+            "{}",
+            health.message
+        );
     }
 
     // ---- scrub -------------------------------------------------------------
