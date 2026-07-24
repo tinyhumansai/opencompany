@@ -165,6 +165,31 @@ export class OpenCompanyClient {
   }
 
   /**
+   * Add a teammate to a desk through the operator overlay (issue #72). The
+   * teammate must be on the company roster; the desk must exist. Adding one
+   * already on the desk is a 409.
+   */
+  addDeskMember(deskId: string, agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "POST",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members`,
+      { agent_id: agentId },
+    );
+  }
+
+  /**
+   * Remove an operator-added desk member (issue #72). Only overlay members can
+   * be removed — a teammate declared on the desk in the manifest is part of the
+   * blueprint and returns a 409.
+   */
+  removeDeskMember(deskId: string, agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
    * A desk's persisted transcript (issue #65), so the console can rehydrate a
    * thread on login/reload instead of always starting empty. `desk` is the
    * thread id (as passed to {@link chat}); omitted reads the operator/General

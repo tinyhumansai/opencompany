@@ -21,6 +21,11 @@ pub const BUILTIN_UNINSTALL: &str =
 pub const MANIFEST_TEAMMATE_DELETE: &str =
     "This teammate is part of your company's blueprint and can't be removed here.";
 
+/// Error shown when a write tries to remove a desk member defined in the
+/// manifest (only operator-added members can be removed at runtime).
+pub const MANIFEST_DESK_MEMBER_DELETE: &str =
+    "This teammate is on the desk in your company's blueprint and can't be removed here.";
+
 /// Error shown when a workspace move would create a cycle.
 pub const WORKSPACE_CYCLE: &str = "You can't move a folder into itself.";
 
