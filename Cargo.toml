@@ -95,6 +95,12 @@ openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = 
 anyhow = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
+# Console MCP OAuth (issue #90): base64url for PKCE (S256 challenge + verifier
+# entropy) and URL building for the `/authorize` redirect. Both are already in
+# the tree via `openhuman_core` + `reqwest`, so pinning them as direct deps adds
+# no new Cargo.lock entries; they link only under the `mcp` feature.
+base64 = { version = "0.22", optional = true }
+url = { version = "2", optional = true }
 
 # Issue #29 (epic #26): the tinyflows workflow engine, embedded directly. It is
 # host-agnostic and Config-free — `Capabilities` is a plain struct of trait
@@ -183,7 +189,7 @@ openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:
 # MCP server management and agent tools share OpenHuman's in-process registry.
 # Enabling it necessarily enables the embedded harness and OpenHuman MCP
 # domain, while the default build remains unchanged.
-mcp = ["openhuman", "openhuman_core/mcp", "dep:uuid"]
+mcp = ["openhuman", "openhuman_core/mcp", "dep:uuid", "dep:base64", "dep:url"]
 # Real HTTP transport to openhuman-core. The trait + offline mock + providers
 # compile without this; only `HttpOpenHumanRpc` is gated behind it.
 openhuman-rpc = ["dep:reqwest"]
