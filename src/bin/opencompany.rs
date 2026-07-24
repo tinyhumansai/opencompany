@@ -397,6 +397,12 @@ fn connections_runtime() -> Result<opencompany::server::ops::ConnectionsRuntime>
         connections =
             connections.with_mail(Arc::new(opencompany::server::ops::smtp::LettreMailSender));
     }
+    #[cfg(feature = "telegram")]
+    {
+        connections = connections.with_telegram(Arc::new(
+            opencompany::company::telegram::HttpTelegramApi::new(),
+        ));
+    }
     if let Some(mail) = opencompany::server::ops::mailer::MailConfig::from_env()? {
         connections = connections.with_mail_credentials(mail.credentials);
     }

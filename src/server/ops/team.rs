@@ -10,7 +10,7 @@
 
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::routing::{delete, post, put};
+use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +26,7 @@ use crate::server::ops::{DOMAIN_KEY, ScopedCompany, scoped};
 
 /// Builds the team route fragment.
 pub fn router() -> Router<AppState> {
-    scoped("/team", post(add_member))
+    scoped("/team", get(list_team).post(add_member))
         .merge(scoped("/team/{agent_id}", delete(remove_member)))
         .merge(scoped("/team/{agent_id}/inbox", put(toggle_inbox)))
 }
@@ -69,6 +69,39 @@ struct InboxAck {
 #[derive(Debug, Deserialize)]
 struct AgentPath {
     agent_id: String,
+}
+
+/// `GET {scope}/team` — the merged roster: manifest teammates (versioned in
+/// `company.toml`, `name: null` — the console falls back to the role) plus
+/// operator-added overlay teammates (`name` always set). Mirrors the GraphQL
+/// `resolve_team` merge (minus its `inbox_enabled` field, which has no REST
+/// consumer yet). Hosts with no persisted record yet return an empty roster,
+/// the same soft-fail the sibling `/desks` route uses, rather than 404ing.
+async fn list_team(company: ScopedCompany) -> Result<Json<Vec<TeamMemberDto>>, ApiError> {
+    let record = company.runtime.store().load(company.id()).await?;
+    let members = record
+        .map(|record| {
+            let mut members: Vec<TeamMemberDto> = record
+                .manifest
+                .agents
+                .iter()
+                .map(|agent| TeamMemberDto {
+                    id: agent.id.clone(),
+                    name: None,
+                    role: agent.role.clone(),
+                    description: agent.description.clone(),
+                })
+                .collect();
+            members.extend(record.overlay_agents.iter().map(|agent| TeamMemberDto {
+                id: agent.id.clone(),
+                name: Some(agent.name.clone()),
+                role: agent.role.clone(),
+                description: agent.description.clone(),
+            }));
+            members
+        })
+        .unwrap_or_default();
+    Ok(Json(members))
 }
 
 async fn add_member(

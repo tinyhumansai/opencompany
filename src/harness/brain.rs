@@ -315,6 +315,7 @@ impl Brain for HarnessBrain {
                 channel: "operator".to_string(),
                 text: "Acknowledged.".to_string(),
                 steps: Vec::new(),
+                reply_to: None,
             });
         }
 
@@ -409,6 +410,7 @@ description = "Runs Acme."
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
@@ -540,6 +542,7 @@ description = "Builds it."
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
@@ -735,6 +738,7 @@ members = ["engineer"]
             facts: None,
             events: None,
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             secrets: None,
         };
@@ -856,6 +860,7 @@ members = ["engineer"]
             facts: None,
             events: Some(events.clone()),
             delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: failures.clone(),
             secrets: None,
         };

@@ -1,4 +1,4 @@
-import type { TurnStep } from "@/api/types";
+import type { ChatHistoryMessageDto, TurnStep } from "@/api/types";
 
 /** One line in the conversation with the company. */
 export interface ChatMessage {
@@ -37,4 +37,26 @@ export function makeMessage(
     channel: opts.channel,
     steps: opts.steps,
   };
+}
+
+/**
+ * Maps a desk's persisted transcript (`GET .../chat/history`, issue #65) to
+ * the console's chat lines, preserving `mine`/author/text and ordering — the
+ * backend already returns messages oldest-first. `id`s are namespaced with an
+ * `h` prefix so a rehydrated line can never collide with one built locally by
+ * {@link makeMessage} (`m<seq>`).
+ */
+export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
+  return entries.map((entry) => {
+    const from: ChatMessage["from"] = entry.mine ? "you" : "company";
+    return {
+      id: `h${entry.id}`,
+      from,
+      text: entry.text,
+      at: entry.atMillis,
+      // A sent message never carries a channel; only attribute one when the
+      // line came from someone/something else, mirroring `ChatPane.send`.
+      channel: from === "company" ? entry.channel : undefined,
+    };
+  });
 }

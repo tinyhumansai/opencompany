@@ -75,3 +75,33 @@ export function runWorkflow(
     { input: input ?? {} },
   );
 }
+
+/**
+ * Authors a new workflow graph (issue #69): the console's form creator posts
+ * the same shape `getWorkflow` returns, and the host writes it to
+ * `workflows/{id}.toml`. Rejections carry a prosumer-language `ApiError`
+ * message (bad id, duplicate id, an edge or `agent` node the graph can't
+ * support, no writable source directory on this deployment).
+ */
+export function createWorkflow(
+  client: OpenCompanyClient,
+  company: string | null,
+  graph: WorkflowGraph,
+): Promise<WorkflowGraph> {
+  return client.post<WorkflowGraph>(`${client.scopeFor(company)}/workflows`, graph);
+}
+
+/**
+ * The node kinds the form creator's palette offers. `tool_call` and
+ * `http_request` are real graph kinds the engine stores and the canvas
+ * renders, but the runtime only executes `trigger`/`agent`/`condition`/
+ * `output` today — the other two are `Unwired*` stubs that error at run time
+ * (see `src/workflows/caps.rs`). Creating one from scratch would silently
+ * produce a workflow that can never finish, so the creator doesn't offer them.
+ */
+export const CREATABLE_NODE_KINDS: { value: string; label: string }[] = [
+  { value: "trigger", label: "Trigger — starts the workflow" },
+  { value: "agent", label: "Agent — a teammate performs a step" },
+  { value: "condition", label: "Condition — branches on something" },
+  { value: "output", label: "Output — reports the result back" },
+];

@@ -248,6 +248,11 @@ dns = ["dep:hickory-resolver"]
 # offline `RecordingMailSender` compile without this; only `LettreMailSender` is
 # gated here.
 smtp = ["dep:lettre"]
+# Real HTTPS transport to api.telegram.org for the Telegram channel
+# (sendMessage / setWebhook). The `TelegramApi` trait, inbound parsing, token
+# scrubbing, and the offline `RecordingTelegramApi` compile without this; only
+# `HttpTelegramApi` is gated here (it needs the shared `reqwest` client).
+telegram = ["dep:reqwest"]
 # OAuth connection lifecycle (authorize-url + server-side token exchange). The
 # read-only connections catalog compiles without this; only the token-exchanging
 # write routes are gated here (they need the shared `reqwest` client).

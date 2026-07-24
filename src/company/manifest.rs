@@ -484,6 +484,25 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_telegram_channel_entry() {
+        let manifest = parse(
+            r#"
+            [company]
+            name = "X"
+            [[agent]]
+            id = "a"
+            role = "A"
+            [channels.telegram]
+            enabled = true
+            "#,
+        );
+        assert!(
+            !manifest.validate().iter().any(|p| p.contains("telegram")),
+            "telegram is a known channel and must validate"
+        );
+    }
+
+    #[test]
     fn public_company_requires_handle() {
         let manifest = parse("[company]\nname = \"X\"\n[place]\ndiscoverable = true\n");
         let problems = manifest.validate();

@@ -9,7 +9,7 @@
 //! first agent when none is tagged (so a company without an orchestrator behaves
 //! exactly as before).
 //!
-//! It reaches three tools, all wired only onto the orchestrator agent:
+//! It reaches four tools, all wired only onto the orchestrator agent:
 //!
 //! * [`QueryCompanyTool`] — a read surface over the company's [`FactStore`] and
 //!   recent [`EventLog`] history.
@@ -18,10 +18,18 @@
 //!   themselves; the [`HarnessBrain`](crate::harness::HarnessBrain) drains the
 //!   queue after the orchestrator's turn (v1: synchronous, in-cycle, capped at
 //!   [`MAX_DELEGATIONS_PER_TURN`], no sub-agent re-delegation).
+//! * [`RunWorkflowTool`] — executes one of the company's saved workflow graphs
+//!   by id via the [`WorkflowRunner`] port (issue #67). It loads the graph from
+//!   the company source directory (the same loader the REST run route uses) and
+//!   invokes the runner reached through a shared [`WorkflowRunnerHandle`], so a
+//!   task waiting on a workflow can actually be run to completion. Unlike the
+//!   delegation tools it runs the graph inline and returns a concise summary of
+//!   the run rather than enqueuing deferred work.
 //!
 //! Compiled only under `feature = "openhuman"` (the whole `harness` module is).
 
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -30,10 +38,11 @@ use openhuman_core::openhuman as oh;
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
 
-use crate::company::Agent as ManifestAgent;
+use crate::company::{Agent as ManifestAgent, WorkflowFile, load_company_workflows};
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
 use crate::ports::types::{CompanyEvent, CompanyId, EventSeq};
+use crate::ports::{WorkflowRun, WorkflowRunner};
 
 /// The manifest cognition-tier that marks the orchestrator agent.
 pub const ORCHESTRATOR_TIER: &str = "orchestrator";
@@ -54,6 +63,8 @@ pub const QUERY_COMPANY_TOOL: &str = "query_company";
 pub const SPAWN_TASK_TOOL: &str = "spawn_task";
 /// The `delegate_to_desk` tool name.
 pub const DELEGATE_TO_DESK_TOOL: &str = "delegate_to_desk";
+/// The `run_workflow` tool name.
+pub const RUN_WORKFLOW_TOOL: &str = "run_workflow";
 
 /// The id of the orchestrator agent for a roster: the first agent tagged
 /// `tier = "orchestrator"`, else the first roster agent, else `None` (empty
@@ -83,8 +94,10 @@ pub fn orchestrator_brief() -> String {
 Answer from whole-company context, and when a request belongs to a specialist desk or should be \
 tracked as work, delegate instead of guessing. Use `query_company` to ground answers in the \
 company's durable facts and recent activity, `delegate_to_desk` to hand a turn to a desk's lead \
-member, and `spawn_task` to open a tracked task card. Delegate only when it genuinely helps — \
-otherwise answer directly and concisely."
+member, `spawn_task` to open a tracked task card, and `run_workflow` to execute one of the \
+company's saved workflows by id (for example to advance or finish a task that is waiting on a \
+workflow run) — you can run workflows yourself; never claim the run_workflow tool is unavailable. \
+Delegate only when it genuinely helps — otherwise answer directly and concisely."
         .to_string()
 }
 
@@ -442,6 +455,316 @@ pub fn delegation_tools(queue: &DelegationQueue) -> Vec<Box<dyn Tool>> {
     ]
 }
 
+/// The complete tool set wired onto the company's orchestrator agent (issues
+/// #53 and #67), in order: the `query_company` read surface, the `spawn_task`
+/// and `delegate_to_desk` delegation tools, and the `run_workflow` execution
+/// tool.
+///
+/// [`build_agent`](crate::harness::build::build_agent) extends the orchestrator
+/// agent's tools with exactly this vector, so a test over this function is the
+/// registration check for the orchestrator's tool list. `workflow_source_dir` is
+/// the company source directory (`companies/<name>`) whose `workflows/` subtree
+/// holds the graphs; `workflow_runner` is the shared handle the runtime builder
+/// fills once the runner is built.
+pub fn orchestrator_tools(
+    company: CompanyId,
+    facts: Option<Arc<dyn FactStore>>,
+    events: Option<Arc<dyn EventLog>>,
+    queue: &DelegationQueue,
+    workflow_source_dir: Option<PathBuf>,
+    workflow_runner: WorkflowRunnerHandle,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(QueryCompanyTool::new(
+        company.clone(),
+        facts,
+        events,
+    ))];
+    tools.extend(delegation_tools(queue));
+    tools.push(Box::new(RunWorkflowTool::new(
+        company,
+        workflow_source_dir,
+        workflow_runner,
+    )));
+    tools
+}
+
+// ---------------------------------------------------------------------------
+// run_workflow (issue #67)
+// ---------------------------------------------------------------------------
+
+/// A shared, fillable handle to the company's [`WorkflowRunner`].
+///
+/// The `run_workflow` tool must reach the runner, but the runner
+/// ([`HarnessWorkflowRunner`](crate::workflows::HarnessWorkflowRunner)) is built
+/// *from* [`HarnessDeps`](crate::harness::HarnessDeps) — so it cannot be a plain
+/// field on deps without a construction cycle. Instead the runtime builder puts
+/// an empty handle on deps, builds the runner from a deps clone (which shares
+/// this one cell), then fills the handle. Every clone — the deps the brain later
+/// builds the orchestrator agent from, and the tool captured into that agent —
+/// sees the same cell, so the fill is visible at turn time.
+///
+/// The cell holds a [`Weak`], so the deps→handle→runner→deps reference is **not**
+/// a strong cycle: the one strong reference lives on the
+/// [`CompanyRuntime`](crate::company::CompanyRuntime), and the tool upgrades the
+/// weak on demand. Empty until filled (and always empty on a build with no
+/// runner), in which case the tool reports that workflow execution is not wired.
+#[derive(Clone, Default)]
+pub struct WorkflowRunnerHandle {
+    inner: Arc<OnceLock<Weak<dyn WorkflowRunner>>>,
+}
+
+impl WorkflowRunnerHandle {
+    /// Fills the handle with a weak reference to the built runner. Idempotent —
+    /// a second fill is ignored (the runner is built once per company boot).
+    pub fn set(&self, runner: &Arc<dyn WorkflowRunner>) {
+        let _ = self.inner.set(Arc::downgrade(runner));
+    }
+
+    /// The wired runner, upgraded from the weak cell, or `None` when no runner
+    /// was attached (or the owning runtime has been dropped).
+    pub fn get(&self) -> Option<Arc<dyn WorkflowRunner>> {
+        self.inner.get().and_then(Weak::upgrade)
+    }
+}
+
+/// How many characters of a node item preview the run summary keeps.
+const ITEM_PREVIEW_CHARS: usize = 120;
+
+/// A tool that runs one of the company's saved workflows by id.
+///
+/// It mirrors the REST run route (`POST /workflows/{wid}/run`): load the graph
+/// from the company source directory, then invoke the [`WorkflowRunner`] reached
+/// through a shared [`WorkflowRunnerHandle`]. On success it returns a concise,
+/// natural-language summary of the run (per-node outcome + any nodes left
+/// pending approval) rather than the engine's raw JSON. Every failure mode — no
+/// runner wired, no source directory, an unknown id, a load or run error — is an
+/// agent-actionable [`ToolResult::error`], never a panic or a silent empty
+/// result, so the orchestrator can reason about and report what went wrong.
+pub struct RunWorkflowTool {
+    company: CompanyId,
+    source_dir: Option<PathBuf>,
+    runner: WorkflowRunnerHandle,
+}
+
+impl RunWorkflowTool {
+    /// Builds the tool over the company id, its on-disk source directory
+    /// (`companies/<name>`, whose `workflows/` subtree holds the graphs), and the
+    /// shared runner handle.
+    pub fn new(
+        company: CompanyId,
+        source_dir: Option<PathBuf>,
+        runner: WorkflowRunnerHandle,
+    ) -> Self {
+        Self {
+            company,
+            source_dir,
+            runner,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for RunWorkflowTool {
+    fn name(&self) -> &str {
+        RUN_WORKFLOW_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "Run one of the company's saved workflows by id to completion — use this to advance or finish work that is waiting on a workflow run. Provide the workflow `id` and an optional `input` trigger payload. Returns a summary of each node's outcome and any steps left pending approval."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The id of the workflow to run (its `workflows/<id>.toml` stem; see the workflows list)."
+                },
+                "input": {
+                    "description": "An optional trigger payload seeded as the workflow's trigger item. Any JSON value; omit to run with no input."
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
+    fn supports_markdown(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        // Accept `id` (canonical) or `workflow` (a natural alias) for the id.
+        let wid = args
+            .get("id")
+            .or_else(|| args.get("workflow"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|w| !w.is_empty());
+        let Some(wid) = wid.map(str::to_string) else {
+            return Ok(ToolResult::error(
+                "`id` is required: pass the id of the workflow to run (see the workflows list).",
+            ));
+        };
+        let input = args.get("input").cloned().unwrap_or(Value::Null);
+
+        // `wid` becomes a filename — reject anything that could escape the
+        // `workflows/` directory (mirrors the REST route's guard).
+        if !is_safe_workflow_id(&wid) {
+            tracing::debug!(company = %self.company, workflow = %wid, "run_workflow: rejected unsafe id");
+            return Ok(ToolResult::error(format!(
+                "No workflow with id `{wid}` exists."
+            )));
+        }
+
+        // The runner is reached through the shared handle; an empty handle means
+        // no runner is wired (default build / no harness).
+        let Some(runner) = self.runner.get() else {
+            tracing::debug!(company = %self.company, workflow = %wid, runner = false, "run_workflow: no runner wired");
+            return Ok(ToolResult::error(
+                "Workflow execution isn't available on this deployment (no workflow runner is wired).",
+            ));
+        };
+
+        // Load the saved graph from the company's on-disk source directory.
+        let Some(source_dir) = self.source_dir.as_deref() else {
+            tracing::debug!(company = %self.company, workflow = %wid, "run_workflow: no source dir");
+            return Ok(ToolResult::error(
+                "This company has no on-disk workflow definitions on this deployment, so there is nothing to run.",
+            ));
+        };
+        // Mirror the REST run route: a missing file is a clean "unknown id"
+        // rather than a raw filesystem read error (which would also leak the
+        // on-disk path into agent-visible text).
+        let path = source_dir.join("workflows").join(format!("{wid}.toml"));
+        if !path.is_file() {
+            tracing::debug!(company = %self.company, workflow = %wid, "run_workflow: unknown id");
+            return Ok(ToolResult::error(format!(
+                "No workflow with id `{wid}` exists. Check the workflows list for valid ids."
+            )));
+        }
+        let file = match load_company_workflows(source_dir, std::slice::from_ref(&wid)) {
+            Ok(files) => files.into_iter().next(),
+            Err(err) => {
+                tracing::debug!(company = %self.company, workflow = %wid, error = %err, "run_workflow: load failed");
+                return Ok(ToolResult::error(format!(
+                    "Couldn't load workflow `{wid}`: {err}"
+                )));
+            }
+        };
+        let Some(file) = file else {
+            tracing::debug!(company = %self.company, workflow = %wid, "run_workflow: unknown id");
+            return Ok(ToolResult::error(format!(
+                "No workflow with id `{wid}` exists. Check the workflows list for valid ids."
+            )));
+        };
+
+        tracing::debug!(company = %self.company, workflow = %wid, runner = true, "run_workflow: invoking runner");
+        match runner.run(&self.company, &file, input).await {
+            Ok(run) => {
+                tracing::debug!(
+                    company = %self.company,
+                    workflow = %wid,
+                    pending = run.pending_approvals.len(),
+                    "run_workflow: run succeeded"
+                );
+                let md = summarize_run(&file, &run);
+                Ok(ToolResult::success_with_markdown(
+                    json!({
+                        "workflow": file.id,
+                        "pending_approvals": run.pending_approvals.len(),
+                    }),
+                    md,
+                ))
+            }
+            Err(err) => {
+                tracing::debug!(company = %self.company, workflow = %wid, error = %err, "run_workflow: run failed");
+                Ok(ToolResult::error(format!(
+                    "Workflow `{wid}` failed to run: {err}"
+                )))
+            }
+        }
+    }
+}
+
+/// Whether `wid` is a single safe on-disk filename stem — no path separators, no
+/// `..`, not empty — so it can't escape the `workflows/` directory.
+fn is_safe_workflow_id(wid: &str) -> bool {
+    use std::path::{Component, Path};
+    let mut comps = Path::new(wid).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+/// A concise, natural-language summary of a completed workflow run: a per-node
+/// outcome line (in graph order) plus any nodes left pending approval. This is
+/// what the tool hands back to the turn — never the engine's raw
+/// `{ run, nodes }` JSON dumped verbatim.
+fn summarize_run(file: &WorkflowFile, run: &WorkflowRun) -> String {
+    let mut md = format!("Ran workflow **{}** (`{}`).\n\n", file.name.trim(), file.id);
+    md.push_str("## Per-node outcome\n");
+    let nodes = run.output.get("nodes").and_then(Value::as_object);
+    match nodes {
+        Some(nodes) if !file.nodes.is_empty() => {
+            for node in &file.nodes {
+                let name = node.name.trim();
+                let kind = node.kind.as_str();
+                match nodes.get(&node.id) {
+                    Some(state) => {
+                        let items = state.get("items").and_then(Value::as_array);
+                        let count = items.map(Vec::len).unwrap_or(0);
+                        let preview = items
+                            .and_then(|items| items.last())
+                            .map(preview_item)
+                            .filter(|p| !p.is_empty());
+                        match preview {
+                            Some(preview) => md.push_str(&format!(
+                                "- **{name}** ({kind}): {count} item(s) — {preview}\n"
+                            )),
+                            None => {
+                                md.push_str(&format!("- **{name}** ({kind}): {count} item(s)\n"))
+                            }
+                        }
+                    }
+                    None => md.push_str(&format!("- **{name}** ({kind}): not reached\n")),
+                }
+            }
+        }
+        _ => md.push_str("_No per-node output was produced._\n"),
+    }
+
+    if run.pending_approvals.is_empty() {
+        md.push_str("\nThe run reached its terminal node(s) without pausing for approval.\n");
+    } else {
+        md.push_str(&format!(
+            "\n**Paused for approval** at: {}. Resolve these for the run to continue.\n",
+            run.pending_approvals.join(", ")
+        ));
+    }
+    md
+}
+
+/// A short, single-line preview of one node output item: the raw string when the
+/// item is a string, else its compact JSON — truncated on a char boundary to
+/// [`ITEM_PREVIEW_CHARS`] so a large item can't blow up the summary.
+fn preview_item(item: &Value) -> String {
+    let raw = match item {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= ITEM_PREVIEW_CHARS {
+        one_line
+    } else {
+        let cut: String = one_line.chars().take(ITEM_PREVIEW_CHARS).collect();
+        format!("{cut}…")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +897,255 @@ mod tests {
         let out = result.output_for_llm(true);
         assert!(out.contains("No durable facts recorded"), "{out}");
         assert!(out.contains("No recent activity"), "{out}");
+    }
+
+    // ---- run_workflow (issue #67) ----
+
+    /// A valid trigger → agent → output graph, mirroring the REST route's fixture.
+    const DEMO_WF: &str = r#"
+        id = "demo"
+        name = "Demo flow"
+        description = "A tiny trigger → agent → output graph."
+        [[node]]
+        id = "start"
+        kind = "trigger"
+        name = "Start"
+        [[node]]
+        id = "worker"
+        kind = "agent"
+        name = "Worker"
+        agent = "assistant"
+        [[node]]
+        id = "done"
+        kind = "output"
+        name = "Report"
+        [[edge]]
+        from = "start"
+        to = "worker"
+        [[edge]]
+        from = "worker"
+        to = "done"
+    "#;
+
+    /// A [`WorkflowRunner`] test double: records the ids it was asked to run and
+    /// returns a canned [`WorkflowRun`].
+    struct StubRunner {
+        calls: Arc<Mutex<Vec<String>>>,
+        run: WorkflowRun,
+    }
+
+    impl StubRunner {
+        fn new(run: WorkflowRun) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                run,
+            }
+        }
+
+        fn empty() -> Self {
+            Self::new(WorkflowRun {
+                output: Value::Null,
+                pending_approvals: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowRunner for StubRunner {
+        async fn run(
+            &self,
+            _company: &CompanyId,
+            workflow: &WorkflowFile,
+            _input: Value,
+        ) -> crate::Result<WorkflowRun> {
+            self.calls.lock().unwrap().push(workflow.id.clone());
+            Ok(self.run.clone())
+        }
+    }
+
+    /// Writes `DEMO_WF` to `<dir>/workflows/demo.toml`.
+    fn seed_demo_workflow(dir: &std::path::Path) {
+        let wf = dir.join("workflows");
+        std::fs::create_dir_all(&wf).unwrap();
+        std::fs::write(wf.join("demo.toml"), DEMO_WF).unwrap();
+    }
+
+    #[test]
+    fn workflow_runner_handle_is_empty_until_filled() {
+        let handle = WorkflowRunnerHandle::default();
+        assert!(handle.get().is_none());
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::empty());
+        handle.set(&runner);
+        assert!(handle.get().is_some());
+    }
+
+    #[test]
+    fn workflow_runner_handle_holds_only_a_weak_reference() {
+        // Proves the deps↔runner cell is not a strong cycle: once the sole strong
+        // owner drops, the handle can no longer upgrade.
+        let handle = WorkflowRunnerHandle::default();
+        {
+            let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::empty());
+            handle.set(&runner);
+            assert!(handle.get().is_some());
+        }
+        assert!(
+            handle.get().is_none(),
+            "the handle must not keep the runner alive"
+        );
+    }
+
+    #[test]
+    fn orchestrator_tools_includes_run_workflow_and_the_rest() {
+        let queue = DelegationQueue::default();
+        let tools = orchestrator_tools(
+            CompanyId::new("acme"),
+            None,
+            None,
+            &queue,
+            None,
+            WorkflowRunnerHandle::default(),
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&RUN_WORKFLOW_TOOL), "got {names:?}");
+        assert!(names.contains(&QUERY_COMPANY_TOOL), "got {names:?}");
+        assert!(names.contains(&SPAWN_TASK_TOOL), "got {names:?}");
+        assert!(names.contains(&DELEGATE_TO_DESK_TOOL), "got {names:?}");
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tool_loads_and_invokes_the_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner_impl = StubRunner::new(WorkflowRun {
+            output: json!({
+                "run": {},
+                "nodes": { "worker": { "items": ["did the thing"] }, "done": { "items": [] } }
+            }),
+            pending_approvals: Vec::new(),
+        });
+        let calls = runner_impl.calls.clone();
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(runner_impl);
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            handle,
+        );
+        let result = tool
+            .execute(json!({ "id": "demo", "input": { "seed": 1 } }))
+            .await
+            .expect("execute");
+
+        assert!(!result.is_error, "expected success, got {result:?}");
+        assert_eq!(calls.lock().unwrap().as_slice(), ["demo"]);
+        let out = result.output_for_llm(true);
+        assert!(out.contains("Demo flow"), "{out}");
+        assert!(out.contains("did the thing"), "{out}");
+        assert!(out.contains("without pausing for approval"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tool_surfaces_pending_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": { "worker": { "items": [] } } }),
+            pending_approvals: vec!["worker".to_string()],
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            handle,
+        );
+        let result = tool
+            .execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+        assert!(!result.is_error);
+        let out = result.output_for_llm(true);
+        assert!(out.contains("Paused for approval"), "{out}");
+        assert!(out.contains("worker"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tool_errors_when_no_runner_is_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+        // A valid workflow on disk, but an empty handle → not wired.
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            WorkflowRunnerHandle::default(),
+        );
+        let result = tool
+            .execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+        assert!(result.is_error, "expected an error result");
+        assert!(result.output_for_llm(false).contains("wired"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tool_errors_on_unknown_id() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::empty());
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            handle,
+        );
+        let result = tool
+            .execute(json!({ "id": "nope" }))
+            .await
+            .expect("execute");
+        assert!(result.is_error);
+        assert!(
+            result.output_for_llm(false).contains("No workflow with id"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tool_requires_an_id() {
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            None,
+            WorkflowRunnerHandle::default(),
+        );
+        let result = tool.execute(json!({})).await.expect("execute");
+        assert!(result.is_error);
+        assert!(
+            result.output_for_llm(false).contains("`id` is required"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tool_rejects_traversal_ids() {
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::empty());
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(std::path::PathBuf::from("/tmp")),
+            handle,
+        );
+        let result = tool
+            .execute(json!({ "id": "../secrets" }))
+            .await
+            .expect("execute");
+        assert!(result.is_error);
     }
 }
