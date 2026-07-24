@@ -267,7 +267,7 @@ function RunResultPanel({
           </p>
         )}
 
-        {nodeResults ? (
+        {nodeResults && nodeResults.length > 0 ? (
           <div className="mb-2 space-y-2">
             {nodeResults.map((n) => (
               <NodeResultCard key={n.id} node={n} />
@@ -280,7 +280,7 @@ function RunResultPanel({
           </p>
         )}
 
-        <details open={!nodeResults}>
+        <details open={!nodeResults || nodeResults.length === 0}>
           <summary className="cursor-pointer text-xs text-muted-foreground">
             Show raw engine output
           </summary>
@@ -297,7 +297,6 @@ function RunResultPanel({
  * (markdown-rendered). Falls back to a subtle placeholder / the branch it took
  * when it produced no text (e.g. a trigger or a condition node). */
 function NodeResultCard({ node }: { node: NodeResult }) {
-  const hasText = node.messages.some((m) => m.text);
   return (
     <div className="rounded-lg border bg-background/40 p-2">
       <div className="mb-1 flex items-center gap-2">
@@ -324,7 +323,7 @@ function NodeResultCard({ node }: { node: NodeResult }) {
           )}
         </div>
       ))}
-      {node.messages.length === 0 && !hasText && (
+      {node.messages.length === 0 && (
         <p className="text-sm text-muted-foreground">—</p>
       )}
     </div>
