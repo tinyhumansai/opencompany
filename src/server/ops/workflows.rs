@@ -408,9 +408,10 @@ async fn create_workflow(
 
     // Write the file atomically: `create_new(true)` fails if the path already
     // exists, closing the TOCTOU gap between a separate `is_file()` check and
-    // `fs::write`. Also, save the store record **after** the file lands so a
-    // store failure doesn't orphan a file — if the save fails the file is
-    // cleaned up and the caller can retry.
+    // `fs::write`. If `write_all` fails, clean up the empty file so the id is
+    // not permanently blocked. Also, save the store record **after** the file
+    // lands so a store failure doesn't orphan a file — if the save fails the
+    // file is cleaned up and the caller can retry.
     let mut wf_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -426,6 +427,7 @@ async fn create_workflow(
             }),
         })?;
     wf_file.write_all(toml_src.as_bytes()).map_err(|source| {
+        let _ = std::fs::remove_file(&path);
         ApiError(OpenCompanyError::StoreIo {
             path: path.clone(),
             source,

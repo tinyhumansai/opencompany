@@ -65,9 +65,9 @@ function starterNodes(): DraftNode[] {
   return [{ key: nextKey(), id: "start", kind: "trigger", name: "Start", summary: "", agent: "" }];
 }
 
-/** A safe on-disk id: no slashes, no `..`, not empty — mirrors the host's
- * `safe_wid` check so a bad id fails fast in the form instead of round-tripping
- * to the server first. */
+/** A safe on-disk id: only letters, digits, `_`, and `-` — a subset of what the
+ * host's `safe_wid` accepts (any single path component), chosen to keep ids
+ * simple and unambiguous without a round-trip to the server first. */
 function isSafeId(id: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(id);
 }
