@@ -242,6 +242,22 @@ impl CompanyRuntime {
         &self.store
     }
 
+    /// The workflow ids declared in this company's manifest
+    /// (`[workflows].enabled`), read from the persisted record. Empty when the
+    /// record hasn't been saved yet.
+    ///
+    /// This is the source of truth for *which* workflows exist on a
+    /// platform-provisioned tenant (no `source_dir`, so nothing to scan on
+    /// disk) — see [`Self::source_dir`]. Both the REST `list_workflows` route
+    /// and the GraphQL `Company.workflows` resolver read it so the two
+    /// surfaces agree on what the company has enabled.
+    pub async fn enabled_workflow_ids(&self) -> Result<Vec<String>> {
+        let record = self.store.load(&self.id).await?;
+        Ok(record
+            .map(|record| record.manifest.workflows.enabled)
+            .unwrap_or_default())
+    }
+
     /// This company's inbox store (inbound + outbound email).
     pub fn inbox(&self) -> &Arc<dyn InboxStore> {
         &self.inbox
