@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,7 +28,9 @@ use crate::ports::types::{
     Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, Verdict,
 };
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
+use crate::server::chat_history::{MessageView, Viewer, history_for_desk};
 use crate::server::error::ApiError;
+use crate::server::ops::language::DEFAULT_DESK;
 use crate::server::ops::{ScopedCompany, scoped};
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 use crate::server::provision::{emit_cycle_webhooks, emit_feedback_webhook};
@@ -39,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/companies", get(list_companies))
         .route("/api/v1/companies/{id}", get(company_status))
         .route("/api/v1/companies/{id}/chat", post(operator_chat))
+        .route("/api/v1/companies/{id}/chat/history", get(chat_history))
         .route("/api/v1/companies/{id}/approvals", get(list_approvals))
         .route(
             "/api/v1/companies/{id}/approvals/{aid}",
@@ -46,6 +49,7 @@ pub fn router() -> Router<AppState> {
         )
         // Single-company aliases (no id; resolved via the sole registered company).
         .route("/api/v1/company/chat", post(operator_chat_single))
+        .route("/api/v1/company/chat/history", get(chat_history_single))
         .route("/api/v1/company/approvals", get(list_approvals_single))
         .route(
             "/api/v1/company/approvals/{aid}",
@@ -318,6 +322,154 @@ async fn operator_chat_single(
     chat_and_emit(&state, &id, runtime, message, by)
         .await
         .map_err(IntoResponse::into_response)
+}
+
+/// Query params for `GET .../chat/history`.
+#[derive(Debug, Deserialize)]
+struct ChatHistoryQuery {
+    /// The desk to read, by id or name. Omitted defaults to the operator's
+    /// General/"main" line — the console's default thread (issue #65).
+    #[serde(default)]
+    desk: Option<String>,
+}
+
+/// One desk-history message, as the console renders it. Mirrors `ChatMessage`
+/// in `frontend/src/lib/chat.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatHistoryMessageDto {
+    /// The message id (its EventLog sequence position).
+    id: String,
+    /// The channel the message came in on.
+    channel: String,
+    /// The author label.
+    author: String,
+    /// The message text.
+    text: String,
+    /// When it was journaled, epoch millis.
+    at_millis: f64,
+    /// Whether it is the operator's own message.
+    mine: bool,
+}
+
+impl From<MessageView> for ChatHistoryMessageDto {
+    fn from(view: MessageView) -> Self {
+        Self {
+            id: view.id,
+            channel: view.channel,
+            author: view.author,
+            text: view.text,
+            at_millis: view.at_millis,
+            mine: view.mine,
+        }
+    }
+}
+
+/// How many messages `GET .../chat/history` returns. Generous enough to
+/// hydrate a console thread on load (issue #65) while still bounding the
+/// response on a very long transcript; pagination is a GraphQL `Chat.history`
+/// concern, not this REST convenience route's.
+const CHAT_HISTORY_LIMIT: usize = 200;
+
+/// Resolves a `?desk=` selector to the `(id, name)` pair `history_for_desk`
+/// filters on.
+///
+/// A selector matching a manifest group chat (by id or name,
+/// case-insensitive) resolves to that desk's real id/name pair — same as the
+/// GraphQL `chat(id:)` lookup. An unmatched selector (an ad hoc thread id the
+/// console addresses with no backing manifest entry, e.g. a static default
+/// thread) passes through as both id and name, so history still finds
+/// whatever was journaled under that exact string. Omitted resolves to the
+/// synthetic General/operator desk.
+async fn resolve_desk(
+    runtime: &CompanyRuntime,
+    desk: Option<&str>,
+) -> Result<(String, String), OpenCompanyError> {
+    let Some(desk) = desk else {
+        return Ok((DEFAULT_DESK.to_string(), DEFAULT_DESK.to_string()));
+    };
+    let record = runtime.store().load(runtime.id()).await?;
+    let matched =
+        record.and_then(|record| {
+            record.manifest.group_chats.into_iter().find(|chat| {
+                chat.id.eq_ignore_ascii_case(desk) || chat.name.eq_ignore_ascii_case(desk)
+            })
+        });
+    Ok(match matched {
+        Some(chat) => (chat.id, chat.name),
+        None => (desk.to_string(), desk.to_string()),
+    })
+}
+
+/// Resolves who is reading a desk's history, for the `mine` flag. Reuses
+/// [`chat_actor`]'s auth (session cookie or platform credential, tenant
+/// address-authorization, temporary-password gate) so a history read can
+/// never see more than a matching chat send could.
+async fn history_viewer(
+    headers: &HeaderMap,
+    state: &AppState,
+    company: &CompanyId,
+) -> Result<Viewer, Response> {
+    let actor = chat_actor(headers, state, company).await?;
+    Ok(match actor {
+        Some(actor) if actor.kind == ActorKind::User => Viewer::User(actor.id),
+        _ => Viewer::Operator,
+    })
+}
+
+/// Shared body for both scope forms of `GET .../chat/history`.
+async fn chat_history_response(
+    state: &AppState,
+    company: &CompanyId,
+    runtime: Arc<CompanyRuntime>,
+    headers: &HeaderMap,
+    query: ChatHistoryQuery,
+) -> Result<Json<Vec<ChatHistoryMessageDto>>, Response> {
+    let viewer = history_viewer(headers, state, company).await?;
+    let (desk_id, desk_name) = resolve_desk(&runtime, query.desk.as_deref())
+        .await
+        .map_err(|e| ApiError(e).into_response())?;
+    let (messages, _total) = history_for_desk(
+        &runtime,
+        &desk_id,
+        &desk_name,
+        &viewer,
+        None,
+        CHAT_HISTORY_LIMIT,
+    )
+    .await
+    .map_err(|e| ApiError(e).into_response())?;
+    Ok(Json(
+        messages
+            .into_iter()
+            .map(ChatHistoryMessageDto::from)
+            .collect(),
+    ))
+}
+
+/// `GET /api/v1/companies/{id}/chat/history` — a desk's transcript (issue
+/// #65), reusing the same filter + projection as GraphQL `Chat.history` via
+/// [`history_for_desk`].
+async fn chat_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ChatHistoryQuery>,
+) -> Result<Json<Vec<ChatHistoryMessageDto>>, Response> {
+    let company = CompanyId::new(&id);
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    chat_history_response(&state, &company, runtime, &headers, query).await
+}
+
+/// `GET /api/v1/company/chat/history` (single-company alias).
+async fn chat_history_single(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatHistoryQuery>,
+) -> Result<Json<Vec<ChatHistoryMessageDto>>, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
+    let id = runtime.id().clone();
+    chat_history_response(&state, &id, runtime, &headers, query).await
 }
 
 /// `GET /api/v1/companies/{id}/approvals`.
@@ -624,6 +776,98 @@ mod test {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/company/desks")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 0);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Issue #65: the console's default thread addresses sends with
+    /// `chat: "main"`, but pre-threading history and the synthetic operator
+    /// desk are keyed on `"General"`. A transcript spanning both ids — one
+    /// operator turn journaled under each — must read back as one history via
+    /// the REST route with no `?desk=` selector (the console's default read).
+    #[tokio::test]
+    async fn chat_history_route_reunifies_general_and_main_transcripts() {
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+        runtime
+            .events()
+            .append(
+                runtime.id(),
+                CompanyEvent::AgentReply {
+                    chat_id: "General".to_string(),
+                    agent_id: "ceo".to_string(),
+                    text: "reply under General".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .events()
+            .append(
+                runtime.id(),
+                CompanyEvent::AgentReply {
+                    chat_id: "main".to_string(),
+                    agent_id: "ceo".to_string(),
+                    text: "reply under main".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/chat/history")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = value.as_array().unwrap();
+        let texts: Vec<&str> = messages
+            .iter()
+            .map(|m| m["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            texts.contains(&"reply under General"),
+            "missing General-id reply: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"reply under main"),
+            "missing main-id reply: {texts:?}"
+        );
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// A desk id with no `?desk=` selector defaults to the operator/General
+    /// thread; an unaddressed thread id that neither matches a manifest desk
+    /// nor the General desk reads back empty rather than erroring.
+    #[tokio::test]
+    async fn chat_history_route_unknown_desk_is_empty_not_an_error() {
+        let home = home();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/chat/history?desk=strategy")
                     .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .body(Body::empty())
                     .unwrap(),

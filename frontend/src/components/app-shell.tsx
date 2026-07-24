@@ -48,7 +48,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { DiscordIcon } from "@/components/discord-icon";
 import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
-import { type ChatMessage, makeMessage } from "@/lib/chat";
+import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
 import { DISCORD_INVITE_URL } from "@/lib/links";
 import { defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
@@ -194,23 +194,57 @@ export function AppShell({
   // Build the chat threads from the company's real desks (issue #53); keep the
   // static defaults when the host doesn't expose `/desks` (404) or defines none.
   // Merges by id so a transcript typed before desks load survives.
+  //
+  // Once the thread list is known, rehydrate each thread's transcript from the
+  // backend's persisted history (issue #65): the server journals every
+  // operator message and agent reply to the EventLog, but the console used to
+  // always start every thread empty. Merges by message id so a line typed
+  // locally before its thread's history lands isn't lost — hydration can race
+  // the operator's first message on a fresh page load.
   useEffect(() => {
     let cancelled = false;
+
+    const hydrate = (threadId: string) => {
+      client
+        .getChatHistory(threadId, company)
+        .then((entries) => {
+          if (cancelled || entries.length === 0) return;
+          const hydrated = fromHistory(entries);
+          setThreads((ts) =>
+            ts.map((t) => {
+              if (t.id !== threadId) return t;
+              const known = new Set(t.messages.map((m) => m.id));
+              const fresh = hydrated.filter((m) => !known.has(m.id));
+              return fresh.length === 0 ? t : { ...t, messages: [...fresh, ...t.messages] };
+            }),
+          );
+        })
+        .catch(() => {
+          /* host without `/chat/history`, or offline — thread stays empty */
+        });
+    };
+
     client
       .listDesks(company)
       .then((desks) => {
         if (cancelled) return;
+        const resolved = threadsFromDesks(desks);
         setThreads((prev) => {
           const byId = new Map(prev.map((t) => [t.id, t]));
-          return threadsFromDesks(desks).map((t) => {
+          return resolved.map((t) => {
             const existing = byId.get(t.id);
             return existing ? { ...t, messages: existing.messages } : t;
           });
         });
+        resolved.forEach((t) => hydrate(t.id));
       })
       .catch(() => {
-        /* host without `/desks`, or offline — keep the current threads */
+        // Host without `/desks`, or offline — keep the static default
+        // threads, but the operator/General line still deserves a
+        // rehydration attempt (it's the one every deployment has).
+        defaultThreads().forEach((t) => hydrate(t.id));
       });
+
     return () => {
       cancelled = true;
     };
