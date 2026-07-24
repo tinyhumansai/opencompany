@@ -1214,10 +1214,7 @@ async fn workflow_create_rejects_bad_edges_missing_agent_and_no_trigger() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_request");
-    assert!(
-        body["error"].as_str().unwrap().contains("roster"),
-        "{body}"
-    );
+    assert!(body["error"].as_str().unwrap().contains("roster"), "{body}");
 
     // No trigger node at all.
     let (status, body) = send(
@@ -1236,11 +1233,13 @@ async fn workflow_create_rejects_bad_edges_missing_agent_and_no_trigger() {
     assert_eq!(body["code"], "invalid_request");
 
     // None of the rejected attempts left a file behind.
-    assert!(!seed_dir.join("workflows").is_dir() || {
-        std::fs::read_dir(seed_dir.join("workflows"))
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(true)
-    });
+    assert!(
+        !seed_dir.join("workflows").is_dir() || {
+            std::fs::read_dir(seed_dir.join("workflows"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)
+        }
+    );
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
