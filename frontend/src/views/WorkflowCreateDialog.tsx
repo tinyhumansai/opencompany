@@ -208,8 +208,8 @@ export function WorkflowCreateDialog({
       ),
       edges: edges.map(
         (e): WorkflowEdge => ({
-          from: e.from,
-          to: e.to,
+          from: e.from.trim(),
+          to: e.to.trim(),
           label: e.label.trim() || undefined,
         }),
       ),
@@ -309,7 +309,7 @@ export function WorkflowCreateDialog({
               <EdgeRow
                 key={e.key}
                 edge={e}
-                nodeIds={nodes.map((n) => n.id).filter(Boolean)}
+                nodeIds={nodes.map((n) => n.id.trim()).filter(Boolean)}
                 onChange={(fields) => updateEdge(e.key, fields)}
                 onRemove={() => removeEdge(e.key)}
               />
