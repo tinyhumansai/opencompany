@@ -100,6 +100,29 @@ export function discoverMcpTools(
   );
 }
 
+/** The `oauth/start` response: the authorization URL to open in a browser. */
+export interface McpOAuthStart {
+  authorizeUrl: string;
+}
+
+/**
+ * Begin a server's browser OAuth sign-in (issue #90). Returns the authorization
+ * URL the console opens in a new tab; the host completes the flow on its
+ * `/oauth/mcp/callback` route and stores the token write-only. 404 `not_wired`
+ * when the harness/OAuth path is off; 400 when the server can't do OAuth (paste
+ * a static token instead).
+ */
+export function startMcpOAuth(
+  client: OpenCompanyClient,
+  company: string | null,
+  name: string,
+): Promise<McpOAuthStart> {
+  return client.post<McpOAuthStart>(
+    `${client.scopeFor(company)}/mcp/servers/${encodeURIComponent(name)}/oauth/start`,
+    {},
+  );
+}
+
 /**
  * Probe a server on demand and return its (scrubbed) health. 404 `not_wired`
  * when the harness is off.
