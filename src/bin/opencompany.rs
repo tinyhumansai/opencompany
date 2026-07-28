@@ -204,6 +204,13 @@ async fn register_company(
     if let Some(overlay) = state.memory_overlay() {
         builder = builder.with_memory_overlay(overlay);
     }
+    #[cfg(feature = "smtp")]
+    if let Ok(Some(cfg)) = opencompany::server::ops::mailer::TenantMailboxConfig::from_env() {
+        builder = builder.with_mail(opencompany::company::runtime::CompanyMail {
+            sender: std::sync::Arc::new(opencompany::server::ops::smtp::LettreMailSender),
+            smtp: cfg.smtp.clone(),
+        });
+    }
     if discoverable {
         builder = builder.with_discoverable(true);
     }
