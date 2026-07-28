@@ -80,6 +80,34 @@ fn signer() -> Box<dyn WebhookSigner> {
     }
 }
 
+/// File an inbound email and, if the company is running, drive one cycle so the
+/// addressed teammate can act on it. Shared by the ingest webhook and the IMAP
+/// poller. `to` is the full recipient address (for the event body); the record
+/// already carries the local-part `inbox`.
+pub(crate) async fn file_and_notify(
+    runtime: &CompanyRuntime,
+    to: &str,
+    record: EmailRecord,
+) -> crate::Result<()> {
+    runtime.inbox().append(runtime.id(), &record).await?;
+    if runtime.ensure_running().await.is_ok() {
+        let event = CompanyEvent::WebhookReceived {
+            channel: "email".to_string(),
+            body: serde_json::json!({
+                "from": record.from_email,
+                "to": to,
+                "inbox": record.inbox,
+                "subject": record.subject,
+                "body": record.body,
+            }),
+        };
+        if let Err(err) = runtime.run_cycle(vec![event]).await {
+            tracing::warn!(company = %runtime.id(), "email cycle failed: {err}");
+        }
+    }
+    Ok(())
+}
+
 /// A `401` drop for an unverifiable payload.
 fn unauthorized() -> Response {
     (
@@ -136,26 +164,8 @@ async fn ingest(runtime: Arc<CompanyRuntime>, headers: &HeaderMap, raw: &[u8]) -
         read: false,
         outbound: false,
     };
-    if let Err(err) = runtime.inbox().append(runtime.id(), &record).await {
+    if let Err(err) = file_and_notify(&runtime, &email.to, record).await {
         return crate::server::error::ApiError(err).into_response();
-    }
-
-    // Drive one cycle so the addressed teammate can act on the mail. A paused or
-    // archived company simply files the mail without running.
-    if runtime.ensure_running().await.is_ok() {
-        let event = CompanyEvent::WebhookReceived {
-            channel: "email".to_string(),
-            body: json!({
-                "from": email.from,
-                "to": email.to,
-                "inbox": inbox,
-                "subject": email.subject,
-                "body": email.body,
-            }),
-        };
-        if let Err(err) = runtime.run_cycle(vec![event]).await {
-            tracing::warn!(company = %runtime.id(), "ingest cycle failed: {err}");
-        }
     }
 
     (StatusCode::ACCEPTED, Json(IngestAck { ok: true, inbox })).into_response()
