@@ -227,7 +227,11 @@ pub(crate) async fn load_credentials(
 }
 
 /// Appends a sent email to the sender's inbox so the console shows outbound mail.
-async fn record_outbound(runtime: &CompanyRuntime, creds: &SmtpCredentials, email: &OutboundEmail) {
+pub(crate) async fn record_outbound(
+    runtime: &CompanyRuntime,
+    creds: &SmtpCredentials,
+    email: &OutboundEmail,
+) {
     let record = EmailRecord {
         id: generate_id(),
         inbox: local_part(&creds.from_email),

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::company::runtime::CompanyRuntime;
+use crate::error::OpenCompanyError;
 use crate::ports::brain::CycleHost;
 use crate::ports::now_millis;
 use crate::ports::types::{
@@ -29,6 +30,7 @@ use crate::ports::types::{
     EffectDisposition, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall, ToolResult, Verdict,
 };
 use crate::runtime::types::CycleReport;
+use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
 /// How many recent traces to load into a cycle's compressed history.
 const HISTORY_LIMIT: usize = 32;
@@ -275,6 +277,51 @@ async fn perform_effect(rt: &CompanyRuntime, effect: &Effect) -> Result<()> {
             }
         }
     }
+    if effect.kind == "email.send" {
+        let to = effect
+            .payload
+            .get("to")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let subject = effect
+            .payload
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let body = effect
+            .payload
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        send_company_email(rt, to, subject, body).await?;
+    }
+    Ok(())
+}
+
+/// Sends an `email.send` effect via the company's own outbound-mail handle
+/// and records the send to the sender's own inbox (so the console shows
+/// outbound mail alongside inbound).
+async fn send_company_email(
+    rt: &CompanyRuntime,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<()> {
+    let Some(mail) = rt.mail() else {
+        return Err(OpenCompanyError::InvalidRequest(
+            "email is not configured for this company".into(),
+        ));
+    };
+    let email = OutboundEmail {
+        to: to.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+    };
+    mail.sender
+        .send(&MailCredentials::Smtp(mail.smtp.clone()), &email)
+        .await?;
+    // Record to the sender's own inbox (from = the company's own address).
+    crate::server::ops::smtp::record_outbound(rt, &mail.smtp, &email).await;
     Ok(())
 }
 
@@ -375,6 +422,7 @@ mod test {
     use std::sync::atomic::AtomicUsize;
 
     use crate::company::CompanyManifest;
+    use crate::company::runtime::CompanyMail;
     use crate::policy::ManifestApprovalGate;
     use crate::ports::ChannelAdapter;
     use crate::ports::brain::Brain;
@@ -383,6 +431,8 @@ mod test {
     };
     use crate::runtime::RuntimeBuilder;
     use crate::runtime::channel::OperatorChannel;
+    use crate::server::ops::mailer::RecordingMailSender;
+    use crate::server::ops::smtp::{SmtpCredentials, SmtpSecurity};
     use crate::store::paths::Bundle;
 
     fn tmp_home() -> std::path::PathBuf {
@@ -805,6 +855,92 @@ mod test {
         );
         assert_eq!(ra.unwrap().responses.len(), 1);
         assert_eq!(rb.unwrap().responses.len(), 1);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    fn test_smtp(from_email: &str) -> SmtpCredentials {
+        SmtpCredentials {
+            host: "smtp.example.com".into(),
+            port: 587,
+            security: SmtpSecurity::Starttls,
+            username: "user".into(),
+            password: "hunter2".into(),
+            from_name: "Acme".into(),
+            from_email: from_email.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn email_send_effect_sends_and_records() {
+        let home = tmp_home();
+        let sender = Arc::new(RecordingMailSender::new());
+        let email_effect = Effect {
+            kind: "email.send".into(),
+            group: EffectGroup::Send,
+            amount_usd: None,
+            established_thread: true,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "to": "x@ext.com", "subject": "Hi", "body": "yo" }),
+        };
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(EffectBrain {
+                effect: email_effect,
+            }))
+            .with_mail(CompanyMail {
+                sender: sender.clone(),
+                smtp: test_smtp("ceo@acme.test"),
+            })
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: "send it".into(),
+            by: None,
+            chat: None,
+        }])
+        .await
+        .unwrap();
+
+        assert_eq!(sender.sent().len(), 1);
+        let inbox = rt.inbox().messages(rt.id(), "ceo", 10, 0).await.unwrap();
+        assert!(inbox.iter().any(|r| r.outbound && r.subject == "Hi"));
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn email_send_effect_without_mail_errors() {
+        let home = tmp_home();
+        let email_effect = Effect {
+            kind: "email.send".into(),
+            group: EffectGroup::Send,
+            amount_usd: None,
+            established_thread: true,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "to": "x@ext.com", "subject": "Hi", "body": "yo" }),
+        };
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(EffectBrain {
+                effect: email_effect,
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let err = perform_effect(
+            &rt,
+            &Effect {
+                kind: "email.send".into(),
+                group: EffectGroup::Send,
+                amount_usd: None,
+                established_thread: true,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "to": "x@ext.com", "subject": "Hi", "body": "yo" }),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("email is not configured"));
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }
