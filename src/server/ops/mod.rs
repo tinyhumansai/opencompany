@@ -16,6 +16,7 @@
 //! compiled only under the `oauth` feature and 404 otherwise.
 
 pub mod domain;
+pub mod imap;
 pub mod inbox;
 pub mod language;
 pub mod mail;

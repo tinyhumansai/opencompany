@@ -49,6 +49,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::OpenCompanyError;
+use crate::server::ops::imap::ImapCredentials;
 use crate::server::ops::smtp::{SmtpCredentials, SmtpSecurity};
 
 /// Which transport a set of [`MailCredentials`] belongs to.
@@ -155,6 +156,71 @@ pub trait MailSender: Send + Sync {
         creds: &MailCredentials,
         email: &OutboundEmail,
     ) -> Result<(), OpenCompanyError>;
+}
+
+/// One inbound message produced by a [`MailReceiver`]. Plain-text body (v1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundEmail {
+    pub from_name: String,
+    pub from_email: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// The inbound-fetch seam. Implementations fetch *new* (unseen) messages and
+/// mark them seen, so a subsequent call returns only newer mail. Mockable so the
+/// poller is exercised offline; the real transport is feature-gated.
+#[async_trait]
+pub trait MailReceiver: Send + Sync {
+    async fn fetch_new(
+        &self,
+        creds: &ImapCredentials,
+    ) -> Result<Vec<InboundEmail>, OpenCompanyError>;
+}
+
+/// Offline mock: returns queued batches, one per `fetch_new` call, and counts calls.
+pub struct RecordingMailReceiver {
+    batches: Mutex<std::collections::VecDeque<Vec<InboundEmail>>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingMailReceiver {
+    pub fn new() -> Self {
+        Self {
+            batches: Mutex::new(std::collections::VecDeque::new()),
+            calls: Default::default(),
+        }
+    }
+    /// Queue a batch to be returned by the next `fetch_new`.
+    pub fn push_batch(&self, batch: Vec<InboundEmail>) {
+        self.batches.lock().expect("poisoned").push_back(batch);
+    }
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for RecordingMailReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl MailReceiver for RecordingMailReceiver {
+    async fn fetch_new(
+        &self,
+        _creds: &ImapCredentials,
+    ) -> Result<Vec<InboundEmail>, OpenCompanyError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self
+            .batches
+            .lock()
+            .expect("poisoned")
+            .pop_front()
+            .unwrap_or_default())
+    }
 }
 
 /// Host-level outbound mail configuration.
@@ -360,5 +426,25 @@ mod test {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "hi@acme.test");
         assert_eq!(sent[0].1.to, "ada@example.com");
+    }
+
+    #[tokio::test]
+    async fn recording_receiver_returns_queued_batches_in_order() {
+        let creds = ImapCredentials {
+            host: "h".into(),
+            port: 993,
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let rx = RecordingMailReceiver::new();
+        rx.push_batch(vec![InboundEmail {
+            from_name: "A".into(),
+            from_email: "a@x".into(),
+            subject: "s".into(),
+            body: "b".into(),
+        }]);
+        assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 1);
+        assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 0); // drained
+        assert_eq!(rx.calls(), 2);
     }
 }
