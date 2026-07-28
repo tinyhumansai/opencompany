@@ -167,21 +167,48 @@ pub struct InboundEmail {
     pub body: String,
 }
 
-/// The inbound-fetch seam. Implementations fetch *new* (unseen) messages and
-/// mark them seen, so a subsequent call returns only newer mail. Mockable so the
+/// One fetched-but-not-yet-acked message: the parsed [`InboundEmail`] plus the
+/// IMAP UID it was fetched under. The UID (not a sequence number, which shifts
+/// on expunge) is what [`MailReceiver::mark_seen`] takes, so filing and acking
+/// stay correctly paired even if the mailbox changes between the two calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedEmail {
+    pub uid: u32,
+    pub email: InboundEmail,
+}
+
+/// The inbound-fetch seam. Implementations fetch *new* (unseen) messages
+/// without marking them seen, and only do so once the caller confirms the
+/// message was durably filed — see [`MailReceiver::mark_seen`]. Mockable so the
 /// poller is exercised offline; the real transport is feature-gated.
 #[async_trait]
 pub trait MailReceiver: Send + Sync {
+    /// Fetches messages not yet marked `\Seen`, without setting that flag
+    /// (`UID FETCH ... BODY.PEEK[]` on the real transport) — a message stays
+    /// unseen, and so is re-fetched, until [`MailReceiver::mark_seen`] is
+    /// called for its UID.
     async fn fetch_new(
         &self,
         creds: &ImapCredentials,
-    ) -> Result<Vec<InboundEmail>, OpenCompanyError>;
+    ) -> Result<Vec<FetchedEmail>, OpenCompanyError>;
+
+    /// Marks `uids` `\Seen`. Callers must only pass UIDs of messages that have
+    /// already been durably filed — this is the "ack" half of the fetch, kept
+    /// separate so a storage failure never causes an unfiled message to be
+    /// marked seen (and thus lost: it would never be re-fetched).
+    async fn mark_seen(
+        &self,
+        creds: &ImapCredentials,
+        uids: &[u32],
+    ) -> Result<(), OpenCompanyError>;
 }
 
-/// Offline mock: returns queued batches, one per `fetch_new` call, and counts calls.
+/// Offline mock: returns queued batches, one per `fetch_new` call, counts
+/// calls, and records every UID passed to `mark_seen`.
 pub struct RecordingMailReceiver {
-    batches: Mutex<std::collections::VecDeque<Vec<InboundEmail>>>,
+    batches: Mutex<std::collections::VecDeque<Vec<FetchedEmail>>>,
     calls: std::sync::atomic::AtomicUsize,
+    marked: Mutex<Vec<u32>>,
 }
 
 impl RecordingMailReceiver {
@@ -189,14 +216,19 @@ impl RecordingMailReceiver {
         Self {
             batches: Mutex::new(std::collections::VecDeque::new()),
             calls: Default::default(),
+            marked: Mutex::new(Vec::new()),
         }
     }
     /// Queue a batch to be returned by the next `fetch_new`.
-    pub fn push_batch(&self, batch: Vec<InboundEmail>) {
+    pub fn push_batch(&self, batch: Vec<FetchedEmail>) {
         self.batches.lock().expect("poisoned").push_back(batch);
     }
     pub fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Every UID passed to `mark_seen` so far, in call order.
+    pub fn marked(&self) -> Vec<u32> {
+        self.marked.lock().expect("poisoned").clone()
     }
 }
 
@@ -211,7 +243,7 @@ impl MailReceiver for RecordingMailReceiver {
     async fn fetch_new(
         &self,
         _creds: &ImapCredentials,
-    ) -> Result<Vec<InboundEmail>, OpenCompanyError> {
+    ) -> Result<Vec<FetchedEmail>, OpenCompanyError> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self
@@ -220,6 +252,18 @@ impl MailReceiver for RecordingMailReceiver {
             .expect("poisoned")
             .pop_front()
             .unwrap_or_default())
+    }
+
+    async fn mark_seen(
+        &self,
+        _creds: &ImapCredentials,
+        uids: &[u32],
+    ) -> Result<(), OpenCompanyError> {
+        self.marked
+            .lock()
+            .expect("poisoned")
+            .extend_from_slice(uids);
+        Ok(())
     }
 }
 
@@ -509,15 +553,32 @@ mod test {
             password: "p".into(),
         };
         let rx = RecordingMailReceiver::new();
-        rx.push_batch(vec![InboundEmail {
-            from_name: "A".into(),
-            from_email: "a@x".into(),
-            subject: "s".into(),
-            body: "b".into(),
+        rx.push_batch(vec![FetchedEmail {
+            uid: 1,
+            email: InboundEmail {
+                from_name: "A".into(),
+                from_email: "a@x".into(),
+                subject: "s".into(),
+                body: "b".into(),
+            },
         }]);
         assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 1);
         assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 0); // drained
         assert_eq!(rx.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn recording_receiver_records_marked_uids() {
+        let creds = ImapCredentials {
+            host: "h".into(),
+            port: 993,
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let rx = RecordingMailReceiver::new();
+        rx.mark_seen(&creds, &[3, 4]).await.unwrap();
+        rx.mark_seen(&creds, &[5]).await.unwrap();
+        assert_eq!(rx.marked(), vec![3, 4, 5]);
     }
 
     #[test]

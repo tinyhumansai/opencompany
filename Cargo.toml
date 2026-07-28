@@ -189,8 +189,8 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 # `webpki-roots` for the trusted root set, both already in the dependency graph
 # transitively via `lettre`'s rustls stack — declaring them directly here just
 # names the version this module actually calls.
-async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"], optional = true }
-mail-parser = { version = "0.9", optional = true }
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"], optional = true }
+mail-parser = { version = "0.11", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 webpki-roots = { version = "1", optional = true }
 

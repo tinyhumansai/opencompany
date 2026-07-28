@@ -23,10 +23,39 @@ impl std::fmt::Debug for ImapCredentials {
     }
 }
 
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let creds = ImapCredentials {
+            host: "imap.example.com".into(),
+            port: 993,
+            username: "acme@opencompany.work".into(),
+            password: "SUPER-SECRET-PW-123".into(),
+        };
+        let rendered = format!("{creds:?}");
+        assert!(
+            !rendered.contains("SUPER-SECRET-PW-123"),
+            "the password leaked into Debug: {rendered}"
+        );
+        assert!(rendered.contains("imap.example.com"));
+        assert!(rendered.contains("993"));
+        assert!(rendered.contains("acme@opencompany.work"));
+    }
+}
+
 #[cfg(feature = "imap")]
 use crate::error::OpenCompanyError;
 #[cfg(feature = "imap")]
-use crate::server::ops::mailer::{InboundEmail, MailReceiver};
+use crate::server::ops::mailer::{FetchedEmail, InboundEmail, MailReceiver};
+
+/// Upper bound on one IMAP round trip (connect through logout, or a
+/// mark-seen exchange). CodeRabbit: an unresponsive server must not hang the
+/// poller tick forever.
+#[cfg(feature = "imap")]
+const IMAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Parse one RFC822 message into an `InboundEmail` (plain-text body, v1).
 #[cfg(feature = "imap")]
@@ -75,6 +104,9 @@ pub(crate) fn parse_message(raw: &[u8]) -> InboundEmail {
 pub struct AsyncImapReceiver;
 
 #[cfg(feature = "imap")]
+type ImapSession = async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+#[cfg(feature = "imap")]
 impl AsyncImapReceiver {
     /// Builds a rustls TLS connector trusting the Mozilla root set.
     ///
@@ -93,17 +125,11 @@ impl AsyncImapReceiver {
             config,
         )))
     }
-}
 
-#[cfg(feature = "imap")]
-#[async_trait::async_trait]
-impl MailReceiver for AsyncImapReceiver {
-    async fn fetch_new(
-        &self,
-        creds: &ImapCredentials,
-    ) -> Result<Vec<InboundEmail>, OpenCompanyError> {
-        use futures::TryStreamExt;
-
+    /// Connects, logs in, and SELECTs INBOX. Shared by `fetch_new` and
+    /// `mark_seen` — each opens its own short-lived session (kept simple
+    /// rather than a pooled/reused connection across the two calls).
+    async fn connect(creds: &ImapCredentials) -> Result<ImapSession, OpenCompanyError> {
         let tcp = tokio::net::TcpStream::connect((creds.host.as_str(), creds.port))
             .await
             .map_err(|e| OpenCompanyError::Store(format!("imap connect: {e}")))?;
@@ -125,22 +151,38 @@ impl MailReceiver for AsyncImapReceiver {
             .await
             .map_err(|e| OpenCompanyError::Store(format!("imap select: {e}")))?;
 
+        Ok(session)
+    }
+
+    /// The actual fetch, unwrapped by [`Self::fetch_new`]'s timeout: `UID
+    /// SEARCH UNSEEN` (immune to sequence-number shift on expunge, unlike
+    /// plain `SEARCH`) then `UID FETCH ... BODY.PEEK[]`. `BODY.PEEK[]` is the
+    /// point — unlike `RFC822`/`BODY[]`, it does NOT set `\Seen`, so a message
+    /// that fails to file durably stays unseen and is retried on the next
+    /// tick instead of being silently dropped.
+    async fn fetch_new_inner(
+        creds: &ImapCredentials,
+    ) -> Result<Vec<FetchedEmail>, OpenCompanyError> {
+        use futures::TryStreamExt;
+
+        let mut session = Self::connect(creds).await?;
+
         let unseen = session
-            .search("UNSEEN")
+            .uid_search("UNSEEN")
             .await
             .map_err(|e| OpenCompanyError::Store(format!("imap search: {e}")))?;
 
         let mut out = Vec::new();
         if !unseen.is_empty() {
-            let set = unseen
+            let mut uids: Vec<u32> = unseen.into_iter().collect();
+            uids.sort_unstable();
+            let set = uids
                 .iter()
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            // RFC822 fetch marks `\Seen` server-side; that IS the intended
-            // dedup — do not add a NOOP/`BODY.PEEK` that would avoid it.
             let mut fetches = session
-                .fetch(&set, "RFC822")
+                .uid_fetch(&set, "UID BODY.PEEK[]")
                 .await
                 .map_err(|e| OpenCompanyError::Store(format!("imap fetch: {e}")))?;
             while let Some(f) = fetches
@@ -148,14 +190,79 @@ impl MailReceiver for AsyncImapReceiver {
                 .await
                 .map_err(|e| OpenCompanyError::Store(format!("imap fetch stream: {e}")))?
             {
-                if let Some(body) = f.body() {
-                    out.push(parse_message(body));
+                if let (Some(uid), Some(body)) = (f.uid, f.body()) {
+                    out.push(FetchedEmail {
+                        uid,
+                        email: parse_message(body),
+                    });
                 }
             }
         }
 
         let _ = session.logout().await;
         Ok(out)
+    }
+
+    /// The actual mark-seen exchange, unwrapped by [`Self::mark_seen`]'s
+    /// timeout: `UID STORE <uids> +FLAGS.SILENT (\Seen)`. Callers only pass
+    /// UIDs of messages already durably filed — see [`MailReceiver::mark_seen`].
+    async fn mark_seen_inner(
+        creds: &ImapCredentials,
+        uids: &[u32],
+    ) -> Result<(), OpenCompanyError> {
+        use futures::TryStreamExt;
+
+        let mut session = Self::connect(creds).await?;
+
+        let set = uids
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        {
+            let updates = session
+                .uid_store(&set, "+FLAGS.SILENT (\\Seen)")
+                .await
+                .map_err(|e| OpenCompanyError::Store(format!("imap store: {e}")))?;
+            // `.SILENT` normally means the server sends no untagged FETCH
+            // responses, but drain the stream to completion regardless so any
+            // that do arrive don't desync the next command on this session.
+            let _: Vec<_> = updates
+                .try_collect()
+                .await
+                .map_err(|e| OpenCompanyError::Store(format!("imap store stream: {e}")))?;
+        }
+
+        let _ = session.logout().await;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "imap")]
+#[async_trait::async_trait]
+impl MailReceiver for AsyncImapReceiver {
+    async fn fetch_new(
+        &self,
+        creds: &ImapCredentials,
+    ) -> Result<Vec<FetchedEmail>, OpenCompanyError> {
+        match tokio::time::timeout(IMAP_TIMEOUT, Self::fetch_new_inner(creds)).await {
+            Ok(result) => result,
+            Err(_) => Err(OpenCompanyError::Store("imap: timed out".into())),
+        }
+    }
+
+    async fn mark_seen(
+        &self,
+        creds: &ImapCredentials,
+        uids: &[u32],
+    ) -> Result<(), OpenCompanyError> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        match tokio::time::timeout(IMAP_TIMEOUT, Self::mark_seen_inner(creds, uids)).await {
+            Ok(result) => result,
+            Err(_) => Err(OpenCompanyError::Store("imap: timed out".into())),
+        }
     }
 }
 

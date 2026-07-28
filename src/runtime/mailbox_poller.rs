@@ -50,25 +50,49 @@ impl MailboxPoller {
     /// Fetches new mail and files each message. Returns the count filed. Skips
     /// (returning `Ok(0)`) when the company is not running — scale-to-zero
     /// leaves unseen mail parked in the mailbox until the next tick after wake.
+    ///
+    /// Messages are fetched without being marked `\Seen` (see
+    /// [`MailReceiver::fetch_new`]); only once a message is durably filed does
+    /// its UID get queued for [`MailReceiver::mark_seen`], and that ack is sent
+    /// after the whole batch has been attempted. A storage failure on one
+    /// message is logged and skipped rather than aborting the batch — both
+    /// choices mean one bad message can never mark itself (or any message
+    /// after it) seen without having been filed, so nothing is silently lost.
     pub async fn tick(&self) -> crate::Result<usize> {
         if self.runtime.ensure_running().await.is_err() {
             return Ok(0);
         }
         let messages = self.receiver.fetch_new(&self.creds).await?;
-        let filed = messages.len();
+        let mut filed_uids = Vec::with_capacity(messages.len());
         for m in messages {
             let record = EmailRecord {
                 id: generate_id(),
                 inbox: local_part(&self.address),
-                from_name: m.from_name,
-                from_email: m.from_email,
-                subject: m.subject,
-                body: m.body,
+                from_name: m.email.from_name,
+                from_email: m.email.from_email,
+                subject: m.email.subject,
+                body: m.email.body,
                 at_millis: now_millis(),
                 read: false,
                 outbound: false,
             };
-            file_and_notify(&self.runtime, &self.address, record).await?;
+            match file_and_notify(&self.runtime, &self.address, record).await {
+                Ok(()) => filed_uids.push(m.uid),
+                Err(err) => {
+                    tracing::warn!(
+                        company = %self.runtime.id(),
+                        uid = m.uid,
+                        %err,
+                        "failed to file inbound email; leaving unseen for retry"
+                    );
+                }
+            }
+        }
+        let filed = filed_uids.len();
+        if !filed_uids.is_empty()
+            && let Err(err) = self.receiver.mark_seen(&self.creds, &filed_uids).await
+        {
+            tracing::warn!(company = %self.runtime.id(), %err, "failed to mark filed emails seen");
         }
         Ok(filed)
     }
@@ -96,8 +120,11 @@ mod tests {
     use super::*;
 
     use crate::company::CompanyManifest;
+    use crate::ports::inbox::InboxMeta;
+    use crate::ports::types::CompanyId;
     use crate::runtime::RuntimeBuilder;
-    use crate::server::ops::mailer::{InboundEmail, RecordingMailReceiver};
+    use crate::server::ops::mailer::{FetchedEmail, InboundEmail, RecordingMailReceiver};
+    use crate::store::FsInboxStore;
 
     fn tmp_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("opencompany-mailpoll-{}", generate_id()))
@@ -129,17 +156,23 @@ mod tests {
 
         let rx = Arc::new(RecordingMailReceiver::new());
         rx.push_batch(vec![
-            InboundEmail {
-                from_name: "A".into(),
-                from_email: "a@x".into(),
-                subject: "s1".into(),
-                body: "b1".into(),
+            FetchedEmail {
+                uid: 10,
+                email: InboundEmail {
+                    from_name: "A".into(),
+                    from_email: "a@x".into(),
+                    subject: "s1".into(),
+                    body: "b1".into(),
+                },
             },
-            InboundEmail {
-                from_name: "B".into(),
-                from_email: "b@x".into(),
-                subject: "s2".into(),
-                body: "b2".into(),
+            FetchedEmail {
+                uid: 11,
+                email: InboundEmail {
+                    from_name: "B".into(),
+                    from_email: "b@x".into(),
+                    subject: "s2".into(),
+                    body: "b2".into(),
+                },
             },
         ]);
         let creds = ImapCredentials {
@@ -168,6 +201,138 @@ mod tests {
                 .len(),
             2
         );
+        // Both durably filed, so both UIDs — and only those UIDs — are acked.
+        assert_eq!(rx.marked(), vec![10, 11]);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// A wrapper [`InboxStore`] delegating to a real `FsInboxStore`, except
+    /// `append` fails on its Nth call (1-indexed) — simulates one message in a
+    /// batch failing to file durably without touching `file_and_notify` itself.
+    struct NthAppendFailsInbox {
+        inner: FsInboxStore,
+        fail_on_call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::inbox::InboxStore for NthAppendFailsInbox {
+        async fn inboxes(&self, company: &CompanyId) -> crate::Result<Vec<InboxMeta>> {
+            self.inner.inboxes(company).await
+        }
+        async fn set_enabled(
+            &self,
+            company: &CompanyId,
+            key: &str,
+            meta: &InboxMeta,
+        ) -> crate::Result<()> {
+            self.inner.set_enabled(company, key, meta).await
+        }
+        async fn messages(
+            &self,
+            company: &CompanyId,
+            key: &str,
+            limit: usize,
+            offset: usize,
+        ) -> crate::Result<Vec<EmailRecord>> {
+            self.inner.messages(company, key, limit, offset).await
+        }
+        async fn append(&self, company: &CompanyId, msg: &EmailRecord) -> crate::Result<()> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.fail_on_call {
+                return Err(crate::error::OpenCompanyError::Store(
+                    "simulated storage failure".into(),
+                ));
+            }
+            self.inner.append(company, msg).await
+        }
+        async fn mark_read(
+            &self,
+            company: &CompanyId,
+            key: &str,
+            ids: Option<&[String]>,
+        ) -> crate::Result<u64> {
+            self.inner.mark_read(company, key, ids).await
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_continues_past_one_filing_failure_and_only_marks_seen_the_filed_uid() {
+        let home = tmp_home();
+        let inbox = Arc::new(NthAppendFailsInbox {
+            inner: FsInboxStore::new(home.clone()),
+            fail_on_call: 2,
+            calls: Default::default(),
+        });
+        let runtime = Arc::new(
+            RuntimeBuilder::new(home.clone(), manifest())
+                .with_inbox(inbox)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let rx = Arc::new(RecordingMailReceiver::new());
+        rx.push_batch(vec![
+            FetchedEmail {
+                uid: 20,
+                email: InboundEmail {
+                    from_name: "A".into(),
+                    from_email: "a@x".into(),
+                    subject: "s1".into(),
+                    body: "b1".into(),
+                },
+            },
+            FetchedEmail {
+                uid: 21,
+                email: InboundEmail {
+                    from_name: "B".into(),
+                    from_email: "b@x".into(),
+                    subject: "s2".into(),
+                    body: "b2".into(),
+                },
+            },
+            FetchedEmail {
+                uid: 22,
+                email: InboundEmail {
+                    from_name: "C".into(),
+                    from_email: "c@x".into(),
+                    subject: "s3".into(),
+                    body: "b3".into(),
+                },
+            },
+        ]);
+        let creds = ImapCredentials {
+            host: "h".into(),
+            port: 993,
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let poller = MailboxPoller::new(
+            runtime.clone(),
+            rx.clone(),
+            creds,
+            "acme@opencompany.work".into(),
+            60,
+        );
+
+        // Message 2 (uid 21) fails to file; messages 1 and 3 must still both
+        // be attempted and filed — one bad message neither aborts the batch
+        // nor gets (nor blocks a later message from getting) marked seen.
+        let n = poller.tick().await.unwrap();
+        assert_eq!(n, 2, "messages 1 and 3 filed; message 2 did not");
+        assert_eq!(
+            runtime
+                .inbox()
+                .messages(runtime.id(), "acme", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // Only the successfully-filed UIDs are acked — 21 must never appear,
+        // or it would be lost forever (marked seen without ever being filed).
+        assert_eq!(rx.marked(), vec![20, 22]);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 
@@ -188,11 +353,14 @@ mod tests {
         runtime.store.save(&record).await.unwrap();
 
         let rx = Arc::new(RecordingMailReceiver::new());
-        rx.push_batch(vec![InboundEmail {
-            from_name: "A".into(),
-            from_email: "a@x".into(),
-            subject: "s1".into(),
-            body: "b1".into(),
+        rx.push_batch(vec![FetchedEmail {
+            uid: 1,
+            email: InboundEmail {
+                from_name: "A".into(),
+                from_email: "a@x".into(),
+                subject: "s1".into(),
+                body: "b1".into(),
+            },
         }]);
         let creds = ImapCredentials {
             host: "h".into(),
