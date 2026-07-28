@@ -325,6 +325,35 @@ async fn send_company_email(
     Ok(())
 }
 
+/// The company's own outbound-mail address, or empty when no mail is
+/// configured for this company.
+#[allow(dead_code)] // wired into the effect-gate cold-recipient check in a later task
+fn company_address(rt: &CompanyRuntime) -> String {
+    rt.mail()
+        .map(|mail| mail.smtp.from_email.clone())
+        .unwrap_or_default()
+}
+
+/// True iff the company's inbox already holds a prior **inbound** email from
+/// `to` — an established thread, so replying is auto-allowed instead of
+/// parking for approval. Fails closed (`false`) on a missing mail handle or a
+/// store error, which routes the caller to the cold-recipient park path.
+#[allow(dead_code)] // wired into the effect-gate cold-recipient check in a later task
+async fn recipient_is_established(rt: &CompanyRuntime, to: &str) -> bool {
+    let address = company_address(rt);
+    if address.is_empty() {
+        return false;
+    }
+    let key = crate::server::ops::smtp::local_part(&address);
+    let to = to.trim().to_ascii_lowercase();
+    match rt.inbox().messages(rt.id(), &key, 500, 0).await {
+        Ok(records) => records
+            .iter()
+            .any(|r| !r.outbound && r.from_email.trim().to_ascii_lowercase() == to),
+        Err(_) => false, // fail closed → parks for approval
+    }
+}
+
 /// The host the brain calls back into mid-cycle. Bridges tool, context, and
 /// effect callbacks to the runtime's ports and gates every effect.
 struct CycleHostImpl<'a> {
@@ -941,6 +970,42 @@ mod test {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("email is not configured"));
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn established_true_only_after_inbound_from_recipient() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_mail(CompanyMail {
+                sender: Arc::new(RecordingMailSender::new()),
+                smtp: test_smtp("ceo@acme.test"),
+            })
+            .build()
+            .await
+            .unwrap();
+
+        assert!(!recipient_is_established(&rt, "x@ext.com").await);
+
+        rt.inbox()
+            .append(
+                rt.id(),
+                &crate::ports::inbox::EmailRecord {
+                    id: "1".into(),
+                    inbox: "ceo".into(),
+                    from_name: "".into(),
+                    from_email: "x@ext.com".into(),
+                    subject: "hi".into(),
+                    body: "".into(),
+                    at_millis: 0,
+                    read: false,
+                    outbound: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(recipient_is_established(&rt, "X@EXT.COM").await);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }
