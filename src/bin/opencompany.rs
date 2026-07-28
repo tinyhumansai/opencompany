@@ -225,6 +225,55 @@ fn spawn_scheduler(
     }
 }
 
+/// Starts a company's IMAP mailbox poller as a background task, if the
+/// platform injected mailbox credentials for this tenant.
+///
+/// Mirrors [`spawn_scheduler`]: reads [`TenantMailboxConfig::from_env`]
+/// (`Ok(None)` means the manager did not wire mail for this tenant — a no-op,
+/// not an error; `Err` logs and skips rather than aborting boot). The actual
+/// IMAP transport only exists when the crate is built with the `imap`
+/// feature, so the poll itself is feature-gated; without the feature this
+/// still validates the env (surfacing config typos) but starts nothing.
+fn spawn_mailbox_poller(
+    state: &AppState,
+    id: &str,
+    shutdown: &Arc<Notify>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let cfg = match opencompany::server::ops::mailer::TenantMailboxConfig::from_env() {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("mailbox config error: {err}");
+            return;
+        }
+    };
+    #[cfg(feature = "imap")]
+    {
+        let Some(runtime) = state.registry().get(&CompanyId::new(id)) else {
+            return;
+        };
+        let receiver: Arc<dyn opencompany::server::ops::mailer::MailReceiver> =
+            Arc::new(opencompany::server::ops::imap::AsyncImapReceiver);
+        let interval = std::env::var("OPENCOMPANY_MAIL_POLL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let poller = opencompany::runtime::mailbox_poller::MailboxPoller::new(
+            runtime,
+            receiver,
+            cfg.imap.clone(),
+            cfg.address.clone(),
+            interval,
+        );
+        handles.push(poller.spawn(shutdown.clone()));
+    }
+    #[cfg(not(feature = "imap"))]
+    {
+        let _ = (state, id, shutdown, handles, cfg);
+    }
+}
+
 /// Attaches an OpenHuman JSON-RPC transport when the `openhuman-rpc` feature is
 /// enabled and `OPENCOMPANY_OPENHUMAN_URL` is set (the attach path).
 ///
@@ -571,6 +620,7 @@ async fn main() -> Result<()> {
                         dir.display()
                     );
                 }
+                spawn_mailbox_poller(&state, &id, &shutdown, &mut scheduler_handles);
             }
             if companies.is_empty() {
                 println!("serving with no companies; pass --company <dir> to load one");
