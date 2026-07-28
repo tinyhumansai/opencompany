@@ -250,7 +250,12 @@ pub(crate) async fn record_outbound(
 
 /// The local part of an address (`ceo@acme.test` → `ceo`), or the whole string
 /// when it carries no `@`.
-pub(crate) fn local_part(address: &str) -> String {
+///
+/// `pub` (not `pub(crate)`) so the `opencompany` binary target — a separate
+/// crate from this library — can reuse it to scope an injected mailbox to its
+/// owning company (see `spawn_mailbox_poller`/`register_company` in
+/// `src/bin/opencompany.rs`).
+pub fn local_part(address: &str) -> String {
     address
         .split_once('@')
         .map(|(local, _)| local.to_string())

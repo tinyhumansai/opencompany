@@ -197,7 +197,7 @@ async fn register_company(
     // in one logical database. A no-op when `tenant_namespace` is unset.
     let derived = opencompany::runtime::company_id_from_name(&name);
     let company_id = state.config().namespaced_company_id(derived);
-    builder = builder.with_id(company_id);
+    builder = builder.with_id(company_id.clone());
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
@@ -206,10 +206,17 @@ async fn register_company(
     }
     #[cfg(feature = "smtp")]
     if let Ok(Some(cfg)) = opencompany::server::ops::mailer::TenantMailboxConfig::from_env() {
-        builder = builder.with_mail(opencompany::company::runtime::CompanyMail {
-            sender: std::sync::Arc::new(opencompany::server::ops::smtp::LettreMailSender),
-            smtp: cfg.smtp.clone(),
-        });
+        // Same guard as `spawn_mailbox_poller`: the injected mailbox belongs to
+        // exactly one company (the one whose id matches its local-part). In a
+        // multi-company process, wiring it to every company would make every
+        // one of them send outbound mail from the same injected address.
+        let mailbox_slug = opencompany::server::ops::smtp::local_part(&cfg.address);
+        if company_id.as_ref() == mailbox_slug {
+            builder = builder.with_mail(opencompany::company::runtime::CompanyMail {
+                sender: std::sync::Arc::new(opencompany::server::ops::smtp::LettreMailSender),
+                smtp: cfg.smtp.clone(),
+            });
+        }
     }
     if discoverable {
         builder = builder.with_discoverable(true);
@@ -283,6 +290,15 @@ fn spawn_mailbox_poller(
             return;
         }
     };
+    // The injected mailbox belongs to exactly one company: the one whose id
+    // equals the mailbox address's local-part. In a multi-company process
+    // every OTHER registered company must skip this poller entirely, or
+    // inbound mail addressed to one company would be filed into another's
+    // inbox.
+    let mailbox_slug = opencompany::server::ops::smtp::local_part(&cfg.address);
+    if id != mailbox_slug {
+        return;
+    }
     #[cfg(feature = "imap")]
     {
         let Some(runtime) = state.registry().get(&CompanyId::new(id)) else {

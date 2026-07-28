@@ -60,10 +60,10 @@ A new builtin tool (mirroring `feedback`, `src/feedback/tool.rs`), registered in
 
 New `MailboxPoller` (new module, e.g. `src/runtime/mailbox_poller.rs`), one per running company that has IMAP config, structured like `CompanyScheduler`:
 
-- Holds an injectable `Clock` (test seam) and a `dyn MailReceiver` (§4.4).
-- **Per tick**: `MailReceiver::fetch_new()` → for each `InboundEmail`, build `EmailRecord { inbound, from_name, from_email, subject, body, … }` and call the shared **`file_and_notify(runtime, record)`** helper (§4.5).
+- Ticks on a fixed `tokio::time::sleep` interval (`OPENCOMPANY_MAIL_POLL_SECONDS`) and holds a `dyn MailReceiver` (§4.4) — no injectable `Clock` seam (unlike `CompanyScheduler`); tests drive it by calling `tick()` directly.
+- **Per tick**: first calls `ensure_running()`; if the company is asleep/paused this fails and the tick is skipped (no fetch, no error). Otherwise `MailReceiver::fetch_new()` → for each `InboundEmail`, build `EmailRecord { inbound, from_name, from_email, subject, body, … }` and call the shared **`file_and_notify(runtime, address, record)`** helper (§4.5).
 - The receiver marks fetched messages `\Seen` so the next tick skips them (Decision 5).
-- **Lifecycle**: started when the company starts running, stopped on sleep/suspend (mirrors scheduler lifecycle). Asleep ⇒ no poll ⇒ mail accumulates unseen in Stalwart ⇒ ingested on next wake.
+- **Lifecycle**: spawned once at boot and stays spawned for the process's lifetime, stopping only on the shared shutdown signal (Ctrl-C) — it is never stopped/restarted on sleep or wake. Instead, each tick's `ensure_running()` check simply skips the poll while the company is asleep/paused, so mail accumulates unseen in Stalwart until the company wakes and a later tick picks it up.
 
 ### 4.4 Transport — `MailReceiver` trait + deps
 
@@ -94,12 +94,12 @@ Both the existing `/inboxes/ingest` webhook route and the new poller call it, so
 In `src/bin/opencompany.rs` / `ConnectionsRuntime` (`:298-317`, where `LettreMailSender` + `MailConfig` are already injected):
 - Build `TenantMailboxConfig::from_env()`; if present, seed company SMTP creds and construct the `MailReceiver`.
 - Register the `send_email` builtin tool.
-- Start a `MailboxPoller` per running company with IMAP config; tie its lifecycle to company run/sleep.
+- Start a `MailboxPoller` per company with IMAP config at boot; it stays spawned for the process's lifetime and skips each tick's poll (via `ensure_running()`) while the company is asleep/paused, rather than being stopped and restarted on sleep/wake.
 
 ## 5. Test plan
 
 - **T1 send (gated):** agent calls `send_email`; with the default policy, an approval effect is raised and **no** mail is sent until approved; with an auto-approve policy, `MailSender::send` is called and an outbound `EmailRecord` is recorded. (Mock `MailSender`.)
-- **T2 receive:** `RecordingMailReceiver` returns 2 messages; one poller tick appends 2 inbound `EmailRecord`s and fires `run_cycle` with a `WebhookReceived{channel:"email"}` per message (injectable `Clock`).
+- **T2 receive:** `RecordingMailReceiver` returns 2 messages; one poller tick appends 2 inbound `EmailRecord`s and fires `run_cycle` with a `WebhookReceived{channel:"email"}` per message (calling `MailboxPoller::tick()` directly — no `Clock` seam).
 - **T3 config:** `TenantMailboxConfig::from_env` parses the 7 injected vars; a partial set (address without password) is a hard error; absent ⇒ `None` (feature off).
 - **T4 helper:** `file_and_notify` is exercised by both the webhook route and the poller (one code path).
 - **T5 round-trip (integration-style, mocks):** inbound message → cycle → agent `send_email` reply → recorded outbound.
@@ -113,4 +113,4 @@ Attachments, HTML bodies, threading/references, multiple mailboxes per company, 
 
 - **UID vs `\Seen` dedup:** v1 uses `\Seen`. If a human ever shares the mailbox, switch to tracking the last-seen IMAP UID persisted per company. Low-risk to change later (isolated to `AsyncImapReceiver`).
 - **IMAP crate choice:** `async-imap` is the default; confirm it builds cleanly against the existing tokio/rustls stack at implementation (fallback: `imap` sync in a blocking task).
-- **Poller ↔ scale-to-zero coordination:** the poller stops on sleep; confirm the manager's idle detection isn't kept awake by IMAP connections (poll should be a short-lived connection per tick, not a persistent IDLE).
+- **Poller ↔ scale-to-zero coordination:** the poller stays spawned and simply skips polling (via `ensure_running()`) while the company is asleep, rather than stopping; confirm the manager's idle detection isn't kept awake by IMAP connections (poll should be a short-lived connection per tick, not a persistent IDLE).

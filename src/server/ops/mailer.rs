@@ -458,6 +458,35 @@ mod test {
     /// run single-threaded: `cargo test mailer:: -- --test-threads=1`).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// RAII guard for env-mutating tests: captures the current value of each
+    /// `key` in `keys` at construction and restores it on drop (set back if it
+    /// was `Some`, removed if it was unset) — so running this suite in a shell
+    /// that already has `OPENCOMPANY_MAIL_*` set doesn't leave those values
+    /// clobbered for whatever runs next, and restoration still happens if the
+    /// test body panics.
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys.iter().map(|&k| (k, std::env::var(k).ok())).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
     fn smtp_creds() -> SmtpCredentials {
         SmtpCredentials {
             host: "smtp.example.com".into(),
@@ -585,6 +614,15 @@ mod test {
     fn tenant_mailbox_config_parses_injected_env() {
         // Serialize env access; set the 7 injected vars.
         let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarGuard::capture(&[
+            "OPENCOMPANY_MAIL_ADDRESS",
+            "OPENCOMPANY_MAIL_SMTP_HOST",
+            "OPENCOMPANY_MAIL_SMTP_PORT",
+            "OPENCOMPANY_MAIL_IMAP_HOST",
+            "OPENCOMPANY_MAIL_IMAP_PORT",
+            "OPENCOMPANY_MAIL_USER",
+            "OPENCOMPANY_MAIL_PASSWORD",
+        ]);
         for (k, v) in [
             ("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work"),
             ("OPENCOMPANY_MAIL_SMTP_HOST", "mail.opencompany.work"),
@@ -605,22 +643,14 @@ mod test {
         assert_eq!(cfg.imap.port, 993);
         assert_eq!(cfg.smtp.from_email, "acme@opencompany.work");
 
-        for k in [
-            "OPENCOMPANY_MAIL_ADDRESS",
-            "OPENCOMPANY_MAIL_SMTP_HOST",
-            "OPENCOMPANY_MAIL_SMTP_PORT",
-            "OPENCOMPANY_MAIL_IMAP_HOST",
-            "OPENCOMPANY_MAIL_IMAP_PORT",
-            "OPENCOMPANY_MAIL_USER",
-            "OPENCOMPANY_MAIL_PASSWORD",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
+        // `_restore` (dropped here) puts every touched var back to whatever it
+        // was before this test ran, rather than unconditionally removing it.
     }
 
     #[test]
     fn tenant_mailbox_config_absent_is_none() {
         let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarGuard::capture(&["OPENCOMPANY_MAIL_ADDRESS"]);
         unsafe { std::env::remove_var("OPENCOMPANY_MAIL_ADDRESS") };
         assert!(TenantMailboxConfig::from_env().unwrap().is_none());
     }
@@ -628,9 +658,10 @@ mod test {
     #[test]
     fn tenant_mailbox_config_partial_is_error() {
         let _g = ENV_LOCK.lock().unwrap();
+        let _restore =
+            EnvVarGuard::capture(&["OPENCOMPANY_MAIL_ADDRESS", "OPENCOMPANY_MAIL_PASSWORD"]);
         unsafe { std::env::set_var("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work") };
         unsafe { std::env::remove_var("OPENCOMPANY_MAIL_PASSWORD") };
         assert!(TenantMailboxConfig::from_env().is_err());
-        unsafe { std::env::remove_var("OPENCOMPANY_MAIL_ADDRESS") };
     }
 }
