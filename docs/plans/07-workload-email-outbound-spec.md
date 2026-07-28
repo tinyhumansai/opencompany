@@ -21,7 +21,7 @@ The live brain is a hosted, closed service we can't modify, and **tools execute 
 |---|---|---|
 | 1 | Trigger | A `send_email` **tool** the agent calls (advertised in the builtin catalog). |
 | 2 | Gating | Intercept at `CycleHostImpl::call_tool` → build an `Effect{kind:"email.send", group:Send}` → run the **same** gate as `emit_effect` (evaluate → execute / park / deny). |
-| 3 | Approval rule | **Established = prior correspondence.** Look up the recipient in the company's `InboxStore`; if we've emailed/received from that address before → `established_thread=true` (policy auto-allows); else `first_time_counterparty=true` (parks). |
+| 3 | Approval rule | **Established = the recipient has emailed us before** (a prior *inbound* `EmailRecord` with `from_email == to`). Then `established_thread=true` + `first_time_counterparty=false` → policy **auto-allows** (reply freely). Otherwise (cold recipient) → `first_time_counterparty=true` → **parks** for approval. *Refinement from the original "we've emailed them" wording:* outbound records don't store the recipient today, so "we emailed them" isn't detectable without a schema change; "they emailed us" is, and it's the reputation-safe direction. Extending to outbound-recipient detection = a documented follow-up (add a `to` field to outbound `EmailRecord`s). The gate `Allow`s **only** when `established_thread && !first_time_counterparty` (`policy/gate.rs:179-186`), so both flags must be set accordingly. |
 | 4 | Executor | New `email.send` branch in `perform_effect` → `MailSender::send` with the tenant's SMTP creds → `record_outbound`. |
 | 5 | Sender wiring | Inject an optional `mail` handle into `CompanyRuntime` via `RuntimeBuilder` (mirroring `inbox`/`secrets`), seeded from `TenantMailboxConfig.smtp`. When absent, `send_email` returns a clear "email not configured" `ToolResult`. |
 | 6 | From identity | Always the company's own `OPENCOMPANY_MAIL_ADDRESS`; the agent cannot spoof another sender. Plain-text body (v1). |
@@ -42,14 +42,15 @@ In `CycleHostImpl::call_tool` (`src/runtime/cycle.rs`), before delegating to `se
 Factor the shared gate logic so `call_tool`'s email path and `emit_effect` don't duplicate the evaluate/park/execute sequence.
 
 ### 4.3 Established-thread lookup
-`established(to)` = `InboxStore::messages(company, inbox_key, ...)` scanning for any record whose counterparty address equals `to` (either a prior outbound `to` or a prior inbound `from`). Reuse the company's own local-part as the inbox key. Keep it bounded (recent N) for cost.
+`established(to)` = scan `InboxStore::messages(company, inbox_key, limit, 0)` for any **inbound** record (`!outbound`) whose `from_email` equals `to` (case-insensitive). `inbox_key` = the company's own local-part (`local_part(address)`). Bound the scan (recent N, e.g. 500) for cost. Outbound records can't contribute today (no recipient stored) — see Decision 3.
 
 ### 4.4 Execute
 Add to `perform_effect` (`src/runtime/cycle.rs`): when `effect.kind == "email.send"`, read `to/subject/body` from `payload`, and if `rt.mail` is present, `mail.sender.send(&mail.creds_as_MailCredentials, &OutboundEmail{to,subject,body})` then `record_outbound(rt, &smtp_creds, &email)`. A missing `rt.mail` at execute time → `OpenCompanyError::InvalidRequest("email not configured")` (parked effects executed after approval hit the same check).
 
 ### 4.5 Sender wiring
-- New `CompanyRuntime` field `mail: Option<Arc<CompanyMail>>` where `CompanyMail { sender: Arc<dyn MailSender>, smtp: SmtpCredentials }`.
-- `RuntimeBuilder::with_mail(...)`; in `src/bin/opencompany.rs`, when `TenantMailboxConfig::from_env()` is `Some` and (under `#[cfg(feature="smtp")]`) a `LettreMailSender` is available, seed it.
+- New `CompanyRuntime` field `mail: Option<CompanyMail>` where `CompanyMail { sender: Arc<dyn MailSender>, smtp: SmtpCredentials }` (both the sender **and** the tenant's creds live here — the injected `OPENCOMPANY_MAIL_*` creds are NOT in `SecretStore["__smtp"]`, so `perform_effect` reads them from `rt.mail`, not `load_credentials`).
+- `RuntimeBuilder`: `mail: Option<CompanyMail>` field + `with_mail(...)` setter + `unwrap`-to-`None` default at `build()` (mirror the `economy: Option<...>` optional pattern, not the always-defaulted `inbox`). Thread it into `CompanyRuntime::new(...)`.
+- In `src/bin/opencompany.rs`: when `TenantMailboxConfig::from_env()` is `Some` and (under `#[cfg(feature="smtp")]`) a `LettreMailSender` is available, `builder = builder.with_mail(CompanyMail{ sender: Arc::new(LettreMailSender), smtp: cfg.smtp.clone() })` at company registration (same spot the poller is wired).
 
 ## 5. Test plan
 
