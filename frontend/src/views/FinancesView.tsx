@@ -1,7 +1,9 @@
-import { useMemo } from "react";
+import { useEffect, useState } from "react";
 import { Bar, BarChart, LabelList, XAxis, YAxis } from "recharts";
 import { ArrowDownLeft, ArrowUpRight, Coins, PiggyBank, TrendingUp, Wallet } from "lucide-react";
 
+import type { OpenCompanyClient } from "@/api/client";
+import type { FinancesDto } from "@/api/types";
 import {
   Card,
   CardContent,
@@ -15,19 +17,52 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
-import { buildFinance, usd } from "@/lib/finance-sample";
+import { usd } from "@/lib/finance-sample";
 import { cn } from "@/lib/utils";
 
 const chartConfig = {
   amount: { label: "Spend", theme: { light: "#2a78d6", dark: "#3987e5" } },
 } satisfies ChartConfig;
 
-const TODAY_MS = Date.now();
+interface Props {
+  client: OpenCompanyClient;
+  company: string | null;
+}
+
+// The empty finances read — shown before the first fetch resolves and as the
+// fallback when a host doesn't expose the surface yet (404). Real-or-zero: no
+// fabricated balance, budget, or transactions.
+const EMPTY_FINANCE: FinancesDto = {
+  balanceUsd: 0,
+  budgetUsd: 0,
+  spentUsd: 0,
+  revenueUsd: 0,
+  netUsd: 0,
+  byCategory: [],
+  transactions: [],
+};
 
 /** Company finances: balance, budget, revenue, spend by category, transactions. */
-export function FinancesView() {
-  const data = useMemo(() => buildFinance(TODAY_MS), []);
-  const budgetPct = Math.min(100, Math.round((data.spentUsd / data.budgetUsd) * 100));
+export function FinancesView({ client, company }: Props) {
+  const [data, setData] = useState<FinancesDto>(EMPTY_FINANCE);
+  useEffect(() => {
+    let alive = true;
+    client
+      .finances(company)
+      .then((finances) => {
+        if (alive) setData(finances);
+      })
+      // Hosts without the surface (older builds) 404 — show the empty state.
+      .catch(() => {
+        if (alive) setData(EMPTY_FINANCE);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [client, company]);
+  // Guard against an uncapped budget (0) so the bar reads 0%, not NaN.
+  const budgetPct =
+    data.budgetUsd > 0 ? Math.min(100, Math.round((data.spentUsd / data.budgetUsd) * 100)) : 0;
 
   return (
     <div className="flex-1 overflow-y-auto">

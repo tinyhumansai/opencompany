@@ -71,6 +71,10 @@ type Chat {
 	The desk's message history, most-recent last. `before` is an opaque
 	EventLog cursor (a stringified sequence position); only messages before
 	it are returned.
+	
+	Filtering + projection is shared with the REST `GET .../chat/history`
+	route via [`chat_history::history_for_desk`] (issue #65) so the two
+	surfaces can never disagree about a desk's transcript.
 	"""
 	history(first: Int! = 50, before: String): MessagePage!
 }
@@ -358,6 +362,11 @@ type Inbox {
 }
 
 """
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+"""
 One remembered fact. Mirrors [`FactRecord`].
 """
 type MemoryFact {
@@ -455,6 +464,12 @@ type Message {
 	Whether it is the operator's own message.
 	"""
 	mine: Boolean!
+	"""
+	The scrubbed processing steps behind a company reply, so a rehydrated
+	transcript renders the same timeline the REST route returns (issue #65
+	parity). Empty for operator messages and tool-less replies.
+	"""
+	steps: [MessageStep!]!
 }
 
 """
@@ -469,6 +484,34 @@ type MessagePage {
 	The total number of items across all pages (before offset/limit).
 	"""
 	total: Int!
+}
+
+"""
+One scrubbed step in a reply's processing timeline. GraphQL mirror of the
+wire [`TurnStep`] (`kind`/`status` are its snake_case string forms), so the
+GraphQL `Message` type carries the same timeline as the REST projection.
+"""
+type MessageStep {
+	"""
+	The step kind (`tool_call` / `thinking` / `note`).
+	"""
+	kind: String!
+	"""
+	How the step ended (`ok` / `error` / `running`).
+	"""
+	status: String!
+	"""
+	A short, human label (never tool arguments or output).
+	"""
+	label: String!
+	"""
+	An optional scrubbed detail (e.g. `server · tool`, a failure cause).
+	"""
+	detail: String
+	"""
+	How long the step took in milliseconds, when known.
+	"""
+	elapsedMs: Float
 }
 
 """
@@ -830,6 +873,25 @@ type WorkflowNode {
 	An optional one-line summary.
 	"""
 	summary: String
+	"""
+	Free-form, kind-specific node config (P1), exposed as a JSON scalar so
+	`Company.workflow(id)` does not drop model data.
+	"""
+	config: JSON
+	"""
+	Per-node error policy: `stop` / `continue` / `route`.
+	"""
+	onError: String
+	"""
+	Per-node retry policy (attempts + backoff), as a JSON scalar. Keys are
+	camelCase (`maxAttempts` / `backoffMs`) to match the REST read shape;
+	see [`RetryGql`].
+	"""
+	retry: JSON
+	"""
+	Whether the node pauses awaiting operator approval before it runs.
+	"""
+	requiresApproval: Boolean
 }
 
 """

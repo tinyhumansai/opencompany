@@ -30,6 +30,11 @@ jobs:
           git -C vendor/openhuman submodule update --init --depth 1 \
             vendor/tinyflows vendor/tinycortex vendor/tinyjuice \
             vendor/tinychannels vendor/tinyplace
+          # tinycortex declares its own `tinyagents` path dependency, so its
+          # manifest must resolve too. Harmless for the default build; required
+          # for any `--features openhuman` build.
+          git -C vendor/openhuman/vendor/tinycortex submodule update --init --depth 1 \
+            vendor/tinyagents
 
       - uses: dtolnay/rust-toolchain@stable
         with:

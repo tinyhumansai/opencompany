@@ -59,6 +59,7 @@ fn record(id: &CompanyId) -> CompanyRecord {
         ledger: Vec::new(),
         lifecycle: "running".to_string(),
         overlay_agents: Vec::new(),
+        overlay_desk_members: Vec::new(),
     }
 }
 
@@ -92,6 +93,7 @@ pub async fn assert_isolation_by_company(
             CompanyEvent::OperatorMessage {
                 text: "a".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -185,6 +187,7 @@ pub async fn assert_append_only_event_and_ledger(
             CompanyEvent::OperatorMessage {
                 text: "e0".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -195,6 +198,7 @@ pub async fn assert_append_only_event_and_ledger(
             CompanyEvent::OperatorMessage {
                 text: "e1".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -211,6 +215,7 @@ pub async fn assert_append_only_event_and_ledger(
             CompanyEvent::OperatorMessage {
                 text: "e2".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -243,6 +248,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
                 CompanyEvent::OperatorMessage {
                     text: format!("a{expected}"),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -257,6 +263,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
             CompanyEvent::OperatorMessage {
                 text: "b0".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -308,6 +315,7 @@ pub async fn assert_export_totality(
         let ev = CompanyEvent::OperatorMessage {
             text: format!("event {i}"),
             by: None,
+            chat: None,
         };
         events.append(&id, ev.clone()).await.unwrap();
         appended.push(ev);

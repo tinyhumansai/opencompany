@@ -36,6 +36,77 @@ MongoDB settings:
 
 - `OPENCOMPANY_MONGODB_URI` — connection string (required for `mongodb`).
 - `OPENCOMPANY_MONGODB_DB` — database name (default `opencompany`).
+- `OPENCOMPANY_TENANT_ID` — tenant identity for **shared-single-DB** mode
+  (default unset). See [Shared single database](#shared-single-database-mode).
+
+## Workspace layout (`src/store/layout.rs`)
+
+`OPENCOMPANY_DATA_DIR` (default `$HOME/.opencompany`; `/data` in a hosted tenant
+container) is the per-instance **workspace root** — everything one running
+instance owns. [`DataLayout`](../../../src/store/layout.rs) names the canonical
+subdirectories under it so stores, agents, and tools resolve well-known
+locations instead of ad-hoc paths:
+
+```text
+<OPENCOMPANY_DATA_DIR>/
+  companies/   ← per-company bundles (companies/<slug>/, owned by the fs store)
+  memory/      ← instance-shared memory artifacts
+  store/       ← instance-shared durable-store artifacts
+  files/       ← instance-shared files (exports, attachments)
+  logs/        ← instance logs
+  tmp/         ← ephemeral scratch, cleared on startup by default
+```
+
+Per-company state (each bundle's own `memory/`/`context/`) lives under
+`companies/<slug>/`; the top-level `memory/`/`store/`/`files/` are the shared,
+instance-level locations. `serve` calls `DataLayout::ensure` at boot: it creates
+the shared subdirectories and — unless `[workspace].clear_tmp_on_startup` is
+`false` — empties `tmp/` so no stale scratch survives a restart. Because the hosting model runs **one container per tenant** with its
+own `OPENCOMPANY_DATA_DIR`, this root *is* the per-tenant workspace — no separate
+per-tenant path prefix is needed.
+
+The `[workspace]` section of `config.toml` (in the data dir) tunes the lifecycle:
+
+```toml
+[workspace]
+clear_tmp_on_startup = true   # default; set false to preserve tmp/ across restarts
+storage_quota_gb = 5          # soft whole-workspace quota; omit or <= 0 = unlimited
+tmp_quota_gb = 1              # soft tmp/ quota; omit or <= 0 = unlimited
+```
+
+**Quotas are soft/advisory in the binary.** At boot `serve` measures the
+workspace (and `tmp/`) and emits an operator-visible `tracing::warn` when either
+exceeds its configured quota. **Hard enforcement** — blocking writes at the
+limit — is the container/StorageClass layer's job (an EFS access point cap or a
+k8s `ResourceQuota`), which is where the deploy manifests wire it; the binary
+surfaces the condition rather than intercepting every write.
+
+Large-file S3 offload remains a follow-up (needs an S3 client + credentials).
+
+## Memory engine overlay (`OPENCOMPANY_MEMORY`)
+
+Memory is a separable concern. `OPENCOMPANY_STORAGE` picks the durable base for
+all fourteen ports; `OPENCOMPANY_MEMORY` optionally swaps **just** the two
+knowledge ports — `MemoryStore` + `ContextStore` — onto a dedicated memory
+engine layered on top of that base. The base still owns every other port
+(companies, events, secrets, tasks, …).
+
+| Value | Engine | Feature flag | Notes |
+|---|---|---|---|
+| `store` (default) | The base backend's own memory | — | fs substring recall, or sqlite/mongodb |
+| `tinycortex` | TinyCortex chunk store | `tinycortex` | Ranked token-overlap recall over a compounding store |
+
+This is why TinyCortex is not a `StorageKind`: it implements only memory +
+context, so it cannot be a full backend — it overlays. `serve` and platform
+provisioning build the overlay once (`open_memory_overlay`,
+`src/store/select.rs`) and apply it to each company's `RuntimeBuilder` via
+`with_memory_overlay`, **after** `with_stores`, so the engine's ports win while
+the base keeps the rest. A selected-but-unavailable engine (feature disabled)
+aborts boot, same as the storage backend.
+
+The compiled TinyCortex backend is the offline in-memory client
+(`src/store/tinycortex.rs`); a networked client for true semantic recall is an
+inert seam until the service is reachable through the OpenHuman integration.
 
 ## MongoDB backend (`src/store/mongodb.rs`)
 
@@ -68,6 +139,51 @@ on each `record` (see [ports.md](ports.md), `UsageMeter`).
    collection makes the company → tenant map durable: `serve` hydrates the
    in-memory `AppState` ownership map from it at boot, and provisioning
    updates it — closing the previous restart-loses-ownership stub.
+
+### Shared single database (`OPENCOMPANY_TENANT_ID`) mode
+
+An operator may run every tenant workload against **one** logical MongoDB
+database instead of one database per tenant (e.g. to stay under a managed
+cluster's database/namespace limits). In this mode the manager injects
+`OPENCOMPANY_TENANT_ID=<tenant-slug>` (alongside `OPENCOMPANY_MONGODB_DB`
+pointing all tenants at the shared database name) so the workload can keep its
+records apart:
+
+- **Id namespacing.** Company ids are prefixed with `<tenant>--` before they
+  reach the store (`AppConfig::namespaced_company_id`). Both the boot path and
+  the API provisioning path prefix with the workload's own
+  `OPENCOMPANY_TENANT_ID` — config, not the request's acting tenant, is
+  authoritative for this workload's data scope. So even a full-platform token
+  provisioning on behalf of another tenant yields a workload-local id rather
+  than one prefixed with a foreign tenant. This keeps the same boot template
+  (`OPENCOMPANY_COMPANY=agentic_software_company` for every tenant) from
+  colliding on the `companies` collection's unique `company_id` index. The
+  prefix is idempotent — an already-prefixed id passes through unchanged.
+- **Ownership.** A provisioned or boot company's `company_id -> tenant_id`
+  mapping is written to the `owners` collection (best-effort) with the
+  workload's own `OPENCOMPANY_TENANT_ID`, so a shared-DB manager can enumerate
+  and purge a tenant's companies later. Recording the same value the id is
+  namespaced with is what lets owners hydration reload it: hydration at boot
+  filters to rows whose `tenant_id` equals this workload's
+  `OPENCOMPANY_TENANT_ID`, so the in-memory ownership map never carries other
+  tenants' companies and no API-provisioned company is orphaned across a
+  restart.
+
+Everything is backwards compatible: with `OPENCOMPANY_TENANT_ID` unset, id
+derivation, ownership recording, and owners hydration behave exactly as before
+(the db-per-tenant and single-tenant paths are unchanged).
+
+#### Isolation tradeoff — read this before enabling shared-single-DB mode
+
+In shared-single-DB mode all tenant workloads hold credentials to the **same**
+logical database. Isolation is **application-layer only** — the `<tenant>--`
+id namespace, the `company_id` filter on every query, and the registry serving
+only locally-loaded companies. A compromised or malicious tenant container that
+reaches the database directly can read and write **every** tenant's documents;
+nothing at the MongoDB auth layer stops it. Database-per-tenant (layer 1 below)
+remains the security-recommended mode and stays the manager default; enable
+shared-single-DB mode only where the operational constraint outweighs this
+weaker isolation.
 
 ### Adding another backend (e.g. DynamoDB)
 

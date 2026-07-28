@@ -47,6 +47,13 @@ pub struct AppConfig {
     pub max_companies_per_tenant: Option<usize>,
     /// Outbound webhook delivery configuration. `None` disables webhooks.
     pub webhook: Option<WebhookConfig>,
+    /// Tenant namespace for shared-single-DB deployments
+    /// (`OPENCOMPANY_TENANT_ID`). When set, provisioned/booted company ids are
+    /// prefixed with `<tenant>--` via [`Self::namespaced_company_id`] so many
+    /// tenants sharing one logical database never collide on the `companies`
+    /// unique index. `None` (the default) is a no-op: db-per-tenant and
+    /// single-tenant deployments are unaffected.
+    pub tenant_namespace: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -63,14 +70,61 @@ impl Default for AppConfig {
             max_companies: None,
             max_companies_per_tenant: None,
             webhook: None,
+            tenant_namespace: None,
         }
     }
+}
+
+/// Prefixes `id` with `<tenant>--` for shared-single-DB namespacing.
+///
+/// Idempotent: an id already carrying the `<tenant>--` prefix is returned
+/// unchanged, so applying it more than once — or to an id read back from a
+/// shared DB — never double-prefixes. Both the boot path and API provisioning
+/// use the workload's own [`AppConfig::tenant_namespace`], so ids stay
+/// workload-local regardless of which tenant a provisioning request acts for.
+pub fn namespace_company_id(tenant: &str, id: CompanyId) -> CompanyId {
+    let prefix = format!("{tenant}--");
+    if id.as_ref().starts_with(&prefix) {
+        id
+    } else {
+        CompanyId::new(format!("{prefix}{}", id.as_ref()))
+    }
+}
+
+/// The canonical form of a tenant identifier for ownership: the bare slug, with
+/// any leading `tenant:` prefix stripped.
+///
+/// The two representations of the *same* tenant must compare equal. A verified
+/// token's [`PlatformClaims::tenant`](crate::server::platform_auth::PlatformClaims)
+/// carries the platform-issued `tenant:acme` form, while the workload's injected
+/// `OPENCOMPANY_TENANT_ID` (and thus [`AppConfig::tenant_namespace`], the id
+/// prefix, and shared-DB `owners` rows) is the bare slug `acme`. Recording
+/// ownership under one form and authorizing against the other would lock a
+/// tenant out of its own companies. Every site that stores, counts, hydrates, or
+/// compares an owning tenant funnels through this one helper so `acme` and
+/// `tenant:acme` are one identity end-to-end.
+pub fn canonical_tenant(tenant: &str) -> &str {
+    tenant.strip_prefix("tenant:").unwrap_or(tenant)
 }
 
 impl AppConfig {
     /// True when hosted cognition can run: hosted mode plus a credential.
     pub fn cycles_available(&self) -> bool {
         self.brain_mode == BrainMode::Hosted && self.tinyhumans_credential.is_some()
+    }
+
+    /// Namespaces a company id for shared-single-DB mode.
+    ///
+    /// Returns `<tenant>--<id>` when [`Self::tenant_namespace`] is set and `id`
+    /// is not already prefixed; returns `id` unchanged when the namespace is
+    /// unset (the no-op that keeps db-per-tenant deployments identical).
+    /// Idempotent: an already-prefixed id passes through untouched, so applying
+    /// it twice — or to an id read back from a shared DB — never double-prefixes.
+    pub fn namespaced_company_id(&self, id: CompanyId) -> CompanyId {
+        match &self.tenant_namespace {
+            Some(tenant) => namespace_company_id(tenant, id),
+            None => id,
+        }
     }
 
     /// The host base URL to embed in published Agent Card endpoints: the
@@ -142,6 +196,7 @@ impl std::fmt::Debug for AppConfig {
             .field("max_companies", &self.max_companies)
             .field("max_companies_per_tenant", &self.max_companies_per_tenant)
             .field("webhook", &self.webhook)
+            .field("tenant_namespace", &self.tenant_namespace)
             .finish()
     }
 }
@@ -164,6 +219,11 @@ pub struct AppState {
     /// selected (`OPENCOMPANY_STORAGE`). Provisioning injects these into each
     /// new company's builder; `None` means fs defaults.
     stores: Option<crate::store::StorageHandles>,
+    /// The memory engine overlay selected by `OPENCOMPANY_MEMORY`, when it is
+    /// not the base store's own memory. Provisioning and boot apply it after
+    /// `stores` so a dedicated engine (TinyCortex) backs recall on top of any
+    /// base backend. `None` means the base backend's memory is used unchanged.
+    memory_overlay: Option<crate::store::MemoryOverlay>,
     /// The repo-level shared skill library directory (`skills/`), set on the
     /// serve path. `None` in platform-provisioned mode (no repo checkout), where
     /// the `skillRegistry` query degrades to empty.
@@ -185,6 +245,21 @@ pub struct AppState {
     /// request. Gated behind `tinyplace` so the default build links no crypto.
     #[cfg(feature = "tinyplace")]
     nonce: std::sync::Arc<crate::economy::NonceCache>,
+    /// In-flight console MCP OAuth flows, keyed by the opaque `state` the browser
+    /// round-trips (issue #90). The `/mcp/servers/{name}/oauth/start` route parks
+    /// a [`PendingOAuth`](crate::company::mcp_oauth::PendingOAuth) here; the
+    /// unauthenticated `/oauth/mcp/callback` route takes it back out by `state`.
+    /// Gated behind `mcp` so the default build links none of the OAuth path.
+    /// Each entry carries the [`Instant`](std::time::Instant) it was parked so
+    /// abandoned flows (closed tab, double-click, pre-callback error) can be
+    /// swept — they hold a `client_secret` + `code_verifier` that must not live
+    /// in memory forever.
+    #[cfg(feature = "mcp")]
+    oauth_pending: Arc<
+        std::sync::Mutex<
+            HashMap<String, (std::time::Instant, crate::company::mcp_oauth::PendingOAuth)>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for AppState {
@@ -208,6 +283,7 @@ impl AppState {
             home: std::path::PathBuf::from("."),
             ownership: Arc::new(RwLock::new(HashMap::new())),
             stores: None,
+            memory_overlay: None,
             skills_root: None,
             skill_registry: Arc::new(OnceLock::new()),
             schema: crate::server::graphql::build_schema(),
@@ -215,6 +291,8 @@ impl AppState {
             cors: crate::server::cors::CorsConfig::default(),
             #[cfg(feature = "tinyplace")]
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
+            #[cfg(feature = "mcp")]
+            oauth_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -246,6 +324,17 @@ impl AppState {
     /// The opened storage backend's handles, if a non-fs backend is selected.
     pub fn stores(&self) -> Option<&crate::store::StorageHandles> {
         self.stores.as_ref()
+    }
+
+    /// Installs the memory engine overlay selected by `OPENCOMPANY_MEMORY`.
+    pub fn with_memory_overlay(mut self, overlay: crate::store::MemoryOverlay) -> Self {
+        self.memory_overlay = Some(overlay);
+        self
+    }
+
+    /// The memory engine overlay, if one is selected (`OPENCOMPANY_MEMORY`).
+    pub fn memory_overlay(&self) -> Option<&crate::store::MemoryOverlay> {
+        self.memory_overlay.as_ref()
     }
 
     /// The repo-level shared skill registry, loaded from `dir` and cached.
@@ -318,11 +407,16 @@ impl AppState {
     }
 
     /// Records that `tenant` owns `id`.
+    ///
+    /// The tenant is stored in [`canonical_tenant`] form so the map always keys
+    /// ownership by the bare slug, whatever representation the caller passes
+    /// (a token's `tenant:acme` claim or the workload's bare `acme` namespace).
     pub fn set_owner(&self, id: CompanyId, tenant: impl Into<String>) {
+        let tenant = canonical_tenant(&tenant.into()).to_string();
         self.ownership
             .write()
             .expect("ownership poisoned")
-            .insert(id, tenant.into());
+            .insert(id, tenant);
     }
 
     /// Forgets the ownership record for `id` (used by archive).
@@ -334,7 +428,12 @@ impl AppState {
     }
 
     /// The number of companies owned by `tenant`.
+    ///
+    /// Both the stored owners and the query are compared in [`canonical_tenant`]
+    /// form, so a `tenant:acme` claim and a bare `acme` namespace count the same
+    /// tenant's companies.
     pub fn tenant_company_count(&self, tenant: &str) -> usize {
+        let tenant = canonical_tenant(tenant);
         self.ownership
             .read()
             .expect("ownership poisoned")
@@ -372,6 +471,55 @@ impl AppState {
     #[cfg(feature = "tinyplace")]
     pub fn nonce(&self) -> &std::sync::Arc<crate::economy::NonceCache> {
         &self.nonce
+    }
+
+    /// How long a parked OAuth flow stays reclaimable before it's swept. Longer
+    /// than any realistic operator round-trip through the authorization server,
+    /// short enough that an abandoned flow's secrets don't linger.
+    #[cfg(feature = "mcp")]
+    const OAUTH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Parks an in-flight console MCP OAuth flow keyed by its opaque `state`, to
+    /// be reclaimed by the callback route. See issue #90. Sweeps flows older than
+    /// [`OAUTH_PENDING_TTL`](Self::OAUTH_PENDING_TTL) on every park so an
+    /// abandoned sign-in (closed tab, double-click, pre-callback error) can't
+    /// retain its `client_secret`/`code_verifier` for the life of the process.
+    #[cfg(feature = "mcp")]
+    pub fn park_oauth(&self, state: String, pending: crate::company::mcp_oauth::PendingOAuth) {
+        let mut guard = self.oauth_pending.lock().expect("oauth pending poisoned");
+        guard.retain(|_, (parked_at, _)| parked_at.elapsed() < Self::OAUTH_PENDING_TTL);
+        guard.insert(state, (std::time::Instant::now(), pending));
+    }
+
+    /// Takes (removes) a parked console MCP OAuth flow by its `state`. `None` when
+    /// the state is unknown, already consumed (single-use, so a replayed
+    /// callback can't re-exchange), or swept as stale past
+    /// [`OAUTH_PENDING_TTL`](Self::OAUTH_PENDING_TTL).
+    #[cfg(feature = "mcp")]
+    pub fn take_oauth(&self, state: &str) -> Option<crate::company::mcp_oauth::PendingOAuth> {
+        let mut guard = self.oauth_pending.lock().expect("oauth pending poisoned");
+        let entry = guard.remove(state)?;
+        let (parked_at, pending) = entry;
+        // A flow that outlived its TTL is treated as expired, not reclaimable.
+        if parked_at.elapsed() >= Self::OAUTH_PENDING_TTL {
+            return None;
+        }
+        Some(pending)
+    }
+
+    /// Test-only: park a flow with an explicit parked-at instant so the TTL
+    /// expiry + sweep paths can be exercised without waiting real time.
+    #[cfg(all(test, feature = "mcp"))]
+    fn park_oauth_at(
+        &self,
+        state: String,
+        pending: crate::company::mcp_oauth::PendingOAuth,
+        parked_at: std::time::Instant,
+    ) {
+        self.oauth_pending
+            .lock()
+            .expect("oauth pending poisoned")
+            .insert(state, (parked_at, pending));
     }
 
     /// Returns a serializable system specification snapshot.
@@ -493,6 +641,62 @@ mod tests {
         assert!(spec.modules.contains(&"server"));
     }
 
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn parked_oauth_flow_is_single_use() {
+        use crate::company::mcp_oauth::PendingOAuth;
+        use crate::ports::types::CompanyId;
+
+        let state = AppState::new(AppConfig::default());
+        let pending = PendingOAuth {
+            company_id: CompanyId::new("acme"),
+            server_name: "notion".into(),
+            code_verifier: "verifier".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            token_endpoint: "https://as.example/token".into(),
+            redirect_uri: "https://acme.example/oauth/mcp/callback".into(),
+        };
+
+        state.park_oauth("state-1".into(), pending.clone());
+        // First take reclaims it; a replayed callback finds nothing (single-use).
+        assert!(state.take_oauth("state-1").is_some());
+        assert!(state.take_oauth("state-1").is_none());
+        // An unknown state is always None.
+        assert!(state.take_oauth("never-parked").is_none());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn parked_oauth_flow_expires_and_is_swept() {
+        use crate::company::mcp_oauth::PendingOAuth;
+        use crate::ports::types::CompanyId;
+        use std::time::{Duration, Instant};
+
+        let state = AppState::new(AppConfig::default());
+        let pending = |server: &str| PendingOAuth {
+            company_id: CompanyId::new("acme"),
+            server_name: server.into(),
+            code_verifier: "verifier".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            token_endpoint: "https://as.example/token".into(),
+            redirect_uri: "https://acme.example/oauth/mcp/callback".into(),
+        };
+        let stale_at = Instant::now() - (AppState::OAUTH_PENDING_TTL + Duration::from_secs(1));
+
+        // Stale-on-read: an entry parked past its TTL is rejected (and removed).
+        state.park_oauth_at("expired".into(), pending("notion"), stale_at);
+        assert!(state.take_oauth("expired").is_none());
+
+        // Sweep-on-park: parking a fresh flow evicts any stale sibling first, so
+        // an abandoned flow's secrets can't outlive the TTL even if never taken.
+        state.park_oauth_at("stale".into(), pending("slack"), stale_at);
+        state.park_oauth("fresh".into(), pending("github"));
+        assert!(state.take_oauth("stale").is_none());
+        assert!(state.take_oauth("fresh").is_some());
+    }
+
     #[test]
     fn host_base_url_falls_back_to_bind() {
         let config = AppConfig::default();
@@ -535,6 +739,65 @@ mod tests {
             .skill_registry(std::path::Path::new("/nonexistent"))
             .expect("cached registry");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn namespaced_company_id_is_noop_when_unset() {
+        let config = AppConfig::default();
+        assert!(config.tenant_namespace.is_none());
+        let id = CompanyId::new("agentic-software-company");
+        assert_eq!(config.namespaced_company_id(id.clone()), id);
+    }
+
+    #[test]
+    fn namespaced_company_id_prefixes_when_set() {
+        let config = AppConfig {
+            tenant_namespace: Some("acme".into()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            config.namespaced_company_id(CompanyId::new("agentic-software-company")),
+            CompanyId::new("acme--agentic-software-company")
+        );
+    }
+
+    #[test]
+    fn namespaced_company_id_is_idempotent() {
+        let config = AppConfig {
+            tenant_namespace: Some("acme".into()),
+            ..AppConfig::default()
+        };
+        let once = config.namespaced_company_id(CompanyId::new("agentic-software-company"));
+        let twice = config.namespaced_company_id(once.clone());
+        assert_eq!(once, twice);
+        assert_eq!(once, CompanyId::new("acme--agentic-software-company"));
+    }
+
+    #[test]
+    fn canonical_tenant_strips_prefix() {
+        assert_eq!(canonical_tenant("tenant:acme"), "acme");
+        assert_eq!(canonical_tenant("acme"), "acme");
+        // Only the leading `tenant:` is stripped, and only once.
+        assert_eq!(canonical_tenant("company:acme"), "company:acme");
+        assert_eq!(canonical_tenant("tenant:tenant:x"), "tenant:x");
+    }
+
+    #[test]
+    fn ownership_is_keyed_canonically_across_representations() {
+        let state = AppState::new(AppConfig::default());
+        let id = CompanyId::new("acme--acme");
+
+        // A row stored in the claim shape (as hydration would set it) is keyed by
+        // the bare slug, so a query in either representation finds it.
+        state.set_owner(id.clone(), "tenant:acme");
+        assert_eq!(state.owner_of(&id).as_deref(), Some("acme"));
+        assert_eq!(state.tenant_company_count("acme"), 1);
+        assert_eq!(state.tenant_company_count("tenant:acme"), 1);
+        assert_eq!(state.tenant_company_count("tenant:globex"), 0);
+
+        // Re-recording under the bare form is the same identity, not a second.
+        state.set_owner(id.clone(), "acme");
+        assert_eq!(state.tenant_company_count("tenant:acme"), 1);
     }
 
     #[test]

@@ -182,21 +182,49 @@ async fn register_company(
     // The company's on-disk source directory (`companies/<name>`) seeds the
     // workspace tree on first boot and lets read resolvers find its committed
     // skills/workflows content.
-    let mut builder = attach_openhuman(RuntimeBuilder::new(home.to_path_buf(), manifest))
-        .with_seed_dir(company_source_dir(dir))
-        .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
-        .with_host_base_url(state.config().host_base_url());
+    let mut builder = attach_tinyhumans_feedback(
+        attach_harness(attach_openhuman(RuntimeBuilder::new(
+            home.to_path_buf(),
+            manifest,
+        ))),
+        state.config(),
+    )
+    .with_seed_dir(company_source_dir(dir))
+    .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
+    .with_host_base_url(state.config().host_base_url());
+    // Shared-single-DB mode: namespace the derived id with this tenant so the
+    // same boot template (`OPENCOMPANY_COMPANY`) does not collide across tenants
+    // in one logical database. A no-op when `tenant_namespace` is unset.
+    let derived = opencompany::runtime::company_id_from_name(&name);
+    let company_id = state.config().namespaced_company_id(derived);
+    builder = builder.with_id(company_id);
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
+    }
+    if let Some(overlay) = state.memory_overlay() {
+        builder = builder.with_memory_overlay(overlay);
     }
     if discoverable {
         builder = builder.with_discoverable(true);
     }
     let runtime = builder.build().await?;
-    let id = runtime.id().as_ref().to_string();
-    state
-        .registry()
-        .insert(runtime.id().clone(), Arc::new(runtime));
+    let company_id = runtime.id().clone();
+    let id = company_id.as_ref().to_string();
+    // Record boot-company ownership so a shared-DB manager can later purge by
+    // tenant. Only meaningful in tenant-namespace mode; otherwise skipped so
+    // db-per-tenant / self-hosted deployments keep their in-memory-only stub.
+    if let Some(tenant) = state.config().tenant_namespace.clone() {
+        // Canonical (bare-slug) form so the persisted `owners` row matches what
+        // tenant-scoped auth compares a `tenant:acme` claim against.
+        let tenant = opencompany::app::canonical_tenant(&tenant).to_string();
+        state.set_owner(company_id.clone(), tenant.clone());
+        if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
+            && let Err(err) = ownership.set_owner(&company_id, &tenant).await
+        {
+            eprintln!("failed to persist ownership for `{id}`: {err}");
+        }
+    }
+    state.registry().insert(company_id, Arc::new(runtime));
     Ok((id, name, schedules))
 }
 
@@ -299,6 +327,72 @@ fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
     }
 }
 
+/// Attaches the embedded OpenHuman harness under the `openhuman` feature.
+///
+/// The harness pool is **always** attached, so cognition routes through a live
+/// company agent whenever *any* inference source is configured — the managed
+/// env default (`TINYHUMANS_API_KEY` / `OPENCOMPANY_INFERENCE_*`), a manifest
+/// `[inference]` section, or a runtime console override (issue #56 — BYOK).
+/// Attaching the pool unconditionally is what unblocks a BYOK-only tenant that
+/// has no platform credential: the builder still constructs the harness brain
+/// from its manifest/runtime config. Without any source, the runtime keeps its
+/// hosted/echo brain.
+///
+/// Without the feature this is the identity function, so the default build is
+/// unaffected.
+#[cfg(not(feature = "openhuman"))]
+fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder
+}
+
+#[cfg(feature = "openhuman")]
+fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
+    use opencompany::app::config::ProcessEnv;
+    use opencompany::harness::HarnessPool;
+    use opencompany::harness::provider::{harness_inference_from_env, media_backend_from_env};
+
+    let builder = builder.with_harness(Arc::new(HarnessPool::new()));
+    // Issue #109: the MANAGED media-generation backend, resolved from the
+    // environment only (never a tenant secret). Absent ⇒ media tools stay unwired
+    // even for a company that grants `media` (fail-closed).
+    let builder = match media_backend_from_env(&ProcessEnv) {
+        Some(media_backend) => builder.with_media_backend(media_backend),
+        None => builder,
+    };
+    // The managed env default is an *optional*, lowest-precedence source; a
+    // BYOK-only tenant supplies none and still gets a harness brain from its
+    // manifest/runtime config.
+    match harness_inference_from_env(&ProcessEnv) {
+        Some((config, model_override)) => builder.with_harness_inference(config, model_override),
+        None => builder,
+    }
+}
+
+/// Routes feedback to the TinyHumans hub when this instance is provisioned with
+/// a credential, so reports are recorded on behalf of the credential's owner
+/// instead of being filed as issues from here.
+///
+/// Without the feature this is the identity function, so the default build stays
+/// network-free and keeps the local capture → GitHub/manual-link path.
+#[cfg(not(feature = "tinyhumans"))]
+fn attach_tinyhumans_feedback(builder: RuntimeBuilder, _config: &AppConfig) -> RuntimeBuilder {
+    builder
+}
+
+#[cfg(feature = "tinyhumans")]
+fn attach_tinyhumans_feedback(builder: RuntimeBuilder, config: &AppConfig) -> RuntimeBuilder {
+    use opencompany::feedback::HttpTinyHumansClient;
+
+    match &config.tinyhumans_credential {
+        Some(credential) => builder.with_tinyhumans_feedback(Arc::new(HttpTinyHumansClient::new(
+            config.api_url.clone(),
+            credential.clone(),
+        ))),
+        // Unprovisioned: keep the local path rather than dropping reports.
+        None => builder,
+    }
+}
+
 /// Parses a non-empty `usize` environment variable, ignoring unset/empty/invalid
 /// values (an invalid value logs a warning and is treated as unset).
 fn env_usize(key: &str) -> Option<usize> {
@@ -358,6 +452,12 @@ fn connections_runtime() -> Result<opencompany::server::ops::ConnectionsRuntime>
     {
         connections =
             connections.with_mail(Arc::new(opencompany::server::ops::smtp::LettreMailSender));
+    }
+    #[cfg(feature = "telegram")]
+    {
+        connections = connections.with_telegram(Arc::new(
+            opencompany::company::telegram::HttpTelegramApi::new(),
+        ));
     }
     if let Some(mail) = opencompany::server::ops::mailer::MailConfig::from_env()? {
         connections = connections.with_mail_credentials(mail.credentials);
@@ -516,6 +616,41 @@ async fn main() -> Result<()> {
             discoverable,
         }) => {
             let home = home.unwrap_or_else(default_home);
+            // Materialize the canonical data-dir workspace layout and empty the
+            // ephemeral `tmp/` scratch so nothing stale survives a restart. The
+            // `[workspace]` section of `config.toml` (in the data dir) toggles
+            // the tmp clear; absent config keeps the default (clear on startup).
+            let data_root = opencompany::app::config::data_dir_from_env();
+            let workspace_cfg = ConfigFile::load(&data_root)?
+                .map(|c| c.workspace.resolve())
+                .unwrap_or_default();
+            let layout = opencompany::store::DataLayout::new(&data_root);
+            layout.ensure(workspace_cfg.clear_tmp_on_startup).await?;
+            // Soft disk-quota alerting. Hard enforcement is the container /
+            // StorageClass layer's job (EFS access point, k8s ResourceQuota);
+            // here we surface an operator-visible warning when a workspace
+            // exceeds its configured `[workspace]` quota.
+            if let Some(limit) = workspace_cfg.storage_quota_bytes {
+                let used = layout.usage_bytes().await?;
+                if used > limit {
+                    tracing::warn!(
+                        used_bytes = used,
+                        quota_bytes = limit,
+                        data_dir = %data_root.display(),
+                        "workspace storage over quota — enforce hard limits at the container/StorageClass layer",
+                    );
+                }
+            }
+            if let Some(limit) = workspace_cfg.tmp_quota_bytes {
+                let used = layout.tmp_bytes().await?;
+                if used > limit {
+                    tracing::warn!(
+                        used_bytes = used,
+                        quota_bytes = limit,
+                        "workspace tmp/ scratch over quota",
+                    );
+                }
+            }
             // tiny.place economy + public-card configuration resolved from the
             // environment (with built-in defaults); the a2a routes and boot
             // going-public flow read these off `AppConfig`.
@@ -526,11 +661,28 @@ async fn main() -> Result<()> {
             let public_url = std::env::var("OPENCOMPANY_PUBLIC_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
+            // Shared-single-DB tenant identity. When set, company ids are
+            // namespaced with this value so many tenants can share one logical
+            // database without colliding on the `companies` unique index. Unset
+            // (db-per-tenant / single-tenant) keeps every id derivation as-is.
+            let tenant_namespace = std::env::var("OPENCOMPANY_TENANT_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            // Hosted-brain credential, resolved with the same precedence the
+            // harness uses (`harness_inference_from_env`) so `/spec`'s
+            // `cycles_available` reflects whether cognition can actually run.
+            let tinyhumans_credential = std::env::var("OPENCOMPANY_INFERENCE_KEY")
+                .or_else(|_| std::env::var("TINYHUMANS_API_KEY"))
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(opencompany::ports::types::SecretValue);
             let mut state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
                 tinyplace_api_url,
                 public_url,
+                tenant_namespace,
+                tinyhumans_credential,
                 ..AppConfig::default()
             })
             .with_cors(opencompany::server::cors::CorsConfig::from_env()?)
@@ -548,14 +700,38 @@ async fn main() -> Result<()> {
                 opencompany::store::open_storage(&storage_settings, &home).await?
             {
                 // Shared-database platform mode: restore the durable company →
-                // tenant map so ownership survives restarts.
+                // tenant map so ownership survives restarts. In shared-single-DB
+                // mode the `owners` collection holds every tenant's rows; hydrate
+                // only this tenant's own mappings so the in-memory map never
+                // leaks other tenants' companies (which are unaddressable here
+                // regardless, since the registry only holds locally-loaded ones).
                 if let Some(ownership) = &handles.ownership {
+                    let self_tenant = state.config().tenant_namespace.clone();
                     for (id, tenant) in ownership.owners().await? {
-                        state.set_owner(id, tenant);
+                        match &self_tenant {
+                            // Compare in canonical (bare-slug) form so a row
+                            // persisted as `tenant:acme` still hydrates under the
+                            // workload's bare `acme` namespace, and vice versa.
+                            Some(me)
+                                if opencompany::app::canonical_tenant(&tenant)
+                                    != opencompany::app::canonical_tenant(me) =>
+                            {
+                                continue;
+                            }
+                            _ => state.set_owner(id, tenant),
+                        }
                     }
                 }
                 state = state.with_stores(handles);
                 println!("storage backend: {:?}", storage_settings.kind);
+            }
+            // Memory engine overlay (`OPENCOMPANY_MEMORY`): swaps just the
+            // memory + context ports onto a dedicated engine on top of the base
+            // backend. A selected-but-unavailable engine aborts boot, same as
+            // the storage backend.
+            if let Some(overlay) = opencompany::store::open_memory_overlay(&storage_settings)? {
+                state = state.with_memory_overlay(overlay);
+                println!("memory backend: {:?}", storage_settings.memory_backend);
             }
             // Platform (multi-tenant) auth: a shared platform token enables the
             // provisioning/lifecycle surface. Without it the prosumer operator
@@ -658,13 +834,7 @@ async fn main() -> Result<()> {
             let env = ProcessEnv;
             // Locate config.toml under the resolved data dir (env override or
             // the default `$HOME/.opencompany`).
-            let config_dir = match std::env::var_os("OPENCOMPANY_DATA_DIR") {
-                Some(dir) => PathBuf::from(dir),
-                None => match std::env::var_os("HOME") {
-                    Some(home) => PathBuf::from(home).join(".opencompany"),
-                    None => PathBuf::from(".opencompany"),
-                },
-            };
+            let config_dir = opencompany::app::config::data_dir_from_env();
             let config_toml = ConfigFile::load(&config_dir)?;
             let manifest = match &company {
                 Some(dir) => CompanyManifest::from_path(dir)?,

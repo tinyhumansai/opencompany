@@ -10,7 +10,11 @@ runtime to the TinyHumans backend (api.tinyhumans.ai) and from it derive:
 - access to the model catalog for TinyAgents-backed fallbacks (tiers map to
   SKUs server-side; the runtime never names models),
 - observability: TinyAgents' Langfuse exporter can proxy traces through the
-  backend's telemetry ingestion using the same credential.
+  backend's telemetry ingestion using the same credential,
+- feedback forwarding: an instance holding a credential sends operator reports
+  to the backend hub, recorded on behalf of the credential's **owner**, instead
+  of filing its own GitHub issues
+  ([feedback-loop](../feedback-loop/README.md)).
 
 **Credential reality vs contract.** Today the backend authenticates
 `/orchestration/v1` with a session JWT (magic-link / OAuth / login-token
@@ -20,10 +24,14 @@ an opaque *TinyHumans credential*: the runtime accepts either a session JWT
 hosts — a tracked upstream workstream, [roadmap.md](../roadmap.md)). The env
 var name `TINYHUMANS_API_KEY` is the stable product contract either way.
 
+Because a forwarded report is attributed to whoever the credential resolves to,
+the same pass-through works for either credential form: the backend identifies
+the owner, and the runtime never needs to know who that is.
+
 Without a credential the runtime still builds, validates manifests, runs
 `opencompany check`/`spec`, and serves the inspection routes — matching the
 README promise that you can build/inspect/explore keyless. Cycles require the
-credential.
+credential; feedback falls back to the local GitHub/manual-link path.
 
 ## Precedence
 
@@ -47,6 +55,9 @@ layer set it, and what is missing for each optional capability.
 | `OPENCOMPANY_DATA_DIR` | `~/.opencompany` | Bundle root for fs stores |
 | `OPENCOMPANY_BRAIN_MODE` | `hosted` | `hosted` \| `sidecar` (overrides `[brain].mode`) |
 | `OPENCOMPANY_OPENHUMAN_URL` | — | Attach to a running `openhuman-core serve` instead of launching |
+| `OPENCOMPANY_INFERENCE_KEY` | `TINYHUMANS_API_KEY` | Harness-brain credential (`openhuman` feature). Per-tenant override of the platform key |
+| `OPENCOMPANY_INFERENCE_URL` | `https://api.tinyhumans.ai/openai/v1` | Harness-brain OpenAI-compatible endpoint (`openhuman` feature) |
+| `OPENCOMPANY_INFERENCE_MODEL` | `chat-v1` | Roster-wide default model/tier for the harness brain (`openhuman` feature) |
 | `TINYPLACE_API_URL` | `https://api.tiny.place` | tiny.place base (staging/local override) |
 | `GITHUB_TOKEN` | — | Only for the feedback→issue flow; without it, feedback is stored locally and a prefilled "file it yourself" link is shown |
 | `OPENCOMPANY_MAIL_PROVIDER` | `smtp` when any `OPENCOMPANY_MAIL_*` is set | Host-level outbound mail transport. Supported: `smtp` |

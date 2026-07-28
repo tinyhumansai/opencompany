@@ -21,10 +21,12 @@ use crate::company::Agent;
 use crate::ports::types::OverlayAgent;
 
 mod calendar;
+pub mod capability;
 mod finances;
 mod types;
 mod usage;
 
+pub use capability::{BudgetPeriod, CapabilityPlan, TierBudgetStatus, plan_named, tokens_in};
 pub use finances::{category_label, finances_from};
 pub use types::{
     AgentTokens, CategorySpend, Direction, Finances, ProviderCalls, Transaction, Usage, UsagePoint,

@@ -7,17 +7,30 @@
 //     and calls use `/api/v1/companies/{id}/*`.
 
 import type { ConsoleConfig } from "../config";
+import type {
+  InstallMcpServerInput,
+  McpCallResult,
+  McpServer,
+  McpTool,
+} from "../lib/mcp";
 import {
   ApiError,
   type ApiErrorBody,
+  type AppSpec,
   type ApprovalSummary,
+  type CapabilityStatusDto,
+  type ChatHistoryMessageDto,
   type ChatResponse,
   type CompanyStatus,
   type ConnectionStart,
   type ConnectionState,
+  type DeskDto,
   type FeedbackInput,
   type FeedbackResponse,
+  type FeedbackSummary,
+  type FinancesDto,
   type TeamMemberDto,
+  type UsageDto,
   type Verdict,
 } from "./types";
 
@@ -103,6 +116,11 @@ export class OpenCompanyClient {
     return this.request<T>("PATCH", path, body);
   }
 
+  /** A typed PUT, for surfaces that live outside this class (e.g. skills). */
+  put<T>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>("PUT", path, body);
+  }
+
   /** A typed DELETE, for surfaces that live outside this class (e.g. auth). */
   del<T>(path: string): Promise<T> {
     return this.request<T>("DELETE", path);
@@ -128,9 +146,94 @@ export class OpenCompanyClient {
     return this.request<CompanyStatus>("GET", `${this.scope(company)}`);
   }
 
-  /** Send the operator's message and return the company's reply. */
-  chat(text: string, company?: string | null): Promise<ChatResponse> {
-    return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, { text });
+  /**
+   * The company's capability-budget status (issue #108): the effective tier plan
+   * and per-tier token spend. Hosts without the surface (or with no `[plan]`)
+   * return `{ configured: false }`; callers render a "no plan configured" note.
+   */
+  capabilityStatus(company?: string | null): Promise<CapabilityStatusDto> {
+    return this.request<CapabilityStatusDto>("GET", `${this.scope(company)}/capabilities`);
+  }
+
+  /**
+   * The company's usage read (Usage view): daily token series, tokens by desk,
+   * OAuth calls by provider, and window totals over a `7d` / `30d` / `90d`
+   * range. Token figures are real-or-zero — the offline build reports a
+   * zero-filled series until the harness cost hook meters spend.
+   */
+  usage(range?: string | null, company?: string | null): Promise<UsageDto> {
+    const qs = range ? `?range=${encodeURIComponent(range)}` : "";
+    return this.request<UsageDto>("GET", `${this.scope(company)}/usage${qs}`);
+  }
+
+  /**
+   * The company's finance read (Finances view): balance, budget vs spend,
+   * revenue, spend by category, and the transaction journal. Figures are
+   * real-or-zero — the offline build reports zeroes until the ledger fills.
+   */
+  finances(company?: string | null): Promise<FinancesDto> {
+    return this.request<FinancesDto>("GET", `${this.scope(company)}/finances`);
+  }
+
+  /**
+   * Send the operator's message and return the company's reply. `chat` is the
+   * addressed desk / thread id (issue #53): the orchestrator routes an addressed
+   * message to that desk's lead, and an unaddressed one answers itself. Omitted /
+   * unknown ids fall to the orchestrator, so callers can always pass the active
+   * thread id safely.
+   */
+  chat(text: string, company?: string | null, chat?: string | null): Promise<ChatResponse> {
+    const body: { text: string; chat?: string } = { text };
+    if (chat) body.chat = chat;
+    return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, body);
+  }
+
+  /**
+   * The company's desks (group chats). Hosts that don't expose `.../desks` yet
+   * return 404 — callers fall back to the static default threads.
+   */
+  listDesks(company?: string | null): Promise<DeskDto[]> {
+    return this.request<DeskDto[]>("GET", `${this.scope(company)}/desks`);
+  }
+
+  /**
+   * Add a teammate to a desk through the operator overlay (issue #72). The
+   * teammate must be on the company roster; the desk must exist. Adding one
+   * already on the desk is a 409.
+   */
+  addDeskMember(deskId: string, agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "POST",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members`,
+      { agent_id: agentId },
+    );
+  }
+
+  /**
+   * Remove an operator-added desk member (issue #72). Only overlay members can
+   * be removed — a teammate declared on the desk in the manifest is part of the
+   * blueprint and returns a 409.
+   */
+  removeDeskMember(deskId: string, agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
+   * A desk's persisted transcript (issue #65), so the console can rehydrate a
+   * thread on login/reload instead of always starting empty. `desk` is the
+   * thread id (as passed to {@link chat}); omitted reads the operator/General
+   * line. Hosts that don't expose `.../chat/history` yet return 404 — callers
+   * fall back to an empty transcript.
+   */
+  getChatHistory(desk?: string | null, company?: string | null): Promise<ChatHistoryMessageDto[]> {
+    const qs = desk ? `?desk=${encodeURIComponent(desk)}` : "";
+    return this.request<ChatHistoryMessageDto[]>(
+      "GET",
+      `${this.scope(company)}/chat/history${qs}`,
+    );
   }
 
   /** The approvals awaiting the operator. */
@@ -159,12 +262,47 @@ export class OpenCompanyClient {
     return this.request<FeedbackResponse>("POST", `${this.scope(company)}/feedback`, input);
   }
 
+  /** This company's past reports, newest first. */
+  listFeedback(company?: string | null): Promise<FeedbackSummary[]> {
+    return this.request<FeedbackSummary[]>("GET", `${this.scope(company)}/feedback`);
+  }
+
+  /**
+   * The host's runtime spec. Unauthenticated and company-agnostic, so it sits
+   * outside `scope()`; the console reads `cycles_available` from it to tell
+   * whether this instance is provisioned with a TinyHumans credential.
+   */
+  spec(): Promise<AppSpec> {
+    return this.request<AppSpec>("GET", "/spec");
+  }
+
   /**
    * The company's agent roster (forward-looking surface). Hosts that don't
    * expose `.../team` yet return 404 — callers fall back to a local roster.
    */
   listTeam(company?: string | null): Promise<TeamMemberDto[]> {
     return this.request<TeamMemberDto[]>("GET", `${this.scope(company)}/team`);
+  }
+
+  /**
+   * Add an operator-defined teammate (a "team overlay" agent). Persists on the
+   * host and shows up in `listTeam` afterwards — never returned by the write
+   * itself, so callers should refetch. Hosts without the write plane 404;
+   * callers fall back to a local-only add.
+   */
+  addTeamMember(
+    input: { name: string; role: string; description?: string },
+    company?: string | null,
+  ): Promise<TeamMemberDto> {
+    return this.request<TeamMemberDto>("POST", `${this.scope(company)}/team`, input);
+  }
+
+  /** Remove an operator-added teammate. 409s for a manifest teammate (can't be removed here). */
+  removeTeamMember(agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/team/${encodeURIComponent(agentId)}`,
+    );
   }
 
   /**
@@ -188,6 +326,68 @@ export class OpenCompanyClient {
     return this.request<void>(
       "POST",
       `${this.scope(company)}/connections/${encodeURIComponent(provider)}/disconnect`,
+    );
+  }
+
+  /** Installed MCP servers plus their live connection state. */
+  listMcpServers(company?: string | null): Promise<{ servers: McpServer[] }> {
+    return this.request<{ servers: McpServer[] }>("GET", `${this.scope(company)}/mcp/servers`);
+  }
+
+  /** Persist a manual stdio or streamable-HTTP MCP server install. */
+  installMcpServer(
+    input: InstallMcpServerInput,
+    company?: string | null,
+  ): Promise<{ server_id: string }> {
+    return this.request<{ server_id: string }>("POST", `${this.scope(company)}/mcp/servers`, input);
+  }
+
+  /** Connect an installed server and return its advertised tools. */
+  connectMcpServer(serverId: string, company?: string | null): Promise<{ tools: McpTool[] }> {
+    return this.request<{ tools: McpTool[] }>(
+      "POST",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/connect`,
+    );
+  }
+
+  /** Stop an installed server's live connection. */
+  disconnectMcpServer(
+    serverId: string,
+    company?: string | null,
+  ): Promise<{ disconnected: boolean }> {
+    return this.request<{ disconnected: boolean }>(
+      "POST",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/disconnect`,
+    );
+  }
+
+  /** Disconnect and remove an MCP install. */
+  uninstallMcpServer(serverId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}`,
+    );
+  }
+
+  /** Cached tools advertised by a connected MCP server. */
+  listMcpTools(serverId: string, company?: string | null): Promise<{ tools: McpTool[] }> {
+    return this.request<{ tools: McpTool[] }>(
+      "GET",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/tools`,
+    );
+  }
+
+  /** Invoke one tool through a connected MCP server. */
+  callMcpTool(
+    serverId: string,
+    tool: string,
+    arguments_: Record<string, unknown>,
+    company?: string | null,
+  ): Promise<McpCallResult> {
+    return this.request<McpCallResult>(
+      "POST",
+      `${this.scope(company)}/mcp/servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(tool)}/call`,
+      { arguments: arguments_ },
     );
   }
 

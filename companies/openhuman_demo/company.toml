@@ -1,0 +1,84 @@
+# A minimal company for the embedded OpenHuman harness (issue #9).
+#
+# Every [[agent]] becomes one live openhuman agent, wired with memory, an
+# approval policy, and the hosted inference provider. Run it with the harness
+# brain by setting an inference credential in the environment:
+#
+#   TINYHUMANS_API_KEY=<jwt> \
+#   OPENCOMPANY_INFERENCE_URL=https://api.tinyhumans.ai/openai/v1 \
+#   cargo run --features openhuman --bin opencompany -- \
+#     serve --company companies/openhuman_demo
+#
+# Without a credential the same company still boots — it just answers with the
+# offline echo brain instead of a real agent turn.
+
+[company]
+name = "OpenHuman Demo Co"
+output = "Answers, plans, and short written drafts"
+human_role = "Steering the company and approving anything costly"
+
+[policy]
+# `full` lets ordinary turns flow without an approval prompt; costly or
+# external effects still route through the gate. Use `supervised` to approve
+# every agent action, or `readonly` to block mutations entirely.
+mode = "full"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+description = "Sets direction, answers about the company, and delegates the work."
+# The operator↔company chat responder. `orchestrator` makes the CEO answer from
+# whole-company context and delegate to the desks below. `mcp:*` grants the
+# remote MCP tool servers declared in `[[mcp_server]]`.
+tier = "orchestrator"
+tools = ["mcp:*"]
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+description = "Explains how things are built and proposes technical plans."
+tools = ["mcp:*"]
+
+[[agent]]
+id = "writer"
+role = "Writer"
+description = "Turns rough notes into short, clear written drafts."
+tools = ["mcp:*"]
+
+# Desks (group chats) the orchestrator can hand a turn to. Each desk's first
+# member is its lead; `delegate_to_desk` runs that member's turn.
+[[group_chat]]
+id = "engineering"
+name = "Engineering desk"
+description = "How things are built and technical plans."
+members = ["engineer"]
+
+[[group_chat]]
+id = "content"
+name = "Content desk"
+description = "Written drafts and copy."
+members = ["writer"]
+
+# A real, public, no-auth MCP tool server (DeepWiki — AI docs for GitHub
+# repositories). Its tools (read_wiki_structure / read_wiki_contents /
+# ask_question) reach every agent granted `mcp:*` above. Add credentialed
+# servers at runtime from the console's Connections tab.
+[[mcp_server]]
+name = "deepwiki"
+endpoint = "https://mcp.deepwiki.com/mcp"
+description = "AI-generated documentation and Q&A for public GitHub repositories."
+
+# Bring-Your-Own-Key inference. Uncomment to route this company's
+# agents through your own provider instead of the managed TinyHumans brain.
+# Omitting the section (the default) keeps the managed brain. The credential is
+# NEVER written here — set it write-only from the console's Connections tab, or
+# name a secret-store key with `api_key_secret`. You can also switch providers
+# live from the console (Connections → Inference) with no restart.
+#
+# [inference]
+# provider = "openrouter"          # managed | openrouter | openai_compatible | ollama
+# # base_url = "https://openrouter.ai/api/v1"   # defaulted for openrouter/managed
+#
+# [inference.models]               # abstract tier → concrete provider model id
+# "chat-v1" = "deepseek/deepseek-chat"
+# "reasoning-v1" = "deepseek/deepseek-r1"

@@ -54,8 +54,8 @@ use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
-    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
-    TaskResult,
+    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, OverlayBlob, SecretValue,
+    StoredEvent, TaskResult,
 };
 use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
@@ -286,23 +286,24 @@ impl CompanyStore for MongoStore {
             )?)?);
         }
 
-        let overlay_agents = match company.get_str("overlay_json") {
-            Ok(json) => serde_json::from_str(json)?,
-            Err(_) => Vec::new(),
+        let overlay = match company.get_str("overlay_json") {
+            Ok(json) => OverlayBlob::parse(json)?,
+            Err(_) => OverlayBlob::default(),
         };
         Ok(Some(CompanyRecord {
             id: id.clone(),
             manifest,
             ledger,
             lifecycle: get_str(&company, "lifecycle")?,
-            overlay_agents,
+            overlay_agents: overlay.agents,
+            overlay_desk_members: overlay.desk_members,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
-        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
+        let overlay_json = serde_json::to_string(&OverlayBlob::from_record(record))?;
         // Append-only: `save` upserts the company document, never the ledger.
         self.collection("companies")
             .update_one(
@@ -1647,6 +1648,65 @@ mod test {
 
     async fn drop_db(store: &MongoStore) {
         let _ = store.db.drop().await;
+    }
+
+    /// Shared-single-DB namespacing: two tenants registering the same template
+    /// name land distinct namespaced ids in one database, so the `companies`
+    /// unique index never conflicts, and the `owners` rows carry the right
+    /// tenant for each. Mirrors what the workload does when
+    /// `OPENCOMPANY_TENANT_ID` is set (see `AppConfig::namespaced_company_id`).
+    #[tokio::test]
+    async fn shared_db_namespaced_companies_do_not_conflict() {
+        let Some(s) = store().await else { return };
+
+        let manifest: CompanyManifest = toml::from_str("[company]\nname = \"Acme\"\n").unwrap();
+        let id_a = crate::app::namespace_company_id(
+            "tenant-a",
+            crate::runtime::company_id_from_name(&manifest.company.name),
+        );
+        let id_b = crate::app::namespace_company_id(
+            "tenant-b",
+            crate::runtime::company_id_from_name(&manifest.company.name),
+        );
+        assert_eq!(id_a.as_ref(), "tenant-a--acme");
+        assert_eq!(id_b.as_ref(), "tenant-b--acme");
+
+        for (id, tenant) in [(&id_a, "tenant-a"), (&id_b, "tenant-b")] {
+            let record = CompanyRecord {
+                id: id.clone(),
+                manifest: manifest.clone(),
+                ledger: Vec::new(),
+                lifecycle: "running".into(),
+                overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+            };
+            // Same template name under two tenants: distinct namespaced ids, no
+            // `companies` unique-index conflict.
+            s.save(&record).await.expect("save namespaced company");
+            s.set_owner(id, tenant).await.expect("record owner");
+        }
+
+        let mut owners = s.owners().await.unwrap();
+        owners.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        assert_eq!(
+            owners,
+            vec![
+                (id_a.clone(), "tenant-a".to_string()),
+                (id_b.clone(), "tenant-b".to_string()),
+            ]
+        );
+
+        // Both companies remain addressable and carry the shared template name.
+        assert_eq!(
+            s.load(&id_a).await.unwrap().unwrap().manifest.company.name,
+            "Acme"
+        );
+        assert_eq!(
+            s.load(&id_b).await.unwrap().unwrap().manifest.company.name,
+            "Acme"
+        );
+
+        drop_db(&s).await;
     }
 
     #[tokio::test]

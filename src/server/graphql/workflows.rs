@@ -48,6 +48,42 @@ pub struct WorkflowNodeGql {
     pub name: String,
     /// An optional one-line summary.
     pub summary: Option<String>,
+    /// Free-form, kind-specific node config (P1), exposed as a JSON scalar so
+    /// `Company.workflow(id)` does not drop model data.
+    pub config: Option<async_graphql::Json<serde_json::Value>>,
+    /// Per-node error policy: `stop` / `continue` / `route`.
+    pub on_error: Option<String>,
+    /// Per-node retry policy (attempts + backoff), as a JSON scalar. Keys are
+    /// camelCase (`maxAttempts` / `backoffMs`) to match the REST read shape;
+    /// see [`RetryGql`].
+    pub retry: Option<async_graphql::Json<RetryGql>>,
+    /// Whether the node pauses awaiting operator approval before it runs.
+    pub requires_approval: Option<bool>,
+}
+
+/// The camelCase retry shape the console reads back over GraphQL, mirroring the
+/// REST `WorkflowRetryOut` (`maxAttempts` / `backoffMs`). The model/TOML type
+/// [`crate::company::WorkflowRetryDef`] stays snake_case; without this mirror
+/// the GraphQL JSON scalar would leak snake_case keys and diverge from REST.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryGql {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<String>,
+}
+
+impl From<crate::company::WorkflowRetryDef> for RetryGql {
+    fn from(r: crate::company::WorkflowRetryDef) -> Self {
+        Self {
+            max_attempts: r.max_attempts,
+            backoff_ms: r.backoff_ms,
+            backoff: r.backoff,
+        }
+    }
 }
 
 /// One directed edge in a workflow graph.
@@ -75,6 +111,10 @@ impl From<WorkflowFile> for WorkflowGql {
                     kind: node.kind.as_str().to_string(),
                     name: node.name,
                     summary: node.summary,
+                    config: node.config.map(async_graphql::Json),
+                    on_error: node.on_error,
+                    retry: node.retry.map(|r| async_graphql::Json(RetryGql::from(r))),
+                    requires_approval: node.requires_approval,
                 })
                 .collect(),
             edges: file
@@ -101,10 +141,7 @@ fn load_one(dir: Option<&Path>, id: &str) -> Option<WorkflowFile> {
 
 /// The enabled workflow ids from the company manifest.
 async fn enabled_ids(runtime: &Arc<CompanyRuntime>) -> async_graphql::Result<Vec<String>> {
-    let record = runtime.store().load(runtime.id()).await?;
-    Ok(record
-        .map(|record| record.manifest.workflows.enabled)
-        .unwrap_or_default())
+    Ok(runtime.enabled_workflow_ids().await?)
 }
 
 /// Resolves `Company.workflows`.
@@ -136,4 +173,47 @@ pub(crate) async fn resolve_one(
     id: &str,
 ) -> async_graphql::Result<Option<WorkflowGql>> {
     Ok(load_one(runtime.source_dir(), id).map(WorkflowGql::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn node_conversion_preserves_p1_fields_and_camelcases_retry() {
+        let file = parse_workflow(
+            r#"
+            id = "wf"
+            name = "Workflow"
+            [[node]]
+            id = "start"
+            kind = "trigger"
+            name = "Start"
+            on_error = "continue"
+            requires_approval = true
+            [node.config]
+            message = "hello"
+            [node.retry]
+            max_attempts = 3
+            backoff_ms = 250
+            backoff = "exponential"
+            "#,
+        )
+        .expect("workflow parses");
+
+        let gql = WorkflowGql::from(file);
+        let node = &gql.nodes[0];
+        assert_eq!(node.config.as_ref().unwrap().0, json!({"message": "hello"}));
+        assert_eq!(node.on_error.as_deref(), Some("continue"));
+        assert_eq!(node.requires_approval, Some(true));
+        assert_eq!(
+            serde_json::to_value(&node.retry.as_ref().unwrap().0).unwrap(),
+            json!({
+                "maxAttempts": 3,
+                "backoffMs": 250,
+                "backoff": "exponential"
+            })
+        );
+    }
 }

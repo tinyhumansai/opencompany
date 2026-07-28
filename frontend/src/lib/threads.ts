@@ -2,6 +2,7 @@
 // talks to the same company chat endpoint; a thread just scopes a transcript
 // and gives the company side a consistent identity (a "desk" you're talking to).
 
+import type { DeskDto } from "../api/types";
 import type { ChatMessage } from "./chat";
 
 export interface ThreadContact {
@@ -19,15 +20,23 @@ export interface Thread {
   messages: ChatMessage[];
 }
 
+/** Avatar tones rotated across desk threads. */
+const DESK_TONES = ["sky", "violet", "amber", "emerald", "rose", "cyan"];
+
+/** The company's main line — the orchestrator you talk to for anything. */
+function mainThread(): Thread {
+  return {
+    id: "main",
+    contact: { name: "Your company", kind: "company" },
+    blurb: "The main line — ask for anything",
+    messages: [],
+  };
+}
+
 /** The default chat list: the company's main line plus a few focused desks. */
 export function defaultThreads(): Thread[] {
   return [
-    {
-      id: "main",
-      contact: { name: "Your company", kind: "company" },
-      blurb: "The main line — ask for anything",
-      messages: [],
-    },
+    mainThread(),
     {
       id: "strategy",
       contact: { name: "Strategy desk", kind: "agent", tone: "sky" },
@@ -47,4 +56,25 @@ export function defaultThreads(): Thread[] {
       messages: [],
     },
   ];
+}
+
+/**
+ * Build the chat list from the company's real desks (issue #53): the main line
+ * (the orchestrator) first, then one thread per desk keyed by its id. Falls back
+ * to {@link defaultThreads} when the company defines no desks (or the fetch
+ * failed and returned an empty list), so the console always renders something.
+ */
+export function threadsFromDesks(desks: DeskDto[]): Thread[] {
+  if (desks.length === 0) return defaultThreads();
+  const deskThreads: Thread[] = desks.map((desk, i) => ({
+    id: desk.id,
+    contact: {
+      name: desk.name,
+      kind: "agent",
+      tone: DESK_TONES[i % DESK_TONES.length],
+    },
+    blurb: desk.description ?? "A desk of your company",
+    messages: [],
+  }));
+  return [mainThread(), ...deskThreads];
 }

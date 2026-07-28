@@ -21,6 +21,8 @@ export interface TaskColumn {
 export const TASK_COLUMNS: TaskColumn[] = [
   { id: "backlog", label: "Backlog" },
   { id: "in_progress", label: "In progress" },
+  // Where a steered-to-pause run parks (issue #111); a card here offers Resume.
+  { id: "paused", label: "Paused" },
   { id: "in_review", label: "In review" },
   { id: "done", label: "Done" },
 ];

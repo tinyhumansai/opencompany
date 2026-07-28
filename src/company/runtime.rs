@@ -19,15 +19,24 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::feedback::service::{FeedbackFiler, FeedbackResponse};
 use crate::feedback::store::FeedbackStore;
-use crate::feedback::types::{FeedbackInput, FeedbackItem};
+use crate::feedback::types::{FeedbackInput, FeedbackItem, FeedbackSummary};
 use crate::policy::ManifestApprovalGate;
 use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
     AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
     FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore,
-    TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
+    TaskRecord, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
+
+/// The board column a task must enter to be dispatched to its assignee.
+const IN_PROGRESS: &str = "in_progress";
+
+/// Whether an upsert moves a card **into** `in_progress` (the dispatch edge).
+/// A card already in `in_progress` re-saved is not a fresh dispatch.
+fn task_enters_in_progress(prev_column: Option<&str>, next_column: &str) -> bool {
+    next_column == IN_PROGRESS && prev_column != Some(IN_PROGRESS)
+}
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
@@ -89,6 +98,22 @@ pub struct CompanyRuntime {
     /// `skills/` and `workflows/` content. `None` in platform-provisioned mode
     /// (no source dir), where those resolvers degrade to manifest-derived/empty.
     pub(crate) source_dir: Option<PathBuf>,
+    /// Issue #29: the workflow runner, when wired. Executes a company's workflow
+    /// graphs on the embedded `tinyflows` engine (agent nodes on the harness
+    /// pool). The port trait is default-compiled, so this field is always
+    /// present; only the concrete `HarnessWorkflowRunner` is `openhuman`-gated,
+    /// so the default build simply leaves it `None` and the run route reports
+    /// "not wired".
+    pub(crate) workflow_runner: Option<Arc<dyn crate::ports::WorkflowRunner>>,
+    /// Issue #111: the registry of in-flight, steerable runs. The operator steer
+    /// routes (`GET …/tasks/inflight`, `POST …/tasks/{key}/steer`) read and write
+    /// it; the harness brain registers a dispatched task / desk delegation here
+    /// before running it. Always present (the type is openhuman-free) — the
+    /// default build simply never registers anything, so the strip is empty and
+    /// every steer is `not in flight`. On the harness path the
+    /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) wires in the same handle
+    /// the harness deps hold via [`set_steer`](Self::set_steer).
+    pub(crate) steer: crate::company::steer::InflightRegistry,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
     /// WS4: the embedded openhuman harness pool, when wired via
@@ -96,6 +121,11 @@ pub struct CompanyRuntime {
     /// Feature-gated so the default build is unaffected.
     #[cfg(feature = "openhuman")]
     pub(crate) harness: Option<Arc<crate::harness::HarnessPool>>,
+    /// MCP installs and live connections for this runtime. The wrapper owns a
+    /// company-home-scoped OpenHuman config while the live registry remains
+    /// shared in-process with harness agents.
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp: Option<Arc<crate::harness::mcp::McpRuntime>>,
 }
 
 impl CompanyRuntime {
@@ -140,9 +170,13 @@ impl CompanyRuntime {
             feedback,
             filer,
             source_dir: None,
+            workflow_runner: None,
+            steer: crate::company::steer::InflightRegistry::new(),
             serial: TokioMutex::new(()),
             #[cfg(feature = "openhuman")]
             harness: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         }
     }
 
@@ -159,6 +193,19 @@ impl CompanyRuntime {
         self.source_dir.as_deref()
     }
 
+    /// Issue #29: attach the workflow runner after construction. Wired by the
+    /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) under the `openhuman`
+    /// feature; without it the run route reports "not wired".
+    pub fn set_workflow_runner(&mut self, runner: Arc<dyn crate::ports::WorkflowRunner>) {
+        self.workflow_runner = Some(runner);
+    }
+
+    /// The workflow runner, if one is wired. `None` in the default build (and on
+    /// any runtime built without a harness), where workflow execution is inert.
+    pub fn workflow_runner(&self) -> Option<&Arc<dyn crate::ports::WorkflowRunner>> {
+        self.workflow_runner.as_ref()
+    }
+
     /// WS4: attach an embedded harness pool after construction (called by the
     /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder)).
     #[cfg(feature = "openhuman")]
@@ -171,6 +218,32 @@ impl CompanyRuntime {
     #[cfg(feature = "openhuman")]
     pub fn harness(&self) -> Option<&Arc<crate::harness::HarnessPool>> {
         self.harness.as_ref()
+    }
+
+    /// Attaches the embedded MCP runtime used by REST and harness agents.
+    #[cfg(feature = "mcp")]
+    pub fn set_mcp(&mut self, mcp: Arc<crate::harness::mcp::McpRuntime>) {
+        self.mcp = Some(mcp);
+    }
+
+    /// Returns this company's embedded MCP runtime when the feature is enabled.
+    #[cfg(feature = "mcp")]
+    pub fn mcp(&self) -> Option<&Arc<crate::harness::mcp::McpRuntime>> {
+        self.mcp.as_ref()
+    }
+
+    /// Issue #111: replaces this runtime's in-flight steer registry with a shared
+    /// handle (wired by the [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) to
+    /// the one the harness deps hold, so the operator routes and the brain see the
+    /// same runs).
+    pub fn set_steer(&mut self, steer: crate::company::steer::InflightRegistry) {
+        self.steer = steer;
+    }
+
+    /// This company's in-flight steer registry — the operator control plane for
+    /// pausing / cancelling / redirecting live runs.
+    pub fn steer(&self) -> &crate::company::steer::InflightRegistry {
+        &self.steer
     }
 
     /// This company's id.
@@ -193,6 +266,22 @@ impl CompanyRuntime {
         &self.store
     }
 
+    /// The workflow ids declared in this company's manifest
+    /// (`[workflows].enabled`), read from the persisted record. Empty when the
+    /// record hasn't been saved yet.
+    ///
+    /// This is the source of truth for *which* workflows exist on a
+    /// platform-provisioned tenant (no `source_dir`, so nothing to scan on
+    /// disk) — see [`Self::source_dir`]. Both the REST `list_workflows` route
+    /// and the GraphQL `Company.workflows` resolver read it so the two
+    /// surfaces agree on what the company has enabled.
+    pub async fn enabled_workflow_ids(&self) -> Result<Vec<String>> {
+        let record = self.store.load(&self.id).await?;
+        Ok(record
+            .map(|record| record.manifest.workflows.enabled)
+            .unwrap_or_default())
+    }
+
     /// This company's inbox store (inbound + outbound email).
     pub fn inbox(&self) -> &Arc<dyn InboxStore> {
         &self.inbox
@@ -201,6 +290,64 @@ impl CompanyRuntime {
     /// This company's task board.
     pub fn tasks(&self) -> &Arc<dyn TaskStore> {
         &self.ops.tasks
+    }
+
+    /// Upserts a board task and edge-fires a dispatch when the write moves the
+    /// card **into** `in_progress` — the drag into `in_progress` is the human
+    /// approval gate. The single write site for REST task mutations, so the
+    /// trigger cannot be bypassed by writing straight to the store.
+    ///
+    /// The dispatch is detached (see [`dispatch_task`](Self::dispatch_task)), so
+    /// the HTTP write returns immediately; the agent turn's result lands back on
+    /// the card asynchronously. Without an attached harness the board stays inert
+    /// — the card simply rests in `in_progress`.
+    pub async fn upsert_task(self: &Arc<Self>, task: &TaskRecord) -> Result<()> {
+        let prev_column = self
+            .ops
+            .tasks
+            .list(&self.id)
+            .await?
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .map(|t| t.column);
+        let dispatch = task_enters_in_progress(prev_column.as_deref(), &task.column);
+        self.ops.tasks.upsert(&self.id, task).await?;
+        if dispatch {
+            self.dispatch_task(task.id.clone());
+        }
+        Ok(())
+    }
+
+    /// Fires the detached [`TaskDispatched`] cycle for a task when a harness is
+    /// attached. Detached (`tokio::spawn`) so the board write returns at once;
+    /// the cycle writes its outcome back onto the card. In the default build (no
+    /// harness) this is a no-op, keeping the board inert.
+    ///
+    /// [`TaskDispatched`]: crate::ports::types::CompanyEvent::TaskDispatched
+    fn dispatch_task(self: &Arc<Self>, task_id: String) {
+        #[cfg(feature = "openhuman")]
+        if self.harness.is_some() {
+            let runtime = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(err) = runtime
+                    .run_cycle(vec![CompanyEvent::TaskDispatched {
+                        task_id: task_id.clone(),
+                    }])
+                    .await
+                {
+                    tracing::warn!(
+                        company = %runtime.id,
+                        task = %task_id,
+                        error = %err,
+                        "task dispatch cycle failed"
+                    );
+                }
+            });
+            return;
+        }
+        // Default build / no harness: the board stays inert. The card rests in
+        // `in_progress` until a harness cycle (or a human) advances it.
+        let _ = task_id;
     }
 
     /// This company's workspace file tree.
@@ -352,6 +499,18 @@ impl CompanyRuntime {
         .await
     }
 
+    /// Lists this company's captured feedback, newest first, as the
+    /// HTTP-safe [`FeedbackSummary`] projection.
+    ///
+    /// The operator's raw words never appear: they are local-only by
+    /// construction (see [`FeedbackItem::operator_words`]), so the reports list
+    /// shows what was reported and where it went, not what was typed.
+    pub async fn list_feedback(&self) -> Result<Vec<FeedbackSummary>> {
+        let mut items = self.feedback.list().await?;
+        items.sort_by_key(|item| std::cmp::Reverse(item.at_millis));
+        Ok(items.iter().map(FeedbackSummary::from_item).collect())
+    }
+
     /// A status snapshot, loading the company record for name and lifecycle.
     pub async fn status(&self) -> Result<CompanyStatus> {
         let record = self.store.load(&self.id).await?;
@@ -417,5 +576,24 @@ impl std::fmt::Debug for CompanyRuntime {
             .field("channels", &self.channels.len())
             .field("has_economy", &self.economy.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_enters_in_progress;
+
+    #[test]
+    fn dispatch_only_on_entering_in_progress() {
+        // Fresh card created straight into `in_progress` → dispatch.
+        assert!(task_enters_in_progress(None, "in_progress"));
+        // The drag: backlog → in_progress → dispatch.
+        assert!(task_enters_in_progress(Some("backlog"), "in_progress"));
+        // Already in_progress, re-saved (e.g. an edit) → no re-dispatch.
+        assert!(!task_enters_in_progress(Some("in_progress"), "in_progress"));
+        // Any non-in_progress target → no dispatch.
+        assert!(!task_enters_in_progress(Some("in_progress"), "in_review"));
+        assert!(!task_enters_in_progress(None, "backlog"));
+        assert!(!task_enters_in_progress(Some("in_review"), "done"));
     }
 }

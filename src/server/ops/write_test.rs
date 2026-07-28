@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::company::CompanyManifest;
+use crate::company::steer::{InflightEntry, InflightKind};
+use crate::ports::facts::{FactKind, FactRecord};
+use crate::ports::tasks::TaskRecord;
 use crate::ports::types::{CompanyId, CompanyRecord};
 use crate::runtime::RuntimeBuilder;
 use crate::server::router;
@@ -36,6 +39,7 @@ async fn state_with_company(home: &std::path::Path) -> AppState {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();
@@ -124,6 +128,14 @@ async fn tasks_crud_round_trips_under_both_scopes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(moved["column"], "done");
 
+    // List (GET) reflects the write — the board the console reads.
+    let (status, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = board.as_array().expect("array of cards");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], id);
+    assert_eq!(rows[0]["column"], "done");
+
     // Delete.
     let (status, _) = send(
         &state,
@@ -142,6 +154,117 @@ async fn tasks_crud_round_trips_under_both_scopes() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn steer_task_validates_statuses_and_journals_acceptance() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+    let endpoint = |key: &str| format!("/api/v1/company/tasks/{key}/steer");
+
+    for body in [
+        json!({"action": "unknown"}),
+        json!({"action": "cancel"}),
+        json!({"action": "redirect", "instruction": "   "}),
+    ] {
+        let (status, _) = send(&state, "POST", &endpoint("missing"), Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    runtime
+        .tasks()
+        .upsert(
+            &company,
+            &TaskRecord {
+                id: "idle".into(),
+                title: "Idle".into(),
+                note: None,
+                column: "backlog".into(),
+                priority: "medium".into(),
+                assignee: String::new(),
+                updated_at_millis: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &state,
+        "POST",
+        &endpoint("idle"),
+        Some(json!({"action": "pause"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        &endpoint("missing"),
+        Some(json!({"action": "pause"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let _delegation = runtime.steer().register(
+        &company,
+        InflightEntry {
+            key: "delegation".into(),
+            task_id: None,
+            kind: InflightKind::Delegation,
+            title: "Engineering".into(),
+            agent_id: "ceo".into(),
+            started_at_millis: 1,
+            pending_action: None,
+        },
+    );
+    let (status, _) = send(
+        &state,
+        "POST",
+        &endpoint("delegation"),
+        Some(json!({"action": "pause"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let _task = runtime.steer().register(
+        &company,
+        InflightEntry {
+            key: "active".into(),
+            task_id: Some("active".into()),
+            kind: InflightKind::Task,
+            title: "Active".into(),
+            agent_id: "ceo".into(),
+            started_at_millis: 2,
+            pending_action: None,
+        },
+    );
+    let (status, _) = send(
+        &state,
+        "POST",
+        &endpoint("active"),
+        Some(json!({"action": "redirect", "instruction": "focus on the API"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let events = runtime
+        .events()
+        .read_from(&company, crate::ports::types::EventSeq::new(0), usize::MAX)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|stored| matches!(
+        &stored.event,
+        crate::ports::types::CompanyEvent::TaskSteered {
+            task_id,
+            action,
+            instruction: Some(instruction),
+            ..
+        } if task_id == "active" && action == "redirect" && instruction == "focus on the API"
+    )));
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
@@ -170,6 +293,235 @@ async fn memory_create_and_delete_journals_event() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn memory_list_filters_stats_and_dual_write() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // Seed three facts with controlled, distinct timestamps so newest-first is
+    // deterministic (the HTTP create path stamps `now_millis`, which can tie
+    // across rapid inserts). Seeding straight into the FactStore also means
+    // these do NOT create ContextStore mirrors — only the HTTP create path does.
+    let seed = [
+        ("f-old", FactKind::Fact, "Alpha channel report", 1_000u64),
+        ("f-mid", FactKind::Preference, "Warm tone", 2_000),
+        ("f-new", FactKind::Person, "Priya contact", 3_000),
+    ];
+    for (id, kind, title, ts) in seed {
+        runtime
+            .facts()
+            .upsert(
+                runtime.id(),
+                &FactRecord {
+                    id: id.into(),
+                    kind,
+                    title: title.into(),
+                    body: "detail".into(),
+                    source: "Seed".into(),
+                    updated_at_millis: ts,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // List reflects the store, newest-first.
+    let (status, rows) = send(&state, "GET", "/api/v1/company/memory", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["id"], "f-new");
+    assert_eq!(rows[2]["id"], "f-old");
+
+    // `?kind=` narrows to one taxonomy.
+    let (status, pref) = send(
+        &state,
+        "GET",
+        "/api/v1/company/memory?kind=preference",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let pref = pref.as_array().unwrap();
+    assert_eq!(pref.len(), 1);
+    assert_eq!(pref[0]["id"], "f-mid");
+
+    // `?query=` is a case-insensitive substring over title + body.
+    let (status, hit) = send(&state, "GET", "/api/v1/company/memory?query=priya", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let hit = hit.as_array().unwrap();
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0]["id"], "f-new");
+
+    // Stats over the seeded facts: 3 facts, freshest timestamp, no agent chunks
+    // yet (seeding bypassed the mirror), 0 task outcomes.
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["facts"], 3);
+    assert_eq!(stats["factsUpdatedAtMillis"], 3_000);
+    assert_eq!(stats["agentChunks"], 0);
+    assert_eq!(stats["taskOutcomes"], 0);
+
+    // Dual-write: the HTTP create path mirrors the fact into the ContextStore so
+    // the agent can recall it. A direct search finds the mirrored text — the
+    // fix that closes the operator manual-ingest loop.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/memory",
+        Some(json!({"kind": "fact", "title": "Launch date", "body": "ships on Friday"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = runtime
+        .context
+        .search(runtime.id(), "Friday", 5)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.snippet.contains("ships on Friday")),
+        "an operator fact must be mirrored into the ContextStore for agent recall"
+    );
+
+    // Stats now count that mirror as an agent chunk (not a task outcome).
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["facts"], 4);
+    assert_eq!(stats["agentChunks"], 1);
+    assert_eq!(stats["taskOutcomes"], 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// End-to-end proof that the dual-write closes the manual-ingest loop: an
+/// operator note written over HTTP is retrieved by the harness's ContextStore
+/// search and rendered by `memory_loop::inject` into the augmented prompt. Gated
+/// on `openhuman` because `memory_loop` is only compiled under that feature.
+#[cfg(feature = "openhuman")]
+#[tokio::test]
+async fn memory_operator_fact_is_injected_into_the_agent_turn() {
+    use crate::harness::memory_loop;
+
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // Operator adds a note through the console write path.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/memory",
+        Some(json!({"kind": "reference", "title": "Launch plan", "body": "we ship on Friday at noon"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The harness retrieve step searches the ContextStore; the mirror lands
+    // there, so a relevant next-turn message recalls it and `inject` renders it
+    // into the augmented prompt — the closed loop, end to end.
+    // The fs ContextStore search is substring-based, so query a token that
+    // appears verbatim in the stored `title\nbody` mirror.
+    let hits = runtime
+        .context
+        .search(runtime.id(), "Friday", memory_loop::RETRIEVE_TOP_K)
+        .await
+        .unwrap();
+    assert!(!hits.is_empty(), "the operator note must be retrievable");
+    let augmented = memory_loop::inject("when do we ship?", &hits);
+    assert!(augmented.contains("Relevant prior work"));
+    assert!(augmented.contains("we ship on Friday at noon"));
+    assert!(augmented.trim_end().ends_with("when do we ship?"));
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Two-company isolation over HTTP: company B never sees company A's facts, and
+/// a tenant token may not address a company it does not own (403) — the same
+/// scoped-auth boundary the credential route enforces.
+#[tokio::test]
+async fn memory_is_isolated_between_companies() {
+    use crate::server::platform_auth::{
+        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+    };
+    use std::collections::HashSet;
+
+    let home = home();
+    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let state = AppState::new(AppConfig::default())
+        .with_home(home.clone())
+        .with_platform_auth(PlatformAuthConfig::new(verifier));
+
+    for name in ["a", "b"] {
+        let id = CompanyId::new(name);
+        let runtime = RuntimeBuilder::new(home.clone(), manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        state
+            .registry()
+            .insert(id.clone(), std::sync::Arc::new(runtime));
+        state.set_owner(id.clone(), format!("tenant:{name}"));
+    }
+
+    let token = |tenant: &str| {
+        StaticPlatformVerifier::tenant_token(&PlatformClaims {
+            tenant: tenant.to_string(),
+            scopes: HashSet::from(["operator".to_string()]),
+            companies: None,
+        })
+    };
+
+    // Company A's owner writes a fact to A.
+    let (status, _) = send_auth(
+        &state,
+        "POST",
+        "/api/v1/companies/a/memory",
+        Some(json!({"kind": "fact", "title": "A secret", "body": "A body"})),
+        Some(&token("tenant:a")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Company B's owner sees an empty memory — A's fact is invisible to B.
+    let (status, list_b) = send_auth(
+        &state,
+        "GET",
+        "/api/v1/companies/b/memory",
+        None,
+        Some(&token("tenant:b")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list_b.as_array().unwrap().len(), 0);
+
+    // A's own memory holds exactly the one fact.
+    let (status, list_a) = send_auth(
+        &state,
+        "GET",
+        "/api/v1/companies/a/memory",
+        None,
+        Some(&token("tenant:a")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list_a.as_array().unwrap().len(), 1);
+
+    // A's token may not address B's memory at all — 403 (scoped auth).
+    let (status, _) = send_auth(
+        &state,
+        "GET",
+        "/api/v1/companies/b/memory",
+        None,
+        Some(&token("tenant:a")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
@@ -260,17 +612,30 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     let home = home();
     let state = state_with_company(&home).await;
 
-    // Install from registry.
+    // Install from registry, carrying the entry's metadata so the host persists
+    // a real SKILL.md the agent can act on (not a content-less slug).
     let (status, skill) = send(
         &state,
         "POST",
         "/api/v1/company/skills/web-research/install",
-        None,
+        Some(json!({
+            "name": "Web Research",
+            "description": "Answer a question from multiple sources with citations.",
+            "category": "Research"
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(skill["source"], "registry");
     assert!(skill["enabled"].as_bool().unwrap());
+    // The install response reflects the persisted custom_doc (parsed back), so a
+    // non-empty description proves content was stored — the fix for the agent
+    // never receiving registry skills.
+    assert_eq!(skill["name"], "Web Research");
+    assert_eq!(
+        skill["description"],
+        "Answer a question from multiple sources with citations."
+    );
 
     // Uninstall the registry skill: 204.
     let (status, _) = send(
@@ -316,6 +681,19 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     assert_eq!(status, StatusCode::OK);
     assert!(!toggled["enabled"].as_bool().unwrap());
 
+    // `GET …/skills` returns the effective set: here (no source dir) that's the
+    // deltas — the custom skill, now disabled.
+    let (status, list) = send(&state, "GET", "/api/v1/company/skills", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = list.as_array().expect("a JSON array of skills");
+    let my_skill = rows
+        .iter()
+        .find(|s| s["id"] == "my-skill")
+        .expect("the custom skill is listed");
+    assert_eq!(my_skill["source"], "custom");
+    assert_eq!(my_skill["name"], "My Skill");
+    assert!(!my_skill["enabled"].as_bool().unwrap());
+
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
@@ -323,6 +701,16 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
 async fn team_overlay_add_delete_and_manifest_delete_conflict() {
     let home = home();
     let state = state_with_company(&home).await;
+
+    // The manifest teammate shows up on the read side before any overlay add,
+    // named `null` (the console falls back to the role).
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let roster = roster.as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["id"], "ceo");
+    assert_eq!(roster[0]["role"], "Chief");
+    assert!(roster[0]["name"].is_null());
 
     // Add an overlay teammate.
     let (status, member) = send(
@@ -335,6 +723,15 @@ async fn team_overlay_add_delete_and_manifest_delete_conflict() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(member["role"], "Designer");
     let id = member["id"].as_str().unwrap().to_string();
+
+    // The read side now merges in the overlay teammate, named this time.
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let roster = roster.as_array().unwrap();
+    assert_eq!(roster.len(), 2);
+    let dana = roster.iter().find(|m| m["id"] == id).unwrap();
+    assert_eq!(dana["name"], "Dana");
+    assert_eq!(dana["role"], "Designer");
 
     // Deleting a manifest teammate is a 409.
     let (status, body) = send(&state, "DELETE", "/api/v1/company/team/ceo", None).await;
@@ -350,6 +747,13 @@ async fn team_overlay_add_delete_and_manifest_delete_conflict() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The removed overlay teammate is gone from the read side too.
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let roster = roster.as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["id"], "ceo");
 
     // Toggle an inbox on.
     let (status, ack) = send(
@@ -498,5 +902,807 @@ async fn unknown_company_scope_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// MCP servers (issue #50)
+// ---------------------------------------------------------------------------
+
+/// A manifest that declares one committed `[[mcp_server]]` — used to assert the
+/// manifest-server guards (cannot delete; overridable).
+fn mcp_manifest() -> CompanyManifest {
+    toml::from_str(
+        "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n[[mcp_server]]\nname = \"docs\"\nendpoint = \"https://docs.example/mcp\"\n",
+    )
+    .unwrap()
+}
+
+/// Boots an fs-backed company from a caller-supplied manifest (mirrors
+/// `state_with_company`, which pins the default manifest).
+async fn state_with_manifest(home: &std::path::Path, manifest: CompanyManifest) -> AppState {
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let id = CompanyId::new("acme");
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    let state = AppState::new(AppConfig::default());
+    state.registry().insert(id, std::sync::Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+    state
+}
+
+#[tokio::test]
+async fn mcp_servers_crud_round_trips_and_token_is_write_only() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // Cold: no servers.
+    let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 0);
+
+    // Add a runtime server WITH a token.
+    let (status, added) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({
+            "name": "notion",
+            "endpoint": "https://notion.example/mcp",
+            "token": "sk-write-only-abc",
+            "allowedTools": ["search"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(added["server"]["name"], "notion");
+    assert_eq!(added["server"]["source"], "runtime");
+    assert_eq!(added["server"]["authConfigured"], true);
+    assert!(added["note"].as_str().unwrap().contains("rebuild"));
+
+    // The token must NOT appear anywhere in the add response.
+    assert!(
+        !serde_json::to_string(&added)
+            .unwrap()
+            .contains("sk-write-only-abc"),
+        "add response leaked the token"
+    );
+
+    // GET reflects it, still without the token.
+    let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = serde_json::to_string(&list).unwrap();
+    assert!(body.contains("notion"));
+    assert!(body.contains("\"authConfigured\":true"));
+    assert!(!body.contains("sk-write-only-abc"), "list leaked the token");
+
+    // Duplicate add is a 409.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "notion", "endpoint": "https://notion.example/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Non-http endpoint is a 400.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "bad", "endpoint": "ftp://x/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Disable via PUT.
+    let (status, updated) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/mcp/servers/notion",
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["server"]["enabled"], false);
+    assert_eq!(
+        updated["server"]["authConfigured"], true,
+        "token survives an update"
+    );
+
+    // Delete (runtime server) → 204, then it's gone.
+    let (status, _) = send(&state, "DELETE", "/api/v1/company/mcp/servers/notion", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn mcp_manifest_server_cannot_be_deleted_but_can_be_overridden() {
+    let home = home();
+    let state = state_with_manifest(&home, mcp_manifest()).await;
+
+    // The manifest server shows up as `manifest`.
+    let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["name"], "docs");
+    assert_eq!(list[0]["source"], "manifest");
+
+    // Deleting a manifest server is a 409.
+    let (status, _) = send(&state, "DELETE", "/api/v1/company/mcp/servers/docs", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // But it can be disabled via a runtime override — still badged manifest.
+    let (status, updated) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/mcp/servers/docs",
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["server"]["source"], "manifest");
+    assert_eq!(updated["server"]["enabled"], false);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Without the `openhuman` feature there is no MCP transport, so live discovery
+/// is "not wired". (Under the feature it would attempt a real network call.)
+#[cfg(not(feature = "openhuman"))]
+#[tokio::test]
+async fn mcp_discovery_is_not_wired_without_the_feature() {
+    let home = home();
+    let state = state_with_manifest(&home, mcp_manifest()).await;
+    let (status, body) = send(
+        &state,
+        "GET",
+        "/api/v1/company/mcp/servers/docs/tools",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_wired");
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// A `user:pass@host` endpoint smuggles a credential into the URL — rejected as
+/// a 400 (the error-hardening cell's validate-on-add).
+#[tokio::test]
+async fn mcp_userinfo_endpoint_is_rejected() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "creds", "endpoint": "https://user:pass@host/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// A query-parameter credential (BrowserBase style) round-trips write-only:
+/// `authConfigured` flips true, the value never appears in the response, and a
+/// non-secret id left in the endpoint URL raises the non-blocking advisory.
+#[tokio::test]
+async fn mcp_query_param_auth_round_trips_write_only_with_advisory() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    let (status, added) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({
+            "name": "browserbase",
+            // A secret-looking query param triggers the advisory; the real
+            // credential rides write-only as a query-parameter auth.
+            "endpoint": "https://api.browserbase.com/mcp?apiKey=leftover",
+            "authKind": "query_param",
+            "paramName": "apiKey",
+            "token": "qp-secret-xyz"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(added["server"]["authConfigured"], true);
+    assert!(
+        added["warning"].as_str().is_some(),
+        "a secret-looking endpoint query raises the advisory: {added}"
+    );
+    assert!(
+        !serde_json::to_string(&added)
+            .unwrap()
+            .contains("qp-secret-xyz"),
+        "the query-parameter credential leaked into the response"
+    );
+
+    // A query_param auth WITHOUT a paramName is a 400.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({
+            "name": "noparam",
+            "endpoint": "https://host/mcp",
+            "authKind": "query_param",
+            "token": "x"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Workflow creator (issue #69)
+// ---------------------------------------------------------------------------
+
+/// Boots an fs-backed company with a writable source directory (a `seed_dir`)
+/// — the workflow creator writes `workflows/<id>.toml` under it, mirroring how
+/// a real `companies/<name>` checkout is wired via `--company`.
+async fn state_with_source_dir(
+    home: &std::path::Path,
+    seed_dir: &std::path::Path,
+    manifest: CompanyManifest,
+) -> AppState {
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let id = CompanyId::new("acme");
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .with_id(id.clone())
+        .with_seed_dir(seed_dir.to_path_buf())
+        .build()
+        .await
+        .unwrap();
+    let state = AppState::new(AppConfig::default());
+    state.registry().insert(id, std::sync::Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+    state
+}
+
+/// A valid graph body: a trigger → an agent node naming the roster's `ceo` →
+/// an output. `$id` becomes both the workflow id and its display name.
+fn workflow_body(id: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "description": "A tiny test graph.",
+        "nodes": [
+            {"id": "start", "kind": "trigger", "name": "Start"},
+            {"id": "worker", "kind": "agent", "name": "Worker", "agent": "ceo"},
+            {"id": "done", "kind": "output", "name": "Done"},
+        ],
+        "edges": [
+            {"from": "start", "to": "worker"},
+            {"from": "worker", "to": "done", "label": "ok"},
+        ],
+    })
+}
+
+#[tokio::test]
+async fn workflow_create_writes_file_appends_enabled_and_is_listed() {
+    let home = home();
+    let seed_dir = home.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let state = state_with_source_dir(&home, &seed_dir, manifest()).await;
+
+    let (status, created) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["id"], "greet");
+    assert_eq!(created["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(created["edges"].as_array().unwrap().len(), 2);
+
+    // The graph landed on disk as TOML under the seed dir.
+    let path = seed_dir.join("workflows").join("greet.toml");
+    assert!(path.is_file(), "workflow file was written to {path:?}");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("id = \"greet\""));
+    assert!(on_disk.contains("agent = \"ceo\""));
+
+    // The operator's live manifest record gained the id in `[workflows].enabled`
+    // — the version-controlled seed dir's own `company.toml` was never touched
+    // (there isn't one here; only the store's copy is checked).
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let record = store.load(&CompanyId::new("acme")).await.unwrap().unwrap();
+    assert_eq!(record.manifest.workflows.enabled, vec!["greet".to_string()]);
+
+    // `GET …/workflows` (which scans the seed dir) now lists it.
+    let (status, list) = send(&state, "GET", "/api/v1/company/workflows", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "greet");
+
+    // `GET …/workflows/{wid}` round-trips the full graph too.
+    let (status, graph) = send(&state, "GET", "/api/v1/company/workflows/greet", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(graph["name"], "greet");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn workflow_create_duplicate_id_is_conflict() {
+    let home = home();
+    let seed_dir = home.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let state = state_with_source_dir(&home, &seed_dir, manifest()).await;
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "conflict");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn workflow_create_rejects_bad_edges_missing_agent_and_no_trigger() {
+    let home = home();
+    let seed_dir = home.join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let state = state_with_source_dir(&home, &seed_dir, manifest()).await;
+
+    // An edge referencing a node id that doesn't exist.
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(json!({
+            "id": "bad-edge",
+            "name": "Bad edge",
+            "nodes": [{"id": "start", "kind": "trigger", "name": "Start"}],
+            "edges": [{"from": "start", "to": "ghost"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+
+    // An agent node naming a teammate not on the roster.
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(json!({
+            "id": "bad-agent",
+            "name": "Bad agent",
+            "nodes": [
+                {"id": "start", "kind": "trigger", "name": "Start"},
+                {"id": "worker", "kind": "agent", "name": "Worker", "agent": "ghost"},
+            ],
+            "edges": [{"from": "start", "to": "worker"}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+    assert!(body["error"].as_str().unwrap().contains("roster"), "{body}");
+
+    // No trigger node at all.
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(json!({
+            "id": "no-trigger",
+            "name": "No trigger",
+            "nodes": [{"id": "only", "kind": "output", "name": "Only"}],
+            "edges": [],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+
+    // None of the rejected attempts left a file behind.
+    assert!(
+        !seed_dir.join("workflows").is_dir() || {
+            std::fs::read_dir(seed_dir.join("workflows"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)
+        }
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn workflow_create_without_source_dir_is_bad_request() {
+    let home = home();
+    // `state_with_company` boots with no `seed_dir`, so the company has no
+    // writable source directory — the platform-provisioned-mode case.
+    let state = state_with_company(&home).await;
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/workflows",
+        Some(workflow_body("greet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Without the `openhuman` feature the on-demand Test route is "not wired".
+#[cfg(not(feature = "openhuman"))]
+#[tokio::test]
+async fn mcp_test_route_is_not_wired_without_the_feature() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "notion", "endpoint": "https://notion.example/mcp" })),
+    )
+    .await;
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers/notion/test",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_wired");
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Under the `openhuman` feature, adding a server probes it — and a probe that
+/// fails (dead endpoint) is **never** rolled back: the server stays added, and
+/// its scrubbed health is returned as `test` and persisted onto the GET shape.
+#[cfg(feature = "openhuman")]
+#[tokio::test]
+async fn mcp_add_probes_without_rollback_and_persists_health() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // A syntactically valid but unreachable endpoint (nothing listening).
+    let (status, added) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers",
+        Some(json!({ "name": "dead", "endpoint": "http://127.0.0.1:1/mcp" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // No rollback — the server is present despite the failed probe.
+    assert_eq!(added["server"]["name"], "dead");
+    // The probe result is echoed and the status is a non-ok tier.
+    assert!(added["test"].is_object(), "probe result echoed: {added}");
+    assert_ne!(added["test"]["status"], "ok");
+
+    // The health is persisted onto the GET shape too.
+    let (_, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
+    let server = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "dead")
+        .expect("server present");
+    assert!(server["health"].is_object(), "health persisted: {server}");
+
+    // On-demand Test re-probes and returns health.
+    let (status, health) = send(
+        &state,
+        "POST",
+        "/api/v1/company/mcp/servers/dead/test",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        health["status"].is_string(),
+        "test returns health: {health}"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+// -- Telegram channel (issue #31) -------------------------------------------
+
+use crate::company::telegram::RecordingTelegramApi;
+
+/// A running "acme" company whose host has a recording Telegram transport
+/// injected, so the inbound webhook can actually deliver a reply offline.
+async fn state_with_telegram(home: &std::path::Path, api: RecordingTelegramApi) -> AppState {
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.to_path_buf());
+    let id = CompanyId::new("acme");
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest())
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    let connections =
+        crate::server::ops::ConnectionsRuntime::new().with_telegram(std::sync::Arc::new(api));
+    let state = AppState::new(AppConfig::default()).with_connections(connections);
+    state.registry().insert(id, std::sync::Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+    state
+}
+
+/// Posts a raw Telegram update to the inbound webhook (no session; the secret
+/// header is the only credential), returning the status and JSON body.
+async fn telegram_hook(
+    state: &AppState,
+    secret_header: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value, String) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/hooks/acme/telegram")
+        .header("content-type", "application/json");
+    if let Some(secret) = secret_header {
+        request = request.header("x-telegram-bot-api-secret-token", secret);
+    }
+    let request = request.body(Body::from(body.to_string())).unwrap();
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let raw = String::from_utf8_lossy(&bytes).to_string();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value, raw)
+}
+
+const BOT_TOKEN: &str = "7654321:AAExampleBotTokenNeverLeaks";
+const WEBHOOK_SECRET: &str = "wh-secret-abc123";
+
+fn telegram_update(chat_id: i64, text: &str) -> Value {
+    json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 7,
+            "from": { "id": 999, "username": "bob" },
+            "chat": { "id": chat_id, "type": "private" },
+            "text": text,
+        }
+    })
+}
+
+#[tokio::test]
+async fn telegram_config_is_write_only_and_status_reads_back() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // Nothing configured yet.
+    let (status, cfg) = send(&state, "GET", "/api/v1/company/channels/telegram", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cfg["configured"], false);
+    assert_eq!(cfg["tokenSet"], false);
+    assert!(
+        cfg["webhookUrl"]
+            .as_str()
+            .unwrap()
+            .ends_with("/hooks/acme/telegram")
+    );
+
+    // Store both credentials (write-only).
+    let (status, cfg) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN, "webhookSecret": WEBHOOK_SECRET })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cfg["configured"], true);
+    assert_eq!(cfg["tokenSet"], true);
+    assert_eq!(cfg["secretSet"], true);
+    // Neither secret is ever echoed back.
+    let body = cfg.to_string();
+    assert!(
+        !body.contains(BOT_TOKEN),
+        "bot token leaked into PUT status"
+    );
+    assert!(
+        !body.contains(WEBHOOK_SECRET),
+        "secret leaked into PUT status"
+    );
+
+    // A partial write rotates the secret without re-sending the token.
+    let (status, _) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "webhookSecret": "rotated" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, cfg) = send(&state, "GET", "/api/v1/company/channels/telegram", None).await;
+    assert_eq!(cfg["tokenSet"], true, "token survived a secret-only PUT");
+
+    // DELETE clears both.
+    let (status, cfg) = send(&state, "DELETE", "/api/v1/company/channels/telegram", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cfg["configured"], false);
+    assert_eq!(cfg["tokenSet"], false);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn telegram_webhook_rejects_an_unverified_post() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN, "webhookSecret": WEBHOOK_SECRET })),
+    )
+    .await;
+
+    // No secret header at all.
+    let (status, _, _) = telegram_hook(&state, None, telegram_update(1, "hi")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Wrong secret.
+    let (status, _, _) = telegram_hook(&state, Some("nope"), telegram_update(1, "hi")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn telegram_inbound_runs_a_turn_and_delivers_the_reply_back() {
+    let home = home();
+    let api = RecordingTelegramApi::new();
+    let state = state_with_telegram(&home, api.clone()).await;
+    send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN, "webhookSecret": WEBHOOK_SECRET })),
+    )
+    .await;
+
+    // A verified inbound update runs one cycle; the echo brain replies and the
+    // reply is delivered back to the ORIGIN chat (555), not any other.
+    let (status, body, raw) = telegram_hook(
+        &state,
+        Some(WEBHOOK_SECRET),
+        telegram_update(555, "status?"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["delivered"], 1);
+    assert_eq!(api.sent(), vec![(555, "You said: status?".to_string())]);
+    // The bot token never appears in the webhook response.
+    assert!(
+        !raw.contains(BOT_TOKEN),
+        "token leaked into webhook response"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn telegram_set_webhook_registers_the_public_url() {
+    let home = home();
+    let api = RecordingTelegramApi::new();
+    let state = state_with_telegram(&home, api.clone()).await;
+    send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN, "webhookSecret": WEBHOOK_SECRET })),
+    )
+    .await;
+
+    let (status, res) = send(
+        &state,
+        "POST",
+        "/api/v1/company/channels/telegram/webhook",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["ok"], true);
+    let webhooks = api.webhooks();
+    assert_eq!(webhooks.len(), 1);
+    assert!(webhooks[0].ends_with("/hooks/acme/telegram"));
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn telegram_token_never_leaks_even_when_delivery_fails() {
+    let home = home();
+    // A transport that fails with an error embedding the bot token.
+    let api = RecordingTelegramApi::failing_with_token_echo();
+    let state = state_with_telegram(&home, api).await;
+    send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN, "webhookSecret": WEBHOOK_SECRET })),
+    )
+    .await;
+
+    // The turn still runs; a delivery failure never fails the webhook and never
+    // surfaces the token in the response body.
+    let (status, body, raw) =
+        telegram_hook(&state, Some(WEBHOOK_SECRET), telegram_update(42, "ping")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["delivered"], 0);
+    assert!(
+        !raw.contains(BOT_TOKEN),
+        "token leaked on a failed delivery"
+    );
+
     tokio::fs::remove_dir_all(&home).await.ok();
 }

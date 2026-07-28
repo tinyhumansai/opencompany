@@ -1,20 +1,9 @@
-// The company's skills: capability write-ups (SKILL.md files) the operator can
-// view, enable/disable, install from a registry, or add. Persisted per company
-// in localStorage; the console has no skills API yet, so this is a local store
-// seeded from the company's own skills plus a shared registry.
+// Static skill presentation data for the console: the shared registry the
+// operator can install from, plus per-category badge styling. The company's
+// live effective skills (installed/enabled state) come from the host over the
+// `…/skills` API (`@/api/skills`), not from here.
 
 export type SkillCategory = "Marketing" | "Research" | "Ops" | "Content" | "Finance";
-
-export type SkillSource = "company" | "registry" | "custom";
-
-export interface InstalledSkill {
-  id: string;
-  name: string;
-  description: string;
-  category: SkillCategory;
-  source: SkillSource;
-  enabled: boolean;
-}
 
 export interface RegistrySkill {
   id: string;
@@ -41,55 +30,3 @@ export const SKILL_REGISTRY: RegistrySkill[] = [
   { id: "meeting-notes", name: "Meeting Notes", description: "Turn a transcript into decisions and action items.", category: "Content", publisher: "OpenCompany" },
   { id: "invoice-drafting", name: "Invoice Drafting", description: "Draft invoices from a scope and rate card.", category: "Finance", publisher: "OpenCompany" },
 ];
-
-let n = 0;
-const genId = () => `skill-${Date.now().toString(36)}-${n++}`;
-
-export function fromRegistry(skill: RegistrySkill): InstalledSkill {
-  return { ...skill, source: "registry", enabled: true };
-}
-
-export function newSkill(fields: {
-  name: string;
-  description: string;
-  category: SkillCategory;
-}): InstalledSkill {
-  return {
-    id: genId(),
-    name: fields.name.trim(),
-    description: fields.description.trim(),
-    category: fields.category,
-    source: "custom",
-    enabled: true,
-  };
-}
-
-const KEY = (company: string | null) => `oc-skills:${company ?? "single"}`;
-
-export function loadSkills(company: string | null): InstalledSkill[] {
-  try {
-    const raw = localStorage.getItem(KEY(company));
-    if (raw) return JSON.parse(raw) as InstalledSkill[];
-  } catch {
-    /* fall through to seed */
-  }
-  return seedSkills();
-}
-
-export function saveSkills(company: string | null, skills: InstalledSkill[]): void {
-  try {
-    localStorage.setItem(KEY(company), JSON.stringify(skills));
-  } catch {
-    /* storage unavailable */
-  }
-}
-
-/** The company's own skills, from its `skills/` directory. */
-function seedSkills(): InstalledSkill[] {
-  return [
-    { id: "seo-audit", name: "SEO Audit", description: "Audit a site's organic-search health and produce prioritized fixes.", category: "Marketing", source: "company", enabled: true },
-    { id: "landing-page", name: "Landing Page", description: "Build and A/B test a conversion-focused landing page from a brief.", category: "Marketing", source: "company", enabled: true },
-    { id: "email-campaign", name: "Email Campaign", description: "Design and send a lifecycle or broadcast email program.", category: "Marketing", source: "company", enabled: true },
-    { id: "brand-positioning", name: "Brand Positioning", description: "Define a company's positioning on one page.", category: "Marketing", source: "company", enabled: false },
-  ];
-}

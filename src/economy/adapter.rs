@@ -345,6 +345,7 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             })
             .await
             .expect("save");

@@ -1,9 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ArrowUp, Building2, PenSquare } from "lucide-react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  ArrowUp,
+  Brain,
+  Building2,
+  ChevronDown,
+  ChevronRight,
+  CornerUpRight,
+  Loader2,
+  Pause,
+  PenSquare,
+  Send,
+  Wrench,
+  X,
+} from "lucide-react";
+import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
-import { ApiError } from "@/api/types";
+import { ApiError, type TurnStep, type TurnStepKind } from "@/api/types";
+import { listInflight, steerTask, type InflightRun, type SteerAction } from "@/api/tasks";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
@@ -18,19 +36,31 @@ interface Props {
   setMessages: (threadId: string, updater: (m: ChatMessage[]) => ChatMessage[]) => void;
   /** Called after a reply lands, so the parent can refresh approvals/status. */
   onReply?: () => void;
+  /** Bumped on every task-lifecycle SSE event, so the in-flight strip refetches. */
+  taskEventTick?: number;
+  /**
+   * The live in-flight tool timeline per thread, built from the transient
+   * `tool_call`/`tool_result` SSE frames while a turn runs. Rendered under the
+   * typing indicator and cleared by the parent when the final reply lands.
+   */
+  liveStepsByThread?: Record<string, TurnStep[]>;
+  /** Marks a thread's chat POST as in flight (parent suppresses the SSE echo). */
+  onSendStart?: (threadId: string) => void;
+  /** Clears the in-flight mark + live timeline once the POST resolves. */
+  onSendEnd?: (threadId: string) => void;
 }
 
 /** Consecutive messages from one sender within this window group together. */
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 /** WhatsApp-style two-pane chat: a thread list on the left, transcript right. */
-export function Conversation({ client, company, threads, activeId, onSelect, setMessages, onReply }: Props) {
+export function Conversation({ client, company, threads, activeId, onSelect, setMessages, onReply, taskEventTick, liveStepsByThread, onSendStart, onSendEnd }: Props) {
   const active = threads.find((t) => t.id === activeId) ?? threads[0];
   // On mobile, the list and the chat share the pane — track which is showing.
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("chat");
 
   return (
-    <div className="flex flex-1 overflow-hidden">
+    <div className="flex min-h-0 flex-1 overflow-hidden">
       <ThreadList
         threads={threads}
         activeId={active.id}
@@ -47,6 +77,10 @@ export function Conversation({ client, company, threads, activeId, onSelect, set
         thread={active}
         setMessages={setMessages}
         onReply={onReply}
+        taskEventTick={taskEventTick}
+        liveSteps={liveStepsByThread?.[active.id] ?? []}
+        onSendStart={onSendStart}
+        onSendEnd={onSendEnd}
         onOpenList={() => setMobilePane("list")}
         className={cn("md:flex", mobilePane === "chat" ? "flex" : "hidden")}
       />
@@ -68,7 +102,7 @@ function ThreadList({
   className?: string;
 }) {
   return (
-    <aside className={cn("w-full shrink-0 flex-col border-r bg-card/40 md:w-80", className)}>
+    <aside className={cn("min-h-0 w-full shrink-0 flex-col border-r bg-card/40 md:w-80", className)}>
       <div className="flex items-center justify-between px-4 py-3">
         <h2 className="text-sm font-semibold">Chats</h2>
         <Button variant="ghost" size="icon" className="size-8" aria-label="New chat" disabled>
@@ -116,6 +150,10 @@ function ChatPane({
   thread,
   setMessages,
   onReply,
+  taskEventTick,
+  liveSteps,
+  onSendStart,
+  onSendEnd,
   onOpenList,
   className,
 }: {
@@ -124,6 +162,10 @@ function ChatPane({
   thread: Thread;
   setMessages: (threadId: string, updater: (m: ChatMessage[]) => ChatMessage[]) => void;
   onReply?: () => void;
+  taskEventTick?: number;
+  liveSteps?: TurnStep[];
+  onSendStart?: (threadId: string) => void;
+  onSendEnd?: (threadId: string) => void;
   onOpenList: () => void;
   className?: string;
 }) {
@@ -144,10 +186,15 @@ function ChatPane({
     setDraft("");
     setMessages(thread.id, (m) => [...m, makeMessage("you", text)]);
     setSending(true);
+    onSendStart?.(thread.id);
     try {
-      const reply = await client.chat(text, company);
+      // Address the active desk thread (issue #53). "main" and any id the
+      // company doesn't define fall to the orchestrator on the backend.
+      const reply = await client.chat(text, company, thread.id);
       const replies = reply.responses.length
-        ? reply.responses.map((r) => makeMessage("company", r.text, { channel: r.channel }))
+        ? reply.responses.map((r) =>
+            makeMessage("company", r.text, { channel: r.channel, steps: r.steps }),
+          )
         : [makeMessage("system", "(no reply)")];
       setMessages(thread.id, (m) => [...m, ...replies]);
       onReply?.();
@@ -156,6 +203,7 @@ function ChatPane({
       setMessages(thread.id, (m) => [...m, makeMessage("system", `Couldn't send — ${msg}`)]);
     } finally {
       setSending(false);
+      onSendEnd?.(thread.id);
     }
   }
 
@@ -167,7 +215,7 @@ function ChatPane({
   }
 
   return (
-    <section className={cn("flex-1 flex-col overflow-hidden", className)}>
+    <section className={cn("min-h-0 flex-1 flex-col overflow-hidden", className)}>
       {/* Contact header */}
       <div className="flex items-center gap-3 border-b px-4 py-2.5">
         <Button
@@ -201,9 +249,20 @@ function ChatPane({
           {groups.map((g, i) => (
             <MessageGroup key={g.key} group={g} prev={groups[i - 1]} />
           ))}
-          {sending && <TypingIndicator contact={thread.contact} />}
+          {sending && (
+            <>
+              {/* Live tool timeline — the running/done rows stream in over SSE as
+                  the turn works, before the final reply lands (issue: tool calls
+                  weren't visible until the turn finished). */}
+              {liveSteps && liveSteps.length > 0 && <StepTimeline steps={liveSteps} />}
+              <TypingIndicator contact={thread.contact} />
+            </>
+          )}
         </div>
       </div>
+
+      {/* In-flight steer strip (issue #111) */}
+      <InflightStrip client={client} company={company} taskEventTick={taskEventTick} />
 
       {/* Composer */}
       <div className="border-t bg-background/80 backdrop-blur">
@@ -233,6 +292,211 @@ function ChatPane({
         </div>
       </div>
     </section>
+  );
+}
+
+/* ---- in-flight steer strip (issue #111) ---- */
+
+/** Past-tense badge copy while a steer of the given verb is in flight. */
+const PENDING_LABEL: Record<string, string> = {
+  pause: "pausing…",
+  cancel: "cancelling…",
+  redirect: "redirecting…",
+};
+
+/**
+ * A strip above the composer listing the company's in-flight runs, so the
+ * operator can steer them (issue #111) without leaving company chat: pause,
+ * redirect, or cancel a dispatched task; cancel a sub-agent delegation. Reads
+ * {@link listInflight} on mount and refetches on any successful steer and on
+ * each task-lifecycle SSE tick. Renders nothing when nothing is in flight (or
+ * when the host has no inflight route), so it stays out of the way.
+ */
+function InflightStrip({
+  client,
+  company,
+  taskEventTick,
+}: {
+  client: OpenCompanyClient;
+  company: string | null;
+  taskEventTick?: number;
+}) {
+  const [runs, setRuns] = useState<InflightRun[]>([]);
+  const mounted = useRef(true);
+
+  const refresh = useCallback(async () => {
+    try {
+      const rows = await listInflight(client, company);
+      if (mounted.current) setRuns(rows);
+    } catch {
+      // Best-effort surface: a host without the inflight route (404) just means
+      // no strip. Clear rather than surface an error into the chat.
+      if (mounted.current) setRuns([]);
+    }
+  }, [client, company]);
+
+  useEffect(() => {
+    mounted.current = true;
+    void refresh();
+    return () => {
+      mounted.current = false;
+    };
+  }, [refresh]);
+
+  // Live refetch when a task-lifecycle event rides the SSE stream.
+  useEffect(() => {
+    if (taskEventTick !== undefined) void refresh();
+  }, [taskEventTick, refresh]);
+
+  if (runs.length === 0) return null;
+
+  return (
+    <div className="border-t bg-muted/30">
+      <div className="mx-auto w-full max-w-3xl px-4 py-2">
+        <p className="mb-1.5 px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          In flight · {runs.length}
+        </p>
+        <div className="flex flex-col gap-1.5">
+          {runs.map((run) => (
+            <InflightRow key={run.key} run={run} onSteer={refresh} client={client} company={company} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InflightRow({
+  run,
+  onSteer,
+  client,
+  company,
+}: {
+  run: InflightRun;
+  onSteer: () => Promise<void> | void;
+  client: OpenCompanyClient;
+  company: string | null;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [redirecting, setRedirecting] = useState(false);
+  const [instruction, setInstruction] = useState("");
+
+  // A pending server-side steer, or an optimistic local one, freezes the row.
+  const pending = run.pendingAction ?? null;
+  const disabled = busy || pending !== null;
+
+  async function steer(action: SteerAction, opts?: { instruction?: string; confirm?: boolean }) {
+    setBusy(true);
+    try {
+      await steerTask(client, company, run.key, { action, ...opts });
+      setRedirecting(false);
+      setInstruction("");
+      await onSteer();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "could not steer the task");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onCancel() {
+    // Cancel is destructive — the backend also requires `confirm: true`.
+    if (!window.confirm(`Cancel “${run.title}”? This stops the run.`)) return;
+    void steer("cancel", { confirm: true });
+  }
+
+  function onRedirect() {
+    const text = instruction.trim();
+    if (!text) return;
+    void steer("redirect", { instruction: text });
+  }
+
+  const isTask = run.kind === "task";
+
+  return (
+    <div className="rounded-lg border bg-card px-2.5 py-1.5">
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-medium">{run.title}</p>
+          <p className="truncate text-[11px] text-muted-foreground">
+            {run.kind === "delegation" ? "Delegation" : "Task"} · {run.agentId}
+          </p>
+        </div>
+
+        {pending !== null ? (
+          <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+            {PENDING_LABEL[pending] ?? "steering…"}
+          </span>
+        ) : (
+          <div className="flex shrink-0 items-center gap-1">
+            {busy && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
+            {isTask && (
+              <>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  disabled={disabled}
+                  onClick={() => void steer("pause")}
+                >
+                  <Pause className="mr-1 size-3.5" />
+                  Pause
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  disabled={disabled}
+                  aria-pressed={redirecting}
+                  onClick={() => setRedirecting((r) => !r)}
+                >
+                  <CornerUpRight className="mr-1 size-3.5" />
+                  Redirect
+                </Button>
+              </>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+              disabled={disabled}
+              onClick={onCancel}
+            >
+              <X className="mr-1 size-3.5" />
+              Cancel
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {isTask && redirecting && pending === null && (
+        <div className="mt-1.5 flex items-center gap-1.5">
+          <Input
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                onRedirect();
+              }
+            }}
+            placeholder="New instruction for this task…"
+            aria-label={`New instruction for ${run.title}`}
+            className="h-7 flex-1 text-xs"
+            autoFocus
+          />
+          <Button
+            size="icon"
+            className="size-7 shrink-0"
+            disabled={disabled || !instruction.trim()}
+            onClick={onRedirect}
+            aria-label="Send redirect"
+          >
+            <Send className="size-3.5" />
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -286,7 +550,10 @@ function MessageGroup({ group, prev }: { group: Group; prev?: Group }) {
             </div>
           )}
           {group.messages.map((m, i) => (
-            <Bubble key={m.id} message={m} mine={mine} last={i === group.messages.length - 1} />
+            <Fragment key={m.id}>
+              {!mine && m.steps && m.steps.length > 0 && <StepTimeline steps={m.steps} />}
+              <Bubble message={m} mine={mine} last={i === group.messages.length - 1} />
+            </Fragment>
           ))}
         </div>
       </div>
@@ -314,6 +581,88 @@ function Bubble({ message, mine, last }: { message: ChatMessage; mine: boolean; 
       </span>
     </div>
   );
+}
+
+/* ---- processing-step timeline (Activity-trace) ---- */
+
+/**
+ * The scrubbed processing steps behind a company reply, rendered above its
+ * bubble. Collapsed by default to a one-line "N steps · M failed" summary; auto
+ * expands when any step failed so a silent MCP failure is visible, not buried.
+ * Renders nothing when there are no steps (a memory-served / tool-less reply).
+ */
+function StepTimeline({ steps }: { steps: TurnStep[] }) {
+  const failed = steps.filter((s) => s.status === "error").length;
+  const hasError = failed > 0;
+  const [open, setOpen] = useState(hasError);
+
+  if (steps.length === 0) return null;
+
+  return (
+    <div className="w-full max-w-[85%] sm:max-w-[75%]">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className={cn(
+          "flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium transition-colors hover:bg-accent/60",
+          hasError ? "text-destructive" : "text-muted-foreground",
+        )}
+      >
+        {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+        <span>
+          {steps.length} step{steps.length === 1 ? "" : "s"}
+          {failed > 0 && ` · ${failed} failed`}
+        </span>
+      </button>
+      {open && (
+        <ol className="mt-0.5 flex flex-col gap-1 rounded-lg border bg-card/60 px-2.5 py-1.5">
+          {steps.map((step, i) => (
+            <StepRow key={i} step={step} />
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+function StepRow({ step }: { step: TurnStep }) {
+  const error = step.status === "error";
+  const Icon = stepIcon(step.kind);
+  return (
+    <li
+      className={cn(
+        "flex items-center gap-1.5 text-[11px] leading-relaxed",
+        error ? "text-destructive" : "text-muted-foreground",
+      )}
+    >
+      <Icon className={cn("size-3 shrink-0", step.status === "running" && "animate-pulse")} />
+      <span className={cn("font-medium", !error && "text-foreground/80")}>{step.label}</span>
+      {step.detail && <span className="min-w-0 truncate">— {step.detail}</span>}
+      {typeof step.elapsedMs === "number" && (
+        <span className="ml-auto shrink-0 tabular-nums opacity-70">
+          {formatElapsed(step.elapsedMs)}
+        </span>
+      )}
+    </li>
+  );
+}
+
+function stepIcon(kind: TurnStepKind) {
+  switch (kind) {
+    case "tool_call":
+      return Wrench;
+    case "thinking":
+      return Brain;
+    case "note":
+      return AlertTriangle;
+    default:
+      return Wrench;
+  }
+}
+
+function formatElapsed(ms: number): string {
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
 function SenderAvatar({ sender }: { sender: Sender }) {

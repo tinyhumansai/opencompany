@@ -18,15 +18,24 @@ use crate::brain::medulla::MedullaTransport;
 use crate::brain::medulla::wire::ToolManifestEntry;
 use crate::brain::{EchoBrain, HostedMedullaBrain};
 use crate::company::CompanyManifest;
+#[cfg(feature = "openhuman")]
+use crate::company::inference::{self, EnvDefault};
 use crate::company::runtime::{CompanyRuntime, OpsStores};
 use crate::feedback::github::{GitHubClient, RateLimiter};
 use crate::feedback::service::FeedbackFiler;
 use crate::feedback::store::FeedbackStore;
+use crate::feedback::tinyhumans::TinyHumansClient;
 use crate::feedback::tool::BuiltinToolProvider;
 use crate::feedback::types::ConsentMode;
+#[cfg(feature = "openhuman")]
+use crate::harness::provider::{HostedProviderConfig, TenantProvider};
+#[cfg(feature = "openhuman")]
+use crate::harness::{HarnessBrain, HarnessDeps};
 use crate::openhuman::rpc::OpenHumanRpc;
 use crate::openhuman::{OpenHumanChannelAdapter, OpenHumanToolProvider};
 use crate::policy::ManifestApprovalGate;
+#[cfg(feature = "openhuman")]
+use crate::ports::WorkflowRunner;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::ports::{
     AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
@@ -40,6 +49,8 @@ use crate::store::paths::Bundle;
 use crate::store::{
     FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsOps, FsSecretStore,
 };
+#[cfg(feature = "openhuman")]
+use crate::workflows::HarnessWorkflowRunner;
 
 /// Derives a filesystem-and-URL-safe company id from a display name.
 ///
@@ -89,6 +100,27 @@ pub fn effective_grants(manifest: &CompanyManifest) -> Vec<String> {
             }
         }
     }
+    dedup(grants)
+}
+
+/// One agent's effective tool grants: its own `tools` narrowed by the company
+/// `allow`-list, or the full allow-list when the agent lists none. This is the
+/// per-agent slice of [`effective_grants`], used by the harness to decide which
+/// tool families an individual agent receives.
+///
+/// Gated to the `openhuman` feature: its only caller is `build_roster`, which is
+/// itself feature-gated, so the default build would otherwise flag it dead.
+#[cfg(feature = "openhuman")]
+pub(crate) fn agent_effective_grants(allow: &[String], agent_tools: &[String]) -> Vec<String> {
+    let grants: Vec<String> = if agent_tools.is_empty() {
+        allow.to_vec()
+    } else {
+        agent_tools
+            .iter()
+            .filter(|tool| allow_covers(allow, tool))
+            .cloned()
+            .collect()
+    };
     dedup(grants)
 }
 
@@ -142,11 +174,26 @@ pub struct RuntimeBuilder {
     seed_dir: Option<PathBuf>,
     feedback: Option<Arc<FeedbackStore>>,
     github: Option<Arc<dyn GitHubClient>>,
+    tinyhumans_feedback: Option<Arc<dyn TinyHumansClient>>,
     consent: ConsentMode,
     /// WS4: the embedded openhuman harness pool. Feature-gated so the default
     /// build is unaffected; wired through to [`CompanyRuntime`] when present.
     #[cfg(feature = "openhuman")]
     harness: Option<Arc<crate::harness::HarnessPool>>,
+    /// WS4/#56: the platform-injected managed inference default (endpoint +
+    /// credential) and an optional roster-wide model override. This is the
+    /// *lowest-precedence* inference source — a manifest `[inference]` section
+    /// or a runtime console override outranks it. With [`harness`](Self::harness)
+    /// set and any inference source configured, cognition routes through a
+    /// per-tenant [`TenantProvider`](crate::harness::provider::TenantProvider).
+    #[cfg(feature = "openhuman")]
+    harness_inference: Option<(HostedProviderConfig, Option<String>)>,
+    /// Issue #109: the MANAGED media-generation backend (env-resolved platform
+    /// credential + URL). `None` fails closed — no image/video tools are wired.
+    /// Threaded onto every harness-built agent's [`HarnessDeps`], but only
+    /// consumed when a company **explicitly** grants the `media` namespace.
+    #[cfg(feature = "openhuman")]
+    media_backend: Option<crate::harness::toolbelt::MediaBackend>,
 }
 
 impl RuntimeBuilder {
@@ -190,9 +237,14 @@ impl RuntimeBuilder {
             seed_dir: None,
             feedback: None,
             github: None,
+            tinyhumans_feedback: None,
             consent: ConsentMode::default(),
             #[cfg(feature = "openhuman")]
             harness: None,
+            #[cfg(feature = "openhuman")]
+            harness_inference: None,
+            #[cfg(feature = "openhuman")]
+            media_backend: None,
         }
     }
 
@@ -288,6 +340,17 @@ impl RuntimeBuilder {
             .with_context(handles.context.clone())
             .with_secrets(handles.secrets.clone())
             .with_inbox(handles.inbox.clone())
+    }
+
+    /// Overlays just the memory + context ports from a selected memory engine
+    /// (`OPENCOMPANY_MEMORY`, see [`crate::store::select`]).
+    ///
+    /// Applied *after* [`with_stores`](Self::with_stores) (or over the fs
+    /// defaults), so a dedicated memory engine such as TinyCortex backs recall
+    /// while the base backend keeps every other durable port.
+    pub fn with_memory_overlay(self, overlay: &crate::store::MemoryOverlay) -> Self {
+        self.with_memory(overlay.memory.clone())
+            .with_context(overlay.context.clone())
     }
 
     /// Swaps the task board store (default: fs-backed).
@@ -417,6 +480,39 @@ impl RuntimeBuilder {
         self
     }
 
+    /// WS4/#56: sets the platform-injected managed inference default (endpoint +
+    /// credential) and an optional roster-wide model override
+    /// (`OPENCOMPANY_INFERENCE_MODEL`). This is the lowest-precedence inference
+    /// source; a manifest `[inference]` section or a runtime console override
+    /// wins over it. Combined with [`with_harness`](Self::with_harness) and any
+    /// configured inference source, cognition routes through a per-tenant
+    /// [`TenantProvider`](crate::harness::provider::TenantProvider). Feature-gated.
+    #[cfg(feature = "openhuman")]
+    pub fn with_harness_inference(
+        mut self,
+        config: HostedProviderConfig,
+        model_override: Option<String>,
+    ) -> Self {
+        self.harness_inference = Some((config, model_override));
+        self
+    }
+
+    /// Issue #109: sets the MANAGED media-generation backend (platform
+    /// credential + URL, resolved from the environment via
+    /// [`media_backend_from_env`](crate::harness::provider::media_backend_from_env)).
+    /// This is the ONLY path media generation is ever fed a credential — never a
+    /// tenant secret — so a company can generate media only on the managed
+    /// platform account. Absent (the default), media tools are never wired even
+    /// for a company that grants `media`. Feature-gated.
+    #[cfg(feature = "openhuman")]
+    pub fn with_media_backend(
+        mut self,
+        media_backend: crate::harness::toolbelt::MediaBackend,
+    ) -> Self {
+        self.media_backend = Some(media_backend);
+        self
+    }
+
     /// Swaps the secret store (default: fs-backed). The feedback scrubber reads
     /// it to fail closed on secret leaks.
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
@@ -441,6 +537,17 @@ impl RuntimeBuilder {
     /// Wires a GitHub client for feedback filing (default: none → manual links).
     pub fn with_github(mut self, github: Arc<dyn GitHubClient>) -> Self {
         self.github = Some(github);
+        self
+    }
+
+    /// Wires the TinyHumans hub for feedback forwarding (default: none → file
+    /// to GitHub instead).
+    ///
+    /// Set this only on a provisioned instance — one with a TinyHumans
+    /// credential. Its presence redirects feedback to the hub, where it is
+    /// recorded on behalf of the credential's owner.
+    pub fn with_tinyhumans_feedback(mut self, client: Arc<dyn TinyHumansClient>) -> Self {
+        self.tinyhumans_feedback = Some(client);
         self
     }
 
@@ -519,6 +626,7 @@ impl RuntimeBuilder {
         let consent = self.consent;
         let filer = Arc::new(FeedbackFiler {
             client: self.github,
+            tinyhumans: self.tinyhumans_feedback,
             repo: crate::feedback::DEFAULT_REPO.to_string(),
             consent,
             limiter: RateLimiter::default(),
@@ -603,34 +711,264 @@ impl RuntimeBuilder {
             }
         };
 
-        // Brain selection: an explicit brain wins; otherwise hosted mode plus a
-        // credential selects the hosted Medulla brain (over an injected or, under
-        // the `medulla` feature, a networked transport). Every other combination
-        // — no credential, sidecar mode, or a hosted default build with no
-        // transport — degrades to the offline echo brain so the default build
-        // stays green.
+        // Brain selection, in precedence order:
+        //   1. an explicit brain (test injection) always wins;
+        //   2. under the `openhuman` feature, an attached harness pool + a
+        //      hosted-inference config routes cognition through the embedded
+        //      openhuman runtime (a real agent turn per operator message);
+        //   3. otherwise hosted mode plus a credential selects the hosted
+        //      Medulla brain (over an injected or, under `medulla`, a networked
+        //      transport);
+        //   4. every other combination degrades to the offline echo brain so
+        //      the default build stays green.
+        // Captured from the harness arm below so the workflow engine (#29) can
+        // reuse the same metered pool/deps the brain runs on.
+        #[cfg(feature = "openhuman")]
+        let mut wf_runner: Option<Arc<dyn WorkflowRunner>> = None;
+        // Issue #111: one in-flight steer registry per company, shared between the
+        // harness deps (which register runs + install the steer hook) and the
+        // runtime (which the operator steer routes reach). Captured from the
+        // harness arm so `CompanyRuntime::set_steer` can be wired downstream.
+        #[cfg(feature = "openhuman")]
+        let mut steer_registry: Option<crate::company::steer::InflightRegistry> = None;
         let brain: Arc<dyn Brain> = match self.brain {
             Some(brain) => brain,
             None => {
-                let tool_catalog: Vec<ToolManifestEntry> = self
-                    .manifest
-                    .tools
-                    .allow
-                    .iter()
-                    .map(|name| ToolManifestEntry {
-                        name: name.clone(),
-                        description: None,
-                        input_schema: None,
-                    })
-                    .collect();
-                select_hosted_or_echo(
-                    self.brain_mode.unwrap_or(BrainMode::Hosted),
-                    self.credential,
-                    self.transport,
-                    self.api_url,
-                    &id,
-                    tool_catalog,
-                )
+                // Clone the pool so it stays available for the downstream
+                // `CompanyRuntime::harness` wiring — the brain and the runtime
+                // deliberately share one pool.
+                #[cfg(feature = "openhuman")]
+                let harness_brain: Option<Arc<dyn Brain>> = match self.harness.clone() {
+                    Some(pool) => {
+                        // The platform-injected managed default (endpoint +
+                        // credential) is the lowest-precedence inference source.
+                        let env_default =
+                            self.harness_inference
+                                .as_ref()
+                                .map(|(config, _)| EnvDefault {
+                                    base_url: config.base_url.clone(),
+                                    api_key: config.api_key.clone(),
+                                });
+                        // An explicit `OPENCOMPANY_INFERENCE_MODEL` flattens the
+                        // whole roster to one workload; otherwise each agent keeps
+                        // its tier-derived model and the tenant
+                        // `[inference].models` table maps it (`None` = no override).
+                        let model_override = self
+                            .harness_inference
+                            .as_ref()
+                            .and_then(|(_, model)| model.clone());
+
+                        // Is any inference source configured — a runtime console
+                        // override, a manifest `[inference]` section, or the
+                        // managed env default? A corrupt runtime config degrades
+                        // to "unconfigured" (managed/echo brain) rather than
+                        // bricking boot.
+                        let configured = inference::resolve_effective(
+                            &id,
+                            &self.manifest.inference,
+                            env_default.as_ref(),
+                            secrets.as_ref(),
+                        )
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                company = %id,
+                                error = %err,
+                                "resolving inference config failed; keeping the managed/echo brain"
+                            );
+                            None
+                        })
+                        .is_some();
+
+                        if configured {
+                            // One shared steer registry; the same handle is wired
+                            // onto the runtime below.
+                            let steer = crate::company::steer::InflightRegistry::new();
+                            steer_registry = Some(steer.clone());
+                            // Resolve the company's effective MCP servers to data
+                            // (manifest ∪ runtime index, credentials materialized)
+                            // before building sync deps. A corrupt index degrades
+                            // to no MCP servers rather than bricking boot.
+                            let mcp_servers = crate::company::mcp::resolve_effective(
+                                &id,
+                                &self.manifest.mcp_servers,
+                                secrets.as_ref(),
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                tracing::warn!(
+                                    company = %id,
+                                    error = %err,
+                                    "resolving MCP servers failed; agents get no MCP tools"
+                                );
+                                Vec::new()
+                            });
+                            // Issue #110: resolve the per-tenant Composio config
+                            // at boot from the company secret store (token) + the
+                            // manifest toolkit allowlist + the env URL override.
+                            // Only companies that explicitly grant `composio`
+                            // touch the store; the token has no env fallback, so a
+                            // missing token stays `None` (fail closed).
+                            // `HarnessPool::ensure` re-resolves this each turn so a
+                            // console token change takes effect without restart.
+                            let composio_config = if crate::company::grants_composio_explicit(
+                                &self.manifest.tools.allow,
+                            ) {
+                                use crate::app::config::EnvSource;
+                                let toolkits = self.manifest.tools.composio.toolkits.clone();
+                                let url = crate::app::config::ProcessEnv
+                                    .get(crate::harness::composio::COMPOSIO_BACKEND_URL_ENV);
+                                crate::harness::composio::TenantComposio::resolve(
+                                    &id,
+                                    secrets.as_ref(),
+                                    toolkits,
+                                    url,
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            let deps = HarnessDeps {
+                                // A per-tenant provider that re-resolves the
+                                // effective inference config on every turn, so a
+                                // console BYOK switch takes effect next turn with
+                                // no rebuild.
+                                provider: Arc::new(TenantProvider::new(
+                                    id.clone(),
+                                    secrets.clone(),
+                                    self.manifest.inference.clone(),
+                                    env_default,
+                                )),
+                                // Static fallback only; `HarnessPool::run` reads
+                                // the live slug from the provider per turn.
+                                provider_slug: "managed".to_string(),
+                                context: context.clone(),
+                                store: store.clone(),
+                                meter: Some(fs_ops.clone()),
+                                workspace_root: home.join("harness"),
+                                model_override,
+                                tasks: Some(ops.tasks.clone()),
+                                // Skill read surface (#28): the operator delta
+                                // store + the company source dir (`companies/<name>`,
+                                // held as `seed_dir`) whose `skills/` subtree
+                                // supplies the committed bundles.
+                                skills: Some(ops.skills.clone()),
+                                skills_source_dir: self.seed_dir.clone(),
+                                mcp_servers,
+                                // Orchestrator read surface + delegation queue
+                                // (#53): the company's facts + event log ground
+                                // `query_company`; a fresh queue per company backs
+                                // the delegation tools the brain drains.
+                                facts: Some(ops.facts.clone()),
+                                events: Some(events.clone()),
+                                delegations: crate::harness::orchestrator::DelegationQueue::default(
+                                ),
+                                // Issue #67: an empty runner handle, filled just
+                                // below once the `HarnessWorkflowRunner` is built,
+                                // so the orchestrator's `run_workflow` tool reaches
+                                // the runner without a construction cycle.
+                                workflow_runner:
+                                    crate::harness::orchestrator::WorkflowRunnerHandle::default(),
+                                // Error-hardening cell: a fresh MCP-failure queue
+                                // the `OcMcpCallTool` decorator fills and the brain
+                                // drains; and a LIVE secret-store handle so
+                                // `HarnessPool::ensure` can re-resolve the effective
+                                // MCP set each turn (MCP-freshness) rather than the
+                                // snapshot frozen here at boot.
+                                mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+                                secrets: Some(secrets.clone()),
+                                // Cell A: the `web` toolbelt SSRF allowlist.
+                                // Domains come straight from the manifest.
+                                web_allowed_domains: self
+                                    .manifest
+                                    .tools
+                                    .web_allowed_domains
+                                    .clone(),
+                                // #113 P2: the company source dir so a workflow's
+                                // `sub_workflow` node resolves a child by id from
+                                // `workflows/<id>.toml`. Same origin as the skills
+                                // source dir but a distinct seam.
+                                workflow_source_dir: self.seed_dir.clone(),
+                                // Issue #108: `capabilities` is the no-plan
+                                // fallback (identity). When `[plan]` is set,
+                                // `HarnessPool::ensure` resolves the per-tenant
+                                // filter from the meter each turn and overwrites
+                                // it; `plan` carries the resolved budget so it can.
+                                capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+                                plan:
+                                    crate::harness::capability_budget::CapabilityPlan::from_manifest(
+                                        &self.manifest.plan,
+                                    ),
+                                // Issue #109: the MANAGED media-generation
+                                // backend, resolved from the environment by the
+                                // CLI (`attach_harness` → `media_backend_from_env`)
+                                // and never from a tenant secret. `None` fails
+                                // closed — `build_agent` wires no media tools even
+                                // for a company that grants `media`.
+                                media: self.media_backend.clone(),
+                                // Issue #110: the per-tenant Composio config
+                                // resolved above (token from the secret store,
+                                // never an env/platform key). `None` fails closed.
+                                composio: composio_config,
+                                steer,
+                            };
+                            let record = CompanyRecord {
+                                id: id.clone(),
+                                manifest: self.manifest.clone(),
+                                ledger: Vec::new(),
+                                lifecycle: "running".to_string(),
+                                overlay_agents: Vec::new(),
+                                overlay_desk_members: Vec::new(),
+                            };
+                            // Workflow agent nodes execute on the same pool as the
+                            // brain — clone before both moves into `HarnessBrain`.
+                            let runner: Arc<dyn WorkflowRunner> =
+                                Arc::new(HarnessWorkflowRunner::new(
+                                    pool.clone(),
+                                    deps.clone(),
+                                    record.clone(),
+                                ));
+                            // Issue #67: fill the shared handle on `deps` (a clone
+                            // of which the runner holds, and which moves into the
+                            // brain below) so the orchestrator's `run_workflow` tool
+                            // reaches this runner. The handle stores a `Weak`; the
+                            // strong ref lives on the runtime via
+                            // `set_workflow_runner`, so this is not a strong cycle.
+                            deps.workflow_runner.set(&runner);
+                            wf_runner = Some(runner);
+                            Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                #[cfg(not(feature = "openhuman"))]
+                let harness_brain: Option<Arc<dyn Brain>> = None;
+
+                if let Some(brain) = harness_brain {
+                    brain
+                } else {
+                    let tool_catalog: Vec<ToolManifestEntry> = self
+                        .manifest
+                        .tools
+                        .allow
+                        .iter()
+                        .map(|name| ToolManifestEntry {
+                            name: name.clone(),
+                            description: None,
+                            input_schema: None,
+                        })
+                        .collect();
+                    select_hosted_or_echo(
+                        self.brain_mode.unwrap_or(BrainMode::Hosted),
+                        self.credential,
+                        self.transport,
+                        self.api_url,
+                        &id,
+                        tool_catalog,
+                    )
+                }
             }
         };
 
@@ -642,12 +980,16 @@ impl RuntimeBuilder {
             .as_ref()
             .map(|r| r.lifecycle.clone())
             .unwrap_or_else(|| "running".to_string());
-        // Preserve the operator team overlay across rebuilds — a rebuild never
-        // rewrites the version-controlled manifest, and it must not drop
-        // operator-added teammates either.
+        // Preserve the operator team + desk overlays across rebuilds — a rebuild
+        // never rewrites the version-controlled manifest, and it must not drop
+        // operator-added teammates or desk memberships either.
         let overlay_agents = existing
             .as_ref()
             .map(|r| r.overlay_agents.clone())
+            .unwrap_or_default();
+        let overlay_desk_members = existing
+            .as_ref()
+            .map(|r| r.overlay_desk_members.clone())
             .unwrap_or_default();
         let ledger = existing.map(|r| r.ledger).unwrap_or_default();
         store
@@ -657,6 +999,7 @@ impl RuntimeBuilder {
                 ledger,
                 lifecycle,
                 overlay_agents,
+                overlay_desk_members,
             })
             .await?;
 
@@ -719,10 +1062,37 @@ impl RuntimeBuilder {
         // skills/workflows content on the serve path.
         runtime.set_source_dir(self.seed_dir.clone());
 
+        // MCP uses OpenHuman's process-global live connection registry. Keep a
+        // runtime-owned config for this OpenCompany home so REST and agents see
+        // the same installed servers, and reconnect persisted installs without
+        // delaying company boot.
+        #[cfg(feature = "mcp")]
+        {
+            let mcp = Arc::new(crate::harness::mcp::McpRuntime::new(home.join("mcp")));
+            runtime.set_mcp(mcp.clone());
+            tokio::spawn(async move { mcp.boot().await });
+        }
+
         // WS4: attach the embedded harness pool when one was provided.
         #[cfg(feature = "openhuman")]
         if let Some(harness) = self.harness.clone() {
             runtime.set_harness(harness);
+        }
+
+        // Issue #111: attach the same steer registry the harness deps hold, so the
+        // operator steer routes and the in-flight strip reach the runs the brain
+        // registers. Only present on the harness path; the default build leaves
+        // the runtime's registry empty (every steer is `not in flight`).
+        #[cfg(feature = "openhuman")]
+        if let Some(registry) = steer_registry {
+            runtime.set_steer(registry);
+        }
+
+        // #29: install the workflow runner captured from the harness arm so
+        // `POST /workflows/{wid}/run` executes instead of reporting `not_wired`.
+        #[cfg(feature = "openhuman")]
+        if let Some(wf_runner) = wf_runner {
+            runtime.set_workflow_runner(wf_runner);
         }
 
         // Boot lifecycle step 3: going-public. Best-effort and non-blocking —

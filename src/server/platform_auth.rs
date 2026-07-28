@@ -326,7 +326,9 @@ pub fn authorize_address(state: &AppState, auth: &GqlAuth, id: &CompanyId) -> Op
                 return None;
             }
             let owner = state.owner_of(id);
-            if owner.as_deref() == Some(claims.tenant.as_str()) && claims.may_address(id) {
+            if owner.as_deref() == Some(crate::app::canonical_tenant(&claims.tenant))
+                && claims.may_address(id)
+            {
                 None
             } else {
                 Some(forbidden())

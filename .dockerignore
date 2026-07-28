@@ -1,13 +1,34 @@
 # Build artifacts and heavy/irrelevant paths kept out of the build context.
 .git
+**/.git
 target/
+**/target/
 **/node_modules/
 **/dist/
-# The host binary build needs vendor/tinyagents (the [patch] source) but never
-# the 90 MB OpenHuman checkout.
-vendor/openhuman/
-docs/
-gitbooks/
+
+# vendor/openhuman (and its own nested vendored crates under vendor/openhuman/
+# vendor/*) back the root Cargo.toml's [patch.crates-io] table and the optional
+# `openhuman_core` path dependency. Cargo must read their Cargo.toml manifests
+# AND their lib sources during *resolution* — even for the default/offline and
+# mongodb/medulla builds where the `openhuman` feature is off — so the whole
+# tree cannot be excluded (that was the packaging bug: `cargo build` failed with
+# "failed to read vendor/openhuman/Cargo.toml"). We therefore keep every
+# Cargo.toml + src/ tree and strip only the documentation, generated books,
+# desktop app, and media that bloat the raw checkout to ~300 MB. openhuman's
+# build.rs is written to tolerate a source-only build (it emits an empty raw-
+# coverage module list when tests/ is absent), and every include_str!/-bytes! in
+# openhuman's sources resolves inside src/, so a `--features openhuman` compile
+# still works from this trimmed context.
+**/docs/
+**/gitbooks/
+**/website/
+**/paper/
+**/wiki/
+vendor/openhuman/app/
+vendor/openhuman/tests/
+vendor/openhuman/e2e/
+vendor/openhuman/fastlane/
+
 *.log
 .env
 .DS_Store

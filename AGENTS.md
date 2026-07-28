@@ -81,6 +81,13 @@ injects its environment. When developing hosted behavior, know the seams:
   tenant container, plus — when database-per-tenant storage is enabled —
   `OPENCOMPANY_STORAGE=mongodb`, `OPENCOMPANY_MONGODB_URI` (credentials
   scoped to that tenant's database only), and `OPENCOMPANY_MONGODB_DB`.
+- In the alternative **shared-single-DB** mode (all tenants on one logical
+  MongoDB), the manager also injects `OPENCOMPANY_TENANT_ID=<tenant-slug>`.
+  The workload then namespaces company ids with `<tenant>--` and records
+  `owners` rows so tenants stay apart in the shared database. Isolation is
+  application-layer only in this mode — a compromised container can reach
+  every tenant's documents; db-per-tenant stays the security default. See
+  `docs/spec/runtime/storage.md`. Unset (the default) is a full no-op.
 - Storage backend selection and the MongoDB backend are documented in
   `docs/spec/runtime/storage.md`; the port traits it implements are the
   entire persistence contract (`docs/spec/runtime/ports.md`).

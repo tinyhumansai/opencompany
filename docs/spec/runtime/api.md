@@ -22,7 +22,8 @@ POST   /api/v1/companies/{id}/chat             operator message → event; SSE r
 GET    /api/v1/companies/{id}/events?since=SEQ SSE stream of events/effects (work feed)
 GET    /api/v1/companies/{id}/approvals        pending approvals
 POST   /api/v1/companies/{id}/approvals/{aid}  { "verdict": "approve"|"deny", "note": "…" }
-POST   /api/v1/companies/{id}/feedback         file feedback (see feedback-loop/)
+POST   /api/v1/companies/{id}/feedback         submit feedback (see feedback-loop/)
+GET    /api/v1/companies/{id}/feedback         past reports (no operator words)
 GET    /api/v1/companies/{id}/memory/traces    inspect working memory (debug)
 POST   /api/v1/companies/{id}/export           export bundle (tar)
 POST   /api/v1/companies/{id}/pause            pause / resume lifecycle transitions

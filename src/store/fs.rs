@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 
 use crate::Result;
@@ -58,18 +57,31 @@ impl PathLocks {
 }
 
 /// Appends one line (a `\n` is added) to `path`, creating the file if absent.
+///
+/// The line and its terminating newline are written in a **single** blocking
+/// `write_all` inside `spawn_blocking` (via `std::fs::OpenOptions` with
+/// `O_APPEND`), so the whole record lands as one atomic OS-level write.
+/// Tokio's async `File` buffers internally and can return before the kernel
+/// write completes, which makes concurrent-appends tests unreliable; this
+/// version always waits for the write syscall to finish before returning.
 pub(crate) async fn append_line(path: &Path, line: &str) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(|e| io_err(path, e))?;
-    file.write_all(line.as_bytes())
-        .await
-        .map_err(|e| io_err(path, e))?;
-    file.write_all(b"\n").await.map_err(|e| io_err(path, e))?;
-    Ok(())
+    let owned_path = path.to_path_buf();
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&owned_path)
+            .map_err(|e| io_err(&owned_path, e))?;
+        file.write_all(record.as_bytes())
+            .map_err(|e| io_err(&owned_path, e))?;
+        Ok::<_, OpenCompanyError>(())
+    })
+    .await
+    .map_err(|e| OpenCompanyError::Store(format!("spawn_blocking failed: {e}")))?
 }
 
 /// Reads a file to a string, returning an empty string if it does not exist.
@@ -121,6 +133,9 @@ struct Meta {
     /// The operator team overlay (teammates added outside the manifest).
     #[serde(default)]
     overlay_agents: Vec<crate::ports::types::OverlayAgent>,
+    /// The operator desk-membership overlay (agents added to desks at runtime).
+    #[serde(default)]
+    overlay_desk_members: Vec<crate::ports::types::OverlayDeskMember>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,11 +178,15 @@ impl CompanyStore for FsCompanyStore {
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
 
         let meta_src = read_optional(&bundle.meta_json()).await?;
-        let (lifecycle, overlay_agents) = if meta_src.trim().is_empty() {
-            ("running".to_string(), Vec::new())
+        let (lifecycle, overlay_agents, overlay_desk_members) = if meta_src.trim().is_empty() {
+            ("running".to_string(), Vec::new(), Vec::new())
         } else {
             let meta: Meta = serde_json::from_str(&meta_src)?;
-            (meta.lifecycle, meta.overlay_agents)
+            (
+                meta.lifecycle,
+                meta.overlay_agents,
+                meta.overlay_desk_members,
+            )
         };
 
         let ledger = read_jsonl::<LedgerEntry>(&bundle.ledger_jsonl()).await?;
@@ -178,6 +197,7 @@ impl CompanyStore for FsCompanyStore {
             ledger,
             lifecycle,
             overlay_agents,
+            overlay_desk_members,
         }))
     }
 
@@ -192,6 +212,7 @@ impl CompanyStore for FsCompanyStore {
         let meta = Meta {
             lifecycle: record.lifecycle.clone(),
             overlay_agents: record.overlay_agents.clone(),
+            overlay_desk_members: record.overlay_desk_members.clone(),
         };
         write_atomic(&bundle.meta_json(), &serde_json::to_string(&meta)?).await?;
         Ok(())
@@ -741,6 +762,40 @@ mod test {
         std::env::temp_dir().join(format!("opencompany-test-{}", generate_id()))
     }
 
+    #[tokio::test]
+    async fn concurrent_appends_stay_one_record_per_line() {
+        // Many tasks appending to the same JSONL file must never interleave a
+        // record with another's newline (the `{a}{b}\n\n` corruption that
+        // `read_jsonl` reports as a "trailing characters" parse error). The
+        // single-write `append_line` makes each record one atomic O_APPEND
+        // write, so this holds deterministically.
+        let root = tmp_root();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("log.jsonl");
+
+        const N: u64 = 64;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let path = path.clone();
+            set.spawn(async move {
+                let line = serde_json::to_string(&serde_json::json!({ "i": i })).unwrap();
+                append_line(&path, &line).await.unwrap();
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+
+        // Every record parses (no merged lines) and all N are present once.
+        let rows: Vec<serde_json::Value> = read_jsonl(&path).await.expect("no corrupt lines");
+        assert_eq!(rows.len() as u64, N, "every append is its own line");
+        let mut seen: Vec<u64> = rows.iter().map(|r| r["i"].as_u64().unwrap()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..N).collect::<Vec<_>>(), "all records intact");
+
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
     // The fs backend runs the identical port-conformance suite the sqlite
     // backend runs under `--features sqlite`. Each test gets a fresh root so the
     // stores start empty.
@@ -822,6 +877,7 @@ mod test {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         };
         store.save(&record).await.unwrap();
 
@@ -856,6 +912,7 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             })
             .await
             .unwrap();
@@ -892,6 +949,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "a".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -902,6 +960,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "b".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -929,6 +988,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -938,7 +998,8 @@ mod test {
             received.event,
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
-                by: None
+                by: None,
+                chat: None
             }
         );
         tokio::fs::remove_dir_all(&root).await.ok();

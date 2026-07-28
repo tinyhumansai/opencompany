@@ -180,6 +180,39 @@ impl ToolPolicy for ApprovalPolicy {
 /// the bridge only the tool name and arguments, not the tool's own
 /// external-effect flag. Unknown tools are treated as external (fail-safe).
 fn is_external_effect(tool_name: &str) -> bool {
+    // The orchestrator's in-cycle delegation tools (`spawn_task`,
+    // `delegate_to_desk`) enqueue internal work the harness brain drains this
+    // turn — a task card or a hand-off to a desk's lead — never an external
+    // effect. Without this, the default `supervised` policy would park them and
+    // `readonly` would deny them, breaking in-cycle delegation. (Issue #53.)
+    if crate::harness::orchestrator::is_delegation_tool(tool_name) {
+        return false;
+    }
+    // An MCP tool call can perform any effect advertised by a third-party
+    // server. Treat it as external even if future prefix rules become broader.
+    if tool_name.eq_ignore_ascii_case("mcp_registry_tool_call") {
+        return true;
+    }
+    // The media catalog is a read-only GET (issue #109): listing models spends
+    // nothing and must never park for approval, even though its name does not
+    // start with a read-only prefix. The `media_generate_*` tools are NOT listed
+    // here — they spend real money and fall through to the external-effect
+    // default, so they park under supervised / deny under readonly.
+    if tool_name.eq_ignore_ascii_case("media_list_models") {
+        return false;
+    }
+    // The Composio read tools (issue #110) are read-only GETs: listing toolkits,
+    // connections, or action schemas reaches no third party and must never park
+    // for approval, even though the `composio_*` name has no read-only prefix.
+    // `composio_authorize` / `composio_execute` are NOT listed here — they begin
+    // an OAuth handoff / run a real action, so they fall through to the external-
+    // effect default (park under supervised, deny under readonly).
+    if matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "composio_list_toolkits" | "composio_list_connections" | "composio_list_tools"
+    ) {
+        return false;
+    }
     const READ_ONLY_PREFIXES: &[&str] = &[
         "read",
         "list",
@@ -200,7 +233,23 @@ fn is_external_effect(tool_name: &str) -> bool {
 /// Map a tool name onto the supervised [`EffectGroup`] taxonomy.
 fn classify_group(tool_name: &str) -> EffectGroup {
     let name = tool_name.to_ascii_lowercase();
-    if name.contains("pay") || name.contains("transfer") || name.starts_with("spend") {
+    if name == "mcp_registry_tool_call" {
+        EffectGroup::Other
+    } else if name == "composio_authorize" {
+        // Beginning an OAuth handoff establishes an account identity for the
+        // company (issue #110) — an identity effect, parked before it lands.
+        EffectGroup::Identity
+    } else if name == "composio_execute" {
+        // Running a Composio action reaches a third-party account (send an
+        // email, post a message, open a PR) — a send effect. Placed before the
+        // generic `contains` heuristics so the slug can't be misclassified.
+        EffectGroup::Send
+    } else if name.starts_with("media_generate") {
+        // Image/video generation is billed by the backend on submit (issue
+        // #109), so it is a spend effect — parked for approval before money
+        // moves. (`media_list_models` is read-only and never reaches here.)
+        EffectGroup::Spend
+    } else if name.contains("pay") || name.contains("transfer") || name.starts_with("spend") {
         EffectGroup::Spend
     } else if name.contains("email") || name.contains("send") || name.contains("message") {
         EffectGroup::Send
@@ -276,6 +325,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervised_parks_mcp_tool_calls_as_external_other_effects() {
+        let p = policy("supervised", &[], None);
+        let args = serde_json::json!({
+            "server_id": "server-1",
+            "tool_name": "echo",
+            "arguments": {"text": "hello"}
+        });
+        assert!(matches!(
+            p.check(&request("mcp_registry_tool_call", args.clone()))
+                .await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        assert_eq!(
+            p.effect_for("mcp_registry_tool_call", &args).group,
+            EffectGroup::Other
+        );
+    }
+
+    #[tokio::test]
     async fn readonly_denies_mutations_allows_reads() {
         let p = policy("readonly", &[], None);
         assert!(matches!(
@@ -310,6 +378,135 @@ mod tests {
             .await,
             ToolPolicyDecision::RequireApproval { .. }
         ));
+    }
+
+    /// Media generation (issue #109): the paid `media_generate_*` tools park
+    /// under supervised and deny under readonly (external spend effect), while
+    /// the read-only `media_list_models` catalog GET is always allowed.
+    #[tokio::test]
+    async fn media_generate_parks_supervised_and_denies_readonly_but_list_is_read_only() {
+        let supervised = policy("supervised", &[], None);
+        for tool in ["media_generate_image", "media_generate_video"] {
+            assert!(
+                matches!(
+                    supervised
+                        .check(&request(tool, serde_json::json!({})))
+                        .await,
+                    ToolPolicyDecision::RequireApproval { .. }
+                ),
+                "{tool} must park under supervised"
+            );
+        }
+        // The catalog GET is read-only — allowed even under supervised.
+        assert_eq!(
+            supervised
+                .check(&request("media_list_models", serde_json::json!({})))
+                .await,
+            ToolPolicyDecision::Allow
+        );
+
+        let readonly = policy("readonly", &[], None);
+        assert!(
+            matches!(
+                readonly
+                    .check(&request("media_generate_image", serde_json::json!({})))
+                    .await,
+                ToolPolicyDecision::Deny { .. }
+            ),
+            "media_generate must be denied under readonly"
+        );
+        // Even a read-only desk can list the model catalog.
+        assert_eq!(
+            readonly
+                .check(&request("media_list_models", serde_json::json!({})))
+                .await,
+            ToolPolicyDecision::Allow
+        );
+    }
+
+    /// Paid generation classifies as a spend effect (issue #109).
+    #[test]
+    fn media_generate_classifies_as_spend() {
+        let p = policy("supervised", &[], None);
+        assert_eq!(
+            p.effect_for("media_generate_image", &serde_json::json!({}))
+                .group,
+            EffectGroup::Spend
+        );
+        assert_eq!(
+            p.effect_for("media_generate_video", &serde_json::json!({}))
+                .group,
+            EffectGroup::Spend
+        );
+    }
+
+    /// Per-tenant Composio (issue #110): the read tools are read-only (allowed
+    /// even under supervised/readonly), while `composio_authorize` /
+    /// `composio_execute` are external — parked under supervised, denied under
+    /// readonly.
+    #[tokio::test]
+    async fn composio_reads_allowed_but_authorize_execute_park_or_deny() {
+        let supervised = policy("supervised", &[], None);
+        for tool in [
+            "composio_list_toolkits",
+            "composio_list_connections",
+            "composio_list_tools",
+        ] {
+            assert_eq!(
+                supervised
+                    .check(&request(tool, serde_json::json!({})))
+                    .await,
+                ToolPolicyDecision::Allow,
+                "{tool} is read-only and must be allowed"
+            );
+        }
+        for tool in ["composio_authorize", "composio_execute"] {
+            assert!(
+                matches!(
+                    supervised
+                        .check(&request(tool, serde_json::json!({})))
+                        .await,
+                    ToolPolicyDecision::RequireApproval { .. }
+                ),
+                "{tool} must park under supervised"
+            );
+        }
+
+        let readonly = policy("readonly", &[], None);
+        // A read-only desk may still browse the Composio surface.
+        assert_eq!(
+            readonly
+                .check(&request("composio_list_connections", serde_json::json!({})))
+                .await,
+            ToolPolicyDecision::Allow
+        );
+        for tool in ["composio_authorize", "composio_execute"] {
+            assert!(
+                matches!(
+                    readonly.check(&request(tool, serde_json::json!({}))).await,
+                    ToolPolicyDecision::Deny { .. }
+                ),
+                "{tool} must be denied under readonly"
+            );
+        }
+    }
+
+    /// Composio effect groups (issue #110): authorize is an Identity effect,
+    /// execute is a Send effect — pinned before the generic `contains`
+    /// heuristics could misclassify the slug.
+    #[test]
+    fn composio_classifies_authorize_identity_and_execute_send() {
+        let p = policy("supervised", &[], None);
+        assert_eq!(
+            p.effect_for("composio_authorize", &serde_json::json!({}))
+                .group,
+            EffectGroup::Identity
+        );
+        assert_eq!(
+            p.effect_for("composio_execute", &serde_json::json!({}))
+                .group,
+            EffectGroup::Send
+        );
     }
 
     #[test]

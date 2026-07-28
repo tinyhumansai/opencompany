@@ -228,6 +228,15 @@ pub enum CompanyEvent {
         /// export/import and the cross-backend round-trip need no migration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
+        /// The desk / chat thread the message targets (issue #53), so the
+        /// orchestrator brain can route an addressed message to that desk's lead
+        /// member and journal replies against it. `None` on an unaddressed
+        /// message (routed to the orchestrator) and on every event journaled
+        /// before this field existed. Like `by`, `skip_serializing_if` keeps a
+        /// pre-existing event byte-identical, so no stored record needs
+        /// migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<String>,
     },
     /// An inbound webhook fired.
     WebhookReceived {
@@ -291,12 +300,90 @@ pub enum CompanyEvent {
         agent_id: String,
         /// The reply text.
         text: String,
+        /// The scrubbed processing steps behind this reply — the same
+        /// per-bubble [`TurnStep`] timeline the live turn streams and the POST
+        /// `/chat` body carries — persisted here so a desk history reload
+        /// rehydrates the tool-call timeline, not just the text. Additive:
+        /// omitted-when-empty on the wire, so every prior log (and every
+        /// non-harness reply, which folds no steps) round-trips byte-identical.
+        /// Never carries raw tool arguments, output, or call ids — only the
+        /// scrubbed shape (see [`crate::harness::steps`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<TurnStep>,
     },
     /// The Operator deleted a durable memory fact. Journaled for the audit trail
     /// per the Operator-rights section of `docs/spec/company-brain/memory.md`.
     MemoryFactDeleted {
         /// The id of the deleted fact.
         fact_id: String,
+    },
+    /// A board task was moved into `in_progress` and dispatched to its assignee
+    /// for one agent turn on the embedded runtime. Journaled so the dispatch is
+    /// auditable and replayable. Only the `openhuman` `HarnessBrain` acts on it;
+    /// the default build's `EchoBrain` ignores it, so the board stays inert
+    /// without the harness.
+    TaskDispatched {
+        /// The id of the dispatched task card.
+        task_id: String,
+    },
+    /// An agent's MCP tool call failed during a turn, journaled by the harness
+    /// so the operator has an audit trail of which server/tool broke and why.
+    /// The `message` is always **scrubbed** at the source (the
+    /// `OcMcpCallTool` → `HarnessBrain` drain path), so this record can never
+    /// carry a credential, response body, or URL query string. Additive: old
+    /// logs never contain it, and its presence doesn't change how any existing
+    /// variant serializes (same `by`/`chat` precedent).
+    McpCallFailed {
+        /// The MCP server the failing call targeted.
+        server: String,
+        /// The remote tool the agent tried to call.
+        tool: String,
+        /// A stable status code (e.g. `credential_required`, `tool_call_rejected`).
+        status: String,
+        /// A short, scrubbed, operator-facing message.
+        message: String,
+    },
+    /// A new workflow graph was authored and enabled (issue #112), from either
+    /// the console `POST …/workflows` route or the orchestrator's
+    /// `create_workflow` tool. Journaled best-effort **after** the graph is
+    /// persisted and enabled, so it records a completed create — a journal
+    /// failure never rolls the create back. Additive: old logs never carry it,
+    /// and its presence doesn't change how any existing variant serializes.
+    WorkflowCreated {
+        /// The new workflow's id (its `workflows/<id>.toml` stem).
+        workflow_id: String,
+        /// The new workflow's display name.
+        name: String,
+        /// Who authored it, when known. `None` when created by a surface that
+        /// carries no attributed actor (the current create paths); kept as an
+        /// `Option` so a future attributed create needs no migration, mirroring
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
+    /// An operator steered an in-flight run — paused, cancelled, or redirected a
+    /// dispatched task (or cancelled a delegation) from chat (issue #111).
+    /// Journaled best-effort **after** the steer is accepted by the in-flight
+    /// registry, so it records an accepted operator control action. Additive: old
+    /// logs never carry it, and its presence doesn't change how any existing
+    /// variant serializes (same `by` / skip-if-none precedent as
+    /// [`WorkflowCreated`](Self::WorkflowCreated)).
+    TaskSteered {
+        /// The steered run's key — the board task id, or a delegation run id.
+        task_id: String,
+        /// The action taken, as a stable wire word: `pause` / `cancel` /
+        /// `redirect`.
+        action: String,
+        /// The operator's redirect instruction (codepoint-capped), present only
+        /// on a `redirect`. Omitted from the wire otherwise, and — being
+        /// operator-authored free text — never projected onto the SSE stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruction: Option<String>,
+        /// Who steered, when known. `None` on a surface that carries no attributed
+        /// actor; kept `Option` so a future attributed steer needs no migration,
+        /// mirroring [`OperatorMessage`](Self::OperatorMessage)'s `by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
     },
 }
 
@@ -649,6 +736,20 @@ pub struct InboundMessage {
     pub from: Actor,
 }
 
+/// Channel-specific reply addressing for an [`OutboundMessage`].
+///
+/// Carries the chat/thread a reply must be delivered back to on channels whose
+/// messages are addressed to a specific conversation — chiefly Telegram, where
+/// the reply has to land in the same `chat.id` the inbound update came from.
+/// The operator channel is a single implicit surface and needs none of this.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyTo {
+    /// The chat/thread id to deliver back to. Rendered as a string so it stays
+    /// channel-agnostic (Telegram's numeric `chat.id`, a future channel's
+    /// opaque thread key) without widening the type per channel.
+    pub chat_id: String,
+}
+
 /// A message the company emits on a channel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutboundMessage {
@@ -656,6 +757,85 @@ pub struct OutboundMessage {
     pub channel: String,
     /// The message text.
     pub text: String,
+    /// The visible processing steps behind this bubble — the agent's tool calls,
+    /// thinking runs, and any surfaced MCP failures — folded and scrubbed from
+    /// the turn's progress stream (see [`crate::harness::steps`] under the
+    /// `openhuman` feature). Per-bubble ownership: the operator bubble carries the
+    /// orchestrator's steps; a delegated desk bubble carries that desk lead's
+    /// steps.
+    ///
+    /// Additive and non-secret: the field is omitted on the wire when empty, so
+    /// every prior producer (and every non-harness brain, which emits none)
+    /// round-trips byte-identically. Never carries raw tool arguments, tool
+    /// output, or call ids — only the scrubbed [`TurnStep`] shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TurnStep>,
+    /// Where to deliver the reply, for channels addressed to a specific
+    /// chat/thread (Telegram). `None` on the operator channel and on every
+    /// message emitted before this field existed; `skip_serializing_if` keeps
+    /// such a message byte-identical on the wire, so no stored record migrates
+    /// (same `by`/`chat`/`McpCallFailed` additive precedent above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyTo>,
+}
+
+/// One visible step in an agent turn's processing timeline, surfaced in the
+/// operator chat.
+///
+/// The point of the timeline: a failed tool call becomes visible (instead of a
+/// vague acknowledgement), and a memory-served answer — which runs **zero**
+/// steps — is distinguishable from a tool-backed one. Folded from the harness
+/// progress stream by [`crate::harness::steps`] (compiled under the `openhuman`
+/// feature); every field is scrubbed there before it reaches this shape.
+///
+/// The wire form is additive and camelCase (`elapsedMs`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStep {
+    /// What kind of step this is (drives the icon in the UI).
+    pub kind: TurnStepKind,
+    /// How the step ended.
+    pub status: TurnStepStatus,
+    /// A short, human label (e.g. "Reading messages", "Thinking"). Derived from
+    /// the tool's server-computed `display_label`, else its tool name — never
+    /// from tool arguments or output.
+    pub label: String,
+    /// An optional muted detail: whitelisted, scrubbed enrichment (e.g. an MCP
+    /// `server · tool`, a delegated desk, a task title) or a plain-language
+    /// failure cause. **Never** raw tool output or arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// How long the step took in milliseconds, when known (tool calls report it;
+    /// thinking/note steps do not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+/// The kind of a [`TurnStep`], driving its icon in the timeline. Serialized in
+/// `snake_case` (`tool_call` / `thinking` / `note`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepKind {
+    /// A tool call (a paired started/completed pair, or an unmatched one).
+    ToolCall,
+    /// A run of the model's reasoning, coalesced to a single "Thinking" step.
+    Thinking,
+    /// A standalone note — e.g. a surfaced MCP failure or the cap-omission
+    /// marker.
+    Note,
+}
+
+/// How a [`TurnStep`] ended. Serialized in `snake_case` (`ok` / `error` /
+/// `running`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepStatus {
+    /// Completed successfully (or an informational step).
+    Ok,
+    /// Failed — rendered in the destructive tone.
+    Error,
+    /// Started but no completion was observed by the end of the turn.
+    Running,
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +859,66 @@ pub struct OverlayAgent {
     pub description: Option<String>,
 }
 
+/// An operator-added desk membership that the version-controlled manifest does
+/// not know about. Persisted as an overlay on the [`CompanyRecord`] and merged
+/// into a desk's effective membership at read/resolve time; the `company.toml`
+/// is never rewritten. Only additions are modelled — a manifest-declared desk
+/// member is part of the blueprint and cannot be removed through the overlay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayDeskMember {
+    /// The desk (group-chat) id this addition targets.
+    pub desk_id: String,
+    /// The teammate id added to the desk. Resolves to a manifest agent or an
+    /// [`OverlayAgent`].
+    pub agent_id: String,
+}
+
+/// The operator overlays persisted as a single JSON blob by the string-column
+/// stores (sqlite + mongodb `overlay_json`). The filesystem store keeps the two
+/// collections as typed fields on its own `Meta` instead.
+///
+/// [`Self::parse`] accepts both the current object form and the legacy bare
+/// array (`overlay_json` held only `Vec<OverlayAgent>` before desk overlays
+/// existed), so existing rows load without a migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OverlayBlob {
+    /// The operator team overlay.
+    #[serde(default)]
+    pub agents: Vec<OverlayAgent>,
+    /// The operator desk-membership overlay.
+    #[serde(default)]
+    pub desk_members: Vec<OverlayDeskMember>,
+}
+
+impl OverlayBlob {
+    /// Builds a blob from a record's two overlay collections.
+    pub fn from_record(record: &CompanyRecord) -> Self {
+        Self {
+            agents: record.overlay_agents.clone(),
+            desk_members: record.overlay_desk_members.clone(),
+        }
+    }
+
+    /// Parses the persisted blob, accepting both the current object form
+    /// (`{"agents":[…],"desk_members":[…]}`) and the legacy bare-array form
+    /// (`[…]`, the pre-desk-overlay value that held only agents).
+    /// When the current form parse fails, falls back to the legacy array; if
+    /// that also fails the *original* error (from the current-form parse) is
+    /// propagated so the caller sees why the object form failed rather than a
+    /// misleading "expected sequence" message.
+    pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        match serde_json::from_str::<OverlayBlob>(json) {
+            Ok(blob) => Ok(blob),
+            Err(original) => serde_json::from_str::<Vec<OverlayAgent>>(json)
+                .map(|agents| Self {
+                    agents,
+                    desk_members: Vec::new(),
+                })
+                .map_err(|_| original),
+        }
+    }
+}
+
 /// A durable company record: charter/roster (manifest) plus ledger and
 /// lifecycle state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -694,6 +934,45 @@ pub struct CompanyRecord {
     /// Operator-added teammates not present in the manifest (the team overlay).
     #[serde(default)]
     pub overlay_agents: Vec<OverlayAgent>,
+    /// Operator-added desk memberships not present in the manifest (the desk
+    /// overlay). Merged into a desk's effective membership at read time.
+    #[serde(default)]
+    pub overlay_desk_members: Vec<OverlayDeskMember>,
+}
+
+impl CompanyRecord {
+    /// The effective member ids of a desk: the manifest's declared members
+    /// first, then any operator-overlay additions for that desk, in order and
+    /// deduplicated on id.
+    ///
+    /// This is the single source of truth for "who is on a desk", shared by the
+    /// REST `list_desks` handler and the harness `desk_lead` resolver so the two
+    /// cannot drift. Ordering rule: manifest order is preserved, overlay members
+    /// are appended in insertion order — so the manifest's first member stays the
+    /// lead, and an overlay lead only applies to a desk the manifest left empty.
+    pub fn effective_desk_members(&self, desk_id: &str) -> Vec<String> {
+        let mut members: Vec<String> = self
+            .manifest
+            .group_chats
+            .iter()
+            .find(|c| c.id == desk_id)
+            .map(|c| c.members.clone())
+            .unwrap_or_default();
+        for add in &self.overlay_desk_members {
+            if add.desk_id == desk_id && !members.contains(&add.agent_id) {
+                members.push(add.agent_id.clone());
+            }
+        }
+        members
+    }
+
+    /// Whether `agent_id` names a roster teammate — a manifest agent or an
+    /// operator-overlay teammate. The desk overlay may only add ids that resolve
+    /// here.
+    pub fn is_roster_agent(&self, agent_id: &str) -> bool {
+        self.manifest.agents.iter().any(|a| a.id == agent_id)
+            || self.overlay_agents.iter().any(|a| a.id == agent_id)
+    }
 }
 
 /// A compact company listing entry.
@@ -852,6 +1131,126 @@ mod test {
         serde_json::from_str(&json).expect("deserialize")
     }
 
+    /// The `TurnStep` wire shape is camelCase with snake_case enum values:
+    /// `{kind, status, label, detail?, elapsedMs?}`. Locks the contract the
+    /// console `TurnStep` mirror in `frontend/src/api/types.ts` depends on.
+    #[test]
+    fn turn_step_wire_shape_is_camel_case_with_snake_case_enums() {
+        let step = TurnStep {
+            kind: TurnStepKind::ToolCall,
+            status: TurnStepStatus::Error,
+            label: "Searching the web".to_string(),
+            detail: Some("brave · search".to_string()),
+            elapsed_ms: Some(1234),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["kind"], "tool_call");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["label"], "Searching the web");
+        assert_eq!(json["detail"], "brave · search");
+        assert_eq!(json["elapsedMs"], 1234);
+        assert_eq!(round_trip(&step), step);
+    }
+
+    /// A step with no detail/elapsed omits both keys, and every kind/status
+    /// value serializes to its documented snake_case token.
+    #[test]
+    fn turn_step_omits_absent_fields_and_covers_every_variant() {
+        let bare = TurnStep {
+            kind: TurnStepKind::Thinking,
+            status: TurnStepStatus::Ok,
+            label: "Thinking".to_string(),
+            detail: None,
+            elapsed_ms: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(json["kind"], "thinking");
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("detail").is_none(), "absent detail is omitted");
+        assert!(json.get("elapsedMs").is_none(), "absent elapsed is omitted");
+
+        assert_eq!(serde_json::to_value(TurnStepKind::Note).unwrap(), "note");
+        assert_eq!(
+            serde_json::to_value(TurnStepStatus::Running).unwrap(),
+            "running"
+        );
+    }
+
+    /// `OutboundMessage.steps` is additive: an empty timeline is omitted from
+    /// the wire entirely (so every prior producer round-trips byte-identically),
+    /// and a legacy `{channel, text}` payload still loads with an empty `steps`.
+    #[test]
+    fn outbound_message_steps_are_additive_and_omitted_when_empty() {
+        let no_steps = OutboundMessage {
+            channel: "operator".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+            reply_to: None,
+        };
+        let json = serde_json::to_string(&no_steps).unwrap();
+        assert_eq!(json, r#"{"channel":"operator","text":"hi"}"#);
+
+        let legacy: OutboundMessage =
+            serde_json::from_str(r#"{"channel":"operator","text":"hi"}"#).unwrap();
+        assert!(legacy.steps.is_empty());
+
+        let with_steps = OutboundMessage {
+            channel: "operator".to_string(),
+            text: "done".to_string(),
+            steps: vec![TurnStep {
+                kind: TurnStepKind::Note,
+                status: TurnStepStatus::Error,
+                label: "MCP: brave unavailable".to_string(),
+                detail: Some("server rejected the call".to_string()),
+                elapsed_ms: None,
+            }],
+            reply_to: None,
+        };
+        assert_eq!(round_trip(&with_steps), with_steps);
+    }
+
+    /// `AgentReply.steps` is additive the same way: a reply journaled before
+    /// the field existed loads with an empty timeline, and a tool-less reply
+    /// omits the key so its on-disk form is byte-identical to the legacy log.
+    #[test]
+    fn agent_reply_steps_are_additive_and_omitted_when_empty() {
+        let legacy: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#,
+        )
+        .expect("a pre-steps AgentReply still loads");
+        match &legacy {
+            CompanyEvent::AgentReply { steps, .. } => assert!(steps.is_empty()),
+            other => panic!("expected AgentReply, got {other:?}"),
+        }
+
+        // A tool-less reply serializes without the `steps` key.
+        let tool_less = CompanyEvent::AgentReply {
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+        };
+        let json = serde_json::to_value(&tool_less).unwrap();
+        assert!(json.get("steps").is_none());
+
+        // A reply with a timeline round-trips it.
+        let with_steps = CompanyEvent::AgentReply {
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "done".to_string(),
+            steps: vec![TurnStep {
+                kind: TurnStepKind::ToolCall,
+                status: TurnStepStatus::Ok,
+                label: "Reading messages".to_string(),
+                detail: None,
+                elapsed_ms: Some(12),
+            }],
+        };
+        let back: CompanyEvent =
+            serde_json::from_str(&serde_json::to_string(&with_steps).unwrap()).unwrap();
+        assert_eq!(back, with_steps);
+    }
+
     #[test]
     fn an_operator_message_journaled_before_attribution_still_loads() {
         // Exactly what is already on disk in every existing company's event
@@ -863,6 +1262,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }
         );
     }
@@ -875,6 +1275,7 @@ mod test {
         let event = CompanyEvent::OperatorMessage {
             text: "hi".into(),
             by: None,
+            chat: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
@@ -890,6 +1291,7 @@ mod test {
                 kind: ActorKind::User,
                 id: "u1".into(),
             }),
+            chat: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["by"]["kind"], "user");
@@ -914,6 +1316,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
             CompanyEvent::WebhookReceived {
                 channel: "email".into(),
@@ -951,6 +1354,53 @@ mod test {
         let json = serde_json::to_value(&events[0]).unwrap();
         assert_eq!(json["kind"], "OperatorMessage");
         assert_eq!(json["text"], "hi");
+    }
+
+    #[test]
+    fn mcp_call_failed_round_trips_and_is_byte_stable() {
+        let event = CompanyEvent::McpCallFailed {
+            server: "browserbase".into(),
+            tool: "browse".into(),
+            status: "tool_call_rejected".into(),
+            message: "server rejected the call".into(),
+        };
+        assert_eq!(round_trip(&event), event);
+        // The tag is emitted under `kind`, and the field set is fixed — a byte
+        // guard so a later field addition is a deliberate, tested change.
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"kind":"McpCallFailed","server":"browserbase","tool":"browse","status":"tool_call_rejected","message":"server rejected the call"}"#
+        );
+    }
+
+    #[test]
+    fn task_steered_round_trips_and_omits_empty_fields() {
+        // A plain pause: no `instruction`, no `by` — both must be OMITTED from
+        // the wire (skip_serializing_if), so old logs stay byte-stable.
+        let pause = CompanyEvent::TaskSteered {
+            task_id: "t1".into(),
+            action: "pause".into(),
+            instruction: None,
+            by: None,
+        };
+        assert_eq!(round_trip(&pause), pause);
+        assert_eq!(
+            serde_json::to_string(&pause).unwrap(),
+            r#"{"kind":"TaskSteered","task_id":"t1","action":"pause"}"#
+        );
+
+        // A redirect carries its (capped) instruction; still no actor.
+        let redirect = CompanyEvent::TaskSteered {
+            task_id: "t1".into(),
+            action: "redirect".into(),
+            instruction: Some("focus on the API".into()),
+            by: None,
+        };
+        assert_eq!(round_trip(&redirect), redirect);
+        assert_eq!(
+            serde_json::to_string(&redirect).unwrap(),
+            r#"{"kind":"TaskSteered","task_id":"t1","action":"redirect","instruction":"focus on the API"}"#
+        );
     }
 
     #[test]
@@ -1035,6 +1485,95 @@ mod test {
             }],
         };
         assert_eq!(round_trip(&card), card);
+    }
+
+    fn desk_record(toml_src: &str, overlay: Vec<OverlayDeskMember>) -> CompanyRecord {
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest: toml::from_str(toml_src).expect("parse manifest"),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: overlay,
+        }
+    }
+
+    /// The effective membership is the manifest members first, then overlay
+    /// additions in insertion order, deduplicated — the shared rule the REST
+    /// list and the harness desk-lead resolver both read.
+    #[test]
+    fn effective_desk_members_unions_manifest_and_overlay_deduped() {
+        let manifest = "[company]\nname = \"Acme\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n\
+             [[group_chat]]\nid = \"studio\"\nname = \"Studio\"\nmembers = [\"ceo\"]\n";
+        let record = desk_record(
+            manifest,
+            vec![
+                OverlayDeskMember {
+                    desk_id: "studio".into(),
+                    agent_id: "eng".into(),
+                },
+                // A duplicate of a manifest member is not added twice.
+                OverlayDeskMember {
+                    desk_id: "studio".into(),
+                    agent_id: "ceo".into(),
+                },
+                // An addition for a different desk is ignored here.
+                OverlayDeskMember {
+                    desk_id: "other".into(),
+                    agent_id: "eng".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            record.effective_desk_members("studio"),
+            vec!["ceo".to_string(), "eng".to_string()]
+        );
+        // An unknown desk with only an overlay addition still resolves it.
+        assert_eq!(
+            record.effective_desk_members("other"),
+            vec!["eng".to_string()]
+        );
+    }
+
+    /// `is_roster_agent` accepts both manifest agents and overlay teammates, and
+    /// rejects an unknown id — the validation the desk-add route relies on.
+    #[test]
+    fn is_roster_agent_covers_manifest_and_overlay() {
+        let manifest = "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n";
+        let mut record = desk_record(manifest, Vec::new());
+        record.overlay_agents.push(OverlayAgent {
+            id: "nova".into(),
+            name: "Nova".into(),
+            role: "Growth".into(),
+            description: None,
+        });
+        assert!(record.is_roster_agent("ceo"));
+        assert!(record.is_roster_agent("nova"));
+        assert!(!record.is_roster_agent("ghost"));
+    }
+
+    /// The persisted overlay blob reads both the current object form and the
+    /// legacy bare-`overlay_agents`-array form, so existing sqlite/mongo rows
+    /// load without a migration.
+    #[test]
+    fn overlay_blob_parses_object_and_legacy_array() {
+        let object = r#"{"agents":[{"id":"a","name":"A","role":"r"}],"desk_members":[{"desk_id":"d","agent_id":"a"}]}"#;
+        let blob = OverlayBlob::parse(object).expect("object");
+        assert_eq!(blob.agents.len(), 1);
+        assert_eq!(blob.desk_members.len(), 1);
+
+        // Legacy: overlay_json used to hold a bare Vec<OverlayAgent>.
+        let legacy = r#"[{"id":"a","name":"A","role":"r"}]"#;
+        let blob = OverlayBlob::parse(legacy).expect("legacy array");
+        assert_eq!(blob.agents.len(), 1);
+        assert!(blob.desk_members.is_empty());
+
+        // The empty-array default persisted by fresh schema.
+        let blob = OverlayBlob::parse("[]").expect("empty array");
+        assert!(blob.agents.is_empty());
+        assert!(blob.desk_members.is_empty());
     }
 
     #[test]

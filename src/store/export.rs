@@ -172,6 +172,7 @@ impl BundleContents {
                 ledger: Vec::new(),
                 lifecycle: self.lifecycle.clone(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
             })
             .await?;
         for entry in &self.ledger {
@@ -543,6 +544,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "kick off".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .expect("cycle");
@@ -726,6 +728,7 @@ mod test {
             ledger: Vec::new(),
             lifecycle: "paused".into(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
         })
         .await
         .unwrap();
@@ -779,6 +782,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();

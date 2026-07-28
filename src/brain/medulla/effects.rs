@@ -90,6 +90,7 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             chat_id,
             agent_id,
             text,
+            ..
         } => (
             Role::Assistant,
             agent_id.clone(),
@@ -101,6 +102,40 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             "operator".to_string(),
             format!("Deleted memory fact {fact_id}"),
             "memory.fact_deleted",
+        ),
+        CompanyEvent::TaskDispatched { task_id } => (
+            Role::System,
+            "board".to_string(),
+            format!("Dispatched task {task_id}"),
+            "task.dispatched",
+        ),
+        CompanyEvent::McpCallFailed {
+            server,
+            tool,
+            status,
+            message,
+        } => (
+            Role::System,
+            "mcp".to_string(),
+            format!("MCP call to {server}/{tool} failed ({status}): {message}"),
+            "mcp.call_failed",
+        ),
+        CompanyEvent::WorkflowCreated {
+            workflow_id, name, ..
+        } => (
+            Role::System,
+            "workflow".to_string(),
+            format!("Created workflow {name} ({workflow_id})"),
+            "workflow.created",
+        ),
+        // Action-only body: the operator's redirect instruction is never wired.
+        CompanyEvent::TaskSteered {
+            task_id, action, ..
+        } => (
+            Role::System,
+            "operator".to_string(),
+            format!("Steered task {task_id} ({action})"),
+            "task.steered",
         ),
     };
     WireEvent {
@@ -184,7 +219,12 @@ pub(crate) fn channel_message_from_effect(effect: &Effect) -> Option<OutboundMes
         .or_else(|| payload_str(payload, "body"))
         .or_else(|| payload_str(payload, "message"))?
         .to_string();
-    Some(OutboundMessage { channel, text })
+    Some(OutboundMessage {
+        channel,
+        text,
+        steps: Vec::new(),
+        reply_to: None,
+    })
 }
 
 /// Records a ledger delta for an executed effect that moved money.

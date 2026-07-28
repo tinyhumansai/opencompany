@@ -5,13 +5,29 @@
 //! report its effective configuration. The cognition kernel (Brain, cycle
 //! loop, stores) lands in later phases; see `docs/spec/roadmap.md`.
 
+pub mod composio;
 #[cfg(test)]
 mod content_test;
 pub mod dns;
+pub mod inference;
 mod manifest;
+pub mod mcp;
+// Console MCP OAuth (issue #90): discovery + PKCE + DCR + token exchange for the
+// per-tenant browser sign-in flow. Needs the vendored `oh::mcp_client` discovery
+// primitive + `uuid`/`base64`/`url`, so it links only under the `mcp` feature.
+#[cfg(feature = "mcp")]
+pub mod mcp_oauth;
 pub mod runtime;
 mod skill_file;
+// Steer (issue #111): pause / cancel / redirect an in-flight task or delegation
+// from the operator chat. Always compiled + openhuman-free so the operator
+// control plane can steer in any build and no agent tool can ever reach it.
+pub mod steer;
+pub mod task_intent;
+pub mod telegram;
 mod types;
+#[cfg(feature = "openhuman")]
+mod workflow_create;
 mod workflow_file;
 pub mod workspace_seed;
 
@@ -20,14 +36,24 @@ use std::path::Path;
 pub use manifest::{LEGACY_MANIFEST_FILE, Located, MANIFEST_FILE, discover};
 pub use skill_file::{SkillDoc, load_dir_skills, parse_skill_md};
 pub use types::{
-    Agent, BRAIN_MODES, Brain, Budget, ChannelConfig, Company, CompanyManifest,
-    DEFAULT_ALWAYS_APPROVE, KNOWN_CHANNELS, POLICY_MODES, Place, Policy, Schedule, Skill, TIERS,
-    TOOL_PROVIDERS, Tools,
+    Agent, BRAIN_MODES, Brain, Budget, ChannelConfig, Company, CompanyManifest, ComposioTools,
+    Connection, DEFAULT_ALWAYS_APPROVE, GATEABLE_NAMESPACES, INFERENCE_PROVIDERS, INFERENCE_TIERS,
+    Inference, KNOWN_CHANNELS, McpServer, PLAN_NAMES, PLAN_PERIODS, POLICY_MODES, Place, Plan,
+    Policy, Schedule, Skill, TIERS, TOOL_PROVIDERS, Tools, grants_composio_explicit,
+    grants_media_explicit,
 };
 pub use workflow_file::{
     WORKFLOW_NODE_KINDS, WorkflowEdgeDef, WorkflowFile, WorkflowNodeDef, WorkflowNodeKind,
-    load_company_workflows, parse_workflow,
+    WorkflowRetryDef, list_source_workflows, load_company_workflows, parse_workflow,
 };
+// Crate-internal only: the workflow creator (issue #69) builds a `RawWorkflow`
+// from its request body, renders it to TOML, and re-parses it through
+// `parse_workflow` above for validation before writing to disk.
+pub(crate) use workflow_file::{RawEdge, RawNode, RawWorkflow, render_workflow};
+// Crate-internal only: the shared validated-persist core (issue #112) both the
+// REST `POST …/workflows` route and the orchestrator `create_workflow` tool run.
+#[cfg(feature = "openhuman")]
+pub(crate) use workflow_create::create_company_workflow;
 pub use workspace_seed::{NodeKind, SeedNode, extract_wikilinks, walk_workspace};
 
 use crate::{Result, VERSION};

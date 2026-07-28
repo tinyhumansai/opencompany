@@ -115,6 +115,49 @@ pub struct FeedbackItem {
     pub consent_mode: ConsentMode,
 }
 
+/// The HTTP-safe projection of a [`FeedbackItem`] for the console's reports
+/// list.
+///
+/// Deliberately *not* a serialization of the whole item: `operator_words` and
+/// `context_excerpt` are local-only and are the two fields this type exists to
+/// leave behind. An operator sees what they reported and where it went, and
+/// re-reads their own words in the client that captured them.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FeedbackSummary {
+    /// The item's id.
+    pub id: String,
+    /// The reported category.
+    pub category: FeedbackCategory,
+    /// The work item the feedback concerns, if any.
+    pub work_item: Option<String>,
+    /// Epoch-millis the item was captured.
+    pub at_millis: u64,
+    /// The filed issue URL, once filed.
+    pub filed_issue_url: Option<String>,
+    /// The last-observed status (`open`, `duplicate`, `forwarded`, …).
+    pub issue_status: Option<String>,
+}
+
+impl FeedbackSummary {
+    /// Projects an item, dropping every local-only field.
+    pub fn from_item(item: &FeedbackItem) -> Self {
+        Self {
+            id: item.id.clone(),
+            category: item.category,
+            work_item: item.work_item.clone(),
+            at_millis: item.at_millis,
+            // A forwarded item stores the hub's id here, which is not a URL;
+            // only surface this when it is one so the console can link it.
+            filed_issue_url: item
+                .filed_issue_url
+                .as_ref()
+                .filter(|url| url.starts_with("http"))
+                .cloned(),
+            issue_status: item.issue_status.clone(),
+        }
+    }
+}
+
 /// The maximum length of a captured context excerpt, in bytes. Data
 /// minimization: issues carry the minimum needed to reproduce.
 pub const CONTEXT_EXCERPT_CAP: usize = 2000;

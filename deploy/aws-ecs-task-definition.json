@@ -15,6 +15,9 @@
         { "name": "OPENCOMPANY_COMPANY", "value": "agentic_marketing_agency" },
         { "name": "OPENCOMPANY_DISCOVERABLE", "value": "false" }
       ],
+      "mountPoints": [
+        { "sourceVolume": "workspace", "containerPath": "/data", "readOnly": false }
+      ],
       "healthCheck": {
         "command": ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"],
         "interval": 15,
@@ -45,6 +48,17 @@
           "awslogs-region": "REGION",
           "awslogs-stream-prefix": "console"
         }
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "workspace",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-CHANGEME",
+        "rootDirectory": "/",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": { "accessPointId": "fsap-CHANGEME", "iam": "ENABLED" }
       }
     }
   ]

@@ -271,6 +271,8 @@ mod test {
                     responses.push(OutboundMessage {
                         channel: "operator".into(),
                         text: format!("scheduled: {prompt}"),
+                        steps: Vec::new(),
+                        reply_to: None,
                     });
                 }
             }

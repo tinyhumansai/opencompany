@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{OpenCompanyError, Result};
 
 use super::types::{
-    BRAIN_MODES, CONNECTION_PRIORITIES, CompanyManifest, KNOWN_CHANNELS, POLICY_MODES, TIERS,
-    TOOL_PROVIDERS,
+    BRAIN_MODES, CONNECTION_PRIORITIES, CompanyManifest, GATEABLE_NAMESPACES, KNOWN_CHANNELS,
+    PLAN_NAMES, PLAN_PERIODS, POLICY_MODES, TIERS, TOOL_PROVIDERS,
 };
 
 /// Preferred manifest filename.
@@ -201,6 +201,14 @@ impl CompanyManifest {
             }
         }
 
+        // MCP servers: unique names, an `http(s)://` endpoint, no stdio in v1.
+        problems.extend(super::mcp::validate_servers(&self.mcp_servers));
+
+        // Inference (issue #56 — BYOK): provider kind, base_url rules, and a
+        // key *name* (never an inline credential). Inert when the section is
+        // absent.
+        problems.extend(super::inference::validate_inference(&self.inference));
+
         // Enabled workflows reference `workflows/<id>.toml`; ids must be sane.
         for id in &self.workflows.enabled {
             if !is_snake_case(id) {
@@ -264,6 +272,28 @@ impl CompanyManifest {
             problems.push(format!(
                 "`[budget].monthly_usd` cannot be negative — you wrote `{monthly}`."
             ));
+        }
+
+        // `[plan]` — capability tier gating (issue #108). Only checked when the
+        // section is set; an absent `[plan]` leaves gating off and is always ok.
+        if self.plan.is_set() {
+            if let Some(name) = self.plan.name.as_deref().map(str::trim)
+                && !name.is_empty()
+                && !PLAN_NAMES.contains(&name)
+            {
+                problems.push(one_of("`[plan].name`", &PLAN_NAMES, name));
+            }
+            if !PLAN_PERIODS.contains(&self.plan.period.as_str()) {
+                problems.push(one_of("`[plan].period`", &PLAN_PERIODS, &self.plan.period));
+            }
+            for namespace in self.plan.token_budgets.keys() {
+                if !GATEABLE_NAMESPACES.contains(&namespace.as_str()) {
+                    problems.push(format!(
+                        "`[plan].token_budgets` has an unknown tool namespace `{namespace}` — budget one of {}.",
+                        join_backticked(&GATEABLE_NAMESPACES)
+                    ));
+                }
+            }
         }
 
         for (index, schedule) in self.schedules.iter().enumerate() {
@@ -421,6 +451,60 @@ mod tests {
     }
 
     #[test]
+    fn valid_plan_section_passes() {
+        let manifest = parse(
+            "[company]\nname = \"X\"\n[plan]\nname = \"starter\"\nperiod = \"monthly\"\n[plan.token_budgets]\nweb = 500000\n",
+        );
+        assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+    }
+
+    #[test]
+    fn absent_plan_is_valid() {
+        // No `[plan]` → gating off; the default section must not trip validation.
+        let manifest = parse("[company]\nname = \"X\"\n");
+        assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+    }
+
+    #[test]
+    fn rejects_unknown_plan_name_in_prosumer_language() {
+        let manifest = parse("[company]\nname = \"X\"\n[plan]\nname = \"enterprise\"\n");
+        let problems = manifest.validate();
+        assert!(
+            problems.iter().any(|p| p.contains("`[plan].name`")
+                && p.contains("free, starter, pro, unlimited")
+                && p.contains("enterprise")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_plan_period() {
+        let manifest =
+            parse("[company]\nname = \"X\"\n[plan]\nname = \"free\"\nperiod = \"hourly\"\n");
+        let problems = manifest.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("`[plan].period`") && p.contains("hourly")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_gateable_budget_namespace() {
+        let manifest = parse(
+            "[company]\nname = \"X\"\n[plan]\nname = \"pro\"\n[plan.token_budgets]\ntelepathy = 100\n",
+        );
+        let problems = manifest.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("telepathy") && p.contains("token_budgets")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
     fn rejects_bad_policy_mode_in_prosumer_language() {
         let manifest = parse("[company]\nname = \"X\"\n[policy]\nmode = \"supervized\"\n");
         let problems = manifest.validate();
@@ -472,6 +556,25 @@ mod tests {
             problems
                 .iter()
                 .any(|p| p.contains("`tier`") && p.contains("genius"))
+        );
+    }
+
+    #[test]
+    fn accepts_a_telegram_channel_entry() {
+        let manifest = parse(
+            r#"
+            [company]
+            name = "X"
+            [[agent]]
+            id = "a"
+            role = "A"
+            [channels.telegram]
+            enabled = true
+            "#,
+        );
+        assert!(
+            !manifest.validate().iter().any(|p| p.contains("telegram")),
+            "telegram is a known channel and must validate"
         );
     }
 
@@ -580,6 +683,74 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("workflow id") && p.contains("Bad-Id")),
             "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_http_mcp_server_and_rejects_stdio() {
+        let ok = parse(
+            r#"
+            [company]
+            name = "X"
+            [[mcp_server]]
+            name = "notion"
+            endpoint = "https://notion.example/mcp"
+            "#,
+        );
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+
+        let bad = parse(
+            r#"
+            [company]
+            name = "X"
+            [[mcp_server]]
+            name = "local"
+            command = "npx some-mcp"
+            "#,
+        );
+        let problems = bad.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("stdio") && p.contains("hosted v1")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_byok_inference_and_rejects_bad_provider() {
+        let ok = parse(
+            r#"
+            [company]
+            name = "X"
+            [inference]
+            provider = "openrouter"
+            [inference.models]
+            "chat-v1" = "deepseek/deepseek-chat"
+            "#,
+        );
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+        assert_eq!(ok.inference.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            ok.inference.models.get("chat-v1").map(String::as_str),
+            Some("deepseek/deepseek-chat")
+        );
+
+        let bad = parse(
+            r#"
+            [company]
+            name = "X"
+            [inference]
+            provider = "ollama"
+            "#,
+        );
+        // Ollama needs a base_url.
+        assert!(
+            bad.validate()
+                .iter()
+                .any(|p| p.contains("base_url") && p.contains("required")),
+            "{:?}",
+            bad.validate()
         );
     }
 

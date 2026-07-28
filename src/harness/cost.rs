@@ -45,14 +45,17 @@ pub struct TurnUsage {
     pub cached_input_tokens: u64,
     /// Best-available USD cost for the turn (charged + estimated).
     pub cost_usd: f64,
-    /// Number of model calls made during the turn.
-    pub call_count: u32,
 }
 
 /// Build the `inference.spend` [`LedgerEntry`] for a turn, or `None` when the
-/// turn consumed nothing (no model calls / no cost).
+/// turn cost nothing.
+///
+/// Gated on **cost**, not tokens: the `/openai/v1` passthrough reports tokens
+/// but bills backend-side and echoes no USD, so a token-bearing zero-cost turn
+/// must not post a meaningless `$0.00` spend line to Finances. Its tokens are
+/// still recorded through [`usage_sample_for`] on the Usage surface.
 pub fn ledger_entry_for(turn: &TurnUsage, agent_id: &str) -> Option<LedgerEntry> {
-    if is_zero_usage(turn) {
+    if turn.cost_usd == 0.0 {
         return None;
     }
     Some(LedgerEntry {
@@ -80,12 +83,11 @@ pub fn usage_sample_for(turn: &TurnUsage, agent_id: &str, provider: &str) -> Opt
     })
 }
 
-/// A turn is zero-usage when it made no calls and moved no tokens or cost.
+/// A turn is zero-usage when it moved no tokens and cost nothing — e.g. the
+/// offline [`MockProvider`](super::provider::MockProvider), whose replies carry
+/// no usage. Such a turn writes neither a ledger entry nor a usage sample.
 fn is_zero_usage(turn: &TurnUsage) -> bool {
-    turn.call_count == 0
-        && turn.input_tokens == 0
-        && turn.output_tokens == 0
-        && turn.cost_usd == 0.0
+    turn.input_tokens == 0 && turn.output_tokens == 0 && turn.cost_usd == 0.0
 }
 
 /// Record a completed turn's cost: append the ledger entry (always available)
@@ -159,13 +161,12 @@ mod tests {
         }
     }
 
-    fn turn_with(cost: f64, calls: u32) -> TurnUsage {
+    fn turn_with(cost: f64) -> TurnUsage {
         TurnUsage {
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 10,
             cost_usd: cost,
-            call_count: calls,
         }
     }
 
@@ -176,9 +177,25 @@ mod tests {
         assert!(usage_sample_for(&turn, "ceo", "managed").is_none());
     }
 
+    /// The `/openai/v1` passthrough reports tokens but no USD (billing happens
+    /// backend-side, off the wire). A token-bearing, zero-cost turn is still
+    /// real usage — it must produce a sample so the Usage surface is not blind.
+    #[test]
+    fn token_only_zero_cost_turn_is_not_zero_usage() {
+        let turn = TurnUsage {
+            input_tokens: 22,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            cost_usd: 0.0,
+        };
+        assert!(usage_sample_for(&turn, "ceo", "managed").is_some());
+        // No USD ⇒ no ledger entry, but the token sample still lands.
+        assert!(ledger_entry_for(&turn, "ceo").is_none());
+    }
+
     #[test]
     fn spend_maps_to_inference_ledger_entry() {
-        let turn = turn_with(0.42, 1);
+        let turn = turn_with(0.42);
         let entry = ledger_entry_for(&turn, "ceo").unwrap();
         assert_eq!(entry.kind, "inference.spend");
         assert_eq!(entry.amount_usd, 0.42);
@@ -189,7 +206,7 @@ mod tests {
     async fn record_turn_cost_writes_ledger_and_sample() {
         let store = RecordingStore::default();
         let meter = RecordingMeter::default();
-        let turn = turn_with(1.5, 2);
+        let turn = turn_with(1.5);
         record_turn_cost(
             &turn,
             "ceo",

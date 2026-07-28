@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/tinyhumansai/opencompany/refs/heads/main/gitbooks/.gitbook/assets/opencompany.png" alt="OpenCompany" />
+</p>
+
 <h1 align="center">OpenCompany</h1>
 
 <p align="center">
@@ -11,6 +15,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/tinyhumansai/opencompany/blob/main/LICENSE"><img src="https://img.shields.io/github/license/tinyhumansai/opencompany?style=flat-square" alt="License: GPL-3.0" /></a>
+  <a href="https://github.com/tinyhumansai/opencompany/stargazers"><img src="https://img.shields.io/github/stars/tinyhumansai/opencompany?style=flat-square" alt="GitHub stars" /></a>
+  <a href="https://github.com/tinyhumansai/opencompany/issues"><img src="https://img.shields.io/github/issues/tinyhumansai/opencompany?style=flat-square" alt="Open issues" /></a>
+  <a href="https://github.com/tinyhumansai/opencompany/pulls"><img src="https://img.shields.io/github/issues-pr/tinyhumansai/opencompany?style=flat-square" alt="Open pull requests" /></a>
+  <a href="https://github.com/tinyhumansai/opencompany/commits/main"><img src="https://img.shields.io/github/last-commit/tinyhumansai/opencompany?style=flat-square" alt="Last commit" /></a>
   <img src="https://img.shields.io/badge/status-work%20in%20progress-orange?style=flat-square" alt="Work in progress" />
 </p>
 
@@ -232,6 +241,14 @@ loop), **`server`** (Axum router), **`openhuman`** (launcher seams),
 
 See [docs/spec/README.md](docs/spec/README.md) for the architecture reference
 and [companies/README.md](companies/README.md) for the full company catalog.
+
+## Documentation
+
+The full docs live in [`gitbooks/`](gitbooks/README.md): what OpenCompany is,
+what one person can run, how [Medulla](gitbooks/overview/medulla.md) drives it,
+and the [tiny.place economy](gitbooks/overview/tiny-place.md). Builders should
+start with the [developer section](gitbooks/developers/README.md) — build,
+CLI, architecture, authoring companies, deployment, and configuration.
 
 ## License
 
