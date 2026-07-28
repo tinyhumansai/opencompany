@@ -308,11 +308,23 @@ impl MailConfig {
 /// `OPENCOMPANY_MAIL_*`. Distinct from the host-level `OPENCOMPANY_MAIL_HOST/...`
 /// platform-mail read by `MailConfig` (login links). Seeds the company's SMTP
 /// send credentials AND the IMAP poller config.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TenantMailboxConfig {
     pub address: String,
     pub smtp: SmtpCredentials,
     pub imap: ImapCredentials,
+}
+
+impl std::fmt::Debug for TenantMailboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the SMTP/IMAP passwords: `SmtpCredentials` derives Debug and
+        // would otherwise print its password field through this struct.
+        f.debug_struct("TenantMailboxConfig")
+            .field("address", &self.address)
+            .field("smtp_host", &self.smtp.host)
+            .field("imap_host", &self.imap.host)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TenantMailboxConfig {
