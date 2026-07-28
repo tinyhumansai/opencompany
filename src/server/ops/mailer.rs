@@ -304,6 +304,62 @@ impl MailConfig {
     }
 }
 
+/// A managed tenant's OWN mailbox identity, injected by the manager as
+/// `OPENCOMPANY_MAIL_*`. Distinct from the host-level `OPENCOMPANY_MAIL_HOST/...`
+/// platform-mail read by `MailConfig` (login links). Seeds the company's SMTP
+/// send credentials AND the IMAP poller config.
+#[derive(Clone, Debug)]
+pub struct TenantMailboxConfig {
+    pub address: String,
+    pub smtp: SmtpCredentials,
+    pub imap: ImapCredentials,
+}
+
+impl TenantMailboxConfig {
+    /// `Ok(None)` when unconfigured (no `OPENCOMPANY_MAIL_ADDRESS`); a *partial*
+    /// injection is a hard error.
+    pub fn from_env() -> Result<Option<Self>, OpenCompanyError> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let Some(address) = var("OPENCOMPANY_MAIL_ADDRESS") else {
+            return Ok(None);
+        };
+        let need = |k: &str| {
+            var(k).ok_or_else(|| {
+                OpenCompanyError::Config(format!(
+                    "{k} is required when OPENCOMPANY_MAIL_ADDRESS is set"
+                ))
+            })
+        };
+        let port = |k: &str| -> Result<u16, OpenCompanyError> {
+            need(k)?
+                .parse::<u16>()
+                .map_err(|_| OpenCompanyError::Config(format!("{k} must be a port number")))
+        };
+        let user = need("OPENCOMPANY_MAIL_USER")?;
+        let password = need("OPENCOMPANY_MAIL_PASSWORD")?;
+        let smtp = SmtpCredentials {
+            host: need("OPENCOMPANY_MAIL_SMTP_HOST")?,
+            port: port("OPENCOMPANY_MAIL_SMTP_PORT")?,
+            security: SmtpSecurity::default(),
+            username: user.clone(),
+            password: password.clone(),
+            from_name: String::new(),
+            from_email: address.clone(),
+        };
+        let imap = ImapCredentials {
+            host: need("OPENCOMPANY_MAIL_IMAP_HOST")?,
+            port: port("OPENCOMPANY_MAIL_IMAP_PORT")?,
+            username: user,
+            password,
+        };
+        Ok(Some(Self {
+            address,
+            smtp,
+            imap,
+        }))
+    }
+}
+
 /// An offline mock sender that records every send and never fails. Used by
 /// tests and any offline deployment.
 #[derive(Clone, Default)]
@@ -341,6 +397,10 @@ impl MailSender for RecordingMailSender {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Serializes tests that read/write process env (env-reading tests must
+    /// run single-threaded: `cargo test mailer:: -- --test-threads=1`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn smtp_creds() -> SmtpCredentials {
         SmtpCredentials {
@@ -446,5 +506,58 @@ mod test {
         assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 1);
         assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 0); // drained
         assert_eq!(rx.calls(), 2);
+    }
+
+    #[test]
+    fn tenant_mailbox_config_parses_injected_env() {
+        // Serialize env access; set the 7 injected vars.
+        let _g = ENV_LOCK.lock().unwrap();
+        for (k, v) in [
+            ("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work"),
+            ("OPENCOMPANY_MAIL_SMTP_HOST", "mail.opencompany.work"),
+            ("OPENCOMPANY_MAIL_SMTP_PORT", "465"),
+            ("OPENCOMPANY_MAIL_IMAP_HOST", "mail.opencompany.work"),
+            ("OPENCOMPANY_MAIL_IMAP_PORT", "993"),
+            ("OPENCOMPANY_MAIL_USER", "acme@opencompany.work"),
+            ("OPENCOMPANY_MAIL_PASSWORD", "secret"),
+        ] {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let cfg = TenantMailboxConfig::from_env()
+            .unwrap()
+            .expect("configured");
+        assert_eq!(cfg.address, "acme@opencompany.work");
+        assert_eq!(cfg.imap.host, "mail.opencompany.work");
+        assert_eq!(cfg.imap.port, 993);
+        assert_eq!(cfg.smtp.from_email, "acme@opencompany.work");
+
+        for k in [
+            "OPENCOMPANY_MAIL_ADDRESS",
+            "OPENCOMPANY_MAIL_SMTP_HOST",
+            "OPENCOMPANY_MAIL_SMTP_PORT",
+            "OPENCOMPANY_MAIL_IMAP_HOST",
+            "OPENCOMPANY_MAIL_IMAP_PORT",
+            "OPENCOMPANY_MAIL_USER",
+            "OPENCOMPANY_MAIL_PASSWORD",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    #[test]
+    fn tenant_mailbox_config_absent_is_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("OPENCOMPANY_MAIL_ADDRESS") };
+        assert!(TenantMailboxConfig::from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn tenant_mailbox_config_partial_is_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work") };
+        unsafe { std::env::remove_var("OPENCOMPANY_MAIL_PASSWORD") };
+        assert!(TenantMailboxConfig::from_env().is_err());
+        unsafe { std::env::remove_var("OPENCOMPANY_MAIL_ADDRESS") };
     }
 }
