@@ -27,7 +27,8 @@ use crate::ports::brain::CycleHost;
 use crate::ports::now_millis;
 use crate::ports::types::{
     Actor, ApprovalId, CompanyEvent, CompanyId, ContextOp, ContextOpResult, CycleRequest, Effect,
-    EffectDisposition, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall, ToolResult, Verdict,
+    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall,
+    ToolResult, Verdict,
 };
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
@@ -327,7 +328,6 @@ async fn send_company_email(
 
 /// The company's own outbound-mail address, or empty when no mail is
 /// configured for this company.
-#[allow(dead_code)] // wired into the effect-gate cold-recipient check in a later task
 fn company_address(rt: &CompanyRuntime) -> String {
     rt.mail()
         .map(|mail| mail.smtp.from_email.clone())
@@ -338,7 +338,6 @@ fn company_address(rt: &CompanyRuntime) -> String {
 /// `to` — an established thread, so replying is auto-allowed instead of
 /// parking for approval. Fails closed (`false`) on a missing mail handle or a
 /// store error, which routes the caller to the cold-recipient park path.
-#[allow(dead_code)] // wired into the effect-gate cold-recipient check in a later task
 async fn recipient_is_established(rt: &CompanyRuntime, to: &str) -> bool {
     let address = company_address(rt);
     if address.is_empty() {
@@ -383,33 +382,11 @@ impl<'a> CycleHostImpl<'a> {
             self.parked.into_inner().expect("parked poisoned"),
         )
     }
-}
 
-#[async_trait]
-impl CycleHost for CycleHostImpl<'_> {
-    async fn call_tool(&self, call: ToolCall) -> Result<ToolResult> {
-        // The provider enforces the manifest grant before any side effect.
-        self.rt.tools.invoke(&self.company, call).await
-    }
-
-    async fn context_op(&self, op: ContextOp) -> Result<ContextOpResult> {
-        match op {
-            ContextOp::Put(chunk) => Ok(ContextOpResult::Addr(
-                self.rt.context.put(&self.company, chunk).await?,
-            )),
-            ContextOp::List { prefix } => Ok(ContextOpResult::Metas(
-                self.rt.context.list(&self.company, &prefix).await?,
-            )),
-            ContextOp::Peek { addr, range } => Ok(ContextOpResult::Text(
-                self.rt.context.peek(&self.company, &addr, range).await?,
-            )),
-            ContextOp::Search { query, limit } => Ok(ContextOpResult::Hits(
-                self.rt.context.search(&self.company, &query, limit).await?,
-            )),
-        }
-    }
-
-    async fn emit_effect(&self, effect: Effect) -> Result<EffectDisposition> {
+    /// Evaluates an effect against policy and either executes it (at-most-once),
+    /// parks it for approval, or denies it. Shared by `emit_effect` and the
+    /// `send_email` tool interception.
+    async fn gate_effect(&self, effect: Effect) -> Result<EffectDisposition> {
         match self.rt.approvals.evaluate(&self.company, &effect).await? {
             PolicyDecision::Allow => {
                 let idx = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -441,6 +418,81 @@ impl CycleHost for CycleHostImpl<'_> {
                 reason: format!("policy denied {}", effect.kind),
             }),
         }
+    }
+
+    /// Intercepts the `send_email` tool: parses `to`/`subject`/`body`, checks
+    /// whether the recipient is an established thread, and routes the result
+    /// through the effect gate as an `email.send` effect rather than invoking
+    /// the tool provider directly.
+    async fn send_email(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let (Some(to), Some(subject), Some(body)) = (get("to"), get("subject"), get("body")) else {
+            return Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({ "error": "send_email requires to, subject, body" }),
+            });
+        };
+        if to.trim().is_empty() {
+            return Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({ "error": "recipient (to) is empty" }),
+            });
+        }
+        let established = recipient_is_established(self.rt, &to).await;
+        let effect = Effect {
+            kind: "email.send".into(),
+            group: EffectGroup::Send,
+            amount_usd: None,
+            established_thread: established,
+            first_time_counterparty: !established,
+            payload: serde_json::json!({ "to": to, "subject": subject, "body": body }),
+        };
+        match self.gate_effect(effect).await? {
+            EffectDisposition::Executed => Ok(ToolResult {
+                ok: true,
+                output: serde_json::json!({ "status": "sent" }),
+            }),
+            EffectDisposition::PendingApproval(id) => Ok(ToolResult {
+                ok: true,
+                output: serde_json::json!({ "status": "pending_approval", "approval_id": id.as_ref() }),
+            }),
+            EffectDisposition::Denied { reason } => Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({ "status": "denied", "reason": reason }),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl CycleHost for CycleHostImpl<'_> {
+    async fn call_tool(&self, call: ToolCall) -> Result<ToolResult> {
+        if call.tool == "send_email" {
+            return self.send_email(call.args).await;
+        }
+        // The provider enforces the manifest grant before any side effect.
+        self.rt.tools.invoke(&self.company, call).await
+    }
+
+    async fn context_op(&self, op: ContextOp) -> Result<ContextOpResult> {
+        match op {
+            ContextOp::Put(chunk) => Ok(ContextOpResult::Addr(
+                self.rt.context.put(&self.company, chunk).await?,
+            )),
+            ContextOp::List { prefix } => Ok(ContextOpResult::Metas(
+                self.rt.context.list(&self.company, &prefix).await?,
+            )),
+            ContextOp::Peek { addr, range } => Ok(ContextOpResult::Text(
+                self.rt.context.peek(&self.company, &addr, range).await?,
+            )),
+            ContextOp::Search { query, limit } => Ok(ContextOpResult::Hits(
+                self.rt.context.search(&self.company, &query, limit).await?,
+            )),
+        }
+    }
+
+    async fn emit_effect(&self, effect: Effect) -> Result<EffectDisposition> {
+        self.gate_effect(effect).await
     }
 }
 
@@ -1006,6 +1058,87 @@ mod test {
             .unwrap();
 
         assert!(recipient_is_established(&rt, "X@EXT.COM").await);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn send_email_bad_args_missing_to_yields_no_effect() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-bad".into(), &rt);
+
+        let res = host
+            .send_email(serde_json::json!({ "subject": "s", "body": "b" }))
+            .await
+            .unwrap();
+        assert!(!res.ok);
+        assert!(res.output["error"].is_string());
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn send_email_parks_for_new_recipient() {
+        let home = tmp_home();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_mail(CompanyMail {
+                sender: sender.clone(),
+                smtp: test_smtp("ceo@acme.test"),
+            })
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-park".into(), &rt);
+
+        let res = host
+            .send_email(serde_json::json!({ "to": "new@ext.com", "subject": "s", "body": "b" }))
+            .await
+            .unwrap();
+        assert_eq!(res.output["status"], "pending_approval");
+        assert_eq!(sender.sent().len(), 0);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn send_email_sends_for_established_recipient() {
+        let home = tmp_home();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_mail(CompanyMail {
+                sender: sender.clone(),
+                smtp: test_smtp("ceo@acme.test"),
+            })
+            .build()
+            .await
+            .unwrap();
+        rt.inbox()
+            .append(
+                rt.id(),
+                &crate::ports::inbox::EmailRecord {
+                    id: "1".into(),
+                    inbox: "ceo".into(),
+                    from_name: "".into(),
+                    from_email: "known@ext.com".into(),
+                    subject: "hi".into(),
+                    body: "".into(),
+                    at_millis: 0,
+                    read: false,
+                    outbound: false,
+                },
+            )
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-send".into(), &rt);
+
+        let res = host
+            .send_email(serde_json::json!({ "to": "known@ext.com", "subject": "s", "body": "b" }))
+            .await
+            .unwrap();
+        assert_eq!(res.output["status"], "sent");
+        assert_eq!(sender.sent().len(), 1);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }
