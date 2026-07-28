@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use crate::Result;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
+use crate::feedback::tool::SEND_EMAIL_TOOL;
 use crate::ports::brain::CycleHost;
 use crate::ports::now_millis;
 use crate::ports::types::{
@@ -35,6 +36,11 @@ use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
 /// How many recent traces to load into a cycle's compressed history.
 const HISTORY_LIMIT: usize = 32;
+
+/// The `Effect::kind` for an outbound email send. Shared between where the
+/// effect is built (`CycleHostImpl::send_email`) and where it is executed
+/// (`perform_effect`) so the two can't drift apart.
+const EMAIL_SEND_KIND: &str = "email.send";
 
 /// Drives cycles for one [`CompanyRuntime`].
 pub struct CycleRunner<'a> {
@@ -278,7 +284,7 @@ async fn perform_effect(rt: &CompanyRuntime, effect: &Effect) -> Result<()> {
             }
         }
     }
-    if effect.kind == "email.send" {
+    if effect.kind == EMAIL_SEND_KIND {
         let to = effect
             .payload
             .get("to")
@@ -425,6 +431,12 @@ impl<'a> CycleHostImpl<'a> {
     /// through the effect gate as an `email.send` effect rather than invoking
     /// the tool provider directly.
     async fn send_email(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if self.rt.mail().is_none() {
+            return Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({ "error": "email is not configured for this company" }),
+            });
+        }
         let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
         let (Some(to), Some(subject), Some(body)) = (get("to"), get("subject"), get("body")) else {
             return Ok(ToolResult {
@@ -440,7 +452,7 @@ impl<'a> CycleHostImpl<'a> {
         }
         let established = recipient_is_established(self.rt, &to).await;
         let effect = Effect {
-            kind: "email.send".into(),
+            kind: EMAIL_SEND_KIND.into(),
             group: EffectGroup::Send,
             amount_usd: None,
             established_thread: established,
@@ -467,7 +479,7 @@ impl<'a> CycleHostImpl<'a> {
 #[async_trait]
 impl CycleHost for CycleHostImpl<'_> {
     async fn call_tool(&self, call: ToolCall) -> Result<ToolResult> {
-        if call.tool == "send_email" {
+        if call.tool == SEND_EMAIL_TOOL {
             return self.send_email(call.args).await;
         }
         // The provider enforces the manifest grant before any side effect.
@@ -984,6 +996,9 @@ mod test {
         .unwrap();
 
         assert_eq!(sender.sent().len(), 1);
+        // The From address is the company's own address, never spoofable via
+        // the effect payload (which carries no `from` field at all).
+        assert_eq!(sender.sent()[0].0, "ceo@acme.test");
         let inbox = rt.inbox().messages(rt.id(), "ceo", 10, 0).await.unwrap();
         assert!(inbox.iter().any(|r| r.outbound && r.subject == "Hi"));
         tokio::fs::remove_dir_all(&home).await.ok();
@@ -1058,6 +1073,30 @@ mod test {
             .unwrap();
 
         assert!(recipient_is_established(&rt, "X@EXT.COM").await);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn send_email_without_mail_returns_clean_error() {
+        let home = tmp_home();
+        // No `.with_mail(..)`: the company has no mailbox wired at all.
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-nomail".into(), &rt);
+
+        let res = host
+            .send_email(serde_json::json!({ "to": "x@ext.com", "subject": "s", "body": "b" }))
+            .await
+            .unwrap();
+        assert!(!res.ok);
+        assert!(
+            res.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not configured")
+        );
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 
