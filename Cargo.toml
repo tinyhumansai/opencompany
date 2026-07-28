@@ -116,8 +116,17 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 # IMAP inbound transport + RFC822 parsing for per-teammate mail receiving. Only
 # link under the `imap` feature; the `MailReceiver` trait + offline mock compile
 # without it. Pure-Rust rustls TLS so no system libs are required.
+#
+# `async-imap` with `runtime-tokio` links no TLS of its own (unlike `lettre`,
+# it takes an already-connected stream in `Client::new`), so `AsyncImapReceiver`
+# builds the TLS connection itself: `tokio-rustls` for the handshake and
+# `webpki-roots` for the trusted root set, both already in the dependency graph
+# transitively via `lettre`'s rustls stack — declaring them directly here just
+# names the version this module actually calls.
 async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"], optional = true }
 mail-parser = { version = "0.9", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "1", optional = true }
 
 # Offline crypto for the tiny.place economy identity. All three are optional and
 # only link under the `tinyplace` feature; the default build pulls none of them.
@@ -198,7 +207,7 @@ smtp = ["dep:lettre"]
 # Real IMAP receive for the email surface. The `MailReceiver` trait and the
 # offline `RecordingMailReceiver` compile without this; only `AsyncImapReceiver`
 # and the RFC822 parser are gated here.
-imap = ["dep:async-imap", "dep:mail-parser"]
+imap = ["dep:async-imap", "dep:mail-parser", "dep:tokio-rustls", "dep:webpki-roots"]
 # OAuth connection lifecycle (authorize-url + server-side token exchange). The
 # read-only connections catalog compiles without this; only the token-exchanging
 # write routes are gated here (they need the shared `reqwest` client).
