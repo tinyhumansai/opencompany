@@ -20,6 +20,11 @@ use crate::ports::types::{CompanyEvent, CompanyId, ToolCall, ToolResult, ToolSpe
 /// The built-in tool name the brain invokes to file feedback.
 pub const FEEDBACK_TOOL: &str = "feedback";
 
+/// The built-in tool name the brain invokes to send an email. Execution is
+/// intercepted upstream (in `CycleHostImpl::call_tool`); this provider only
+/// advertises the spec.
+pub const SEND_EMAIL_TOOL: &str = "send_email";
+
 /// A [`ToolProvider`] that adds the always-granted `feedback` tool on top of an
 /// inner provider.
 pub struct BuiltinToolProvider {
@@ -67,6 +72,28 @@ impl BuiltinToolProvider {
                     "work_ref": { "type": "string" }
                 },
                 "required": ["category", "note"]
+            }),
+        }
+    }
+
+    /// The `ToolSpec` advertised for the built-in send_email tool. Execution
+    /// is intercepted upstream in `CycleHostImpl::call_tool`; this spec only
+    /// advertises the tool to the brain.
+    fn send_email_spec() -> ToolSpec {
+        ToolSpec {
+            name: SEND_EMAIL_TOOL.to_string(),
+            description: "Send an email from your company mailbox to a recipient. The first \
+                email to a new recipient needs operator approval; replies to people who have \
+                emailed you send immediately."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["to", "subject", "body"]
             }),
         }
     }
@@ -120,6 +147,7 @@ impl ToolProvider for BuiltinToolProvider {
     async fn catalog(&self, company: &CompanyId) -> Result<Vec<ToolSpec>> {
         let mut catalog = self.inner.catalog(company).await?;
         catalog.push(Self::spec());
+        catalog.push(Self::send_email_spec());
         Ok(catalog)
     }
 
@@ -163,6 +191,19 @@ mod test {
         let (provider, _fb, root) = wiring();
         let catalog = provider.catalog(&CompanyId::new("acme")).await.unwrap();
         assert!(catalog.iter().any(|t| t.name == FEEDBACK_TOOL));
+        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn catalog_advertises_send_email() {
+        let (provider, _fb, root) = wiring();
+        let specs = provider.catalog(&CompanyId::new("acme")).await.unwrap();
+        let spec = specs
+            .iter()
+            .find(|s| s.name == "send_email")
+            .expect("send_email advertised");
+        let req = &spec.input_schema["required"];
+        assert!(req.as_array().unwrap().iter().any(|v| v == "to"));
         tokio::fs::remove_dir_all(&root).await.ok();
     }
 
