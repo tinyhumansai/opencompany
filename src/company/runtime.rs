@@ -40,6 +40,8 @@ fn task_enters_in_progress(prev_column: Option<&str>, next_column: &str) -> bool
 use crate::runtime::CycleRunner;
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
+use crate::server::ops::mailer::MailSender;
+use crate::server::ops::smtp::SmtpCredentials;
 
 /// The WS3 console ports, bundled so the runtime constructor stays legible.
 /// Each is an `Arc<dyn …>` keyed by [`CompanyId`], defaulting to the fs backend
@@ -62,6 +64,14 @@ pub struct OpsStores {
     pub sessions: Arc<dyn SessionStore>,
     /// Pending magic-link login codes.
     pub login_codes: Arc<dyn LoginCodeStore>,
+}
+
+/// The company's own outbound-mail handle: a sender + its SMTP credentials
+/// (the manager-injected per-tenant mailbox). `None` when email isn't wired.
+#[derive(Clone)]
+pub struct CompanyMail {
+    pub sender: Arc<dyn MailSender>,
+    pub smtp: SmtpCredentials,
 }
 
 /// A running company: its brain, stores, channels, and policy gate, wired
@@ -87,6 +97,10 @@ pub struct CompanyRuntime {
     pub(crate) secrets: Arc<dyn SecretStore>,
     /// Per-teammate email (inbound + outbound), backing the inbox surface.
     pub(crate) inbox: Arc<dyn InboxStore>,
+    /// The company's own outbound-mail handle (sender + SMTP credentials),
+    /// wired via [`RuntimeBuilder::with_mail`](crate::runtime::RuntimeBuilder::with_mail).
+    /// `None` when email send isn't wired.
+    pub(crate) mail: Option<CompanyMail>,
     /// The WS3 console ports (tasks, workspace, facts, usage, skills).
     pub(crate) ops: OpsStores,
     /// Durable store of feedback items (the "feedback family").
@@ -146,6 +160,7 @@ impl CompanyRuntime {
         journal: Arc<RuntimeJournal>,
         secrets: Arc<dyn SecretStore>,
         inbox: Arc<dyn InboxStore>,
+        mail: Option<CompanyMail>,
         ops: OpsStores,
         feedback: Arc<FeedbackStore>,
         filer: Arc<FeedbackFiler>,
@@ -166,6 +181,7 @@ impl CompanyRuntime {
             journal,
             secrets,
             inbox,
+            mail,
             ops,
             feedback,
             filer,
@@ -285,6 +301,12 @@ impl CompanyRuntime {
     /// This company's inbox store (inbound + outbound email).
     pub fn inbox(&self) -> &Arc<dyn InboxStore> {
         &self.inbox
+    }
+
+    /// This company's outbound-mail handle (sender + SMTP credentials), when
+    /// wired. `None` when email send isn't configured.
+    pub fn mail(&self) -> Option<&CompanyMail> {
+        self.mail.as_ref()
     }
 
     /// This company's task board.

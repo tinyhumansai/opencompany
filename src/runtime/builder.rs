@@ -20,7 +20,7 @@ use crate::brain::{EchoBrain, HostedMedullaBrain};
 use crate::company::CompanyManifest;
 #[cfg(feature = "openhuman")]
 use crate::company::inference::{self, EnvDefault};
-use crate::company::runtime::{CompanyRuntime, OpsStores};
+use crate::company::runtime::{CompanyMail, CompanyRuntime, OpsStores};
 use crate::feedback::github::{GitHubClient, RateLimiter};
 use crate::feedback::service::FeedbackFiler;
 use crate::feedback::store::FeedbackStore;
@@ -163,6 +163,7 @@ pub struct RuntimeBuilder {
     openhuman: Option<Arc<dyn OpenHumanRpc>>,
     secrets: Option<Arc<dyn SecretStore>>,
     inbox: Option<Arc<dyn InboxStore>>,
+    mail: Option<CompanyMail>,
     tasks: Option<Arc<dyn TaskStore>>,
     workspace: Option<Arc<dyn WorkspaceStore>>,
     facts: Option<Arc<dyn FactStore>>,
@@ -226,6 +227,7 @@ impl RuntimeBuilder {
             openhuman: None,
             secrets: None,
             inbox: None,
+            mail: None,
             tasks: None,
             workspace: None,
             facts: None,
@@ -524,6 +526,13 @@ impl RuntimeBuilder {
     /// email for the per-teammate inboxes.
     pub fn with_inbox(mut self, inbox: Arc<dyn InboxStore>) -> Self {
         self.inbox = Some(inbox);
+        self
+    }
+
+    /// Wires the company's outbound mail sender + credentials. Absent by default
+    /// (email send is opt-in / hosted-only).
+    pub fn with_mail(mut self, mail: CompanyMail) -> Self {
+        self.mail = Some(mail);
         self
     }
 
@@ -1052,6 +1061,7 @@ impl RuntimeBuilder {
             journal,
             secrets,
             inbox,
+            self.mail,
             ops,
             feedback,
             filer,
