@@ -14,6 +14,7 @@ pub mod channel;
 pub mod cron;
 pub mod cycle;
 pub mod journal;
+pub mod mailbox_poller;
 pub mod registry;
 pub mod scheduler;
 pub mod tools;
