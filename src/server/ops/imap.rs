@@ -280,3 +280,87 @@ mod imap_tests {
         assert!(msg.body.contains("Hello world"));
     }
 }
+
+/// Live transport smoke test. Ignored by default — it talks to a real Stalwart
+/// mailbox using credentials from the environment (the password is never in the
+/// code). Sends a uniquely-tagged email FROM the configured mailbox TO itself,
+/// then polls until it comes back, proving `LettreMailSender` (send),
+/// `AsyncImapReceiver::fetch_new` (UID + BODY.PEEK), and `mark_seen` all work
+/// end-to-end against real infrastructure.
+///
+/// Run it with the mailbox creds exported (SMTP_PORT 465 = implicit TLS):
+/// ```sh
+/// export OPENCOMPANY_MAIL_ADDRESS=alice@opencompany.work
+/// export OPENCOMPANY_MAIL_SMTP_HOST=mail.opencompany.work
+/// export OPENCOMPANY_MAIL_SMTP_PORT=465
+/// export OPENCOMPANY_MAIL_IMAP_HOST=mail.opencompany.work
+/// export OPENCOMPANY_MAIL_IMAP_PORT=993
+/// export OPENCOMPANY_MAIL_USER=alice@opencompany.work
+/// export OPENCOMPANY_MAIL_PASSWORD='…'
+/// cargo test --features imap,smtp send_then_receive_roundtrip -- --ignored --nocapture
+/// ```
+#[cfg(all(test, feature = "imap", feature = "smtp"))]
+mod live_smoke {
+    use crate::server::ops::imap::AsyncImapReceiver;
+    use crate::server::ops::mailer::{
+        MailCredentials, MailReceiver, MailSender, OutboundEmail, TenantMailboxConfig,
+    };
+    use crate::server::ops::smtp::LettreMailSender;
+
+    #[tokio::test]
+    #[ignore = "live: needs OPENCOMPANY_MAIL_* + a real Stalwart mailbox"]
+    async fn send_then_receive_roundtrip() {
+        let cfg = TenantMailboxConfig::from_env()
+            .expect("OPENCOMPANY_MAIL_* parse failed")
+            .expect("set OPENCOMPANY_MAIL_ADDRESS + the SMTP/IMAP vars first");
+
+        let token = format!(
+            "SMOKE-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        eprintln!(
+            "mailbox={} smtp={}:{}({:?}) imap={}:{}",
+            cfg.address,
+            cfg.smtp.host,
+            cfg.smtp.port,
+            cfg.smtp.security,
+            cfg.imap.host,
+            cfg.imap.port
+        );
+
+        // 1) Send to self.
+        let email = OutboundEmail {
+            to: cfg.address.clone(),
+            subject: token.clone(),
+            body: "workload transport smoke test".into(),
+        };
+        LettreMailSender
+            .send(&MailCredentials::Smtp(cfg.smtp.clone()), &email)
+            .await
+            .expect("SMTP send failed");
+        eprintln!("sent '{token}' -> {}", cfg.address);
+
+        // 2) Poll the mailbox until it arrives (~up to 60s).
+        let rx = AsyncImapReceiver;
+        for attempt in 1..=12 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let msgs = rx.fetch_new(&cfg.imap).await.expect("IMAP fetch failed");
+            eprintln!("poll {attempt}: {} unseen", msgs.len());
+            if let Some(f) = msgs.iter().find(|f| f.email.subject.contains(&token)) {
+                eprintln!(
+                    "RECEIVED uid={} from={} subject='{}'",
+                    f.uid, f.email.from_email, f.email.subject
+                );
+                rx.mark_seen(&cfg.imap, &[f.uid])
+                    .await
+                    .expect("mark_seen failed");
+                eprintln!("marked uid {} Seen — round-trip OK", f.uid);
+                return;
+            }
+        }
+        panic!("round-trip message '{token}' not received within ~60s");
+    }
+}

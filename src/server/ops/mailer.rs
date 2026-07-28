@@ -393,10 +393,19 @@ impl TenantMailboxConfig {
         };
         let user = need("OPENCOMPANY_MAIL_USER")?;
         let password = need("OPENCOMPANY_MAIL_PASSWORD")?;
+        let smtp_port = port("OPENCOMPANY_MAIL_SMTP_PORT")?;
+        // The injected env carries no SECURITY var, so derive it from the port:
+        // 465 = implicit TLS (SMTPS); everything else (587, 25, custom) = STARTTLS.
+        // STARTTLS on 465 fails the handshake, so this must match the port.
+        let security = if smtp_port == 465 {
+            SmtpSecurity::Ssl
+        } else {
+            SmtpSecurity::Starttls
+        };
         let smtp = SmtpCredentials {
             host: need("OPENCOMPANY_MAIL_SMTP_HOST")?,
-            port: port("OPENCOMPANY_MAIL_SMTP_PORT")?,
-            security: SmtpSecurity::default(),
+            port: smtp_port,
+            security,
             username: user.clone(),
             password: password.clone(),
             from_name: String::new(),
