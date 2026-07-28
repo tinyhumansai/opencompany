@@ -873,6 +873,29 @@ pub struct OverlayDeskMember {
     pub agent_id: String,
 }
 
+/// An operator-created desk (group chat) that the version-controlled manifest
+/// does not declare. Persisted as an overlay on the [`CompanyRecord`] and merged
+/// with the manifest's `[[group_chat]]` desks at read/resolve time; the
+/// `company.toml` is never rewritten. This is the desk analogue of
+/// [`OverlayAgent`] — the manifest stays authoritative and rebuild-preserved,
+/// while runtime-created desks live alongside it and survive rebuilds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayDesk {
+    /// The desk id — snake_case, unique across the manifest desks and the other
+    /// overlay desks. Doubles as the chat thread id.
+    pub id: String,
+    /// Human-readable desk name.
+    pub name: String,
+    /// What the desk is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The desk's founding member ids, in order; the first is its lead. Each
+    /// must resolve to a roster teammate (manifest agent or [`OverlayAgent`]).
+    /// Further members can still be added through the desk-member overlay.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
 /// The operator overlays persisted as a single JSON blob by the string-column
 /// stores (sqlite + mongodb `overlay_json`). The filesystem store keeps the two
 /// collections as typed fields on its own `Meta` instead.
@@ -888,24 +911,30 @@ pub struct OverlayBlob {
     /// The operator desk-membership overlay.
     #[serde(default)]
     pub desk_members: Vec<OverlayDeskMember>,
+    /// The operator-created desk overlay. Absent on rows written before desk
+    /// creation existed, so `#[serde(default)]` loads them as empty.
+    #[serde(default)]
+    pub desks: Vec<OverlayDesk>,
 }
 
 impl OverlayBlob {
-    /// Builds a blob from a record's two overlay collections.
+    /// Builds a blob from a record's overlay collections.
     pub fn from_record(record: &CompanyRecord) -> Self {
         Self {
             agents: record.overlay_agents.clone(),
             desk_members: record.overlay_desk_members.clone(),
+            desks: record.overlay_desks.clone(),
         }
     }
 
     /// Parses the persisted blob, accepting both the current object form
-    /// (`{"agents":[…],"desk_members":[…]}`) and the legacy bare-array form
-    /// (`[…]`, the pre-desk-overlay value that held only agents).
+    /// (`{"agents":[…],"desk_members":[…],"desks":[…]}`) and the legacy
+    /// bare-array form (`[…]`, the pre-desk-overlay value that held only agents).
     /// When the current form parse fails, falls back to the legacy array; if
     /// that also fails the *original* error (from the current-form parse) is
     /// propagated so the caller sees why the object form failed rather than a
-    /// misleading "expected sequence" message.
+    /// misleading "expected sequence" message. New optional keys (`desks`) are
+    /// absorbed by `#[serde(default)]`, so no migration is needed.
     pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
         match serde_json::from_str::<OverlayBlob>(json) {
             Ok(blob) => Ok(blob),
@@ -913,6 +942,7 @@ impl OverlayBlob {
                 .map(|agents| Self {
                     agents,
                     desk_members: Vec::new(),
+                    desks: Vec::new(),
                 })
                 .map_err(|_| original),
         }
@@ -938,18 +968,23 @@ pub struct CompanyRecord {
     /// overlay). Merged into a desk's effective membership at read time.
     #[serde(default)]
     pub overlay_desk_members: Vec<OverlayDeskMember>,
+    /// Operator-created desks not present in the manifest (the desk-creation
+    /// overlay). Merged with the manifest's `[[group_chat]]` desks at read time.
+    #[serde(default)]
+    pub overlay_desks: Vec<OverlayDesk>,
 }
 
 impl CompanyRecord {
-    /// The effective member ids of a desk: the manifest's declared members
-    /// first, then any operator-overlay additions for that desk, in order and
-    /// deduplicated on id.
+    /// The effective member ids of a desk: the desk's declared members first
+    /// (from the manifest `[[group_chat]]` or, for an operator-created desk, the
+    /// [`OverlayDesk`]), then any operator-overlay member additions for that
+    /// desk, in order and deduplicated on id.
     ///
     /// This is the single source of truth for "who is on a desk", shared by the
     /// REST `list_desks` handler and the harness `desk_lead` resolver so the two
-    /// cannot drift. Ordering rule: manifest order is preserved, overlay members
-    /// are appended in insertion order — so the manifest's first member stays the
-    /// lead, and an overlay lead only applies to a desk the manifest left empty.
+    /// cannot drift. Ordering rule: declared order is preserved, overlay members
+    /// are appended in insertion order — so the first declared member stays the
+    /// lead, and an overlay lead only applies to a desk declared with no members.
     pub fn effective_desk_members(&self, desk_id: &str) -> Vec<String> {
         let mut members: Vec<String> = self
             .manifest
@@ -957,6 +992,12 @@ impl CompanyRecord {
             .iter()
             .find(|c| c.id == desk_id)
             .map(|c| c.members.clone())
+            .or_else(|| {
+                self.overlay_desks
+                    .iter()
+                    .find(|d| d.id == desk_id)
+                    .map(|d| d.members.clone())
+            })
             .unwrap_or_default();
         for add in &self.overlay_desk_members {
             if add.desk_id == desk_id && !members.contains(&add.agent_id) {
@@ -964,6 +1005,31 @@ impl CompanyRecord {
             }
         }
         members
+    }
+
+    /// Resolves a desk key (an id, or a case-insensitive name) to its canonical
+    /// id, searching the manifest desks first and then the operator-created
+    /// overlay desks. Lets the harness route to overlay desks by the same
+    /// id-or-name key it already accepts for manifest desks.
+    pub fn resolve_desk_id(&self, key: &str) -> Option<String> {
+        self.manifest
+            .group_chats
+            .iter()
+            .find(|c| c.id == key || c.name.eq_ignore_ascii_case(key))
+            .map(|c| c.id.clone())
+            .or_else(|| {
+                self.overlay_desks
+                    .iter()
+                    .find(|d| d.id == key || d.name.eq_ignore_ascii_case(key))
+                    .map(|d| d.id.clone())
+            })
+    }
+
+    /// Whether a desk with `desk_id` exists in either the manifest or the
+    /// operator-created overlay desks.
+    pub fn desk_exists(&self, desk_id: &str) -> bool {
+        self.manifest.group_chats.iter().any(|c| c.id == desk_id)
+            || self.overlay_desks.iter().any(|d| d.id == desk_id)
     }
 
     /// Whether `agent_id` names a roster teammate — a manifest agent or an
@@ -1495,6 +1561,7 @@ mod test {
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
             overlay_desk_members: overlay,
+            overlay_desks: Vec::new(),
         }
     }
 
@@ -1574,6 +1641,63 @@ mod test {
         let blob = OverlayBlob::parse("[]").expect("empty array");
         assert!(blob.agents.is_empty());
         assert!(blob.desk_members.is_empty());
+        assert!(blob.desks.is_empty());
+
+        // A pre-desk-creation object row (no `desks` key) loads with an empty
+        // desk overlay — no migration needed.
+        let pre_desks = r#"{"agents":[],"desk_members":[]}"#;
+        let blob = OverlayBlob::parse(pre_desks).expect("pre-desks object");
+        assert!(blob.desks.is_empty());
+    }
+
+    /// An operator-created overlay desk resolves through the same
+    /// `effective_desk_members` / `resolve_desk_id` / `desk_exists` helpers the
+    /// manifest desks use, so the REST list and the harness desk-lead resolver
+    /// treat it identically. Member additions still layer on top.
+    #[test]
+    fn overlay_desk_resolves_like_a_manifest_desk() {
+        let manifest = "[company]\nname = \"Acme\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n";
+        let mut record = desk_record(manifest, Vec::new());
+        record.overlay_desks.push(OverlayDesk {
+            id: "growth".into(),
+            name: "Growth".into(),
+            description: None,
+            members: vec!["eng".into()],
+        });
+        // Resolves by id and by case-insensitive name.
+        assert_eq!(record.resolve_desk_id("growth").as_deref(), Some("growth"));
+        assert_eq!(record.resolve_desk_id("GROWTH").as_deref(), Some("growth"));
+        assert!(record.desk_exists("growth"));
+        // Founding member is the lead; a later overlay addition appends.
+        assert_eq!(
+            record.effective_desk_members("growth"),
+            vec!["eng".to_string()]
+        );
+        record.overlay_desk_members.push(OverlayDeskMember {
+            desk_id: "growth".into(),
+            agent_id: "ceo".into(),
+        });
+        assert_eq!(
+            record.effective_desk_members("growth"),
+            vec!["eng".to_string(), "ceo".to_string()]
+        );
+    }
+
+    /// The overlay blob round-trips operator-created desks through its persisted
+    /// JSON form, so a created desk survives a store save/load cycle.
+    #[test]
+    fn overlay_blob_round_trips_desks() {
+        let with_desks = r#"{"agents":[],"desk_members":[],"desks":[{"id":"growth","name":"Growth","members":["eng"]}]}"#;
+        let blob = OverlayBlob::parse(with_desks).expect("object with desks");
+        assert_eq!(blob.desks.len(), 1);
+        assert_eq!(blob.desks[0].id, "growth");
+        assert_eq!(blob.desks[0].members, vec!["eng".to_string()]);
+        // Re-serialize and re-parse — the desk survives the round trip.
+        let json = serde_json::to_string(&blob).expect("serialize");
+        let again = OverlayBlob::parse(&json).expect("reparse");
+        assert_eq!(again.desks, blob.desks);
     }
 
     #[test]

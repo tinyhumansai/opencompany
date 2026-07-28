@@ -30,8 +30,8 @@ use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::{
-    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, OverlayDeskMember,
-    StoredEvent, TurnStep, Verdict,
+    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, OverlayDesk,
+    OverlayDeskMember, StoredEvent, TurnStep, Verdict,
 };
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::chat_history::{MessageView, Viewer, history_for_desk};
@@ -62,8 +62,12 @@ pub fn router() -> Router<AppState> {
             post(resolve_approval_single),
         )
         // The company's desks (group chats), under both scope forms — the
-        // console builds its chat threads from these (issue #53).
-        .merge(scoped("/desks", get(list_desks)))
+        // console builds its chat threads from these (issue #53). `POST` creates
+        // a desk through the operator overlay (the manifest is never rewritten).
+        .merge(scoped("/desks", get(list_desks).post(create_desk)))
+        // Delete an operator-created desk (a manifest desk is part of the
+        // blueprint and cannot be deleted here).
+        .merge(scoped("/desks/{desk_id}", delete(delete_desk)))
         // Desk membership writes (issue #72): add an agent to a desk, or remove
         // an operator-added member. Registered under both scope forms.
         .merge(scoped("/desks/{desk_id}/members", post(add_desk_member)))
@@ -97,6 +101,12 @@ struct DeskDto {
     /// the blueprint and cannot be removed at runtime). Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     overlay_members: Vec<String>,
+    /// Whether the whole desk was operator-created (an overlay desk) rather than
+    /// declared in the manifest blueprint. The console offers a delete action
+    /// only for these — blueprint desks cannot be deleted at runtime. Omitted
+    /// (defaults false) for manifest desks.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    overlay_created: bool,
 }
 
 /// `GET {scope}/desks` — the company's desks, built from its manifest group
@@ -112,28 +122,45 @@ async fn list_desks(scope: ScopedCompany) -> Result<Json<Vec<DeskDto>>, Response
         .map_err(|e| ApiError(e).into_response())?;
     let desks = record
         .map(|record| {
-            record
-                .manifest
-                .group_chats
-                .iter()
-                .map(|chat| {
-                    let members = record.effective_desk_members(&chat.id);
-                    // The overlay subset: effective members not declared in the
-                    // manifest for this desk.
-                    let overlay_members = members
-                        .iter()
-                        .filter(|m| !chat.members.contains(m))
-                        .cloned()
-                        .collect();
-                    DeskDto {
-                        id: chat.id.clone(),
-                        name: chat.name.clone(),
-                        description: chat.description.clone(),
-                        members,
-                        overlay_members,
-                    }
-                })
-                .collect()
+            // Manifest (blueprint) desks first, then operator-created overlay
+            // desks — the same order the harness `desk_lead` resolver searches.
+            let manifest_desks = record.manifest.group_chats.iter().map(|chat| {
+                let members = record.effective_desk_members(&chat.id);
+                // The overlay subset: effective members not declared in the
+                // manifest for this desk.
+                let overlay_members = members
+                    .iter()
+                    .filter(|m| !chat.members.contains(m))
+                    .cloned()
+                    .collect();
+                DeskDto {
+                    id: chat.id.clone(),
+                    name: chat.name.clone(),
+                    description: chat.description.clone(),
+                    members,
+                    overlay_members,
+                    overlay_created: false,
+                }
+            });
+            let overlay_desks = record.overlay_desks.iter().map(|desk| {
+                let members = record.effective_desk_members(&desk.id);
+                // For an overlay desk the founding members are `desk.members`;
+                // anything beyond them came from the desk-member overlay.
+                let overlay_members = members
+                    .iter()
+                    .filter(|m| !desk.members.contains(m))
+                    .cloned()
+                    .collect();
+                DeskDto {
+                    id: desk.id.clone(),
+                    name: desk.name.clone(),
+                    description: desk.description.clone(),
+                    members,
+                    overlay_members,
+                    overlay_created: true,
+                }
+            });
+            manifest_desks.chain(overlay_desks).collect()
         })
         .unwrap_or_default();
     Ok(Json(desks))
@@ -256,6 +283,176 @@ async fn remove_desk_member(
             "desk member {agent_id}"
         ))));
     }
+    scope.runtime.store().save(&record).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The create-desk body. `name` is required; `id` is optional (derived from the
+/// name when omitted); `description` and `members` are optional.
+#[derive(Debug, Deserialize)]
+struct CreateDesk {
+    /// The desk's display name (required).
+    name: String,
+    /// An optional description of what the desk is for.
+    #[serde(default)]
+    description: Option<String>,
+    /// An optional explicit desk id (snake_case). Derived from `name` when
+    /// omitted.
+    #[serde(default)]
+    id: Option<String>,
+    /// The desk's founding member ids, in order (the first becomes the lead).
+    /// Each must resolve to a roster teammate. Optional — a desk can start empty
+    /// and gain members through the desk-member overlay.
+    #[serde(default)]
+    members: Vec<String>,
+}
+
+/// Derives a snake_case desk id from a display name: lowercase, runs of
+/// non-alphanumeric characters collapse to a single `_`, leading/trailing `_`
+/// trimmed. Returns an empty string when the name has no alphanumerics (the
+/// caller then rejects it as an invalid id).
+fn slugify_desk_id(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_us = true; // trims leading underscores
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_us = false;
+        } else if !prev_us {
+            out.push('_');
+            prev_us = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// Whether `id` is a valid desk id: non-empty and only ascii lowercase letters,
+/// digits, or underscores. Mirrors the manifest's `[[group_chat]]` id rule so a
+/// runtime-created desk id is indistinguishable from a blueprint one.
+fn is_valid_desk_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// `POST {scope}/desks` — create a desk through the operator overlay. Mirrors the
+/// desk-member write pattern (`add_desk_member`): load the record, mutate an
+/// overlay collection, and save. The manifest's `[[group_chat]]` blueprint is
+/// never rewritten, and the created desk is preserved across rebuilds like every
+/// other overlay.
+///
+/// Validates that `name` is non-empty, the (given or derived) id is snake_case
+/// and not already taken by a manifest or overlay desk (`400`/`409`), and every
+/// member resolves to a roster teammate (`400`). Returns the created desk.
+async fn create_desk(
+    scope: ScopedCompany,
+    Json(body): Json<CreateDesk>,
+) -> Result<(StatusCode, Json<DeskDto>), ApiError> {
+    let _guard = scope.runtime.serial.lock().await;
+    let mut record = scope
+        .runtime
+        .store()
+        .load(scope.id())
+        .await?
+        .ok_or_else(|| OpenCompanyError::CompanyNotFound(scope.id().to_string()))?;
+
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "desk name is required".to_string(),
+        )));
+    }
+    // An explicit id is honored (trimmed); otherwise derive one from the name.
+    let id = match body.id.as_deref().map(str::trim) {
+        Some(explicit) if !explicit.is_empty() => explicit.to_string(),
+        _ => slugify_desk_id(&name),
+    };
+    if !is_valid_desk_id(&id) {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+            "invalid desk id {id:?} — use lowercase letters, digits, and underscores"
+        ))));
+    }
+    if record.desk_exists(&id) {
+        return Err(ApiError(OpenCompanyError::Conflict(format!(
+            "a desk with id {id:?} already exists"
+        ))));
+    }
+    // Validate + dedup the founding members; each must be a roster teammate.
+    let mut members: Vec<String> = Vec::with_capacity(body.members.len());
+    for member in body.members {
+        if !record.is_roster_agent(&member) {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                "no such teammate {member}"
+            ))));
+        }
+        if !members.contains(&member) {
+            members.push(member);
+        }
+    }
+
+    let description = body
+        .description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    let desk = OverlayDesk {
+        id: id.clone(),
+        name: name.clone(),
+        description: description.clone(),
+        members: members.clone(),
+    };
+    record.overlay_desks.push(desk);
+    scope.runtime.store().save(&record).await?;
+
+    let effective = record.effective_desk_members(&id);
+    Ok((
+        StatusCode::CREATED,
+        Json(DeskDto {
+            id,
+            name,
+            description,
+            members: effective,
+            overlay_members: Vec::new(),
+            overlay_created: true,
+        }),
+    ))
+}
+
+/// `DELETE {scope}/desks/{desk_id}` — delete an operator-created desk. A
+/// manifest-declared desk is part of the version-controlled blueprint and cannot
+/// be deleted here (`409`); an unknown desk id is a `404`. Deleting an overlay
+/// desk also drops any desk-member overlay rows that targeted it, so no orphan
+/// membership survives.
+async fn delete_desk(
+    scope: ScopedCompany,
+    Path(DeskPath { desk_id }): Path<DeskPath>,
+) -> Result<StatusCode, ApiError> {
+    let _guard = scope.runtime.serial.lock().await;
+    let mut record = scope
+        .runtime
+        .store()
+        .load(scope.id())
+        .await?
+        .ok_or_else(|| OpenCompanyError::CompanyNotFound(scope.id().to_string()))?;
+
+    // A manifest desk belongs to the blueprint — never deletable at runtime.
+    if record.manifest.group_chats.iter().any(|c| c.id == desk_id) {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            language::MANIFEST_DESK_DELETE.to_string(),
+        )));
+    }
+    let before = record.overlay_desks.len();
+    record.overlay_desks.retain(|d| d.id != desk_id);
+    if record.overlay_desks.len() == before {
+        return Err(ApiError(OpenCompanyError::CompanyNotFound(format!(
+            "desk {desk_id}"
+        ))));
+    }
+    // Drop any member-overlay rows that targeted the now-deleted desk.
+    record.overlay_desk_members.retain(|m| m.desk_id != desk_id);
     scope.runtime.store().save(&record).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -986,6 +1183,7 @@ mod test {
                 lifecycle: lifecycle.to_string(),
                 overlay_agents: Vec::new(),
                 overlay_desk_members: Vec::new(),
+                overlay_desks: Vec::new(),
             })
             .await
             .unwrap();
@@ -1103,6 +1301,7 @@ mod test {
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
             overlay_desk_members: Vec::new(),
+            overlay_desks: Vec::new(),
         };
         FsCompanyStore::new(home.to_path_buf())
             .save(&record)
@@ -1204,6 +1403,7 @@ mod test {
                 lifecycle: "running".to_string(),
                 overlay_agents: Vec::new(),
                 overlay_desk_members: Vec::new(),
+                overlay_desks: Vec::new(),
             })
             .await
             .unwrap();
@@ -1332,6 +1532,161 @@ mod test {
                 Request::builder()
                     .method("DELETE")
                     .uri("/api/v1/company/desks/studio/members/eng")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Creating a desk persists it as an overlay and surfaces it in `list_desks`
+    /// alongside the manifest desks, flagged `overlayCreated` with its lead
+    /// first. The manifest is never rewritten.
+    #[tokio::test]
+    async fn create_desk_persists_and_appears_in_list() {
+        let home = home();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/desks")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Growth desk","description":"Acquisition.","members":["eng","ceo"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let bytes = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Id derived from the name; the first member is the lead.
+        assert_eq!(body["id"], "growth_desk");
+        assert_eq!(body["name"], "Growth desk");
+        assert_eq!(body["overlayCreated"], true);
+        assert_eq!(body["members"][0], "eng");
+        assert_eq!(body["members"][1], "ceo");
+
+        // The list now carries the manifest desk and the created overlay desk.
+        let desks = get_desks(&app, &cookie).await;
+        let arr = desks.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "studio"); // manifest desk first
+        assert_eq!(arr[1]["id"], "growth_desk");
+        assert_eq!(arr[1]["overlayCreated"], true);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Create-desk validation: an empty name is 400, an id colliding with a
+    /// manifest desk is 409, and an unknown member is 400.
+    #[tokio::test]
+    async fn create_desk_validates_name_id_and_members() {
+        let home = home();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let cases = [
+            (r#"{"name":"   "}"#, StatusCode::BAD_REQUEST),
+            (r#"{"name":"Studio","id":"studio"}"#, StatusCode::CONFLICT),
+            (
+                r#"{"name":"Ghost desk","members":["ghost"]}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (body, want) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/company/desks")
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), want, "body {body}");
+        }
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Deleting an operator-created desk drops it (and any of its overlay
+    /// members); a manifest desk cannot be deleted (409); an unknown id is 404.
+    #[tokio::test]
+    async fn delete_desk_removes_overlay_and_guards_manifest() {
+        let home = home();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // Create an overlay desk to delete.
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/desks")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Growth","members":["eng"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A manifest desk cannot be deleted.
+        let manifest_delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/desks/studio")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest_delete.status(), StatusCode::CONFLICT);
+
+        // The overlay desk deletes and drops out of the list.
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/desks/growth")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+        let desks = get_desks(&app, &cookie).await;
+        assert_eq!(desks.as_array().unwrap().len(), 1);
+        assert_eq!(desks[0]["id"], "studio");
+
+        // Deleting it again is a 404.
+        let gone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/desks/growth")
                     .header("cookie", &cookie)
                     .body(Body::empty())
                     .unwrap(),

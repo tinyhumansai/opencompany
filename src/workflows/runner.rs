@@ -136,6 +136,7 @@ description = "Runs Acme."
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
             overlay_desk_members: Vec::new(),
+            overlay_desks: Vec::new(),
         }
     }
 
@@ -207,6 +208,7 @@ allow = ["*"]
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
             overlay_desk_members: Vec::new(),
+            overlay_desks: Vec::new(),
         }
     }
 

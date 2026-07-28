@@ -11,6 +11,16 @@ export type ConnectionCategory =
   | "Storage";
 
 export interface ConnectionProvider {
+  /**
+   * The provider identity. This string MUST be identical end-to-end: the
+   * manifest `[[connection]] provider = "…"`, this catalog `id`, and the
+   * backend `well_known(provider)` key (`src/server/ops/connections.rs`) are the
+   * same token. A tile whose `id` has no matching backend key can never
+   * complete OAuth — `startConnection(id)` resolves no `provider_config` and the
+   * host answers "provider not enabled". Backend keys today: `slack`, `github`,
+   * `google`, `gmail`. Keep new tiles aligned to an existing key (or add the
+   * backend key first); do not invent console-only ids.
+   */
   id: string;
   name: string;
   description: string;
@@ -39,6 +49,11 @@ export const CONNECTION_PROVIDERS: ConnectionProvider[] = [
     glyph: "#",
   },
   {
+    // DEAD TILE until aligned: backend `well_known` has no `google-calendar`
+    // key — the closest existing key is `google`. Connecting this tile fails
+    // ("provider not enabled") until either the id is changed to `google` (or a
+    // dedicated `google-calendar` key + scopes are added to
+    // `well_known`/`provider_config` in src/server/ops/connections.rs).
     id: "google-calendar",
     name: "Google Calendar",
     description: "Schedule and read events on a shared calendar.",
@@ -55,6 +70,9 @@ export const CONNECTION_PROVIDERS: ConnectionProvider[] = [
     glyph: "N",
   },
   {
+    // DEAD TILE until aligned: backend `well_known` has no `google-drive` key
+    // (closest existing key is `google`). See the `google-calendar` note above —
+    // align the id to a backend key or add the key before this tile can connect.
     id: "google-drive",
     name: "Google Drive",
     description: "Store and retrieve files and deliverables.",

@@ -14,7 +14,7 @@ use crate::Result;
 use crate::ports::types::CompanyId;
 
 /// Where a skill came from. Mirrors the console's `SkillSource`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillSource {
     /// A skill shipped in the company bundle (`companies/<name>/skills/**`).

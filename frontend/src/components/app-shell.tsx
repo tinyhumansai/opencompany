@@ -40,9 +40,9 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import { CompanySwitcher } from "@/components/company-switcher";
 import { FeedbackDialog } from "@/components/feedback-dialog";
+import { TourController } from "@/tour/TourController";
 import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { DiscordIcon } from "@/components/discord-icon";
@@ -52,6 +52,7 @@ import { useHashView } from "@/hooks/use-hash-view";
 import { toast } from "sonner";
 
 import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
+import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { DISCORD_INVITE_URL } from "@/lib/links";
 import { defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
@@ -236,7 +237,11 @@ export function AppShell({
       window.location.pathname + (query ? `?${query}` : "") + window.location.hash,
     );
     setView("connections");
-    toast.success(`Connected ${connected}.`);
+    // The callback param carries the raw provider id (e.g. "slack"); show the
+    // catalog display name ("Slack") when we know it, falling back to the id.
+    const providerName =
+      CONNECTION_PROVIDERS.find((p) => p.id === connected)?.name ?? connected;
+    toast.success(`Connected ${providerName}.`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -439,13 +444,13 @@ export function AppShell({
             onBackToPicker={onBackToPicker}
           />
         </SidebarHeader>
-        <SidebarContent>
+        <SidebarContent data-tour="sidebar">
           {NAV.map((group) => (
             <SidebarGroup key={group.label}>
               <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
               <SidebarMenu>
                 {group.items.map((item) => (
-                  <SidebarMenuItem key={item.view}>
+                  <SidebarMenuItem key={item.view} data-tour={`nav-${item.view}`}>
                     <SidebarMenuButton
                       isActive={view === item.view}
                       tooltip={item.label}
@@ -482,7 +487,6 @@ export function AppShell({
       <SidebarInset className="min-h-0">
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="mr-1 h-4" />
           <h1 className="text-sm font-semibold">{TITLES[view]}</h1>
           <div className="ml-auto flex items-center gap-2">
             <StatusPill lifecycle={feed.status.lifecycle} className="hidden sm:inline-flex" />
@@ -598,6 +602,8 @@ export function AppShell({
         open={feedbackOpen}
         onOpenChange={setFeedbackOpen}
       />
+
+      <TourController company={company} setView={setView} />
     </SidebarProvider>
   );
 }

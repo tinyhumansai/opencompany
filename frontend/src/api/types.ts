@@ -83,6 +83,24 @@ export interface DeskDto {
    * company blueprint. Omitted (undefined) when there are none.
    */
   overlayMembers?: string[];
+  /**
+   * Whether the whole desk was operator-created (an overlay desk) rather than
+   * declared in the manifest blueprint. The console offers a delete action only
+   * for these. Omitted (undefined/false) for blueprint desks.
+   */
+  overlayCreated?: boolean;
+}
+
+/**
+ * Body for `POST {scope}/desks` — create a desk. `name` is required; `id` is
+ * derived from the name when omitted; `members` are optional roster teammate
+ * ids (the first becomes the lead).
+ */
+export interface CreateDeskInput {
+  name: string;
+  description?: string;
+  id?: string;
+  members?: string[];
 }
 
 /**

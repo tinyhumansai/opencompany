@@ -267,7 +267,10 @@ function ChatPane({
       {/* Composer */}
       <div className="border-t bg-background/80 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-4 py-3">
-          <div className="relative flex items-end gap-2 rounded-xl border bg-card p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/50">
+          <div
+            data-tour="chat-composer"
+            className="relative flex items-end gap-2 rounded-xl border bg-card p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/50"
+          >
             <Textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}

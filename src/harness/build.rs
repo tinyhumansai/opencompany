@@ -371,7 +371,9 @@ pub fn build_agent(
     let tools = toolbelt::filter_by_capabilities(tools, &deps.capabilities);
 
     AgentBuilder::default()
-        .provider_arc(deps.provider.clone())
+        // `HarnessModel` upcasts to the tinyagents `ChatModel<()>` the builder's
+        // native injection seam takes (the old `Provider` adapter is gone).
+        .chat_model(deps.provider.clone() as Arc<dyn tinyagents::harness::model::ChatModel<()>>)
         .memory(memory)
         .tools(tools)
         .tool_dispatcher(Box::new(AttrTolerantXmlDispatcher::default()))

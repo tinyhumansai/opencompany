@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Flag, Globe, Pause, Play, Power, Archive as ArchiveIcon } from "lucide-react";
+import { Compass, Flag, Globe, Pause, Play, Power, Archive as ArchiveIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import type { LifecycleAction, OpenCompanyClient } from "@/api/client";
@@ -27,6 +27,7 @@ import { DomainSettings } from "@/components/domain-settings";
 import { StatusPill } from "@/components/status-pill";
 import { ThemeToggle } from "@/components/theme-toggle";
 import type { CompanyFeed } from "@/hooks/use-company";
+import { restartTour } from "@/tour/state";
 
 interface Props {
   client: OpenCompanyClient;
@@ -95,6 +96,25 @@ export function SettingsView({ client, company, feed, onFlag }: Props) {
               <CardDescription>Switch between light, dark, and system themes.</CardDescription>
             </div>
             <ThemeToggle />
+          </CardHeader>
+        </Card>
+
+        {/* Product tour */}
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <div className="space-y-1">
+              <CardTitle className="text-base">Product tour</CardTitle>
+              <CardDescription>Replay the guided walkthrough of the console.</CardDescription>
+            </div>
+            <Button
+              variant="outline"
+              onClick={() => {
+                restartTour(company);
+                toast.success("Starting the product tour.");
+              }}
+            >
+              <Compass className="size-4" /> Replay tour
+            </Button>
           </CardHeader>
         </Card>
 

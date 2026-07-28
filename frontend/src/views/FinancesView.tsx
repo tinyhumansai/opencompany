@@ -17,8 +17,11 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "@/components/ui/chart";
-import { usd } from "@/lib/finance-sample";
 import { cn } from "@/lib/utils";
+
+function usd(n: number, maxFrac = 2): string {
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: maxFrac });
+}
 
 const chartConfig = {
   amount: { label: "Spend", theme: { light: "#2a78d6", dark: "#3987e5" } },

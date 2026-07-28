@@ -215,9 +215,12 @@ tiny = ["tinyagents"]
 # WS4: embed `vendor/openhuman` (`openhuman_core`) directly as the tenant agent
 # harness via `AgentBuilder`. `src/harness/` compiles only under this feature;
 # the default build stays offline and echo-brained (byte-for-byte unaffected).
-# `reqwest` is pulled in for the hosted Medulla inference `Provider`; the
+# `reqwest` is pulled in for the hosted Medulla inference model; the
 # `MockProvider` and every adapter compile without touching the network.
-openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:tinyflows", "dep:regex", "dep:uuid"]
+# Enables `tiny` so the `tinyagents` crate is in scope: the harness's inference
+# models implement its `ChatModel<()>` trait (openhuman's old `Provider` trait
+# was deleted upstream); it is the same vendored crate `openhuman_core` uses.
+openhuman = ["tiny", "dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:tinyflows", "dep:regex", "dep:uuid"]
 # MCP server management and agent tools share OpenHuman's in-process registry.
 # Enabling it necessarily enables the embedded harness and OpenHuman MCP
 # domain, while the default build remains unchanged.

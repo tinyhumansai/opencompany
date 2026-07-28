@@ -299,6 +299,7 @@ impl CompanyStore for SqliteStore {
             lifecycle,
             overlay_agents: overlay.agents,
             overlay_desk_members: overlay.desk_members,
+            overlay_desks: overlay.desks,
         }))
     }
 

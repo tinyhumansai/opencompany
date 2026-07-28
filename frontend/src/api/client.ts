@@ -24,6 +24,7 @@ import {
   type CompanyStatus,
   type ConnectionStart,
   type ConnectionState,
+  type CreateDeskInput,
   type DeskDto,
   type FeedbackInput,
   type FeedbackResponse,
@@ -218,6 +219,28 @@ export class OpenCompanyClient {
     return this.request<void>(
       "DELETE",
       `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
+   * Create a desk through the operator overlay. `name` is required; the id is
+   * derived from it when omitted. Members are optional and must be roster
+   * teammates; the first is the desk's lead. The manifest is never rewritten and
+   * the desk survives rebuilds. A duplicate id is a 409, an invalid id/empty
+   * name a 400.
+   */
+  createDesk(input: CreateDeskInput, company?: string | null): Promise<DeskDto> {
+    return this.request<DeskDto>("POST", `${this.scope(company)}/desks`, input);
+  }
+
+  /**
+   * Delete an operator-created desk. A manifest (blueprint) desk cannot be
+   * deleted at runtime and returns a 409; an unknown id is a 404.
+   */
+  deleteDesk(deskId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}`,
     );
   }
 

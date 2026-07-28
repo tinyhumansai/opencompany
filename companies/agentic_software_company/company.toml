@@ -52,6 +52,26 @@ id = "devrel"
 role = "Developer Relations"
 description = "Engage developers with demos, content, and community."
 
+# Group chats — the desks the human talks to. Each pulls in a few agents from
+# the roster above; the first member is the desk's lead (the routing target).
+[[group_chat]]
+id = "engineering"
+name = "Engineering"
+description = "Build, test, and secure the product."
+members = ["backend_engineer", "frontend_engineer", "qa_engineer", "security_engineer"]
+
+[[group_chat]]
+id = "product_design"
+name = "Product & Design"
+description = "Roadmap, specs, and the user experience."
+members = ["product_manager", "designer"]
+
+[[group_chat]]
+id = "go_to_market"
+name = "Go-to-Market"
+description = "Docs, developer relations, and customer support."
+members = ["devrel", "docs_writer", "customer_support"]
+
 # Workflow graphs to enable. The graphs live in this company's workflows/
 # directory (one file per id), not inline here.
 [workflows]

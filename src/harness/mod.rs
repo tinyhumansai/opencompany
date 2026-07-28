@@ -63,7 +63,8 @@ use openhuman_core::openhuman as oh;
 use tokio::sync::{Mutex, RwLock};
 
 use oh::agent::Agent;
-use oh::inference::provider::Provider;
+
+use crate::harness::provider::HarnessModel;
 
 use crate::company::Agent as ManifestAgent;
 use crate::company::Policy;
@@ -84,8 +85,11 @@ use crate::runtime::builder::agent_effective_grants;
 /// Shared dependencies every harness-built agent draws on.
 #[derive(Clone)]
 pub struct HarnessDeps {
-    /// The inference provider shared across a company's agents.
-    pub provider: Arc<dyn Provider>,
+    /// The inference model shared across a company's agents. A [`HarnessModel`]
+    /// is a tinyagents [`ChatModel<()>`](tinyagents::harness::model::ChatModel)
+    /// plus the telemetry slug the cost hook reads live per turn; it upcasts to
+    /// `Arc<dyn ChatModel<()>>` at the openhuman `AgentBuilder::chat_model` seam.
+    pub provider: Arc<dyn HarnessModel>,
     /// Stable provider slug attributed to usage samples (e.g. `managed`).
     pub provider_slug: String,
     /// Context store backing every agent's [`OcMemory`](memory::OcMemory).
@@ -492,6 +496,18 @@ pub struct HarnessPool {
     /// store wired the config is the static [`HarnessDeps::composio`], whose
     /// fingerprint never moves.
     composio_fingerprints: RwLock<HashMap<CompanyId, u64>>,
+    /// Fingerprint of the operator skill-delta set the cached roster was built
+    /// from, keyed by company (issue #41). Drives skill-delta freshness:
+    /// [`ensure`](Self::ensure) re-fetches the deltas from the
+    /// [`SkillStateStore`](crate::ports::skills_state::SkillStateStore) on every
+    /// call and rebuilds the roster whenever they change — so a skill
+    /// authored / edited / enabled / disabled in the console Skills tab reaches
+    /// the agent on the company's **next** turn with no restart. Without this
+    /// axis the four fingerprints above are all stable on a skills-only change,
+    /// the fast path returns early, and the new skill never surfaces until a
+    /// process restart (the regression this fixes). With no skill store wired
+    /// the delta set is always empty — stable fingerprint, no rebuild.
+    skill_fingerprints: RwLock<HashMap<CompanyId, u64>>,
 }
 
 impl Default for HarnessPool {
@@ -522,6 +538,7 @@ impl HarnessPool {
             overlay_fingerprints: RwLock::new(HashMap::new()),
             capability_fingerprints: RwLock::new(HashMap::new()),
             composio_fingerprints: RwLock::new(HashMap::new()),
+            skill_fingerprints: RwLock::new(HashMap::new()),
         }
     }
 
@@ -543,6 +560,15 @@ impl HarnessPool {
     /// teammate added through the console `POST .../team` route or the
     /// orchestrator's `add_agent` tool becomes a real, addressable roster agent
     /// on the company's **next** `ensure` call, with no restart.
+    ///
+    /// **Skill-delta freshness (issue #41)**: the operator skill deltas are
+    /// fetched from [`HarnessDeps::skills`] and fingerprinted **before** the
+    /// fast-path staleness check (not after it, as they were — the regression),
+    /// so a skill authored / edited / enabled / disabled in the console Skills
+    /// tab rebuilds the roster and reaches the agent on its **next** turn, even
+    /// when every other axis (MCP, overlay, capability, composio) is unchanged.
+    /// With no skill store wired the delta set is empty and the fingerprint is
+    /// stable — no rebuild, exactly as before.
     pub async fn ensure(&self, company: &CompanyRecord, deps: &HarnessDeps) -> crate::Result<()> {
         // Re-resolve + fingerprint the effective MCP set (cheap; no rebuild yet).
         let effective_mcp = self.resolve_effective_mcp(company, deps).await;
@@ -567,29 +593,37 @@ impl HarnessPool {
         let composio_config = self.resolve_composio(company, deps).await;
         let composio_fp = composio::TenantComposio::fingerprint(&composio_config);
 
+        // Re-fetch + fingerprint the operator skill deltas (issue #41) BEFORE the
+        // fast-path check. A skills-only change leaves every other axis stable, so
+        // unless skills participate in the staleness check the cached roster is
+        // wrongly reused and a console-authored / edited / disabled skill never
+        // surfaces until a restart (the regression). `build_roster`/`build_agent`
+        // stay synchronous and fold these deltas into each agent's effective
+        // skill set; the same Vec is reused for the rebuild below (no re-fetch).
+        let skill_deltas = match &deps.skills {
+            Some(store) => store.list(&company.id).await?,
+            None => Vec::new(),
+        };
+        let skill_fp = skill_delta_fingerprint(&skill_deltas);
+
         {
             let agents = self.agents.read().await;
             let mcp_fingerprints = self.mcp_fingerprints.read().await;
             let overlay_fingerprints = self.overlay_fingerprints.read().await;
             let capability_fingerprints = self.capability_fingerprints.read().await;
             let composio_fingerprints = self.composio_fingerprints.read().await;
+            let skill_fingerprints = self.skill_fingerprints.read().await;
             if agents.contains_key(&company.id)
                 && mcp_fingerprints.get(&company.id) == Some(&mcp_fp)
                 && overlay_fingerprints.get(&company.id) == Some(&overlay_fp)
                 && capability_fingerprints.get(&company.id) == Some(&capability_fp)
                 && composio_fingerprints.get(&company.id) == Some(&composio_fp)
+                && skill_fingerprints.get(&company.id) == Some(&skill_fp)
             {
                 return Ok(());
             }
         }
 
-        // Fetch the operator skill deltas once (async) before building the
-        // roster; `build_roster`/`build_agent` stay synchronous and fold the
-        // deltas into each agent's effective skill set.
-        let skill_deltas = match &deps.skills {
-            Some(store) => store.list(&company.id).await?,
-            None => Vec::new(),
-        };
         // Fold the freshly-resolved MCP set into the deps the roster is built
         // from, so a changed set actually reaches the rebuilt agents. The clone
         // shares every Arc / queue handle — only `mcp_servers` is overridden.
@@ -628,6 +662,10 @@ impl HarnessPool {
             .write()
             .await
             .insert(company.id.clone(), composio_fp);
+        self.skill_fingerprints
+            .write()
+            .await
+            .insert(company.id.clone(), skill_fp);
         Ok(())
     }
 
@@ -755,6 +793,13 @@ impl HarnessPool {
             .await
             .get(company)
             .copied()
+    }
+
+    /// The current skill-delta fingerprint for a company (test-only), so a
+    /// skill-freshness test can assert a rebuild happened (issue #41).
+    #[cfg(test)]
+    pub async fn skill_fingerprint_of(&self, company: &CompanyId) -> Option<u64> {
+        self.skill_fingerprints.read().await.get(company).copied()
     }
 
     /// Routes a message to one agent and returns its reply, recording the turn's
@@ -1060,6 +1105,35 @@ fn overlay_fingerprint(agents: &[OverlayAgent]) -> u64 {
     hasher.finish()
 }
 
+/// A stable fingerprint of a company's operator skill-delta set (issue #41),
+/// used to detect a skill authored / edited / enabled / disabled between
+/// [`HarnessPool::ensure`] calls. Mirrors [`mcp_fingerprint`]'s shape.
+///
+/// The deltas are **sorted by `slug`** before hashing because
+/// [`SkillStateStore::list`](crate::ports::skills_state::SkillStateStore::list)
+/// gives no ordering contract — an order-sensitive hash would thrash the roster
+/// (and drop live agent conversation state) whenever the store returned the
+/// same skills in a different row order. The full `custom_doc` body is hashed so
+/// an *edited* skill (same slug, new content) also triggers a rebuild. No
+/// secrets are involved — a skill delta is operator-authored content.
+fn skill_delta_fingerprint(deltas: &[SkillState]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut ordered: Vec<&SkillState> = deltas.iter().collect();
+    ordered.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    let mut hasher = DefaultHasher::new();
+    ordered.len().hash(&mut hasher);
+    for delta in ordered {
+        delta.slug.hash(&mut hasher);
+        delta.enabled.hash(&mut hasher);
+        delta.source.hash(&mut hasher);
+        delta.custom_doc.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Build every roster agent for a company: every manifest `[[agent]]`, plus
 /// every operator- or orchestrator-added [`OverlayAgent`] (issue #71 — Active
 /// Runtime Teammates) that does not collide with a manifest agent id.
@@ -1175,6 +1249,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
+    use tinyagents::harness::model::{ChatModel, ModelRequest, ModelResponse};
 
     use crate::company::CompanyManifest;
     use crate::harness::provider::MockProvider;
@@ -1317,6 +1392,7 @@ description = "Builds the product."
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
             overlay_desk_members: Vec::new(),
+            overlay_desks: Vec::new(),
         }
     }
 
@@ -1626,10 +1702,11 @@ description = "Builds the product."
 
     // --- Empty-response turn wrapper ----------------------------------------
 
-    /// A provider that plays back a scripted sequence of outcomes, one per
-    /// `chat_with_system` call, so the empty-response retry wrapper can be driven
-    /// deterministically. `Ok("")` is the transient empty class; `Err(_)` is a
-    /// hard error.
+    /// A model that plays back a scripted sequence of outcomes, one per
+    /// [`invoke`](ChatModel::invoke) call, so the empty-response retry wrapper can
+    /// be driven deterministically. `Ok("")` is the transient empty class (the
+    /// harness turn raises the empty-response error on a blank assistant reply);
+    /// `Err(_)` is a hard error.
     struct ScriptedProvider {
         script: StdMutex<std::collections::VecDeque<Result<String, String>>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -1645,23 +1722,24 @@ description = "Builds the product."
     }
 
     #[async_trait]
-    impl oh::inference::provider::Provider for ScriptedProvider {
-        fn telemetry_provider_id(&self) -> String {
-            "scripted".to_string()
-        }
-        async fn chat_with_system(
+    impl ChatModel<()> for ScriptedProvider {
+        async fn invoke(
             &self,
-            _system: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> anyhow::Result<String> {
+            _state: &(),
+            _request: ModelRequest,
+        ) -> tinyagents::Result<ModelResponse> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match self.script.lock().unwrap().pop_front() {
-                Some(Ok(reply)) => Ok(reply),
-                Some(Err(err)) => Err(anyhow::anyhow!("{err}")),
-                None => Ok("exhausted".to_string()),
+                Some(Ok(reply)) => Ok(ModelResponse::assistant(reply)),
+                Some(Err(err)) => Err(tinyagents::TinyAgentsError::Model(err)),
+                None => Ok(ModelResponse::assistant("exhausted")),
             }
+        }
+    }
+
+    impl HarnessModel for ScriptedProvider {
+        fn telemetry_provider_id(&self) -> String {
+            "scripted".to_string()
         }
     }
 
@@ -1896,6 +1974,200 @@ description = "Builds the product."
         assert_eq!(pool.mcp_fingerprint_of(&rec.id).await, Some(after));
     }
 
+    // --- Skill-delta freshness (issue #41) ----------------------------------
+
+    /// An in-memory `SkillStateStore` whose delta set a test can mutate between
+    /// two `ensure` calls — the same way the console Skills tab authors, edits,
+    /// enables, or disables a skill — so the freshness gate can be observed
+    /// reacting with no restart.
+    #[derive(Default)]
+    struct MemSkills {
+        deltas: StdMutex<Vec<SkillState>>,
+    }
+
+    #[async_trait]
+    impl SkillStateStore for MemSkills {
+        async fn list(&self, _company: &CompanyId) -> crate::Result<Vec<SkillState>> {
+            Ok(self.deltas.lock().unwrap().clone())
+        }
+        async fn set(&self, _company: &CompanyId, state: &SkillState) -> crate::Result<()> {
+            let mut deltas = self.deltas.lock().unwrap();
+            match deltas.iter_mut().find(|s| s.slug == state.slug) {
+                Some(slot) => *slot = state.clone(),
+                None => deltas.push(state.clone()),
+            }
+            Ok(())
+        }
+        async fn remove(&self, _company: &CompanyId, slug: &str) -> crate::Result<bool> {
+            let mut deltas = self.deltas.lock().unwrap();
+            let before = deltas.len();
+            deltas.retain(|s| s.slug != slug);
+            Ok(deltas.len() != before)
+        }
+    }
+
+    /// A valid custom-skill delta (its `custom_doc` parses, so `materialize`
+    /// writes it to the scratch tree).
+    fn custom_skill(slug: &str, enabled: bool, body: &str) -> SkillState {
+        SkillState {
+            slug: slug.to_string(),
+            enabled,
+            source: crate::ports::skills_state::SkillSource::Custom,
+            custom_doc: Some(body.to_string()),
+        }
+    }
+
+    const STANDUP_MD: &str =
+        "---\nname: Standup Digest\ndescription: Summarize the standup\n---\n\n# Standup Digest\n";
+
+    /// The scratch path a materialized skill lands at for the first roster agent
+    /// (`ceo`) under a company's workspace root.
+    fn skill_scratch(ws: &std::path::Path, slug: &str) -> std::path::PathBuf {
+        ws.join("acme")
+            .join("ceo")
+            .join("skill-catalog")
+            .join("skills")
+            .join(slug)
+            .join("SKILL.md")
+    }
+
+    /// The regression: a skill authored in the console after the first roster
+    /// build reaches the agent on the NEXT `ensure` — the fingerprint changes,
+    /// the roster rebuilds in place, and the skill's `SKILL.md` materializes —
+    /// even though MCP / overlay / capability / composio are all unchanged.
+    #[tokio::test]
+    async fn ensure_rebuilds_when_a_custom_skill_is_authored() {
+        let skills = Arc::new(MemSkills::default());
+        let mut fx = fixture();
+        fx.deps.skills = Some(skills.clone());
+        let ws = fx._dir.path().to_path_buf();
+        let pool = HarnessPool::new();
+        let rec = record();
+
+        pool.ensure(&rec, &fx.deps).await.expect("first ensure");
+        let before = pool
+            .skill_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert!(
+            !skill_scratch(&ws, "standup-digest").exists(),
+            "no skill authored yet"
+        );
+
+        // Author a custom skill in the "console" (the live store) — no restart.
+        skills
+            .set(&rec.id, &custom_skill("standup-digest", true, STANDUP_MD))
+            .await
+            .unwrap();
+
+        pool.ensure(&rec, &fx.deps).await.expect("second ensure");
+        let after = pool
+            .skill_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert_ne!(
+            before, after,
+            "authoring a skill must change the fingerprint"
+        );
+        assert_eq!(
+            pool.resident_companies().await,
+            1,
+            "same company, rebuilt in place"
+        );
+        assert!(
+            skill_scratch(&ws, "standup-digest").is_file(),
+            "the authored skill must surface to the agent with no restart"
+        );
+
+        // A third ensure with no change is a no-op (fingerprint stable).
+        pool.ensure(&rec, &fx.deps).await.expect("third ensure");
+        assert_eq!(pool.skill_fingerprint_of(&rec.id).await, Some(after));
+    }
+
+    /// An unchanged delta set across two `ensure` calls keeps the fingerprint
+    /// stable and reuses the cached roster (the common fast path).
+    #[tokio::test]
+    async fn ensure_skill_fast_path_is_stable() {
+        let skills = Arc::new(MemSkills::default());
+        let rec = record();
+        skills
+            .set(&rec.id, &custom_skill("standup-digest", true, STANDUP_MD))
+            .await
+            .unwrap();
+        let mut fx = fixture();
+        fx.deps.skills = Some(skills.clone());
+        let pool = HarnessPool::new();
+
+        pool.ensure(&rec, &fx.deps).await.expect("first ensure");
+        let first = pool.skill_fingerprint_of(&rec.id).await.unwrap();
+        pool.ensure(&rec, &fx.deps).await.expect("second ensure");
+        let second = pool.skill_fingerprint_of(&rec.id).await.unwrap();
+        assert_eq!(
+            first, second,
+            "unchanged deltas keep the fingerprint stable"
+        );
+        assert_eq!(
+            pool.resident_companies().await,
+            1,
+            "roster reused, not grown"
+        );
+    }
+
+    /// Disabling a skill in the console drops it from the rebuilt scratch tree
+    /// on the next `ensure` (fingerprint moves, `SKILL.md` gone).
+    #[tokio::test]
+    async fn ensure_rebuilds_when_a_skill_is_disabled() {
+        let skills = Arc::new(MemSkills::default());
+        let rec = record();
+        skills
+            .set(&rec.id, &custom_skill("standup-digest", true, STANDUP_MD))
+            .await
+            .unwrap();
+        let mut fx = fixture();
+        fx.deps.skills = Some(skills.clone());
+        let ws = fx._dir.path().to_path_buf();
+        let pool = HarnessPool::new();
+
+        pool.ensure(&rec, &fx.deps).await.expect("first ensure");
+        let enabled_fp = pool.skill_fingerprint_of(&rec.id).await.unwrap();
+        let path = skill_scratch(&ws, "standup-digest");
+        assert!(path.is_file(), "an enabled skill materializes");
+
+        // Disable it in the console.
+        skills
+            .set(&rec.id, &custom_skill("standup-digest", false, STANDUP_MD))
+            .await
+            .unwrap();
+        pool.ensure(&rec, &fx.deps).await.expect("second ensure");
+        let disabled_fp = pool.skill_fingerprint_of(&rec.id).await.unwrap();
+        assert_ne!(enabled_fp, disabled_fp, "disabling changes the fingerprint");
+        assert!(
+            !path.exists(),
+            "a disabled skill is dropped from the rebuilt scratch tree"
+        );
+        assert_eq!(pool.resident_companies().await, 1, "rebuilt in place");
+    }
+
+    /// The fingerprint is order-agnostic (the store gives no ordering contract)
+    /// but content-sensitive (an edited `custom_doc` must trigger a rebuild).
+    #[test]
+    fn skill_delta_fingerprint_is_order_agnostic_but_content_sensitive() {
+        let a = custom_skill("alpha", true, "---\nname: A\ndescription: a\n---\n");
+        let b = custom_skill("beta", true, "---\nname: B\ndescription: b\n---\n");
+        assert_eq!(
+            skill_delta_fingerprint(&[a.clone(), b.clone()]),
+            skill_delta_fingerprint(&[b, a.clone()]),
+            "row order must not change the fingerprint"
+        );
+
+        let a_edited = custom_skill("alpha", true, "---\nname: A\ndescription: EDITED\n---\n");
+        assert_ne!(
+            skill_delta_fingerprint(&[a]),
+            skill_delta_fingerprint(&[a_edited]),
+            "an edited custom_doc must change the fingerprint"
+        );
+    }
+
     // --- Overlay-agent freshness (issue #71) --------------------------------
 
     /// A `CompanyStore` backed by a live, mutable record — so a test can mutate
@@ -2051,6 +2323,7 @@ description = "Sets direction."
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
             overlay_desk_members: Vec::new(),
+            overlay_desks: Vec::new(),
         }
     }
 

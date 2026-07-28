@@ -114,7 +114,7 @@ export function Overview({ feed, onNavigate, onFlag }: Props) {
         </Card>
 
         {/* Quick actions */}
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-3" data-tour="overview-quickactions">
           <QuickAction icon={MessagesSquare} label="Talk to your company" onClick={() => onNavigate("conversation")} />
           <QuickAction icon={ShieldCheck} label="Review approvals" onClick={() => onNavigate("approvals")} />
           <QuickAction icon={Flag} label="Flag something" onClick={onFlag} />

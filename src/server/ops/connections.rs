@@ -349,11 +349,108 @@ fn extract_account(token: &serde_json::Value) -> Option<String> {
 // Disconnect
 // ---------------------------------------------------------------------------
 
-/// Deletes stored tokens (best-effort revoke is a follow-up).
+/// The provider's token-revocation endpoint, if one is known. GitHub's URL
+/// carries the app `client_id` in its path. Overridable per provider via
+/// `OPENCOMPANY_OAUTH_<P>_REVOKE_URL` (tests point this at a local mock).
+/// `None` means "no known revoke flow" — disconnect still blanks the local
+/// secret; there is simply no remote call to make.
+fn revoke_url(provider: &str, config: &ProviderConfig) -> Option<String> {
+    let key = provider.to_ascii_uppercase();
+    if let Some(url) = std::env::var(format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"))
+        .ok()
+        .filter(|u| !u.is_empty())
+    {
+        return Some(url);
+    }
+    match provider {
+        "slack" => Some("https://slack.com/api/auth.revoke".to_string()),
+        "github" => Some(format!(
+            "https://api.github.com/applications/{}/grant",
+            config.client_id
+        )),
+        _ => None,
+    }
+}
+
+/// Reads the stored `access_token` for a provider, if a non-empty token blob is
+/// present. Returns `None` when nothing is stored or the blob has no token.
+/// The token is used only to build the revoke request and is never logged.
+async fn stored_access_token(runtime: &CompanyRuntime, provider: &str) -> Option<String> {
+    let value = runtime
+        .secrets()
+        .get(runtime.id(), &oauth_key(provider))
+        .await
+        .ok()
+        .flatten()?;
+    if value.expose().trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(value.expose())
+        .ok()?
+        .get("token")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|a| a.as_str())
+        .map(str::to_string)
+}
+
+/// Best-effort provider-side token revocation, run before the local secret is
+/// blanked. Any failure — unknown provider, unconfigured app credentials, a
+/// network error, or a non-success status — is logged and swallowed so the
+/// disconnect always proceeds. Token material is never logged or returned.
+async fn best_effort_revoke(runtime: &CompanyRuntime, provider: &str) {
+    let Some(access_token) = stored_access_token(runtime, provider).await else {
+        return;
+    };
+    let Some(config) = provider_config(provider) else {
+        return;
+    };
+    let Some(url) = revoke_url(provider, &config) else {
+        return;
+    };
+    // Bound the best-effort revoke: a provider that accepts the connection but
+    // hangs (or a slow `_REVOKE_URL` override) must not block the disconnect
+    // handler indefinitely. A builder failure skips the remote revoke entirely
+    // — the caller blanks the local secret unconditionally, so this stays
+    // best-effort without blocking or panicking.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(provider, "oauth revoke client build failed: {err}");
+            return;
+        }
+    };
+    let request = match provider {
+        // GitHub revokes a grant with an authenticated DELETE carrying the token
+        // in the JSON body and the app credentials as Basic auth.
+        "github" => client
+            .delete(&url)
+            .basic_auth(&config.client_id, Some(&config.client_secret))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "opencompany")
+            .json(&json!({ "access_token": access_token })),
+        // Slack (and any override that behaves like it) revokes with a POST form.
+        _ => client.post(&url).form(&[("token", access_token.as_str())]),
+    };
+    match request.send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            tracing::warn!(provider, status = %resp.status(), "oauth revoke returned non-success")
+        }
+        Err(err) => tracing::warn!(provider, "oauth revoke request failed: {err}"),
+    }
+}
+
+/// Revokes the provider grant (best-effort) then deletes the stored tokens.
 async fn do_disconnect(
     runtime: Arc<CompanyRuntime>,
     provider: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Ask the provider to invalidate the grant first, best-effort: a failed or
+    // absent revoke must never block the local disconnect below.
+    best_effort_revoke(&runtime, provider).await;
     // Overwrite with an empty marker: the secret store has no delete; an empty
     // value reads back as "not connected" on the read side.
     runtime
@@ -430,5 +527,171 @@ mod test {
             Some("Acme".to_string())
         );
         assert_eq!(extract_account(&json!({ "access_token": "x" })), None);
+    }
+
+    // ---- disconnect / best-effort revoke ----------------------------------
+
+    use crate::company::CompanyManifest;
+    use crate::company::runtime::CompanyRuntime;
+    use crate::runtime::RuntimeBuilder;
+
+    /// Builds an isolated in-memory company runtime for disconnect tests.
+    async fn test_runtime() -> (Arc<CompanyRuntime>, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!("oc-disc-{}", crate::ports::generate_id()));
+        let manifest: CompanyManifest =
+            toml::from_str("[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n").unwrap();
+        let runtime = RuntimeBuilder::new(home.clone(), manifest)
+            .with_id(CompanyId::new("acme"))
+            .build()
+            .await
+            .unwrap();
+        (Arc::new(runtime), home)
+    }
+
+    /// A process-unique provider id (env-key safe) so the env vars each test
+    /// sets never collide with a sibling test running in parallel.
+    fn unique_provider() -> String {
+        format!("revtest{}", crate::ports::generate_id().replace('-', ""))
+    }
+
+    async fn store_token(runtime: &CompanyRuntime, provider: &str, access_token: &str) {
+        runtime
+            .secrets()
+            .set(
+                runtime.id(),
+                &oauth_key(provider),
+                SecretValue(
+                    json!({ "token": { "access_token": access_token }, "account": "acc" })
+                        .to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn is_blanked(runtime: &CompanyRuntime, provider: &str) -> bool {
+        runtime
+            .secrets()
+            .get(runtime.id(), &oauth_key(provider))
+            .await
+            .unwrap()
+            .map(|v| v.expose().trim().is_empty())
+            .unwrap_or(true)
+    }
+
+    /// No app credentials configured → provider_config is `None`, so there is no
+    /// remote to revoke, but the disconnect must still blank the local secret.
+    #[tokio::test]
+    async fn disconnect_blanks_secret_without_revoke_config() {
+        let (runtime, home) = test_runtime().await;
+        let provider = unique_provider();
+        store_token(&runtime, &provider, "CANARY-should-never-leak").await;
+
+        let resp = do_disconnect(runtime.clone(), &provider).await.unwrap();
+        assert_eq!(resp.0["connected"], false);
+        assert!(is_blanked(&runtime, &provider).await, "secret not blanked");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The best-effort revoke path is invoked: with app credentials + a revoke
+    /// URL configured, disconnect POSTs the token to the provider endpoint AND
+    /// blanks the local secret.
+    #[tokio::test]
+    async fn disconnect_invokes_provider_revoke() {
+        use axum::extract::State;
+        use axum::routing::post;
+
+        let hits: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/revoke",
+                post(|State(hits): State<Arc<tokio::sync::Mutex<Vec<String>>>>, body: String| async move {
+                    hits.lock().await.push(body);
+                    "ok"
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (runtime, home) = test_runtime().await;
+        let provider = unique_provider();
+        let key = provider.to_ascii_uppercase();
+        // SAFETY: unique per-test provider name → no cross-test env collision.
+        unsafe {
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_ID"), "cid");
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_SECRET"), "csec");
+            std::env::set_var(
+                format!("OPENCOMPANY_OAUTH_{key}_AUTHORIZE_URL"),
+                "http://x/a",
+            );
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_TOKEN_URL"), "http://x/t");
+            std::env::set_var(
+                format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"),
+                format!("http://{addr}/revoke"),
+            );
+        }
+
+        store_token(&runtime, &provider, "CANARY-revoke-me").await;
+        let _ = do_disconnect(runtime.clone(), &provider).await.unwrap();
+
+        let received = hits.lock().await;
+        assert_eq!(received.len(), 1, "revoke endpoint was not called");
+        assert!(
+            received[0].contains("CANARY-revoke-me"),
+            "revoke request did not carry the stored token"
+        );
+        drop(received);
+        assert!(is_blanked(&runtime, &provider).await, "secret not blanked");
+
+        unsafe {
+            for suffix in ["ID", "SECRET", "AUTHORIZE_URL", "TOKEN_URL", "REVOKE_URL"] {
+                std::env::remove_var(format!("OPENCOMPANY_OAUTH_{key}_{suffix}"));
+            }
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A revoke endpoint that refuses the connection must not fail the
+    /// disconnect: the local secret is still blanked.
+    #[tokio::test]
+    async fn disconnect_blanks_secret_when_revoke_fails() {
+        // Bind then drop to obtain a port with nothing listening on it.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        let (runtime, home) = test_runtime().await;
+        let provider = unique_provider();
+        let key = provider.to_ascii_uppercase();
+        // SAFETY: unique per-test provider name → no cross-test env collision.
+        unsafe {
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_ID"), "cid");
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_SECRET"), "csec");
+            std::env::set_var(
+                format!("OPENCOMPANY_OAUTH_{key}_AUTHORIZE_URL"),
+                "http://x/a",
+            );
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_TOKEN_URL"), "http://x/t");
+            std::env::set_var(
+                format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"),
+                format!("http://{dead_addr}/revoke"),
+            );
+        }
+
+        store_token(&runtime, &provider, "CANARY-unreachable").await;
+        // Must still succeed even though the revoke POST cannot connect.
+        let _ = do_disconnect(runtime.clone(), &provider).await.unwrap();
+        assert!(is_blanked(&runtime, &provider).await, "secret not blanked");
+
+        unsafe {
+            for suffix in ["ID", "SECRET", "AUTHORIZE_URL", "TOKEN_URL", "REVOKE_URL"] {
+                std::env::remove_var(format!("OPENCOMPANY_OAUTH_{key}_{suffix}"));
+            }
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

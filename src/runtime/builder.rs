@@ -928,6 +928,7 @@ impl RuntimeBuilder {
                                 lifecycle: "running".to_string(),
                                 overlay_agents: Vec::new(),
                                 overlay_desk_members: Vec::new(),
+                                overlay_desks: Vec::new(),
                             };
                             // Workflow agent nodes execute on the same pool as the
                             // brain — clone before both moves into `HarnessBrain`.
@@ -991,7 +992,8 @@ impl RuntimeBuilder {
             .unwrap_or_else(|| "running".to_string());
         // Preserve the operator team + desk overlays across rebuilds — a rebuild
         // never rewrites the version-controlled manifest, and it must not drop
-        // operator-added teammates or desk memberships either.
+        // operator-added teammates, desk memberships, or operator-created desks
+        // either.
         let overlay_agents = existing
             .as_ref()
             .map(|r| r.overlay_agents.clone())
@@ -999,6 +1001,10 @@ impl RuntimeBuilder {
         let overlay_desk_members = existing
             .as_ref()
             .map(|r| r.overlay_desk_members.clone())
+            .unwrap_or_default();
+        let overlay_desks = existing
+            .as_ref()
+            .map(|r| r.overlay_desks.clone())
             .unwrap_or_default();
         let ledger = existing.map(|r| r.ledger).unwrap_or_default();
         store
@@ -1009,6 +1015,7 @@ impl RuntimeBuilder {
                 lifecycle,
                 overlay_agents,
                 overlay_desk_members,
+                overlay_desks,
             })
             .await?;
 

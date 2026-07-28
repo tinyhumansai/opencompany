@@ -173,6 +173,7 @@ impl BundleContents {
                 lifecycle: self.lifecycle.clone(),
                 overlay_agents: Vec::new(),
                 overlay_desk_members: Vec::new(),
+                overlay_desks: Vec::new(),
             })
             .await?;
         for entry in &self.ledger {
@@ -729,6 +730,7 @@ mod test {
             lifecycle: "paused".into(),
             overlay_agents: Vec::new(),
             overlay_desk_members: Vec::new(),
+            overlay_desks: Vec::new(),
         })
         .await
         .unwrap();

@@ -36,8 +36,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { compact, usd } from "@/lib/usage-sample";
 import { cn } from "@/lib/utils";
+
+/** Compact token/number formatting: 1.2M, 340K, 5.1K. */
+function compact(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1)}K`;
+  return `${n}`;
+}
+
+function usd(n: number): string {
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: n < 100 ? 2 : 0 });
+}
 
 const RANGES: Record<string, number> = { "7d": 7, "30d": 30, "90d": 90 };
 const RANGE_LABELS: Record<string, string> = { "7d": "Last 7 days", "30d": "Last 30 days", "90d": "Last 90 days" };

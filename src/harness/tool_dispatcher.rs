@@ -47,8 +47,9 @@ use regex::Regex;
 use oh::agent::dispatcher::{
     ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use oh::agent::messages::{ChatMessage, ConversationMessage};
 use oh::context::prompt::ToolCallFormat;
-use oh::inference::provider::{ChatMessage, ChatResponse, ConversationMessage};
+use oh::inference::provider::ChatResponse;
 use oh::tools::{Tool, ToolSpec};
 
 /// Matches an **open** tag of the `tool_call` family that carries one or more
@@ -148,9 +149,8 @@ impl ToolDispatcher for AttrTolerantXmlDispatcher {
 mod tests {
     use super::*;
 
-    /// Build a [`ChatResponse`] carrying `text` the way the hosted provider does
-    /// (`chat_response_from_payload` in `provider.rs:585`): text set, no native
-    /// tool calls, no usage, no reasoning.
+    /// Build a [`ChatResponse`] carrying `text` the way the vendored parser
+    /// consumes it: text set, no native tool calls, no usage, no reasoning.
     fn response(text: &str) -> ChatResponse {
         ChatResponse {
             text: Some(text.to_string()),
