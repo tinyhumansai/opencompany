@@ -234,10 +234,8 @@ impl AgentRunner for HarnessAgentRunner {
         request: Value,
         _conn: Option<&str>,
     ) -> TfResult<Value> {
-        let message = compose_turn_message(
-            &message_from_request(&request),
-            self.run_request.as_deref(),
-        );
+        let message =
+            compose_turn_message(&message_from_request(&request), self.run_request.as_deref());
         tracing::debug!(
             company = %self.company,
             agent = agent_ref,
