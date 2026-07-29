@@ -849,7 +849,10 @@ description = "Builds it."
         let (brain, tasks) = brain_with_tasks(dir.path());
         let mut c = card("t-no-origin", "maya");
         c.origin_chat_id = None;
-        tasks.upsert(&CompanyId::new("acme"), &c).await.expect("seed");
+        tasks
+            .upsert(&CompanyId::new("acme"), &c)
+            .await
+            .expect("seed");
 
         let posted = brain.run_task("t-no-origin").await.expect("run");
         assert!(
@@ -868,7 +871,10 @@ description = "Builds it."
         let (brain, tasks) = brain_with_tasks(dir.path());
         let mut c = card("t-origin", "maya");
         c.origin_chat_id = Some("strategy".to_string());
-        tasks.upsert(&CompanyId::new("acme"), &c).await.expect("seed");
+        tasks
+            .upsert(&CompanyId::new("acme"), &c)
+            .await
+            .expect("seed");
 
         let posted = brain
             .run_task("t-origin")
