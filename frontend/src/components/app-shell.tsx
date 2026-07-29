@@ -54,7 +54,7 @@ import { toast } from "sonner";
 import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
 import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { DISCORD_INVITE_URL } from "@/lib/links";
-import { defaultThreads, threadsFromDesks } from "@/lib/threads";
+import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -280,9 +280,21 @@ export function AppShell({
 
     client
       .listDesks(company)
-      .then((desks) => {
+      .then(async (desks) => {
         if (cancelled) return;
-        const resolved = threadsFromDesks(desks);
+        // Issue #151 §3.3: desks first, then one DM thread per roster teammate.
+        // The roster is fetched separately and tolerated as optional — a host
+        // that 404s `/team` keeps its desks rather than losing the whole list.
+        const team = await client.listTeam(company).catch(() => []);
+        if (cancelled) return;
+        const deskThreads = threadsFromDesks(desks);
+        const resolved = [
+          ...deskThreads,
+          ...agentDmThreads(
+            team,
+            deskThreads.map((t) => t.id),
+          ),
+        ];
         setThreads((prev) => {
           const byId = new Map(prev.map((t) => [t.id, t]));
           return resolved.map((t) => {

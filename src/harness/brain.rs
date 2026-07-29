@@ -220,15 +220,34 @@ impl HarnessBrain {
         }
     }
 
-    /// Resolves which agent answers an operator message. A message addressed to a
-    /// desk (its `chat` field naming a group chat with a lead member) is answered
-    /// by that desk's lead; everything else — including the "General" desk and
-    /// unaddressed messages — goes to the orchestrator (the default responder).
+    /// Resolves which agent answers an operator message.
+    ///
+    /// Resolution order, and the order matters:
+    ///
+    /// 1. a **desk** (the `chat` field naming a group chat with a lead member) is
+    ///    answered by that desk's lead — unchanged;
+    /// 2. a **roster teammate id** is answered by that teammate directly, which
+    ///    is what makes a per-agent DM thread possible (issue #151 §3.3);
+    /// 3. everything else — the "General" desk, an unknown id, an unaddressed
+    ///    message — goes to the orchestrator, as before.
+    ///
+    /// Desks are tried first so a desk whose id happens to match an agent id
+    /// keeps routing as a desk; the DM case only ever claims ids that resolve to
+    /// no desk at all. Without step 2 a DM thread would silently reach the
+    /// orchestrator instead of the teammate the operator opened — the console
+    /// would look like it were addressing an agent while talking to someone
+    /// else.
     fn responder_for(&self, chat: Option<&str>) -> String {
-        match chat.and_then(|desk| self.desk_lead(desk)) {
-            Some(member) => member,
-            None => self.responder.clone(),
+        let Some(chat) = chat else {
+            return self.responder.clone();
+        };
+        if let Some(lead) = self.desk_lead(chat) {
+            return lead;
         }
+        if self.record.is_roster_agent(chat) {
+            return chat.to_string();
+        }
+        self.responder.clone()
     }
 
     /// The lead member of a desk: the first member of the matching group chat
@@ -958,6 +977,33 @@ members = ["engineer"]
         assert_eq!(brain.responder_for(Some("General")), "chief");
         assert_eq!(brain.responder_for(Some("nope")), "chief");
         assert_eq!(brain.responder_for(None), "chief");
+    }
+
+    // ── Issue #151 §3.3: a DM thread reaches the teammate it names ──
+
+    /// A chat id naming a roster teammate answers as that teammate, which is
+    /// what a per-agent DM thread is. Before this it fell through to the
+    /// orchestrator, so the console would show an agent's thread while someone
+    /// else answered in it.
+    #[test]
+    fn responder_for_routes_a_roster_agent_id_to_that_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks) = brain_with_desk(dir.path());
+        assert_eq!(brain.responder_for(Some("engineer")), "engineer");
+        assert_eq!(brain.responder_for(Some("chief")), "chief");
+    }
+
+    /// Desks still win. A desk id is resolved as a desk even if an agent shares
+    /// the name, so no existing thread changes where it lands.
+    #[test]
+    fn a_desk_still_outranks_an_agent_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks) = brain_with_desk(dir.path());
+        // `eng_desk` is a desk led by `engineer`; it must resolve through the
+        // desk path, not the DM path.
+        assert_eq!(brain.responder_for(Some("eng_desk")), "engineer");
+        // And an id that is neither still reaches the orchestrator.
+        assert_eq!(brain.responder_for(Some("not-a-teammate")), "chief");
     }
 
     /// An operator-added overlay member is resolved as a desk's lead (issue #72):
