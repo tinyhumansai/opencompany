@@ -19,6 +19,34 @@ use crate::harness::{HarnessDeps, HarnessPool};
 use crate::ports::types::{CompanyId, CompanyRecord};
 use crate::ports::{WorkflowRun, WorkflowRunner};
 
+/// How deeply a workflow may re-enter itself before the run is refused
+/// (issue #151 part a).
+///
+/// One level of nesting is legitimate and useful — a `sub_workflow` node, or a
+/// workflow whose agent node asks the orchestrator to run a second, different
+/// graph. Beyond that a chain is almost certainly a cycle rather than a plan,
+/// and the cost of being wrong is asymmetric: refusing a deep run returns a
+/// readable tool error, while allowing it aborts the host.
+pub(crate) const MAX_WORKFLOW_DEPTH: usize = 4;
+
+tokio::task_local! {
+    /// How many workflow runs are already on this call chain.
+    ///
+    /// A task-local, not a counter on the runner, and that distinction is the
+    /// point: a workflow run, the agent turns inside it, and any tool those
+    /// turns call all execute inline on **one** tokio task (the only `spawn` on
+    /// the path is the progress-event collector, which runs nothing re-entrant).
+    /// So this counts exactly one causal chain. A shared counter would instead
+    /// count *concurrent* runs and refuse two operators running unrelated
+    /// workflows at the same time.
+    static WORKFLOW_DEPTH: usize;
+}
+
+/// The current re-entry depth, `0` outside any workflow run.
+fn current_workflow_depth() -> usize {
+    WORKFLOW_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
 /// Runs `workflow` for the company described by `record` on the tinyflows engine
 /// with the trigger `input`, returning the final run state and any nodes left
 /// pending approval.
@@ -32,6 +60,48 @@ use crate::ports::{WorkflowRun, WorkflowRunner};
 /// (agent nodes address it by teammate id) — [`HarnessWorkflowRunner::run`] does
 /// this via [`HarnessPool::ensure`] before delegating here.
 pub async fn run_workflow(
+    pool: Arc<HarnessPool>,
+    deps: HarnessDeps,
+    record: &CompanyRecord,
+    workflow: &WorkflowFile,
+    input: Value,
+) -> Result<WorkflowRun> {
+    // Issue #151 part a: refuse an unbounded re-entry before it takes the host
+    // down. `run_workflow` is an orchestrator tool, and a workflow `agent` node
+    // may address the orchestrator — so a graph whose agent node runs a
+    // workflow that reaches the orchestrator again recurses with no bound. Each
+    // level is a whole agent turn plus an engine run, so the process dies on a
+    // stack overflow rather than returning an error, taking every other tenant
+    // on the host with it. `MAX_DELEGATIONS_PER_TURN` caps fan-out *within* one
+    // turn and does nothing about depth.
+    let depth = current_workflow_depth();
+    if depth >= MAX_WORKFLOW_DEPTH {
+        tracing::warn!(
+            company = %record.id,
+            workflow = %workflow.id,
+            depth,
+            "workflow: refusing a run past the re-entry limit"
+        );
+        return Err(OpenCompanyError::Harness(format!(
+            "workflow `{}` was not run: it is already {depth} workflow runs deep, at the \
+             re-entry limit of {}. A workflow whose agent node runs another workflow that \
+             reaches back here will loop forever — break the cycle, or run the inner \
+             workflow on its own.",
+            workflow.id, MAX_WORKFLOW_DEPTH
+        )));
+    }
+
+    WORKFLOW_DEPTH
+        .scope(
+            depth + 1,
+            run_workflow_inner(pool, deps, record, workflow, input),
+        )
+        .await
+}
+
+/// The run itself, always executed inside a [`WORKFLOW_DEPTH`] scope so a
+/// nested run sees this one on the chain.
+async fn run_workflow_inner(
     pool: Arc<HarnessPool>,
     deps: HarnessDeps,
     record: &CompanyRecord,
@@ -1072,4 +1142,113 @@ to = "done"
             run.output
         );
     }
+
+    /// A trivial graph is enough — the guard fires before translation.
+    const TRIVIAL: &str = r#"
+id = "trivial"
+name = "Trivial"
+[[node]]
+id = "start"
+kind = "trigger"
+name = "Start"
+[[node]]
+id = "done"
+kind = "output"
+name = "Done"
+[[edge]]
+from = "start"
+to = "done"
+"#;
+
+    /// Outside any run the chain is empty, so nothing is refused.
+    #[tokio::test]
+    async fn depth_is_zero_outside_a_run() {
+        assert_eq!(current_workflow_depth(), 0);
+    }
+
+    /// Each nested run sees the ones already on the chain — this is what makes
+    /// the guard count a causal chain rather than a moment in time.
+    #[tokio::test]
+    async fn depth_accumulates_down_a_nested_chain() {
+        WORKFLOW_DEPTH
+            .scope(1, async {
+                assert_eq!(current_workflow_depth(), 1);
+                WORKFLOW_DEPTH
+                    .scope(2, async {
+                        assert_eq!(current_workflow_depth(), 2);
+                    })
+                    .await;
+                // Leaving the inner scope restores the outer depth.
+                assert_eq!(current_workflow_depth(), 1);
+            })
+            .await;
+        assert_eq!(current_workflow_depth(), 0);
+    }
+
+    /// Two runs side by side are not a chain. A shared counter would refuse the
+    /// second; a task-local correctly sees each at depth 0.
+    #[tokio::test]
+    async fn concurrent_unrelated_runs_do_not_stack() {
+        let a = WORKFLOW_DEPTH.scope(1, async { current_workflow_depth() });
+        let b = async { current_workflow_depth() };
+        let (inside, outside) = tokio::join!(a, b);
+        assert_eq!(inside, 1);
+        assert_eq!(
+            outside, 0,
+            "a concurrent run must not inherit another chain's depth"
+        );
+    }
+
+    /// At the limit the run is refused with a message naming the workflow and
+    /// the limit — and, critically, it returns rather than recursing.
+    #[tokio::test]
+    async fn a_run_at_the_limit_is_refused_with_an_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crate::company::parse_workflow(TRIVIAL).expect("parses");
+
+        let err = WORKFLOW_DEPTH
+            .scope(MAX_WORKFLOW_DEPTH, async {
+                run_workflow(
+                    Arc::new(HarnessPool::new()),
+                    deps(dir.path()),
+                    &tools_record(),
+                    &file,
+                    Value::Null,
+                )
+                .await
+            })
+            .await
+            .expect_err("a run at the re-entry limit must be refused");
+
+        let msg = err.to_string();
+        assert!(msg.contains("trivial"), "must name the workflow: {msg}");
+        assert!(msg.contains("re-entry limit"), "{msg}");
+        assert!(
+            msg.contains(&MAX_WORKFLOW_DEPTH.to_string()),
+            "must state the limit: {msg}"
+        );
+    }
+
+    /// One level below the limit still runs — the guard bounds recursion, it
+    /// does not ban nesting.
+    #[tokio::test]
+    async fn a_run_below_the_limit_still_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = crate::company::parse_workflow(TRIVIAL).expect("parses");
+
+        let out = WORKFLOW_DEPTH
+            .scope(MAX_WORKFLOW_DEPTH - 1, async {
+                run_workflow(
+                    Arc::new(HarnessPool::new()),
+                    deps(dir.path()),
+                    &tools_record(),
+                    &file,
+                    Value::Null,
+                )
+                .await
+            })
+            .await;
+        assert!(out.is_ok(), "a run below the limit must execute: {out:?}");
+    }
 }
+
