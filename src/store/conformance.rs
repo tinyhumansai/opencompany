@@ -542,6 +542,7 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
         priority: "medium".to_string(),
         assignee: "Strategy desk".to_string(),
         updated_at_millis: at,
+        origin_chat_id: None,
     };
 
     tasks

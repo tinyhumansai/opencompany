@@ -31,6 +31,20 @@ pub struct TaskRecord {
     pub assignee: String,
     /// Epoch-millis timestamp of the last update.
     pub updated_at_millis: u64,
+    /// The chat/desk thread the task was created from, when it came from a
+    /// delegation (issue #151 §3.2).
+    ///
+    /// A dispatched card runs asynchronously, long after the turn that spawned
+    /// it has answered, so the completion reply has no ambient thread to post
+    /// onto — without this it can only be written into `note`, where the
+    /// operator has to go looking for it. Stamped by `spawn_task` from the
+    /// delegating turn's chat id.
+    ///
+    /// `None` for a card created straight on the board (no originating
+    /// conversation) and for every card written before this field existed —
+    /// both simply get no post-back, exactly as today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_chat_id: Option<String>,
 }
 
 /// Durable per-company task board. Company A's tasks MUST be invisible to

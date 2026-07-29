@@ -190,6 +190,7 @@ async fn steer_task_validates_statuses_and_journals_acceptance() {
                 priority: "medium".into(),
                 assignee: String::new(),
                 updated_at_millis: 1,
+                origin_chat_id: None,
             },
         )
         .await

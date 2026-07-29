@@ -72,9 +72,17 @@ impl HarnessBrain {
     /// onto the board — moved to `in_review` on success, back to `backlog` with
     /// the error noted on failure. A missing task store or a card that has since
     /// vanished is a silent no-op.
-    async fn run_task(&self, task_id: &str) -> Result<()> {
+    /// Runs a dispatched card to completion and, when the card remembers the
+    /// conversation it was spawned from, returns the reply to post back there
+    /// (issue #151 §3.2).
+    ///
+    /// Before this the answer only ever reached `card.note`: the card runs
+    /// asynchronously, long after the turn that spawned it has answered, so the
+    /// operator had to know to go and look. The note is still written — it stays
+    /// the durable record — and the post-back is additive.
+    async fn run_task(&self, task_id: &str) -> Result<Option<OutboundMessage>> {
         let Some(tasks) = self.deps.tasks.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(mut card) = tasks
             .list(&self.record.id)
@@ -82,7 +90,7 @@ impl HarnessBrain {
             .into_iter()
             .find(|t| t.id == task_id)
         else {
-            return Ok(());
+            return Ok(None);
         };
 
         let responder = self.task_responder(&card.assignee);
@@ -207,7 +215,25 @@ impl HarnessBrain {
         tasks.upsert(&self.record.id, &card).await?;
         // `guard` drops here → the run leaves the in-flight strip.
         drop(guard);
-        Ok(())
+
+        // Issue #151 §3.2: answer in the conversation the card was spawned
+        // from. Only a card that remembers an origin posts back — one created
+        // straight on the board, or written before `origin_chat_id` existed,
+        // has no thread to answer in and behaves exactly as before.
+        //
+        // The bubble is attributed to the responder (matching a delegated desk
+        // reply) and carries the card's landing column, so the operator reads
+        // one line and knows both what came back and where the card went. Steps
+        // are deliberately empty: a dispatched card discards them into the note.
+        let Some(origin) = card.origin_chat_id.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(OutboundMessage {
+            channel: responder,
+            text: task_postback_text(&card),
+            reply_to: Some(origin),
+            steps: Vec::new(),
+        }))
     }
 
     /// Resolves which roster agent runs a task: its `assignee` when that names a
@@ -321,6 +347,10 @@ impl HarnessBrain {
                     priority: "medium".to_string(),
                     assignee: assignee.unwrap_or_default(),
                     updated_at_millis: now_millis(),
+                    // Issue #151 §3.2: remember which conversation asked for
+                    // this, so the completion can answer there instead of only
+                    // landing in the note.
+                    origin_chat_id: chat_id.map(str::to_string),
                 };
                 tasks.upsert(&self.record.id, &card).await?;
                 Ok(None)
@@ -379,6 +409,25 @@ fn task_instruction(card: &TaskRecord) -> String {
     match card.note.as_deref().filter(|n| !n.is_empty()) {
         Some(note) => format!("Task: {}\n\n{}", card.title, note),
         None => format!("Task: {}", card.title),
+    }
+}
+
+/// The post-back line for a finished card (issue #151 §3.2): what the card was,
+/// where it landed, and the reply itself.
+///
+/// Reads the *result* out of the card rather than taking the raw turn reply, so
+/// a cancelled or paused run posts the same thing the board shows instead of
+/// claiming an answer it does not have.
+fn task_postback_text(card: &TaskRecord) -> String {
+    let status = match card.column.as_str() {
+        "in_review" => "is ready for review",
+        "paused" => "is paused",
+        "backlog" => "went back to the backlog",
+        other => other,
+    };
+    match card.note.as_deref().filter(|n| !n.trim().is_empty()) {
+        Some(note) => format!("\"{}\" {status}.\n\n{note}", card.title),
+        None => format!("\"{}\" {status}.", card.title),
     }
 }
 
@@ -452,7 +501,9 @@ impl Brain for HarnessBrain {
                     channel_responses.extend(delegated);
                 }
                 CompanyEvent::TaskDispatched { task_id } => {
-                    self.run_task(task_id).await?;
+                    if let Some(message) = self.run_task(task_id).await? {
+                        channel_responses.push(message);
+                    }
                 }
                 _ => {}
             }
@@ -734,7 +785,104 @@ description = "Builds it."
             priority: "high".to_string(),
             assignee: assignee.to_string(),
             updated_at_millis: 0,
+            origin_chat_id: None,
         }
+    }
+
+    // ── Issue #151 §3.2: a finished card answers where it was asked ──────
+
+    /// The post-back names the card, where it landed, and the result — so the
+    /// operator reads one bubble instead of going to find the note.
+    #[test]
+    fn postback_reports_the_card_title_status_and_result() {
+        let mut finished = card("t1", "maya");
+        finished.column = "in_review".to_string();
+        finished.note = Some("[maya] Draft is up.".to_string());
+
+        let text = task_postback_text(&finished);
+        assert!(text.contains("Ship the thing"), "{text}");
+        assert!(text.contains("is ready for review"), "{text}");
+        assert!(text.contains("Draft is up."), "{text}");
+    }
+
+    /// A cancelled or paused run must not claim an answer it does not have —
+    /// the post-back reads the card, not the raw turn reply.
+    #[test]
+    fn postback_reflects_the_landing_column_not_a_presumed_success() {
+        let mut paused = card("t1", "maya");
+        paused.column = "paused".to_string();
+        paused.note = Some("[maya] [paused] halfway".to_string());
+        assert!(task_postback_text(&paused).contains("is paused"));
+
+        let mut cancelled = card("t1", "maya");
+        cancelled.column = "backlog".to_string();
+        cancelled.note = Some("[operator] cancelled while in flight".to_string());
+        let text = task_postback_text(&cancelled);
+        assert!(text.contains("went back to the backlog"), "{text}");
+        assert!(!text.contains("ready for review"), "{text}");
+    }
+
+    /// A card with no note still posts a readable line rather than a title
+    /// followed by a dangling blank block.
+    #[test]
+    fn postback_without_a_note_is_still_a_complete_sentence() {
+        let mut finished = card("t1", "maya");
+        finished.column = "in_review".to_string();
+        finished.note = None;
+        let text = task_postback_text(&finished);
+        assert_eq!(text, "\"Ship the thing\" is ready for review.");
+
+        finished.note = Some("   ".to_string());
+        assert_eq!(
+            task_postback_text(&finished),
+            "\"Ship the thing\" is ready for review.",
+            "a whitespace-only note must not append an empty block"
+        );
+    }
+
+    /// The compatibility guarantee: a card with no remembered origin — one made
+    /// straight on the board, or written before `origin_chat_id` existed —
+    /// posts back nowhere and behaves exactly as it did before.
+    #[tokio::test]
+    async fn a_card_with_no_origin_posts_back_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-no-origin", "maya");
+        c.origin_chat_id = None;
+        tasks.upsert(&CompanyId::new("acme"), &c).await.expect("seed");
+
+        let posted = brain.run_task("t-no-origin").await.expect("run");
+        assert!(
+            posted.is_none(),
+            "a card with no originating thread must not post back"
+        );
+        // The note is still the durable record.
+        assert!(only_card(&tasks).await.note.is_some());
+    }
+
+    /// …and one that does remember its origin answers there, attributed to the
+    /// responder and threaded with `reply_to`.
+    #[tokio::test]
+    async fn a_card_with_an_origin_posts_back_to_that_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-origin", "maya");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks.upsert(&CompanyId::new("acme"), &c).await.expect("seed");
+
+        let posted = brain
+            .run_task("t-origin")
+            .await
+            .expect("run")
+            .expect("a card with an origin must post back");
+        assert_eq!(posted.reply_to.as_deref(), Some("strategy"));
+        assert!(
+            !posted.channel.is_empty(),
+            "the bubble must be attributed to the responder"
+        );
+        assert!(posted.text.contains("Ship the thing"), "{}", posted.text);
+        // A dispatched card discards its steps into the note.
+        assert!(posted.steps.is_empty());
     }
 
     async fn only_card(tasks: &Arc<FsOps>) -> TaskRecord {

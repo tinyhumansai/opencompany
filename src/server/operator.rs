@@ -838,6 +838,7 @@ async fn run_chat(
             priority: "medium".to_string(),
             assignee: String::new(),
             updated_at_millis: crate::ports::now_millis(),
+            origin_chat_id: None,
         };
         if let Err(err) = runtime.upsert_task(&record).await {
             tracing::warn!(error = %err, "failed to open task card for chat request");

@@ -31,6 +31,7 @@ use crate::ports::types::{
     EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall,
     ToolResult, Verdict,
 };
+use crate::runtime::channel::OPERATOR_CHANNEL;
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
@@ -211,7 +212,36 @@ impl<'a> CycleRunner<'a> {
                 return Ok(());
             }
         }
-        // No adapter for this channel id: drop silently in Phase 1.
+        // Issue #151: an agent reply is addressed by *agent id*, not by adapter
+        // id — a delegated desk bubble and a dispatched card's post-back both
+        // carry `channel: "<agent_id>"` so the console can attribute them. No
+        // adapter answers to an agent id, so this used to drop them silently:
+        // the operator REST route reads `CycleReport.responses` directly and
+        // never noticed, but a company reached over a real channel adapter got
+        // the orchestrator's reply and lost every delegated one.
+        //
+        // Fall back to the operator adapter, which is the console's own surface
+        // and always the right destination for an agent→human reply. The
+        // message is forwarded unchanged, so its `channel` still names the agent
+        // and attribution survives.
+        if let Some(operator) = self
+            .rt
+            .channels
+            .iter()
+            .find(|c| c.channel_id() == OPERATOR_CHANNEL)
+        {
+            tracing::debug!(
+                channel = %msg.channel,
+                "no adapter for this channel id; delivering via the operator channel"
+            );
+            operator.send(msg.clone()).await?;
+            return Ok(());
+        }
+        // Nothing to deliver on at all (a runtime with no operator adapter).
+        tracing::debug!(
+            channel = %msg.channel,
+            "no adapter for this channel id and no operator channel; response not delivered"
+        );
         Ok(())
     }
 }
@@ -583,6 +613,73 @@ mod test {
                 token_usage: TokenUsage::default(),
             })
         }
+    }
+
+    /// A brain that answers on the operator channel and *also* emits a
+    /// delegated reply addressed by agent id — the shape `run_delegation` and a
+    /// dispatched card's post-back both produce.
+    struct DelegatingBrain;
+
+    #[async_trait]
+    impl Brain for DelegatingBrain {
+        async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+            Ok(CycleResult {
+                channel_responses: vec![
+                    OutboundMessage {
+                        channel: "operator".into(),
+                        text: "orchestrator".into(),
+                        steps: Vec::new(),
+                        reply_to: None,
+                    },
+                    OutboundMessage {
+                        // Addressed by *agent id*: no adapter answers to this.
+                        channel: "maya".into(),
+                        text: "delegated reply".into(),
+                        steps: Vec::new(),
+                        reply_to: Some("strategy".into()),
+                    },
+                ],
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "delegating cycle")],
+                ledger_deltas: Vec::new(),
+                token_usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    /// Issue #151: a delegated reply is addressed by agent id, so no adapter
+    /// matches it. It used to be dropped silently — the operator REST route
+    /// never noticed because it reads `CycleReport.responses` directly, but a
+    /// company reached over a channel adapter lost every delegated reply while
+    /// still receiving the orchestrator's.
+    #[tokio::test]
+    async fn a_reply_addressed_by_agent_id_reaches_the_operator_channel() {
+        let home = tmp_home();
+        let operator_channel = OperatorChannel::new();
+        let channels: Vec<Arc<dyn ChannelAdapter>> = vec![Arc::new(operator_channel.clone())];
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_brain(Arc::new(DelegatingBrain))
+            .with_channels(channels)
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: "hand it off".into(),
+            by: None,
+            chat: None,
+        }])
+        .await
+        .unwrap();
+
+        let sent = operator_channel.sent();
+        assert_eq!(sent.len(), 2, "both replies must be delivered: {sent:?}");
+        // Attribution survives the fallback — the bubble still names the agent.
+        let delegated = sent
+            .iter()
+            .find(|m| m.text == "delegated reply")
+            .expect("the delegated reply must be delivered");
+        assert_eq!(delegated.channel, "maya");
+        assert_eq!(delegated.reply_to.as_deref(), Some("strategy"));
     }
 
     #[tokio::test]

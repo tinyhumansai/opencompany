@@ -119,6 +119,7 @@ async fn create_task(
         priority: body.priority.unwrap_or_else(|| "medium".to_string()),
         assignee: body.assignee.unwrap_or_default(),
         updated_at_millis: now_millis(),
+        origin_chat_id: None,
     };
     company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
