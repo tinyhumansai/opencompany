@@ -28,8 +28,8 @@ use crate::ports::brain::CycleHost;
 use crate::ports::now_millis;
 use crate::ports::types::{
     Actor, ApprovalId, CompanyEvent, CompanyId, ContextOp, ContextOpResult, CycleRequest, Effect,
-    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall,
-    ToolResult, Verdict,
+    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ReplyTo,
+    ToolCall, ToolResult, Verdict,
 };
 use crate::runtime::channel::OPERATOR_CHANNEL;
 use crate::runtime::types::CycleReport;
@@ -636,7 +636,9 @@ mod test {
                         channel: "maya".into(),
                         text: "delegated reply".into(),
                         steps: Vec::new(),
-                        reply_to: Some("strategy".into()),
+                        reply_to: Some(ReplyTo {
+                            chat_id: "strategy".into(),
+                        }),
                     },
                 ],
                 new_traces: vec![CompressedTrace::now(&req.cycle_id, "delegating cycle")],
@@ -679,7 +681,10 @@ mod test {
             .find(|m| m.text == "delegated reply")
             .expect("the delegated reply must be delivered");
         assert_eq!(delegated.channel, "maya");
-        assert_eq!(delegated.reply_to.as_deref(), Some("strategy"));
+        assert_eq!(
+            delegated.reply_to.as_ref().map(|r| r.chat_id.as_str()),
+            Some("strategy")
+        );
     }
 
     #[tokio::test]
