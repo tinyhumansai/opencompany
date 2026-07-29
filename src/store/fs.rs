@@ -886,6 +886,20 @@ mod test {
         tokio::fs::remove_dir_all(&root).await.ok();
     }
 
+    /// The fs backend's migration path: index lines written before
+    /// `stored_at_millis` existed carry no such field, and must still
+    /// deserialize — reporting an unknown (`0`) store time rather than failing
+    /// the read and blanking the whole Brain list.
+    #[test]
+    fn legacy_context_index_line_without_a_stamp_still_parses() {
+        let legacy = r#"{"addr":"abc123","label":"agent/ceo","len":24}"#;
+        let entry: IndexEntry = serde_json::from_str(legacy).expect("legacy index line parses");
+        assert_eq!(entry.addr, "abc123");
+        assert_eq!(entry.label, "agent/ceo");
+        assert_eq!(entry.len, 24);
+        assert_eq!(entry.stored_at_millis, 0);
+    }
+
     #[tokio::test]
     async fn conformance_export_totality() {
         let root = tmp_root();

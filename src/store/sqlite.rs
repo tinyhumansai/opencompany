@@ -1839,6 +1839,80 @@ mod test {
         conformance::assert_context_chunk_stamps(store()).await;
     }
 
+    /// The migration path a fresh database never exercises.
+    ///
+    /// [`MIGRATIONS`] is all `CREATE TABLE IF NOT EXISTS`, which is a no-op
+    /// against a database that already has `context_chunks` — so on an existing
+    /// deployment only [`add_column_if_missing`] can add `stored_ms`. Without
+    /// it, every read of the column would fail with "no such column" and the
+    /// whole Brain list/stats surface would 500.
+    #[tokio::test]
+    async fn legacy_context_chunks_table_gains_stored_ms_on_open() {
+        // A database as it looked before the column existed, with a row in it.
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE context_chunks (
+                 company_id TEXT NOT NULL,
+                 addr       TEXT NOT NULL,
+                 label      TEXT NOT NULL,
+                 body       TEXT NOT NULL,
+                 len        INTEGER NOT NULL,
+                 PRIMARY KEY (company_id, addr)
+             );
+             INSERT INTO context_chunks (company_id, addr, label, body, len)
+             VALUES ('acme', 'legacy-addr', 'agent/ceo', 'remembered before stamps', 24);",
+        )
+        .expect("seed a pre-`stored_ms` database");
+
+        let store = SqliteStore::from_conn(conn).expect("migrations run on a legacy database");
+        let id = CompanyId::new("acme");
+
+        // The legacy row survives the migration and reports an *unknown* store
+        // time — not the epoch, and not a misleading "migrated just now".
+        let metas = store.list(&id, "").await.expect("list after migration");
+        assert_eq!(metas.len(), 1, "the legacy row must not be dropped");
+        assert_eq!(metas[0].label, "agent/ceo");
+        assert_eq!(
+            metas[0].stored_at_millis, 0,
+            "a row written before stamps existed has no store time to report"
+        );
+
+        // A write after the migration is stamped for real.
+        let before = now_millis();
+        store
+            .put(
+                &id,
+                ContextChunk {
+                    label: "agent/ops".to_string(),
+                    body: "remembered after the migration".to_string(),
+                },
+            )
+            .await
+            .expect("put into a migrated database");
+
+        let metas = store.list(&id, "").await.expect("list after put");
+        assert_eq!(metas.len(), 2);
+        let fresh = metas
+            .iter()
+            .find(|m| m.label == "agent/ops")
+            .expect("the new chunk is listed");
+        assert!(
+            fresh.stored_at_millis >= before,
+            "a post-migration write must carry a real stamp, got {}",
+            fresh.stored_at_millis
+        );
+
+        // Reopening an already-migrated database must not try to add the column
+        // a second time — the `ALTER` would fail with "duplicate column name".
+        add_column_if_missing(
+            &store.conn(),
+            "context_chunks",
+            "stored_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .expect("adding an existing column is a no-op, not an error");
+    }
+
     #[tokio::test]
     async fn conformance_usage_meter() {
         conformance::assert_usage_meter(store()).await;
