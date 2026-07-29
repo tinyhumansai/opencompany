@@ -147,7 +147,7 @@ fn slug_toolkit(slug: &str) -> String {
 }
 
 #[cfg(feature = "composio")]
-pub use live::composio_tools;
+pub use live::{ComposioMetering, composio_tools};
 
 #[cfg(feature = "composio")]
 mod live {
@@ -158,11 +158,31 @@ mod live {
     use serde_json::{Value, json};
 
     use crate::harness::mcp_probe::scrub;
+    use crate::metering::record_oauth_call;
+    use crate::ports::UsageMeter;
+    use crate::ports::now_millis;
 
     use oh::composio::ComposioClient;
     use oh::integrations::IntegrationClient;
     use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
     use openhuman_core::openhuman as oh;
+
+    /// What `composio_execute` needs to meter a call it just made: the company
+    /// the sample belongs to, the agent that made it, and the meter to write to.
+    ///
+    /// Bundled because these three travel together and are individually
+    /// meaningless — and because [`composio_tools`] would otherwise grow four
+    /// positional parameters at a call site that already has many.
+    #[derive(Clone)]
+    pub struct ComposioMetering {
+        /// The company the sample is scoped to.
+        pub company: CompanyId,
+        /// The agent whose turn made the call.
+        pub agent: String,
+        /// The usage meter. `None` leaves metering off entirely (the harness
+        /// wires no meter in some embeddings) — the tools still work.
+        pub meter: Option<Arc<dyn UsageMeter>>,
+    }
 
     /// Build the five per-tenant Composio tools over the tenant's bearer token.
     ///
@@ -173,9 +193,17 @@ mod live {
     /// `authorize` / `execute` tools are `Execute` and additionally park for
     /// operator approval through the harness [`ApprovalPolicy`](crate::harness::policy).
     ///
+    /// `metering` lets `composio_execute` record a
+    /// [`SampleKind::OauthCall`](crate::ports::usage::SampleKind) sample per
+    /// call it completes, which is what puts numbers in the Usage view's
+    /// calls-by-provider chart (issue #152).
+    ///
     /// Gated on the `composio` feature; the default/`openhuman` build never
     /// compiles this.
-    pub fn composio_tools(config: &TenantComposio) -> Vec<Box<dyn Tool>> {
+    pub fn composio_tools(
+        config: &TenantComposio,
+        metering: ComposioMetering,
+    ) -> Vec<Box<dyn Tool>> {
         // The Config-free seam: `IntegrationClient::new(backend_url, auth_token)`
         // takes the per-tenant credential directly, with no OpenHuman global
         // `Config`. The bearer is the ONLY isolation lever — see the module docs.
@@ -210,6 +238,7 @@ mod live {
                 client,
                 secrets,
                 toolkits,
+                metering,
             }),
         ]
     }
@@ -522,6 +551,7 @@ mod live {
         client: ComposioClient,
         secrets: Vec<String>,
         toolkits: Arc<Vec<String>>,
+        metering: ComposioMetering,
     }
 
     #[async_trait]
@@ -573,12 +603,110 @@ mod live {
             // tracing carries the slug/toolkit only — NEVER arguments or bodies.
             tracing::debug!(tool = %tool, toolkit = %toolkit, "[composio] execute");
             match self.client.execute_tool(&tool, arguments).await {
-                Ok(resp) => Ok(scrubbed_ok(
-                    serde_json::to_value(&resp).unwrap_or(Value::Null),
-                    &self.secrets,
-                )),
+                Ok(resp) => {
+                    // Metered only on success — i.e. a call that actually
+                    // reached the connected account. `connections` in the read
+                    // model is the *count of providers seen*, so counting a
+                    // failed call would report a connection for a provider this
+                    // company may not even be connected to. Never fails the
+                    // call: `record_oauth_call` logs and swallows.
+                    if let Some(meter) = self.metering.meter.as_deref() {
+                        record_oauth_call(
+                            meter,
+                            &self.metering.company,
+                            &self.metering.agent,
+                            &toolkit,
+                            now_millis(),
+                        )
+                        .await;
+                    }
+                    Ok(scrubbed_ok(
+                        serde_json::to_value(&resp).unwrap_or(Value::Null),
+                        &self.secrets,
+                    ))
+                }
                 Err(err) => Ok(scrubbed_err("composio_execute failed", &err, &self.secrets)),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod live_tests {
+        use super::*;
+
+        use std::sync::Mutex;
+
+        use crate::ports::types::CompanyId;
+        use crate::ports::usage::UsageSample;
+
+        #[derive(Default)]
+        struct RecordingMeter {
+            samples: Mutex<Vec<UsageSample>>,
+        }
+
+        #[async_trait]
+        impl UsageMeter for RecordingMeter {
+            async fn record(
+                &self,
+                _company: &CompanyId,
+                sample: &UsageSample,
+            ) -> crate::Result<()> {
+                self.samples.lock().unwrap().push(sample.clone());
+                Ok(())
+            }
+            async fn query(
+                &self,
+                _company: &CompanyId,
+                _since: u64,
+            ) -> crate::Result<Vec<UsageSample>> {
+                Ok(self.samples.lock().unwrap().clone())
+            }
+        }
+
+        /// An execute tool whose allowlist admits `gmail` only, wired to a
+        /// recording meter. The client is constructed but never dialled by the
+        /// paths under test — both return before any network call.
+        fn tool_with(meter: Arc<RecordingMeter>) -> ComposioExecuteTool {
+            ComposioExecuteTool {
+                client: ComposioClient::new(Arc::new(IntegrationClient::new(
+                    "https://example.invalid".to_string(),
+                    "token".to_string(),
+                ))),
+                secrets: vec!["token".to_string()],
+                toolkits: Arc::new(vec!["gmail".to_string()]),
+                metering: ComposioMetering {
+                    company: CompanyId::new("acme"),
+                    agent: "ceo".to_string(),
+                    meter: Some(meter),
+                },
+            }
+        }
+
+        /// A call blocked by the toolkit allowlist never reaches the provider,
+        /// so it must not count towards `oauthCalls` — and must not invent a
+        /// `connections` entry for a toolkit this company cannot even use.
+        #[tokio::test]
+        async fn allowlist_rejection_records_no_sample() {
+            let meter = Arc::new(RecordingMeter::default());
+            let result = tool_with(meter.clone())
+                .execute(json!({"tool": "SLACK_POST_MESSAGE"}))
+                .await
+                .expect("execute returns a result rather than erroring");
+            assert!(result.is_error, "the call should be refused");
+            assert!(meter.samples.lock().unwrap().is_empty());
+        }
+
+        /// A malformed call is rejected before the client is touched, so it is
+        /// likewise not a metered OAuth call.
+        #[tokio::test]
+        async fn missing_tool_argument_records_no_sample() {
+            let meter = Arc::new(RecordingMeter::default());
+            let result = tool_with(meter.clone())
+                .execute(json!({}))
+                .await
+                .expect("execute returns a result rather than erroring");
+            assert!(result.is_error, "the call should be refused");
+            assert!(meter.samples.lock().unwrap().is_empty());
         }
     }
 }

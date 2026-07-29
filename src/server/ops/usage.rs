@@ -11,10 +11,15 @@
 //! Data maturity: token/cost samples only populate on a harness
 //! (`openhuman`-feature) build via `src/harness/cost.rs`. The offline build has
 //! no cost hook, so the meter is empty and the series is (correctly) zero-filled
-//! — that is the true value, not a stub. OAuth-call samples
-//! ([`SampleKind::OauthCall`](crate::ports::usage::SampleKind)) are not yet
-//! emitted anywhere, so `byProvider` / `oauthCalls` read zero until the Phase 2
-//! emit work lands.
+//! — that is the true value, not a stub.
+//!
+//! The same holds for OAuth-call samples
+//! ([`SampleKind::OauthCall`](crate::ports::usage::SampleKind)): they are now
+//! emitted per completed connected-tool call (see
+//! [`metering::oauth`](crate::metering::oauth)), but only a `composio`-feature
+//! build wires a connected-tool surface at all — so on a default build
+//! `byProvider` / `oauthCalls` still read zero, and that zero is now the honest
+//! answer ("no connected tools in this build") rather than a missing hook.
 
 use axum::Json;
 use axum::Router;
@@ -68,7 +73,8 @@ struct UsageDto {
     series: Vec<UsagePoint>,
     /// Tokens per teammate (desk), highest first.
     by_agent: Vec<AgentTokens>,
-    /// OAuth calls per provider, highest first (empty until Phase 2 emit).
+    /// OAuth calls per provider, highest first. Empty on a build with no
+    /// connected-tool surface compiled in — see the module docs.
     by_provider: Vec<ProviderCalls>,
     /// Window totals.
     totals: UsageTotals,

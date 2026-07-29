@@ -48,7 +48,15 @@ pub fn bucket_usage(
         total_output += s.output_tokens;
         total_cost += s.cost_usd;
 
-        *per_agent.entry(s.agent.clone()).or_default() += s.input_tokens + s.output_tokens;
+        // "Tokens by teammate" is a token chart, so a token-less sample must not
+        // mint a row there. `OauthCall` samples are deliberately zero-token, and
+        // before they were ever emitted this branch could not be reached by one;
+        // without the guard, an agent that only made connected-tool calls would
+        // appear as a 0-token bar.
+        let tokens = s.input_tokens + s.output_tokens;
+        if tokens > 0 {
+            *per_agent.entry(s.agent.clone()).or_default() += tokens;
+        }
 
         if s.kind == SampleKind::OauthCall {
             oauth_calls += 1;
@@ -261,5 +269,29 @@ mod tests {
         assert_eq!(u.totals.connections, 2);
         // OAuth calls carry no tokens.
         assert_eq!(u.totals.tokens, 150);
+    }
+
+    #[test]
+    fn oauth_only_agents_do_not_appear_as_zero_token_teammates() {
+        // "Tokens by teammate" is a token chart. An agent whose whole window is
+        // connected-tool calls has no tokens to show, so it must not render as
+        // an empty bar beside the agents that actually spent.
+        let now = at(2026, 7, 16);
+        let samples = vec![
+            inference(at(2026, 7, 16), "ceo", 100, 50, 0.1),
+            oauth(at(2026, 7, 16), "github"),
+            // `ops` only ever made an OAuth call this window.
+            UsageSample {
+                agent: "ops".to_string(),
+                ..oauth(at(2026, 7, 16), "gmail")
+            },
+        ];
+        let u = bucket_usage(&samples, UsageRange::D7, now, &HashMap::new());
+        assert_eq!(u.by_agent.len(), 1);
+        assert_eq!(u.by_agent[0].name, "ceo");
+        assert_eq!(u.by_agent[0].tokens, 150);
+        // The calls still count — only the token attribution is withheld.
+        assert_eq!(u.totals.oauth_calls, 2);
+        assert_eq!(u.totals.connections, 2);
     }
 }

@@ -10,6 +10,12 @@
 //!   balance → [`Finances`] (balance, budget vs spend, revenue, spend by
 //!   category, the transaction journal).
 //!
+//! [`oauth`] is the one write-side piece: it mints the
+//! [`SampleKind::OauthCall`](crate::ports::usage::SampleKind) samples
+//! [`bucket_usage`] turns into the calls-by-provider chart. It sits here rather
+//! than at the (feature-gated) connected-tool call sites so the contract is
+//! compiled and tested by the default CI build — see its module docs.
+//!
 //! WS2 owns the async-graphql wrappers (`graphql/usage.rs`,
 //! `graphql/finances.rs`); this module deliberately has no async-graphql
 //! dependency so the projections can be unit-tested against seeded data and
@@ -23,11 +29,13 @@ use crate::ports::types::OverlayAgent;
 mod calendar;
 pub mod capability;
 mod finances;
+pub mod oauth;
 mod types;
 mod usage;
 
 pub use capability::{BudgetPeriod, CapabilityPlan, TierBudgetStatus, plan_named, tokens_in};
 pub use finances::{category_label, finances_from};
+pub use oauth::{UNKNOWN_PROVIDER, oauth_call_sample, record_oauth_call};
 pub use types::{
     AgentTokens, CategorySpend, Direction, Finances, ProviderCalls, Transaction, Usage, UsagePoint,
     UsageRange, UsageTotals,

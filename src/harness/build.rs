@@ -261,7 +261,18 @@ pub fn build_agent(
     #[cfg(feature = "composio")]
     if crate::company::grants_composio_explicit(grants) {
         match &deps.composio {
-            Some(config) => tools.extend(crate::harness::composio::composio_tools(config)),
+            // The metering handle lets `composio_execute` record an `OauthCall`
+            // usage sample per completed call, so the Usage view's
+            // calls-by-provider chart reflects real connected-tool activity
+            // (issue #152). A `None` meter simply leaves metering off.
+            Some(config) => tools.extend(crate::harness::composio::composio_tools(
+                config,
+                crate::harness::composio::ComposioMetering {
+                    company: company.clone(),
+                    agent: manifest_agent.id.clone(),
+                    meter: deps.meter.clone(),
+                },
+            )),
             None => tracing::warn!(
                 company = %company,
                 agent = %manifest_agent.id,
