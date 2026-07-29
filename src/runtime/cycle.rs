@@ -28,8 +28,8 @@ use crate::ports::brain::CycleHost;
 use crate::ports::now_millis;
 use crate::ports::types::{
     Actor, ApprovalId, CompanyEvent, CompanyId, ContextOp, ContextOpResult, CycleRequest, Effect,
-    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ReplyTo,
-    ToolCall, ToolResult, Verdict,
+    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall,
+    ToolResult, Verdict,
 };
 use crate::runtime::channel::OPERATOR_CHANNEL;
 use crate::runtime::types::CycleReport;
@@ -550,7 +550,7 @@ mod test {
     use crate::ports::ChannelAdapter;
     use crate::ports::brain::Brain;
     use crate::ports::types::{
-        ActorKind, CompressedTrace, CycleResult, EffectGroup, EventSeq, TokenUsage,
+        ActorKind, CompressedTrace, CycleResult, EffectGroup, EventSeq, ReplyTo, TokenUsage,
     };
     use crate::runtime::RuntimeBuilder;
     use crate::runtime::channel::OperatorChannel;
