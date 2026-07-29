@@ -74,12 +74,17 @@ use self::tools::WorkflowToolInvoker;
 ///
 /// `pool`/`deps` are shared with the rest of the harness surface — the roster the
 /// agent nodes address is the one already resident in `pool`.
+///
+/// `run_request` is the operator's topic for this run (issue #154), threaded to
+/// the agent capability so every agent node's turn message carries what was
+/// actually asked, not just the node's authored instruction.
 pub async fn build_capabilities(
     pool: Arc<HarnessPool>,
     deps: HarnessDeps,
     record: &CompanyRecord,
     workflow_id: &str,
     run_id: &str,
+    run_request: Option<String>,
 ) -> Capabilities {
     let company = record.id.clone();
     let mode = PolicyMode::parse(&record.manifest.policy.mode);
@@ -149,7 +154,12 @@ pub async fn build_capabilities(
         // `deps` moves in last — the borrows above (`deps.capabilities`,
         // `deps.secrets`, `deps.workspace_root`, `deps.workflow_source_dir`) are
         // all done by here.
-        agent: Some(Arc::new(HarnessAgentRunner::new(pool, deps, company))),
+        agent: Some(Arc::new(HarnessAgentRunner::new(
+            pool,
+            deps,
+            company,
+            run_request,
+        ))),
     }
 }
 
@@ -191,15 +201,27 @@ pub struct HarnessAgentRunner {
     pool: Arc<HarnessPool>,
     deps: HarnessDeps,
     company: CompanyId,
+    /// What the operator asked for on this run (issue #154), when they supplied
+    /// it. A node's `prompt` is authored into the graph and is the same on every
+    /// run, so without this the run's topic never reaches the teammate doing the
+    /// work — the agent would run, find no subject, and ask for one.
+    run_request: Option<String>,
 }
 
 impl HarnessAgentRunner {
-    /// Builds a runner over an already-populated pool for `company`.
-    pub fn new(pool: Arc<HarnessPool>, deps: HarnessDeps, company: CompanyId) -> Self {
+    /// Builds a runner over an already-populated pool for `company`, carrying
+    /// the operator's run request (issue #154) when one was supplied.
+    pub fn new(
+        pool: Arc<HarnessPool>,
+        deps: HarnessDeps,
+        company: CompanyId,
+        run_request: Option<String>,
+    ) -> Self {
         Self {
             pool,
             deps,
             company,
+            run_request,
         }
     }
 }
@@ -212,7 +234,10 @@ impl AgentRunner for HarnessAgentRunner {
         request: Value,
         _conn: Option<&str>,
     ) -> TfResult<Value> {
-        let message = message_from_request(&request);
+        let message = compose_turn_message(
+            &message_from_request(&request),
+            self.run_request.as_deref(),
+        );
         tracing::debug!(
             company = %self.company,
             agent = agent_ref,
@@ -241,6 +266,54 @@ fn message_from_request(request: &Value) -> String {
         }
     }
     request.to_string()
+}
+
+/// Combines a node's authored instruction with the operator's run request
+/// (issue #154).
+///
+/// A node's `prompt` is baked into the graph, so it is identical on every run —
+/// it says *what this step does*, never *what was asked this time*. Before this,
+/// the run's topic stopped at the trigger node and the agent had no subject to
+/// work on, which is what made a run end with the agent asking the operator for
+/// a topic they had no field to supply.
+///
+/// The instruction stays first so the node's job still leads; the request is
+/// appended under a labelled heading so a teammate can tell the standing
+/// instruction from this run's subject. A blank or whitespace-only request is
+/// treated as absent, leaving the message byte-identical to the previous
+/// behaviour — runs that supply no topic are unchanged.
+fn compose_turn_message(instruction: &str, run_request: Option<&str>) -> String {
+    let request = run_request.map(str::trim).filter(|r| !r.is_empty());
+    match request {
+        Some(request) => {
+            let instruction = instruction.trim();
+            if instruction.is_empty() {
+                return request.to_string();
+            }
+            format!("{instruction}\n\nRequest for this run:\n{request}")
+        }
+        None => instruction.to_string(),
+    }
+}
+
+/// Extracts a human-readable run request from the trigger input (issue #154).
+///
+/// The console posts `{"request": "…"}`, but the run endpoint accepts an
+/// arbitrary JSON trigger payload, so this also accepts a bare string and the
+/// nearby key spellings a hand-written call or an older client may use. Anything
+/// else (an object with no recognised key, a number, `null`) yields `None` and
+/// the run proceeds exactly as it did before — the topic is an addition, not a
+/// new requirement.
+pub(super) fn run_request_text(input: &Value) -> Option<String> {
+    let text = match input {
+        Value::String(s) => s.as_str(),
+        Value::Object(_) => ["request", "input", "topic", "message", "text"]
+            .iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str))?,
+        _ => return None,
+    };
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The bare-completion fallback. An `agent` node with no `agent_ref` would land
@@ -300,6 +373,93 @@ mod tests {
         );
         assert_eq!(message_from_request(&json!({ "input": "I" })), "I");
         assert_eq!(message_from_request(&json!({ "message": "M" })), "M");
+    }
+
+    // ── Issue #154: the operator's run request reaches the agent ──
+
+    #[test]
+    fn run_request_is_appended_under_a_labelled_heading() {
+        let out = compose_turn_message("Draft the launch post.", Some("dark mode for iOS"));
+        // The node's standing instruction still leads.
+        assert!(out.starts_with("Draft the launch post."), "{out}");
+        // …and this run's subject is distinguishable from it.
+        assert!(out.contains("Request for this run:"), "{out}");
+        assert!(out.contains("dark mode for iOS"), "{out}");
+    }
+
+    #[test]
+    fn a_run_with_no_request_is_byte_identical_to_the_old_message() {
+        // The guarantee that makes this safe to land: runs that supply no topic
+        // must behave exactly as they did before.
+        for empty in [None, Some(""), Some("   "), Some("\n\t ")] {
+            assert_eq!(
+                compose_turn_message("Draft the launch post.", empty),
+                "Draft the launch post.",
+                "empty request {empty:?} must not alter the message"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_with_no_instruction_stands_on_its_own() {
+        // No dangling heading when the node carries no usable instruction.
+        assert_eq!(
+            compose_turn_message("", Some("ship dark mode")),
+            "ship dark mode"
+        );
+        assert_eq!(
+            compose_turn_message("   ", Some("ship dark mode")),
+            "ship dark mode"
+        );
+    }
+
+    #[test]
+    fn run_request_text_reads_the_console_payload_and_a_bare_string() {
+        assert_eq!(
+            run_request_text(&json!({ "request": "dark mode" })).as_deref(),
+            Some("dark mode")
+        );
+        assert_eq!(
+            run_request_text(&json!("dark mode")).as_deref(),
+            Some("dark mode")
+        );
+        // Tolerated spellings from a hand-written call or an older client.
+        for key in ["input", "topic", "message", "text"] {
+            let mut payload = serde_json::Map::new();
+            payload.insert(key.to_string(), json!("dark mode"));
+            assert_eq!(
+                run_request_text(&Value::Object(payload)).as_deref(),
+                Some("dark mode"),
+                "key {key} should be accepted"
+            );
+        }
+        // Trimmed.
+        assert_eq!(
+            run_request_text(&json!({ "request": "  dark mode  " })).as_deref(),
+            Some("dark mode")
+        );
+    }
+
+    #[test]
+    fn run_request_text_is_none_for_payloads_that_carry_no_topic() {
+        // These are the shapes an existing caller already sends — none may start
+        // injecting a topic into agent messages.
+        for payload in [
+            json!({}),
+            json!(null),
+            json!(42),
+            json!({ "request": "" }),
+            json!({ "request": "   " }),
+            json!({ "unrelated": "value" }),
+            json!({ "request": 7 }),
+            json!(["dark mode"]),
+        ] {
+            assert_eq!(
+                run_request_text(&payload),
+                None,
+                "payload {payload} must carry no topic"
+            );
+        }
     }
 
     #[test]

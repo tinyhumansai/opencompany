@@ -28,6 +28,7 @@ import type { OpenCompanyClient } from "@/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -68,6 +69,11 @@ export function WorkflowsView({
   const [loadingGraph, setLoadingGraph] = useState(false);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<WorkflowRunResult | null>(null);
+  // Issue #154: what the operator is asking this run to work on. `ranWith` is
+  // pinned when the run is dispatched so the result panel echoes the request the
+  // shown output came from, not whatever has been typed since.
+  const [request, setRequest] = useState("");
+  const [ranWith, setRanWith] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -131,8 +137,17 @@ export function WorkflowsView({
   const run = useCallback(async () => {
     if (!selectedId) return;
     setRunning(true);
+    // Trimmed once here so the echoed request and the payload the host receives
+    // can never disagree.
+    const asked = request.trim();
     try {
-      const res = await runWorkflow(client, company, selectedId);
+      const res = await runWorkflow(
+        client,
+        company,
+        selectedId,
+        asked ? { request: asked } : {},
+      );
+      setRanWith(asked);
       setResult(res);
       toast.success("Workflow ran.");
     } catch (e) {
@@ -140,7 +155,7 @@ export function WorkflowsView({
     } finally {
       setRunning(false);
     }
-  }, [client, company, selectedId]);
+  }, [client, company, selectedId, request]);
 
   // The creator posts the full graph back, so the new entry can be spliced
   // straight into the list and selected — no extra round trip to re-list.
@@ -200,6 +215,19 @@ export function WorkflowsView({
               ))}
             </SelectContent>
           </Select>
+          <Input
+            value={request}
+            onChange={(e) => setRequest(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && selectedId && !running && !loadingGraph) {
+                void run();
+              }
+            }}
+            disabled={!selectedId || running}
+            placeholder="What should this run work on?"
+            aria-label="Request for this run"
+            className="h-8 w-64"
+          />
           <Button size="sm" onClick={() => void run()} disabled={!selectedId || running || loadingGraph}>
             {running ? (
               <Loader2 className="mr-1.5 size-4 animate-spin" />
@@ -264,7 +292,12 @@ export function WorkflowsView({
       </div>
 
       {result && (
-        <RunResultPanel result={result} graph={graph} onClose={() => setResult(null)} />
+        <RunResultPanel
+          result={result}
+          graph={graph}
+          request={ranWith}
+          onClose={() => setResult(null)}
+        />
       )}
 
       <WorkflowCreateDialog
@@ -390,10 +423,14 @@ function DetailField({ label, children }: { label: string; children: ReactNode }
 function RunResultPanel({
   result,
   graph,
+  request,
   onClose,
 }: {
   result: WorkflowRunResult;
   graph: WorkflowGraph | null;
+  /** What the operator asked this run for (issue #154); "" when they asked for
+   * nothing, in which case the line is omitted rather than showing a bare dash. */
+  request: string;
   onClose: () => void;
 }) {
   const nodeResults = useMemo(
@@ -418,6 +455,11 @@ function RunResultPanel({
         </Button>
       </div>
       <div className="max-h-72 overflow-auto px-4 pb-3">
+        {request && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">Requested:</span> {request}
+          </p>
+        )}
         {result.pendingApprovals.length > 0 && (
           <p className="mb-2 text-xs text-muted-foreground">
             Waiting on: {result.pendingApprovals.join(", ")}

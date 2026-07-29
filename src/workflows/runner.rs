@@ -41,8 +41,14 @@ pub async fn run_workflow(
     let graph = super::translate::translate(workflow);
     let compiled = tinyflows::compiler::compile(&graph).map_err(map_engine_error)?;
     let run_id = uuid::Uuid::new_v4().to_string();
+    // Issue #154: the operator's run request rides the trigger payload. Pull it
+    // out before the input is handed to the engine so every agent node's turn
+    // message carries the topic — a node's authored `prompt` is the same on
+    // every run and cannot say what was asked this time.
+    let run_request = super::caps::run_request_text(&input);
     let capabilities =
-        super::caps::build_capabilities(pool, deps, record, &workflow.id, &run_id).await;
+        super::caps::build_capabilities(pool, deps, record, &workflow.id, &run_id, run_request)
+            .await;
     let outcome = tinyflows::engine::run(&compiled, input, &capabilities)
         .await
         .map_err(map_engine_error)?;
