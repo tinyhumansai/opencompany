@@ -29,7 +29,11 @@ export interface MemoryEntry {
   body: string;
   /** Which desk/teammate/agent captured it. */
   source: string;
-  /** Epoch-millis of the last update (`0` for context rows, which carry none). */
+  /**
+   * Epoch-millis of the last update. For context rows this is when the chunk
+   * was stored; `0` only when the backend has no stamp for it (chunks written
+   * before store times were recorded), which still renders as `—`.
+   */
   updatedAt: number;
 }
 
@@ -50,6 +54,15 @@ export interface MemoryStats {
   facts: number;
   /** The newest fact's last-updated epoch-millis (`0` when there are none). */
   factsUpdatedAtMillis: number;
+  /**
+   * The newest epoch-millis across *every* memory source — operator facts and
+   * the agents' context chunks alike (`0` when nothing is remembered yet).
+   *
+   * This, not `factsUpdatedAtMillis`, is what the "Last updated" stat renders:
+   * agents only ever write context chunks, so the facts-only figure sits at `0`
+   * for any company whose operator has not hand-authored a fact.
+   */
+  lastUpdatedAtMillis: number;
   /** Total agent-accessible context chunks (learned context + outcomes + mirrors). */
   agentChunks: number;
   /** Of those, how many are stored task outcomes. */

@@ -534,6 +534,21 @@ pub struct ChunkMeta {
     pub label: String,
     /// The chunk's length in bytes.
     pub len: usize,
+    /// Epoch-millis when the chunk was stored (`0` for rows written before
+    /// backends started stamping, so old data reads as "unknown" rather than
+    /// as the epoch).
+    ///
+    /// This is what lets the Brain's "Last updated" stat move when agents write
+    /// memory — they write only through this port, never to the `FactStore`
+    /// (see `server::ops::memory::memory_stats`).
+    ///
+    /// Chunks are append-only and never rewritten, so this only ever moves for
+    /// a *new* chunk. Backends differ on a re-`put` of an identical body —
+    /// sqlite/mongo dedupe on the content address and keep the first write,
+    /// the fs index appends a second line — so read freshness as the max
+    /// across chunks rather than assuming one row per body.
+    #[serde(default)]
+    pub stored_at_millis: u64,
 }
 
 /// A single ledger movement.

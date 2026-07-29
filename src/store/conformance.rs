@@ -1080,6 +1080,49 @@ pub async fn assert_fact_store(facts: Arc<dyn FactStore>) {
     assert_eq!(facts.list(&alpha, None, None).await.unwrap().len(), 1);
 }
 
+/// Asserts every [`ContextStore`] stamps a stored chunk with the wall-clock
+/// time it was written, and surfaces that stamp through `list`.
+///
+/// This is what lets the Brain's "Last updated" stat move when agents write
+/// memory: agent memory and task outcomes only ever land in the `ContextStore`,
+/// so without a per-chunk stamp the stat can only reflect operator-authored
+/// facts (see `server::ops::memory::memory_stats`).
+///
+/// Deliberately says nothing about re-`put`ting an identical body: the backends
+/// genuinely differ there (sqlite/mongo dedupe on the content address and keep
+/// the first write, the fs index appends a second line), and pinning one
+/// behaviour here would assert a contract the suite's own backends do not share.
+/// Readers of the stamp take the max across chunks for that reason.
+pub async fn assert_context_chunk_stamps(context: Arc<dyn ContextStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let before = now_millis();
+
+    context
+        .put(
+            &alpha,
+            ContextChunk {
+                label: "agent/ceo".to_string(),
+                body: "the launch slipped to Friday".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let after = now_millis();
+
+    let metas = context.list(&alpha, "").await.unwrap();
+    assert_eq!(metas.len(), 1);
+    let stamped = metas[0].stored_at_millis;
+    assert!(
+        (before..=after).contains(&stamped),
+        "a stored chunk must carry the time it was written; got {stamped}, expected within \
+         {before}..={after}"
+    );
+
+    // The stamp travels per company, like every other field on the port.
+    assert!(context.list(&beta, "").await.unwrap().is_empty());
+}
+
 /// Asserts the [`UsageMeter`] contract: isolation, record, and windowed query.
 pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     let alpha = CompanyId::new("alpha");

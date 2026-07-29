@@ -1281,6 +1281,9 @@ mod tests {
                     addr: addr.clone(),
                     label: c.label.clone(),
                     len: c.body.len(),
+                    // The mock does not model store time; these tests exercise
+                    // the harness, not the Brain's freshness stat.
+                    stored_at_millis: 0,
                 })
                 .collect())
         }

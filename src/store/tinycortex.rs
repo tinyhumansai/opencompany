@@ -38,6 +38,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::memory::MemoryStore;
+use crate::ports::now_millis;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyId, CompressedTrace, ContextChunk, EvictionPolicy,
     TaskResult,
@@ -109,12 +110,14 @@ struct CompanyCells {
     chunks: Vec<StoredChunk>,
 }
 
-/// A stored context chunk: its content address, label, and body.
+/// A stored context chunk: its content address, label, body, and the
+/// epoch-millis it was first stored.
 #[derive(Clone)]
 struct StoredChunk {
     addr: String,
     label: String,
     body: String,
+    stored_at_millis: u64,
 }
 
 /// An offline, in-memory [`CortexClient`] backing the cortex stores.
@@ -198,6 +201,7 @@ impl CortexClient for InMemoryCortex {
                     addr: addr.to_string(),
                     label: chunk.label,
                     body: chunk.body,
+                    stored_at_millis: now_millis(),
                 });
             }
         });
@@ -213,6 +217,7 @@ impl CortexClient for InMemoryCortex {
                     addr: ChunkAddr::new(s.addr.clone()),
                     label: s.label.clone(),
                     len: s.body.len(),
+                    stored_at_millis: s.stored_at_millis,
                 })
                 .collect()
         }))
@@ -592,6 +597,13 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let (store, events, mem, ctx) = stores(dir.path());
         conformance::assert_export_totality(store, events, mem, ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_context_chunk_stamps(ctx).await;
     }
 
     fn company() -> CompanyId {

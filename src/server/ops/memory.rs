@@ -120,6 +120,9 @@ struct RawChunk {
     addr: String,
     label: String,
     body: String,
+    /// Epoch-millis the chunk was first stored (`0` when the backend has no
+    /// stamp for it — chunks written before backends began recording one).
+    stored_at_millis: u64,
 }
 
 /// Truncates `s` to at most `max` characters on a char boundary, appending an
@@ -203,8 +206,9 @@ fn context_entries(chunks: Vec<RawChunk>, query: Option<&str>) -> Vec<MemoryEntr
             title,
             body,
             source,
-            // Context chunks carry no timestamp; the console renders `—`.
-            updated_at: 0,
+            // A chunk stored before backends began stamping reports `0`, which
+            // the console still renders as `—`.
+            updated_at: chunk.stored_at_millis,
         });
     }
 
@@ -248,6 +252,16 @@ struct MemoryStats {
     facts: usize,
     /// The newest fact's last-updated epoch-millis (`0` when there are none).
     facts_updated_at_millis: u64,
+    /// The newest epoch-millis across *every* memory source — operator facts
+    /// and the agents' context chunks alike (`0` when the company remembers
+    /// nothing yet).
+    ///
+    /// This, not [`Self::facts_updated_at_millis`], is what the console's
+    /// "Last updated" stat renders. Agents only ever write to the
+    /// `ContextStore`, so a facts-only figure sat at `0` — and the stat at "—"
+    /// — for any company whose operator had not hand-authored a fact, however
+    /// much memory the agents had accumulated.
+    last_updated_at_millis: u64,
     /// Total agent-accessible context chunks — learned context, task outcomes,
     /// and the operator-fact mirrors together.
     agent_chunks: usize,
@@ -317,6 +331,7 @@ async fn list_facts(
                 addr: meta.addr.to_string(),
                 label: meta.label,
                 body,
+                stored_at_millis: meta.stored_at_millis,
             });
         }
         entries.extend(context_entries(chunks, query.as_deref()));
@@ -337,7 +352,11 @@ async fn memory_stats(company: ScopedCompany) -> Result<Json<MemoryStats>, ApiEr
     let facts_updated_at_millis = facts.first().map(|f| f.updated_at_millis).unwrap_or(0);
     // Prefix `""` lists every chunk; the task-outcome prefix narrows to stored
     // outcomes (a subset of the total).
-    let agent_chunks = company.runtime.context.list(company.id(), "").await?.len();
+    let chunks = company.runtime.context.list(company.id(), "").await?;
+    let agent_chunks = chunks.len();
+    // Chunks list in insertion order, not freshness order, and a backend that
+    // predates the stamp reports `0` — so take the max rather than the head.
+    let chunks_stored_at_millis = chunks.iter().map(|m| m.stored_at_millis).max().unwrap_or(0);
     let task_outcomes = company
         .runtime
         .context
@@ -347,6 +366,7 @@ async fn memory_stats(company: ScopedCompany) -> Result<Json<MemoryStats>, ApiEr
     Ok(Json(MemoryStats {
         facts: facts.len(),
         facts_updated_at_millis,
+        last_updated_at_millis: facts_updated_at_millis.max(chunks_stored_at_millis),
         agent_chunks,
         task_outcomes,
     }))
@@ -430,10 +450,15 @@ mod combined_list_tests {
     use super::*;
 
     fn chunk(label: &str, body: &str) -> RawChunk {
+        chunk_at(label, body, 0)
+    }
+
+    fn chunk_at(label: &str, body: &str, stored_at_millis: u64) -> RawChunk {
         RawChunk {
             addr: format!("addr-{label}"),
             label: label.to_string(),
             body: body.to_string(),
+            stored_at_millis,
         }
     }
 
@@ -507,6 +532,29 @@ mod combined_list_tests {
             !ctx[0].editable,
             "read-only rows expose no edit/delete affordance"
         );
+    }
+
+    #[test]
+    fn context_rows_carry_their_stored_at_stamp() {
+        // Context rows used to hardcode `updated_at: 0`, so every agent-written
+        // memory rendered "—" no matter how recently it landed.
+        let entries = context_entries(
+            vec![
+                chunk_at("agent-1/notes", "recent", 2_000),
+                chunk_at("task-outcome/agent-1", "Task: t\nOutcome: o", 3_000),
+            ],
+            None,
+        );
+        assert_eq!(entries[0].updated_at, 2_000);
+        assert_eq!(entries[1].updated_at, 3_000);
+    }
+
+    #[test]
+    fn unstamped_context_rows_stay_dashed() {
+        // A chunk written before backends stamped has no store time; reporting
+        // `0` keeps the console's "—" rather than inventing the epoch.
+        let entries = context_entries(vec![chunk("agent-1/notes", "legacy")], None);
+        assert_eq!(entries[0].updated_at, 0);
     }
 
     #[test]

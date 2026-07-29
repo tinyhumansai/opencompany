@@ -556,6 +556,7 @@ impl ContextStore for MongoStore {
                     "body": &chunk.body,
                     "len": chunk.body.len() as i64,
                     "ord": ord as i64,
+                    "stored_ms": now_millis() as i64,
                 }},
             )
             .with_options(UpdateOptions::builder().upsert(true).build())
@@ -581,6 +582,10 @@ impl ContextStore for MongoStore {
                     addr: ChunkAddr::new(get_str(&doc, "addr")?),
                     label,
                     len: get_i64(&doc, "len")? as usize,
+                    // Absent on documents written before the field existed;
+                    // those read as an unknown (`0`) store time rather than
+                    // failing the whole list.
+                    stored_at_millis: doc.get_i64("stored_ms").unwrap_or(0).max(0) as u64,
                 });
             }
         }
@@ -1782,6 +1787,13 @@ mod test {
     async fn conformance_fact_store() {
         let Some(s) = store().await else { return };
         conformance::assert_fact_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        let Some(s) = store().await else { return };
+        conformance::assert_context_chunk_stamps(s.clone()).await;
         drop_db(&s).await;
     }
 

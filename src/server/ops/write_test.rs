@@ -11,7 +11,7 @@ use crate::company::CompanyManifest;
 use crate::company::steer::{InflightEntry, InflightKind};
 use crate::ports::facts::{FactKind, FactRecord};
 use crate::ports::tasks::TaskRecord;
-use crate::ports::types::{CompanyId, CompanyRecord};
+use crate::ports::types::{CompanyId, CompanyRecord, ContextChunk};
 use crate::runtime::RuntimeBuilder;
 use crate::server::router;
 use crate::store::FsCompanyStore;
@@ -369,6 +369,8 @@ async fn memory_list_filters_stats_and_dual_write() {
     assert_eq!(stats["factsUpdatedAtMillis"], 3_000);
     assert_eq!(stats["agentChunks"], 0);
     assert_eq!(stats["taskOutcomes"], 0);
+    // Nothing but facts so far, so "Last updated" tracks the newest fact.
+    assert_eq!(stats["lastUpdatedAtMillis"], 3_000);
 
     // Dual-write: the HTTP create path mirrors the fact into the ContextStore so
     // the agent can recall it. A direct search finds the mirrored text — the
@@ -397,6 +399,106 @@ async fn memory_list_filters_stats_and_dual_write() {
     assert_eq!(stats["facts"], 4);
     assert_eq!(stats["agentChunks"], 1);
     assert_eq!(stats["taskOutcomes"], 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// The Brain's "Last updated" stat must move when *agents* write memory, not
+/// only when the operator hand-authors a fact.
+///
+/// The reported bug (#153): agent memory and task outcomes land exclusively in
+/// the `ContextStore`, and the stat was computed from the `FactStore` alone —
+/// so a company whose agents were actively remembering, but whose operator had
+/// never added a fact, showed "—" forever.
+#[tokio::test]
+async fn memory_stats_last_updated_covers_agent_written_context() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // A brand-new company remembers nothing: the stat is genuinely empty, and
+    // "—" is the honest rendering.
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["facts"], 0);
+    assert_eq!(stats["agentChunks"], 0);
+    assert_eq!(
+        stats["lastUpdatedAtMillis"], 0,
+        "no memory of any kind yet, so the stat has nothing to report"
+    );
+
+    // Now an agent writes memory — no operator fact anywhere in sight. This is
+    // the exact state that used to pin the stat at 0.
+    let before = crate::ports::now_millis();
+    for (label, body) in [
+        ("agent-ceo/notes", "the launch slipped to Friday"),
+        ("task-outcome/agent-ceo", "Task: ship it\nOutcome: done"),
+    ] {
+        runtime
+            .context
+            .put(
+                runtime.id(),
+                ContextChunk {
+                    label: label.to_string(),
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["facts"], 0, "still no operator facts");
+    assert_eq!(stats["agentChunks"], 2);
+    assert_eq!(stats["taskOutcomes"], 1);
+    assert_eq!(
+        stats["factsUpdatedAtMillis"], 0,
+        "the facts-only figure is unchanged — it is simply not the whole story"
+    );
+    let last_updated = stats["lastUpdatedAtMillis"].as_u64().unwrap();
+    assert!(
+        last_updated >= before,
+        "agent-written memory must move the Brain's Last updated stat, got {last_updated}"
+    );
+
+    // An operator fact newer than any chunk takes over the stat.
+    runtime
+        .facts()
+        .upsert(
+            runtime.id(),
+            &FactRecord {
+                id: "f-future".into(),
+                kind: FactKind::Fact,
+                title: "Board meeting".into(),
+                body: "moved to Monday".into(),
+                source: "You".into(),
+                updated_at_millis: last_updated + 60_000,
+            },
+        )
+        .await
+        .unwrap();
+    let (status, stats) = send(&state, "GET", "/api/v1/company/memory/stats", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stats["lastUpdatedAtMillis"],
+        last_updated + 60_000,
+        "the stat is the max across every memory source, whichever is freshest"
+    );
+
+    // The list surfaces the same stamps per row, so a context card no longer
+    // renders "—" while the header claims recent activity.
+    let (status, rows) = send(&state, "GET", "/api/v1/company/memory", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = rows.as_array().unwrap();
+    let context_rows: Vec<&Value> = rows.iter().filter(|r| r["origin"] != "fact").collect();
+    assert_eq!(context_rows.len(), 2);
+    assert!(
+        context_rows
+            .iter()
+            .all(|r| r["updatedAt"].as_u64().unwrap() >= before),
+        "each agent-written row carries the time it was stored"
+    );
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }

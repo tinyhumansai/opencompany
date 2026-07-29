@@ -269,7 +269,9 @@ function HealthStrip({
     { label: "Total items", value: String(total) },
     { label: "Agent memory", value: String(stats?.agentChunks ?? 0) },
     { label: "Task outcomes", value: String(stats?.taskOutcomes ?? 0) },
-    { label: "Last updated", value: formatUpdated(stats?.factsUpdatedAtMillis ?? 0) },
+    // Across every memory source, not just operator facts — agents write only
+    // context chunks, so a facts-only figure left this stat at "—" forever.
+    { label: "Last updated", value: formatUpdated(stats?.lastUpdatedAtMillis ?? 0) },
   ];
   return (
     <Card data-testid="memory-health">

@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS context_chunks (
     label      TEXT NOT NULL,
     body       TEXT NOT NULL,
     len        INTEGER NOT NULL,
+    stored_ms  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (company_id, addr)
 );
 CREATE TABLE IF NOT EXISTS secrets (
@@ -205,6 +206,39 @@ fn sql_err(e: rusqlite::Error) -> OpenCompanyError {
     OpenCompanyError::Store(format!("sqlite error: {e}"))
 }
 
+/// Adds `column` to `table` when it is absent, so an additive schema change
+/// reaches databases created before the column existed.
+///
+/// [`MIGRATIONS`] is a bundle of `CREATE TABLE IF NOT EXISTS` statements, which
+/// silently skip an already-created table — new columns would therefore never
+/// land on an existing file. `PRAGMA table_info` is the check rather than
+/// swallowing the `ALTER`'s "duplicate column name" error, so a genuine `ALTER`
+/// failure still surfaces.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let present = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(sql_err)?;
+        // `table_info` column 1 is the column name.
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(sql_err)?;
+        let mut found = false;
+        for row in rows {
+            if row.map_err(sql_err)? == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+        .map_err(sql_err)
+}
+
 /// Translates a `usize` limit into a SQLite `LIMIT` value. `usize::MAX` (the
 /// "read everything" sentinel used by export/replay) maps to `-1`, SQLite's
 /// unbounded-limit encoding.
@@ -239,6 +273,14 @@ impl SqliteStore {
 
     fn from_conn(conn: Connection) -> Result<Self> {
         conn.execute_batch(MIGRATIONS).map_err(sql_err)?;
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on a database that predates a
+        // column, so additive columns need their own idempotent step.
+        add_column_if_missing(
+            &conn,
+            "context_chunks",
+            "stored_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             conn: Arc::new(StdMutex::new(conn)),
             senders: Arc::new(StdMutex::new(HashMap::new())),
@@ -553,14 +595,15 @@ impl ContextStore for SqliteStore {
         let addr = content_address(&chunk.body);
         let conn = self.conn();
         conn.execute(
-            "INSERT OR IGNORE INTO context_chunks (company_id, addr, label, body, len) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO context_chunks (company_id, addr, label, body, len, stored_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id.as_ref(),
                 addr,
                 chunk.label,
                 chunk.body,
-                chunk.body.len() as i64
+                chunk.body.len() as i64,
+                now_millis() as i64
             ],
         )
         .map_err(sql_err)?;
@@ -571,7 +614,8 @@ impl ContextStore for SqliteStore {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT addr, label, len FROM context_chunks WHERE company_id = ?1 ORDER BY rowid",
+                "SELECT addr, label, len, stored_ms FROM context_chunks \
+                 WHERE company_id = ?1 ORDER BY rowid",
             )
             .map_err(sql_err)?;
         let rows = stmt
@@ -580,17 +624,19 @@ impl ContextStore for SqliteStore {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })
             .map_err(sql_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (addr, label, len) = row.map_err(sql_err)?;
+            let (addr, label, len, stored_ms) = row.map_err(sql_err)?;
             if label.starts_with(prefix) {
                 out.push(ChunkMeta {
                     addr: ChunkAddr::new(addr),
                     label,
                     len: len as usize,
+                    stored_at_millis: stored_ms.max(0) as u64,
                 });
             }
         }
@@ -1786,6 +1832,11 @@ mod test {
     #[tokio::test]
     async fn conformance_fact_store() {
         conformance::assert_fact_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        conformance::assert_context_chunk_stamps(store()).await;
     }
 
     #[tokio::test]
