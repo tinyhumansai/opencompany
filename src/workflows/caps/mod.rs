@@ -311,7 +311,7 @@ pub(super) fn run_request_text(input: &Value) -> Option<String> {
         _ => return None,
     };
     let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    (!trimmed.is_empty()).then_some(trimmed.to_string())
 }
 
 /// The bare-completion fallback. An `agent` node with no `agent_ref` would land
