@@ -31,12 +31,12 @@ use crate::harness::{HarnessDeps, HarnessPool};
 /// appended; past this cap the run is finalized to `in_review` so a redirect
 /// storm can't loop forever.
 const MAX_REDIRECTS_PER_DISPATCH: u32 = 3;
-use crate::ports::brain::{Brain, Cognition, CycleHost, UsageMetering};
+use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
     TokenUsage, TurnStep, TurnStepKind, TurnStepStatus,
 };
-use crate::ports::{TaskRecord, generate_id, now_millis};
+use crate::ports::{Cognition, TaskRecord, UsageMetering, generate_id, now_millis};
 
 /// A [`Brain`] that answers with a live openhuman agent turn.
 pub struct HarnessBrain {
