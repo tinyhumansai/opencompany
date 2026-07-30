@@ -234,6 +234,48 @@ export interface TeamMemberDto {
   name?: string;
   role: string;
   description?: string;
+  /**
+   * Whether this teammate has an enabled inbox, as the host's `InboxStore` sees
+   * it. Absent on hosts predating the field; the console reads that as `false`.
+   */
+  inboxEnabled?: boolean;
+}
+
+/**
+ * One teammate inbox's non-secret status, from `GET .../inboxes`. Both inbound
+ * paths (the ingest webhook and the IMAP poller) file into the same store this
+ * projects, so received mail shows up here.
+ */
+export interface InboxDto {
+  /** The inbox key (a teammate's local part / slug). */
+  key: string;
+  /** The teammate's display name. */
+  name: string;
+  /** The full address (`{key}@{domain}` when a domain is configured). */
+  address: string;
+  /** Whether the inbox is enabled on the Team page. */
+  enabled: boolean;
+  /** The number of unread received (inbound) messages. */
+  unread: number;
+}
+
+/** One email in an inbox, from `GET .../inboxes/{key}/messages`. */
+export interface InboxMessageDto {
+  id: string;
+  /** The inbox this belongs to (the teammate local part). */
+  inbox: string;
+  /** The sender's display name (may be empty). */
+  fromName: string;
+  /** The sender's email address. */
+  fromEmail: string;
+  subject: string;
+  /** Plain-text body. */
+  body: string;
+  /** When it arrived / was sent, epoch millis. */
+  atMillis: number;
+  read: boolean;
+  /** True for a sent message, false for a received one. */
+  outbound: boolean;
 }
 
 /**

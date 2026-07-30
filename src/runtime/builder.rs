@@ -949,6 +949,8 @@ impl RuntimeBuilder {
                                 // MCP set each turn (MCP-freshness) rather than the
                                 // snapshot frozen here at boot.
                                 mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+                                approval_requests:
+                                    crate::harness::policy::ApprovalRequestQueue::default(),
                                 secrets: Some(secrets.clone()),
                                 // Cell A: the `web` toolbelt SSRF allowlist.
                                 // Domains come straight from the manifest.
@@ -1045,7 +1047,7 @@ impl RuntimeBuilder {
                 if let Some(brain) = harness_brain {
                     brain
                 } else {
-                    let tool_catalog: Vec<ToolManifestEntry> = self
+                    let mut tool_catalog: Vec<ToolManifestEntry> = self
                         .manifest
                         .tools
                         .allow
@@ -1056,6 +1058,18 @@ impl RuntimeBuilder {
                             input_schema: None,
                         })
                         .collect();
+                    // Issue #176: advertise the delegation tools to Medulla on
+                    // the hosted path, so a hosted company's orchestrator can
+                    // delegate exactly as the harness one does. The device
+                    // services the resulting tool-call frames in `CycleHostImpl`
+                    // (a durable board-card hand-off) with no local cognition.
+                    // De-duped against `tools.allow` so a manifest that already
+                    // lists a delegation tool is not advertised twice.
+                    for entry in crate::runtime::delegation_tools::delegation_manifest_entries() {
+                        if !tool_catalog.iter().any(|e| e.name == entry.name) {
+                            tool_catalog.push(entry);
+                        }
+                    }
                     select_hosted_or_echo(
                         self.brain_mode.unwrap_or(BrainMode::Hosted),
                         self.credential,

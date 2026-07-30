@@ -921,6 +921,293 @@ async fn inbox_read_marks_and_reports_unread() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
+/// Appends one received email to `inbox`, for the read-surface tests below.
+async fn append_mail(
+    runtime: &crate::company::runtime::CompanyRuntime,
+    inbox: &str,
+    id: &str,
+    subject: &str,
+    at_millis: u64,
+) {
+    use crate::ports::inbox::EmailRecord;
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: id.into(),
+                inbox: inbox.into(),
+                from_name: format!("{inbox} correspondent"),
+                from_email: format!("{inbox}-sender@x.test"),
+                subject: subject.into(),
+                body: format!("body for {subject}"),
+                at_millis,
+                read: false,
+                outbound: false,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// The regression for issue #173: two teammates' inboxes must read back as two
+/// *different* sets of mail. The console used to render a client-side fixture —
+/// the same four invented emails for everybody — because no per-agent read was
+/// reachable over REST at all.
+#[tokio::test]
+async fn inbox_reads_are_per_agent_and_never_shared() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // Enable two inboxes and file distinct mail in each. Inbox keys are agent
+    // ids; `cto` is an operator-added teammate as far as the toggle cares, so it
+    // takes its own key without a manifest entry.
+    for agent in ["ceo", "cto"] {
+        let (status, _) = send(
+            &state,
+            "PUT",
+            &format!("/api/v1/company/team/{agent}/inbox"),
+            Some(json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    append_mail(&runtime, "ceo", "c1", "board deck", 10).await;
+    append_mail(&runtime, "ceo", "c2", "investor intro", 20).await;
+    append_mail(&runtime, "cto", "t1", "on-call rotation", 30).await;
+
+    // The roster lists both, each with its own unread count.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let ceo = rows.iter().find(|r| r["key"] == "ceo").unwrap();
+    let cto = rows.iter().find(|r| r["key"] == "cto").unwrap();
+    assert_eq!(ceo["enabled"], true);
+    assert_eq!(ceo["unread"], 2);
+    assert_eq!(cto["unread"], 1);
+
+    // Each inbox reads back only its own mail — the shared-fixture bug. The
+    // route serves store (append) order; the console sorts newest-first.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ceo_subjects: Vec<&str> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(ceo_subjects, vec!["board deck", "investor intro"]);
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/cto/messages", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["subject"], "on-call rotation");
+    assert_eq!(items[0]["fromEmail"], "cto-sender@x.test");
+    assert_eq!(items[0]["inbox"], "cto");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// An inbox nobody has mail in — or that does not exist at all — reads as an
+/// empty list rather than a 404. An enabled-but-empty inbox is a legitimate
+/// state, and the console must render it as such rather than as an error.
+#[tokio::test]
+async fn inbox_messages_soft_fail_on_unknown_key() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    append_mail(&runtime, "ceo", "m0", "mail 0", 1).await;
+
+    let (status, body) = send(
+        &state,
+        "GET",
+        "/api/v1/company/inboxes/nobody/messages",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+
+    // …and the inbox that *does* hold mail is unaffected by that read.
+    let (_, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// An inbox switched on but never written to is still listed, so the console can
+/// show it the moment the Team toggle flips — and `GET …/team` reports the same
+/// enabled state, so the toggle isn't a client-side guess.
+#[tokio::test]
+async fn team_read_reports_inbox_enabled_and_empty_inbox_is_listed() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // Before the toggle: no inbox on the roster, and nothing listed.
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ceo = roster
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "ceo")
+        .unwrap()
+        .clone();
+    assert_eq!(ceo["inboxEnabled"], false);
+    let (_, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert!(body.as_array().unwrap().is_empty());
+
+    // Toggle it on: listed with zero mail, and the roster agrees.
+    let (status, _) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/team/ceo/inbox",
+        Some(json!({"enabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["key"], "ceo");
+    assert_eq!(rows[0]["enabled"], true);
+    assert_eq!(rows[0]["unread"], 0);
+    // The manifest role is the display name until a domain gives it an address.
+    assert_eq!(rows[0]["name"], "Chief");
+
+    let (_, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    let ceo = roster
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "ceo")
+        .unwrap()
+        .clone();
+    assert_eq!(ceo["inboxEnabled"], true);
+
+    // Toggling back off keeps the inbox listed but disabled — the console
+    // filters on `enabled`, so it drops out of the selector without losing mail.
+    let (status, _) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/team/ceo/inbox",
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert_eq!(body.as_array().unwrap()[0]["enabled"], false);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Mail that arrives through the ingest webhook is exactly what the console's
+/// read surface returns — the end-to-end path issue #173's repro step 4 walked.
+#[tokio::test]
+async fn ingested_mail_shows_up_on_the_console_read_surface() {
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    // Straight into the store, as `file_and_notify` does for a verified payload
+    // (the HMAC path itself is covered in `ops::test`).
+    append_mail(&runtime, "ceo", "ingested-1", "hello from outside", 42).await;
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "ingested-1");
+    assert_eq!(items[0]["subject"], "hello from outside");
+    assert_eq!(items[0]["read"], false);
+    assert_eq!(items[0]["outbound"], false);
+
+    // Reading it drops the unread count the selector badges.
+    let (_, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/inboxes/ceo/read",
+        Some(json!({"ids": ["ingested-1"]})),
+    )
+    .await;
+    assert_eq!(body["unread"], 0);
+    let (_, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert_eq!(body.as_array().unwrap()[0]["unread"], 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn inbox_list_and_messages_project_store() {
+    use crate::ports::inbox::EmailRecord;
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    // One inbound (unread) + one outbound reply in inbox "ceo".
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: "in1".into(),
+                inbox: "ceo".into(),
+                from_name: "Priya".into(),
+                from_email: "p@x.test".into(),
+                subject: "hi".into(),
+                body: "hello world".into(),
+                at_millis: 1,
+                read: false,
+                outbound: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: "out1".into(),
+                inbox: "ceo".into(),
+                from_name: String::new(),
+                from_email: "ceo@acme.test".into(),
+                subject: "re: hi".into(),
+                body: "reply".into(),
+                at_millis: 2,
+                read: false,
+                outbound: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    // GET /inboxes surfaces the message-bearing inbox; outbound doesn't count toward unread.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ceo = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["key"] == "ceo")
+        .expect("ceo inbox listed");
+    assert_eq!(ceo["unread"], 1);
+
+    // GET messages returns both, camelCase, oldest first.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = body.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["id"], "in1");
+    assert_eq!(msgs[0]["fromEmail"], "p@x.test");
+    assert_eq!(msgs[1]["outbound"], true);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
 #[tokio::test]
 async fn chat_accepts_desk_id_and_replies() {
     let home = home();

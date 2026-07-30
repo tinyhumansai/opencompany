@@ -540,7 +540,7 @@ export function AppShell({
               onSendEnd={onSendEnd}
             />
           )}
-          {view === "inbox" && <InboxView company={company} />}
+          {view === "inbox" && <InboxView client={client} company={company} />}
           {view === "tasks" && <TasksView client={client} company={company} />}
           {view === "team" && <TeamView client={client} company={company} />}
           {view === "desks" && <DesksView client={client} company={company} />}

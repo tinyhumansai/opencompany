@@ -70,6 +70,11 @@ impl CycleHost for RecordingHost {
         self.effects.lock().unwrap().push(effect);
         Ok(self.disposition.clone())
     }
+
+    async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+        self.effects.lock().unwrap().push(effect);
+        Ok(ApprovalId::new("appr-parked"))
+    }
 }
 
 // ---------------------------------------------------------------------------

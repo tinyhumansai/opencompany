@@ -23,14 +23,27 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
-use crate::harness::orchestrator::{self, Delegation};
+use crate::harness::orchestrator;
+// `Delegation` is only named by the test-only `run_delegation` wrapper and the
+// delegation tests (via `use super::*`); the cycle path drives the runner's
+// `handle_operator_message` and never spells the type out.
+#[cfg(test)]
+use crate::harness::orchestrator::Delegation;
+use crate::harness::run_turn::HarnessRunTurn;
 use crate::harness::{HarnessDeps, HarnessPool};
+use crate::runtime::delegation::{self, DelegationRunner, RunTurn};
 
 /// The most operator redirects honored within a single task dispatch (issue
 /// #111). A redirect re-runs the turn in-loop with the fresh instruction
-/// appended; past this cap the run is finalized to `in_review` so a redirect
-/// storm can't loop forever.
+/// appended; past this cap the run is finalized to its terminal column (see
+/// [`success_terminal_column`]) so a redirect storm can't loop forever.
 const MAX_REDIRECTS_PER_DISPATCH: u32 = 3;
+
+/// The board column a card lands in when the operator is the reviewer.
+const IN_REVIEW: &str = "in_review";
+
+/// The terminal board column — nothing dispatches out of it.
+const DONE: &str = "done";
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
@@ -69,9 +82,10 @@ impl HarnessBrain {
 
     /// Runs one dispatched board task: load the card, route it to its assignee
     /// (or the default responder) for a single turn, and write the outcome back
-    /// onto the board — moved to `in_review` on success, back to `backlog` with
-    /// the error noted on failure. A missing task store or a card that has since
-    /// vanished is a silent no-op.
+    /// onto the board — moved to its success terminal column on success (see
+    /// [`success_terminal_column`]), back to `backlog` with the error noted on
+    /// failure. A missing task store or a card that has since vanished is a
+    /// silent no-op.
     /// Runs a dispatched card to completion and, when the card remembers the
     /// conversation it was spawned from, returns the reply to post back there
     /// (issue #151 §3.2).
@@ -119,19 +133,16 @@ impl HarnessBrain {
         let mut instruction = base_instruction.clone();
         let mut redirects: u32 = 0;
 
+        // Route the background turn through the brain-agnostic `RunTurn` seam
+        // (issue #176), re-attaching `HarnessDeps` behind `HarnessRunTurn`.
+        let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+
         loop {
-            let outcome = self
-                .pool
+            let outcome = run_turn
                 // A dispatched task card carries no chat bubble (its steps are
                 // discarded into the note), so its live turn frames must not leak
                 // onto the console timeline — run it un-streamed (#125 review).
-                .run_steered_background(
-                    &self.record.id,
-                    &responder,
-                    &instruction,
-                    &self.deps,
-                    &control,
-                )
+                .run_steered_background(&self.record.id, &responder, &instruction, &control)
                 .await;
             // One-shot read of what (if anything) the operator asked for. `None`
             // is the ordinary, unsteered path.
@@ -145,7 +156,8 @@ impl HarnessBrain {
                                 &responder,
                                 &outcome.reply,
                             ));
-                            card.column = "in_review".to_string();
+                            let terminal = success_terminal_column(&card);
+                            card.column = terminal.to_string();
                         }
                         Err(err) => {
                             card.note = Some(append_result(
@@ -191,13 +203,15 @@ impl HarnessBrain {
                     ));
                     if redirects > MAX_REDIRECTS_PER_DISPATCH {
                         // Exhausted the redirect budget — finalize the last run's
-                        // reply to `in_review` rather than looping forever.
+                        // reply to the card's terminal column rather than looping
+                        // forever.
                         let last = match &outcome {
                             Ok(outcome) => outcome.reply.clone(),
                             Err(err) => format!("dispatch failed: {err}"),
                         };
                         card.note = Some(append_result(card.note.as_deref(), &responder, &last));
-                        card.column = "in_review".to_string();
+                        let terminal = success_terminal_column(&card);
+                        card.column = terminal.to_string();
                         break;
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
@@ -287,14 +301,10 @@ impl HarnessBrain {
     /// agent or a team-overlay teammate, so an overlay-added lead is reachable on
     /// a desk the manifest left empty.
     fn desk_lead(&self, desk: &str) -> Option<String> {
-        // Resolve the desk key (id or case-insensitive name) against both the
-        // manifest desks and the operator-created overlay desks, so a
-        // runtime-created desk routes exactly like a blueprint one.
-        let desk_id = self.record.resolve_desk_id(desk)?;
-        self.record
-            .effective_desk_members(&desk_id)
-            .into_iter()
-            .find(|m| self.record.is_roster_agent(m))
+        // Desk-lead resolution is brain-agnostic — it reads only `CompanyRecord`
+        // — so it lives on the delegation seam (issue #176); this stays a thin
+        // wrapper for the routing callers on the brain.
+        delegation::desk_lead(&self.record, desk)
     }
 
     /// Drains the MCP failure queue **onto the operator bubble's step timeline**
@@ -334,91 +344,113 @@ impl HarnessBrain {
         Ok(())
     }
 
+    /// Drains the approval-request queue and parks each request on the host's
+    /// approval gate, so an approval-gated tool call the agent hit during this
+    /// cycle reaches the operator's Approvals page (issue #172).
+    ///
+    /// The missing half of the approval path. openhuman resolves a
+    /// `RequireApproval` **inline** — it blocks the tool and narrates the
+    /// refusal to the model — so nothing downstream of the turn ever learned a
+    /// request existed and `journal.pending()` stayed empty. The
+    /// [`ApprovalPolicy`](crate::harness::policy::ApprovalPolicy) now records
+    /// each blocked call on the shared queue; this drains it once per cycle and
+    /// parks it through
+    /// [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect).
+    ///
+    /// Parked, not re-evaluated:
+    /// [`emit_effect`](crate::ports::brain::CycleHost::emit_effect) would
+    /// re-decide the request against the runtime
+    /// [`ApprovalGate`](crate::ports::ApprovalGate), which allows (and therefore
+    /// "executes") anything it classifies as
+    /// [`EffectGroup::Other`](crate::ports::types::EffectGroup::Other) — most
+    /// gated tool calls — and the request would disappear again. The verdict was
+    /// already reached inside the turn; the runtime's job here is only to hold
+    /// it for the operator.
+    ///
+    /// Bounded by
+    /// [`MAX_APPROVAL_REQUESTS_PER_TURN`](crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN);
+    /// anything past the cap is discarded rather than flooding the queue.
+    ///
+    /// **A failed park never takes the batch or the turn down with it.**
+    /// [`ApprovalRequestQueue::drain`](crate::harness::policy::ApprovalRequestQueue::drain)
+    /// empties the shared queue up front, so propagating the first
+    /// [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect)
+    /// error with `?` would lose every *later* request in the batch — already out
+    /// of the queue and never retried — and would discard the turn's
+    /// already-computed operator reply along with it. That is precisely the
+    /// silent-disappearance failure this issue exists to fix, so each failure is
+    /// logged at `error` and the drain continues.
+    async fn park_approval_requests(&self, host: &dyn CycleHost) -> Result<()> {
+        for request in self
+            .deps
+            .approval_requests
+            .drain(crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN)
+        {
+            match host.park_effect(request.effect).await {
+                Ok(approval_id) => log::info!(
+                    "[harness::brain] parked '{}' for operator approval (id={approval_id}): {}",
+                    request.tool,
+                    request.reason
+                ),
+                // Loud, and the only trace of a request the operator will never
+                // see — the queue entry is already gone.
+                Err(err) => log::error!(
+                    "[harness::brain] failed to park '{}' for operator approval ({}): {err}",
+                    request.tool,
+                    request.reason
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// Executes one drained delegation from the orchestrator's turn.
     ///
     /// `spawn_task` opens a backlog card through the same
     /// [`TaskStore::upsert`](crate::ports::TaskStore) path the console uses and
     /// surfaces nothing extra (a missing task store is a silent no-op).
     /// `delegate_to_desk` runs a single turn on the desk's lead member and
-    /// returns its reply as its own chat bubble — `channel = <member id>`, the
-    /// distinct-bubble path the console already renders. An unknown desk (no
-    /// roster-backed lead) is a silent no-op. No sub-agent re-delegation in v1:
-    /// desk members carry no delegation tools, so their turns queue nothing.
+    /// **returns its reply for the orchestrator to relay** (a [`DeskReply`]) —
+    /// the CEO-relay hand-back: instead of a disconnected sibling bubble the
+    /// teammate's answer feeds a second orchestrator turn so the CEO comes back
+    /// with it in one coherent conversation. An unknown desk (no roster-backed
+    /// lead) or a cancelled run yields nothing to relay. No sub-agent
+    /// re-delegation in v1: desk members carry no delegation tools, so their
+    /// turns queue nothing.
+    ///
+    /// The orchestration lives on the brain-agnostic seam (issue #176); this is
+    /// a thin wrapper that re-attaches `HarnessDeps` behind a
+    /// [`HarnessRunTurn`] and drives a [`DelegationRunner`]. It exists only to
+    /// keep the delegation tests exercising the same code path the cycle drives
+    /// through [`DelegationRunner::handle_operator_message`], so it is
+    /// test-only — the cycle never calls it directly.
+    #[cfg(test)]
     async fn run_delegation(
         &self,
         delegation: Delegation,
         chat_id: Option<&str>,
-    ) -> Result<Option<OutboundMessage>> {
-        match delegation {
-            Delegation::SpawnTask {
-                title,
-                note,
-                assignee,
-            } => {
-                let Some(tasks) = self.deps.tasks.as_ref() else {
-                    return Ok(None);
-                };
-                let card = TaskRecord {
-                    id: generate_id(),
-                    title,
-                    note,
-                    column: "backlog".to_string(),
-                    priority: "medium".to_string(),
-                    assignee: assignee.unwrap_or_default(),
-                    updated_at_millis: now_millis(),
-                    // Issue #151 §3.2: remember which conversation asked for
-                    // this, so the completion can answer there instead of only
-                    // landing in the note.
-                    origin_chat_id: chat_id.map(str::to_string),
-                };
-                tasks.upsert(&self.record.id, &card).await?;
-                Ok(None)
-            }
-            Delegation::DelegateToDesk { desk, instruction } => {
-                let Some(member) = self.desk_lead(&desk) else {
-                    return Ok(None);
-                };
-                // Register the delegated turn so an operator can CANCEL it
-                // mid-flight (cancel-only in v1 — pause/redirect are rejected at
-                // the route). RAII guard deregisters on every exit path.
-                let guard = self.deps.steer.register(
-                    &self.record.id,
-                    InflightEntry {
-                        key: generate_id(),
-                        task_id: None,
-                        kind: InflightKind::Delegation,
-                        title: desk.clone(),
-                        agent_id: member.clone(),
-                        started_at_millis: now_millis(),
-                        pending_action: None,
-                    },
-                );
-                let control = guard.control().clone();
-                let outcome = self
-                    .pool
-                    .run_steered(
-                        &self.record.id,
-                        &member,
-                        &instruction,
-                        &self.deps,
-                        &control,
-                        chat_id,
-                    )
-                    .await?;
-                // A cancel issued mid-flight discards the delegated reply — no
-                // bubble surfaces.
-                if matches!(control.take(), Some(SteerAction::Cancel)) {
-                    return Ok(None);
-                }
-                // The desk lead's own steps ride on its distinct bubble.
-                Ok(Some(OutboundMessage {
-                    channel: member,
-                    text: outcome.reply,
-                    reply_to: None,
-                    steps: outcome.steps,
-                }))
-            }
-        }
+    ) -> Result<delegation::DelegationOutcome> {
+        let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+        self.delegation_runner(&run_turn)
+            .run_delegation(delegation, chat_id)
+            .await
+    }
+
+    /// Builds a [`DelegationRunner`] over `run_turn`, threading the brain-agnostic
+    /// handles it needs — the record (desk-lead resolution), the task store, the
+    /// steer registry, the company id, and the shared delegation queue the turn
+    /// pushes onto. `HarnessDeps` never crosses the seam; it stays behind
+    /// `run_turn`.
+    fn delegation_runner<'a>(&'a self, run_turn: &'a HarnessRunTurn<'a>) -> DelegationRunner<'a> {
+        DelegationRunner::new(
+            run_turn,
+            &self.record,
+            self.deps.tasks.as_ref(),
+            &self.deps.steer,
+            &self.record.id,
+            &self.deps.delegations,
+            orchestrator::MAX_DELEGATIONS_PER_TURN,
+        )
     }
 }
 
@@ -431,6 +463,27 @@ fn task_instruction(card: &TaskRecord) -> String {
     }
 }
 
+/// Where a dispatched card lands once its run succeeds (issue #171).
+///
+/// `in_review` is a naming convention, not a mechanism: nothing consumes it.
+/// `task_enters_in_progress` only edge-fires a dispatch when a card enters
+/// `in_progress`, so an `in_review` card triggers no further cycle and the only
+/// runtime write of `done` is the operator's manual drag on the board.
+///
+/// That is fine for a card an operator made themselves — they are the reviewer,
+/// and the card is sitting in front of them. It strands a card stamped with
+/// `origin_chat_id`: that card came from `spawn_task` during an agent-to-agent
+/// handoff, its result was already posted back into the originating thread, and
+/// no operator is watching the board for it. So a card that remembers an origin
+/// completes to `done`; a board-created card still parks in `in_review`.
+fn success_terminal_column(card: &TaskRecord) -> &'static str {
+    if card.origin_chat_id.is_some() {
+        DONE
+    } else {
+        IN_REVIEW
+    }
+}
+
 /// The post-back line for a finished card (issue #151 §3.2): what the card was,
 /// where it landed, and the reply itself.
 ///
@@ -439,7 +492,8 @@ fn task_instruction(card: &TaskRecord) -> String {
 /// claiming an answer it does not have.
 fn task_postback_text(card: &TaskRecord) -> String {
     let status = match card.column.as_str() {
-        "in_review" => "is ready for review",
+        DONE => "is done",
+        IN_REVIEW => "is ready for review",
         "paused" => "is paused",
         "backlog" => "went back to the backlog",
         other => other,
@@ -463,9 +517,16 @@ fn append_result(prev: Option<&str>, responder: &str, body: &str) -> String {
 
 #[async_trait]
 impl Brain for HarnessBrain {
-    async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+    async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
         // Idempotent — builds the roster on the first cycle, a no-op after.
         self.pool.ensure(&self.record, &self.deps).await?;
+
+        // Issue #172: start from an empty approval queue so nothing a prior
+        // cycle — or a workflow run sharing these deps — left behind is parked
+        // under this cycle. Every turn this cycle runs (the operator turn, its
+        // delegated desk turns, a dispatched card) pushes onto the same queue and
+        // is drained once at the end.
+        self.deps.approval_requests.clear();
 
         let mut channel_responses = Vec::new();
         for event in &req.events {
@@ -480,44 +541,32 @@ impl Brain for HarnessBrain {
                     // in this cycle rides the same operator thread, so it gets the
                     // same id.
                     let chat_id = chat.as_deref();
-                    // Clear stale delegations + MCP failures so nothing leaks from
-                    // a prior turn, run the turn (metered through `deps`), then
-                    // drain whatever the orchestrator queued (capped; discarded
-                    // past the cap).
-                    self.deps.delegations.clear();
+                    // Clear stale MCP failures so nothing leaks from a prior turn
+                    // (the delegation queue is cleared inside the runner, right
+                    // before the orchestrator turn).
                     self.deps.mcp_failures.clear();
-                    let outcome = self
-                        .pool
-                        .run(&self.record.id, &responder, text, &self.deps, chat_id)
+                    // Drive the brain-agnostic delegation seam (issue #176): the
+                    // orchestrator turn, its queued delegations, and the CEO-relay
+                    // hand-back all run behind the `RunTurn` impl. `HarnessDeps` is
+                    // re-attached behind `HarnessRunTurn`.
+                    let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+                    let turn = self
+                        .delegation_runner(&run_turn)
+                        .handle_operator_message(&responder, text, chat_id)
                         .await?;
-                    // The orchestrator's own steps ride on the operator bubble.
-                    let mut operator_steps = outcome.steps;
-                    // Run whatever the orchestrator queued; each delegated desk
-                    // bubble carries its own lead's steps. Collect them first so
-                    // the operator bubble can still be finalized before it is
-                    // pushed (any MCP failure a delegated turn recorded lands on
-                    // the operator timeline).
-                    let mut delegated = Vec::new();
-                    for delegation in self
-                        .deps
-                        .delegations
-                        .drain(orchestrator::MAX_DELEGATIONS_PER_TURN)
-                    {
-                        if let Some(message) = self.run_delegation(delegation, chat_id).await? {
-                            delegated.push(message);
-                        }
-                    }
+                    let mut operator_steps = turn.steps;
+                    let operator_reply = turn.reply;
                     // Re-skin any MCP tool-call failures (from the orchestrator
-                    // turn or a delegated desk turn) as error steps on the
-                    // operator bubble — one surface, one renderer.
+                    // turn, a delegated desk turn, or the relay turn) as error
+                    // steps on the operator bubble — one surface, one renderer.
                     self.surface_mcp_failures(&mut operator_steps).await?;
                     channel_responses.push(OutboundMessage {
                         channel: "operator".to_string(),
-                        text: outcome.reply,
+                        text: operator_reply,
                         reply_to: None,
                         steps: operator_steps,
                     });
-                    channel_responses.extend(delegated);
+                    channel_responses.extend(turn.bubbles);
                 }
                 CompanyEvent::TaskDispatched { task_id } => {
                     if let Some(message) = self.run_task(task_id).await? {
@@ -527,6 +576,12 @@ impl Brain for HarnessBrain {
                 _ => {}
             }
         }
+
+        // Issue #172: every approval-gated tool call this cycle's turns hit is
+        // parked on the host's gate now, so it shows up on the operator's
+        // Approvals page instead of only being narrated away in chat.
+        self.park_approval_requests(host).await?;
+
         // The runtime requires at least one channel response per cycle.
         if channel_responses.is_empty() {
             channel_responses.push(OutboundMessage {
@@ -578,12 +633,13 @@ mod tests {
     use crate::harness::provider::{HarnessModel, MockProvider};
     use crate::ports::brain::CycleHost;
     use crate::ports::types::{
-        CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, ToolCall, ToolResult,
+        ApprovalId, CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, ToolCall,
+        ToolResult,
     };
     use crate::store::{FsCompanyStore, FsContextStore, FsOps};
 
-    /// A `CycleHost` that auto-executes anything the brain asks for; the harness
-    /// brain v1 makes no host calls, so it stays inert.
+    /// A `CycleHost` that auto-executes anything the brain asks for and swallows
+    /// anything it parks; used by every test that isn't about approvals.
     #[derive(Default)]
     struct NoopHost;
 
@@ -600,6 +656,45 @@ mod tests {
         }
         async fn emit_effect(&self, _effect: Effect) -> Result<EffectDisposition> {
             Ok(EffectDisposition::Executed)
+        }
+        async fn park_effect(&self, _effect: Effect) -> Result<ApprovalId> {
+            Ok(ApprovalId::new("appr-parked"))
+        }
+    }
+
+    /// A `CycleHost` that records every effect parked for approval, so the
+    /// approval drain can be asserted on (issue #172). Anything else it does is
+    /// inert.
+    #[derive(Default)]
+    struct ParkingHost {
+        parked: std::sync::Mutex<Vec<Effect>>,
+    }
+
+    impl ParkingHost {
+        /// The effects parked through `park_effect`, in order.
+        fn parked(&self) -> Vec<Effect> {
+            self.parked.lock().expect("parked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CycleHost for ParkingHost {
+        async fn call_tool(&self, _call: ToolCall) -> Result<ToolResult> {
+            Ok(ToolResult {
+                ok: true,
+                output: serde_json::Value::Null,
+            })
+        }
+        async fn context_op(&self, _op: ContextOp) -> Result<ContextOpResult> {
+            Ok(ContextOpResult::Text(String::new()))
+        }
+        async fn emit_effect(&self, _effect: Effect) -> Result<EffectDisposition> {
+            panic!("an approval request must be parked, never re-evaluated as an effect");
+        }
+        async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+            let mut parked = self.parked.lock().expect("parked");
+            parked.push(effect);
+            Ok(ApprovalId::new(format!("appr-{}", parked.len())))
         }
     }
 
@@ -650,6 +745,7 @@ description = "Runs Acme."
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -793,6 +889,7 @@ description = "Builds it."
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -936,8 +1033,9 @@ description = "Builds it."
             .expect("one card")
     }
 
-    /// A dispatched task runs a turn and moves to `in_review`, its result folded
-    /// into the note under the responder that ran it.
+    /// A dispatched **board-created** card (no `origin_chat_id`) runs a turn and
+    /// moves to `in_review` — the operator who made it is the reviewer — with
+    /// its result folded into the note under the responder that ran it.
     #[tokio::test]
     async fn task_dispatch_runs_and_moves_to_in_review() {
         let dir = tempfile::tempdir().unwrap();
@@ -964,6 +1062,92 @@ description = "Builds it."
         // echoes the instruction (the card title) back into the reply.
         assert!(note.contains("[ceo]"), "{note:?}");
         assert!(note.contains("Ship the thing"), "{note:?}");
+    }
+
+    // ── Issue #171: a delegated handoff reaches `done` on its own ─────────
+
+    /// The regression: a card spawned by a delegating turn (so it carries an
+    /// `origin_chat_id`) has no operator watching the board, so leaving it in
+    /// `in_review` stranded it forever. It must complete to `done`.
+    #[tokio::test]
+    async fn dispatched_card_with_an_origin_completes_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-origin", "maya");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks
+            .upsert(&CompanyId::new("acme"), &c)
+            .await
+            .expect("seed");
+
+        let posted = brain
+            .run_task("t-origin")
+            .await
+            .expect("run")
+            .expect("a card with an origin posts back");
+
+        let moved = only_card(&tasks).await;
+        assert_eq!(
+            moved.column, "done",
+            "a delegated handoff must reach the terminal column, not park in in_review"
+        );
+        // The note stays the durable record of what came back.
+        assert!(moved.note.expect("note").contains("Ship the thing"));
+        // …and the bubble says so rather than asking for a review nobody will do.
+        assert!(posted.text.contains("is done"), "{}", posted.text);
+        assert!(!posted.text.contains("ready for review"), "{}", posted.text);
+    }
+
+    /// The success terminal is chosen by origin, not by outcome: a board-created
+    /// card keeps its `in_review` review gate.
+    #[test]
+    fn success_terminal_column_is_done_only_for_a_card_with_an_origin() {
+        let board_card = card("t1", "maya");
+        assert_eq!(success_terminal_column(&board_card), "in_review");
+
+        let mut delegated = card("t2", "maya");
+        delegated.origin_chat_id = Some("strategy".to_string());
+        assert_eq!(success_terminal_column(&delegated), "done");
+    }
+
+    /// The redirect-cap finalize branch is the other success terminal, so it has
+    /// to make the same choice — otherwise a steered handoff still strands.
+    #[tokio::test]
+    async fn redirect_cap_finalizes_a_card_with_an_origin_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let redirect = || SteerAction::Redirect {
+            instruction: "focus on the API".to_string(),
+        };
+        let (brain, tasks, _provider) = brain_that_steers_itself(
+            dir.path(),
+            "t1",
+            vec![redirect(), redirect(), redirect(), redirect()],
+        );
+        let mut c = card("t1", "");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(only_card(&tasks).await.column, "done");
+    }
+
+    /// The post-back has to have wording for the new landing column — without it
+    /// the fallback arm renders the raw column id into the sentence.
+    #[test]
+    fn postback_reads_naturally_for_a_done_card() {
+        let mut finished = card("t1", "maya");
+        finished.column = "done".to_string();
+        finished.note = None;
+        assert_eq!(task_postback_text(&finished), "\"Ship the thing\" is done.");
     }
 
     /// An `assignee` that names a roster member routes the turn to that member.
@@ -1106,6 +1290,7 @@ members = ["engineer"]
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1381,7 +1566,10 @@ members = ["eng1", "eng2"]
             )
             .await
             .expect("delegation runs");
-        assert!(out.is_none(), "spawn_task surfaces no chat bubble");
+        assert!(
+            out.bubble.is_none() && out.desk_reply.is_none(),
+            "spawn_task surfaces nothing to relay or bubble"
+        );
 
         let cards = tasks.list(&CompanyId::new("acme")).await.unwrap();
         assert_eq!(cards.len(), 1);
@@ -1390,8 +1578,9 @@ members = ["eng1", "eng2"]
         assert_eq!(cards[0].assignee, "engineer");
     }
 
-    /// A `delegate_to_desk` delegation runs the desk lead and surfaces its reply
-    /// as its own bubble (`channel = <member id>`); an unknown desk is a no-op.
+    /// A `delegate_to_desk` delegation runs the desk lead and hands its reply
+    /// back to relay (a `DeskReply` attributed to the lead, no standalone
+    /// bubble); an unknown desk yields nothing.
     #[tokio::test]
     async fn delegate_to_desk_delegation_answers_as_the_desk_lead() {
         let dir = tempfile::tempdir().unwrap();
@@ -1412,12 +1601,17 @@ members = ["eng1", "eng2"]
                 None,
             )
             .await
-            .expect("delegation runs")
-            .expect("desk lead replies");
-        // The reply is its own bubble attributed to the desk lead, and the mock
-        // provider echoes the instruction, proving the member's turn ran.
-        assert_eq!(out.channel, "engineer");
-        assert!(out.text.contains("ship-marker"), "{:?}", out.text);
+            .expect("delegation runs");
+        // The answer comes back as a DeskReply to relay — not a standalone
+        // bubble — attributed to the desk lead, and the mock provider echoes the
+        // instruction, proving the member's turn ran.
+        assert!(
+            out.bubble.is_none(),
+            "the desk reply is relayed, not bubbled"
+        );
+        let desk = out.desk_reply.expect("desk lead replies");
+        assert_eq!(desk.member, "engineer");
+        assert!(desk.reply.contains("ship-marker"), "{:?}", desk.reply);
 
         // An unknown desk delegates to nobody.
         let none = brain
@@ -1430,7 +1624,10 @@ members = ["eng1", "eng2"]
             )
             .await
             .expect("delegation runs");
-        assert!(none.is_none(), "an unknown desk is a silent no-op");
+        assert!(
+            none.bubble.is_none() && none.desk_reply.is_none(),
+            "an unknown desk yields nothing"
+        );
     }
 
     // --- MCP failure drain --------------------------------------------------
@@ -1465,6 +1662,7 @@ members = ["eng1", "eng2"]
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: failures.clone(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1513,6 +1711,219 @@ members = ["eng1", "eng2"]
             )),
             "an McpCallFailed audit event was journaled"
         );
+    }
+
+    // --- Approval parking (issue #172) --------------------------------------
+
+    /// A brain over `dir` whose deps carry `requests` as the shared
+    /// approval-request queue — the same handle every roster agent's
+    /// `ApprovalPolicy` pushes onto.
+    fn brain_with_approval_queue(
+        dir: &std::path::Path,
+        requests: crate::harness::policy::ApprovalRequestQueue,
+    ) -> HarnessBrain {
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: None,
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: requests,
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        };
+        HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
+    }
+
+    /// The regression for #172: a `RequireApproval` recorded during a turn is
+    /// **parked** on the host, so it lands in the journal the Approvals page
+    /// reads instead of being narrated away in chat and lost.
+    ///
+    /// `ParkingHost` panics on `emit_effect`, which pins the other half of the
+    /// fix: the request must NOT be re-evaluated by the runtime gate (which
+    /// allows — and so silently "executes" — the `Other` group most gated tool
+    /// calls classify into).
+    #[tokio::test]
+    async fn approval_requests_are_parked_for_the_operator() {
+        use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};
+        use openhuman_core::openhuman::agent::tool_policy::{
+            ToolCallContext, ToolPolicy, ToolPolicyDecision, ToolPolicyRequest,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let requests = ApprovalRequestQueue::default();
+        let brain = brain_with_approval_queue(dir.path(), requests.clone());
+
+        // Exactly what a supervised policy records when the agent reaches for a
+        // gated tool mid-turn.
+        let policy = ApprovalPolicy::new(
+            &crate::company::Policy {
+                mode: "supervised".to_string(),
+                always_approve: Vec::new(),
+                auto_approve_under_usd: None,
+            },
+            None,
+        )
+        .with_requests(requests.clone());
+        let args = serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" });
+        let request = ToolPolicyRequest::new(
+            "composio_execute",
+            args.clone(),
+            ToolCallContext::session("s", "chat", "ceo", "call-1", 0),
+        );
+        assert!(
+            matches!(
+                policy.check(&request).await,
+                ToolPolicyDecision::RequireApproval { .. }
+            ),
+            "the fixture must reproduce a gated call"
+        );
+        assert_eq!(requests.queued(), 1, "the decision was recorded to park");
+
+        let host = ParkingHost::default();
+        brain
+            .park_approval_requests(&host)
+            .await
+            .expect("the drain parks");
+
+        let parked = host.parked();
+        assert_eq!(parked.len(), 1, "one approval reached the operator");
+        assert_eq!(parked[0].kind, "composio_execute");
+        assert_eq!(
+            parked[0].payload, args,
+            "the call's arguments are preserved"
+        );
+        assert_eq!(requests.queued(), 0, "the queue is drained");
+    }
+
+    /// A second drain parks nothing: the queue is emptied, so a later cycle
+    /// can't re-park a request the operator has already been shown.
+    #[tokio::test]
+    async fn draining_twice_parks_nothing_the_second_time() {
+        use crate::harness::policy::{ApprovalRequest, ApprovalRequestQueue};
+        use crate::ports::types::EffectGroup;
+
+        let dir = tempfile::tempdir().unwrap();
+        let requests = ApprovalRequestQueue::default();
+        let brain = brain_with_approval_queue(dir.path(), requests.clone());
+        requests.push(ApprovalRequest {
+            tool: "media_generate_image".to_string(),
+            reason: "supervised".to_string(),
+            effect: Effect {
+                kind: "media_generate_image".to_string(),
+                group: EffectGroup::Spend,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "prompt": "a logo" }),
+            },
+        });
+
+        let host = ParkingHost::default();
+        brain.park_approval_requests(&host).await.expect("drain");
+        brain
+            .park_approval_requests(&host)
+            .await
+            .expect("second drain");
+        assert_eq!(host.parked().len(), 1, "parked once, not twice");
+    }
+
+    /// A host that fails to park the *first* effect it is handed, then behaves.
+    /// Models a transient journal/IO fault mid-batch.
+    #[derive(Default)]
+    struct FlakyParkingHost {
+        parked: std::sync::Mutex<Vec<Effect>>,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyParkingHost {
+        fn parked(&self) -> Vec<Effect> {
+            self.parked.lock().expect("parked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CycleHost for FlakyParkingHost {
+        async fn call_tool(&self, _call: ToolCall) -> Result<ToolResult> {
+            Ok(ToolResult {
+                ok: true,
+                output: serde_json::Value::Null,
+            })
+        }
+        async fn context_op(&self, _op: ContextOp) -> Result<ContextOpResult> {
+            Ok(ContextOpResult::Text(String::new()))
+        }
+        async fn emit_effect(&self, _effect: Effect) -> Result<EffectDisposition> {
+            panic!("an approval request must be parked, never re-evaluated as an effect");
+        }
+        async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+            if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(crate::OpenCompanyError::Store(
+                    "journal on fire".to_string(),
+                ));
+            }
+            let mut parked = self.parked.lock().expect("parked");
+            parked.push(effect);
+            Ok(ApprovalId::new(format!("appr-{}", parked.len())))
+        }
+    }
+
+    /// One failed park must not take the rest of the batch — or the turn's reply
+    /// — down with it. `drain` has already emptied the shared queue, so a `?`
+    /// here would lose every later request forever and abort `run_cycle`,
+    /// reproducing for the remainder of the batch exactly the silent
+    /// disappearance this issue fixes.
+    #[tokio::test]
+    async fn a_failed_park_does_not_drop_the_rest_of_the_batch() {
+        use crate::harness::policy::{ApprovalRequest, ApprovalRequestQueue};
+        use crate::ports::types::EffectGroup;
+
+        let dir = tempfile::tempdir().unwrap();
+        let requests = ApprovalRequestQueue::default();
+        let brain = brain_with_approval_queue(dir.path(), requests.clone());
+        for tool in ["first_tool", "second_tool", "third_tool"] {
+            requests.push(ApprovalRequest {
+                tool: tool.to_string(),
+                reason: "supervised".to_string(),
+                effect: Effect {
+                    kind: tool.to_string(),
+                    group: EffectGroup::Other,
+                    amount_usd: None,
+                    established_thread: false,
+                    first_time_counterparty: false,
+                    payload: serde_json::json!({ "tool": tool }),
+                },
+            });
+        }
+
+        let host = FlakyParkingHost::default();
+        brain
+            .park_approval_requests(&host)
+            .await
+            .expect("a park failure is logged, not propagated");
+
+        // The first park failed; the two after it still reached the operator.
+        let parked = host.parked();
+        assert_eq!(parked.len(), 2, "the batch continued past the failure");
+        assert_eq!(parked[0].kind, "second_tool");
+        assert_eq!(parked[1].kind, "third_tool");
     }
 
     // --- Steer disposition (issue #111) -------------------------------------
@@ -1605,6 +2016,7 @@ members = ["eng1", "eng2"]
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1750,6 +2162,242 @@ members = ["eng1", "eng2"]
             .await
             .expect("cancellation is handled");
 
-        assert!(result.is_none(), "cancelled delegation must not bubble");
+        assert!(
+            result.bubble.is_none() && result.desk_reply.is_none(),
+            "cancelled delegation must not bubble or relay"
+        );
+    }
+
+    // --- CEO-relay hand-back (delegate_to_desk second turn) ------------------
+
+    /// A provider that simulates the orchestrator queuing a `delegate_to_desk`
+    /// on its turns: on each invoke it pops the next scripted delegation (if any)
+    /// onto the shared queue — exactly what the real tool call does — then echoes
+    /// the last user message so a test can read the turn's reply. Sharing the
+    /// queue handle with [`HarnessDeps::delegations`] is what lets the brain
+    /// drain it after the turn.
+    struct DelegatingProvider {
+        queue: orchestrator::DelegationQueue,
+        pushes: StdMutex<VecDeque<Option<Delegation>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChatModel<()> for DelegatingProvider {
+        async fn invoke(
+            &self,
+            _state: &(),
+            request: ModelRequest,
+        ) -> tinyagents::Result<ModelResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(Some(delegation)) = self.pushes.lock().unwrap().pop_front() {
+                self.queue.push(delegation);
+            }
+            let message = request
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m, Message::User(_)))
+                .map(|m| m.text())
+                .unwrap_or_default();
+            Ok(ModelResponse::assistant(format!("did: {message}")))
+        }
+    }
+
+    impl HarnessModel for DelegatingProvider {
+        fn telemetry_provider_id(&self) -> String {
+            "delegating".to_string()
+        }
+    }
+
+    /// A brain over the desk-bearing record whose provider is a
+    /// [`DelegatingProvider`] scripted to push `pushes[i]` on invoke `i + 1`.
+    /// Returns the brain plus the shared provider so a test can read the invoke
+    /// count.
+    fn brain_that_delegates(
+        dir: &std::path::Path,
+        pushes: Vec<Option<Delegation>>,
+    ) -> (HarnessBrain, Arc<DelegatingProvider>) {
+        let queue = orchestrator::DelegationQueue::default();
+        let provider = Arc::new(DelegatingProvider {
+            queue: queue.clone(),
+            pushes: StdMutex::new(pushes.into_iter().collect()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let deps = HarnessDeps {
+            provider: provider.clone(),
+            provider_slug: "delegating".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: None,
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: Some(Arc::new(FsOps::new(dir))),
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: queue,
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        };
+        (
+            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_with_desk()),
+            provider,
+        )
+    }
+
+    /// (a) After a `delegate_to_desk`, the operator-facing reply is a SECOND
+    /// orchestrator turn that relays the teammate's answer — one coherent
+    /// bubble, not a disconnected sibling.
+    #[tokio::test]
+    async fn delegate_to_desk_relays_the_answer_in_a_second_orchestrator_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 (orchestrator) queues a delegate_to_desk; invoke 2 is the desk
+        // lead's turn; invoke 3 is the relay turn (queues nothing).
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![Some(Delegation::DelegateToDesk {
+                desk: "eng_desk".to_string(),
+                instruction: "diagnose the outage".to_string(),
+            })],
+        );
+
+        let result = brain
+            .run_cycle(
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "why is the site down?".into(),
+                    by: None,
+                    chat: None,
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        // The operator sees ONE bubble — the CEO's relay, not a separate teammate
+        // sibling bubble.
+        assert_eq!(result.channel_responses.len(), 1);
+        let bubble = &result.channel_responses[0];
+        assert_eq!(bubble.channel, "operator");
+        // Three turns ran: orchestrator → desk lead → exactly one relay turn.
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "orchestrator, desk lead, then exactly one relay turn"
+        );
+        // The relayed bubble carries the teammate's answer (the desk lead echoed
+        // its instruction, and the relay prompt embeds that reply under an
+        // `engineer replied:` frame) — proving the operator reply is the SECOND
+        // turn relaying the teammate, not the pre-delegation first reply.
+        assert!(
+            bubble.text.contains("engineer replied:")
+                && bubble.text.contains("diagnose the outage"),
+            "the relay carries the teammate's answer: {:?}",
+            bubble.text
+        );
+        // …and it is the relay turn, whose prompt framed the hand-back.
+        assert!(
+            bubble.text.contains("Relay their answer"),
+            "the operator bubble is the relay turn: {:?}",
+            bubble.text
+        );
+    }
+
+    /// (b) The relay turn cannot re-delegate: a delegation it queues is
+    /// discarded, so no further desk turn or relay runs (cost stays bounded to
+    /// one extra turn).
+    #[tokio::test]
+    async fn the_relay_turn_cannot_re_delegate() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 queues a delegation; invoke 3 (the relay) ALSO tries to queue
+        // one — which must be discarded, so no fourth/fifth turn runs.
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![
+                Some(Delegation::DelegateToDesk {
+                    desk: "eng_desk".to_string(),
+                    instruction: "first".to_string(),
+                }),
+                None, // the desk lead's turn queues nothing
+                Some(Delegation::DelegateToDesk {
+                    desk: "eng_desk".to_string(),
+                    instruction: "second".to_string(),
+                }),
+            ],
+        );
+
+        let result = brain
+            .run_cycle(
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "handle it".into(),
+                    by: None,
+                    chat: None,
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        // Exactly three turns: orchestrator, desk lead, relay. The relay's queued
+        // delegation was dropped — no fourth (desk-lead) or fifth (relay) turn.
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the relay turn's delegation is discarded — one extra turn, no loop"
+        );
+        // The discard actually emptied the queue (not left dirty for next cycle).
+        assert_eq!(
+            brain.deps.delegations.queued(),
+            0,
+            "the relay turn's queued delegation was discarded"
+        );
+        // Still exactly one operator bubble.
+        assert_eq!(result.channel_responses.len(), 1);
+        assert_eq!(result.channel_responses[0].channel, "operator");
+    }
+
+    /// (c) A normal, non-delegating message still produces exactly one turn — the
+    /// relay path is entered only when a `delegate_to_desk` actually answered.
+    #[tokio::test]
+    async fn a_non_delegating_message_runs_exactly_one_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted delegations → the orchestrator answers directly.
+        let (brain, provider) = brain_that_delegates(dir.path(), Vec::new());
+
+        let result = brain
+            .run_cycle(
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "status?".into(),
+                    by: None,
+                    chat: None,
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no delegation → a single orchestrator turn, no relay"
+        );
+        assert_eq!(result.channel_responses.len(), 1);
+        assert_eq!(result.channel_responses[0].channel, "operator");
+        assert!(
+            result.channel_responses[0].text.contains("status?"),
+            "{:?}",
+            result.channel_responses[0].text
+        );
     }
 }

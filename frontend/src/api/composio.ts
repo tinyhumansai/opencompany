@@ -31,6 +31,20 @@ export interface ComposioMutation {
   note: string;
 }
 
+/** The `POST …/composio/authorize` response: the hosted connect URL to open. */
+export interface ComposioAuthorize {
+  /** Composio-hosted OAuth URL the operator opens in a new browser tab. */
+  connectUrl: string;
+}
+
+/** One toolkit's connected state, as returned by `GET …/composio/connections`. */
+export interface ComposioConnection {
+  /** Toolkit slug, e.g. `gmail`. */
+  toolkit: string;
+  /** Whether the company has at least one active connection for this toolkit. */
+  connected: boolean;
+}
+
 /** The company's Composio status. */
 export function getComposioStatus(
   client: OpenCompanyClient,
@@ -49,4 +63,34 @@ export function setComposioToken(
   token: string,
 ): Promise<ComposioMutation> {
   return client.put<ComposioMutation>(`${client.scopeFor(company)}/composio/token`, { token });
+}
+
+/**
+ * Begin a per-provider OAuth handoff for `toolkit` (e.g. `gmail`). Returns the
+ * Composio-hosted connect URL the console opens in a new tab. Composio runs the
+ * OAuth itself — there is no local callback — so the console then polls
+ * {@link listComposioConnections} until the toolkit reports connected. 409 when
+ * the feature is not in the build, or no per-tenant token is configured yet.
+ */
+export function startComposioAuthorize(
+  client: OpenCompanyClient,
+  company: string | null,
+  toolkit: string,
+): Promise<ComposioAuthorize> {
+  return client.post<ComposioAuthorize>(`${client.scopeFor(company)}/composio/authorize`, {
+    toolkit,
+  });
+}
+
+/**
+ * The company's per-toolkit connected state — one row per toolkit that has at
+ * least one connection. The console cross-references this against the granted
+ * `toolkits` to render each provider row's connected / sign-in state. 409 when
+ * the feature is not in the build, or no per-tenant token is configured yet.
+ */
+export function listComposioConnections(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<ComposioConnection[]> {
+  return client.get<ComposioConnection[]>(`${client.scopeFor(company)}/composio/connections`);
 }

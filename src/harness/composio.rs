@@ -151,7 +151,7 @@ fn slug_toolkit(slug: &str) -> String {
 }
 
 #[cfg(feature = "composio")]
-pub use live::{ComposioMetering, composio_tools};
+pub use live::{ComposioMetering, authorize_connect_url, composio_tools, list_connection_states};
 
 #[cfg(feature = "composio")]
 mod live {
@@ -211,10 +211,7 @@ mod live {
         // The Config-free seam: `IntegrationClient::new(backend_url, auth_token)`
         // takes the per-tenant credential directly, with no OpenHuman global
         // `Config`. The bearer is the ONLY isolation lever — see the module docs.
-        let client = ComposioClient::new(Arc::new(IntegrationClient::new(
-            config.backend_url.clone(),
-            config.auth_token.clone(),
-        )));
+        let client = client_for(config);
         let secrets = vec![config.auth_token.clone()];
         let toolkits = Arc::new(config.toolkits.clone());
         vec![
@@ -270,6 +267,86 @@ mod live {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("missing required `{key}` string argument"))
+    }
+
+    /// Build a [`ComposioClient`] over a resolved tenant config.
+    ///
+    /// The Config-free seam: `IntegrationClient::new(backend_url, auth_token)`
+    /// takes the per-tenant credential directly, with no OpenHuman global
+    /// `Config`. The bearer is the ONLY isolation lever — see the module docs.
+    /// Shared by the agent tools ([`composio_tools`]) and the operator-console
+    /// ops handlers ([`authorize_connect_url`], [`list_connection_states`]) so
+    /// both dial the backend the exact same way.
+    fn client_for(config: &TenantComposio) -> ComposioClient {
+        ComposioClient::new(Arc::new(IntegrationClient::new(
+            config.backend_url.clone(),
+            config.auth_token.clone(),
+        )))
+    }
+
+    /// Scrub the tenant bearer out of an upstream error before it can bubble to
+    /// a console handler or a log line — the backend can reflect the presented
+    /// bearer in an error body, and the ops surface must never echo it.
+    fn scrub_err(err: &anyhow::Error, config: &TenantComposio) -> anyhow::Error {
+        anyhow::anyhow!(scrub(&format!("{err}"), &[config.auth_token.clone()]))
+    }
+
+    /// Begin an OAuth handoff for `toolkit` and return the Composio-hosted
+    /// connect URL the operator opens in a browser. Backs the console's
+    /// `POST …/composio/authorize` route (the same building block the
+    /// `composio_authorize` agent tool wraps).
+    ///
+    /// Composio runs the OAuth itself — there is **no** local callback route.
+    /// The console opens the returned URL in a new tab and polls
+    /// [`list_connection_states`] until the toolkit reports connected.
+    ///
+    /// The tenant allowlist is enforced **before** any network call — a toolkit
+    /// the company is not permitted to connect never reaches the backend. Any
+    /// upstream error is scrubbed of the tenant bearer before it bubbles.
+    pub async fn authorize_connect_url(config: &TenantComposio, toolkit: &str) -> Result<String> {
+        let toolkit = toolkit.trim();
+        if toolkit.is_empty() {
+            anyhow::bail!("composio authorize: toolkit must not be empty");
+        }
+        if !toolkit_allowed(&config.toolkits, toolkit) {
+            anyhow::bail!("toolkit `{toolkit}` is not in this company's Composio allowlist");
+        }
+        tracing::debug!(toolkit = %toolkit, "[composio] ops authorize");
+        match client_for(config).authorize(toolkit, None).await {
+            Ok(resp) => Ok(resp.connect_url),
+            Err(err) => Err(scrub_err(&err, config)),
+        }
+    }
+
+    /// The per-toolkit connected state the console renders as provider rows: one
+    /// `(toolkit, connected)` pair per toolkit that has at least one connection,
+    /// with `connected == true` when **any** connection for that toolkit is
+    /// active. Backs the console's `GET …/composio/connections` route.
+    ///
+    /// Filtered to the tenant allowlist (mirrors the `composio_list_connections`
+    /// agent tool) so a connection outside the company's grant is never
+    /// surfaced. Sorted by toolkit for a stable render order. Any upstream error
+    /// is scrubbed of the tenant bearer before it bubbles.
+    pub async fn list_connection_states(config: &TenantComposio) -> Result<Vec<(String, bool)>> {
+        tracing::debug!(allowlist = ?config.toolkits, "[composio] ops list_connections");
+        let resp = match client_for(config).list_connections().await {
+            Ok(resp) => resp,
+            Err(err) => return Err(scrub_err(&err, config)),
+        };
+        let mut states: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
+        for conn in resp.connections {
+            let toolkit = conn.normalized_toolkit();
+            if !toolkit_allowed(&config.toolkits, &toolkit) {
+                continue;
+            }
+            let active = conn.is_active();
+            states
+                .entry(toolkit)
+                .and_modify(|c| *c = *c || active)
+                .or_insert(active);
+        }
+        Ok(states.into_iter().collect())
     }
 
     // ── composio_list_toolkits ──────────────────────────────────────────
@@ -878,6 +955,123 @@ mod tests {
     }
 }
 
+/// The console-facing ops helpers ([`authorize_connect_url`],
+/// [`list_connection_states`]) over a mock Composio backend: proves the connect
+/// URL is surfaced, the allowlist is enforced before any network call, and
+/// connection rows aggregate to per-toolkit `connected` state filtered to the
+/// tenant grant.
+#[cfg(all(test, feature = "composio"))]
+mod ops_helper_tests {
+    use super::*;
+
+    use std::net::SocketAddr;
+
+    use axum::Router;
+    use axum::routing::{get, post};
+    use serde_json::{Value, json};
+
+    /// Mock `POST /agent-integrations/composio/authorize` — returns a hosted
+    /// connect URL inside the backend's `{success,data}` envelope.
+    async fn authorize_handler() -> axum::Json<Value> {
+        axum::Json(json!({
+            "success": true,
+            "data": { "connectUrl": "https://connect.composio.dev/abc", "connectionId": "conn-xyz" }
+        }))
+    }
+
+    /// Mock `GET /agent-integrations/composio/connections` — gmail has one
+    /// active + one pending row (→ connected), slack only pending (→ not
+    /// connected), notion active (filtered out unless allowlisted).
+    async fn connections_handler() -> axum::Json<Value> {
+        axum::Json(json!({
+            "success": true,
+            "data": { "connections": [
+                { "id": "c1", "toolkit": "gmail", "status": "ACTIVE" },
+                { "id": "c2", "toolkit": "gmail", "status": "INITIATED" },
+                { "id": "c3", "toolkit": "slack", "status": "INITIATED" },
+                { "id": "c4", "toolkit": "notion", "status": "ACTIVE" }
+            ] }
+        }))
+    }
+
+    async fn spawn_backend() -> String {
+        let app = Router::new()
+            .route(
+                "/agent-integrations/composio/authorize",
+                post(authorize_handler),
+            )
+            .route(
+                "/agent-integrations/composio/connections",
+                get(connections_handler),
+            );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn config(url: &str, toolkits: Vec<String>) -> TenantComposio {
+        TenantComposio {
+            backend_url: url.to_string(),
+            auth_token: "tenant-token".to_string(),
+            toolkits,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_hosted_connect_url() {
+        let url = spawn_backend().await;
+        let out = authorize_connect_url(&config(&url, vec!["gmail".into()]), "gmail")
+            .await
+            .expect("authorize returns a connect URL");
+        assert_eq!(out, "https://connect.composio.dev/abc");
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_toolkit_outside_allowlist_before_any_network_call() {
+        // Backend URL is unreachable — the allowlist rejection must fire first.
+        let out =
+            authorize_connect_url(&config("http://127.0.0.1:1", vec!["gmail".into()]), "slack")
+                .await;
+        let err = out.expect_err("a toolkit outside the allowlist must be refused");
+        assert!(err.to_string().contains("allowlist"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_connection_states_aggregates_active_and_filters_to_allowlist() {
+        let url = spawn_backend().await;
+        // gmail + slack allowed; notion is active upstream but not in the grant.
+        let states = list_connection_states(&config(&url, vec!["gmail".into(), "slack".into()]))
+            .await
+            .expect("list connections");
+        assert_eq!(
+            states,
+            vec![("gmail".to_string(), true), ("slack".to_string(), false)],
+            "gmail active (one ACTIVE row), slack pending only, notion filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_connection_states_empty_allowlist_admits_every_toolkit() {
+        let url = spawn_backend().await;
+        let states = list_connection_states(&config(&url, Vec::new()))
+            .await
+            .expect("list connections");
+        assert_eq!(
+            states,
+            vec![
+                ("gmail".to_string(), true),
+                ("notion".to_string(), true),
+                ("slack".to_string(), false),
+            ]
+        );
+    }
+}
+
 /// The mandatory tenant-isolation test (issue #110): two per-tenant configs (A
 /// and B) over a mock backend that records the `Authorization` header of each
 /// request and answers with tenant-specific data. Proves the ONLY isolation
@@ -956,7 +1150,12 @@ mod isolation_tests {
     }
 
     fn list_connections_tool(config: &TenantComposio) -> Box<dyn Tool> {
-        composio_tools(config)
+        let metering = ComposioMetering {
+            company: CompanyId::new("acme"),
+            agent: "ceo".to_string(),
+            meter: None,
+        };
+        composio_tools(config, metering)
             .into_iter()
             .find(|t| t.name() == "composio_list_connections")
             .expect("composio_list_connections tool present")

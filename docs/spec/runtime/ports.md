@@ -55,6 +55,8 @@ pub trait CycleHost: Send + Sync {
     async fn call_tool(&self, call: ToolCall) -> Result<ToolResult>;
     async fn context_op(&self, op: ContextOp) -> Result<ContextOpResult>;
     async fn emit_effect(&self, effect: Effect) -> Result<EffectDisposition>;
+    /// Parks an already-decided effect for approval, without re-evaluating it.
+    async fn park_effect(&self, effect: Effect) -> Result<ApprovalId>;
 }
 
 pub enum EffectDisposition {
@@ -63,6 +65,14 @@ pub enum EffectDisposition {
     Denied { reason: String },
 }
 ```
+
+`emit_effect` submits an effect for a **decision** — the gate evaluates it and
+executes, parks, or denies it. `park_effect` is for a brain that hosts its own
+policy layer and has **already** decided: the harness brain's openhuman
+`ApprovalPolicy` blocks a gated tool call inside the agent turn, and the
+projected call is parked as-is so the operator can see and resolve it. Passing
+it back through `emit_effect` would re-decide it against the coarser
+`ApprovalGate` taxonomy and quietly drop it (issue #172).
 
 `CycleRequest` carries `{cycle_id, company_id, events, compressed_history,
 roster, context_index}`; `CycleResult` carries channel responses, new

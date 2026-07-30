@@ -123,7 +123,7 @@ impl Brain for EchoBrain {
 mod test {
     use super::*;
     use crate::ports::types::{
-        CompanyId, ContextOp, ContextOpResult, EffectDisposition, ToolCall, ToolResult,
+        ApprovalId, CompanyId, ContextOp, ContextOpResult, EffectDisposition, ToolCall, ToolResult,
     };
 
     /// A minimal host that records emitted effects and auto-executes them.
@@ -148,6 +148,11 @@ mod test {
         async fn emit_effect(&self, effect: Effect) -> Result<EffectDisposition> {
             self.effects.lock().unwrap().push(effect);
             Ok(EffectDisposition::Executed)
+        }
+
+        async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+            self.effects.lock().unwrap().push(effect);
+            Ok(ApprovalId::new("appr-parked"))
         }
     }
 

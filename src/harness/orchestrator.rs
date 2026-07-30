@@ -73,10 +73,10 @@ const FACT_LIMIT: usize = 20;
 
 /// The `query_company` tool name.
 pub const QUERY_COMPANY_TOOL: &str = "query_company";
-/// The `spawn_task` tool name.
-pub const SPAWN_TASK_TOOL: &str = "spawn_task";
-/// The `delegate_to_desk` tool name.
-pub const DELEGATE_TO_DESK_TOOL: &str = "delegate_to_desk";
+// The `spawn_task` / `delegate_to_desk` names are the brain-agnostic canonical
+// constants (issue #176) — re-exported here so the harness path and the hosted
+// path share one definition and cannot drift.
+pub use crate::runtime::delegation_tools::{DELEGATE_TO_DESK_TOOL, SPAWN_TASK_TOOL};
 /// The `run_workflow` tool name (issue #67).
 pub const RUN_WORKFLOW_TOOL: &str = "run_workflow";
 /// The `add_agent` tool name (issue #71 — Active Runtime Teammates).
@@ -447,16 +447,7 @@ impl Tool for SpawnTaskTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "title": { "type": "string", "description": "The task title." },
-                "note": { "type": "string", "description": "An optional longer brief." },
-                "assignee": { "type": "string", "description": "An optional desk/teammate id to own it." }
-            },
-            "required": ["title"],
-            "additionalProperties": false
-        })
+        crate::runtime::delegation_tools::spawn_task_schema()
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -520,15 +511,7 @@ impl Tool for DelegateToDeskTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "desk": { "type": "string", "description": "The desk id or name to delegate to." },
-                "instruction": { "type": "string", "description": "The instruction for the desk's lead member." }
-            },
-            "required": ["desk", "instruction"],
-            "additionalProperties": false
-        })
+        crate::runtime::delegation_tools::delegate_to_desk_schema()
     }
 
     fn permission_level(&self) -> PermissionLevel {

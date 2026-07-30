@@ -12,7 +12,7 @@
 
 use axum::Json;
 use axum::Router;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -26,8 +26,19 @@ const SWITCH_NOTE: &str =
     "Agents pick up the new Composio token on their next turn — no restart needed.";
 
 /// Builds the Composio management route fragment.
+///
+/// The read/write-token plane (`GET …/composio`, `PUT …/composio/token`) is
+/// always present. The per-provider OAuth sign-in plane (`POST
+/// …/composio/authorize`, `GET …/composio/connections`) is **also** always
+/// present in the route table — mirroring how `get_status` stays wired and
+/// reports `inBuild:false` rather than `#[cfg]`-ing itself out — but its
+/// handlers only reach the live Composio client under the `composio` feature;
+/// otherwise they answer `409 Conflict` "not in this build".
 pub fn router() -> Router<AppState> {
-    scoped("/composio", get(get_status)).merge(scoped("/composio/token", put(set_token)))
+    scoped("/composio", get(get_status))
+        .merge(scoped("/composio/token", put(set_token)))
+        .merge(scoped("/composio/authorize", post(authorize)))
+        .merge(scoped("/composio/connections", get(connections)))
 }
 
 /// The company's Composio status as the console renders it. **Never** carries the
@@ -64,6 +75,34 @@ struct MutationResponse {
 #[serde(rename_all = "camelCase")]
 struct SetToken {
     token: String,
+}
+
+/// `POST …/composio/authorize` body: the toolkit slug (`gmail` / `slack` /
+/// `github` / …) to begin an OAuth handoff for.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorizeBody {
+    toolkit: String,
+}
+
+/// `POST …/composio/authorize` response: the Composio-hosted connect URL the
+/// operator opens in a browser tab. Composio runs the OAuth itself; there is no
+/// local callback — the console polls [`ConnectionDto`] until the toolkit
+/// reports connected.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorizeDto {
+    connect_url: String,
+}
+
+/// One per-toolkit connected state in the `GET …/composio/connections`
+/// response: `connected` is true when the company has at least one active
+/// connection for that toolkit.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionDto {
+    toolkit: String,
+    connected: bool,
 }
 
 /// Resolves the Composio status DTO for a company.
@@ -114,6 +153,120 @@ async fn set_token(
         status: effective_status(runtime).await?,
         note: SWITCH_NOTE.to_string(),
     }))
+}
+
+/// `POST …/composio/authorize` — begin a per-provider OAuth handoff and return
+/// the Composio-hosted connect URL the operator opens in a browser tab.
+///
+/// Composio runs the OAuth flow itself — there is **no** local callback route.
+/// The console opens the URL and polls [`connections`] until the toolkit
+/// reports connected. Under a non-`composio` build this answers `409 Conflict`
+/// (see [`router`]).
+async fn authorize(
+    company: ScopedCompany,
+    Json(body): Json<AuthorizeBody>,
+) -> Result<Json<AuthorizeDto>, ApiError> {
+    authorize_impl(company.runtime.as_ref(), body.toolkit).await
+}
+
+/// `GET …/composio/connections` — the company's per-toolkit connected state,
+/// one [`ConnectionDto`] per toolkit that has at least one connection. The
+/// console cross-references this against the granted `toolkits` to render each
+/// provider row's connected/sign-in state. `409 Conflict` on a non-`composio`
+/// build.
+async fn connections(company: ScopedCompany) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
+    connections_impl(company.runtime.as_ref()).await
+}
+
+/// Resolve the per-tenant Composio config (bearer + backend URL + toolkit
+/// allowlist) the way the harness roster build does, so the console dials the
+/// backend with the exact same tenant identity. A `409 Conflict` when no token
+/// is configured — the operator must set it (paste-token card) before OAuth.
+#[cfg(feature = "composio")]
+async fn resolve_tenant(
+    runtime: &CompanyRuntime,
+) -> Result<crate::harness::composio::TenantComposio, ApiError> {
+    use crate::app::config::EnvSource;
+
+    let record = runtime.store().load(runtime.id()).await.map_err(ApiError)?;
+    let toolkits = record
+        .map(|record| record.manifest.tools.composio.toolkits.clone())
+        .unwrap_or_default();
+    let env = crate::app::config::ProcessEnv;
+    let backend_env = env.get(crate::company::composio::COMPOSIO_BACKEND_URL_ENV);
+    let api_env = env.get(crate::company::composio::TINYHUMANS_API_URL_ENV);
+    crate::harness::composio::TenantComposio::resolve(
+        runtime.id(),
+        runtime.secrets().as_ref(),
+        toolkits,
+        backend_env,
+        api_env,
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError(crate::error::OpenCompanyError::Conflict(
+            "no Composio token configured for this company — set the token first".to_string(),
+        ))
+    })
+}
+
+#[cfg(feature = "composio")]
+async fn authorize_impl(
+    runtime: &CompanyRuntime,
+    toolkit: String,
+) -> Result<Json<AuthorizeDto>, ApiError> {
+    let config = resolve_tenant(runtime).await?;
+    let connect_url = crate::harness::composio::authorize_connect_url(&config, &toolkit)
+        .await
+        .map_err(|err| {
+            ApiError(crate::error::OpenCompanyError::TinyHumans {
+                code: "composio_authorize".to_string(),
+                message: err.to_string(),
+            })
+        })?;
+    Ok(Json(AuthorizeDto { connect_url }))
+}
+
+#[cfg(feature = "composio")]
+async fn connections_impl(runtime: &CompanyRuntime) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
+    let config = resolve_tenant(runtime).await?;
+    let states = crate::harness::composio::list_connection_states(&config)
+        .await
+        .map_err(|err| {
+            ApiError(crate::error::OpenCompanyError::TinyHumans {
+                code: "composio_connections".to_string(),
+                message: err.to_string(),
+            })
+        })?;
+    Ok(Json(
+        states
+            .into_iter()
+            .map(|(toolkit, connected)| ConnectionDto { toolkit, connected })
+            .collect(),
+    ))
+}
+
+/// A `409 Conflict` "Composio is not in this build" — the OAuth plane's off-state
+/// under a non-`composio` build. Mirrors the status route's `inBuild:false`
+/// semantics rather than pretending nothing is connected.
+#[cfg(not(feature = "composio"))]
+fn not_in_build() -> ApiError {
+    ApiError(crate::error::OpenCompanyError::Conflict(
+        "Composio is not compiled into this build".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "composio"))]
+async fn authorize_impl(
+    _runtime: &CompanyRuntime,
+    _toolkit: String,
+) -> Result<Json<AuthorizeDto>, ApiError> {
+    Err(not_in_build())
+}
+
+#[cfg(not(feature = "composio"))]
+async fn connections_impl(_runtime: &CompanyRuntime) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
+    Err(not_in_build())
 }
 
 #[cfg(test)]
@@ -258,6 +411,53 @@ mod tests {
         .await;
         let (_, dto, _) = send(&state, "GET", "/api/v1/company/composio", None).await;
         assert_eq!(dto["granted"], false, "{dto}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The OAuth sign-in plane is always wired into the route table (like the
+    /// status route), so `POST …/composio/authorize` is never a 404. Without a
+    /// usable Composio client it conflicts (`409`): on the default build because
+    /// the feature is not compiled in; under the `composio` feature because no
+    /// per-tenant token is configured yet. Either way the console gets a clear,
+    /// non-404 signal rather than a missing route.
+    #[tokio::test]
+    async fn authorize_route_conflicts_without_build_or_token() {
+        let home = home();
+        let state = state_with_manifest(
+            &home,
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[tools]\nallow = [\"composio\"]\n[tools.composio]\ntoolkits = [\"gmail\"]\n",
+        )
+        .await;
+
+        let (status, body, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/composio/authorize",
+            Some(json!({ "toolkit": "gmail" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{raw}");
+        assert_eq!(body["code"], "conflict", "{body}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `GET …/composio/connections` is likewise always wired and conflicts
+    /// (`409`) when there is no usable client — no build feature or no token.
+    #[tokio::test]
+    async fn connections_route_conflicts_without_build_or_token() {
+        let home = home();
+        let state = state_with_manifest(
+            &home,
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[tools]\nallow = [\"composio\"]\n[tools.composio]\ntoolkits = [\"gmail\"]\n",
+        )
+        .await;
+
+        let (status, body, raw) =
+            send(&state, "GET", "/api/v1/company/composio/connections", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{raw}");
+        assert_eq!(body["code"], "conflict", "{body}");
+
         std::fs::remove_dir_all(&home).ok();
     }
 }

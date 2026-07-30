@@ -13,6 +13,21 @@ pub mod builder;
 pub mod channel;
 pub mod cron;
 pub mod cycle;
+/// Brain-agnostic delegation seam (issue #176): the [`RunTurn`] trait +
+/// [`DelegationRunner`] the harness brain drives. Compiled only under
+/// `openhuman` — it drains the harness delegation queue and yields harness
+/// [`TurnOutcome`]s. See [`delegation`].
+///
+/// [`RunTurn`]: delegation::RunTurn
+/// [`DelegationRunner`]: delegation::DelegationRunner
+/// [`TurnOutcome`]: crate::harness::TurnOutcome
+#[cfg(feature = "openhuman")]
+pub mod delegation;
+/// Brain-agnostic delegation-tool primitives (issue #176): the tool names,
+/// argument schemas, hosted [`ToolManifestEntry`](crate::brain::medulla::wire::ToolManifestEntry)
+/// catalog, and desk-lead resolver shared by BOTH the harness and hosted paths.
+/// Compiled in every build (the hosted brain ships in the default build).
+pub mod delegation_tools;
 pub mod journal;
 pub mod mailbox_poller;
 pub mod registry;

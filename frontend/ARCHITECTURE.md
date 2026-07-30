@@ -90,8 +90,9 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
 
 ### Team — `src/views/TeamView.tsx`
 - Shows the agent roster (name, role, description); operator can add/remove.
-- **Source:** ✅ real — `Company.team` (GraphQL) merges the manifest `[[agent]]`
-  roster with operator overlays; `POST/DELETE …/team` and
+- **Source:** ✅ real — `Company.team` (GraphQL) and `GET …/team` (REST, what the
+  console calls) merge the manifest `[[agent]]` roster with operator overlays and
+  tag each teammate's `inboxEnabled`; `POST/DELETE …/team` and
   `PUT …/team/{id}/inbox` (REST) write the overlay.
 - **Note:** overlay teammates are **roster-only in v1** — they show in the
   roster and get an inbox, but no harness agent is built for them yet.
@@ -103,13 +104,21 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
   endpoint. Desk-scoped routing of replies is single-responder in v1 (the full
   desk-member handler is WS3).
 
-### Inbox — `src/views/InboxView.tsx`, `src/lib/inbox.ts`
+### Inbox — `src/views/InboxView.tsx`, `src/api/inbox.ts`
 - Per-agent email inbox; enabled via a Team toggle.
-- **Source:** ✅ real — `Company.inboxes` (GraphQL, `InboxStore`-backed) lists
-  enabled inboxes and pages messages; `POST …/inboxes/{key}/read` marks read and
-  `PUT …/team/{id}/inbox` toggles an inbox. Inbound mail arrives via the
-  HMAC-signed `POST …/inboxes/ingest` webhook. Real send/receive depends on
-  Domain/SMTP (below).
+- **Source:** ✅ real — `client.listInboxes()` (`GET …/inboxes`) lists every inbox
+  with its unread count and `client.inboxMessages()`
+  (`GET …/inboxes/{key}/messages`) reads one teammate's mail, both
+  `InboxStore`-backed REST twins of the `Company.inboxes` GraphQL resolver (the
+  console ships no GraphQL client). `client.markInboxRead()`
+  (`POST …/inboxes/{key}/read`) marks read and `setInboxEnabled`
+  (`PUT …/team/{id}/inbox`) toggles an inbox. Inbound mail arrives via the
+  HMAC-signed `POST …/inboxes/ingest` webhook and the IMAP poller, which file
+  into the same store. Real send/receive depends on Domain/SMTP (below).
+- **Note:** inboxes are keyed by **agent id**, the same key the ingest webhook
+  files mail under. Nothing is seeded or cached client-side — an inbox with no
+  mail renders empty (issue #173 replaced a localStorage fixture that showed the
+  same four invented emails for every teammate).
 
 ### Tasks (Kanban) — `src/views/TasksView.tsx`, `src/lib/tasks-sample.ts`
 - Columns Backlog/In progress/In review/Done; drag to move; priority + assignee.
@@ -183,8 +192,9 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
 The console's models are the response contract. Keep host payloads aligned with:
 
 - `src/api/types.ts` — `CompanyStatus`, `ApprovalSummary`, `ChatResponse`,
-  `FeedbackResponse`, `TeamMemberDto`, `ConnectionState`, `ConnectionStart`.
-- `src/lib/threads.ts` `Thread`/`ThreadContact`, `src/lib/inbox.ts` `EmailMessage`,
+  `FeedbackResponse`, `TeamMemberDto`, `InboxDto`, `InboxMessageDto`,
+  `ConnectionState`, `ConnectionStart`.
+- `src/lib/threads.ts` `Thread`/`ThreadContact`,
   `src/lib/tasks-sample.ts` `TaskCard`, `src/lib/skills.ts` `InstalledSkill`,
   `src/lib/workspace.ts` `FsNode`, `src/lib/memory.ts` `MemoryEntry`,
   `src/lib/usage-sample.ts` `UsageData`, `src/lib/finance-sample.ts` `FinanceData`,

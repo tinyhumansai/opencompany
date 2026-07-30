@@ -20,7 +20,9 @@ The builder seams are wired to OpenCompany's own ports:
   for offline tests.
 - **Approval policy** → `harness::policy::ApprovalPolicy` maps `[policy].mode`
   onto openhuman's `ToolPolicy`; the security-tier words
-  (readonly/supervised/full) line up 1:1.
+  (readonly/supervised/full) line up 1:1. See
+  [approval parking](#approval-parking) for how a gated call reaches the
+  operator.
 - **Tools / skills** → injected from the company's manifest grants.
 
 See [`docs/modules/runtime/README.md`](../runtime/README.md) for `HarnessPool`
@@ -38,6 +40,34 @@ no explicit brain — brain precedence is `with_brain` > harness > hosted/echo.
 The `opencompany` binary's `attach_harness` resolves that config from the
 environment (below), so `serve` boots on the harness brain automatically when a
 credential is present.
+
+## Approval parking
+
+openhuman resolves a `ToolPolicyDecision::RequireApproval` **inline**: it blocks
+the tool call and feeds the model a refusal, then lets the turn continue. That
+refusal used to be the only trace a gated call left — nothing was written to
+OpenCompany's `ApprovalGate` or its journal, so the operator's Approvals page
+stayed empty however many tools an agent parked (issue #172).
+
+The two halves are now joined:
+
+1. `ApprovalPolicy::check` projects every `RequireApproval` onto an `Effect`
+   (`effect_for` — the tool name becomes the effect `kind`, the arguments become
+   the payload) and pushes it onto the shared `ApprovalRequestQueue` carried on
+   `HarnessDeps`. Duplicates (a model re-trying the same blocked call) collapse.
+2. `HarnessBrain::run_cycle` clears that queue before its turns and drains it
+   after, parking each request through `CycleHost::park_effect` — capped at
+   `MAX_APPROVAL_REQUESTS_PER_TURN`.
+
+`park_effect` is deliberately **not** `emit_effect`: the verdict was already
+reached inside the turn, and re-evaluating it against the coarser `ApprovalGate`
+taxonomy would `Allow` (and so "execute" as a no-op) anything in the `Other`
+group — which is most gated tool calls — making the request vanish again.
+
+**Not yet wired: resume-after-approval.** Because openhuman resolves the decision
+inline, approving a parked tool call records the verdict and clears the queue but
+does not re-dispatch the tool; the operator re-asks. Suspending and resuming a
+call inside openhuman's session loop is separate work.
 
 ## Inference config (environment)
 
