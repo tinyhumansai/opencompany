@@ -234,6 +234,11 @@ export interface TeamMemberDto {
   name?: string;
   role: string;
   description?: string;
+  /**
+   * Whether this teammate has an enabled inbox, as the host's `InboxStore` sees
+   * it. Absent on hosts predating the field; the console reads that as `false`.
+   */
+  inboxEnabled?: boolean;
 }
 
 /**

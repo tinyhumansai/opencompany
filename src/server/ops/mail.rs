@@ -8,6 +8,12 @@
 //! poller, see [`inbox`](super::inbox)) is visible in the web app. The write
 //! marks messages read and returns the count still unread. Every field here is
 //! non-secret message metadata/body; credentials never appear.
+//!
+//! These are the console's *only* per-agent inbox read — it ships no GraphQL
+//! client, which is why the Inbox view used to fall back to a client-side
+//! fixture that invented the same mail for every teammate (issue #173). Each
+//! key reads its own mail and nothing else; the enable toggle behind
+//! `enabled` lives in [`team`](super::team) (`PUT …/team/{agentId}/inbox`).
 
 use axum::extract::Path;
 use axum::routing::{get, post};

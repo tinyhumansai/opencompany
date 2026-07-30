@@ -25,13 +25,17 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::feedback::tool::SEND_EMAIL_TOOL;
 use crate::ports::brain::CycleHost;
-use crate::ports::now_millis;
+use crate::ports::tasks::TaskRecord;
 use crate::ports::types::{
-    Actor, ApprovalId, CompanyEvent, CompanyId, ContextOp, ContextOpResult, CycleRequest, Effect,
-    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall,
-    ToolResult, Verdict,
+    Actor, ApprovalId, CompanyEvent, CompanyId, CompanyRecord, ContextOp, ContextOpResult,
+    CycleRequest, Effect, EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage,
+    PolicyDecision, ToolCall, ToolResult, Verdict,
 };
+use crate::ports::{generate_id, now_millis};
 use crate::runtime::channel::OPERATOR_CHANNEL;
+use crate::runtime::delegation_tools::{
+    DELEGATE_TO_DESK_TOOL, DelegateArgs, SPAWN_TASK_TOOL, SpawnTaskArgs, desk_lead,
+};
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
@@ -60,7 +64,7 @@ impl<'a> CycleRunner<'a> {
         self.run_locked(events).await
     }
 
-    async fn run_locked(&self, events: Vec<CompanyEvent>) -> Result<CycleReport> {
+    async fn run_locked(&self, mut events: Vec<CompanyEvent>) -> Result<CycleReport> {
         let company = self.rt.id.clone();
 
         // 2. Persist input — durable before any thinking.
@@ -79,7 +83,8 @@ impl<'a> CycleRunner<'a> {
             .recent_traces(&company, HISTORY_LIMIT)
             .await?;
         let context_index = self.rt.context.list(&company, "").await?;
-        let roster = match self.rt.store.load(&company).await? {
+        let record = self.rt.store.load(&company).await?;
+        let roster = match &record {
             Some(record) => record
                 .manifest
                 .agents
@@ -88,6 +93,17 @@ impl<'a> CycleRunner<'a> {
                 .collect(),
             None => Vec::new(),
         };
+
+        // Issue #176 (handed-task awareness): when an operator message is
+        // addressed to a desk/agent that already has open work handed to it,
+        // fold a briefing of that work into the message the brain sees — so a
+        // direct "what are you working on?" surfaces the handed task truthfully.
+        // Brain-agnostic (both brains read `req.events`); mutates only the
+        // in-memory copy handed to the brain, never the durable log persisted
+        // above.
+        if let Some(record) = &record {
+            self.inject_handed_task_awareness(record, &mut events).await;
+        }
 
         let cycle_id = crate::ports::generate_id();
         let request = CycleRequest {
@@ -123,6 +139,64 @@ impl<'a> CycleRunner<'a> {
             parked,
             persisted_seq,
         })
+    }
+
+    /// Folds a briefing of open handed work into any operator message addressed
+    /// to a desk/agent that owns it (issue #176, handed-task awareness). Reads
+    /// open task cards once and appends, to each addressed `OperatorMessage`,
+    /// the cards whose assignee resolves to the addressed target — so a direct
+    /// "what are you working on?" is answered truthfully. A no-op when nothing
+    /// is addressed or no open work matches. Mutates only the in-memory events
+    /// handed to the brain, never the durable event log.
+    async fn inject_handed_task_awareness(
+        &self,
+        record: &CompanyRecord,
+        events: &mut [CompanyEvent],
+    ) {
+        // Cheap exit before touching the task store: nothing is addressed.
+        if !events
+            .iter()
+            .any(|e| matches!(e, CompanyEvent::OperatorMessage { chat: Some(_), .. }))
+        {
+            return;
+        }
+        let cards = self.rt.tasks().list(&self.rt.id).await.unwrap_or_default();
+        let open: Vec<&TaskRecord> = cards
+            .iter()
+            .filter(|c| c.column != "done" && !c.assignee.trim().is_empty())
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        for event in events.iter_mut() {
+            let CompanyEvent::OperatorMessage {
+                text,
+                chat: Some(target),
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let mut lines: Vec<String> = open
+                .iter()
+                .filter(|c| assignment_matches(record, target.as_str(), &c.assignee))
+                .map(|c| match &c.note {
+                    Some(note) if !note.trim().is_empty() => {
+                        format!("- {} — {}", c.title, first_line(note, 120))
+                    }
+                    _ => format!("- {}", c.title),
+                })
+                .collect();
+            if lines.is_empty() {
+                continue;
+            }
+            lines.sort();
+            text.push_str(&format!(
+                "\n\n[Open work already handed to you (answer truthfully if asked what you are \
+working on):\n{}\n]",
+                lines.join("\n")
+            ));
+        }
     }
 
     /// Resolves a parked approval, executes the effect on approval, and runs a
@@ -523,6 +597,155 @@ impl<'a> CycleHostImpl<'a> {
             }),
         }
     }
+
+    /// Services the `spawn_task` tool (issue #176): opens a tracked task card on
+    /// the company's board through the same [`TaskStore`](crate::ports::TaskStore)
+    /// path the console and the harness path use. A blank title is a clean tool
+    /// error rather than a silent no-op. The card is durable, so a later direct
+    /// query to its assignee surfaces it (handed-task awareness).
+    async fn spawn_task(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let Some(parsed) = SpawnTaskArgs::parse(&args) else {
+            return Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({ "error": "spawn_task requires a non-empty title" }),
+            });
+        };
+        let card = TaskRecord {
+            id: generate_id(),
+            title: parsed.title.clone(),
+            note: parsed.note,
+            column: "backlog".to_string(),
+            priority: "medium".to_string(),
+            assignee: parsed.assignee.unwrap_or_default(),
+            updated_at_millis: now_millis(),
+            origin_chat_id: None,
+            // No parent (#185), for the same reason as the harness path: this
+            // is a chat-turn delegation, so no task is in scope to be the
+            // parent. Lineage is set through the task API's `parentTaskId`.
+            parent_task_id: None,
+        };
+        self.rt.tasks().upsert(&self.company, &card).await?;
+        Ok(ToolResult {
+            ok: true,
+            output: serde_json::json!({
+                "status": "queued",
+                "task_id": card.id,
+                "title": parsed.title,
+            }),
+        })
+    }
+
+    /// Services the `delegate_to_desk` tool (issue #176) on the hosted path: a
+    /// *durable, asynchronous* hand-off. Resolves the target desk, writes a task
+    /// card assigned to that desk (so a later direct query to the desk surfaces
+    /// the handed work), and returns a summary the remote cognition relays to
+    /// the operator.
+    ///
+    /// This deliberately does NOT run the desk lead's turn: a hosted build has
+    /// no in-process cognition pool. The synchronous, one-voice relay the
+    /// harness performs needs Medulla multi-agent support and is tracked in
+    /// #176; the durable hand-off is the brain-agnostic capability that ships
+    /// now. An unknown desk is a clean tool error, not a lost hand-off.
+    async fn delegate_to_desk(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let Some(parsed) = DelegateArgs::parse(&args) else {
+            return Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({
+                    "error": "delegate_to_desk requires a desk and an instruction"
+                }),
+            });
+        };
+        let record = self.rt.store.load(&self.company).await?;
+        let Some(desk_id) = record
+            .as_ref()
+            .and_then(|r| r.resolve_desk_id(&parsed.desk))
+        else {
+            return Ok(ToolResult {
+                ok: false,
+                output: serde_json::json!({
+                    "status": "unknown_desk",
+                    "error": format!("no desk matches \"{}\"", parsed.desk),
+                }),
+            });
+        };
+        // The desk's lead, when it has a roster-backed one, is recorded in the
+        // note; the card is assigned to the DESK so an operator asking the desk
+        // directly (chat targets the desk) sees the hand-off.
+        let lead = record.as_ref().and_then(|r| desk_lead(r, &parsed.desk));
+        let note = match &lead {
+            Some(member) => format!(
+                "Delegated to the {desk_id} desk (lead: {member}).\n\n{instruction}",
+                instruction = parsed.instruction
+            ),
+            None => format!(
+                "Delegated to the {desk_id} desk (no lead member on the roster yet).\n\n{instruction}",
+                instruction = parsed.instruction
+            ),
+        };
+        let card = TaskRecord {
+            id: generate_id(),
+            title: first_line(&parsed.instruction, 80),
+            note: Some(note),
+            column: "backlog".to_string(),
+            priority: "medium".to_string(),
+            assignee: desk_id.clone(),
+            updated_at_millis: now_millis(),
+            origin_chat_id: None,
+            // No parent (#185), for the same reason as the harness path: this
+            // is a chat-turn delegation, so no task is in scope to be the
+            // parent. Lineage is set through the task API's `parentTaskId`.
+            parent_task_id: None,
+        };
+        self.rt.tasks().upsert(&self.company, &card).await?;
+        Ok(ToolResult {
+            ok: true,
+            output: serde_json::json!({
+                "status": "handed_off",
+                "desk": desk_id,
+                "lead": lead,
+                "task_id": card.id,
+            }),
+        })
+    }
+}
+
+/// The first non-empty line of `text`, trimmed and capped to `max` chars — the
+/// task-card title derived from a delegation instruction (which may be a whole
+/// paragraph). Falls back to a short cap of the whole string when there is no
+/// line break. UTF-8-safe: never slices mid-codepoint.
+fn first_line(text: &str, max: usize) -> String {
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(text)
+        .trim();
+    match line.char_indices().nth(max) {
+        Some((idx, _)) => format!("{}…", &line[..idx]),
+        None => line.to_string(),
+    }
+}
+
+/// Whether a task card assigned to `assignee` counts as "handed to" the target
+/// a direct operator message is addressed to (issue #176). Matches when the two
+/// are the same string (case-insensitively), resolve to the same desk, or the
+/// assignee is the addressed desk's lead — so a hand-off recorded against a desk
+/// id surfaces when the operator addresses that desk by id or name, and a card
+/// assigned to a person surfaces when that person is addressed.
+fn assignment_matches(record: &CompanyRecord, target: &str, assignee: &str) -> bool {
+    if assignee.eq_ignore_ascii_case(target) {
+        return true;
+    }
+    if let (Some(a), Some(b)) = (
+        record.resolve_desk_id(target),
+        record.resolve_desk_id(assignee),
+    ) && a == b
+    {
+        return true;
+    }
+    if let Some(lead) = desk_lead(record, target) {
+        return lead.eq_ignore_ascii_case(assignee);
+    }
+    false
 }
 
 #[async_trait]
@@ -530,6 +753,19 @@ impl CycleHost for CycleHostImpl<'_> {
     async fn call_tool(&self, call: ToolCall) -> Result<ToolResult> {
         if call.tool == SEND_EMAIL_TOOL {
             return self.send_email(call.args).await;
+        }
+        // Issue #176: service the delegation tools device-side so the hosted
+        // (Medulla) path can delegate. Unlike the harness path — which runs the
+        // desk lead's turn in-process and relays it in one voice — a hosted
+        // build has no local cognition pool, so the hand-off is *durable and
+        // asynchronous*: a board card the desk sees when asked directly. (The
+        // synchronous cross-agent cognition relay needs Medulla multi-agent
+        // support; tracked in #176.)
+        if call.tool == SPAWN_TASK_TOOL {
+            return self.spawn_task(call.args).await;
+        }
+        if call.tool == DELEGATE_TO_DESK_TOOL {
+            return self.delegate_to_desk(call.args).await;
         }
         // The provider enforces the manifest grant before any side effect.
         self.rt.tools.invoke(&self.company, call).await
@@ -1396,6 +1632,253 @@ mod test {
             .unwrap();
         assert_eq!(res.output["status"], "sent");
         assert_eq!(sender.sent().len(), 1);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #176: delegation host arms + handed-task awareness.
+    // -----------------------------------------------------------------------
+
+    /// A manifest with an Engineering desk (`eng`, lead `eng1`) — for the desk
+    /// resolution paths of `delegate_to_desk` and the awareness matcher.
+    fn desk_manifest() -> CompanyManifest {
+        let toml_src = r#"
+            [company]
+            name = "Acme"
+
+            [[agent]]
+            id = "chief"
+            role = "Chief"
+            tier = "orchestrator"
+
+            [[agent]]
+            id = "eng1"
+            role = "Engineer"
+
+            [[group_chat]]
+            id = "eng"
+            name = "Engineering"
+            members = ["eng1"]
+
+            [policy]
+            mode = "full"
+            "#;
+        toml::from_str(toml_src).expect("parse desk manifest")
+    }
+
+    /// A brain that records the text of every operator message it is handed, so
+    /// a test can assert what awareness the kernel folded in before the brain.
+    struct CapturingBrain {
+        seen: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Brain for CapturingBrain {
+        async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+            for event in &req.events {
+                if let CompanyEvent::OperatorMessage { text, .. } = event {
+                    self.seen.lock().expect("seen").push(text.clone());
+                }
+            }
+            Ok(CycleResult {
+                channel_responses: Vec::new(),
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "capture")],
+                ledger_deltas: Vec::new(),
+                token_usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_task_arm_opens_a_board_card() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+
+        let res = host
+            .spawn_task(serde_json::json!({ "title": "  Ship it ", "assignee": " eng " }))
+            .await
+            .unwrap();
+        assert!(res.ok);
+        assert_eq!(res.output["status"], "queued");
+
+        let cards = rt.tasks().list(rt.id()).await.unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].title, "Ship it");
+        assert_eq!(cards[0].assignee, "eng");
+
+        // A blank title is a clean tool error, no card.
+        let bad = host
+            .spawn_task(serde_json::json!({ "title": "  " }))
+            .await
+            .unwrap();
+        assert!(!bad.ok);
+        assert_eq!(rt.tasks().list(rt.id()).await.unwrap().len(), 1);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn delegate_to_desk_arm_records_handoff_and_rejects_unknown_desk() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), desk_manifest())
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+
+        // Known desk (by name) → card assigned to the resolved desk id, lead noted.
+        let ok = host
+            .delegate_to_desk(
+                serde_json::json!({ "desk": "Engineering", "instruction": "build invoicing" }),
+            )
+            .await
+            .unwrap();
+        assert!(ok.ok);
+        assert_eq!(ok.output["desk"], "eng");
+        assert_eq!(ok.output["lead"], "eng1");
+
+        // Unknown desk → clean error, no card.
+        let bad = host
+            .delegate_to_desk(serde_json::json!({ "desk": "Legal", "instruction": "review" }))
+            .await
+            .unwrap();
+        assert!(!bad.ok);
+        assert_eq!(bad.output["status"], "unknown_desk");
+
+        let cards = rt.tasks().list(rt.id()).await.unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].assignee, "eng");
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn call_tool_dispatches_delegation_tools() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+
+        // Reached through the CycleHost trait exactly as the hosted brain does.
+        let res = host
+            .call_tool(ToolCall {
+                tool: SPAWN_TASK_TOOL.to_string(),
+                args: serde_json::json!({ "title": "via call_tool" }),
+            })
+            .await
+            .unwrap();
+        assert!(res.ok);
+        assert_eq!(rt.tasks().list(rt.id()).await.unwrap().len(), 1);
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn handed_task_awareness_surfaces_open_cards_on_a_direct_query() {
+        let home = tmp_home();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let rt = RuntimeBuilder::new(home.clone(), desk_manifest())
+            .with_brain(Arc::new(CapturingBrain { seen: seen.clone() }))
+            .build()
+            .await
+            .unwrap();
+
+        // Hand work to the Engineering desk (card assigned to the desk id).
+        rt.tasks()
+            .upsert(
+                rt.id(),
+                &TaskRecord {
+                    id: "t1".into(),
+                    title: "Ship invoicing".into(),
+                    note: Some("build the importer".into()),
+                    column: "backlog".into(),
+                    priority: "medium".into(),
+                    assignee: "eng".into(),
+                    updated_at_millis: 0,
+                    origin_chat_id: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Asking the desk directly (by name) surfaces the handed task...
+        rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: "what are you working on?".into(),
+            by: None,
+            chat: Some("Engineering".into()),
+        }])
+        .await
+        .unwrap();
+
+        // ...and asking with no address (the orchestrator) does NOT get the
+        // desk's briefing folded into it.
+        rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: "status?".into(),
+            by: None,
+            chat: None,
+        }])
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0].contains("Open work already handed to you")
+                && seen[0].contains("Ship invoicing"),
+            "direct query carries the briefing: {:?}",
+            seen[0]
+        );
+        assert!(
+            !seen[1].contains("Open work already handed to you"),
+            "unaddressed query has no desk briefing: {:?}",
+            seen[1]
+        );
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    #[tokio::test]
+    async fn awareness_skips_done_cards() {
+        let home = tmp_home();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let rt = RuntimeBuilder::new(home.clone(), desk_manifest())
+            .with_brain(Arc::new(CapturingBrain { seen: seen.clone() }))
+            .build()
+            .await
+            .unwrap();
+        rt.tasks()
+            .upsert(
+                rt.id(),
+                &TaskRecord {
+                    id: "t1".into(),
+                    title: "Already finished".into(),
+                    note: None,
+                    column: "done".into(),
+                    priority: "medium".into(),
+                    assignee: "eng".into(),
+                    updated_at_millis: 0,
+                    origin_chat_id: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: "what's up?".into(),
+            by: None,
+            chat: Some("eng".into()),
+        }])
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            !seen[0].contains("Open work already handed to you"),
+            "done cards are not surfaced as open work: {:?}",
+            seen[0]
+        );
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 }

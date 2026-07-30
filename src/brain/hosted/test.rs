@@ -503,3 +503,191 @@ async fn e2e_supervised_effect_parks_and_acks_not_ok() {
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #176: hosted-path delegation (durable async hand-off, no local
+// cognition) + handed-task awareness.
+// ---------------------------------------------------------------------------
+
+/// A manifest with an Engineering desk (`eng`) whose lead is `eng1`, plus a
+/// hosted brain. Used to prove hosted `delegate_to_desk` resolves the desk and
+/// records the hand-off against it.
+fn desk_manifest() -> CompanyManifest {
+    let toml_src = r#"
+        [company]
+        name = "Acme"
+
+        [brain]
+        mode = "hosted"
+
+        [tools]
+        allow = ["noop"]
+
+        [policy]
+        mode = "full"
+
+        [[agent]]
+        id = "chief"
+        role = "Chief"
+        tier = "orchestrator"
+
+        [[agent]]
+        id = "eng1"
+        role = "Engineer"
+
+        [[group_chat]]
+        id = "eng"
+        name = "Engineering"
+        members = ["eng1"]
+        "#;
+    toml::from_str(toml_src).expect("valid manifest")
+}
+
+/// The hosted catalog registered with Medulla must advertise the delegation
+/// tools on top of the manifest's own `tools.allow`, so a hosted company's
+/// orchestrator can actually delegate.
+#[tokio::test]
+async fn e2e_hosted_catalog_advertises_delegation_tools() {
+    let home = tmp_home();
+    let transport = Arc::new(MockTransport::new());
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "hi".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    let registered = transport.registered_tools();
+    assert_eq!(registered.len(), 1, "tools register exactly once");
+    let names: Vec<&str> = registered[0].iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"noop"), "manifest tool kept: {names:?}");
+    assert!(
+        names.contains(&"spawn_task"),
+        "spawn_task advertised: {names:?}"
+    );
+    assert!(
+        names.contains(&"delegate_to_desk"),
+        "delegate_to_desk advertised: {names:?}"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Medulla emitting a `spawn_task` tool-call on the hosted path opens a durable
+/// board card device-side and answers ok — no local cognition needed.
+#[tokio::test]
+async fn e2e_spawn_task_tool_call_opens_a_board_card() {
+    let home = tmp_home();
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        runtime_cid(),
+        vec![tool_call_frame(
+            "spawn_task",
+            0,
+            json!({ "title": "Ship the invoice flow", "assignee": "eng" }),
+        )],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "open a task to ship invoicing".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    // The tool was answered ok.
+    let answers = transport.tool_answers();
+    assert_eq!(answers.len(), 1);
+    assert!(answers[0].ok, "spawn_task answered ok: {:?}", answers[0]);
+
+    // A durable card landed on the board.
+    let cards = rt.tasks().list(rt.id()).await.unwrap();
+    assert_eq!(cards.len(), 1, "one card opened: {cards:?}");
+    assert_eq!(cards[0].title, "Ship the invoice flow");
+    assert_eq!(cards[0].assignee, "eng");
+    assert_eq!(cards[0].column, "backlog");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Medulla emitting a `delegate_to_desk` tool-call resolves the desk and records
+/// a durable hand-off card assigned to that desk (so it surfaces when the desk
+/// is asked directly). An unknown desk is a clean tool error, not a lost card.
+#[tokio::test]
+async fn e2e_delegate_to_desk_tool_call_writes_a_handoff_card() {
+    let home = tmp_home();
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        runtime_cid(),
+        vec![
+            tool_call_frame(
+                "delegate_to_desk",
+                0,
+                json!({ "desk": "Engineering", "instruction": "build the invoice importer" }),
+            ),
+            tool_call_frame(
+                "delegate_to_desk",
+                1,
+                json!({ "desk": "Nonexistent", "instruction": "do a thing" }),
+            ),
+        ],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), desk_manifest())
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "have engineering build invoicing".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    let answers = transport.tool_answers();
+    assert_eq!(answers.len(), 2);
+    // First hand-off resolved the desk by name and succeeded.
+    assert!(answers[0].ok, "known desk hands off ok: {:?}", answers[0]);
+    // Unknown desk answered ok:false (clean error) and wrote no card.
+    assert!(
+        !answers[1].ok,
+        "unknown desk is a clean error: {:?}",
+        answers[1]
+    );
+
+    let cards = rt.tasks().list(rt.id()).await.unwrap();
+    assert_eq!(cards.len(), 1, "only the known desk got a card: {cards:?}");
+    // Assigned to the resolved desk id, with the lead recorded in the note.
+    assert_eq!(cards[0].assignee, "eng");
+    let note = cards[0].note.as_deref().unwrap_or_default();
+    assert!(note.contains("eng1"), "note records the lead: {note}");
+    assert!(
+        note.contains("build the invoice importer"),
+        "note carries the instruction"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}

@@ -36,9 +36,11 @@ with no `{id}`.
 
 The console's writes are a REST router family under `src/server/ops/`, each
 route registered under **both** scope forms (`…/companies/{id}/…` and the
-`…/company/…` prosumer alias) by the `scoped` helper. All reads for these
-surfaces go through GraphQL (below); these are the mutations only. Anything a
-build doesn't serve `404`s — the console treats that as "not wired yet".
+`…/company/…` prosumer alias) by the `scoped` helper. These are the mutations,
+plus **one deliberate read exception**: the two inbox `GET`s at the end of the
+block below. Every other console read goes through GraphQL (see the read plane
+below). Anything a build doesn't serve `404`s — the console treats that as "not
+wired yet".
 
 ```text
 POST   …/tasks                              create a task card
@@ -59,7 +61,19 @@ DELETE …/team/{agentId}                      remove an overlay teammate
 PUT    …/team/{agentId}/inbox                toggle a teammate's inbox
 POST   …/inboxes/{key}/read                  mark inbox messages read
 POST   …/inboxes/ingest                     HMAC-signed inbound email → inbox
+GET    …/inboxes                            list inboxes + unread counts
+GET    …/inboxes/{key}/messages              one teammate's mail (store order)
 ```
+
+The two inbox `GET`s are the read exception, and they are **REST twins of the
+`Company.inboxes` GraphQL resolver**: the operator console ships no GraphQL
+client, so without them the Inbox view had no reachable per-agent read at all
+and fell back to a client-side fixture (issue #173). They read the same
+`InboxStore` both inbound paths — the ingest webhook and the IMAP poller — file
+into, and `GET …/team` tags each teammate with `inboxEnabled` so the Team toggle
+reflects that store too. Messages come back in append order; the console sorts
+them newest-first. The GraphQL resolver stays the canonical read for any client
+that does speak GraphQL — these routes duplicate it, they do not replace it.
 
 Team writes are an **operator overlay** persisted through the store, merged
 into the manifest roster at read time — the version-controlled `company.toml`
@@ -86,8 +100,10 @@ GET    /api/v1/oauth/callback                OAuth redirect target (unscoped; st
 ## Read plane — GraphQL (`/graphql`)
 
 Every console **read** is served by a single async-graphql query surface at
-`POST /graphql` (with a `GET /graphql` GraphiQL explorer in development). The
-schema is query-only — REST owns writes — and is **built once at startup** and
+`POST /graphql` (with a `GET /graphql` GraphiQL explorer in development) — the
+sole exception being the two inbox `GET`s above, which exist because the console
+ships no GraphQL client and the Inbox view needs a per-agent read. The schema is
+query-only — REST otherwise owns writes — and is **built once at startup** and
 stored on `AppState`; each request injects its resolved `GqlAuth` principal.
 
 The schema is rooted at a **`Company` aggregation object** so a view fetches

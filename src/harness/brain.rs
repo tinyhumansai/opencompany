@@ -23,8 +23,15 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
-use crate::harness::orchestrator::{self, Delegation};
+use crate::harness::orchestrator;
+// `Delegation` is only named by the test-only `run_delegation` wrapper and the
+// delegation tests (via `use super::*`); the cycle path drives the runner's
+// `handle_operator_message` and never spells the type out.
+#[cfg(test)]
+use crate::harness::orchestrator::Delegation;
+use crate::harness::run_turn::HarnessRunTurn;
 use crate::harness::{HarnessDeps, HarnessPool};
+use crate::runtime::delegation::{self, DelegationRunner, RunTurn};
 
 /// The most operator redirects honored within a single task dispatch (issue
 /// #111). A redirect re-runs the turn in-loop with the fresh instruction
@@ -42,7 +49,7 @@ use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
     TokenUsage, TurnStep, TurnStepKind, TurnStepStatus,
 };
-use crate::ports::{TaskRecord, generate_id, now_millis};
+use crate::ports::{TaskRecord, now_millis};
 
 /// A [`Brain`] that answers with a live openhuman agent turn.
 pub struct HarnessBrain {
@@ -50,32 +57,6 @@ pub struct HarnessBrain {
     deps: HarnessDeps,
     record: CompanyRecord,
     responder: String,
-}
-
-/// The outcome of draining one queued delegation.
-///
-/// A `spawn_task` yields nothing operator-visible (it only opens a board card).
-/// A synchronous `delegate_to_desk` yields a [`DeskReply`] — the teammate's
-/// answer captured so the orchestrator can **relay** it in a follow-up turn
-/// (the CEO-relay hand-back) instead of leaving it as a disconnected sibling
-/// bubble. `bubble` stays for any future delegation that surfaces its own
-/// standalone message directly.
-#[derive(Default)]
-struct DelegationOutcome {
-    /// A chat bubble to surface as-is (unused by the current delegations).
-    bubble: Option<OutboundMessage>,
-    /// A synchronous desk reply to relay through a second orchestrator turn.
-    desk_reply: Option<DeskReply>,
-}
-
-/// A synchronous desk-lead answer captured for the orchestrator to relay: which
-/// member answered, their reply text, and their own turn steps (folded onto the
-/// operator timeline so the teammate's activity stays visible on the single
-/// relayed bubble).
-struct DeskReply {
-    member: String,
-    reply: String,
-    steps: Vec<TurnStep>,
 }
 
 impl HarnessBrain {
@@ -151,22 +132,20 @@ impl HarnessBrain {
         let base_instruction = task_instruction(&card);
         let mut instruction = base_instruction.clone();
         let mut redirects: u32 = 0;
+
+        // Route the background turn through the brain-agnostic `RunTurn` seam
+        // (issue #176), re-attaching `HarnessDeps` behind `HarnessRunTurn`.
+        let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+
         // The loop yields the run's operator-facing result on whichever path
         // ends it, so the completion event (#185) reports the same text that
         // lands in the card's note — never a second, divergent rendering.
         let result_text = loop {
-            let outcome = self
-                .pool
+            let outcome = run_turn
                 // A dispatched task card carries no chat bubble (its steps are
                 // discarded into the note), so its live turn frames must not leak
                 // onto the console timeline — run it un-streamed (#125 review).
-                .run_steered_background(
-                    &self.record.id,
-                    &responder,
-                    &instruction,
-                    &self.deps,
-                    &control,
-                )
+                .run_steered_background(&self.record.id, &responder, &instruction, &control)
                 .await;
             // One-shot read of what (if anything) the operator asked for. `None`
             // is the ordinary, unsteered path.
@@ -406,14 +385,10 @@ impl HarnessBrain {
     /// agent or a team-overlay teammate, so an overlay-added lead is reachable on
     /// a desk the manifest left empty.
     fn desk_lead(&self, desk: &str) -> Option<String> {
-        // Resolve the desk key (id or case-insensitive name) against both the
-        // manifest desks and the operator-created overlay desks, so a
-        // runtime-created desk routes exactly like a blueprint one.
-        let desk_id = self.record.resolve_desk_id(desk)?;
-        self.record
-            .effective_desk_members(&desk_id)
-            .into_iter()
-            .find(|m| self.record.is_roster_agent(m))
+        // Desk-lead resolution is brain-agnostic — it reads only `CompanyRecord`
+        // — so it lives on the delegation seam (issue #176); this stays a thin
+        // wrapper for the routing callers on the brain.
+        delegation::desk_lead(&self.record, desk)
     }
 
     /// Drains the MCP failure queue **onto the operator bubble's step timeline**
@@ -552,111 +527,41 @@ impl HarnessBrain {
     /// lead) or a cancelled run yields nothing to relay. No sub-agent
     /// re-delegation in v1: desk members carry no delegation tools, so their
     /// turns queue nothing.
+    ///
+    /// The orchestration lives on the brain-agnostic seam (issue #176); this is
+    /// a thin wrapper that re-attaches `HarnessDeps` behind a
+    /// [`HarnessRunTurn`] and drives a [`DelegationRunner`]. It exists only to
+    /// keep the delegation tests exercising the same code path the cycle drives
+    /// through [`DelegationRunner::handle_operator_message`], so it is
+    /// test-only — the cycle never calls it directly.
+    #[cfg(test)]
     async fn run_delegation(
         &self,
         delegation: Delegation,
         chat_id: Option<&str>,
-    ) -> Result<DelegationOutcome> {
-        match delegation {
-            Delegation::SpawnTask {
-                title,
-                note,
-                assignee,
-            } => {
-                let Some(tasks) = self.deps.tasks.as_ref() else {
-                    return Ok(DelegationOutcome::default());
-                };
-                let card = TaskRecord {
-                    id: generate_id(),
-                    title,
-                    note,
-                    column: "backlog".to_string(),
-                    priority: "medium".to_string(),
-                    assignee: assignee.unwrap_or_default(),
-                    updated_at_millis: now_millis(),
-                    // Issue #151 §3.2: remember which conversation asked for
-                    // this, so the completion can answer there instead of only
-                    // landing in the note.
-                    origin_chat_id: chat_id.map(str::to_string),
-                    // No parent (#185). `run_delegation` is only reached from an
-                    // orchestrator *chat* turn: `run_task` never drains the
-                    // delegation queue, and a dispatched card's responder is a
-                    // desk member, which carries no delegation tools ("no
-                    // sub-agent re-delegation in v1", above). So no task is ever
-                    // in scope here to be the parent. Lineage is written through
-                    // the task API's `parentTaskId` instead; when task turns do
-                    // gain delegation tools, this is the site that stamps it.
-                    parent_task_id: None,
-                };
-                tasks.upsert(&self.record.id, &card).await?;
-                Ok(DelegationOutcome::default())
-            }
-            Delegation::DelegateToDesk { desk, instruction } => {
-                let Some(member) = self.desk_lead(&desk) else {
-                    return Ok(DelegationOutcome::default());
-                };
-                // Register the delegated turn so an operator can CANCEL it
-                // mid-flight (cancel-only in v1 — pause/redirect are rejected at
-                // the route). RAII guard deregisters on every exit path.
-                let guard = self.deps.steer.register(
-                    &self.record.id,
-                    InflightEntry {
-                        key: generate_id(),
-                        task_id: None,
-                        kind: InflightKind::Delegation,
-                        title: desk.clone(),
-                        agent_id: member.clone(),
-                        started_at_millis: now_millis(),
-                        pending_action: None,
-                    },
-                );
-                let control = guard.control().clone();
-                let outcome = self
-                    .pool
-                    .run_steered(
-                        &self.record.id,
-                        &member,
-                        &instruction,
-                        &self.deps,
-                        &control,
-                        chat_id,
-                    )
-                    .await?;
-                // A cancel issued mid-flight discards the delegated reply —
-                // nothing is relayed.
-                if matches!(control.take(), Some(SteerAction::Cancel)) {
-                    return Ok(DelegationOutcome::default());
-                }
-                // Hand the teammate's answer back to the caller to RELAY through
-                // a second orchestrator turn (the CEO-relay hand-back). Their
-                // steps ride along and get folded onto the relayed operator
-                // bubble so the teammate's activity stays visible.
-                Ok(DelegationOutcome {
-                    bubble: None,
-                    desk_reply: Some(DeskReply {
-                        member,
-                        reply: outcome.reply,
-                        steps: outcome.steps,
-                    }),
-                })
-            }
-        }
+    ) -> Result<delegation::DelegationOutcome> {
+        let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+        self.delegation_runner(&run_turn)
+            .run_delegation(delegation, chat_id)
+            .await
     }
-}
 
-/// The prompt for the CEO-relay hand-back turn: the operator's original message
-/// plus each teammate's reply, framed so the orchestrator relays the answer back
-/// as its own single, coherent response and does not delegate again.
-fn build_relay_prompt(original: &str, desk_replies: &[(String, String)]) -> String {
-    let mut prompt = format!(
-        "The operator asked:\n{original}\n\nYou delegated this to your team and their reply is \
-below. Relay their answer back to the operator now as your own single, coherent response — \
-summarize it or pass it along. Do not delegate again; just relay what came back."
-    );
-    for (member, reply) in desk_replies {
-        prompt.push_str(&format!("\n\n{member} replied:\n{reply}"));
+    /// Builds a [`DelegationRunner`] over `run_turn`, threading the brain-agnostic
+    /// handles it needs — the record (desk-lead resolution), the task store, the
+    /// steer registry, the company id, and the shared delegation queue the turn
+    /// pushes onto. `HarnessDeps` never crosses the seam; it stays behind
+    /// `run_turn`.
+    fn delegation_runner<'a>(&'a self, run_turn: &'a HarnessRunTurn<'a>) -> DelegationRunner<'a> {
+        DelegationRunner::new(
+            run_turn,
+            &self.record,
+            self.deps.tasks.as_ref(),
+            &self.deps.steer,
+            &self.record.id,
+            &self.deps.delegations,
+            orchestrator::MAX_DELEGATIONS_PER_TURN,
+        )
     }
-    prompt
 }
 
 /// The turn instruction for a dispatched card: its title, plus its note when it
@@ -746,79 +651,21 @@ impl Brain for HarnessBrain {
                     // in this cycle rides the same operator thread, so it gets the
                     // same id.
                     let chat_id = chat.as_deref();
-                    // Clear stale delegations + MCP failures so nothing leaks from
-                    // a prior turn, run the turn (metered through `deps`), then
-                    // drain whatever the orchestrator queued (capped; discarded
-                    // past the cap).
-                    self.deps.delegations.clear();
+                    // Clear stale MCP failures so nothing leaks from a prior turn
+                    // (the delegation queue is cleared inside the runner, right
+                    // before the orchestrator turn).
                     self.deps.mcp_failures.clear();
-                    let outcome = self
-                        .pool
-                        .run(&self.record.id, &responder, text, &self.deps, chat_id)
+                    // Drive the brain-agnostic delegation seam (issue #176): the
+                    // orchestrator turn, its queued delegations, and the CEO-relay
+                    // hand-back all run behind the `RunTurn` impl. `HarnessDeps` is
+                    // re-attached behind `HarnessRunTurn`.
+                    let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+                    let turn = self
+                        .delegation_runner(&run_turn)
+                        .handle_operator_message(&responder, text, chat_id)
                         .await?;
-                    // The orchestrator's own steps ride on the operator bubble;
-                    // its reply is the operator-facing text UNLESS a synchronous
-                    // desk delegation runs, in which case the relay turn's reply
-                    // replaces it (below).
-                    let mut operator_steps = outcome.steps;
-                    let mut operator_reply = outcome.reply;
-                    // Run whatever the orchestrator queued. A `spawn_task` opens a
-                    // card silently; a `delegate_to_desk` runs the desk lead and
-                    // hands its answer back to RELAY (the CEO-relay hand-back)
-                    // rather than surfacing as a disconnected sibling bubble. Any
-                    // future delegation that surfaces its own bubble lands in
-                    // `delegated`.
-                    let mut delegated = Vec::new();
-                    let mut desk_replies: Vec<(String, String)> = Vec::new();
-                    for delegation in self
-                        .deps
-                        .delegations
-                        .drain(orchestrator::MAX_DELEGATIONS_PER_TURN)
-                    {
-                        let out = self.run_delegation(delegation, chat_id).await?;
-                        if let Some(bubble) = out.bubble {
-                            delegated.push(bubble);
-                        }
-                        if let Some(desk) = out.desk_reply {
-                            // Fold the teammate's activity onto the operator
-                            // timeline, then remember the answer to relay.
-                            operator_steps.extend(desk.steps);
-                            desk_replies.push((desk.member, desk.reply));
-                        }
-                    }
-                    // CEO-relay hand-back: when a synchronous desk delegation
-                    // answered, run exactly ONE more orchestrator turn whose
-                    // prompt is the original message plus the teammate reply,
-                    // and surface THAT as the operator bubble — so the CEO comes
-                    // back with the answer in one coherent conversation. The
-                    // relay turn must not re-delegate: its prompt is relay-only,
-                    // and as a safety net the delegation queue is cleared before
-                    // it and drained-and-discarded after, so anything it tries
-                    // to queue is dropped (bounding cost to one extra turn, no
-                    // re-delegation loop). No delegation → the single first turn
-                    // stays exactly as before.
-                    if !desk_replies.is_empty() {
-                        let relay_prompt = build_relay_prompt(text, &desk_replies);
-                        self.deps.delegations.clear();
-                        let relay = self
-                            .pool
-                            .run(
-                                &self.record.id,
-                                &responder,
-                                &relay_prompt,
-                                &self.deps,
-                                chat_id,
-                            )
-                            .await?;
-                        // Discard anything the relay turn queued — it can only
-                        // relay, never re-delegate.
-                        let _ = self
-                            .deps
-                            .delegations
-                            .drain(orchestrator::MAX_DELEGATIONS_PER_TURN);
-                        operator_reply = relay.reply;
-                        operator_steps.extend(relay.steps);
-                    }
+                    let mut operator_steps = turn.steps;
+                    let operator_reply = turn.reply;
                     // Re-skin any MCP tool-call failures (from the orchestrator
                     // turn, a delegated desk turn, or the relay turn) as error
                     // steps on the operator bubble — one surface, one renderer.
@@ -829,7 +676,7 @@ impl Brain for HarnessBrain {
                         reply_to: None,
                         steps: operator_steps,
                     });
-                    channel_responses.extend(delegated);
+                    channel_responses.extend(turn.bubbles);
                 }
                 CompanyEvent::TaskDispatched { task_id } => {
                     if let Some(message) = self.run_task(task_id).await? {
