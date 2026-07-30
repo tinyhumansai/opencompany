@@ -191,6 +191,7 @@ async fn steer_task_validates_statuses_and_journals_acceptance() {
                 assignee: String::new(),
                 updated_at_millis: 1,
                 origin_chat_id: None,
+                parent_task_id: None,
             },
         )
         .await
@@ -1817,6 +1818,138 @@ async fn telegram_token_never_leaks_even_when_delivery_fails() {
     assert!(
         !raw.contains(BOT_TOKEN),
         "token leaked on a failed delivery"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// #185: `GET …/tasks/{id}` assembles the header, the per-task timeline, and
+/// the lineage in one read.
+///
+/// The timeline half is the point: the journal is company-scoped, so this
+/// asserts that a reply tagged with *this* task is admitted while an untagged
+/// chat reply and a reply tagged to a *different* task are both excluded. Those
+/// three cases are exactly what the `task_id` threading exists to separate.
+#[tokio::test]
+async fn task_detail_assembles_timeline_and_lineage() {
+    use crate::ports::types::CompanyEvent;
+
+    let home = home();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+
+    let card = |id: &str, title: &str, parent: Option<&str>| TaskRecord {
+        id: id.into(),
+        title: title.into(),
+        note: None,
+        column: "in_review".into(),
+        priority: "medium".into(),
+        assignee: "ceo".into(),
+        updated_at_millis: 1,
+        origin_chat_id: None,
+        parent_task_id: parent.map(str::to_string),
+    };
+    for t in [
+        card("t-parent", "Parent", None),
+        card("t-1", "Ship it", Some("t-parent")),
+        card("t-child", "Subtask", Some("t-1")),
+        card("t-other", "Unrelated", None),
+    ] {
+        runtime.tasks().upsert(&company, &t).await.unwrap();
+    }
+
+    for event in [
+        CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+        },
+        // Tagged to this task — admitted.
+        CompanyEvent::AgentReply {
+            chat_id: "t-1".into(),
+            agent_id: "ceo".into(),
+            text: "on it".into(),
+            steps: Vec::new(),
+            task_id: Some("t-1".into()),
+        },
+        // An ordinary chat reply — excluded.
+        CompanyEvent::AgentReply {
+            chat_id: "General".into(),
+            agent_id: "ceo".into(),
+            text: "unrelated chatter".into(),
+            steps: Vec::new(),
+            task_id: None,
+        },
+        // Tagged to a different task — excluded.
+        CompanyEvent::AgentReply {
+            chat_id: "t-other".into(),
+            agent_id: "ceo".into(),
+            text: "someone else's work".into(),
+            steps: Vec::new(),
+            task_id: Some("t-other".into()),
+        },
+        CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".into(),
+            desk: "ceo".into(),
+            output: "shipped".into(),
+            column: "in_review".into(),
+        },
+    ] {
+        runtime.events().append(&company, event).await.unwrap();
+    }
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(body["task"]["id"], "t-1");
+    assert_eq!(body["task"]["parentTaskId"], "t-parent");
+
+    let kinds: Vec<&str> = body["timeline"]
+        .as_array()
+        .expect("timeline array")
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["dispatched", "reply", "completed"]);
+
+    let raw = serde_json::to_string(&body["timeline"]).unwrap();
+    assert!(
+        !raw.contains("unrelated chatter") && !raw.contains("someone else's work"),
+        "another task's / an untagged chat reply leaked onto this timeline: {raw}"
+    );
+
+    assert_eq!(body["lineage"]["parent"]["id"], "t-parent");
+    let children = body["lineage"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["id"], "t-child");
+
+    // An unknown id 404s, matching PATCH/DELETE.
+    let (status, _) = send(&state, "GET", "/api/v1/company/tasks/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// #185 gave `GET …/tasks/{task_id}` a handler, which now overlaps the static
+/// `GET …/tasks/inflight` the operator strip reads.
+///
+/// Before #185 the dynamic segment carried no GET, so nothing could shadow the
+/// strip. Now something can: if the routes were ever reordered (or the static
+/// one dropped), `inflight` would be parsed as a *card id*, `task_detail` would
+/// find no such card, and the strip would 404 — with no test failing anywhere
+/// else, because no card can be named `inflight` for the collision to show up
+/// in ordinary use.
+#[tokio::test]
+async fn inflight_read_is_not_shadowed_by_task_detail() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // The strip's read still resolves to the inflight handler: an array, not
+    // the object `task_detail` would return, and not a 404.
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/inflight", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.is_array(),
+        "GET /tasks/inflight must hit list_inflight, not task_detail: {body}"
     );
 
     tokio::fs::remove_dir_all(&home).await.ok();

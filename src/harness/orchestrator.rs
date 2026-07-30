@@ -420,6 +420,9 @@ fn summarize_event(event: &CompanyEvent) -> String {
         CompanyEvent::TaskSteered {
             task_id, action, ..
         } => format!("task steered ({action}): {task_id}"),
+        CompanyEvent::DeskTaskCompleted {
+            task_id, column, ..
+        } => format!("task completed ({column}): {task_id}"),
     }
 }
 

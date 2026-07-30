@@ -118,8 +118,10 @@ impl HarnessBrain {
         let base_instruction = task_instruction(&card);
         let mut instruction = base_instruction.clone();
         let mut redirects: u32 = 0;
-
-        loop {
+        // The loop yields the run's operator-facing result on whichever path
+        // ends it, so the completion event (#185) reports the same text that
+        // lands in the card's note — never a second, divergent rendering.
+        let result_text = loop {
             let outcome = self
                 .pool
                 // A dispatched task card carries no chat bubble (its steps are
@@ -140,34 +142,28 @@ impl HarnessBrain {
                     // A dispatched task discards its steps — the note is text-only.
                     match outcome {
                         Ok(outcome) => {
-                            card.note = Some(append_result(
-                                card.note.as_deref(),
-                                &responder,
-                                &outcome.reply,
-                            ));
+                            let result = outcome.reply;
+                            card.note =
+                                Some(append_result(card.note.as_deref(), &responder, &result));
                             card.column = "in_review".to_string();
+                            break result;
                         }
                         Err(err) => {
-                            card.note = Some(append_result(
-                                card.note.as_deref(),
-                                &responder,
-                                &format!("dispatch failed: {err}"),
-                            ));
+                            let result = format!("dispatch failed: {err}");
+                            card.note =
+                                Some(append_result(card.note.as_deref(), &responder, &result));
                             card.column = "backlog".to_string();
+                            break result;
                         }
                     }
-                    break;
                 }
                 Some(SteerAction::Cancel) => {
                     // Partial work is DISCARDED — only a cancellation note lands,
                     // and the card returns to `backlog`.
-                    card.note = Some(append_result(
-                        card.note.as_deref(),
-                        "operator",
-                        "cancelled while in flight",
-                    ));
+                    let result = "cancelled while in flight".to_string();
+                    card.note = Some(append_result(card.note.as_deref(), "operator", &result));
                     card.column = "backlog".to_string();
-                    break;
+                    break result;
                 }
                 Some(SteerAction::Pause) => {
                     // Partial work is PRESERVED in the note; the card parks in the
@@ -180,7 +176,7 @@ impl HarnessBrain {
                     };
                     card.note = Some(append_result(card.note.as_deref(), &responder, &partial));
                     card.column = "paused".to_string();
-                    break;
+                    break partial;
                 }
                 Some(SteerAction::Redirect { instruction: fresh }) => {
                     redirects += 1;
@@ -198,7 +194,7 @@ impl HarnessBrain {
                         };
                         card.note = Some(append_result(card.note.as_deref(), &responder, &last));
                         card.column = "in_review".to_string();
-                        break;
+                        break last;
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
                     // operator instruction.
@@ -209,12 +205,67 @@ impl HarnessBrain {
                     continue;
                 }
             }
-        }
+        };
 
         card.updated_at_millis = now_millis();
         tasks.upsert(&self.record.id, &card).await?;
         // `guard` drops here → the run leaves the in-flight strip.
         drop(guard);
+
+        // Issue #185: correlate this dispatch's journal trail to its card.
+        //
+        // Ordering matters. Any MCP failures the turn queued are drained FIRST,
+        // tagged with this task, so they land on the task's own timeline. Before
+        // this they were left in the queue for whichever operator turn drained
+        // next — which both mis-attributed them to an unrelated chat bubble and
+        // left the dispatch's timeline silent about the very calls that broke.
+        //
+        // The steps the drain produces are discarded, matching the rest of
+        // `run_task`: a dispatched card has no chat bubble to render them on
+        // (they are journaled as `McpCallFailed` events instead).
+        let mut discarded_steps = Vec::new();
+        self.surface_mcp_failures(&mut discarded_steps, Some(&card.id))
+            .await?;
+
+        if let Some(events) = self.deps.events.as_ref() {
+            // The run's reply, tagged so the per-task timeline can filter it out
+            // of the company-scoped journal.
+            //
+            // `chat_id` is the **card id**, deliberately, not the card's origin
+            // thread. `chat_history::owns` routes a reply into a desk's history
+            // by matching `chat_id` against the desk id/name, so using the
+            // origin here would inject this record into that desk's chat — a
+            // behaviour change well outside a read foundation, and a duplicate
+            // of the live post-back bubble below. A card id matches no desk, so
+            // the record stays exactly what it is: timeline material, reachable
+            // only through `task_id`. An empty string would be worse still — it
+            // folds into the General desk.
+            events
+                .append(
+                    &self.record.id,
+                    CompanyEvent::AgentReply {
+                        chat_id: card.id.clone(),
+                        agent_id: responder.clone(),
+                        text: result_text.clone(),
+                        steps: Vec::new(),
+                        task_id: Some(card.id.clone()),
+                    },
+                )
+                .await?;
+            // The terminal anchor, journaled after the card's landing column is
+            // persisted so it always records a completed run.
+            events
+                .append(
+                    &self.record.id,
+                    CompanyEvent::DeskTaskCompleted {
+                        task_id: card.id.clone(),
+                        desk: responder.clone(),
+                        output: result_text,
+                        column: card.column.clone(),
+                    },
+                )
+                .await?;
+        }
 
         // Issue #151 §3.2: answer in the conversation the card was spawned
         // from. Only a card that remembers an origin posts back — one created
@@ -308,7 +359,17 @@ impl HarnessBrain {
     /// instead of a separate warning bubble. Every string was already scrubbed at
     /// the source (`OcMcpCallTool`), so `scrubbed_message` is safe to show and to
     /// persist.
-    async fn surface_mcp_failures(&self, steps: &mut Vec<TurnStep>) -> Result<()> {
+    ///
+    /// `task_id` is the dispatched card the failing turn belonged to, when the
+    /// drain runs inside a [`CompanyEvent::TaskDispatched`] cycle (issue #185).
+    /// It is stamped onto each journaled failure so a task's broken tool calls
+    /// can be filtered out of the company-scoped journal onto its own timeline;
+    /// a chat turn passes `None` and journals exactly as before.
+    async fn surface_mcp_failures(
+        &self,
+        steps: &mut Vec<TurnStep>,
+        task_id: Option<&str>,
+    ) -> Result<()> {
         for failure in self.deps.mcp_failures.drain() {
             steps.push(TurnStep {
                 kind: TurnStepKind::Note,
@@ -322,6 +383,7 @@ impl HarnessBrain {
                     .append(
                         &self.record.id,
                         CompanyEvent::McpCallFailed {
+                            task_id: task_id.map(str::to_string),
                             server: failure.server,
                             tool: failure.tool,
                             status: failure.status,
@@ -370,6 +432,15 @@ impl HarnessBrain {
                     // this, so the completion can answer there instead of only
                     // landing in the note.
                     origin_chat_id: chat_id.map(str::to_string),
+                    // No parent (#185). `run_delegation` is only reached from an
+                    // orchestrator *chat* turn: `run_task` never drains the
+                    // delegation queue, and a dispatched card's responder is a
+                    // desk member, which carries no delegation tools ("no
+                    // sub-agent re-delegation in v1", above). So no task is ever
+                    // in scope here to be the parent. Lineage is written through
+                    // the task API's `parentTaskId` instead; when task turns do
+                    // gain delegation tools, this is the site that stamps it.
+                    parent_task_id: None,
                 };
                 tasks.upsert(&self.record.id, &card).await?;
                 Ok(None)
@@ -510,7 +581,7 @@ impl Brain for HarnessBrain {
                     // Re-skin any MCP tool-call failures (from the orchestrator
                     // turn or a delegated desk turn) as error steps on the
                     // operator bubble — one surface, one renderer.
-                    self.surface_mcp_failures(&mut operator_steps).await?;
+                    self.surface_mcp_failures(&mut operator_steps, None).await?;
                     channel_responses.push(OutboundMessage {
                         channel: "operator".to_string(),
                         text: outcome.reply,
@@ -805,6 +876,7 @@ description = "Builds it."
             assignee: assignee.to_string(),
             updated_at_millis: 0,
             origin_chat_id: None,
+            parent_task_id: None,
         }
     }
 
@@ -1473,8 +1545,10 @@ members = ["eng1", "eng2"]
         });
 
         let mut steps: Vec<TurnStep> = Vec::new();
+        // `None` — this is the chat-turn drain, which journals no `task_id`
+        // (#185). The dispatch drain passes the card id; see `run_task`.
         brain
-            .surface_mcp_failures(&mut steps)
+            .surface_mcp_failures(&mut steps, None)
             .await
             .expect("drain surfaces failures");
 

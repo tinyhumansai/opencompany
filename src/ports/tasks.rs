@@ -45,6 +45,26 @@ pub struct TaskRecord {
     /// both simply get no post-back, exactly as today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_chat_id: Option<String>,
+    /// The task whose dispatch turn spawned this card (issue #185) — the
+    /// parent half of the Task Detail screen's lineage.
+    ///
+    /// An agent running a dispatched card can itself delegate, opening a new
+    /// backlog card through the same `spawn_task` path. That makes the board a
+    /// forest, but nothing recorded the edge: `origin_chat_id` names the
+    /// *conversation* a card came from, which is shared by every sibling
+    /// spawned in that thread and is `None` entirely for a board-native card.
+    /// Lineage needs the task-to-task edge, so it gets its own field.
+    ///
+    /// Read back as: `parent` is the card with this id; `children` are the
+    /// cards whose `parent_task_id` is this card's id.
+    ///
+    /// `None` for a card created straight on the board, for one delegated from
+    /// an ordinary chat turn (no task in scope), and for every card written
+    /// before this field existed — all three are lineage roots, exactly as
+    /// today. Additive on the wire like [`Self::origin_chat_id`], so no stored
+    /// board needs migrating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
 }
 
 /// Durable per-company task board. Company A's tasks MUST be invisible to

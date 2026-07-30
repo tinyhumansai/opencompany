@@ -630,6 +630,7 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             agent_id,
             text,
             steps,
+            task_id,
         } => {
             let mut o = envelope("agent_reply");
             o["chatId"] = json!(chat_id);
@@ -639,6 +640,11 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             // when empty so a tool-less reply's wire form is unchanged.
             if !steps.is_empty() {
                 o["steps"] = json!(steps);
+            }
+            // Correlation key for a dispatch-produced reply (#185); omitted for
+            // an ordinary chat reply so the legacy wire shape is unchanged.
+            if let Some(task_id) = task_id {
+                o["taskId"] = json!(task_id);
             }
             o
         }
@@ -655,12 +661,34 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             tool,
             status,
             message,
+            task_id,
         } => {
             let mut o = envelope("mcp_call_failed");
             o["server"] = json!(server);
             o["tool"] = json!(tool);
             o["status"] = json!(status);
             o["message"] = json!(message);
+            // Correlation key when the failing call ran inside a dispatch
+            // (#185); omitted for a chat-turn failure.
+            if let Some(task_id) = task_id {
+                o["taskId"] = json!(task_id);
+            }
+            o
+        }
+        // The dispatch terminal (#185). `output` is the agent's own reply text
+        // — the same string already written into the card's note — never raw
+        // tool output, so it is safe to project.
+        CompanyEvent::DeskTaskCompleted {
+            task_id,
+            desk,
+            output,
+            column,
+        } => {
+            let mut o = envelope("desk_task_completed");
+            o["taskId"] = json!(task_id);
+            o["desk"] = json!(desk);
+            o["output"] = json!(output);
+            o["column"] = json!(column);
             o
         }
         CompanyEvent::ApprovalResolved {
@@ -839,6 +867,7 @@ async fn run_chat(
             assignee: String::new(),
             updated_at_millis: crate::ports::now_millis(),
             origin_chat_id: None,
+            parent_task_id: None,
         };
         if let Err(err) = runtime.upsert_task(&record).await {
             tracing::warn!(error = %err, "failed to open task card for chat request");
@@ -882,6 +911,7 @@ async fn chat_and_emit(
             .append(
                 id,
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: desk.clone(),
                     agent_id: response.channel.clone(),
                     text: response.text.clone(),
@@ -2092,6 +2122,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: "General".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "reply under General".to_string(),
@@ -2105,6 +2136,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: "main".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "reply under main".to_string(),
@@ -2159,6 +2191,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: "main".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "done".to_string(),
@@ -2487,6 +2520,7 @@ mod test {
     fn projects_agent_reply_with_chat_fields_and_steps() {
         use crate::ports::types::{TurnStep, TurnStepKind, TurnStepStatus};
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "General".into(),
             agent_id: "ceo".into(),
             text: "shipped it".into(),
@@ -2513,6 +2547,7 @@ mod test {
     #[test]
     fn projects_agent_reply_omits_empty_steps() {
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "General".into(),
             agent_id: "ceo".into(),
             text: "hi".into(),
@@ -2536,6 +2571,7 @@ mod test {
     #[test]
     fn projects_mcp_call_failed_with_scrubbed_message() {
         let v = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            task_id: None,
             server: "browserbase".into(),
             tool: "browse".into(),
             status: "tool_call_rejected".into(),

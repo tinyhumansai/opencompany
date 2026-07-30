@@ -310,6 +310,23 @@ pub enum CompanyEvent {
         /// scrubbed shape (see [`crate::harness::steps`]).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         steps: Vec<TurnStep>,
+        /// The board task this reply was produced by, when it came out of a
+        /// [`TaskDispatched`](Self::TaskDispatched) cycle rather than a chat
+        /// turn (issue #185).
+        ///
+        /// This is the correlation key the per-task timeline filters on: the
+        /// journal is company-scoped, so without it a dispatch's reply cannot
+        /// be told apart from every other desk reply in the log.
+        ///
+        /// `None` for an ordinary chat reply and for every event journaled
+        /// before this field existed. Additive in exactly the same way as
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by` / `chat`:
+        /// `#[serde(default)]` is what lets an already-persisted log load, and
+        /// `skip_serializing_if` is what keeps an untagged reply serializing
+        /// byte-for-byte as it did before this field existed, so no stored
+        /// record needs migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// The Operator deleted a durable memory fact. Journaled for the audit trail
     /// per the Operator-rights section of `docs/spec/company-brain/memory.md`.
@@ -342,6 +359,16 @@ pub enum CompanyEvent {
         status: String,
         /// A short, scrubbed, operator-facing message.
         message: String,
+        /// The board task whose dispatch turn made the failing call, when the
+        /// failure happened inside a [`TaskDispatched`](Self::TaskDispatched)
+        /// cycle (issue #185). Lets a task's failed tool calls be filtered out
+        /// of the company-scoped journal onto its own timeline.
+        ///
+        /// `None` for a failure raised during a chat turn and for every event
+        /// journaled before this field existed. Same additive contract as
+        /// [`AgentReply`](Self::AgentReply)'s `task_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// A new workflow graph was authored and enabled (issue #112), from either
     /// the console `POST …/workflows` route or the orchestrator's
@@ -384,6 +411,40 @@ pub enum CompanyEvent {
         /// mirroring [`OperatorMessage`](Self::OperatorMessage)'s `by`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
+    },
+    /// A dispatched board task finished its run (issue #185) — the terminal
+    /// anchor a per-task timeline ends on and a lineage rollup counts.
+    ///
+    /// Journaled by the harness at the end of a
+    /// [`TaskDispatched`](Self::TaskDispatched) cycle, **after** the card's
+    /// landing column has been persisted, so it always records a completed
+    /// run. "Completed" here means *the run stopped*, not *it succeeded*: a
+    /// cancelled, paused, or failed dispatch emits one too, and `column`
+    /// carries where the card actually landed. Without that, a timeline could
+    /// not distinguish "still running" from "finished badly".
+    ///
+    /// This issue only *adds* the event. #171's done-transition can consume
+    /// it; nothing here writes the board column off the back of it.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes.
+    DeskTaskCompleted {
+        /// The completed task card's id.
+        task_id: String,
+        /// The desk / agent that ran it — the resolved responder, not the
+        /// card's raw `assignee` (which may name nobody on the roster).
+        desk: String,
+        /// The run's operator-facing result text.
+        ///
+        /// This is the agent's own reply (or a short `dispatch failed: …` /
+        /// cancellation line), which is the same text already written into the
+        /// card's note — never raw tool output, arguments, or call ids.
+        output: String,
+        /// The board column the card landed in: `in_review` on a normal
+        /// finish, `backlog` on a failure or cancellation, `paused` on a
+        /// pause. Lets a reader tell a successful run from a stopped one
+        /// without re-deriving it from `output`.
+        column: String,
     },
 }
 
@@ -1406,6 +1467,7 @@ mod test {
 
         // A tool-less reply serializes without the `steps` key.
         let tool_less = CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
             text: "hi".to_string(),
@@ -1416,6 +1478,7 @@ mod test {
 
         // A reply with a timeline round-trips it.
         let with_steps = CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
             text: "done".to_string(),
@@ -1430,6 +1493,76 @@ mod test {
         let back: CompanyEvent =
             serde_json::from_str(&serde_json::to_string(&with_steps).unwrap()).unwrap();
         assert_eq!(back, with_steps);
+    }
+
+    /// #185: the `task_id` correlation key is additive in both directions —
+    /// an event journaled before it existed still loads, and an untagged event
+    /// still serializes byte-for-byte as it did before the field was added.
+    ///
+    /// That second half is the migration-free guarantee: every already-persisted
+    /// `AgentReply` / `McpCallFailed` in every company's log must round-trip
+    /// unchanged, or the cross-backend export/import comparison breaks.
+    #[test]
+    fn task_id_correlation_is_additive_and_omitted_when_absent() {
+        let legacy: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#,
+        )
+        .expect("a pre-task_id AgentReply still loads");
+        match &legacy {
+            CompanyEvent::AgentReply { task_id, .. } => assert!(task_id.is_none()),
+            other => panic!("expected AgentReply, got {other:?}"),
+        }
+
+        // An untagged reply keeps the legacy wire shape exactly.
+        let untagged = CompanyEvent::AgentReply {
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+            task_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).unwrap(),
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#
+        );
+
+        // A dispatch-produced reply carries the key and round-trips.
+        let tagged = CompanyEvent::AgentReply {
+            chat_id: "t-1".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "done".to_string(),
+            steps: Vec::new(),
+            task_id: Some("t-1".to_string()),
+        };
+        let back: CompanyEvent =
+            serde_json::from_str(&serde_json::to_string(&tagged).unwrap()).unwrap();
+        assert_eq!(back, tagged);
+
+        // Same contract on the failure event.
+        let legacy_mcp: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"McpCallFailed","server":"gh","tool":"issues","status":"credential_required","message":"needs auth"}"#,
+        )
+        .expect("a pre-task_id McpCallFailed still loads");
+        match &legacy_mcp {
+            CompanyEvent::McpCallFailed { task_id, .. } => assert!(task_id.is_none()),
+            other => panic!("expected McpCallFailed, got {other:?}"),
+        }
+    }
+
+    /// #185: the dispatch terminal round-trips, and reports where the card
+    /// landed so a stopped run is distinguishable from a successful one.
+    #[test]
+    fn desk_task_completed_round_trips() {
+        let done = CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".to_string(),
+            desk: "ceo".to_string(),
+            output: "shipped".to_string(),
+            column: "in_review".to_string(),
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains(r#""kind":"DeskTaskCompleted""#));
+        let back: CompanyEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, done);
     }
 
     #[test]
@@ -1540,6 +1673,7 @@ mod test {
     #[test]
     fn mcp_call_failed_round_trips_and_is_byte_stable() {
         let event = CompanyEvent::McpCallFailed {
+            task_id: None,
             server: "browserbase".into(),
             tool: "browse".into(),
             status: "tool_call_rejected".into(),

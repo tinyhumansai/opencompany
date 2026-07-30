@@ -80,7 +80,28 @@ pub trait EventLog: Send + Sync {
 graph was authored + enabled via the console `POST …/workflows` route or the
 orchestrator's `create_workflow` tool; journaled best-effort after persist),
 `TaskSteered` (an operator paused, cancelled, or redirected an in-flight task
-or delegation).
+or delegation), `DeskTaskCompleted` (a dispatched board task finished its run —
+the terminal anchor a per-task timeline ends on; "completed" means the run
+stopped, not that it succeeded, and `column` carries where the card landed).
+
+### Per-task event correlation (issue #185)
+
+The journal is company-scoped, so the events a dispatch *produces* cannot be
+filtered back to their task by shape alone. `AgentReply` and `McpCallFailed`
+therefore carry an optional `task_id`, stamped by the harness when the
+producing turn ran inside a `TaskDispatched` cycle and absent for an ordinary
+chat turn. Together with the `TaskDispatched` / `DeskTaskCompleted` anchors,
+that is what `GET …/tasks/{task_id}` filters on to assemble a task's timeline.
+
+Both fields are additive — `#[serde(default, skip_serializing_if = …)]` — so
+every already-persisted event loads unchanged and an untagged event serializes
+byte-for-byte as it did before the field existed. No stored log needs
+migrating, and the cross-backend export/import round-trip is unaffected.
+
+`TaskRecord` gains `parent_task_id` on the same contract, recording the
+task-to-task edge that `origin_chat_id` (a *conversation*, shared by every
+sibling spawned in that thread, and absent entirely on a board-native card)
+cannot express. It is the parent half of the Task Detail screen's lineage.
 
 ## MemoryStore
 
