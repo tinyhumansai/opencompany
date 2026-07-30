@@ -949,6 +949,8 @@ impl RuntimeBuilder {
                                 // MCP set each turn (MCP-freshness) rather than the
                                 // snapshot frozen here at boot.
                                 mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+                                approval_requests:
+                                    crate::harness::policy::ApprovalRequestQueue::default(),
                                 secrets: Some(secrets.clone()),
                                 // Cell A: the `web` toolbelt SSRF allowlist.
                                 // Domains come straight from the manifest.

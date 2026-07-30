@@ -334,6 +334,48 @@ impl HarnessBrain {
         Ok(())
     }
 
+    /// Drains the approval-request queue and parks each request on the host's
+    /// approval gate, so an approval-gated tool call the agent hit during this
+    /// cycle reaches the operator's Approvals page (issue #172).
+    ///
+    /// The missing half of the approval path. openhuman resolves a
+    /// `RequireApproval` **inline** — it blocks the tool and narrates the
+    /// refusal to the model — so nothing downstream of the turn ever learned a
+    /// request existed and `journal.pending()` stayed empty. The
+    /// [`ApprovalPolicy`](crate::harness::policy::ApprovalPolicy) now records
+    /// each blocked call on the shared queue; this drains it once per cycle and
+    /// parks it through
+    /// [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect).
+    ///
+    /// Parked, not re-evaluated:
+    /// [`emit_effect`](crate::ports::brain::CycleHost::emit_effect) would
+    /// re-decide the request against the runtime
+    /// [`ApprovalGate`](crate::ports::ApprovalGate), which allows (and therefore
+    /// "executes") anything it classifies as
+    /// [`EffectGroup::Other`](crate::ports::types::EffectGroup::Other) — most
+    /// gated tool calls — and the request would disappear again. The verdict was
+    /// already reached inside the turn; the runtime's job here is only to hold
+    /// it for the operator.
+    ///
+    /// Bounded by
+    /// [`MAX_APPROVAL_REQUESTS_PER_TURN`](crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN);
+    /// anything past the cap is discarded rather than flooding the queue.
+    async fn park_approval_requests(&self, host: &dyn CycleHost) -> Result<()> {
+        for request in self
+            .deps
+            .approval_requests
+            .drain(crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN)
+        {
+            let approval_id = host.park_effect(request.effect).await?;
+            log::info!(
+                "[harness::brain] parked '{}' for operator approval (id={approval_id}): {}",
+                request.tool,
+                request.reason
+            );
+        }
+        Ok(())
+    }
+
     /// Executes one drained delegation from the orchestrator's turn.
     ///
     /// `spawn_task` opens a backlog card through the same
@@ -463,9 +505,16 @@ fn append_result(prev: Option<&str>, responder: &str, body: &str) -> String {
 
 #[async_trait]
 impl Brain for HarnessBrain {
-    async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+    async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
         // Idempotent — builds the roster on the first cycle, a no-op after.
         self.pool.ensure(&self.record, &self.deps).await?;
+
+        // Issue #172: start from an empty approval queue so nothing a prior
+        // cycle — or a workflow run sharing these deps — left behind is parked
+        // under this cycle. Every turn this cycle runs (the operator turn, its
+        // delegated desk turns, a dispatched card) pushes onto the same queue and
+        // is drained once at the end.
+        self.deps.approval_requests.clear();
 
         let mut channel_responses = Vec::new();
         for event in &req.events {
@@ -527,6 +576,12 @@ impl Brain for HarnessBrain {
                 _ => {}
             }
         }
+
+        // Issue #172: every approval-gated tool call this cycle's turns hit is
+        // parked on the host's gate now, so it shows up on the operator's
+        // Approvals page instead of only being narrated away in chat.
+        self.park_approval_requests(host).await?;
+
         // The runtime requires at least one channel response per cycle.
         if channel_responses.is_empty() {
             channel_responses.push(OutboundMessage {
@@ -565,12 +620,13 @@ mod tests {
     use crate::harness::provider::{HarnessModel, MockProvider};
     use crate::ports::brain::CycleHost;
     use crate::ports::types::{
-        CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, ToolCall, ToolResult,
+        ApprovalId, CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, ToolCall,
+        ToolResult,
     };
     use crate::store::{FsCompanyStore, FsContextStore, FsOps};
 
-    /// A `CycleHost` that auto-executes anything the brain asks for; the harness
-    /// brain v1 makes no host calls, so it stays inert.
+    /// A `CycleHost` that auto-executes anything the brain asks for and swallows
+    /// anything it parks; used by every test that isn't about approvals.
     #[derive(Default)]
     struct NoopHost;
 
@@ -587,6 +643,45 @@ mod tests {
         }
         async fn emit_effect(&self, _effect: Effect) -> Result<EffectDisposition> {
             Ok(EffectDisposition::Executed)
+        }
+        async fn park_effect(&self, _effect: Effect) -> Result<ApprovalId> {
+            Ok(ApprovalId::new("appr-parked"))
+        }
+    }
+
+    /// A `CycleHost` that records every effect parked for approval, so the
+    /// approval drain can be asserted on (issue #172). Anything else it does is
+    /// inert.
+    #[derive(Default)]
+    struct ParkingHost {
+        parked: std::sync::Mutex<Vec<Effect>>,
+    }
+
+    impl ParkingHost {
+        /// The effects parked through `park_effect`, in order.
+        fn parked(&self) -> Vec<Effect> {
+            self.parked.lock().expect("parked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CycleHost for ParkingHost {
+        async fn call_tool(&self, _call: ToolCall) -> Result<ToolResult> {
+            Ok(ToolResult {
+                ok: true,
+                output: serde_json::Value::Null,
+            })
+        }
+        async fn context_op(&self, _op: ContextOp) -> Result<ContextOpResult> {
+            Ok(ContextOpResult::Text(String::new()))
+        }
+        async fn emit_effect(&self, _effect: Effect) -> Result<EffectDisposition> {
+            panic!("an approval request must be parked, never re-evaluated as an effect");
+        }
+        async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+            let mut parked = self.parked.lock().expect("parked");
+            parked.push(effect);
+            Ok(ApprovalId::new(format!("appr-{}", parked.len())))
         }
     }
 
@@ -637,6 +732,7 @@ description = "Runs Acme."
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -780,6 +876,7 @@ description = "Builds it."
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1093,6 +1190,7 @@ members = ["engineer"]
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1452,6 +1550,7 @@ members = ["eng1", "eng2"]
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: failures.clone(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1500,6 +1599,138 @@ members = ["eng1", "eng2"]
             )),
             "an McpCallFailed audit event was journaled"
         );
+    }
+
+    // --- Approval parking (issue #172) --------------------------------------
+
+    /// A brain over `dir` whose deps carry `requests` as the shared
+    /// approval-request queue — the same handle every roster agent's
+    /// `ApprovalPolicy` pushes onto.
+    fn brain_with_approval_queue(
+        dir: &std::path::Path,
+        requests: crate::harness::policy::ApprovalRequestQueue,
+    ) -> HarnessBrain {
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: None,
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: requests,
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        };
+        HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
+    }
+
+    /// The regression for #172: a `RequireApproval` recorded during a turn is
+    /// **parked** on the host, so it lands in the journal the Approvals page
+    /// reads instead of being narrated away in chat and lost.
+    ///
+    /// `ParkingHost` panics on `emit_effect`, which pins the other half of the
+    /// fix: the request must NOT be re-evaluated by the runtime gate (which
+    /// allows — and so silently "executes" — the `Other` group most gated tool
+    /// calls classify into).
+    #[tokio::test]
+    async fn approval_requests_are_parked_for_the_operator() {
+        use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};
+        use openhuman_core::openhuman::agent::tool_policy::{
+            ToolCallContext, ToolPolicy, ToolPolicyDecision, ToolPolicyRequest,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let requests = ApprovalRequestQueue::default();
+        let brain = brain_with_approval_queue(dir.path(), requests.clone());
+
+        // Exactly what a supervised policy records when the agent reaches for a
+        // gated tool mid-turn.
+        let policy = ApprovalPolicy::new(
+            &crate::company::Policy {
+                mode: "supervised".to_string(),
+                always_approve: Vec::new(),
+                auto_approve_under_usd: None,
+            },
+            None,
+        )
+        .with_requests(requests.clone());
+        let args = serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" });
+        let request = ToolPolicyRequest::new(
+            "composio_execute",
+            args.clone(),
+            ToolCallContext::session("s", "chat", "ceo", "call-1", 0),
+        );
+        assert!(
+            matches!(
+                policy.check(&request).await,
+                ToolPolicyDecision::RequireApproval { .. }
+            ),
+            "the fixture must reproduce a gated call"
+        );
+        assert_eq!(requests.queued(), 1, "the decision was recorded to park");
+
+        let host = ParkingHost::default();
+        brain
+            .park_approval_requests(&host)
+            .await
+            .expect("the drain parks");
+
+        let parked = host.parked();
+        assert_eq!(parked.len(), 1, "one approval reached the operator");
+        assert_eq!(parked[0].kind, "composio_execute");
+        assert_eq!(
+            parked[0].payload, args,
+            "the call's arguments are preserved"
+        );
+        assert_eq!(requests.queued(), 0, "the queue is drained");
+    }
+
+    /// A second drain parks nothing: the queue is emptied, so a later cycle
+    /// can't re-park a request the operator has already been shown.
+    #[tokio::test]
+    async fn draining_twice_parks_nothing_the_second_time() {
+        use crate::harness::policy::{ApprovalRequest, ApprovalRequestQueue};
+        use crate::ports::types::EffectGroup;
+
+        let dir = tempfile::tempdir().unwrap();
+        let requests = ApprovalRequestQueue::default();
+        let brain = brain_with_approval_queue(dir.path(), requests.clone());
+        requests.push(ApprovalRequest {
+            tool: "media_generate_image".to_string(),
+            reason: "supervised".to_string(),
+            effect: Effect {
+                kind: "media_generate_image".to_string(),
+                group: EffectGroup::Spend,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "prompt": "a logo" }),
+            },
+        });
+
+        let host = ParkingHost::default();
+        brain.park_approval_requests(&host).await.expect("drain");
+        brain
+            .park_approval_requests(&host)
+            .await
+            .expect("second drain");
+        assert_eq!(host.parked().len(), 1, "parked once, not twice");
     }
 
     // --- Steer disposition (issue #111) -------------------------------------
@@ -1592,6 +1823,7 @@ members = ["eng1", "eng2"]
             delegations: orchestrator::DelegationQueue::default(),
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
