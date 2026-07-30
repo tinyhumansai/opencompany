@@ -194,6 +194,11 @@ async fn create_task(
     company: ScopedCompany,
     Json(body): Json<CreateTask>,
 ) -> Result<Json<TaskCard>, ApiError> {
+    // Read → validate → write is one critical section. Two concurrent requests
+    // that each read the board before either has written would both validate
+    // against a snapshot missing the other's edge, and could persist a lineage
+    // neither request would have been allowed to create on its own.
+    let _serialized = company.runtime.task_writes.lock().await;
     if let Some(parent) = body.parent_task_id.as_deref() {
         let board = company.runtime.tasks().list(company.id()).await?;
         // `None` child: the card does not exist yet, so it cannot be in a cycle.
@@ -219,6 +224,12 @@ async fn patch_task(
     Path(TaskPath { task_id }): Path<TaskPath>,
     Json(body): Json<PatchTask>,
 ) -> Result<Json<TaskCard>, ApiError> {
+    // As in `create_task`, the read → validate → write is one critical section:
+    // a re-parent validated against a stale board is exactly how two requests
+    // close a cycle neither of them could close alone. Held for the whole
+    // handler, which also makes the surrounding read-modify-write of the card's
+    // other fields lost-update free.
+    let _serialized = company.runtime.task_writes.lock().await;
     // The whole board is kept (not consumed by `into_iter`) so a re-parent can
     // be checked for existence and cycles against it.
     let board = company.runtime.tasks().list(company.id()).await?;
@@ -255,6 +266,10 @@ async fn delete_task(
     company: ScopedCompany,
     Path(TaskPath { task_id }): Path<TaskPath>,
 ) -> Result<StatusCode, ApiError> {
+    // Serialized with the other board writes so a delete cannot land between a
+    // concurrent re-parent's existence check and its write, which would leave
+    // the dangling edge `validate_parent` exists to prevent.
+    let _serialized = company.runtime.task_writes.lock().await;
     if company
         .runtime
         .tasks()

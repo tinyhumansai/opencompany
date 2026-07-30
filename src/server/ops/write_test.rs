@@ -2197,3 +2197,78 @@ async fn parent_task_id_rejects_self_unknown_and_cycles() {
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
+
+/// #185 review follow-up: validation is only as good as its atomicity.
+///
+/// Each half of `A → B` / `B → A` is individually legal against a board that
+/// has neither edge yet. Read → validate → write therefore has to be one
+/// critical section: without it both requests can validate against a snapshot
+/// taken before the other wrote, and the pair persists the very cycle
+/// `validate_parent` exists to reject.
+///
+/// With the writes serialized this is deterministic rather than probabilistic —
+/// whichever request takes the lock second sees the first one's edge and is
+/// rejected — so the assertion is *exactly* one success, not "usually one".
+#[tokio::test]
+async fn concurrent_reparents_cannot_race_a_cycle_onto_the_board() {
+    let home = home();
+    let state = std::sync::Arc::new(state_with_company(&home).await);
+
+    let mut ids = Vec::new();
+    for title in ["A", "B"] {
+        let (_, card) = send(
+            &state,
+            "POST",
+            "/api/v1/company/tasks",
+            Some(json!({ "title": title })),
+        )
+        .await;
+        ids.push(card["id"].as_str().unwrap().to_string());
+    }
+    let (a_id, b_id) = (ids[0].clone(), ids[1].clone());
+
+    // Fire both halves of the would-be cycle at once.
+    let reparent = |child: String, parent: String| {
+        let state = state.clone();
+        tokio::spawn(async move {
+            send(
+                &state,
+                "PATCH",
+                &format!("/api/v1/company/tasks/{child}"),
+                Some(json!({ "parentTaskId": parent })),
+            )
+            .await
+            .0
+        })
+    };
+    let first = reparent(b_id.clone(), a_id.clone());
+    let second = reparent(a_id.clone(), b_id.clone());
+    let (first, second) = (first.await.unwrap(), second.await.unwrap());
+
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one re-parent may win: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|s| **s == StatusCode::BAD_REQUEST)
+            .count(),
+        1,
+        "the loser must be rejected as a cycle, not silently applied: {outcomes:?}"
+    );
+
+    // And the board itself is a forest: the two cards cannot both have parents.
+    let (_, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    let parented = board
+        .as_array()
+        .expect("board is a list")
+        .iter()
+        .filter(|c| c["parentTaskId"].is_string())
+        .count();
+    assert_eq!(parented, 1, "a cycle reached the board: {board}");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}

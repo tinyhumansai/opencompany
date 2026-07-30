@@ -130,6 +130,15 @@ pub struct CompanyRuntime {
     pub(crate) steer: crate::company::steer::InflightRegistry,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
+    /// Held across a REST board write's read → validate → write, so two
+    /// concurrent edits cannot each validate against a snapshot that predates
+    /// the other's edge (issue #185 review).
+    ///
+    /// Deliberately **not** [`serial`](Self::serial): that lock is held for a
+    /// whole cycle, which is a live agent turn, so reusing it would park every
+    /// board edit behind an LLM call. This one is only ever held across a
+    /// couple of store round-trips.
+    pub(crate) task_writes: TokioMutex<()>,
     /// WS4: the embedded openhuman harness pool, when wired via
     /// [`RuntimeBuilder::with_harness`](crate::runtime::RuntimeBuilder::with_harness).
     /// Feature-gated so the default build is unaffected.
@@ -189,6 +198,7 @@ impl CompanyRuntime {
             workflow_runner: None,
             steer: crate::company::steer::InflightRegistry::new(),
             serial: TokioMutex::new(()),
+            task_writes: TokioMutex::new(()),
             #[cfg(feature = "openhuman")]
             harness: None,
             #[cfg(feature = "mcp")]
