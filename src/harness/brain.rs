@@ -28,9 +28,15 @@ use crate::harness::{HarnessDeps, HarnessPool};
 
 /// The most operator redirects honored within a single task dispatch (issue
 /// #111). A redirect re-runs the turn in-loop with the fresh instruction
-/// appended; past this cap the run is finalized to `in_review` so a redirect
-/// storm can't loop forever.
+/// appended; past this cap the run is finalized to its terminal column (see
+/// [`success_terminal_column`]) so a redirect storm can't loop forever.
 const MAX_REDIRECTS_PER_DISPATCH: u32 = 3;
+
+/// The board column a card lands in when the operator is the reviewer.
+const IN_REVIEW: &str = "in_review";
+
+/// The terminal board column — nothing dispatches out of it.
+const DONE: &str = "done";
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
@@ -69,9 +75,10 @@ impl HarnessBrain {
 
     /// Runs one dispatched board task: load the card, route it to its assignee
     /// (or the default responder) for a single turn, and write the outcome back
-    /// onto the board — moved to `in_review` on success, back to `backlog` with
-    /// the error noted on failure. A missing task store or a card that has since
-    /// vanished is a silent no-op.
+    /// onto the board — moved to its success terminal column on success (see
+    /// [`success_terminal_column`]), back to `backlog` with the error noted on
+    /// failure. A missing task store or a card that has since vanished is a
+    /// silent no-op.
     /// Runs a dispatched card to completion and, when the card remembers the
     /// conversation it was spawned from, returns the reply to post back there
     /// (issue #151 §3.2).
@@ -145,7 +152,8 @@ impl HarnessBrain {
                                 &responder,
                                 &outcome.reply,
                             ));
-                            card.column = "in_review".to_string();
+                            let terminal = success_terminal_column(&card);
+                            card.column = terminal.to_string();
                         }
                         Err(err) => {
                             card.note = Some(append_result(
@@ -191,13 +199,15 @@ impl HarnessBrain {
                     ));
                     if redirects > MAX_REDIRECTS_PER_DISPATCH {
                         // Exhausted the redirect budget — finalize the last run's
-                        // reply to `in_review` rather than looping forever.
+                        // reply to the card's terminal column rather than looping
+                        // forever.
                         let last = match &outcome {
                             Ok(outcome) => outcome.reply.clone(),
                             Err(err) => format!("dispatch failed: {err}"),
                         };
                         card.note = Some(append_result(card.note.as_deref(), &responder, &last));
-                        card.column = "in_review".to_string();
+                        let terminal = success_terminal_column(&card);
+                        card.column = terminal.to_string();
                         break;
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
@@ -431,6 +441,27 @@ fn task_instruction(card: &TaskRecord) -> String {
     }
 }
 
+/// Where a dispatched card lands once its run succeeds (issue #171).
+///
+/// `in_review` is a naming convention, not a mechanism: nothing consumes it.
+/// `task_enters_in_progress` only edge-fires a dispatch when a card enters
+/// `in_progress`, so an `in_review` card triggers no further cycle and the only
+/// runtime write of `done` is the operator's manual drag on the board.
+///
+/// That is fine for a card an operator made themselves — they are the reviewer,
+/// and the card is sitting in front of them. It strands a card stamped with
+/// `origin_chat_id`: that card came from `spawn_task` during an agent-to-agent
+/// handoff, its result was already posted back into the originating thread, and
+/// no operator is watching the board for it. So a card that remembers an origin
+/// completes to `done`; a board-created card still parks in `in_review`.
+fn success_terminal_column(card: &TaskRecord) -> &'static str {
+    if card.origin_chat_id.is_some() {
+        DONE
+    } else {
+        IN_REVIEW
+    }
+}
+
 /// The post-back line for a finished card (issue #151 §3.2): what the card was,
 /// where it landed, and the reply itself.
 ///
@@ -439,7 +470,8 @@ fn task_instruction(card: &TaskRecord) -> String {
 /// claiming an answer it does not have.
 fn task_postback_text(card: &TaskRecord) -> String {
     let status = match card.column.as_str() {
-        "in_review" => "is ready for review",
+        DONE => "is done",
+        IN_REVIEW => "is ready for review",
         "paused" => "is paused",
         "backlog" => "went back to the backlog",
         other => other,
@@ -923,8 +955,9 @@ description = "Builds it."
             .expect("one card")
     }
 
-    /// A dispatched task runs a turn and moves to `in_review`, its result folded
-    /// into the note under the responder that ran it.
+    /// A dispatched **board-created** card (no `origin_chat_id`) runs a turn and
+    /// moves to `in_review` — the operator who made it is the reviewer — with
+    /// its result folded into the note under the responder that ran it.
     #[tokio::test]
     async fn task_dispatch_runs_and_moves_to_in_review() {
         let dir = tempfile::tempdir().unwrap();
@@ -951,6 +984,92 @@ description = "Builds it."
         // echoes the instruction (the card title) back into the reply.
         assert!(note.contains("[ceo]"), "{note:?}");
         assert!(note.contains("Ship the thing"), "{note:?}");
+    }
+
+    // ── Issue #171: a delegated handoff reaches `done` on its own ─────────
+
+    /// The regression: a card spawned by a delegating turn (so it carries an
+    /// `origin_chat_id`) has no operator watching the board, so leaving it in
+    /// `in_review` stranded it forever. It must complete to `done`.
+    #[tokio::test]
+    async fn dispatched_card_with_an_origin_completes_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-origin", "maya");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks
+            .upsert(&CompanyId::new("acme"), &c)
+            .await
+            .expect("seed");
+
+        let posted = brain
+            .run_task("t-origin")
+            .await
+            .expect("run")
+            .expect("a card with an origin posts back");
+
+        let moved = only_card(&tasks).await;
+        assert_eq!(
+            moved.column, "done",
+            "a delegated handoff must reach the terminal column, not park in in_review"
+        );
+        // The note stays the durable record of what came back.
+        assert!(moved.note.expect("note").contains("Ship the thing"));
+        // …and the bubble says so rather than asking for a review nobody will do.
+        assert!(posted.text.contains("is done"), "{}", posted.text);
+        assert!(!posted.text.contains("ready for review"), "{}", posted.text);
+    }
+
+    /// The success terminal is chosen by origin, not by outcome: a board-created
+    /// card keeps its `in_review` review gate.
+    #[test]
+    fn success_terminal_column_is_done_only_for_a_card_with_an_origin() {
+        let board_card = card("t1", "maya");
+        assert_eq!(success_terminal_column(&board_card), "in_review");
+
+        let mut delegated = card("t2", "maya");
+        delegated.origin_chat_id = Some("strategy".to_string());
+        assert_eq!(success_terminal_column(&delegated), "done");
+    }
+
+    /// The redirect-cap finalize branch is the other success terminal, so it has
+    /// to make the same choice — otherwise a steered handoff still strands.
+    #[tokio::test]
+    async fn redirect_cap_finalizes_a_card_with_an_origin_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let redirect = || SteerAction::Redirect {
+            instruction: "focus on the API".to_string(),
+        };
+        let (brain, tasks, _provider) = brain_that_steers_itself(
+            dir.path(),
+            "t1",
+            vec![redirect(), redirect(), redirect(), redirect()],
+        );
+        let mut c = card("t1", "");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(only_card(&tasks).await.column, "done");
+    }
+
+    /// The post-back has to have wording for the new landing column — without it
+    /// the fallback arm renders the raw column id into the sentence.
+    #[test]
+    fn postback_reads_naturally_for_a_done_card() {
+        let mut finished = card("t1", "maya");
+        finished.column = "done".to_string();
+        finished.note = None;
+        assert_eq!(task_postback_text(&finished), "\"Ship the thing\" is done.");
     }
 
     /// An `assignee` that names a roster member routes the turn to that member.
