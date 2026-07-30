@@ -986,27 +986,23 @@ async fn inbox_reads_are_per_agent_and_never_shared() {
     let cto = rows.iter().find(|r| r["key"] == "cto").unwrap();
     assert_eq!(ceo["enabled"], true);
     assert_eq!(ceo["unread"], 2);
-    assert_eq!(ceo["total"], 2);
     assert_eq!(cto["unread"], 1);
-    assert_eq!(cto["total"], 1);
 
-    // Each inbox reads back only its own mail — the shared-fixture bug.
+    // Each inbox reads back only its own mail — the shared-fixture bug. The
+    // route serves store (append) order; the console sorts newest-first.
     let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 2);
-    let ceo_subjects: Vec<&str> = body["items"]
+    let ceo_subjects: Vec<&str> = body
         .as_array()
         .unwrap()
         .iter()
         .map(|m| m["subject"].as_str().unwrap())
         .collect();
-    // Newest first, so a `limit` keeps today's mail rather than the oldest.
-    assert_eq!(ceo_subjects, vec!["investor intro", "board deck"]);
+    assert_eq!(ceo_subjects, vec!["board deck", "investor intro"]);
 
     let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/cto/messages", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 1);
-    let items = body["items"].as_array().unwrap();
+    let items = body.as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["subject"], "on-call rotation");
     assert_eq!(items[0]["fromEmail"], "cto-sender@x.test");
@@ -1015,53 +1011,16 @@ async fn inbox_reads_are_per_agent_and_never_shared() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
-/// `?limit=`/`?offset=` page from the newest end, and an inbox nobody has mail
-/// in (or that does not exist) reads as an empty page rather than a 404.
+/// An inbox nobody has mail in — or that does not exist at all — reads as an
+/// empty list rather than a 404. An enabled-but-empty inbox is a legitimate
+/// state, and the console must render it as such rather than as an error.
 #[tokio::test]
-async fn inbox_messages_page_newest_first_and_soft_fail_on_unknown_key() {
+async fn inbox_messages_soft_fail_on_unknown_key() {
     let home = home();
     let state = state_with_company(&home).await;
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
-    for i in 0..5u64 {
-        append_mail(&runtime, "ceo", &format!("m{i}"), &format!("mail {i}"), i).await;
-    }
+    append_mail(&runtime, "ceo", "m0", "mail 0", 1).await;
 
-    let (status, body) = send(
-        &state,
-        "GET",
-        "/api/v1/company/inboxes/ceo/messages?limit=2",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    // `total` stays the unpaginated count so the console can page.
-    assert_eq!(body["total"], 5);
-    let subjects: Vec<&str> = body["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["subject"].as_str().unwrap())
-        .collect();
-    assert_eq!(subjects, vec!["mail 4", "mail 3"]);
-
-    let (status, body) = send(
-        &state,
-        "GET",
-        "/api/v1/company/inboxes/ceo/messages?limit=2&offset=2",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let subjects: Vec<&str> = body["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["subject"].as_str().unwrap())
-        .collect();
-    assert_eq!(subjects, vec!["mail 2", "mail 1"]);
-
-    // An inbox with no mail is empty, not a 404 — an enabled-but-empty inbox is
-    // a legitimate state, and the console must render it as such.
     let (status, body) = send(
         &state,
         "GET",
@@ -1070,8 +1029,11 @@ async fn inbox_messages_page_newest_first_and_soft_fail_on_unknown_key() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 0);
-    assert!(body["items"].as_array().unwrap().is_empty());
+    assert!(body.as_array().unwrap().is_empty());
+
+    // …and the inbox that *does* hold mail is unaffected by that read.
+    let (_, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
@@ -1113,7 +1075,6 @@ async fn team_read_reports_inbox_enabled_and_empty_inbox_is_listed() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["key"], "ceo");
     assert_eq!(rows[0]["enabled"], true);
-    assert_eq!(rows[0]["total"], 0);
     assert_eq!(rows[0]["unread"], 0);
     // The manifest role is the display name until a domain gives it an address.
     assert_eq!(rows[0]["name"], "Chief");
@@ -1158,7 +1119,7 @@ async fn ingested_mail_shows_up_on_the_console_read_surface() {
 
     let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
     assert_eq!(status, StatusCode::OK);
-    let items = body["items"].as_array().unwrap();
+    let items = body.as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "ingested-1");
     assert_eq!(items[0]["subject"], "hello from outside");
@@ -1176,6 +1137,73 @@ async fn ingested_mail_shows_up_on_the_console_read_surface() {
     assert_eq!(body["unread"], 0);
     let (_, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
     assert_eq!(body.as_array().unwrap()[0]["unread"], 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
+async fn inbox_list_and_messages_project_store() {
+    use crate::ports::inbox::EmailRecord;
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    // One inbound (unread) + one outbound reply in inbox "ceo".
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: "in1".into(),
+                inbox: "ceo".into(),
+                from_name: "Priya".into(),
+                from_email: "p@x.test".into(),
+                subject: "hi".into(),
+                body: "hello world".into(),
+                at_millis: 1,
+                read: false,
+                outbound: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: "out1".into(),
+                inbox: "ceo".into(),
+                from_name: String::new(),
+                from_email: "ceo@acme.test".into(),
+                subject: "re: hi".into(),
+                body: "reply".into(),
+                at_millis: 2,
+                read: false,
+                outbound: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    // GET /inboxes surfaces the message-bearing inbox; outbound doesn't count toward unread.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ceo = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["key"] == "ceo")
+        .expect("ceo inbox listed");
+    assert_eq!(ceo["unread"], 1);
+
+    // GET messages returns both, camelCase, oldest first.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = body.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["id"], "in1");
+    assert_eq!(msgs[0]["fromEmail"], "p@x.test");
+    assert_eq!(msgs[1]["outbound"], true);
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }

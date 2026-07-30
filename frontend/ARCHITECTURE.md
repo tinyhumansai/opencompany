@@ -106,13 +106,15 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
 
 ### Inbox — `src/views/InboxView.tsx`, `src/api/inbox.ts`
 - Per-agent email inbox; enabled via a Team toggle.
-- **Source:** ✅ real — `GET …/inboxes` lists every inbox with its unread count
-  and `GET …/inboxes/{key}/messages` pages one teammate's mail, both
+- **Source:** ✅ real — `client.listInboxes()` (`GET …/inboxes`) lists every inbox
+  with its unread count and `client.inboxMessages()`
+  (`GET …/inboxes/{key}/messages`) reads one teammate's mail, both
   `InboxStore`-backed REST twins of the `Company.inboxes` GraphQL resolver (the
-  console ships no GraphQL client). `POST …/inboxes/{key}/read` marks read and
-  `PUT …/team/{id}/inbox` toggles an inbox. Inbound mail arrives via the
-  HMAC-signed `POST …/inboxes/ingest` webhook. Real send/receive depends on
-  Domain/SMTP (below).
+  console ships no GraphQL client). `client.markInboxRead()`
+  (`POST …/inboxes/{key}/read`) marks read and `setInboxEnabled`
+  (`PUT …/team/{id}/inbox`) toggles an inbox. Inbound mail arrives via the
+  HMAC-signed `POST …/inboxes/ingest` webhook and the IMAP poller, which file
+  into the same store. Real send/receive depends on Domain/SMTP (below).
 - **Note:** inboxes are keyed by **agent id**, the same key the ingest webhook
   files mail under. Nothing is seeded or cached client-side — an inbox with no
   mail renders empty (issue #173 replaced a localStorage fixture that showed the
@@ -190,8 +192,9 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
 The console's models are the response contract. Keep host payloads aligned with:
 
 - `src/api/types.ts` — `CompanyStatus`, `ApprovalSummary`, `ChatResponse`,
-  `FeedbackResponse`, `TeamMemberDto`, `ConnectionState`, `ConnectionStart`.
-- `src/lib/threads.ts` `Thread`/`ThreadContact`, `src/api/inbox.ts` `Inbox`/`EmailMessage`,
+  `FeedbackResponse`, `TeamMemberDto`, `InboxDto`, `InboxMessageDto`,
+  `ConnectionState`, `ConnectionStart`.
+- `src/lib/threads.ts` `Thread`/`ThreadContact`,
   `src/lib/tasks-sample.ts` `TaskCard`, `src/lib/skills.ts` `InstalledSkill`,
   `src/lib/workspace.ts` `FsNode`, `src/lib/memory.ts` `MemoryEntry`,
   `src/lib/usage-sample.ts` `UsageData`, `src/lib/finance-sample.ts` `FinanceData`,

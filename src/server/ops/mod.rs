@@ -23,7 +23,6 @@ pub mod domain;
 pub mod finances;
 pub mod imap;
 pub mod inbox;
-pub mod inbox_read;
 pub mod inference;
 pub mod language;
 pub mod mail;
@@ -151,7 +150,6 @@ pub fn router() -> Router<AppState> {
         .merge(usage::router())
         .merge(smtp::router())
         .merge(inbox::router())
-        .merge(inbox_read::router())
         .merge(tasks::router())
         .merge(memory::router())
         .merge(workspace::router())

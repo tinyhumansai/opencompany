@@ -2,15 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Inbox as InboxIcon, Mail, Send } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
-import {
-  type EmailMessage,
-  enabledInboxes,
-  type Inbox,
-  inboxMessages,
-  listInboxes,
-  markInboxRead,
-  preview,
-} from "@/api/inbox";
+import { enabledInboxes, preview } from "@/api/inbox";
+import type { InboxDto, InboxMessageDto } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -32,15 +25,17 @@ type Load = "loading" | "ready" | "error";
 
 /**
  * An email inbox surface. Each teammate with an inbox enabled gets its own, read
- * live from the host's `InboxStore` (`GET …/inboxes`) — never a client-side
- * fixture, so two teammates show two different sets of mail (issue #173).
+ * live from the host's `InboxStore` through `client.listInboxes()` /
+ * `client.inboxMessages()` — never a client-side fixture, so two teammates show
+ * two different sets of mail (issue #173). Both inbound paths file into that
+ * store, so ingest-webhook and IMAP-polled mail both land here.
  */
 export function InboxView({ client, company }: Props) {
   const [load, setLoad] = useState<Load>("loading");
   const [error, setError] = useState<string | null>(null);
-  const [inboxes, setInboxes] = useState<Inbox[]>([]);
+  const [inboxes, setInboxes] = useState<InboxDto[]>([]);
   const [activeKey, setActiveKey] = useState("");
-  const [messages, setMessages] = useState<EmailMessage[]>([]);
+  const [messages, setMessages] = useState<InboxMessageDto[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<"list" | "read">("list");
@@ -52,7 +47,7 @@ export function InboxView({ client, company }: Props) {
   // The inbox roster: which teammates have an inbox, and how much is unread.
   const loadRoster = useCallback(async () => {
     try {
-      const rows = await listInboxes(client, company);
+      const rows = await client.listInboxes(company);
       setInboxes(rows);
       setActiveKey((current) =>
         rows.some((i) => i.enabled && i.key === current)
@@ -76,7 +71,8 @@ export function InboxView({ client, company }: Props) {
   }, [loadRoster]);
 
   // The selected inbox's mail. Refetched whenever the selection changes, so
-  // switching teammates always shows that teammate's own correspondence.
+  // switching teammates always shows that teammate's own correspondence. The
+  // host returns append order (oldest first); the reader wants newest first.
   const activeInboxKey = active?.key;
   useEffect(() => {
     if (!activeInboxKey) {
@@ -87,8 +83,8 @@ export function InboxView({ client, company }: Props) {
     setMessagesLoading(true);
     void (async () => {
       try {
-        const page = await inboxMessages(client, company, activeInboxKey);
-        if (!cancelled) setMessages(page.items);
+        const mail = await client.inboxMessages(activeInboxKey, company);
+        if (!cancelled) setMessages(mail.slice().sort((a, b) => b.atMillis - a.atMillis));
       } catch {
         if (!cancelled) setMessages([]);
       } finally {
@@ -100,7 +96,7 @@ export function InboxView({ client, company }: Props) {
     };
   }, [client, company, activeInboxKey]);
 
-  async function openMessage(inboxKey: string, message: EmailMessage) {
+  async function openMessage(inboxKey: string, message: InboxMessageDto) {
     setOpenId(message.id);
     setMobilePane("read");
     if (message.read) return;
@@ -108,7 +104,7 @@ export function InboxView({ client, company }: Props) {
     // remaining unread count the badge renders.
     setMessages((ms) => ms.map((m) => (m.id === message.id ? { ...m, read: true } : m)));
     try {
-      const { unread } = await markInboxRead(client, company, inboxKey, [message.id]);
+      const { unread } = await client.markInboxRead(inboxKey, [message.id], company);
       setInboxes((is) => is.map((i) => (i.key === inboxKey ? { ...i, unread } : i)));
     } catch {
       // Leave the row read locally; the next roster load reconciles with the host.
@@ -148,7 +144,8 @@ export function InboxView({ client, company }: Props) {
           <p className="font-medium text-foreground">No inboxes yet</p>
           <p className="max-w-sm text-sm">
             Give an agent its own inbox from the <span className="font-medium">Team</span> page —
-            flip on the inbox toggle for anyone who needs to receive email.
+            flip on the inbox toggle for anyone who needs to receive email. Mail sent to that
+            address shows up here.
           </p>
         </div>
       </div>
@@ -228,7 +225,7 @@ function MessageRow({
   active,
   onClick,
 }: {
-  message: EmailMessage;
+  message: InboxMessageDto;
   active: boolean;
   onClick: () => void;
 }) {
@@ -259,7 +256,15 @@ function MessageRow({
   );
 }
 
-function Reading({ message, inbox, onBack }: { message: EmailMessage; inbox: Inbox; onBack: () => void }) {
+function Reading({
+  message,
+  inbox,
+  onBack,
+}: {
+  message: InboxMessageDto;
+  inbox: InboxDto;
+  onBack: () => void;
+}) {
   const box = inbox.address || inbox.key;
   return (
     <>
@@ -279,9 +284,9 @@ function Reading({ message, inbox, onBack }: { message: EmailMessage; inbox: Inb
             <div className="min-w-0">
               <p className="text-sm font-medium">{sender(message)}</p>
               <p className="truncate text-xs text-muted-foreground">
-                {message.outbound
-                  ? `${box} · to ${message.fromEmail}`
-                  : `${message.fromEmail} · to ${box}`}
+                {/* A sent record carries the sending box's own address and no
+                    recipient, so outbound reads as "sent from this box". */}
+                {message.outbound ? `Sent from ${box}` : `${message.fromEmail} · to ${box}`}
               </p>
             </div>
             <span className="ml-auto shrink-0 text-xs text-muted-foreground">
@@ -295,8 +300,12 @@ function Reading({ message, inbox, onBack }: { message: EmailMessage; inbox: Inb
   );
 }
 
-/** The name to show for a message — ingest often supplies only an address. */
-function sender(message: EmailMessage): string {
+/**
+ * The name to show for a message — ingest often supplies only an address, and a
+ * sent copy comes from the operator's own company rather than a correspondent.
+ */
+function sender(message: InboxMessageDto): string {
+  if (message.outbound) return "You";
   return message.fromName.trim() || message.fromEmail || "Unknown sender";
 }
 

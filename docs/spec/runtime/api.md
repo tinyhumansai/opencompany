@@ -60,14 +60,16 @@ PUT    …/team/{agentId}/inbox                toggle a teammate's inbox
 POST   …/inboxes/{key}/read                  mark inbox messages read
 POST   …/inboxes/ingest                     HMAC-signed inbound email → inbox
 GET    …/inboxes                            list inboxes + unread counts
-GET    …/inboxes/{key}/messages              page one teammate's mail (newest first)
+GET    …/inboxes/{key}/messages              one teammate's mail (store order)
 ```
 
 The two inbox `GET`s are **REST twins of the `Company.inboxes` GraphQL
 resolver**: the operator console ships no GraphQL client, so without them the
 Inbox view had no reachable per-agent read at all and fell back to a client-side
-fixture (issue #173). They read the same `InboxStore`, and `GET …/team` tags each
+fixture (issue #173). They read the same `InboxStore` both inbound paths — the
+ingest webhook and the IMAP poller — file into, and `GET …/team` tags each
 teammate with `inboxEnabled` so the Team toggle reflects that store too.
+Messages come back in append order; the console sorts them newest-first.
 
 Team writes are an **operator overlay** persisted through the store, merged
 into the manifest roster at read time — the version-controlled `company.toml`

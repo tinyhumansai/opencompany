@@ -181,8 +181,15 @@ impl AsyncImapReceiver {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            // The parens are load-bearing: async-imap sends the query string
+            // verbatim, and RFC 3501 requires a multi-item fetch to be a
+            // parenthesized list. Without them the command is `UID FETCH <set>
+            // UID BODY.PEEK[]` — two bare fetch-atts, which strict servers
+            // (Stalwart) reject past the first, so `BODY[]` never comes back and
+            // every message parses to an empty body. `UID` is requested
+            // explicitly for clarity even though UID FETCH always echoes it.
             let mut fetches = session
-                .uid_fetch(&set, "UID BODY.PEEK[]")
+                .uid_fetch(&set, "(UID BODY.PEEK[])")
                 .await
                 .map_err(|e| OpenCompanyError::Store(format!("imap fetch: {e}")))?;
             while let Some(f) = fetches
