@@ -9,7 +9,7 @@
 //! first agent when none is tagged (so a company without an orchestrator behaves
 //! exactly as before).
 //!
-//! It reaches six tools, all wired only onto the orchestrator agent:
+//! It reaches eight tools, all wired only onto the orchestrator agent:
 //!
 //! * [`QueryCompanyTool`] — a read surface over the company's [`FactStore`] and
 //!   recent [`EventLog`] history.
@@ -30,6 +30,12 @@
 //!   `POST .../workflows` route runs, so the orchestrator can capture a
 //!   repeatable process mid-chat; it lands enabled and runnable by
 //!   [`RunWorkflowTool`] the same turn.
+//! * [`AssignTaskTool`] / [`ReviewTaskTool`] (issue #186) — the board's
+//!   lifecycle. `assign_task` sets or changes who owns an existing card;
+//!   `review_task` records the orchestrator's verdict on one awaiting review
+//!   (`approve` keeps it in `in_review` for #171's done-transition to consume,
+//!   `revise` returns it to the backlog). Both enqueue a [`Delegation`] drained
+//!   by the brain, like the other delegation tools.
 //! * [`AddAgentTool`] (issue #71) — writes a new [`OverlayAgent`] through the
 //!   same store path the console `POST .../team` route uses, so the
 //!   orchestrator can bring on a teammate mid-chat.
@@ -53,6 +59,7 @@ use crate::company::{
     list_source_workflows, load_company_workflows,
 };
 use crate::error::OpenCompanyError;
+use crate::harness::lifecycle::ReviewDecision;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
 use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, OverlayAgent};
@@ -83,6 +90,10 @@ pub const RUN_WORKFLOW_TOOL: &str = "run_workflow";
 pub const ADD_AGENT_TOOL: &str = "add_agent";
 /// The `create_workflow` tool name (issue #112 — author a saved workflow graph).
 pub const CREATE_WORKFLOW_TOOL: &str = "create_workflow";
+/// The `assign_task` tool name (issue #186 — orchestrator lifecycle authority).
+pub const ASSIGN_TASK_TOOL: &str = "assign_task";
+/// The `review_task` tool name (issue #186 — orchestrator lifecycle authority).
+pub const REVIEW_TASK_TOOL: &str = "review_task";
 
 /// The id of the orchestrator agent for a roster: the first agent tagged
 /// `tier = "orchestrator"`, else the first roster agent, else `None` (empty
@@ -109,6 +120,8 @@ pub fn is_delegation_tool(tool: &str) -> bool {
         || tool == DELEGATE_TO_DESK_TOOL
         || tool == ADD_AGENT_TOOL
         || tool == CREATE_WORKFLOW_TOOL
+        || tool == ASSIGN_TASK_TOOL
+        || tool == REVIEW_TASK_TOOL
 }
 
 /// The orchestrator persona brief, appended to the orchestrator agent's persona.
@@ -128,8 +141,12 @@ condition / output steps) when a repeatable process is worth capturing — it's 
 and runnable with run_workflow — and `add_agent` to bring on a new teammate (a name, role, and \
 optional mandate) when the company genuinely needs one — it becomes a real, addressable member of \
 the team starting next turn. \
-Delegate, run or create a workflow, or add a teammate only when it genuinely helps — otherwise \
-answer directly and concisely."
+You also own the board's lifecycle: `assign_task` to set or change who owns an existing card (this \
+records ownership only — moving the card to In Progress is what starts the work), and \
+`review_task` to record your verdict on a card awaiting review, either `approve` when the work is \
+accepted or `revise` to send it back to the backlog for another pass. \
+Delegate, run or create a workflow, add a teammate, or act on the board only when it genuinely \
+helps — otherwise answer directly and concisely."
         .to_string()
 }
 
@@ -156,6 +173,25 @@ pub enum Delegation {
         desk: String,
         /// The instruction handed to the desk's lead member.
         instruction: String,
+    },
+    /// Set (or change) who owns an existing board card (issue #186 part b).
+    AssignTask {
+        /// The card's id.
+        task_id: String,
+        /// The roster/desk id taking it on.
+        assignee: String,
+        /// An optional line recorded on the card explaining the assignment.
+        note: Option<String>,
+    },
+    /// Record the orchestrator's verdict on a card in `in_review` (issue #186
+    /// part b).
+    ReviewTask {
+        /// The card's id.
+        task_id: String,
+        /// The verdict.
+        decision: ReviewDecision,
+        /// An optional reviewer comment recorded on the card.
+        note: Option<String>,
     },
 }
 
@@ -561,13 +597,185 @@ impl Tool for DelegateToDeskTool {
     }
 }
 
-/// The orchestrator's delegation tools over a shared queue: `spawn_task` and
-/// `delegate_to_desk`. `query_company` is built separately because it needs the
+// ---------------------------------------------------------------------------
+// assign_task / review_task (issue #186 part b — orchestrator lifecycle authority)
+// ---------------------------------------------------------------------------
+
+/// A lifecycle tool that (re)assigns an existing board card.
+///
+/// Part (a) of #186 gave the orchestrator the *reply* and put the column
+/// decisions behind a seam; this is the half that makes the authority real —
+/// the orchestrator can now decide who owns a card, rather than assignment
+/// being fixed at the moment the card was opened.
+///
+/// **It does not (re)dispatch.** Dispatch fires from
+/// `CompanyRuntime::upsert_task`, which is reached by the console's
+/// `column → in_progress` PATCH; the delegation queue drains through the
+/// [`TaskStore`](crate::ports::TaskStore) port instead, which deliberately has
+/// no runtime handle. Assigning a card therefore sets its owner and leaves
+/// dispatch to that existing path — reaching the runtime from a tool would be a
+/// layering change well outside this issue.
+pub struct AssignTaskTool {
+    queue: DelegationQueue,
+}
+
+impl AssignTaskTool {
+    /// Builds the tool over the shared delegation queue.
+    pub fn new(queue: DelegationQueue) -> Self {
+        Self { queue }
+    }
+}
+
+#[async_trait]
+impl Tool for AssignTaskTool {
+    fn name(&self) -> &str {
+        ASSIGN_TASK_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "Set or change who owns an existing task card on the company's board. Provide the card's `task_id`, the `assignee` (a desk or teammate id), and an optional `note` explaining the assignment. This records ownership; it does not start the work — move the card to In Progress to dispatch it."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The id of the card to assign." },
+                "assignee": { "type": "string", "description": "The desk/teammate id taking it on." },
+                "note": { "type": "string", "description": "An optional line explaining the assignment." }
+            },
+            "required": ["task_id", "assignee"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let task_id = required_str(&args, "task_id")?;
+        let assignee = required_str(&args, "assignee")?;
+        let note = optional_str(&args, "note");
+
+        self.queue.push(Delegation::AssignTask {
+            task_id: task_id.clone(),
+            assignee: assignee.clone(),
+            note,
+        });
+        Ok(ToolResult::success(format!(
+            "Assigned card {task_id} to {assignee}."
+        )))
+    }
+}
+
+/// A lifecycle tool that records the orchestrator's verdict on a card sitting
+/// in `in_review`.
+///
+/// **Approving does not move the card to `done`.** That transition is issue
+/// #171's (PR #179, open) and #186's scope note says not to duplicate it, so an
+/// approved card stays in `in_review` — precisely the state #171 consumes —
+/// with the verdict recorded on its note. `revise` returns the card to
+/// `backlog` so it can be picked up again. See
+/// [`crate::harness::lifecycle::review_landing_column`].
+pub struct ReviewTaskTool {
+    queue: DelegationQueue,
+}
+
+impl ReviewTaskTool {
+    /// Builds the tool over the shared delegation queue.
+    pub fn new(queue: DelegationQueue) -> Self {
+        Self { queue }
+    }
+}
+
+#[async_trait]
+impl Tool for ReviewTaskTool {
+    fn name(&self) -> &str {
+        REVIEW_TASK_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "Record your review of a task card that is awaiting review. Provide the card's `task_id` and a `decision` of `approve` (the work is accepted) or `revise` (it needs another pass, which returns the card to the backlog), plus an optional `note` with your feedback."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "The id of the card being reviewed." },
+                "decision": {
+                    "type": "string",
+                    "enum": ["approve", "revise"],
+                    "description": "`approve` to accept the work, `revise` to send it back."
+                },
+                "note": { "type": "string", "description": "Optional reviewer feedback." }
+            },
+            "required": ["task_id", "decision"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let task_id = required_str(&args, "task_id")?;
+        let raw = required_str(&args, "decision")?;
+        // An unrecognised verdict is an error, never a silent approval: a card
+        // must not pass review on a typo.
+        let decision = ReviewDecision::parse(&raw).ok_or_else(|| {
+            anyhow::anyhow!("`decision` must be `approve` or `revise`, got `{raw}`")
+        })?;
+        let note = optional_str(&args, "note");
+
+        self.queue.push(Delegation::ReviewTask {
+            task_id: task_id.clone(),
+            decision,
+            note,
+        });
+        Ok(match decision {
+            ReviewDecision::Approve => ToolResult::success(format!(
+                "Approved card {task_id}; it stays in review pending the done transition."
+            )),
+            ReviewDecision::Revise => ToolResult::success(format!(
+                "Sent card {task_id} back to the backlog for another pass."
+            )),
+        })
+    }
+}
+
+/// Reads a required non-empty string argument, trimmed.
+fn required_str(args: &Value, key: &str) -> anyhow::Result<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("`{key}` is required"))
+}
+
+/// Reads an optional non-empty string argument, trimmed. A blank string is
+/// treated as absent so a note never renders as an empty block.
+fn optional_str(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The orchestrator's delegation and lifecycle tools over a shared queue:
+/// `spawn_task`, `delegate_to_desk`, and — since #186 part b — `assign_task`
+/// and `review_task`. `query_company` is built separately because it needs the
 /// read ports, not the queue.
 pub fn delegation_tools(queue: &DelegationQueue) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(SpawnTaskTool::new(queue.clone())),
         Box::new(DelegateToDeskTool::new(queue.clone())),
+        Box::new(AssignTaskTool::new(queue.clone())),
+        Box::new(ReviewTaskTool::new(queue.clone())),
     ]
 }
 
@@ -1401,6 +1609,107 @@ mod tests {
         assert_eq!(queue.queued(), 0);
     }
 
+    // ── Issue #186 part b: the lifecycle tools ─────────────────────────────
+
+    #[tokio::test]
+    async fn assign_task_tool_enqueues_an_assignment() {
+        let queue = DelegationQueue::default();
+        let tool = AssignTaskTool::new(queue.clone());
+        tool.execute(json!({ "task_id": "t1", "assignee": "eng", "note": "closer to it" }))
+            .await
+            .expect("execute");
+        assert_eq!(
+            queue.drain(MAX_DELEGATIONS_PER_TURN),
+            vec![Delegation::AssignTask {
+                task_id: "t1".to_string(),
+                assignee: "eng".to_string(),
+                note: Some("closer to it".to_string()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_task_tool_requires_a_card_and_an_assignee() {
+        let queue = DelegationQueue::default();
+        let tool = AssignTaskTool::new(queue.clone());
+        assert!(tool.execute(json!({ "assignee": "eng" })).await.is_err());
+        assert!(tool.execute(json!({ "task_id": "t1" })).await.is_err());
+        // A blank string is not an assignee.
+        assert!(
+            tool.execute(json!({ "task_id": "t1", "assignee": "  " }))
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn review_task_tool_enqueues_both_verdicts() {
+        let queue = DelegationQueue::default();
+        let tool = ReviewTaskTool::new(queue.clone());
+        tool.execute(json!({ "task_id": "t1", "decision": "approve", "note": "good" }))
+            .await
+            .expect("approve");
+        tool.execute(json!({ "task_id": "t2", "decision": "revise" }))
+            .await
+            .expect("revise");
+        assert_eq!(
+            queue.drain(MAX_DELEGATIONS_PER_TURN),
+            vec![
+                Delegation::ReviewTask {
+                    task_id: "t1".to_string(),
+                    decision: ReviewDecision::Approve,
+                    note: Some("good".to_string()),
+                },
+                Delegation::ReviewTask {
+                    task_id: "t2".to_string(),
+                    decision: ReviewDecision::Revise,
+                    note: None,
+                },
+            ]
+        );
+    }
+
+    /// An unrecognised verdict is an error, never a silent approval — a card
+    /// must not pass review because the model typed something unexpected.
+    #[tokio::test]
+    async fn review_task_tool_rejects_an_unknown_verdict_rather_than_approving() {
+        let queue = DelegationQueue::default();
+        let tool = ReviewTaskTool::new(queue.clone());
+        assert!(
+            tool.execute(json!({ "task_id": "t1", "decision": "maybe" }))
+                .await
+                .is_err()
+        );
+        assert!(tool.execute(json!({ "task_id": "t1" })).await.is_err());
+        assert_eq!(queue.queued(), 0, "nothing may be queued on a bad verdict");
+    }
+
+    /// Both lifecycle tools are internal delegation work, so the approval
+    /// policy must classify them as such — never as an external effect to park.
+    #[test]
+    fn the_lifecycle_tools_are_internal_delegation_tools() {
+        assert!(is_delegation_tool(ASSIGN_TASK_TOOL));
+        assert!(is_delegation_tool(REVIEW_TASK_TOOL));
+    }
+
+    /// The orchestrator is actually handed the new tools.
+    #[test]
+    fn delegation_tools_include_the_lifecycle_tools() {
+        let names: Vec<String> = delegation_tools(&DelegationQueue::default())
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(names.contains(&ASSIGN_TASK_TOOL.to_string()), "{names:?}");
+        assert!(names.contains(&REVIEW_TASK_TOOL.to_string()), "{names:?}");
+        // …without dropping the ones that were already there.
+        assert!(names.contains(&SPAWN_TASK_TOOL.to_string()), "{names:?}");
+        assert!(
+            names.contains(&DELEGATE_TO_DESK_TOOL.to_string()),
+            "{names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn delegate_to_desk_tool_enqueues_a_hand_off() {
         let queue = DelegationQueue::default();
@@ -1701,7 +2010,7 @@ name = "Morning"
     }
 
     #[test]
-    fn orchestrator_tools_includes_all_six() {
+    fn orchestrator_tools_includes_all_eight() {
         let queue = DelegationQueue::default();
         let tools = orchestrator_tools(
             CompanyId::new("acme"),
@@ -1713,13 +2022,16 @@ name = "Morning"
             Arc::new(MemStore::default()),
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names.len(), 6, "got {names:?}");
+        // Six before #186; `assign_task` + `review_task` make eight.
+        assert_eq!(names.len(), 8, "got {names:?}");
         assert!(names.contains(&RUN_WORKFLOW_TOOL), "got {names:?}");
         assert!(names.contains(&CREATE_WORKFLOW_TOOL), "got {names:?}");
         assert!(names.contains(&ADD_AGENT_TOOL), "got {names:?}");
         assert!(names.contains(&QUERY_COMPANY_TOOL), "got {names:?}");
         assert!(names.contains(&SPAWN_TASK_TOOL), "got {names:?}");
         assert!(names.contains(&DELEGATE_TO_DESK_TOOL), "got {names:?}");
+        assert!(names.contains(&ASSIGN_TASK_TOOL), "got {names:?}");
+        assert!(names.contains(&REVIEW_TASK_TOOL), "got {names:?}");
     }
 
     #[tokio::test]

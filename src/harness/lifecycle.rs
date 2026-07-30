@@ -76,6 +76,61 @@ pub enum TaskRunEnd {
     RedirectsExhausted,
 }
 
+/// The orchestrator's verdict on a card sitting in `in_review` (issue #186
+/// part b).
+///
+/// Deliberately only two outcomes, and deliberately neither of them writes
+/// [`COLUMN_DONE`] — see [`review_landing_column`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// The work is accepted. The card stays in `in_review`, which is the state
+    /// #171's done-transition consumes.
+    Approve,
+    /// The work needs another pass. The card returns to `backlog` so it can be
+    /// re-dispatched.
+    Revise,
+}
+
+impl ReviewDecision {
+    /// Parses the `decision` argument of the `review_task` tool. Accepts the
+    /// obvious synonyms an LLM reaches for, because a rejected tool call costs
+    /// the orchestrator a whole turn.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "approve" | "approved" | "accept" | "accepted" | "ok" => Some(Self::Approve),
+            "revise" | "reject" | "rejected" | "rework" | "changes" => Some(Self::Revise),
+            _ => None,
+        }
+    }
+}
+
+/// The board column a reviewed card lands in.
+///
+/// **`Approve` deliberately leaves the card in `in_review` rather than moving
+/// it to `done`.** The `in_review → done` write is issue #171's (PR #179,
+/// open), and #186's own scope note says not to duplicate it. What this issue
+/// supplies is the orchestrator *authority* around that transition: an
+/// approving verdict recorded on the card, in the column #171 consumes. When
+/// #179 lands, this is the one function that changes.
+pub fn review_landing_column(decision: ReviewDecision) -> &'static str {
+    match decision {
+        ReviewDecision::Approve => COLUMN_IN_REVIEW,
+        ReviewDecision::Revise => COLUMN_BACKLOG,
+    }
+}
+
+/// The note block a review records on the card, in the orchestrator's voice.
+pub fn review_note(decision: ReviewDecision, note: Option<&str>) -> String {
+    let verdict = match decision {
+        ReviewDecision::Approve => "reviewed: approved",
+        ReviewDecision::Revise => "reviewed: needs another pass",
+    };
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => format!("{verdict} — {note}"),
+        None => verdict.to_string(),
+    }
+}
+
 /// The board column a run ending this way lands its card in.
 ///
 /// The single authority for that mapping. A failed or cancelled run goes back
@@ -209,6 +264,63 @@ mod test {
                 "the done transition belongs to #171, not to a run ending"
             );
         }
+    }
+
+    /// #186 part b: the orchestrator's review verdict. `Approve` must NOT
+    /// write `done` — that transition is #171's (PR #179, open) — so an
+    /// approved card stays in `in_review`, which is exactly the state #171
+    /// consumes. `Revise` sends it back to be re-dispatched.
+    #[test]
+    fn an_approved_review_waits_in_review_for_171_rather_than_writing_done() {
+        assert_eq!(
+            review_landing_column(ReviewDecision::Approve),
+            COLUMN_IN_REVIEW,
+            "approving must not duplicate #171's done-write"
+        );
+        assert_ne!(review_landing_column(ReviewDecision::Approve), COLUMN_DONE);
+        assert_eq!(
+            review_landing_column(ReviewDecision::Revise),
+            COLUMN_BACKLOG
+        );
+    }
+
+    #[test]
+    fn a_review_decision_accepts_the_synonyms_a_model_reaches_for() {
+        for raw in ["approve", "Approved", " ACCEPT ", "ok"] {
+            assert_eq!(
+                ReviewDecision::parse(raw),
+                Some(ReviewDecision::Approve),
+                "{raw}"
+            );
+        }
+        for raw in ["revise", "Reject", "rework", "changes"] {
+            assert_eq!(
+                ReviewDecision::parse(raw),
+                Some(ReviewDecision::Revise),
+                "{raw}"
+            );
+        }
+        // An unrecognised verdict is rejected rather than silently approved —
+        // guessing here would let a card through review on a typo.
+        assert_eq!(ReviewDecision::parse("maybe"), None);
+        assert_eq!(ReviewDecision::parse(""), None);
+    }
+
+    #[test]
+    fn a_review_note_records_the_verdict_and_any_reviewer_comment() {
+        assert_eq!(
+            review_note(ReviewDecision::Approve, None),
+            "reviewed: approved"
+        );
+        assert_eq!(
+            review_note(ReviewDecision::Revise, Some("tighten the intro")),
+            "reviewed: needs another pass — tighten the intro"
+        );
+        // A blank comment must not leave a dangling em dash.
+        assert_eq!(
+            review_note(ReviewDecision::Approve, Some("   ")),
+            "reviewed: approved"
+        );
     }
 
     #[test]

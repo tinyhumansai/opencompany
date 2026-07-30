@@ -435,7 +435,82 @@ impl HarnessBrain {
                     steps: outcome.steps,
                 }))
             }
+            // ── Issue #186 part b: orchestrator lifecycle authority ─────────
+            //
+            // Both write through the same `TaskStore` path the console uses, so
+            // an orchestrator-driven change is persisted identically to an
+            // operator-driven one. Neither surfaces a bubble: the orchestrator
+            // is mid-turn and will describe what it did in its own reply, and a
+            // second bubble would be it talking to itself.
+            //
+            // A card that has since vanished is a silent no-op, matching every
+            // other task path in this file.
+            Delegation::AssignTask {
+                task_id,
+                assignee,
+                note,
+            } => {
+                let Some((tasks, mut card)) = self.load_card(&task_id).await? else {
+                    return Ok(None);
+                };
+                card.assignee = assignee.clone();
+                card.note = Some(append_result(
+                    card.note.as_deref(),
+                    &self.orchestrator(),
+                    &match note {
+                        Some(note) => format!("assigned to {assignee} — {note}"),
+                        None => format!("assigned to {assignee}"),
+                    },
+                ));
+                // The column is untouched on purpose: dispatch fires from
+                // `CompanyRuntime::upsert_task`, which this port cannot reach.
+                // Assignment records ownership; the board's
+                // `column → in_progress` PATCH still starts the work.
+                card.updated_at_millis = now_millis();
+                tasks.upsert(&self.record.id, &card).await?;
+                Ok(None)
+            }
+            Delegation::ReviewTask {
+                task_id,
+                decision,
+                note,
+            } => {
+                let Some((tasks, mut card)) = self.load_card(&task_id).await? else {
+                    return Ok(None);
+                };
+                card.note = Some(append_result(
+                    card.note.as_deref(),
+                    &self.orchestrator(),
+                    &lifecycle::review_note(decision, note.as_deref()),
+                ));
+                // `Approve` leaves the card in `in_review` — the done-write is
+                // #171's (PR #179, open) and must not be duplicated here.
+                card.column = lifecycle::review_landing_column(decision).to_string();
+                card.updated_at_millis = now_millis();
+                tasks.upsert(&self.record.id, &card).await?;
+                Ok(None)
+            }
         }
+    }
+
+    /// Loads one board card by id, with its store handle.
+    ///
+    /// `None` when there is no task store wired, or when the card has since
+    /// been deleted — both of which every task path in this file treats as a
+    /// silent no-op rather than an error.
+    async fn load_card(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(Arc<dyn crate::ports::TaskStore>, TaskRecord)>> {
+        let Some(tasks) = self.deps.tasks.as_ref() else {
+            return Ok(None);
+        };
+        let card = tasks
+            .list(&self.record.id)
+            .await?
+            .into_iter()
+            .find(|t| t.id == task_id);
+        Ok(card.map(|card| (tasks.clone(), card)))
     }
 }
 
@@ -1373,6 +1448,149 @@ members = ["eng1", "eng2"]
         assert_eq!(cards[0].title, "Draft the plan");
         assert_eq!(cards[0].column, "backlog");
         assert_eq!(cards[0].assignee, "engineer");
+    }
+
+    // ── Issue #186 part b: orchestrator lifecycle authority ────────────────
+
+    /// `assign_task` changes who owns an existing card, records the change in
+    /// the orchestrator's voice, and — deliberately — does **not** touch the
+    /// column: dispatch fires from `CompanyRuntime::upsert_task`, which the
+    /// `TaskStore` port this drain writes through cannot reach.
+    #[tokio::test]
+    async fn assign_task_reassigns_the_card_without_dispatching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-assign", "engineer");
+        c.column = "backlog".to_string();
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        let out = brain
+            .run_delegation(
+                Delegation::AssignTask {
+                    task_id: "t-assign".to_string(),
+                    assignee: "ceo".to_string(),
+                    note: Some("closer to the customer".to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("delegation runs");
+        assert!(
+            out.is_none(),
+            "the orchestrator is mid-turn; a bubble here would be it talking to itself"
+        );
+
+        let after = only_card(&tasks).await;
+        assert_eq!(after.assignee, "ceo");
+        assert_eq!(
+            after.column, "backlog",
+            "assignment records ownership; it must not start the work"
+        );
+        let note = after.note.expect("note");
+        assert!(note.contains("assigned to ceo"), "{note}");
+        assert!(note.contains("closer to the customer"), "{note}");
+        assert!(
+            note.contains(&format!("[{}]", brain.orchestrator())),
+            "the assignment is recorded in the orchestrator's voice: {note}"
+        );
+    }
+
+    /// Approving must NOT write `done` — that transition is #171's (PR #179,
+    /// open). The card stays in `in_review`, which is the state #171 consumes,
+    /// with the verdict recorded.
+    #[tokio::test]
+    async fn review_approve_records_the_verdict_and_leaves_done_to_171() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-review", "engineer");
+        c.column = "in_review".to_string();
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_delegation(
+                Delegation::ReviewTask {
+                    task_id: "t-review".to_string(),
+                    decision: lifecycle::ReviewDecision::Approve,
+                    note: Some("ships as-is".to_string()),
+                },
+                None,
+            )
+            .await
+            .expect("delegation runs");
+
+        let after = only_card(&tasks).await;
+        assert_eq!(
+            after.column, "in_review",
+            "#186 must not duplicate #171's in_review -> done write"
+        );
+        assert_ne!(after.column, "done");
+        let note = after.note.expect("note");
+        assert!(note.contains("reviewed: approved"), "{note}");
+        assert!(note.contains("ships as-is"), "{note}");
+    }
+
+    /// `revise` is a transition #186 does own: the card goes back to the
+    /// backlog so it can be picked up and re-dispatched.
+    #[tokio::test]
+    async fn review_revise_sends_the_card_back_to_the_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-revise", "engineer");
+        c.column = "in_review".to_string();
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_delegation(
+                Delegation::ReviewTask {
+                    task_id: "t-revise".to_string(),
+                    decision: lifecycle::ReviewDecision::Revise,
+                    note: None,
+                },
+                None,
+            )
+            .await
+            .expect("delegation runs");
+
+        let after = only_card(&tasks).await;
+        assert_eq!(after.column, "backlog");
+        assert!(
+            after.note.expect("note").contains("needs another pass"),
+            "the verdict must be recorded even without a reviewer comment"
+        );
+    }
+
+    /// A card that has since been deleted is a silent no-op, matching every
+    /// other task path in this file — never an error that kills the turn.
+    #[tokio::test]
+    async fn a_lifecycle_delegation_for_a_missing_card_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+
+        for delegation in [
+            Delegation::AssignTask {
+                task_id: "ghost".to_string(),
+                assignee: "ceo".to_string(),
+                note: None,
+            },
+            Delegation::ReviewTask {
+                task_id: "ghost".to_string(),
+                decision: lifecycle::ReviewDecision::Approve,
+                note: None,
+            },
+        ] {
+            let out = brain
+                .run_delegation(delegation, None)
+                .await
+                .expect("a missing card must not error");
+            assert!(out.is_none());
+        }
+        assert!(
+            tasks
+                .list(&CompanyId::new("acme"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A `delegate_to_desk` delegation runs the desk lead and surfaces its reply
