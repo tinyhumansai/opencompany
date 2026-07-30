@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Inbox as InboxIcon, Mail, Send } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
@@ -37,6 +37,8 @@ export function InboxView({ client, company }: Props) {
   const [activeKey, setActiveKey] = useState("");
   const [messages, setMessages] = useState<InboxMessageDto[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
+  const [messagesError, setMessagesError] = useState<string | null>(null);
+  const [messagesReload, setMessagesReload] = useState(0);
   const [openId, setOpenId] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<"list" | "read">("list");
 
@@ -44,10 +46,20 @@ export function InboxView({ client, company }: Props) {
   const active = listed.find((i) => i.key === activeKey) ?? listed[0];
   const openMsg = messages.find((m) => m.id === openId) ?? null;
 
+  /**
+   * Generation counter for the roster fetch. Bumped on every load and on
+   * teardown, so a response that resolves after the company changed — or after
+   * a second "Try again" — is dropped instead of overwriting the newer roster,
+   * active key, and unread counts.
+   */
+  const rosterRun = useRef(0);
+
   // The inbox roster: which teammates have an inbox, and how much is unread.
   const loadRoster = useCallback(async () => {
+    const run = ++rosterRun.current;
     try {
       const rows = await client.listInboxes(company);
+      if (run !== rosterRun.current) return;
       setInboxes(rows);
       setActiveKey((current) =>
         rows.some((i) => i.enabled && i.key === current)
@@ -57,6 +69,9 @@ export function InboxView({ client, company }: Props) {
       setError(null);
       setLoad("ready");
     } catch (cause) {
+      // A stale failure must not bury a newer roster either — the error path is
+      // gated on the same generation as the success path.
+      if (run !== rosterRun.current) return;
       // No fixture fallback: a host that can't serve inboxes says so rather than
       // render invented mail.
       setInboxes([]);
@@ -68,6 +83,11 @@ export function InboxView({ client, company }: Props) {
   useEffect(() => {
     setLoad("loading");
     void loadRoster();
+    // Invalidate the in-flight load when the company changes or the view
+    // unmounts, so its response can never land on the next company's state.
+    return () => {
+      rosterRun.current += 1;
+    };
   }, [loadRoster]);
 
   // The selected inbox's mail. Refetched whenever the selection changes, so
@@ -77,16 +97,26 @@ export function InboxView({ client, company }: Props) {
   useEffect(() => {
     if (!activeInboxKey) {
       setMessages([]);
+      setMessagesError(null);
       return;
     }
     let cancelled = false;
     setMessagesLoading(true);
+    setMessagesError(null);
     void (async () => {
       try {
         const mail = await client.inboxMessages(activeInboxKey, company);
         if (!cancelled) setMessages(mail.slice().sort((a, b) => b.atMillis - a.atMillis));
-      } catch {
-        if (!cancelled) setMessages([]);
+      } catch (cause) {
+        // A failed read is NOT an empty inbox. Rendering "no messages yet" here
+        // would be the fixture bug in a new costume: the console would state
+        // something about this teammate's mail that it does not know.
+        if (!cancelled) {
+          setMessages([]);
+          setMessagesError(
+            cause instanceof Error ? cause.message : "Couldn't load this inbox.",
+          );
+        }
       } finally {
         if (!cancelled) setMessagesLoading(false);
       }
@@ -94,7 +124,7 @@ export function InboxView({ client, company }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [client, company, activeInboxKey]);
+  }, [client, company, activeInboxKey, messagesReload]);
 
   async function openMessage(inboxKey: string, message: InboxMessageDto) {
     setOpenId(message.id);
@@ -186,6 +216,24 @@ export function InboxView({ client, company }: Props) {
               {Array.from({ length: 4 }).map((_, i) => (
                 <Skeleton key={i} className="h-14 rounded-lg" />
               ))}
+            </div>
+          ) : messagesError ? (
+            <div
+              className="flex flex-col items-center gap-3 p-8 text-center text-sm text-muted-foreground"
+              data-testid="inbox-messages-error"
+            >
+              <Mail className="size-6" />
+              <div className="space-y-1">
+                <p className="font-medium text-foreground">Couldn't load this inbox</p>
+                <p className="max-w-xs">{messagesError}</p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setMessagesReload((n) => n + 1)}
+              >
+                Try again
+              </Button>
             </div>
           ) : messages.length > 0 ? (
             messages.map((m) => (
