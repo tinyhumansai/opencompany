@@ -124,26 +124,26 @@ pub async fn record_inference_usage(
         cost_usd = usage.cost_usd,
         "[usage] recording cycle inference usage"
     );
-    if let Some(entry) = inference_ledger_entry(usage, agent) {
-        if let Err(err) = store.append_ledger(company, entry).await {
-            tracing::warn!(
-                company = %company,
-                agent = %agent,
-                error = %err,
-                "[usage] failed to append the inference spend entry; the cycle itself succeeded"
-            );
-        }
+    if let Some(entry) = inference_ledger_entry(usage, agent)
+        && let Err(err) = store.append_ledger(company, entry).await
+    {
+        tracing::warn!(
+            company = %company,
+            agent = %agent,
+            error = %err,
+            "[usage] failed to append the inference spend entry; the cycle itself succeeded"
+        );
     }
-    if let Some(sample) = inference_sample(usage, agent, provider) {
-        if let Err(err) = meter.record(company, &sample).await {
-            tracing::warn!(
-                company = %company,
-                agent = %agent,
-                provider = %sample.provider,
-                error = %err,
-                "[usage] failed to record an inference sample; the cycle itself succeeded"
-            );
-        }
+    if let Some(sample) = inference_sample(usage, agent, provider)
+        && let Err(err) = meter.record(company, &sample).await
+    {
+        tracing::warn!(
+            company = %company,
+            agent = %agent,
+            provider = %sample.provider,
+            error = %err,
+            "[usage] failed to record an inference sample; the cycle itself succeeded"
+        );
     }
 }
 
