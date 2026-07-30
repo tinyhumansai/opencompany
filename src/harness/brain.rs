@@ -99,15 +99,15 @@ impl HarnessBrain {
         self
     }
 
-    /// Runs one dispatched board task: load the card, route it to its assignee
-    /// (or the default responder) for a single turn, and write the outcome back
-    /// onto the board — moved to its success terminal column on success (see
-    /// [`success_terminal_column`]), back to `backlog` with the error noted on
-    /// failure. A missing task store or a card that has since vanished is a
-    /// silent no-op.
     /// Runs a dispatched card to completion and, when the card remembers the
     /// conversation it was spawned from, returns the reply to post back there
     /// (issue #151 §3.2).
+    ///
+    /// Loads the card, routes it to its assignee (or the default responder) for
+    /// a single turn, and writes the outcome back onto the board — moved to its
+    /// success terminal column on success (see [`success_terminal_column`]),
+    /// back to `backlog` with the error noted on failure. A missing task store
+    /// or a card that has since vanished is a silent no-op.
     ///
     /// Before this the answer only ever reached `card.note`: the card runs
     /// asynchronously, long after the turn that spawned it has answered, so the
@@ -447,7 +447,14 @@ impl HarnessBrain {
                 elapsed_ms: None,
             });
             if let Some(events) = self.deps.events.as_ref() {
-                events
+                // Best-effort **per failure**. `drain` is a `mem::take`, so the
+                // queue is already empty by the time this loop runs and the
+                // batch exists only in this iterator. Propagating with `?` here
+                // would discard every failure after the first journal error —
+                // permanently, since nothing remains to retry from. A failed
+                // audit write must not cost us the rest of the audit.
+                let server = failure.server.clone();
+                if let Err(err) = events
                     .append(
                         &self.record.id,
                         CompanyEvent::McpCallFailed {
@@ -458,7 +465,15 @@ impl HarnessBrain {
                             message: failure.scrubbed_message,
                         },
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(
+                        server = %server,
+                        task_id = task_id.unwrap_or("-"),
+                        error = %err,
+                        "[task] failed to journal an MCP failure; draining the rest"
+                    );
+                }
             }
         }
         Ok(())
@@ -1831,6 +1846,120 @@ members = ["eng1", "eng2"]
                     if server == "browserbase" && status == "tool_call_rejected"
             )),
             "an McpCallFailed audit event was journaled"
+        );
+    }
+
+    /// #185 review follow-up: one bad journal write must not swallow the rest of
+    /// the batch.
+    ///
+    /// `McpFailureQueue::drain` is a `mem::take` — by the time the loop runs the
+    /// queue is empty and the batch exists only in that iterator. Propagating
+    /// the first append error with `?` therefore did not merely skip one audit
+    /// event, it discarded every failure behind it with nothing left to retry
+    /// from. Journaling is per-item best-effort so the drain always completes.
+    #[tokio::test]
+    async fn a_failed_journal_write_does_not_swallow_the_rest_of_the_drain() {
+        use crate::harness::mcp_probe::McpFailure;
+        use crate::ports::EventLog;
+        use crate::ports::types::{EventSeq, StoredEvent};
+        use futures::stream::{self, BoxStream};
+
+        /// An event log whose FIRST append fails and whose later appends
+        /// succeed, recording what got through.
+        #[derive(Default)]
+        struct FailFirstLog {
+            seen: StdMutex<Vec<CompanyEvent>>,
+            appends: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl EventLog for FailFirstLog {
+            async fn append(&self, _id: &CompanyId, event: CompanyEvent) -> Result<EventSeq> {
+                let nth = self
+                    .appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if nth == 0 {
+                    return Err(crate::error::OpenCompanyError::Store(
+                        "journal unavailable".to_string(),
+                    ));
+                }
+                let mut guard = self.seen.lock().unwrap();
+                guard.push(event);
+                Ok(EventSeq::new(guard.len() as u64))
+            }
+            async fn read_from(
+                &self,
+                _id: &CompanyId,
+                _seq: EventSeq,
+                _limit: usize,
+            ) -> Result<Vec<StoredEvent>> {
+                Ok(Vec::new())
+            }
+            fn subscribe(&self, _id: &CompanyId) -> BoxStream<'static, StoredEvent> {
+                Box::pin(stream::empty())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(FailFirstLog::default());
+        let failures = crate::harness::mcp_probe::McpFailureQueue::default();
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir.path())),
+            store: Arc::new(FsCompanyStore::new(dir.path())),
+            meter: None,
+            workspace_root: dir.path().to_path_buf(),
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: Some(log.clone()),
+            delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: failures.clone(),
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        };
+        let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record());
+
+        for server in ["first", "second", "third"] {
+            failures.push(McpFailure {
+                server: server.into(),
+                tool: "browse".into(),
+                status: "tool_call_rejected".into(),
+                hint: None,
+                scrubbed_message: "server rejected the call".into(),
+            });
+        }
+
+        let mut steps: Vec<TurnStep> = Vec::new();
+        brain
+            .surface_mcp_failures(&mut steps, Some("t1"))
+            .await
+            .expect("a journal error is best-effort, not fatal");
+
+        // Every failure is re-skinned onto the timeline regardless…
+        assert_eq!(steps.len(), 3, "all three failures surfaced as steps");
+        // …and the two after the failed write still reached the journal. Before
+        // this fix `seen` was empty: the `?` returned on `first` and `second` /
+        // `third` were dropped with the drained batch.
+        let seen = log.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the drain continued past the failed append");
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                CompanyEvent::McpCallFailed { server, .. } if server == "third"
+            )),
+            "the last failure in the batch was still journaled"
         );
     }
 
