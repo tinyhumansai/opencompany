@@ -59,7 +59,15 @@ DELETE …/team/{agentId}                      remove an overlay teammate
 PUT    …/team/{agentId}/inbox                toggle a teammate's inbox
 POST   …/inboxes/{key}/read                  mark inbox messages read
 POST   …/inboxes/ingest                     HMAC-signed inbound email → inbox
+GET    …/inboxes                            list inboxes + unread counts
+GET    …/inboxes/{key}/messages              page one teammate's mail (newest first)
 ```
+
+The two inbox `GET`s are **REST twins of the `Company.inboxes` GraphQL
+resolver**: the operator console ships no GraphQL client, so without them the
+Inbox view had no reachable per-agent read at all and fell back to a client-side
+fixture (issue #173). They read the same `InboxStore`, and `GET …/team` tags each
+teammate with `inboxEnabled` so the Team toggle reflects that store too.
 
 Team writes are an **operator overlay** persisted through the store, merged
 into the manifest roster at read time — the version-controlled `company.toml`
