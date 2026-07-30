@@ -33,7 +33,7 @@
 //! * [`AssignTaskTool`] / [`ReviewTaskTool`] (issue #186) — the board's
 //!   lifecycle. `assign_task` sets or changes who owns an existing card;
 //!   `review_task` records the orchestrator's verdict on one awaiting review
-//!   (`approve` keeps it in `in_review` for #171's done-transition to consume,
+//!   (`approve` completes it to `done` — #171's transition, PR #179 — and
 //!   `revise` returns it to the backlog). Both enqueue a [`Delegation`] drained
 //!   by the brain, like the other delegation tools.
 //! * [`AddAgentTool`] (issue #71) — writes a new [`OverlayAgent`] through the
@@ -672,10 +672,11 @@ impl Tool for AssignTaskTool {
 /// A lifecycle tool that records the orchestrator's verdict on a card sitting
 /// in `in_review`.
 ///
-/// **Approving does not move the card to `done`.** That transition is issue
-/// #171's (PR #179, open) and #186's scope note says not to duplicate it, so an
-/// approved card stays in `in_review` — precisely the state #171 consumes —
-/// with the verdict recorded on its note. `revise` returns the card to
+/// **Approving completes the card to `done`.** That is issue #171's
+/// `in_review → done` transition (PR #179), which this tool supplies for the
+/// one card shape #179's own rule cannot reach: a board-created card, which has
+/// no `origin_chat_id` and so never completes on its own. The verdict is
+/// recorded on the card's note either way; `revise` returns the card to
 /// `backlog` so it can be picked up again. See
 /// [`crate::harness::lifecycle::review_landing_column`].
 pub struct ReviewTaskTool {

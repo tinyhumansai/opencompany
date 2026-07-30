@@ -30,6 +30,8 @@ import {
   type FeedbackResponse,
   type FeedbackSummary,
   type FinancesDto,
+  type InboxDto,
+  type InboxMessageDto,
   type TeamMemberDto,
   type UsageDto,
   type Verdict,
@@ -344,6 +346,37 @@ export class OpenCompanyClient {
     return this.request<void>(
       "DELETE",
       `${this.scope(company)}/team/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
+   * The company's inboxes with unread counts (Inbox tab). Both inbound paths —
+   * the ingest webhook and the IMAP poller — file into the store this reads, so
+   * received mail appears here. Hosts without the surface 404; callers treat
+   * that as "no inboxes".
+   */
+  listInboxes(company?: string | null): Promise<InboxDto[]> {
+    return this.request<InboxDto[]>("GET", `${this.scope(company)}/inboxes`);
+  }
+
+  /** One inbox's messages, oldest first. */
+  inboxMessages(key: string, company?: string | null): Promise<InboxMessageDto[]> {
+    return this.request<InboxMessageDto[]>(
+      "GET",
+      `${this.scope(company)}/inboxes/${encodeURIComponent(key)}/messages`,
+    );
+  }
+
+  /** Mark inbox messages read (the given ids, or all when omitted); returns the count still unread. */
+  markInboxRead(
+    key: string,
+    ids?: string[],
+    company?: string | null,
+  ): Promise<{ unread: number }> {
+    return this.request<{ unread: number }>(
+      "POST",
+      `${this.scope(company)}/inboxes/${encodeURIComponent(key)}/read`,
+      ids ? { ids } : undefined,
     );
   }
 

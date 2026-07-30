@@ -20,18 +20,23 @@
 //! shape), so it is unit-testable without a harness pool, a task store, or a
 //! live agent. `run_task` keeps the I/O and calls in here for every choice.
 //!
-//! # Pending dependencies
+//! # Relationship to neighbouring issues
 //!
-//! * **#171 (`in_review` → `done`, PR #179, still open).** [`COLUMN_DONE`] is
-//!   defined here but deliberately never returned by [`landing_column`]: no
-//!   code path in this crate writes the done column yet, and this issue must
-//!   not duplicate that transition. When #179 lands, the done-write belongs in
-//!   [`landing_column`] (or a reviewer-driven successor to it) rather than as a
-//!   sixth inline string somewhere else.
+//! * **#171 (`in_review` → `done`, PR #179) — landed, and folded in here.**
+//!   #179 shipped the done-write as a `success_terminal_column` helper inside
+//!   `brain.rs`. That is exactly the decision this module exists to own, so the
+//!   helper moved here and [`landing_column`] now consumes it. A card reaches
+//!   [`COLUMN_DONE`] by one of two routes, and never both: a *delegated* card
+//!   (one carrying an `origin_chat_id`) completes straight to `done`, because
+//!   its answer is relayed into the conversation it came from and no operator
+//!   is watching the board for it; a *board-created* card lands in
+//!   [`COLUMN_IN_REVIEW`] and reaches `done` only through an approving
+//!   orchestrator verdict ([`review_landing_column`]). Between them every
+//!   card has a terminal, which is what #171 was about.
 //! * **#185 (per-task event correlation, PR #190, still open).** #190 journals
 //!   `CompanyEvent::DeskTaskCompleted { column, .. }` from the tail of
 //!   `run_task`. That `column` is exactly what [`landing_column`] decides, so
-//!   once both land the event reports this module's decision rather than a
+//!   once it lands the event reports this module's decision rather than a
 //!   re-derived literal. **This issue does not emit that event** — doing so
 //!   would double-journal the timeline's terminal anchor.
 
@@ -45,10 +50,9 @@ pub const COLUMN_BACKLOG: &str = "backlog";
 /// The board column a paused run parks its card in. Resume is a plain
 /// `column → in_progress` PATCH, which re-triggers dispatch.
 pub const COLUMN_PAUSED: &str = "paused";
-/// The terminal column. **Nothing in this crate writes it yet** — the
-/// transition is issue #171's (PR #179, open). Defined here so the constant
-/// lives beside its siblings and #171 has an obvious seat, not because this
-/// issue uses it.
+/// The terminal column — nothing dispatches out of it. Reached by
+/// [`landing_column`] for a delegated card and by [`review_landing_column`] for
+/// an approved board card (issue #171 / PR #179).
 pub const COLUMN_DONE: &str = "done";
 
 /// The note attribution used for an operator-initiated stop, as opposed to a
@@ -79,12 +83,11 @@ pub enum TaskRunEnd {
 /// The orchestrator's verdict on a card sitting in `in_review` (issue #186
 /// part b).
 ///
-/// Deliberately only two outcomes, and deliberately neither of them writes
-/// [`COLUMN_DONE`] — see [`review_landing_column`].
+/// Deliberately only two outcomes — see [`review_landing_column`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewDecision {
-    /// The work is accepted. The card stays in `in_review`, which is the state
-    /// #171's done-transition consumes.
+    /// The work is accepted, which finishes the card: this is #171's
+    /// done-transition for a board-created card.
     Approve,
     /// The work needs another pass. The card returns to `backlog` so it can be
     /// re-dispatched.
@@ -106,15 +109,16 @@ impl ReviewDecision {
 
 /// The board column a reviewed card lands in.
 ///
-/// **`Approve` deliberately leaves the card in `in_review` rather than moving
-/// it to `done`.** The `in_review → done` write is issue #171's (PR #179,
-/// open), and #186's own scope note says not to duplicate it. What this issue
-/// supplies is the orchestrator *authority* around that transition: an
-/// approving verdict recorded on the card, in the column #171 consumes. When
-/// #179 lands, this is the one function that changes.
+/// **`Approve` writes [`COLUMN_DONE`].** This is the `in_review → done`
+/// transition issue #171 asked for, in the place #186 built for it: the
+/// orchestrator's verdict *is* the review a board-created card was parked
+/// waiting for, so approving it finishes it. It cannot duplicate #179's
+/// origin-based done-write, because only a card with **no** `origin_chat_id`
+/// ever reaches `in_review` in the first place (see [`landing_column`]).
+/// `Revise` sends the card back to be re-dispatched.
 pub fn review_landing_column(decision: ReviewDecision) -> &'static str {
     match decision {
-        ReviewDecision::Approve => COLUMN_IN_REVIEW,
+        ReviewDecision::Approve => COLUMN_DONE,
         ReviewDecision::Revise => COLUMN_BACKLOG,
     }
 }
@@ -131,17 +135,36 @@ pub fn review_note(decision: ReviewDecision, note: Option<&str>) -> String {
     }
 }
 
+/// Where a run that produced a result lands its card (issue #171, PR #179).
+///
+/// `in_review` is a naming convention, not a mechanism: nothing consumes it
+/// automatically. `task_enters_in_progress` only edge-fires a dispatch when a
+/// card enters `in_progress`, so an `in_review` card triggers no further cycle.
+///
+/// That is right for a card an operator made themselves — they are the
+/// reviewer, and the card is sitting in front of them (and the orchestrator can
+/// close it out with [`ReviewDecision::Approve`]). It strands a card stamped
+/// with `origin_chat_id`: that card came from `spawn_task` during an
+/// agent-to-agent handoff, its result is relayed straight back into the
+/// originating thread, and nobody is watching the board for it. So a card that
+/// remembers an origin completes to `done`.
+pub fn success_terminal_column(card: &TaskRecord) -> &'static str {
+    if card.origin_chat_id.is_some() {
+        COLUMN_DONE
+    } else {
+        COLUMN_IN_REVIEW
+    }
+}
+
 /// The board column a run ending this way lands its card in.
 ///
 /// The single authority for that mapping. A failed or cancelled run goes back
 /// to `backlog` (it is not reviewable work); a paused one parks; everything
-/// that produced a result lands in `in_review` for the orchestrator to judge.
-///
-/// Never returns [`COLUMN_DONE`] — see the module docs. `done` is #171's
-/// transition and is reached by review, not by a run ending.
-pub fn landing_column(end: TaskRunEnd) -> &'static str {
+/// that produced a result goes to its [`success_terminal_column`] — `done` for
+/// a delegated card, `in_review` for a board-created one.
+pub fn landing_column(end: TaskRunEnd, card: &TaskRecord) -> &'static str {
     match end {
-        TaskRunEnd::Completed | TaskRunEnd::RedirectsExhausted => COLUMN_IN_REVIEW,
+        TaskRunEnd::Completed | TaskRunEnd::RedirectsExhausted => success_terminal_column(card),
         TaskRunEnd::Failed | TaskRunEnd::Cancelled => COLUMN_BACKLOG,
         TaskRunEnd::Paused => COLUMN_PAUSED,
     }
@@ -232,55 +255,102 @@ mod test {
         }
     }
 
+    /// A card carrying an `origin_chat_id` — one spawned during a handoff.
+    fn delegated_card(column: &str) -> TaskRecord {
+        let mut c = card(column, None);
+        c.origin_chat_id = Some("strategy".to_string());
+        c
+    }
+
     /// The mapping every break point in `run_task`'s steer loop now defers to.
     /// Pinned exhaustively so a new `TaskRunEnd` cannot be added without a
     /// deliberate decision about where its card lands.
     #[test]
     fn landing_column_is_the_single_authority_for_a_cards_fate() {
-        assert_eq!(landing_column(TaskRunEnd::Completed), COLUMN_IN_REVIEW);
+        let board = card(COLUMN_IN_REVIEW, None);
         assert_eq!(
-            landing_column(TaskRunEnd::RedirectsExhausted),
+            landing_column(TaskRunEnd::Completed, &board),
             COLUMN_IN_REVIEW
         );
-        assert_eq!(landing_column(TaskRunEnd::Failed), COLUMN_BACKLOG);
-        assert_eq!(landing_column(TaskRunEnd::Cancelled), COLUMN_BACKLOG);
-        assert_eq!(landing_column(TaskRunEnd::Paused), COLUMN_PAUSED);
+        assert_eq!(
+            landing_column(TaskRunEnd::RedirectsExhausted, &board),
+            COLUMN_IN_REVIEW
+        );
+        assert_eq!(landing_column(TaskRunEnd::Failed, &board), COLUMN_BACKLOG);
+        assert_eq!(
+            landing_column(TaskRunEnd::Cancelled, &board),
+            COLUMN_BACKLOG
+        );
+        assert_eq!(landing_column(TaskRunEnd::Paused, &board), COLUMN_PAUSED);
     }
 
-    /// #171 is still open (PR #179): nothing here may write the done column, or
-    /// this issue would duplicate that transition.
+    /// #171 (PR #179): a delegated card completes to `done` instead of
+    /// stranding in `in_review` that nobody is watching. Both success
+    /// terminals — a clean finish and the redirect cap — must agree, or a
+    /// steered handoff still strands.
     #[test]
-    fn no_run_ending_lands_a_card_in_done() {
+    fn a_delegated_card_completes_to_done_but_a_stopped_one_still_does_not() {
+        let delegated = delegated_card(COLUMN_IN_REVIEW);
+        assert_eq!(
+            landing_column(TaskRunEnd::Completed, &delegated),
+            COLUMN_DONE
+        );
+        assert_eq!(
+            landing_column(TaskRunEnd::RedirectsExhausted, &delegated),
+            COLUMN_DONE
+        );
+
+        // A run that produced no result is not finished work, whatever the
+        // card's origin: it goes back or parks, never to the terminal column.
         for end in [
-            TaskRunEnd::Completed,
             TaskRunEnd::Failed,
             TaskRunEnd::Cancelled,
             TaskRunEnd::Paused,
-            TaskRunEnd::RedirectsExhausted,
         ] {
             assert_ne!(
-                landing_column(end),
+                landing_column(end, &delegated),
                 COLUMN_DONE,
-                "the done transition belongs to #171, not to a run ending"
+                "an unfinished run must not reach the terminal column"
             );
         }
     }
 
-    /// #186 part b: the orchestrator's review verdict. `Approve` must NOT
-    /// write `done` — that transition is #171's (PR #179, open) — so an
-    /// approved card stays in `in_review`, which is exactly the state #171
-    /// consumes. `Revise` sends it back to be re-dispatched.
+    /// The success terminal is chosen by origin, not by outcome: a
+    /// board-created card keeps its `in_review` review gate.
     #[test]
-    fn an_approved_review_waits_in_review_for_171_rather_than_writing_done() {
+    fn success_terminal_column_is_done_only_for_a_card_with_an_origin() {
         assert_eq!(
-            review_landing_column(ReviewDecision::Approve),
-            COLUMN_IN_REVIEW,
-            "approving must not duplicate #171's done-write"
+            success_terminal_column(&card(COLUMN_IN_REVIEW, None)),
+            COLUMN_IN_REVIEW
         );
-        assert_ne!(review_landing_column(ReviewDecision::Approve), COLUMN_DONE);
+        assert_eq!(
+            success_terminal_column(&delegated_card(COLUMN_IN_REVIEW)),
+            COLUMN_DONE
+        );
+    }
+
+    /// #186 part b: the orchestrator's review verdict finishes a board card.
+    /// This is #171's `in_review → done` write for the one card shape #179's
+    /// origin rule cannot reach — a card with no origin never completes to
+    /// `done` on its own, so without this it would sit in review forever.
+    #[test]
+    fn an_approving_review_finishes_the_card_and_revise_sends_it_back() {
+        assert_eq!(review_landing_column(ReviewDecision::Approve), COLUMN_DONE);
         assert_eq!(
             review_landing_column(ReviewDecision::Revise),
             COLUMN_BACKLOG
+        );
+    }
+
+    /// The two done-writes are disjoint: review only ever sees a card that
+    /// reached `in_review`, and #179's rule sends every card with an origin
+    /// straight to `done` instead. So no card is finished twice.
+    #[test]
+    fn only_a_card_without_an_origin_can_reach_review() {
+        assert_ne!(
+            landing_column(TaskRunEnd::Completed, &delegated_card(COLUMN_IN_REVIEW)),
+            COLUMN_IN_REVIEW,
+            "a delegated card must never park in the column review consumes"
         );
     }
 
