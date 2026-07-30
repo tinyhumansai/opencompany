@@ -143,7 +143,9 @@ impl<'a> CycleRunner<'a> {
     /// A zero-usage cycle writes nothing, which covers the idle cycle, the
     /// offline echo brain, and the openhuman harness — the harness meters each
     /// turn as it runs and deliberately reports zero here, so its spend is never
-    /// double-counted.
+    /// double-counted. Both non-`PerCycle` declarations are also enforced
+    /// directly, so a path that reports usage against its own contract is warned
+    /// about and dropped rather than trusted.
     ///
     /// Accounting never fails the cycle it accounts for: the write is
     /// logged-and-swallowed inside
@@ -154,18 +156,36 @@ impl<'a> CycleRunner<'a> {
             return;
         }
         let cognition = self.rt.brain.cognition();
-        if cognition.metering == UsageMetering::PerTurn {
-            // Defensive: a self-metering path should report zero. If one ever
-            // reports usage too, drop it here rather than charge it twice, and
-            // say so loudly.
-            tracing::warn!(
-                company = %company,
-                path = %cognition.path,
-                input = usage.input,
-                output = usage.output,
-                "[usage] a per-turn-metered brain also reported cycle usage; ignoring it to avoid double-counting"
-            );
-            return;
+        // Both non-`PerCycle` arms declare "do not meter me here", so both are
+        // enforced. Leaving `None` to fall through would have metered a brain
+        // that runs no model at all under its own slug — the echo brain would
+        // post a `provider: "none"` row into `byProvider`.
+        match cognition.metering {
+            UsageMetering::PerTurn => {
+                // Defensive: a self-metering path should report zero. If one ever
+                // reports usage too, drop it here rather than charge it twice, and
+                // say so loudly.
+                tracing::warn!(
+                    company = %company,
+                    path = %cognition.path,
+                    input = usage.input,
+                    output = usage.output,
+                    "[usage] a per-turn-metered brain also reported cycle usage; ignoring it to avoid double-counting"
+                );
+                return;
+            }
+            UsageMetering::None => {
+                tracing::warn!(
+                    company = %company,
+                    path = %cognition.path,
+                    input = usage.input,
+                    output = usage.output,
+                    "[usage] a brain that declares it runs no model reported cycle usage; ignoring it — \
+                     the path's Cognition::metering is wrong, or it grew a real model call"
+                );
+                return;
+            }
+            UsageMetering::PerCycle => {}
         }
         crate::metering::record_inference_usage(
             usage,
@@ -1167,6 +1187,35 @@ mod test {
             .with_brain(Arc::new(MeteredBrain {
                 usage: reported_usage(9.99),
                 metering: UsageMetering::PerTurn,
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(Vec::new()).await.unwrap();
+
+        assert!(rt.usage().query(rt.id(), 0).await.unwrap().is_empty());
+        let record = rt.store().load(rt.id()).await.unwrap().unwrap();
+        assert!(
+            !record
+                .ledger
+                .iter()
+                .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND)
+        );
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// `UsageMetering::None` means "no model runs on this path", so the cycle
+    /// seam must enforce it too. Without that arm a `None` brain reporting
+    /// non-zero usage was still metered under its own slug — the echo brain
+    /// would post a `provider: "none"` row into `byProvider`.
+    #[tokio::test]
+    async fn a_brain_that_runs_no_model_is_not_metered() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(MeteredBrain {
+                usage: reported_usage(4.2),
+                metering: UsageMetering::None,
             }))
             .build()
             .await

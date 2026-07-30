@@ -43,7 +43,13 @@ pub enum UsageMetering {
     /// truth, not a missing hook.
     None,
 }
+```
 
+`CycleRunner` **enforces** both non-`PerCycle` arms: a path that declares
+`PerTurn` or `None` and then reports non-zero cycle usage is warned about and
+dropped, never metered. Only `PerCycle` reaches the meter.
+
+```rust
 /// Callbacks the brain makes into the host mid-cycle.
 pub trait CycleHost: Send + Sync {
     async fn call_tool(&self, call: ToolCall) -> Result<ToolResult>;
@@ -338,11 +344,19 @@ pub trait UsageMeter: Send + Sync {
 ```
 
 `UsageSample` records one metered event (`SampleKind::Inference` tokens or
-`SampleKind::OauthCall`). **Writers:** `metering::inference` (always compiled) —
-called per turn by the openhuman harness's cost hook and per cycle by
-`CycleRunner` for every other cognition path — and `metering::oauth` for
-connected-tool calls. Both log-and-swallow: accounting never fails the work it
-accounts for. **Retention:** backends evict samples older than
+`SampleKind::OauthCall`). **Writers** — three, and they do **not** share failure
+semantics:
+
+| Writer | Called | On write failure |
+| --- | --- | --- |
+| `metering::inference::record_inference_usage` (always compiled) | per cycle by `CycleRunner`, for every cognition path that is not `PerTurn`-metered | logs and swallows — returns `()`, so the cycle still succeeds |
+| `metering::oauth::record_oauth_call` | per connected-tool call | logs and swallows — returns `()` |
+| `harness::cost::record_turn_cost` | per turn by the openhuman harness's cost hook | **propagates** — returns `Result<()>` and `HarnessPool::run_inner` applies `?`, so a ledger or meter failure fails the turn |
+
+The per-cycle and OAuth paths hold "accounting never fails the work it accounts
+for"; the per-turn harness path deliberately does not, because it writes the
+`inference.spend` ledger entry in the same call and a silently dropped ledger
+write is a money bug. **Retention:** backends evict samples older than
 **90 days** (`RETENTION_DAYS`, the console's maximum `D90` window) on write,
 anchored to the newest observed sample for deterministic eviction. Samples are
 non-secret accounting rows; money still resolves from the ledger and `[budget]`.

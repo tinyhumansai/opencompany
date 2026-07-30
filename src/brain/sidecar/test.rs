@@ -197,6 +197,36 @@ async fn inference_frame_invokes_host_callback_and_answers() {
     assert_eq!(result.token_usage.output, 7);
 }
 
+/// `with_cost` and `with_tokens` must compose in either order. `with_tokens`
+/// used to replace the whole `TokenUsage`, so cost-first ordering silently reset
+/// `cost_usd` to zero and any fixture written that way metered a free cycle —
+/// the exact under-reporting issue #174 is about. The tokens-first ordering is
+/// already covered by `cycle_folds_multi_pass_usage`; this pins the reverse.
+#[tokio::test]
+async fn mock_inference_cost_survives_a_later_with_tokens() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(cid(), vec![inference_frame(0, "what next?")]);
+    let inference = Arc::new(
+        MockInferenceClient::new()
+            .with_text("done")
+            // Cost first — the ordering that used to lose the cost.
+            .with_cost(0.005)
+            .with_tokens(10, 4),
+    );
+    let brain = brain(transport.clone(), inference.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 10);
+    assert_eq!(result.token_usage.output, 4);
+    assert!(
+        (result.token_usage.cost_usd - 0.005).abs() < 1e-9,
+        "with_tokens must not clear a cost set by with_cost, got {}",
+        result.token_usage.cost_usd
+    );
+}
+
 /// Issue #174: the host's inference client is the only side that sees what a pass
 /// cost, so the cycle total must carry the cost too — that is what the runtime
 /// meters onto the Usage and Finances surfaces.

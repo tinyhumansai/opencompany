@@ -1019,16 +1019,20 @@ impl RuntimeBuilder {
                             Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
                         } else {
                             // Do not degrade silently (issue #174): an openhuman
-                            // build with no resolvable inference source falls back
-                            // to the hosted/echo brain, so the operator sees a
-                            // company that answers (echo) or defers upstream while
-                            // Usage reads zero. That zero means "no key", not
-                            // "metering broken" — say so once at boot, and let the
-                            // inference-status route report the path it landed on.
+                            // build with no resolvable inference source disables
+                            // the harness path and falls through to
+                            // `select_hosted_or_echo`. Say that much and no more —
+                            // whether Usage then reads zero depends on what that
+                            // selection lands on (hosted Medulla with a credential
+                            // and a transport does meter per cycle; the echo brain
+                            // runs no model at all), so promising zero tokens here
+                            // would be wrong half the time. The inference-status
+                            // route reports the path actually selected.
                             tracing::warn!(
                                 company = %id,
                                 "no inference source resolved (no runtime override, no manifest [inference], no managed default); \
-                                 falling back to the hosted/echo brain — the Usage view will read zero tokens until one is configured"
+                                 the openhuman harness is disabled for this company — falling back to hosted/echo cognition, \
+                                 see the inference-status route for the path actually selected"
                             );
                             None
                         }
