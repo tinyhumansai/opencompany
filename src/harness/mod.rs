@@ -40,6 +40,7 @@ pub mod build;
 pub mod capability_budget;
 pub mod composio;
 pub mod cost;
+pub mod lifecycle;
 pub mod mcp;
 pub mod mcp_probe;
 pub mod memory;

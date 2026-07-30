@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
+use crate::harness::lifecycle::{self, TaskRunEnd};
 use crate::harness::orchestrator::{self, Delegation};
 use crate::harness::{HarnessDeps, HarnessPool};
 
@@ -140,33 +141,29 @@ impl HarnessBrain {
                     // A dispatched task discards its steps — the note is text-only.
                     match outcome {
                         Ok(outcome) => {
-                            card.note = Some(append_result(
-                                card.note.as_deref(),
-                                &responder,
-                                &outcome.reply,
-                            ));
-                            card.column = "in_review".to_string();
+                            settle(&mut card, TaskRunEnd::Completed, &responder, &outcome.reply);
                         }
                         Err(err) => {
-                            card.note = Some(append_result(
-                                card.note.as_deref(),
+                            settle(
+                                &mut card,
+                                TaskRunEnd::Failed,
                                 &responder,
                                 &format!("dispatch failed: {err}"),
-                            ));
-                            card.column = "backlog".to_string();
+                            );
                         }
                     }
                     break;
                 }
                 Some(SteerAction::Cancel) => {
                     // Partial work is DISCARDED — only a cancellation note lands,
-                    // and the card returns to `backlog`.
-                    card.note = Some(append_result(
-                        card.note.as_deref(),
-                        "operator",
+                    // and the card returns to `backlog`. The note is attributed to
+                    // the operator, not the assignee (the seam decides that too).
+                    settle(
+                        &mut card,
+                        TaskRunEnd::Cancelled,
+                        &responder,
                         "cancelled while in flight",
-                    ));
-                    card.column = "backlog".to_string();
+                    );
                     break;
                 }
                 Some(SteerAction::Pause) => {
@@ -178,8 +175,7 @@ impl HarnessBrain {
                         Ok(outcome) => format!("[paused] {}", outcome.reply),
                         Err(err) => format!("[paused] dispatch failed: {err}"),
                     };
-                    card.note = Some(append_result(card.note.as_deref(), &responder, &partial));
-                    card.column = "paused".to_string();
+                    settle(&mut card, TaskRunEnd::Paused, &responder, &partial);
                     break;
                 }
                 Some(SteerAction::Redirect { instruction: fresh }) => {
@@ -191,13 +187,12 @@ impl HarnessBrain {
                     ));
                     if redirects > MAX_REDIRECTS_PER_DISPATCH {
                         // Exhausted the redirect budget — finalize the last run's
-                        // reply to `in_review` rather than looping forever.
+                        // reply rather than looping forever.
                         let last = match &outcome {
                             Ok(outcome) => outcome.reply.clone(),
                             Err(err) => format!("dispatch failed: {err}"),
                         };
-                        card.note = Some(append_result(card.note.as_deref(), &responder, &last));
-                        card.column = "in_review".to_string();
+                        settle(&mut card, TaskRunEnd::RedirectsExhausted, &responder, &last);
                         break;
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
@@ -221,19 +216,41 @@ impl HarnessBrain {
         // straight on the board, or written before `origin_chat_id` existed,
         // has no thread to answer in and behaves exactly as before.
         //
-        // The bubble is attributed to the responder (matching a delegated desk
-        // reply) and carries the card's landing column, so the operator reads
-        // one line and knows both what came back and where the card went. Steps
-        // are deliberately empty: a dispatched card discards them into the note.
+        // Issue #186: the **orchestrator** relays the result, not the assignee.
+        //
+        // The bubble used to be attributed to the responder, so a desk member
+        // spoke straight to the operator — which bypasses the orchestrator's
+        // role as the single point of contact that `run_delegation` already
+        // honours. It is now the orchestrator's bubble, and the assignee is
+        // credited inside the text, so the operator still knows who did the
+        // work without a second voice in the thread.
+        //
+        // It still carries the card's landing column, so the operator reads one
+        // line and knows both what came back and where the card went. Steps are
+        // deliberately empty: a dispatched card discards them into the note.
         let Some(origin) = card.origin_chat_id.clone() else {
             return Ok(None);
         };
-        Ok(Some(OutboundMessage {
-            channel: responder,
-            text: task_postback_text(&card),
-            reply_to: Some(crate::ports::types::ReplyTo { chat_id: origin }),
-            steps: Vec::new(),
-        }))
+        Ok(Some(lifecycle::relay_reply(
+            &card,
+            &responder,
+            &self.orchestrator(),
+            origin,
+        )))
+    }
+
+    /// The company orchestrator's agent id — the single voice that answers the
+    /// operator (issue #186).
+    ///
+    /// Resolved from the roster rather than read off [`Self::responder`],
+    /// because `with_responder` can point that at any agent for a test or a
+    /// single-desk company; the relay must still be attributed to the real
+    /// orchestrator. Falls back to `responder` only when the roster has no
+    /// orchestrator to name at all, which is the same empty-roster case
+    /// [`orchestrator::orchestrator_id`] already tolerates.
+    fn orchestrator(&self) -> String {
+        orchestrator::orchestrator_id(&self.record.manifest.agents)
+            .unwrap_or_else(|| self.responder.clone())
     }
 
     /// Resolves which roster agent runs a task: its `assignee` when that names a
@@ -437,17 +454,22 @@ fn task_instruction(card: &TaskRecord) -> String {
 /// Reads the *result* out of the card rather than taking the raw turn reply, so
 /// a cancelled or paused run posts the same thing the board shows instead of
 /// claiming an answer it does not have.
-fn task_postback_text(card: &TaskRecord) -> String {
-    let status = match card.column.as_str() {
-        "in_review" => "is ready for review",
-        "paused" => "is paused",
-        "backlog" => "went back to the backlog",
-        other => other,
-    };
-    match card.note.as_deref().filter(|n| !n.trim().is_empty()) {
-        Some(note) => format!("\"{}\" {status}.\n\n{note}", card.title),
-        None => format!("\"{}\" {status}.", card.title),
-    }
+/// Records one run ending on the card: the result block on its note, and the
+/// board column it lands in.
+///
+/// Both decisions are the orchestrator's (issue #186), so both are read from
+/// [`crate::harness::lifecycle`] rather than written as literals here. Every
+/// break point in `run_task`'s steer loop goes through this one function, which
+/// is what stops a sixth exit inventing a sixth column string — and gives #171
+/// (the `in_review → done` write, PR #179) and #190's
+/// `DeskTaskCompleted { column, .. }` a single decision to consume.
+fn settle(card: &mut TaskRecord, end: TaskRunEnd, responder: &str, body: &str) {
+    card.note = Some(append_result(
+        card.note.as_deref(),
+        &lifecycle::note_attribution(end, responder),
+        body,
+    ));
+    card.column = lifecycle::landing_column(end).to_string();
 }
 
 /// Appends a responder-attributed result block to a card's note, preserving any
@@ -810,54 +832,12 @@ description = "Builds it."
 
     // ── Issue #151 §3.2: a finished card answers where it was asked ──────
 
-    /// The post-back names the card, where it landed, and the result — so the
-    /// operator reads one bubble instead of going to find the note.
-    #[test]
-    fn postback_reports_the_card_title_status_and_result() {
-        let mut finished = card("t1", "maya");
-        finished.column = "in_review".to_string();
-        finished.note = Some("[maya] Draft is up.".to_string());
-
-        let text = task_postback_text(&finished);
-        assert!(text.contains("Ship the thing"), "{text}");
-        assert!(text.contains("is ready for review"), "{text}");
-        assert!(text.contains("Draft is up."), "{text}");
-    }
-
-    /// A cancelled or paused run must not claim an answer it does not have —
-    /// the post-back reads the card, not the raw turn reply.
-    #[test]
-    fn postback_reflects_the_landing_column_not_a_presumed_success() {
-        let mut paused = card("t1", "maya");
-        paused.column = "paused".to_string();
-        paused.note = Some("[maya] [paused] halfway".to_string());
-        assert!(task_postback_text(&paused).contains("is paused"));
-
-        let mut cancelled = card("t1", "maya");
-        cancelled.column = "backlog".to_string();
-        cancelled.note = Some("[operator] cancelled while in flight".to_string());
-        let text = task_postback_text(&cancelled);
-        assert!(text.contains("went back to the backlog"), "{text}");
-        assert!(!text.contains("ready for review"), "{text}");
-    }
-
-    /// A card with no note still posts a readable line rather than a title
-    /// followed by a dangling blank block.
-    #[test]
-    fn postback_without_a_note_is_still_a_complete_sentence() {
-        let mut finished = card("t1", "maya");
-        finished.column = "in_review".to_string();
-        finished.note = None;
-        let text = task_postback_text(&finished);
-        assert_eq!(text, "\"Ship the thing\" is ready for review.");
-
-        finished.note = Some("   ".to_string());
-        assert_eq!(
-            task_postback_text(&finished),
-            "\"Ship the thing\" is ready for review.",
-            "a whitespace-only note must not append an empty block"
-        );
-    }
+    // The post-back's *text* rules — title, landing status, note folding,
+    // whitespace-only notes — moved with the renderer to
+    // `crate::harness::lifecycle` (issue #186), which owns them now and covers
+    // each case plus the new assignee-credit rule. What stays here is the
+    // wiring: that `run_task` reaches the relay at all, and attributes it to
+    // the orchestrator.
 
     /// The compatibility guarantee: a card with no remembered origin — one made
     /// straight on the board, or written before `origin_chat_id` existed —
@@ -882,13 +862,18 @@ description = "Builds it."
         assert!(only_card(&tasks).await.note.is_some());
     }
 
-    /// …and one that does remember its origin answers there, attributed to the
-    /// responder and threaded with `reply_to`.
+    /// …and one that does remember its origin answers there, threaded with
+    /// `reply_to` and — since issue #186 — attributed to the **orchestrator**
+    /// rather than to the assignee that did the work.
     #[tokio::test]
     async fn a_card_with_an_origin_posts_back_to_that_thread() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, tasks) = brain_with_tasks(dir.path());
-        let mut c = card("t-origin", "maya");
+        // A roster assignee, deliberately: an off-roster one falls back to the
+        // default responder (`task_responder`), which in this fixture *is* the
+        // orchestrator — so the credit would be correctly suppressed and this
+        // test would prove nothing about the one-voice relay.
+        let mut c = card("t-origin", "engineer");
         c.origin_chat_id = Some("strategy".to_string());
         tasks
             .upsert(&CompanyId::new("acme"), &c)
@@ -904,11 +889,24 @@ description = "Builds it."
             posted.reply_to.as_ref().map(|r| r.chat_id.as_str()),
             Some("strategy")
         );
-        assert!(
-            !posted.channel.is_empty(),
-            "the bubble must be attributed to the responder"
+        // Issue #186: one voice. The bubble belongs to the orchestrator, and
+        // the assignee that ran the card is credited in the text instead of
+        // speaking to the operator directly.
+        assert_eq!(
+            posted.channel,
+            brain.orchestrator(),
+            "the orchestrator relays a finished card, not the assignee"
+        );
+        assert_ne!(
+            posted.channel, "engineer",
+            "the assignee must not address the operator directly"
         );
         assert!(posted.text.contains("Ship the thing"), "{}", posted.text);
+        assert!(
+            posted.text.contains("engineer"),
+            "the relay must still credit who did the work: {}",
+            posted.text
+        );
         // A dispatched card discards its steps into the note.
         assert!(posted.steps.is_empty());
     }
