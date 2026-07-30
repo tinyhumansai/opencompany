@@ -360,18 +360,36 @@ impl HarnessBrain {
     /// Bounded by
     /// [`MAX_APPROVAL_REQUESTS_PER_TURN`](crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN);
     /// anything past the cap is discarded rather than flooding the queue.
+    ///
+    /// **A failed park never takes the batch or the turn down with it.**
+    /// [`ApprovalRequestQueue::drain`](crate::harness::policy::ApprovalRequestQueue::drain)
+    /// empties the shared queue up front, so propagating the first
+    /// [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect)
+    /// error with `?` would lose every *later* request in the batch — already out
+    /// of the queue and never retried — and would discard the turn's
+    /// already-computed operator reply along with it. That is precisely the
+    /// silent-disappearance failure this issue exists to fix, so each failure is
+    /// logged at `error` and the drain continues.
     async fn park_approval_requests(&self, host: &dyn CycleHost) -> Result<()> {
         for request in self
             .deps
             .approval_requests
             .drain(crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN)
         {
-            let approval_id = host.park_effect(request.effect).await?;
-            log::info!(
-                "[harness::brain] parked '{}' for operator approval (id={approval_id}): {}",
-                request.tool,
-                request.reason
-            );
+            match host.park_effect(request.effect).await {
+                Ok(approval_id) => log::info!(
+                    "[harness::brain] parked '{}' for operator approval (id={approval_id}): {}",
+                    request.tool,
+                    request.reason
+                ),
+                // Loud, and the only trace of a request the operator will never
+                // see — the queue entry is already gone.
+                Err(err) => log::error!(
+                    "[harness::brain] failed to park '{}' for operator approval ({}): {err}",
+                    request.tool,
+                    request.reason
+                ),
+            }
         }
         Ok(())
     }
@@ -1731,6 +1749,87 @@ members = ["eng1", "eng2"]
             .await
             .expect("second drain");
         assert_eq!(host.parked().len(), 1, "parked once, not twice");
+    }
+
+    /// A host that fails to park the *first* effect it is handed, then behaves.
+    /// Models a transient journal/IO fault mid-batch.
+    #[derive(Default)]
+    struct FlakyParkingHost {
+        parked: std::sync::Mutex<Vec<Effect>>,
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyParkingHost {
+        fn parked(&self) -> Vec<Effect> {
+            self.parked.lock().expect("parked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CycleHost for FlakyParkingHost {
+        async fn call_tool(&self, _call: ToolCall) -> Result<ToolResult> {
+            Ok(ToolResult {
+                ok: true,
+                output: serde_json::Value::Null,
+            })
+        }
+        async fn context_op(&self, _op: ContextOp) -> Result<ContextOpResult> {
+            Ok(ContextOpResult::Text(String::new()))
+        }
+        async fn emit_effect(&self, _effect: Effect) -> Result<EffectDisposition> {
+            panic!("an approval request must be parked, never re-evaluated as an effect");
+        }
+        async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+            if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(crate::OpenCompanyError::Store(
+                    "journal on fire".to_string(),
+                ));
+            }
+            let mut parked = self.parked.lock().expect("parked");
+            parked.push(effect);
+            Ok(ApprovalId::new(format!("appr-{}", parked.len())))
+        }
+    }
+
+    /// One failed park must not take the rest of the batch — or the turn's reply
+    /// — down with it. `drain` has already emptied the shared queue, so a `?`
+    /// here would lose every later request forever and abort `run_cycle`,
+    /// reproducing for the remainder of the batch exactly the silent
+    /// disappearance this issue fixes.
+    #[tokio::test]
+    async fn a_failed_park_does_not_drop_the_rest_of_the_batch() {
+        use crate::harness::policy::{ApprovalRequest, ApprovalRequestQueue};
+        use crate::ports::types::EffectGroup;
+
+        let dir = tempfile::tempdir().unwrap();
+        let requests = ApprovalRequestQueue::default();
+        let brain = brain_with_approval_queue(dir.path(), requests.clone());
+        for tool in ["first_tool", "second_tool", "third_tool"] {
+            requests.push(ApprovalRequest {
+                tool: tool.to_string(),
+                reason: "supervised".to_string(),
+                effect: Effect {
+                    kind: tool.to_string(),
+                    group: EffectGroup::Other,
+                    amount_usd: None,
+                    established_thread: false,
+                    first_time_counterparty: false,
+                    payload: serde_json::json!({ "tool": tool }),
+                },
+            });
+        }
+
+        let host = FlakyParkingHost::default();
+        brain
+            .park_approval_requests(&host)
+            .await
+            .expect("a park failure is logged, not propagated");
+
+        // The first park failed; the two after it still reached the operator.
+        let parked = host.parked();
+        assert_eq!(parked.len(), 2, "the batch continued past the failure");
+        assert_eq!(parked[0].kind, "second_tool");
+        assert_eq!(parked[1].kind, "third_tool");
     }
 
     // --- Steer disposition (issue #111) -------------------------------------
