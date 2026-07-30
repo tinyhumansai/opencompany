@@ -435,25 +435,44 @@ impl<'a> CycleHostImpl<'a> {
                 Ok(EffectDisposition::Executed)
             }
             PolicyDecision::RequireApproval => {
-                let approval_id = self
-                    .rt
-                    .approvals
-                    .park(&self.company, effect.clone())
-                    .await?;
-                self.rt
-                    .journal
-                    .record_parked(&approval_id, &effect, now_millis())
-                    .await?;
-                self.parked
-                    .lock()
-                    .expect("parked poisoned")
-                    .push(approval_id.clone());
-                Ok(EffectDisposition::PendingApproval(approval_id))
+                Ok(EffectDisposition::PendingApproval(self.park(effect).await?))
             }
             PolicyDecision::Deny => Ok(EffectDisposition::Denied {
                 reason: format!("policy denied {}", effect.kind),
             }),
         }
+    }
+
+    /// Parks `effect` on the approval gate, journals it durably, and records the
+    /// id on this cycle's outcome.
+    ///
+    /// The single write path into the operator's approval queue: the
+    /// `RequireApproval` arm of [`gate_effect`](Self::gate_effect) and the
+    /// already-decided [`CycleHost::park_effect`] callback both land here, so a
+    /// parked effect is journaled exactly one way and survives a restart with its
+    /// original [`ApprovalId`] regardless of who decided it.
+    async fn park(&self, effect: Effect) -> Result<ApprovalId> {
+        let approval_id = self
+            .rt
+            .approvals
+            .park(&self.company, effect.clone())
+            .await?;
+        self.rt
+            .journal
+            .record_parked(&approval_id, &effect, now_millis())
+            .await?;
+        self.parked
+            .lock()
+            .expect("parked poisoned")
+            .push(approval_id.clone());
+        tracing::debug!(
+            kind = %effect.kind,
+            group = ?effect.group,
+            approval_id = %approval_id,
+            cycle = %self.cycle_id,
+            "[cycle] parked effect for operator approval"
+        );
+        Ok(approval_id)
     }
 
     /// Intercepts the `send_email` tool: parses `to`/`subject`/`body`, checks
@@ -536,6 +555,10 @@ impl CycleHost for CycleHostImpl<'_> {
     async fn emit_effect(&self, effect: Effect) -> Result<EffectDisposition> {
         self.gate_effect(effect).await
     }
+
+    async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+        self.park(effect).await
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +632,37 @@ mod test {
             Ok(CycleResult {
                 channel_responses: responses,
                 new_traces: vec![CompressedTrace::now(&req.cycle_id, "effect cycle")],
+                ledger_deltas: Vec::new(),
+                token_usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    /// A brain that parks one caller-supplied effect per `OperatorMessage`
+    /// through [`CycleHost::park_effect`] — the shape the harness brain produces
+    /// when its openhuman policy blocked a tool call inside the turn (#172).
+    struct ParkingBrain {
+        effect: Effect,
+    }
+
+    #[async_trait]
+    impl Brain for ParkingBrain {
+        async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
+            let mut responses = Vec::new();
+            for event in &req.events {
+                if let CompanyEvent::OperatorMessage { text, .. } = event {
+                    host.park_effect(self.effect.clone()).await?;
+                    responses.push(OutboundMessage {
+                        channel: "operator".into(),
+                        text: format!("that needs your approval: {text}"),
+                        steps: Vec::new(),
+                        reply_to: None,
+                    });
+                }
+            }
+            Ok(CycleResult {
+                channel_responses: responses,
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "parking cycle")],
                 ledger_deltas: Vec::new(),
                 token_usage: TokenUsage::default(),
             })
@@ -805,6 +859,68 @@ mod test {
             .unwrap();
         assert!(follow_up.parked.is_empty());
         assert!(rt.pending_approvals().is_empty());
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Issue #172: an already-decided approval request parks and reaches the
+    /// operator's queue **without** being re-evaluated.
+    ///
+    /// The company runs `full` autonomy and the effect classifies as `Other` —
+    /// the two conditions under which `ApprovalGate::evaluate` returns `Allow`.
+    /// Had the request gone through `emit_effect` it would have been "executed"
+    /// as a no-op and vanished, which is exactly how a chat-gated tool call used
+    /// to disappear before ever reaching the Approvals page.
+    #[tokio::test]
+    async fn a_decided_request_parks_without_being_re_evaluated() {
+        let home = tmp_home();
+        let tool_effect = Effect {
+            kind: "composio_execute".into(),
+            group: EffectGroup::Other,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" }),
+        };
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(ParkingBrain {
+                effect: tool_effect.clone(),
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "send that email".into(),
+                by: None,
+                chat: None,
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(report.parked.len(), 1, "the request parked");
+        assert!(
+            report.executed_effects.is_empty(),
+            "a parked request must not execute"
+        );
+
+        // The Approvals page reads exactly this.
+        let pending = rt.pending_approvals();
+        assert_eq!(pending.len(), 1, "the operator sees the request");
+        assert_eq!(pending[0].kind, "composio_execute");
+        assert_eq!(pending[0].id, report.parked[0]);
+
+        // And it is durable: a fresh runtime over the same home replays it, so a
+        // restart does not lose what the operator still owes an answer to.
+        let rt2 = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(ParkingBrain {
+                effect: tool_effect,
+            }))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(rt2.pending_approvals().len(), 1);
+
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 

@@ -74,7 +74,7 @@ use crate::error::OpenCompanyError;
 use crate::harness::cost::{TurnUsage, record_turn_cost};
 use crate::harness::mcp_probe::McpFailureQueue;
 use crate::harness::orchestrator::DelegationQueue;
-use crate::harness::policy::ApprovalPolicy;
+use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::types::{CompanyId, CompanyRecord, OverlayAgent, TurnStep};
 use crate::ports::{
@@ -163,6 +163,14 @@ pub struct HarnessDeps {
     /// cheap-shared-handle pattern as [`Self::delegations`]; every string it
     /// carries is scrubbed at the source. Default is an empty queue.
     pub mcp_failures: McpFailureQueue,
+    /// The shared approval-request queue every agent's [`ApprovalPolicy`] pushes
+    /// a `RequireApproval` decision onto and the [`HarnessBrain`] drains after a
+    /// turn, parking each request through
+    /// [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect)
+    /// so it reaches the operator's Approvals page (issue #172). Same
+    /// cheap-shared-handle pattern as [`Self::delegations`]; the default is an
+    /// empty queue, which simply means nothing is ever parked.
+    pub approval_requests: ApprovalRequestQueue,
     /// The company's [`SecretStore`], so [`HarnessPool::ensure`] can **re-resolve**
     /// the effective MCP server set on each call and rebuild the roster when a
     /// console add/remove/enable-toggle changes it — the MCP-freshness fix (a
@@ -1175,7 +1183,8 @@ pub(crate) fn build_roster(
         Vec::with_capacity(company.manifest.agents.len() + company.overlay_agents.len());
 
     for manifest_agent in &company.manifest.agents {
-        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily)
+            .with_requests(deps.approval_requests.clone());
         let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
         let grants = agent_effective_grants(allow, &manifest_agent.tools);
         let agent = build::build_agent(
@@ -1211,7 +1220,8 @@ pub(crate) fn build_roster(
         let manifest_agent = overlay_agent_to_manifest(overlay);
         // No per-teammate budget cap or cognition-tier hint in v1 — see
         // `overlay_agent_to_manifest`.
-        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily)
+            .with_requests(deps.approval_requests.clone());
         let grants = agent_effective_grants(allow, &manifest_agent.tools);
         let agent = build::build_agent(
             &company.id,
@@ -1440,6 +1450,7 @@ description = "Builds the product."
                 delegations: DelegationQueue::default(),
                 workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
                 mcp_failures: McpFailureQueue::default(),
+                approval_requests: ApprovalRequestQueue::default(),
                 secrets: None,
                 web_allowed_domains: Vec::new(),
                 capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1497,6 +1508,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1779,6 +1791,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1933,6 +1946,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: Some(secrets.clone()),
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -2239,6 +2253,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -2387,6 +2402,7 @@ description = "Sets direction."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
