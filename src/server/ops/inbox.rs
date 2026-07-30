@@ -1,14 +1,22 @@
 //! Inbound email ingest transport.
 //!
-//! `POST …/inboxes/ingest` is the HMAC-signed webhook a mail-forwarding
-//! provider (or, in managed deployments, the platform manager that owns MX)
-//! pushes received mail into — there is no IMAP polling in v1. The request body
-//! is verified against the per-company ingest secret in
-//! [`SecretStore`](crate::ports::SecretStore) using the same signer seam as the
-//! platform webhooks; an unverifiable payload is dropped with `401` and never
-//! becomes an event.
+//! There are two ways mail reaches a company, and they converge on the same
+//! filing tail ([`file_and_notify`]):
 //!
-//! A verified payload is appended to the addressed teammate's
+//! 1. **HMAC-signed webhook** — `POST …/inboxes/ingest`, this module. A
+//!    mail-forwarding provider (or, in managed deployments, the platform
+//!    component that owns MX) pushes received mail in. The request body is
+//!    verified against the per-company ingest secret in
+//!    [`SecretStore`](crate::ports::SecretStore) using the same signer seam as
+//!    the platform webhooks; an unverifiable payload is dropped with `401` and
+//!    never becomes an event. Push-based, so it only reaches an awake company.
+//! 2. **IMAP poll** (`imap` feature) — the managed default, where each company
+//!    reads its own Stalwart mailbox with the injected credentials
+//!    (`MailboxPoller` → `AsyncImapReceiver`). Pull-based, so mail accumulates
+//!    in Stalwart while a company is scaled to zero and is picked up on the
+//!    next tick after it wakes.
+//!
+//! Either way a message is appended to the addressed teammate's
 //! [`InboxStore`](crate::ports::InboxStore) and drives one cycle with a
 //! [`CompanyEvent::WebhookReceived`](crate::ports::types::CompanyEvent) on the
 //! `email` channel so the teammate can act on the mail.

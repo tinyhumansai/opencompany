@@ -923,6 +923,73 @@ async fn inbox_read_marks_and_reports_unread() {
 }
 
 #[tokio::test]
+async fn inbox_list_and_messages_project_store() {
+    use crate::ports::inbox::EmailRecord;
+    let home = home();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    // One inbound (unread) + one outbound reply in inbox "ceo".
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: "in1".into(),
+                inbox: "ceo".into(),
+                from_name: "Priya".into(),
+                from_email: "p@x.test".into(),
+                subject: "hi".into(),
+                body: "hello world".into(),
+                at_millis: 1,
+                read: false,
+                outbound: false,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .inbox()
+        .append(
+            runtime.id(),
+            &EmailRecord {
+                id: "out1".into(),
+                inbox: "ceo".into(),
+                from_name: String::new(),
+                from_email: "ceo@acme.test".into(),
+                subject: "re: hi".into(),
+                body: "reply".into(),
+                at_millis: 2,
+                read: false,
+                outbound: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    // GET /inboxes surfaces the message-bearing inbox; outbound doesn't count toward unread.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ceo = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["key"] == "ceo")
+        .expect("ceo inbox listed");
+    assert_eq!(ceo["unread"], 1);
+
+    // GET messages returns both, camelCase, oldest first.
+    let (status, body) = send(&state, "GET", "/api/v1/company/inboxes/ceo/messages", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let msgs = body.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["id"], "in1");
+    assert_eq!(msgs[0]["fromEmail"], "p@x.test");
+    assert_eq!(msgs[1]["outbound"], true);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+#[tokio::test]
 async fn chat_accepts_desk_id_and_replies() {
     let home = home();
     let state = state_with_company(&home).await;
