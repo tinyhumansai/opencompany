@@ -28,9 +28,15 @@ use crate::harness::{HarnessDeps, HarnessPool};
 
 /// The most operator redirects honored within a single task dispatch (issue
 /// #111). A redirect re-runs the turn in-loop with the fresh instruction
-/// appended; past this cap the run is finalized to `in_review` so a redirect
-/// storm can't loop forever.
+/// appended; past this cap the run is finalized to its terminal column (see
+/// [`success_terminal_column`]) so a redirect storm can't loop forever.
 const MAX_REDIRECTS_PER_DISPATCH: u32 = 3;
+
+/// The board column a card lands in when the operator is the reviewer.
+const IN_REVIEW: &str = "in_review";
+
+/// The terminal board column — nothing dispatches out of it.
+const DONE: &str = "done";
 use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord};
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
@@ -45,6 +51,32 @@ pub struct HarnessBrain {
     deps: HarnessDeps,
     record: CompanyRecord,
     responder: String,
+}
+
+/// The outcome of draining one queued delegation.
+///
+/// A `spawn_task` yields nothing operator-visible (it only opens a board card).
+/// A synchronous `delegate_to_desk` yields a [`DeskReply`] — the teammate's
+/// answer captured so the orchestrator can **relay** it in a follow-up turn
+/// (the CEO-relay hand-back) instead of leaving it as a disconnected sibling
+/// bubble. `bubble` stays for any future delegation that surfaces its own
+/// standalone message directly.
+#[derive(Default)]
+struct DelegationOutcome {
+    /// A chat bubble to surface as-is (unused by the current delegations).
+    bubble: Option<OutboundMessage>,
+    /// A synchronous desk reply to relay through a second orchestrator turn.
+    desk_reply: Option<DeskReply>,
+}
+
+/// A synchronous desk-lead answer captured for the orchestrator to relay: which
+/// member answered, their reply text, and their own turn steps (folded onto the
+/// operator timeline so the teammate's activity stays visible on the single
+/// relayed bubble).
+struct DeskReply {
+    member: String,
+    reply: String,
+    steps: Vec<TurnStep>,
 }
 
 impl HarnessBrain {
@@ -70,9 +102,10 @@ impl HarnessBrain {
 
     /// Runs one dispatched board task: load the card, route it to its assignee
     /// (or the default responder) for a single turn, and write the outcome back
-    /// onto the board — moved to `in_review` on success, back to `backlog` with
-    /// the error noted on failure. A missing task store or a card that has since
-    /// vanished is a silent no-op.
+    /// onto the board — moved to its success terminal column on success (see
+    /// [`success_terminal_column`]), back to `backlog` with the error noted on
+    /// failure. A missing task store or a card that has since vanished is a
+    /// silent no-op.
     /// Runs a dispatched card to completion and, when the card remembers the
     /// conversation it was spawned from, returns the reply to post back there
     /// (issue #151 §3.2).
@@ -146,7 +179,8 @@ impl HarnessBrain {
                             let result = outcome.reply;
                             card.note =
                                 Some(append_result(card.note.as_deref(), &responder, &result));
-                            card.column = "in_review".to_string();
+                            let terminal = success_terminal_column(&card);
+                            card.column = terminal.to_string();
                             break result;
                         }
                         Err(err) => {
@@ -188,13 +222,15 @@ impl HarnessBrain {
                     ));
                     if redirects > MAX_REDIRECTS_PER_DISPATCH {
                         // Exhausted the redirect budget — finalize the last run's
-                        // reply to `in_review` rather than looping forever.
+                        // reply to the card's terminal column rather than looping
+                        // forever.
                         let last = match &outcome {
                             Ok(outcome) => outcome.reply.clone(),
                             Err(err) => format!("dispatch failed: {err}"),
                         };
                         card.note = Some(append_result(card.note.as_deref(), &responder, &last));
-                        card.column = "in_review".to_string();
+                        let terminal = success_terminal_column(&card);
+                        card.column = terminal.to_string();
                         break last;
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
@@ -217,12 +253,21 @@ impl HarnessBrain {
         // Task Detail Artifacts tab has something behind it, and so a later
         // operator edit can be diffed against what the agent actually wrote.
         //
-        // Only a card that landed in `in_review` produces one: that is the
-        // state meaning "the agent produced something reviewable". A failure,
-        // a cancellation, or a pause writes its line to the note as before but
-        // is NOT an artifact — versioning `dispatch failed: …` strings would
-        // bury the real drafts and make the churn metric meaningless.
-        if card.column == "in_review" {
+        // Only a card that landed in its **success terminal** produces one:
+        // that is the state meaning "the agent produced something reviewable".
+        // A failure, a cancellation, or a pause writes its line to the note as
+        // before but is NOT an artifact — versioning `dispatch failed: …`
+        // strings would bury the real drafts and make the churn metric
+        // meaningless.
+        //
+        // The success terminal is two columns, not one (#179): a board-created
+        // card parks in `in_review` for its operator reviewer, while a card
+        // carrying an `origin_chat_id` — a delegated handoff nobody is watching
+        // the board for — completes straight to `done`. Both ran a turn and
+        // both produced a deliverable, so testing the column against
+        // `success_terminal_column` keeps the artifact tied to "the run
+        // succeeded" rather than to one particular landing column.
+        if card.column == success_terminal_column(&card) {
             self.record_task_artifact(&card, &responder, &result_text)
                 .await?;
         }
@@ -396,15 +441,18 @@ impl HarnessBrain {
     /// [`TaskStore::upsert`](crate::ports::TaskStore) path the console uses and
     /// surfaces nothing extra (a missing task store is a silent no-op).
     /// `delegate_to_desk` runs a single turn on the desk's lead member and
-    /// returns its reply as its own chat bubble — `channel = <member id>`, the
-    /// distinct-bubble path the console already renders. An unknown desk (no
-    /// roster-backed lead) is a silent no-op. No sub-agent re-delegation in v1:
-    /// desk members carry no delegation tools, so their turns queue nothing.
+    /// **returns its reply for the orchestrator to relay** (a [`DeskReply`]) —
+    /// the CEO-relay hand-back: instead of a disconnected sibling bubble the
+    /// teammate's answer feeds a second orchestrator turn so the CEO comes back
+    /// with it in one coherent conversation. An unknown desk (no roster-backed
+    /// lead) or a cancelled run yields nothing to relay. No sub-agent
+    /// re-delegation in v1: desk members carry no delegation tools, so their
+    /// turns queue nothing.
     async fn run_delegation(
         &self,
         delegation: Delegation,
         chat_id: Option<&str>,
-    ) -> Result<Option<OutboundMessage>> {
+    ) -> Result<DelegationOutcome> {
         match delegation {
             Delegation::SpawnTask {
                 title,
@@ -412,7 +460,7 @@ impl HarnessBrain {
                 assignee,
             } => {
                 let Some(tasks) = self.deps.tasks.as_ref() else {
-                    return Ok(None);
+                    return Ok(DelegationOutcome::default());
                 };
                 let card = TaskRecord {
                     id: generate_id(),
@@ -428,11 +476,11 @@ impl HarnessBrain {
                     origin_chat_id: chat_id.map(str::to_string),
                 };
                 tasks.upsert(&self.record.id, &card).await?;
-                Ok(None)
+                Ok(DelegationOutcome::default())
             }
             Delegation::DelegateToDesk { desk, instruction } => {
                 let Some(member) = self.desk_lead(&desk) else {
-                    return Ok(None);
+                    return Ok(DelegationOutcome::default());
                 };
                 // Register the delegated turn so an operator can CANCEL it
                 // mid-flight (cancel-only in v1 — pause/redirect are rejected at
@@ -461,21 +509,41 @@ impl HarnessBrain {
                         chat_id,
                     )
                     .await?;
-                // A cancel issued mid-flight discards the delegated reply — no
-                // bubble surfaces.
+                // A cancel issued mid-flight discards the delegated reply —
+                // nothing is relayed.
                 if matches!(control.take(), Some(SteerAction::Cancel)) {
-                    return Ok(None);
+                    return Ok(DelegationOutcome::default());
                 }
-                // The desk lead's own steps ride on its distinct bubble.
-                Ok(Some(OutboundMessage {
-                    channel: member,
-                    text: outcome.reply,
-                    reply_to: None,
-                    steps: outcome.steps,
-                }))
+                // Hand the teammate's answer back to the caller to RELAY through
+                // a second orchestrator turn (the CEO-relay hand-back). Their
+                // steps ride along and get folded onto the relayed operator
+                // bubble so the teammate's activity stays visible.
+                Ok(DelegationOutcome {
+                    bubble: None,
+                    desk_reply: Some(DeskReply {
+                        member,
+                        reply: outcome.reply,
+                        steps: outcome.steps,
+                    }),
+                })
             }
         }
     }
+}
+
+/// The prompt for the CEO-relay hand-back turn: the operator's original message
+/// plus each teammate's reply, framed so the orchestrator relays the answer back
+/// as its own single, coherent response and does not delegate again.
+fn build_relay_prompt(original: &str, desk_replies: &[(String, String)]) -> String {
+    let mut prompt = format!(
+        "The operator asked:\n{original}\n\nYou delegated this to your team and their reply is \
+below. Relay their answer back to the operator now as your own single, coherent response — \
+summarize it or pass it along. Do not delegate again; just relay what came back."
+    );
+    for (member, reply) in desk_replies {
+        prompt.push_str(&format!("\n\n{member} replied:\n{reply}"));
+    }
+    prompt
 }
 
 /// The turn instruction for a dispatched card: its title, plus its note when it
@@ -487,6 +555,33 @@ fn task_instruction(card: &TaskRecord) -> String {
     }
 }
 
+/// Where a dispatched card lands once its run succeeds (issue #171).
+///
+/// `in_review` is a naming convention, not a mechanism: nothing consumes it.
+/// `task_enters_in_progress` only edge-fires a dispatch when a card enters
+/// `in_progress`, so an `in_review` card triggers no further cycle and the only
+/// runtime write of `done` is the operator's manual drag on the board.
+///
+/// That is fine for a card an operator made themselves — they are the reviewer,
+/// and the card is sitting in front of them. It strands a card stamped with
+/// `origin_chat_id`: that card came from `spawn_task` during an agent-to-agent
+/// handoff, its result was already posted back into the originating thread, and
+/// no operator is watching the board for it. So a card that remembers an origin
+/// completes to `done`; a board-created card still parks in `in_review`.
+///
+/// One thing does read this back (#187): `run_task` records a versioned
+/// artifact only for a card that landed on the column this returns, which is
+/// how "the run succeeded" is distinguished from a failure, cancellation, or
+/// pause. Compare against this function rather than against a literal column,
+/// or a delegated handoff completing to `done` silently stops versioning.
+fn success_terminal_column(card: &TaskRecord) -> &'static str {
+    if card.origin_chat_id.is_some() {
+        DONE
+    } else {
+        IN_REVIEW
+    }
+}
+
 /// The post-back line for a finished card (issue #151 §3.2): what the card was,
 /// where it landed, and the reply itself.
 ///
@@ -495,7 +590,8 @@ fn task_instruction(card: &TaskRecord) -> String {
 /// claiming an answer it does not have.
 fn task_postback_text(card: &TaskRecord) -> String {
     let status = match card.column.as_str() {
-        "in_review" => "is ready for review",
+        DONE => "is done",
+        IN_REVIEW => "is ready for review",
         "paused" => "is paused",
         "backlog" => "went back to the backlog",
         other => other,
@@ -546,30 +642,76 @@ impl Brain for HarnessBrain {
                         .pool
                         .run(&self.record.id, &responder, text, &self.deps, chat_id)
                         .await?;
-                    // The orchestrator's own steps ride on the operator bubble.
+                    // The orchestrator's own steps ride on the operator bubble;
+                    // its reply is the operator-facing text UNLESS a synchronous
+                    // desk delegation runs, in which case the relay turn's reply
+                    // replaces it (below).
                     let mut operator_steps = outcome.steps;
-                    // Run whatever the orchestrator queued; each delegated desk
-                    // bubble carries its own lead's steps. Collect them first so
-                    // the operator bubble can still be finalized before it is
-                    // pushed (any MCP failure a delegated turn recorded lands on
-                    // the operator timeline).
+                    let mut operator_reply = outcome.reply;
+                    // Run whatever the orchestrator queued. A `spawn_task` opens a
+                    // card silently; a `delegate_to_desk` runs the desk lead and
+                    // hands its answer back to RELAY (the CEO-relay hand-back)
+                    // rather than surfacing as a disconnected sibling bubble. Any
+                    // future delegation that surfaces its own bubble lands in
+                    // `delegated`.
                     let mut delegated = Vec::new();
+                    let mut desk_replies: Vec<(String, String)> = Vec::new();
                     for delegation in self
                         .deps
                         .delegations
                         .drain(orchestrator::MAX_DELEGATIONS_PER_TURN)
                     {
-                        if let Some(message) = self.run_delegation(delegation, chat_id).await? {
-                            delegated.push(message);
+                        let out = self.run_delegation(delegation, chat_id).await?;
+                        if let Some(bubble) = out.bubble {
+                            delegated.push(bubble);
+                        }
+                        if let Some(desk) = out.desk_reply {
+                            // Fold the teammate's activity onto the operator
+                            // timeline, then remember the answer to relay.
+                            operator_steps.extend(desk.steps);
+                            desk_replies.push((desk.member, desk.reply));
                         }
                     }
+                    // CEO-relay hand-back: when a synchronous desk delegation
+                    // answered, run exactly ONE more orchestrator turn whose
+                    // prompt is the original message plus the teammate reply,
+                    // and surface THAT as the operator bubble — so the CEO comes
+                    // back with the answer in one coherent conversation. The
+                    // relay turn must not re-delegate: its prompt is relay-only,
+                    // and as a safety net the delegation queue is cleared before
+                    // it and drained-and-discarded after, so anything it tries
+                    // to queue is dropped (bounding cost to one extra turn, no
+                    // re-delegation loop). No delegation → the single first turn
+                    // stays exactly as before.
+                    if !desk_replies.is_empty() {
+                        let relay_prompt = build_relay_prompt(text, &desk_replies);
+                        self.deps.delegations.clear();
+                        let relay = self
+                            .pool
+                            .run(
+                                &self.record.id,
+                                &responder,
+                                &relay_prompt,
+                                &self.deps,
+                                chat_id,
+                            )
+                            .await?;
+                        // Discard anything the relay turn queued — it can only
+                        // relay, never re-delegate.
+                        let _ = self
+                            .deps
+                            .delegations
+                            .drain(orchestrator::MAX_DELEGATIONS_PER_TURN);
+                        operator_reply = relay.reply;
+                        operator_steps.extend(relay.steps);
+                    }
                     // Re-skin any MCP tool-call failures (from the orchestrator
-                    // turn or a delegated desk turn) as error steps on the
-                    // operator bubble — one surface, one renderer.
+                    // turn, a delegated desk turn, or the relay turn) as error
+                    // steps on the operator bubble — one surface, one renderer.
                     self.surface_mcp_failures(&mut operator_steps).await?;
                     channel_responses.push(OutboundMessage {
                         channel: "operator".to_string(),
-                        text: outcome.reply,
+                        text: operator_reply,
                         reply_to: None,
                         steps: operator_steps,
                     });
@@ -853,6 +995,44 @@ description = "Builds it."
         )
     }
 
+    /// As [`brain_with_tasks`], but with the artifact store wired to the same
+    /// [`FsOps`] handle (it implements both), so a dispatch's versioned output
+    /// is observable.
+    fn brain_with_artifacts(dir: &std::path::Path) -> (HarnessBrain, Arc<FsOps>) {
+        let ops = Arc::new(FsOps::new(dir));
+        let deps = HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: Some(Arc::new(FsOps::new(dir))),
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: Some(ops.clone()),
+            artifacts: Some(ops.clone()),
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        };
+        (
+            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_two()),
+            ops,
+        )
+    }
+
     fn card(id: &str, assignee: &str) -> TaskRecord {
         TaskRecord {
             id: id.to_string(),
@@ -981,8 +1161,9 @@ description = "Builds it."
             .expect("one card")
     }
 
-    /// A dispatched task runs a turn and moves to `in_review`, its result folded
-    /// into the note under the responder that ran it.
+    /// A dispatched **board-created** card (no `origin_chat_id`) runs a turn and
+    /// moves to `in_review` — the operator who made it is the reviewer — with
+    /// its result folded into the note under the responder that ran it.
     #[tokio::test]
     async fn task_dispatch_runs_and_moves_to_in_review() {
         let dir = tempfile::tempdir().unwrap();
@@ -1009,6 +1190,175 @@ description = "Builds it."
         // echoes the instruction (the card title) back into the reply.
         assert!(note.contains("[ceo]"), "{note:?}");
         assert!(note.contains("Ship the thing"), "{note:?}");
+    }
+
+    // ── Issue #171: a delegated handoff reaches `done` on its own ─────────
+
+    /// The regression: a card spawned by a delegating turn (so it carries an
+    /// `origin_chat_id`) has no operator watching the board, so leaving it in
+    /// `in_review` stranded it forever. It must complete to `done`.
+    #[tokio::test]
+    async fn dispatched_card_with_an_origin_completes_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-origin", "maya");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks
+            .upsert(&CompanyId::new("acme"), &c)
+            .await
+            .expect("seed");
+
+        let posted = brain
+            .run_task("t-origin")
+            .await
+            .expect("run")
+            .expect("a card with an origin posts back");
+
+        let moved = only_card(&tasks).await;
+        assert_eq!(
+            moved.column, "done",
+            "a delegated handoff must reach the terminal column, not park in in_review"
+        );
+        // The note stays the durable record of what came back.
+        assert!(moved.note.expect("note").contains("Ship the thing"));
+        // …and the bubble says so rather than asking for a review nobody will do.
+        assert!(posted.text.contains("is done"), "{}", posted.text);
+        assert!(!posted.text.contains("ready for review"), "{}", posted.text);
+    }
+
+    /// Issue #179 split the success terminal in two, and artifact capture (#187)
+    /// keys off it: a delegated card completes to `done` rather than parking in
+    /// `in_review`, and its deliverable must still be versioned.
+    ///
+    /// Gating capture on the literal `in_review` would silently stop versioning
+    /// exactly the cards nobody is watching the board for — the run succeeded
+    /// and produced output either way, so the guard has to track "landed on the
+    /// success terminal", not one particular column name.
+    #[tokio::test]
+    async fn a_delegated_card_completing_to_done_still_records_an_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, ops) = brain_with_artifacts(dir.path());
+        // Empty assignee → the default responder, so the turn actually runs.
+        let mut c = card("t-origin", "");
+        c.origin_chat_id = Some("strategy".to_string());
+        ops.upsert(&CompanyId::new("acme"), &c).await.expect("seed");
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t-origin".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let moved = only_card(&ops).await;
+        assert_eq!(
+            moved.column, "done",
+            "a delegated card lands on the `done` success terminal (#179)"
+        );
+        let artifacts = crate::ports::artifacts::ArtifactStore::list(
+            &*ops,
+            &CompanyId::new("acme"),
+            Some("t-origin"),
+        )
+        .await
+        .expect("list");
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "a delegated card's deliverable must still be versioned"
+        );
+        assert_eq!(artifacts[0].versions.len(), 1);
+    }
+
+    /// The other half of the same guard: a run that did NOT succeed still
+    /// writes its note but must not open an artifact, whichever terminal the
+    /// card would otherwise have used.
+    #[tokio::test]
+    async fn a_cancelled_delegated_card_records_no_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, ops, _provider) =
+            brain_that_steers_itself(dir.path(), "t-cancel", vec![SteerAction::Cancel]);
+        let mut c = card("t-cancel", "");
+        c.origin_chat_id = Some("strategy".to_string());
+        ops.upsert(&CompanyId::new("acme"), &c).await.expect("seed");
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t-cancel".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(only_card(&ops).await.column, "backlog");
+        let artifacts = crate::ports::artifacts::ArtifactStore::list(
+            &*ops,
+            &CompanyId::new("acme"),
+            Some("t-cancel"),
+        )
+        .await
+        .expect("list");
+        assert!(
+            artifacts.is_empty(),
+            "a cancelled run has no deliverable to version"
+        );
+    }
+
+    /// The success terminal is chosen by origin, not by outcome: a board-created
+    /// card keeps its `in_review` review gate.
+    #[test]
+    fn success_terminal_column_is_done_only_for_a_card_with_an_origin() {
+        let board_card = card("t1", "maya");
+        assert_eq!(success_terminal_column(&board_card), "in_review");
+
+        let mut delegated = card("t2", "maya");
+        delegated.origin_chat_id = Some("strategy".to_string());
+        assert_eq!(success_terminal_column(&delegated), "done");
+    }
+
+    /// The redirect-cap finalize branch is the other success terminal, so it has
+    /// to make the same choice — otherwise a steered handoff still strands.
+    #[tokio::test]
+    async fn redirect_cap_finalizes_a_card_with_an_origin_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let redirect = || SteerAction::Redirect {
+            instruction: "focus on the API".to_string(),
+        };
+        let (brain, tasks, _provider) = brain_that_steers_itself(
+            dir.path(),
+            "t1",
+            vec![redirect(), redirect(), redirect(), redirect()],
+        );
+        let mut c = card("t1", "");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(only_card(&tasks).await.column, "done");
+    }
+
+    /// The post-back has to have wording for the new landing column — without it
+    /// the fallback arm renders the raw column id into the sentence.
+    #[test]
+    fn postback_reads_naturally_for_a_done_card() {
+        let mut finished = card("t1", "maya");
+        finished.column = "done".to_string();
+        finished.note = None;
+        assert_eq!(task_postback_text(&finished), "\"Ship the thing\" is done.");
     }
 
     /// An `assignee` that names a roster member routes the turn to that member.
@@ -1427,7 +1777,10 @@ members = ["eng1", "eng2"]
             )
             .await
             .expect("delegation runs");
-        assert!(out.is_none(), "spawn_task surfaces no chat bubble");
+        assert!(
+            out.bubble.is_none() && out.desk_reply.is_none(),
+            "spawn_task surfaces nothing to relay or bubble"
+        );
 
         let cards = tasks.list(&CompanyId::new("acme")).await.unwrap();
         assert_eq!(cards.len(), 1);
@@ -1436,8 +1789,9 @@ members = ["eng1", "eng2"]
         assert_eq!(cards[0].assignee, "engineer");
     }
 
-    /// A `delegate_to_desk` delegation runs the desk lead and surfaces its reply
-    /// as its own bubble (`channel = <member id>`); an unknown desk is a no-op.
+    /// A `delegate_to_desk` delegation runs the desk lead and hands its reply
+    /// back to relay (a `DeskReply` attributed to the lead, no standalone
+    /// bubble); an unknown desk yields nothing.
     #[tokio::test]
     async fn delegate_to_desk_delegation_answers_as_the_desk_lead() {
         let dir = tempfile::tempdir().unwrap();
@@ -1458,12 +1812,17 @@ members = ["eng1", "eng2"]
                 None,
             )
             .await
-            .expect("delegation runs")
-            .expect("desk lead replies");
-        // The reply is its own bubble attributed to the desk lead, and the mock
-        // provider echoes the instruction, proving the member's turn ran.
-        assert_eq!(out.channel, "engineer");
-        assert!(out.text.contains("ship-marker"), "{:?}", out.text);
+            .expect("delegation runs");
+        // The answer comes back as a DeskReply to relay — not a standalone
+        // bubble — attributed to the desk lead, and the mock provider echoes the
+        // instruction, proving the member's turn ran.
+        assert!(
+            out.bubble.is_none(),
+            "the desk reply is relayed, not bubbled"
+        );
+        let desk = out.desk_reply.expect("desk lead replies");
+        assert_eq!(desk.member, "engineer");
+        assert!(desk.reply.contains("ship-marker"), "{:?}", desk.reply);
 
         // An unknown desk delegates to nobody.
         let none = brain
@@ -1476,7 +1835,10 @@ members = ["eng1", "eng2"]
             )
             .await
             .expect("delegation runs");
-        assert!(none.is_none(), "an unknown desk is a silent no-op");
+        assert!(
+            none.bubble.is_none() && none.desk_reply.is_none(),
+            "an unknown desk yields nothing"
+        );
     }
 
     // --- MCP failure drain --------------------------------------------------
@@ -1644,7 +2006,9 @@ members = ["eng1", "eng2"]
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: Some(tasks.clone()),
-            artifacts: None,
+            // Same handle as `tasks` (FsOps is both stores), so a steered run's
+            // artifact side effect — or the absence of one — is observable.
+            artifacts: Some(tasks.clone()),
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -1798,6 +2162,242 @@ members = ["eng1", "eng2"]
             .await
             .expect("cancellation is handled");
 
-        assert!(result.is_none(), "cancelled delegation must not bubble");
+        assert!(
+            result.bubble.is_none() && result.desk_reply.is_none(),
+            "cancelled delegation must not bubble or relay"
+        );
+    }
+
+    // --- CEO-relay hand-back (delegate_to_desk second turn) ------------------
+
+    /// A provider that simulates the orchestrator queuing a `delegate_to_desk`
+    /// on its turns: on each invoke it pops the next scripted delegation (if any)
+    /// onto the shared queue — exactly what the real tool call does — then echoes
+    /// the last user message so a test can read the turn's reply. Sharing the
+    /// queue handle with [`HarnessDeps::delegations`] is what lets the brain
+    /// drain it after the turn.
+    struct DelegatingProvider {
+        queue: orchestrator::DelegationQueue,
+        pushes: StdMutex<VecDeque<Option<Delegation>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChatModel<()> for DelegatingProvider {
+        async fn invoke(
+            &self,
+            _state: &(),
+            request: ModelRequest,
+        ) -> tinyagents::Result<ModelResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(Some(delegation)) = self.pushes.lock().unwrap().pop_front() {
+                self.queue.push(delegation);
+            }
+            let message = request
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m, Message::User(_)))
+                .map(|m| m.text())
+                .unwrap_or_default();
+            Ok(ModelResponse::assistant(format!("did: {message}")))
+        }
+    }
+
+    impl HarnessModel for DelegatingProvider {
+        fn telemetry_provider_id(&self) -> String {
+            "delegating".to_string()
+        }
+    }
+
+    /// A brain over the desk-bearing record whose provider is a
+    /// [`DelegatingProvider`] scripted to push `pushes[i]` on invoke `i + 1`.
+    /// Returns the brain plus the shared provider so a test can read the invoke
+    /// count.
+    fn brain_that_delegates(
+        dir: &std::path::Path,
+        pushes: Vec<Option<Delegation>>,
+    ) -> (HarnessBrain, Arc<DelegatingProvider>) {
+        let queue = orchestrator::DelegationQueue::default();
+        let provider = Arc::new(DelegatingProvider {
+            queue: queue.clone(),
+            pushes: StdMutex::new(pushes.into_iter().collect()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let deps = HarnessDeps {
+            provider: provider.clone(),
+            provider_slug: "delegating".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: None,
+            workspace_root: dir.to_path_buf(),
+            model_override: None,
+            tasks: Some(Arc::new(FsOps::new(dir))),
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            artifacts: None,
+            delegations: queue,
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        };
+        (
+            HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_with_desk()),
+            provider,
+        )
+    }
+
+    /// (a) After a `delegate_to_desk`, the operator-facing reply is a SECOND
+    /// orchestrator turn that relays the teammate's answer — one coherent
+    /// bubble, not a disconnected sibling.
+    #[tokio::test]
+    async fn delegate_to_desk_relays_the_answer_in_a_second_orchestrator_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 (orchestrator) queues a delegate_to_desk; invoke 2 is the desk
+        // lead's turn; invoke 3 is the relay turn (queues nothing).
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![Some(Delegation::DelegateToDesk {
+                desk: "eng_desk".to_string(),
+                instruction: "diagnose the outage".to_string(),
+            })],
+        );
+
+        let result = brain
+            .run_cycle(
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "why is the site down?".into(),
+                    by: None,
+                    chat: None,
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        // The operator sees ONE bubble — the CEO's relay, not a separate teammate
+        // sibling bubble.
+        assert_eq!(result.channel_responses.len(), 1);
+        let bubble = &result.channel_responses[0];
+        assert_eq!(bubble.channel, "operator");
+        // Three turns ran: orchestrator → desk lead → exactly one relay turn.
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "orchestrator, desk lead, then exactly one relay turn"
+        );
+        // The relayed bubble carries the teammate's answer (the desk lead echoed
+        // its instruction, and the relay prompt embeds that reply under an
+        // `engineer replied:` frame) — proving the operator reply is the SECOND
+        // turn relaying the teammate, not the pre-delegation first reply.
+        assert!(
+            bubble.text.contains("engineer replied:")
+                && bubble.text.contains("diagnose the outage"),
+            "the relay carries the teammate's answer: {:?}",
+            bubble.text
+        );
+        // …and it is the relay turn, whose prompt framed the hand-back.
+        assert!(
+            bubble.text.contains("Relay their answer"),
+            "the operator bubble is the relay turn: {:?}",
+            bubble.text
+        );
+    }
+
+    /// (b) The relay turn cannot re-delegate: a delegation it queues is
+    /// discarded, so no further desk turn or relay runs (cost stays bounded to
+    /// one extra turn).
+    #[tokio::test]
+    async fn the_relay_turn_cannot_re_delegate() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 queues a delegation; invoke 3 (the relay) ALSO tries to queue
+        // one — which must be discarded, so no fourth/fifth turn runs.
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![
+                Some(Delegation::DelegateToDesk {
+                    desk: "eng_desk".to_string(),
+                    instruction: "first".to_string(),
+                }),
+                None, // the desk lead's turn queues nothing
+                Some(Delegation::DelegateToDesk {
+                    desk: "eng_desk".to_string(),
+                    instruction: "second".to_string(),
+                }),
+            ],
+        );
+
+        let result = brain
+            .run_cycle(
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "handle it".into(),
+                    by: None,
+                    chat: None,
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        // Exactly three turns: orchestrator, desk lead, relay. The relay's queued
+        // delegation was dropped — no fourth (desk-lead) or fifth (relay) turn.
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the relay turn's delegation is discarded — one extra turn, no loop"
+        );
+        // The discard actually emptied the queue (not left dirty for next cycle).
+        assert_eq!(
+            brain.deps.delegations.queued(),
+            0,
+            "the relay turn's queued delegation was discarded"
+        );
+        // Still exactly one operator bubble.
+        assert_eq!(result.channel_responses.len(), 1);
+        assert_eq!(result.channel_responses[0].channel, "operator");
+    }
+
+    /// (c) A normal, non-delegating message still produces exactly one turn — the
+    /// relay path is entered only when a `delegate_to_desk` actually answered.
+    #[tokio::test]
+    async fn a_non_delegating_message_runs_exactly_one_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted delegations → the orchestrator answers directly.
+        let (brain, provider) = brain_that_delegates(dir.path(), Vec::new());
+
+        let result = brain
+            .run_cycle(
+                request(vec![CompanyEvent::OperatorMessage {
+                    text: "status?".into(),
+                    by: None,
+                    chat: None,
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no delegation → a single orchestrator turn, no relay"
+        );
+        assert_eq!(result.channel_responses.len(), 1);
+        assert_eq!(result.channel_responses[0].channel, "operator");
+        assert!(
+            result.channel_responses[0].text.contains("status?"),
+            "{:?}",
+            result.channel_responses[0].text
+        );
     }
 }

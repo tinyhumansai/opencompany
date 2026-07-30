@@ -721,9 +721,17 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .map(opencompany::ports::types::SecretValue);
+            // Honor TINYHUMANS_API_URL (e.g. staging) — the config layer reads
+            // it, but this manual AppConfig build otherwise falls to the prod
+            // default, so a staging credential could never reach staging.
+            let api_url = std::env::var("TINYHUMANS_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| AppConfig::default().api_url);
             let mut state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
+                api_url,
                 tinyplace_api_url,
                 public_url,
                 tenant_namespace,
