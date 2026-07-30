@@ -13,7 +13,7 @@ use crate::Result;
 
 use super::wire::{
     EffectFrame, EffectResult, EventsAccepted, EventsRequest, ToolCallFrame, ToolManifestEntry,
-    ToolResultFrame, WorldDiffAccepted, WorldDiffRequest,
+    ToolResultFrame, UsageFrame, WorldDiffAccepted, WorldDiffRequest,
 };
 
 /// A frame arriving out-of-band for an in-flight cycle.
@@ -27,6 +27,10 @@ pub enum InboundFrame {
     Effect(EffectFrame),
     /// A device tool to invoke then answer (`orch:tool_call`).
     ToolCall(ToolCallFrame),
+    /// What the cycle's inference cost (`orch:usage`), folded into the cycle's
+    /// token/cost total so the Usage surface sees the hosted path's spend.
+    /// Nothing is acked — usage is a report, not a request.
+    Usage(UsageFrame),
     /// The cycle has finished; stop consuming the stream.
     CycleComplete,
 }

@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::brain::medulla::MockTransport;
-use crate::brain::medulla::wire::{self, EffectFrame, OrchErrorCode, Role, ToolCallFrame};
+use crate::brain::medulla::wire::{
+    self, EffectFrame, OrchErrorCode, Role, ToolCallFrame, UsageFrame,
+};
 use crate::ports::types::{
     ApprovalId, ChunkAddr, ChunkHit, CompanyEvent, ContextOp, ContextOpResult, Effect,
     EffectDisposition, ToolResult, Verdict,
@@ -131,6 +133,19 @@ fn tool_call_frame(name: &str, index: usize, args: Value) -> InboundFrame {
     })
 }
 
+/// A usage report for the cycle under test (issue #174), keyed on the same
+/// deterministic dedupe id the server would derive.
+fn usage_frame(index: usize, input: u64, output: u64, cost_usd: Option<f64>) -> InboundFrame {
+    InboundFrame::Usage(UsageFrame {
+        cycle_id: cid(),
+        call_id: wire::call_id(&cid(), wire::USAGE_CALL_KIND, index),
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: 0,
+        cost_usd,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -221,6 +236,98 @@ async fn duplicate_effect_frame_is_handled_once() {
     assert_eq!(host.effects.lock().unwrap().len(), 1);
     assert_eq!(transport.acks().len(), 1);
     assert_eq!(result.channel_responses.len(), 1);
+}
+
+// ── Issue #174: usage frames make the hosted path meterable ─────────────────
+
+/// Without this the hosted path is structurally unmetered: the model runs
+/// upstream, so a reported frame is the only way the host learns what it cost.
+#[tokio::test]
+async fn usage_frames_are_folded_into_the_cycle_total() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![
+            usage_frame(0, 900, 120, Some(0.014)),
+            usage_frame(1, 300, 40, Some(0.006)),
+        ],
+    );
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 1_200);
+    assert_eq!(result.token_usage.output, 160);
+    assert!((result.token_usage.cost_usd - 0.02).abs() < 1e-9);
+    // Usage is a report, not a request: nothing is acked or answered for it.
+    assert!(transport.acks().is_empty());
+    assert!(transport.tool_answers().is_empty());
+}
+
+/// Frame delivery is at-least-once, so a replayed usage report must not
+/// double-charge the meter.
+#[tokio::test]
+async fn duplicate_usage_frame_is_counted_once() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![
+            usage_frame(0, 500, 50, Some(0.01)),
+            usage_frame(0, 500, 50, Some(0.01)),
+        ],
+    );
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 500);
+    assert_eq!(result.token_usage.output, 50);
+    assert_eq!(result.token_usage.cost_usd, 0.01);
+}
+
+/// The managed passthrough bills backend-side and echoes no USD. Tokens still
+/// count — a `costUsd`-less frame is usage, not noise.
+#[tokio::test]
+async fn a_usage_frame_without_cost_still_reports_tokens() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(cid(), vec![usage_frame(0, 42, 7, None)]);
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 42);
+    assert_eq!(result.token_usage.output, 7);
+    assert_eq!(result.token_usage.cost_usd, 0.0);
+}
+
+/// A backend that does not emit the frame yet stays compatible: the cycle simply
+/// reports zero, which the runtime meters as nothing rather than as a guess.
+#[tokio::test]
+async fn a_cycle_with_no_usage_frame_reports_zero() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![effect_frame("send_dm", 0, json!({ "body": "hi" }))],
+    );
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert!(result.token_usage.is_zero());
+}
+
+/// The brain declares where its usage is metered so the console can tell "no
+/// inference configured" from "inference ran but nothing was metered".
+#[test]
+fn cognition_reports_the_hosted_path_and_provider() {
+    let cognition = brain(Arc::new(MockTransport::new())).cognition();
+    assert_eq!(cognition.path, "hosted");
+    assert_eq!(cognition.provider, crate::metering::MEDULLA_PROVIDER);
+    assert_eq!(cognition.metering, UsageMetering::PerCycle);
 }
 
 #[tokio::test]
@@ -496,5 +603,92 @@ async fn e2e_supervised_effect_parks_and_acks_not_ok() {
     .unwrap();
     assert!(rt.pending_approvals().is_empty());
 
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Issue #174 end to end: a real runtime on the hosted brain records the tokens
+/// and cost the wire reported, so the console's Usage view stops reading zero.
+#[tokio::test]
+async fn e2e_reported_usage_lands_on_the_usage_meter() {
+    let home = tmp_home();
+    let transport = Arc::new(MockTransport::new());
+    // `cid()` and `runtime_cid()` are the same deterministic id: company `acme`,
+    // first event at seq 0.
+    transport.script_cycle(
+        runtime_cid(),
+        vec![
+            usage_frame(0, 1_500, 260, Some(0.042)),
+            effect_frame("send_dm", 0, json!({ "body": "on it" })),
+        ],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "how are we doing".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    let samples = rt.usage().query(rt.id(), 0).await.unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].input_tokens, 1_500);
+    assert_eq!(samples[0].output_tokens, 260);
+    assert_eq!(samples[0].cost_usd, 0.042);
+    assert_eq!(samples[0].provider, crate::metering::MEDULLA_PROVIDER);
+    assert_eq!(
+        samples[0].kind,
+        crate::ports::usage::SampleKind::Inference,
+        "hosted cycles meter as inference, not as an OAuth call"
+    );
+
+    // The spend also reaches Finances as an `inference.spend` ledger entry.
+    let record = rt.store().load(rt.id()).await.unwrap().unwrap();
+    assert!(
+        record
+            .ledger
+            .iter()
+            .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND && e.amount_usd == 0.042)
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// The same company with no usage frame on the wire: an honest zero, and no
+/// fabricated sample.
+#[tokio::test]
+async fn e2e_a_cycle_without_usage_frames_meters_nothing() {
+    let home = tmp_home();
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        runtime_cid(),
+        vec![effect_frame("send_dm", 0, json!({ "body": "on it" }))],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "hello".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    assert!(rt.usage().query(rt.id(), 0).await.unwrap().is_empty());
     tokio::fs::remove_dir_all(&home).await.ok();
 }

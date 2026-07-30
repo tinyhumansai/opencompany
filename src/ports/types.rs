@@ -564,13 +564,46 @@ pub struct LedgerEntry {
     pub memo: String,
 }
 
-/// Token accounting for a cycle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Token **and cost** accounting for a cycle — what the runtime meters onto the
+/// Usage surface after the brain returns.
+///
+/// The cost fields carry no `Eq` (they are `f64`), so this type is `PartialEq`
+/// only. Both are `#[serde(default)]` so a peer that predates them still
+/// decodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Input tokens consumed.
     pub input: u64,
     /// Output tokens produced.
     pub output: u64,
+    /// Input tokens served from the provider's KV cache.
+    #[serde(default)]
+    pub cached_input: u64,
+    /// Best-available USD cost for the cycle. Zero when the path reports tokens
+    /// but bills elsewhere (the managed `/openai/v1` passthrough echoes no USD).
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+impl TokenUsage {
+    /// Whether the cycle moved no tokens and cost nothing — the guard that keeps
+    /// an idle or offline cycle from writing a meaningless usage sample.
+    ///
+    /// Includes [`Self::cached_input`]: a cache-served pass is real usage even
+    /// if a provider ever reported it without fresh input tokens.
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cached_input == 0 && self.cost_usd == 0.0
+    }
+
+    /// Folds another total into this one — how a brain accumulates the usage of
+    /// several passes into one cycle total. Token counts saturate rather than
+    /// wrap so a bogus peer value can never underflow the meter.
+    pub fn fold(&mut self, other: &TokenUsage) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
+        self.cost_usd += other.cost_usd;
+    }
 }
 
 /// Everything the brain needs to run one cycle.
@@ -1310,6 +1343,90 @@ mod test {
     {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    // ── Issue #174: cycle usage carries cost, and folds ─────────────────────
+
+    /// A cycle with nothing to report writes nothing, and any single non-zero
+    /// field makes it real usage — including a token-less charge.
+    #[test]
+    fn token_usage_is_zero_only_when_every_field_is() {
+        assert!(TokenUsage::default().is_zero());
+        for usage in [
+            TokenUsage {
+                input: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                output: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                cached_input: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                cost_usd: 0.0001,
+                ..TokenUsage::default()
+            },
+        ] {
+            assert!(!usage.is_zero(), "{usage:?} is real usage");
+        }
+    }
+
+    /// Several model passes in one cycle accumulate into one total.
+    #[test]
+    fn token_usage_folds_passes_together() {
+        let mut total = TokenUsage::default();
+        total.fold(&TokenUsage {
+            input: 100,
+            output: 20,
+            cached_input: 10,
+            cost_usd: 0.01,
+        });
+        total.fold(&TokenUsage {
+            input: 50,
+            output: 5,
+            cached_input: 0,
+            cost_usd: 0.02,
+        });
+        assert_eq!(total.input, 150);
+        assert_eq!(total.output, 25);
+        assert_eq!(total.cached_input, 10);
+        assert!((total.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    /// A bogus peer value must never wrap the meter into a huge or tiny number.
+    #[test]
+    fn token_usage_fold_saturates_instead_of_overflowing() {
+        let mut total = TokenUsage {
+            input: u64::MAX,
+            output: u64::MAX,
+            cached_input: u64::MAX,
+            cost_usd: 0.0,
+        };
+        total.fold(&TokenUsage {
+            input: 10,
+            output: 10,
+            cached_input: 10,
+            cost_usd: 0.0,
+        });
+        assert_eq!(total.input, u64::MAX);
+        assert_eq!(total.output, u64::MAX);
+        assert_eq!(total.cached_input, u64::MAX);
+    }
+
+    /// The cost fields are additive on the wire: a peer that predates them still
+    /// decodes, and an all-zero usage still serializes them for a peer that has
+    /// them.
+    #[test]
+    fn token_usage_decodes_a_payload_without_the_cost_fields() {
+        let legacy: TokenUsage = serde_json::from_str(r#"{"input":7,"output":3}"#).unwrap();
+        assert_eq!(legacy.input, 7);
+        assert_eq!(legacy.output, 3);
+        assert_eq!(legacy.cached_input, 0);
+        assert_eq!(legacy.cost_usd, 0.0);
+        assert_eq!(round_trip(&legacy), legacy);
     }
 
     /// The `TurnStep` wire shape is camelCase with snake_case enum values:

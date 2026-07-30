@@ -5,6 +5,7 @@
 //! services the brain's callbacks through a `CycleHost`.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::ports::types::{
@@ -12,12 +13,77 @@ use crate::ports::types::{
     ToolResult,
 };
 
+/// Where a cognition path's inference usage is metered — the operator's answer
+/// to "why does Usage read zero?" (issue #174).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageMetering {
+    /// Metered per agent turn by the path itself, from the provider's real
+    /// token/cost totals (the `openhuman` harness). A zero reading here means
+    /// nothing ran.
+    PerTurn,
+    /// Metered per cycle by the runtime, from what the brain reports as
+    /// [`CycleResult::token_usage`](crate::ports::types::CycleResult::token_usage)
+    /// — the hosted Medulla path reads it off the `orch:usage` wire frame, so a
+    /// zero reading means the upstream reported no usage.
+    #[default]
+    PerCycle,
+    /// No model inference happens on this path, so there is nothing to meter
+    /// (the offline echo brain). A zero reading is the truth, not a gap.
+    None,
+}
+
+/// How a [`Brain`] does cognition, for metering and operator diagnosis.
+///
+/// The runtime reads [`Self::provider`] when it meters a cycle's usage, and the
+/// console's inference-status route surfaces the whole descriptor so an operator
+/// can tell "no inference source configured, so nothing was spent" from
+/// "inference ran but the meter never saw it".
+///
+/// Deliberately not `Serialize`: the labels are `&'static str` build facts, so a
+/// route projects them onto its own DTO (`cognition` + `usageMetering`) rather
+/// than leaking this shape onto the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cognition {
+    /// Stable label for the path: `harness`, `hosted`, `echo`, `sidecar`, or
+    /// `custom` for an injected brain.
+    pub path: &'static str,
+    /// The provider slug this path's cycle usage is metered under.
+    pub provider: &'static str,
+    /// Where this path's usage is metered.
+    pub metering: UsageMetering,
+}
+
+impl Default for Cognition {
+    fn default() -> Self {
+        Self {
+            // An injected brain (a test double, a caller-supplied brain) reports
+            // its usage through `CycleResult` like the hosted path, but cannot
+            // name the provider that served it.
+            path: "custom",
+            provider: crate::metering::UNKNOWN_PROVIDER,
+            metering: UsageMetering::PerCycle,
+        }
+    }
+}
+
 /// The cognition port. One `run_cycle` call turns a batch of events into a
 /// [`CycleResult`], calling back into the host for tools, context, and effects.
 #[async_trait]
 pub trait Brain: Send + Sync {
     /// Runs one cycle over the request, using `host` for mid-cycle callbacks.
     async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult>;
+
+    /// How this brain does cognition and where its usage is metered.
+    ///
+    /// The default describes an injected brain: usage comes back through
+    /// [`CycleResult::token_usage`](crate::ports::types::CycleResult::token_usage)
+    /// under an unknown provider. A brain that meters itself must say so with
+    /// [`UsageMetering::PerTurn`] **and** report zero `token_usage`, or its spend
+    /// is counted twice.
+    fn cognition(&self) -> Cognition {
+        Cognition::default()
+    }
 }
 
 /// Callbacks the brain makes into the host mid-cycle.

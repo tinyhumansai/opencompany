@@ -10,6 +10,7 @@ import {
   testInference,
   type InferenceProvider,
   type InferenceStatus,
+  type UsageMetering,
 } from "@/api/inference";
 import { ApiError } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
@@ -35,6 +36,16 @@ const PROVIDER_LABELS: Record<InferenceProvider, string> = {
   openrouter: "OpenRouter",
   ollama: "Ollama (local)",
   openai_compatible: "Custom (OpenAI-compatible)",
+};
+
+/**
+ * What the live cognition path's metering mode means for the Usage view — so a
+ * zero token/cost reading is legible instead of alarming (issue #174).
+ */
+const METERING_NOTES: Record<UsageMetering, string> = {
+  perTurn: "usage metered per turn",
+  perCycle: "usage metered per cycle, from what the provider reports",
+  none: "no model runs on this path, so Usage stays at zero",
 };
 
 /** Per-provider form defaults applied when the operator picks a provider. */
@@ -233,6 +244,14 @@ export function InferenceSection({
                   </Button>
                 </div>
                 <p className="truncate text-xs text-muted-foreground">{status.baseUrl}</p>
+                {/* Issue #174: config resolving to a provider does not mean the
+                    company booted onto it. Say which cognition path is live and
+                    whether its usage is metered, so a zero Usage reading reads as
+                    "nothing was spent" rather than "accounting is broken". */}
+                <p className="text-xs text-muted-foreground">
+                  Cognition: <span className="font-mono">{status.cognition}</span> ·{" "}
+                  {METERING_NOTES[status.usageMetering] ?? "usage metering unknown"}
+                </p>
                 {modelRows.length > 0 && (
                   <ul className="space-y-1 rounded-md bg-muted/40 p-2">
                     {modelRows.map(([tier, model]) => (

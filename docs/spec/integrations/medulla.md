@@ -100,6 +100,20 @@ Default namespace, credential in handshake `auth.token`.
   3. Client answers `orch:tool_result` `{ callId, ok, result?, error? }`.
   Cloud tools (server-side) win over device tools on name collision; unknown
   tools are rejected.
+- **Usage out** (issue #174): `orch:usage`
+  `{ cycleId, callId, inputTokens, outputTokens, cachedInputTokens?, costUsd? }`,
+  one frame per model pass. The host never touches the model on this path, so
+  this frame is the **only** way it learns what a cycle cost; without it the
+  hosted path is structurally unmetered and the console's Usage view reads zero
+  however much inference ran. Nothing is acked — usage is a report, not a
+  request. Delivery is at-least-once like every other frame, so `callId` is
+  deterministic (`{cycleId}:usage:{index}`) and the client dedupes on it rather
+  than double-charging the meter.
+  The frame is **advisory and additive**: a backend that does not emit it yet is
+  unaffected — the client folds whatever arrives (nothing ⇒ a zero total, metered
+  as nothing rather than guessed at), `cachedInputTokens` defaults to `0`, and an
+  omitted `costUsd` means "tokens moved, billing happens off the wire", which
+  still records tokens but posts no `$0.00` spend line to Finances.
 
 ## How `HostedMedullaBrain` maps the kernel onto v1
 
@@ -111,6 +125,7 @@ Default namespace, credential in handshake `auth.token`.
 | `CycleHost::call_tool` | device-tool round-trip: the runtime registers the company's granted tool catalog via `orch:register_tools`; `orch:tool_call` → `ToolProvider::invoke` → `orch:tool_result` |
 | `CycleHost::context_op` | exposed as device tools (`context_put`, `context_search`, …) until v2 adds first-class context ops |
 | `CycleHost::emit_effect` | every effect frame passes the `ApprovalGate` **before** acking `ok`; parked effects ack `ok: false` with a "pending approval" error so the brain hears the gate |
+| `CycleResult.token_usage` | `orch:usage` frames folded into the cycle total, then metered by `CycleRunner` onto the Usage surface (`SampleKind::Inference`, provider `medulla`) and, when the frame carries USD, onto Finances as an `inference.spend` ledger entry. Per-teammate attribution is not on the wire, so hosted usage is charged to the whole-company bucket (`company`) |
 | `MemoryStore` | mirrors the read surface (`/sessions/:id/messages`) plus locally-journaled cycle summaries; server keeps its own compressed state |
 | World state | `POST /v1/world-diff` after notable local effects (approvals resolved, payments, feedback) |
 

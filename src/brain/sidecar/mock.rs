@@ -187,7 +187,18 @@ impl MockInferenceClient {
 
     /// Sets the token usage each completion reports.
     pub fn with_tokens(mut self, input: u64, output: u64) -> Self {
-        self.token_usage = TokenUsage { input, output };
+        self.token_usage = TokenUsage {
+            input,
+            output,
+            ..TokenUsage::default()
+        };
+        self
+    }
+
+    /// Sets the USD cost each completion reports, so a test can drive the
+    /// cycle-level cost metering the runtime does.
+    pub fn with_cost(mut self, cost_usd: f64) -> Self {
+        self.token_usage.cost_usd = cost_usd;
         self
     }
 

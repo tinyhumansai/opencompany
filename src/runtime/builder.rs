@@ -1018,6 +1018,18 @@ impl RuntimeBuilder {
                             wf_runner = Some(runner);
                             Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
                         } else {
+                            // Do not degrade silently (issue #174): an openhuman
+                            // build with no resolvable inference source falls back
+                            // to the hosted/echo brain, so the operator sees a
+                            // company that answers (echo) or defers upstream while
+                            // Usage reads zero. That zero means "no key", not
+                            // "metering broken" — say so once at boot, and let the
+                            // inference-status route report the path it landed on.
+                            tracing::warn!(
+                                company = %id,
+                                "no inference source resolved (no runtime override, no manifest [inference], no managed default); \
+                                 falling back to the hosted/echo brain — the Usage view will read zero tokens until one is configured"
+                            );
                             None
                         }
                     }

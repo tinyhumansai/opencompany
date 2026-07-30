@@ -9,8 +9,13 @@
 //!    [`CycleHost`] that gates every emitted effect.
 //! 5. **Gate** — inside the host: evaluate, then execute (at-most-once), park,
 //!    or deny each effect.
-//! 6. **Persist output** — save traces and ledger deltas, route channel
-//!    responses to their adapters.
+//! 6. **Persist output** — save traces and ledger deltas, meter the cycle's
+//!    inference usage, and route channel responses to their adapters.
+//!
+//! Step 6's metering is the *generic* cost seam: whatever the brain reports as
+//! [`CycleResult::token_usage`](crate::ports::types::CycleResult::token_usage)
+//! lands on the Usage/Finances surfaces, so hosted Medulla cognition is metered
+//! like the openhuman harness instead of reading a blind zero (issue #174).
 //!
 //! The per-company serial lock is held for the whole cycle, so cycles never
 //! interleave within a company while distinct companies stay concurrent.
@@ -24,12 +29,12 @@ use crate::Result;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::feedback::tool::SEND_EMAIL_TOOL;
-use crate::ports::brain::CycleHost;
+use crate::ports::brain::{CycleHost, UsageMetering};
 use crate::ports::now_millis;
 use crate::ports::types::{
     Actor, ApprovalId, CompanyEvent, CompanyId, ContextOp, ContextOpResult, CycleRequest, Effect,
-    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, ToolCall,
-    ToolResult, Verdict,
+    EffectDisposition, EffectGroup, LedgerEntry, OutboundMessage, PolicyDecision, TokenUsage,
+    ToolCall, ToolResult, Verdict,
 };
 use crate::runtime::channel::OPERATOR_CHANNEL;
 use crate::runtime::types::CycleReport;
@@ -111,6 +116,13 @@ impl<'a> CycleRunner<'a> {
         for delta in &result.ledger_deltas {
             self.rt.store.append_ledger(&company, delta.clone()).await?;
         }
+        // 6b. Meter what the cycle's thinking cost. This is the *generic* seam, so
+        // every brain that reports usage is metered — before issue #174 only the
+        // openhuman harness metered (per turn, through its own hook) and the
+        // hosted/sidecar paths dropped `CycleResult.token_usage` on the floor,
+        // leaving the Usage view at a blind zero. A brain that meters itself
+        // reports zero here (see `HarnessBrain`), so nothing is counted twice.
+        self.record_cycle_usage(&company, &result.token_usage).await;
         for response in &result.channel_responses {
             self.route_response(response).await?;
         }
@@ -123,6 +135,47 @@ impl<'a> CycleRunner<'a> {
             parked,
             persisted_seq,
         })
+    }
+
+    /// Meters a finished cycle's inference usage onto the Usage + Finances
+    /// surfaces, attributed to the brain's own provider slug (issue #174).
+    ///
+    /// A zero-usage cycle writes nothing, which covers the idle cycle, the
+    /// offline echo brain, and the openhuman harness — the harness meters each
+    /// turn as it runs and deliberately reports zero here, so its spend is never
+    /// double-counted.
+    ///
+    /// Accounting never fails the cycle it accounts for: the write is
+    /// logged-and-swallowed inside
+    /// [`record_inference_usage`](crate::metering::record_inference_usage), so a
+    /// meter fault cannot undo model output the operator can already see.
+    async fn record_cycle_usage(&self, company: &CompanyId, usage: &TokenUsage) {
+        if usage.is_zero() {
+            return;
+        }
+        let cognition = self.rt.brain.cognition();
+        if cognition.metering == UsageMetering::PerTurn {
+            // Defensive: a self-metering path should report zero. If one ever
+            // reports usage too, drop it here rather than charge it twice, and
+            // say so loudly.
+            tracing::warn!(
+                company = %company,
+                path = %cognition.path,
+                input = usage.input,
+                output = usage.output,
+                "[usage] a per-turn-metered brain also reported cycle usage; ignoring it to avoid double-counting"
+            );
+            return;
+        }
+        crate::metering::record_inference_usage(
+            usage,
+            crate::metering::UNATTRIBUTED_AGENT,
+            cognition.provider,
+            company,
+            self.rt.store.as_ref(),
+            self.rt.usage().as_ref(),
+        )
+        .await;
     }
 
     /// Resolves a parked approval, executes the effect on approval, and runs a
@@ -750,7 +803,7 @@ mod test {
         // Same key again: skipped, no second ledger entry.
         execute_effect_once(&rt, "k1", &effect).await.unwrap();
 
-        let record = rt.store.load(rt.id()).await.unwrap().unwrap();
+        let record = rt.store().load(rt.id()).await.unwrap().unwrap();
         assert_eq!(record.ledger.len(), 1);
 
         // Rebuild the runtime over the same home; journal replay must remember
@@ -965,6 +1018,192 @@ mod test {
             .await
             .unwrap();
         assert!(raw.contains("ApprovalExpired"));
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    // ── Issue #174: the generic cycle seam meters inference usage ────────────
+
+    /// A brain that reports a fixed [`TokenUsage`] for every cycle — the shape
+    /// hosted Medulla cognition produces once its `orch:usage` frames land.
+    struct MeteredBrain {
+        usage: TokenUsage,
+        metering: UsageMetering,
+    }
+
+    impl MeteredBrain {
+        fn per_cycle(usage: TokenUsage) -> Self {
+            Self {
+                usage,
+                metering: UsageMetering::PerCycle,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Brain for MeteredBrain {
+        async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+            Ok(CycleResult {
+                channel_responses: vec![OutboundMessage {
+                    channel: "operator".into(),
+                    text: "thought about it".into(),
+                    steps: Vec::new(),
+                    reply_to: None,
+                }],
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "metered cycle")],
+                ledger_deltas: Vec::new(),
+                token_usage: self.usage,
+            })
+        }
+
+        fn cognition(&self) -> crate::ports::Cognition {
+            crate::ports::Cognition {
+                path: "test",
+                provider: "medulla",
+                metering: self.metering,
+            }
+        }
+    }
+
+    fn reported_usage(cost_usd: f64) -> TokenUsage {
+        TokenUsage {
+            input: 1_200,
+            output: 340,
+            cached_input: 200,
+            cost_usd,
+        }
+    }
+
+    /// The bug: a brain outside the openhuman harness reported real token usage
+    /// and the cycle loop dropped it, so the Usage view read zero forever.
+    #[tokio::test]
+    async fn reported_cycle_usage_reaches_the_usage_meter() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(MeteredBrain::per_cycle(reported_usage(0.031))))
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            text: "how are we doing".into(),
+            by: None,
+            chat: None,
+        }])
+        .await
+        .unwrap();
+
+        let samples = rt.usage().query(rt.id(), 0).await.unwrap();
+        assert_eq!(samples.len(), 1, "one inference sample per metered cycle");
+        let sample = &samples[0];
+        assert_eq!(sample.kind, crate::ports::usage::SampleKind::Inference);
+        assert_eq!(sample.input_tokens, 1_200);
+        assert_eq!(sample.output_tokens, 340);
+        assert_eq!(sample.cached_input_tokens, 200);
+        assert_eq!(sample.cost_usd, 0.031);
+        assert_eq!(sample.provider, "medulla");
+        assert_eq!(sample.agent, crate::metering::UNATTRIBUTED_AGENT);
+
+        // Cost also lands on Finances as an `inference.spend` ledger entry.
+        let record = rt.store().load(rt.id()).await.unwrap().unwrap();
+        let spend: Vec<_> = record
+            .ledger
+            .iter()
+            .filter(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND)
+            .collect();
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].amount_usd, 0.031);
+
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Tokens without USD (the managed passthrough bills backend-side) still
+    /// count on the Usage surface, but must not post a `$0.00` spend line.
+    #[tokio::test]
+    async fn token_only_usage_meters_without_a_ledger_entry() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(MeteredBrain::per_cycle(reported_usage(0.0))))
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(Vec::new()).await.unwrap();
+
+        assert_eq!(rt.usage().query(rt.id(), 0).await.unwrap().len(), 1);
+        let record = rt.store().load(rt.id()).await.unwrap().unwrap();
+        assert!(
+            !record
+                .ledger
+                .iter()
+                .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND)
+        );
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// A cycle that spent nothing writes nothing — an idle cycle or the offline
+    /// echo brain must not mint an empty sample.
+    #[tokio::test]
+    async fn a_zero_usage_cycle_writes_no_sample() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(MeteredBrain::per_cycle(TokenUsage::default())))
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(Vec::new()).await.unwrap();
+
+        assert!(rt.usage().query(rt.id(), 0).await.unwrap().is_empty());
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// The openhuman harness meters every turn itself, so the cycle seam must
+    /// stay out of its way: a self-metering path's cycle usage is ignored rather
+    /// than charged a second time.
+    #[tokio::test]
+    async fn a_self_metering_brain_is_not_metered_twice() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(MeteredBrain {
+                usage: reported_usage(9.99),
+                metering: UsageMetering::PerTurn,
+            }))
+            .build()
+            .await
+            .unwrap();
+
+        rt.run_cycle(Vec::new()).await.unwrap();
+
+        assert!(rt.usage().query(rt.id(), 0).await.unwrap().is_empty());
+        let record = rt.store().load(rt.id()).await.unwrap().unwrap();
+        assert!(
+            !record
+                .ledger
+                .iter()
+                .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND)
+        );
+        tokio::fs::remove_dir_all(&home).await.ok();
+    }
+
+    /// Every cycle meters independently, so a multi-turn conversation
+    /// accumulates rather than overwriting.
+    #[tokio::test]
+    async fn each_cycle_meters_its_own_usage() {
+        let home = tmp_home();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .with_brain(Arc::new(MeteredBrain::per_cycle(reported_usage(0.01))))
+            .build()
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            rt.run_cycle(Vec::new()).await.unwrap();
+        }
+
+        let samples = rt.usage().query(rt.id(), 0).await.unwrap();
+        assert_eq!(samples.len(), 3);
+        let total: u64 = samples.iter().map(|s| s.input_tokens).sum();
+        assert_eq!(total, 3_600);
         tokio::fs::remove_dir_all(&home).await.ok();
     }
 

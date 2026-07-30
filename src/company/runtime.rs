@@ -387,6 +387,17 @@ impl CompanyRuntime {
         &self.ops.usage
     }
 
+    /// Which cognition path this company actually booted onto, and where that
+    /// path's inference usage is metered.
+    ///
+    /// The console's inference-status route surfaces this so an operator can tell
+    /// "no inference source resolved, so the company fell back to a path that
+    /// spends nothing" from "inference ran but the meter never saw it" — the
+    /// silent degradation that made issue #174 hard to read.
+    pub fn cognition(&self) -> crate::ports::Cognition {
+        self.brain.cognition()
+    }
+
     /// This company's skill-state deltas.
     pub fn skills(&self) -> &Arc<dyn SkillStateStore> {
         &self.ops.skills

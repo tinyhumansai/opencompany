@@ -110,7 +110,10 @@ impl MedullaTransport for HttpSocketTransport {
     }
 
     fn cycle_frames(&self, _cycle_id: &str) -> BoxStream<'static, Result<InboundFrame>> {
-        // TODO(medulla): bridge the `orch:effect:*` / `orch:tool_call` stream.
+        // TODO(medulla): bridge the `orch:effect:*` / `orch:tool_call` /
+        // `orch:usage` stream. Dropping `orch:usage` when wiring this would leave
+        // the networked path unmetered exactly as issue #174 described, even
+        // though the brain and the meter below it now handle it.
         // Until the socket client is wired, report an empty cycle so a networked
         // build is a compilable scaffold rather than a hang.
         stream::once(async { Ok(InboundFrame::CycleComplete) }).boxed()

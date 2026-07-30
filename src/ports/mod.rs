@@ -31,7 +31,7 @@ pub mod workflow_runner;
 pub mod workspace;
 
 pub use approvals::ApprovalGate;
-pub use brain::{Brain, CycleHost};
+pub use brain::{Brain, Cognition, CycleHost, UsageMetering};
 pub use channel::ChannelAdapter;
 pub use context::ContextStore;
 pub use economy::AgentEconomy;
