@@ -2556,6 +2556,65 @@ mod test {
         .expect("agent_reply is an attention signal");
         // A tool-less reply keeps the legacy wire shape — no `steps` key.
         assert!(v.get("steps").is_none());
+        // …and an uncorrelated reply carries no `taskId` either, so the
+        // pre-#185 wire shape is byte-for-byte what it was.
+        assert!(v.get("taskId").is_none());
+    }
+
+    /// #185: the correlation key rides the SSE stream when — and only when — the
+    /// event carries one. Both directions matter: its presence is what lets a
+    /// live console route a frame to the right task, and its absence is what
+    /// keeps the legacy shape intact for every ordinary chat reply.
+    #[test]
+    fn projects_task_id_only_when_the_event_is_correlated() {
+        let reply = super::project_event(&stored(CompanyEvent::AgentReply {
+            task_id: Some("t-1".into()),
+            chat_id: "t-1".into(),
+            agent_id: "ceo".into(),
+            text: "on it".into(),
+            steps: Vec::new(),
+        }))
+        .expect("agent_reply is an attention signal");
+        assert_eq!(reply["taskId"], serde_json::json!("t-1"));
+
+        let failure = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            task_id: Some("t-1".into()),
+            server: "gh".into(),
+            tool: "issues".into(),
+            status: "credential_required".into(),
+            message: "needs auth".into(),
+        }))
+        .expect("mcp_call_failed is an attention signal");
+        assert_eq!(failure["taskId"], serde_json::json!("t-1"));
+
+        let uncorrelated = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            task_id: None,
+            server: "gh".into(),
+            tool: "issues".into(),
+            status: "credential_required".into(),
+            message: "needs auth".into(),
+        }))
+        .expect("mcp_call_failed is an attention signal");
+        assert!(uncorrelated.get("taskId").is_none());
+    }
+
+    /// #185: the dispatch terminal projects all four fields. `column` is the one
+    /// that matters most — it is how a console tells a clean finish from a
+    /// cancelled or failed run without parsing `output`.
+    #[test]
+    fn projects_desk_task_completed_with_every_field() {
+        let v = super::project_event(&stored(CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".into(),
+            desk: "ceo".into(),
+            output: "shipped".into(),
+            column: "in_review".into(),
+        }))
+        .expect("desk_task_completed is an attention signal");
+        assert_eq!(v["type"], serde_json::json!("desk_task_completed"));
+        assert_eq!(v["taskId"], serde_json::json!("t-1"));
+        assert_eq!(v["desk"], serde_json::json!("ceo"));
+        assert_eq!(v["output"], serde_json::json!("shipped"));
+        assert_eq!(v["column"], serde_json::json!("in_review"));
     }
 
     #[test]

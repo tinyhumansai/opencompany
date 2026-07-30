@@ -223,9 +223,25 @@ impl HarnessBrain {
         // The steps the drain produces are discarded, matching the rest of
         // `run_task`: a dispatched card has no chat bubble to render them on
         // (they are journaled as `McpCallFailed` events instead).
+        //
+        // Every write below is **best-effort**: the card was already persisted
+        // above, so propagating a journal failure with `?` would abandon the
+        // terminal anchor *and* the #151 post-back for a dispatch that has in
+        // fact landed — leaving a timeline stuck "still running" for a card the
+        // board already shows in `in_review`, and failing the whole cycle over
+        // a bookkeeping write. Matches the existing journal-after-persist sites
+        // (`chat_and_emit`, `WorkflowCreated`, `TaskSteered`).
         let mut discarded_steps = Vec::new();
-        self.surface_mcp_failures(&mut discarded_steps, Some(&card.id))
-            .await?;
+        if let Err(err) = self
+            .surface_mcp_failures(&mut discarded_steps, Some(&card.id))
+            .await
+        {
+            tracing::warn!(
+                task_id = %card.id,
+                error = %err,
+                "[task] failed to journal dispatch MCP failures; continuing"
+            );
+        }
 
         if let Some(events) = self.deps.events.as_ref() {
             // The run's reply, tagged so the per-task timeline can filter it out
@@ -240,7 +256,7 @@ impl HarnessBrain {
             // the record stays exactly what it is: timeline material, reachable
             // only through `task_id`. An empty string would be worse still — it
             // folds into the General desk.
-            events
+            if let Err(err) = events
                 .append(
                     &self.record.id,
                     CompanyEvent::AgentReply {
@@ -251,10 +267,19 @@ impl HarnessBrain {
                         task_id: Some(card.id.clone()),
                     },
                 )
-                .await?;
+                .await
+            {
+                tracing::warn!(
+                    task_id = %card.id,
+                    error = %err,
+                    "[task] failed to journal dispatch reply; continuing"
+                );
+            }
             // The terminal anchor, journaled after the card's landing column is
-            // persisted so it always records a completed run.
-            events
+            // persisted so it always records a completed run. Attempted even if
+            // the reply above failed — the anchor is what closes a timeline, so
+            // dropping it is strictly worse than dropping the reply.
+            if let Err(err) = events
                 .append(
                     &self.record.id,
                     CompanyEvent::DeskTaskCompleted {
@@ -264,7 +289,14 @@ impl HarnessBrain {
                         column: card.column.clone(),
                     },
                 )
-                .await?;
+                .await
+            {
+                tracing::warn!(
+                    task_id = %card.id,
+                    error = %err,
+                    "[task] failed to journal task completion; continuing"
+                );
+            }
         }
 
         // Issue #151 §3.2: answer in the conversation the card was spawned

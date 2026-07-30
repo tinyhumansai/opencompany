@@ -135,10 +135,70 @@ async fn list_tasks(company: ScopedCompany) -> Result<Json<Vec<TaskCard>>, ApiEr
     Ok(Json(rows.into_iter().map(TaskCard::from).collect()))
 }
 
+/// Validates a proposed `parent_task_id` against the board.
+///
+/// Rejects three things, all at the write boundary — the cheap place to keep
+/// the lineage a forest rather than discovering it is not one on read:
+///
+/// * **self-parenting**, which would make a card its own parent *and* its own
+///   child in `task_detail`;
+/// * a parent that **names no existing card**, which yields a dangling edge and
+///   a lineage whose `parent` silently reads as `None`;
+/// * a **cycle** (`t1 → t2 → t1`). Nothing hangs today because `task_detail`
+///   walks a single level, but a persisted cycle is a latent trap for any
+///   future consumer that does walk the chain — a rollup, a breadcrumb.
+///
+/// `child` is the id being parented — `None` on create, where the new card has
+/// no id on the board yet and therefore cannot be part of a cycle.
+fn validate_parent(
+    parent_task_id: &str,
+    child: Option<&str>,
+    board: &[TaskRecord],
+) -> Result<(), ApiError> {
+    if Some(parent_task_id) == child {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "a task cannot be its own parent".to_string(),
+        )));
+    }
+    if !board.iter().any(|t| t.id == parent_task_id) {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+            "parent task {parent_task_id} does not exist"
+        ))));
+    }
+    let Some(child) = child else {
+        return Ok(());
+    };
+    // Walk up from the proposed parent. Reaching `child` means the new edge
+    // would close a loop. The visited set bounds the walk even if the stored
+    // board already contains a cycle from before this validation existed.
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = Some(parent_task_id.to_string());
+    while let Some(id) = cursor {
+        if id == child {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                "parent task {parent_task_id} would create a cycle through {child}"
+            ))));
+        }
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        cursor = board
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.parent_task_id.clone());
+    }
+    Ok(())
+}
+
 async fn create_task(
     company: ScopedCompany,
     Json(body): Json<CreateTask>,
 ) -> Result<Json<TaskCard>, ApiError> {
+    if let Some(parent) = body.parent_task_id.as_deref() {
+        let board = company.runtime.tasks().list(company.id()).await?;
+        // `None` child: the card does not exist yet, so it cannot be in a cycle.
+        validate_parent(parent, None, &board)?;
+    }
     let record = TaskRecord {
         id: generate_id(),
         title: body.title,
@@ -159,13 +219,13 @@ async fn patch_task(
     Path(TaskPath { task_id }): Path<TaskPath>,
     Json(body): Json<PatchTask>,
 ) -> Result<Json<TaskCard>, ApiError> {
-    let mut record = company
-        .runtime
-        .tasks()
-        .list(company.id())
-        .await?
-        .into_iter()
+    // The whole board is kept (not consumed by `into_iter`) so a re-parent can
+    // be checked for existence and cycles against it.
+    let board = company.runtime.tasks().list(company.id()).await?;
+    let mut record = board
+        .iter()
         .find(|t| t.id == task_id)
+        .cloned()
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(format!("task {task_id}")))?;
     if let Some(title) = body.title {
         record.title = title;
@@ -183,6 +243,7 @@ async fn patch_task(
         record.assignee = assignee;
     }
     if let Some(parent_task_id) = body.parent_task_id {
+        validate_parent(&parent_task_id, Some(&task_id), &board)?;
         record.parent_task_id = Some(parent_task_id);
     }
     record.updated_at_millis = now_millis();
@@ -340,30 +401,73 @@ async fn task_detail(
     }))
 }
 
+/// How many journal events one `read_from` page pulls.
+///
+/// The scan is bounded per page rather than per request: a task's events can sit
+/// anywhere in a company's history, so the whole log must still be *traversed* —
+/// but it is never all *resident* at once.
+const TIMELINE_PAGE: usize = 512;
+
 /// Folds the company journal down to one task's timeline.
 ///
-/// Single pass, oldest-first. `window` opens on this task's dispatch anchor and
-/// closes on its completion anchor; untagged-but-windowed events (approvals)
-/// are only admitted while it is open, so a resolution belonging to a different
-/// task's run never leaks in.
+/// Oldest-first, paged. `window` opens on this task's dispatch anchor and closes
+/// on its completion anchor; untagged-but-windowed events (approvals) are only
+/// admitted while it is open, so a resolution belonging to a different task's
+/// run never leaks in.
+///
+/// **Why the scan does not stop at the first completion anchor.** A card can be
+/// re-dispatched — moved back to `in_progress` after review — which opens a
+/// second dispatch → completion cycle later in the same log. Stopping at the
+/// first `DeskTaskCompleted` would silently truncate every run after the first,
+/// which is worse than the cost it saves. Bounding the page size gives the
+/// memory win without that correctness loss; a stored per-task dispatch offset
+/// is the durable fix for the traversal cost and is left to the epic.
 async fn task_timeline(
     company: &ScopedCompany,
     task_id: &str,
 ) -> Result<Vec<TimelineEntry>, ApiError> {
     use crate::ports::types::EventSeq;
 
-    let stored = company
-        .runtime
-        .events()
-        .read_from(company.id(), EventSeq::new(0), usize::MAX)
-        .await?;
-
     let mut timeline = Vec::new();
     let mut window_open = false;
-    for ev in &stored {
+    let mut next_seq = 0u64;
+    loop {
+        let page = company
+            .runtime
+            .events()
+            .read_from(company.id(), EventSeq::new(next_seq), TIMELINE_PAGE)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        // Advance past the last event read. `read_from` is inclusive of `seq`,
+        // so without the `+ 1` the final event of each page would be re-read
+        // forever.
+        next_seq = page
+            .last()
+            .map(|ev| ev.seq.value() + 1)
+            .unwrap_or(next_seq + 1);
+        let exhausted = page.len() < TIMELINE_PAGE;
+        fold_page(&page, task_id, &mut window_open, &mut timeline);
+        if exhausted {
+            break;
+        }
+    }
+    Ok(timeline)
+}
+
+/// Folds one page of journal events onto `timeline`, carrying the window state
+/// across pages.
+fn fold_page(
+    page: &[crate::ports::types::StoredEvent],
+    task_id: &str,
+    window_open: &mut bool,
+    timeline: &mut Vec<TimelineEntry>,
+) {
+    for ev in page {
         let entry = match &ev.event {
             CompanyEvent::TaskDispatched { task_id: id } if id == task_id => {
-                window_open = true;
+                *window_open = true;
                 Some(("dispatched", "Dispatched".to_string(), None))
             }
             CompanyEvent::AgentReply {
@@ -393,7 +497,7 @@ async fn task_timeline(
                 output,
                 column,
             } if id == task_id => {
-                window_open = false;
+                *window_open = false;
                 Some((
                     "completed",
                     format!("Finished on {desk} → {column}"),
@@ -403,7 +507,7 @@ async fn task_timeline(
             // Window-correlated, not id-correlated — see `task_detail`'s docs.
             // The operator's identity is deliberately dropped: it can carry a
             // user id, matching the SSE projection's deny-by-default stance.
-            CompanyEvent::ApprovalResolved { verdict, .. } if window_open => Some((
+            CompanyEvent::ApprovalResolved { verdict, .. } if *window_open => Some((
                 "approval",
                 format!(
                     "Approval {}",
@@ -423,7 +527,6 @@ async fn task_timeline(
             });
         }
     }
-    Ok(timeline)
 }
 
 // ---------------------------------------------------------------------------

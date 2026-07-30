@@ -1954,3 +1954,179 @@ async fn inflight_read_is_not_shadowed_by_task_detail() {
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }
+
+/// #185 review follow-up: pin the two timeline branches the first test skipped —
+/// `tool_failed`, and the window-correlated `approval` arm.
+///
+/// The approval arm is the only branch in `task_timeline` whose correlation is
+/// heuristic (parked effects carry no task id, so it is scoped by the run
+/// window). That makes it the one most likely to regress into leaking another
+/// run's resolution, so it is asserted from both sides: a resolution *before*
+/// the dispatch anchor must be excluded, one *inside* the window admitted.
+#[tokio::test]
+async fn task_timeline_scopes_approvals_to_the_run_window() {
+    use crate::ports::types::{Actor, ActorKind, ApprovalId, CompanyEvent, Verdict};
+
+    let home = home();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+
+    runtime
+        .tasks()
+        .upsert(
+            &company,
+            &TaskRecord {
+                id: "t-1".into(),
+                title: "Ship it".into(),
+                note: None,
+                column: "in_review".into(),
+                priority: "medium".into(),
+                assignee: "ceo".into(),
+                updated_at_millis: 1,
+                origin_chat_id: None,
+                parent_task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let approval = |id: &str| CompanyEvent::ApprovalResolved {
+        approval_id: ApprovalId::new(id),
+        verdict: Verdict::Approve,
+        by: Actor {
+            kind: ActorKind::User,
+            id: "u-1".into(),
+        },
+    };
+
+    for event in [
+        // Before the dispatch anchor — belongs to some other run, must not leak.
+        approval("before"),
+        CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+        },
+        // Inside the window — admitted.
+        approval("during"),
+        CompanyEvent::McpCallFailed {
+            task_id: Some("t-1".into()),
+            server: "gh".into(),
+            tool: "issues".into(),
+            status: "credential_required".into(),
+            message: "needs auth".into(),
+        },
+        CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".into(),
+            desk: "ceo".into(),
+            output: "shipped".into(),
+            column: "in_review".into(),
+        },
+        // After the window closed — must not leak either.
+        approval("after"),
+    ] {
+        runtime.events().append(&company, event).await.unwrap();
+    }
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let kinds: Vec<&str> = body["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["dispatched", "approval", "tool_failed", "completed"],
+        "exactly one approval — the one inside the run window"
+    );
+
+    // The failure carries its scrubbed message; the operator's identity on the
+    // approval is dropped, matching the SSE projection's deny-by-default stance.
+    let raw = serde_json::to_string(&body["timeline"]).unwrap();
+    assert!(raw.contains("needs auth"));
+    assert!(!raw.contains("u-1"), "operator identity leaked: {raw}");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// #185 review follow-up: the lineage forest is enforced at the write boundary.
+///
+/// Without this a card could be its own parent (appearing as both parent and
+/// child of itself in `task_detail`), point at a card that does not exist, or
+/// close a `t1 → t2 → t1` loop — all persisted silently.
+#[tokio::test]
+async fn parent_task_id_rejects_self_unknown_and_cycles() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    let create = |title: &str| {
+        let title = title.to_string();
+        async move { json!({ "title": title }) }
+    };
+    let (_, a) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(create("A").await),
+    )
+    .await;
+    let (_, b) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(create("B").await),
+    )
+    .await;
+    let (a_id, b_id) = (
+        a["id"].as_str().unwrap().to_string(),
+        b["id"].as_str().unwrap().to_string(),
+    );
+
+    // Unknown parent on create.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({ "title": "C", "parentTaskId": "nope" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Self-parenting on patch.
+    let (status, _) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/tasks/{a_id}"),
+        Some(json!({ "parentTaskId": a_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A legitimate edge: B's parent is A.
+    let (status, _) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/tasks/{b_id}"),
+        Some(json!({ "parentTaskId": a_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // …which makes A → B a cycle.
+    let (status, _) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/tasks/{a_id}"),
+        Some(json!({ "parentTaskId": b_id })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "A → B → A must be rejected"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
