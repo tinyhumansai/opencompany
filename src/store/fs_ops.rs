@@ -21,6 +21,7 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::error::OpenCompanyError;
+use crate::ports::artifacts::{ArtifactRecord, ArtifactStore};
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
 use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
 use crate::ports::now_millis;
@@ -451,6 +452,63 @@ impl FactStore for FsOps {
 }
 
 // ---------------------------------------------------------------------------
+// ArtifactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ArtifactStore for FsOps {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        task_id: Option<&str>,
+    ) -> Result<Vec<ArtifactRecord>> {
+        let mut artifacts = dedup_latest(
+            read_jsonl::<ArtifactRecord>(&self.bundle(company).artifacts_jsonl()).await?,
+        );
+        if let Some(task_id) = task_id {
+            artifacts.retain(|a| a.task_id == task_id);
+        }
+        artifacts.sort_by_key(|a| std::cmp::Reverse(a.updated_at_millis));
+        Ok(artifacts)
+    }
+
+    async fn get(&self, company: &CompanyId, id: &str) -> Result<Option<ArtifactRecord>> {
+        let artifacts = dedup_latest(
+            read_jsonl::<ArtifactRecord>(&self.bundle(company).artifacts_jsonl()).await?,
+        );
+        Ok(artifacts.into_iter().find(|a| a.id == id))
+    }
+
+    async fn upsert(&self, company: &CompanyId, artifact: &ArtifactRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.artifacts_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut artifacts = dedup_latest(read_jsonl::<ArtifactRecord>(&path).await?);
+        match artifacts.iter_mut().find(|a| a.id == artifact.id) {
+            Some(existing) => *existing = artifact.clone(),
+            None => artifacts.push(artifact.clone()),
+        }
+        rewrite_jsonl(&path, &artifacts).await
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let path = self.bundle(company).artifacts_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut artifacts = dedup_latest(read_jsonl::<ArtifactRecord>(&path).await?);
+        let before = artifacts.len();
+        artifacts.retain(|a| a.id != id);
+        if artifacts.len() == before {
+            return Ok(false);
+        }
+        rewrite_jsonl(&path, &artifacts).await?;
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -833,15 +891,37 @@ where
     Ok(serde_json::from_str(&contents)?)
 }
 
+/// Something a JSONL log keys its last-write-wins dedupe on.
+///
+/// Kept as a trait rather than a closure so [`dedup_latest`] reads identically
+/// at every call site; the two implementors below are the only record types
+/// stored in an id-keyed JSONL log.
+trait HasId {
+    fn record_id(&self) -> &str;
+}
+
+impl HasId for FactRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for ArtifactRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Keeps the last record per id (last-write-wins), preserving first-seen order.
-fn dedup_latest(records: Vec<FactRecord>) -> Vec<FactRecord> {
+fn dedup_latest<T: HasId>(records: Vec<T>) -> Vec<T> {
     let mut order: Vec<String> = Vec::new();
-    let mut by_id: HashMap<String, FactRecord> = HashMap::new();
+    let mut by_id: HashMap<String, T> = HashMap::new();
     for record in records {
-        if !by_id.contains_key(&record.id) {
-            order.push(record.id.clone());
+        let id = record.record_id().to_string();
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
         }
-        by_id.insert(record.id.clone(), record);
+        by_id.insert(id, record);
     }
     order
         .into_iter()
@@ -907,6 +987,7 @@ mod test {
     async fn conformance_fact_store() {
         let root = tmp_root();
         conformance::assert_fact_store(Arc::new(FsOps::new(&root))).await;
+        conformance::assert_artifact_store(Arc::new(FsOps::new(&root))).await;
         tokio::fs::remove_dir_all(&root).await.ok();
     }
 

@@ -130,6 +130,15 @@ CREATE TABLE IF NOT EXISTS facts (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (company_id, id)
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    company_id    TEXT NOT NULL,
+    id            TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    artifact_json TEXT NOT NULL,
+    updated_ms    INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE INDEX IF NOT EXISTS artifacts_by_task ON artifacts (company_id, task_id);
 CREATE TABLE IF NOT EXISTS usage_samples (
     company_id TEXT NOT NULL,
     seq        INTEGER NOT NULL,
@@ -1411,6 +1420,111 @@ impl crate::ports::facts::FactStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// ArtifactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::artifacts::ArtifactStore for SqliteStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        task_id: Option<&str>,
+    ) -> Result<Vec<crate::ports::artifacts::ArtifactRecord>> {
+        let conn = self.conn();
+        // `task_id` is filtered in SQL (it has an index) rather than in Rust,
+        // so a company with many artifacts does not deserialize the whole set
+        // to answer one task's Artifacts tab.
+        let mut out: Vec<crate::ports::artifacts::ArtifactRecord> = Vec::new();
+        match task_id {
+            Some(task_id) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT artifact_json FROM artifacts WHERE company_id = ?1 \
+                         AND task_id = ?2 ORDER BY updated_ms DESC",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![company.as_ref(), task_id], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(sql_err)?;
+                for row in rows {
+                    out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+                }
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT artifact_json FROM artifacts WHERE company_id = ?1 \
+                         ORDER BY updated_ms DESC",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+                    .map_err(sql_err)?;
+                for row in rows {
+                    out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::artifacts::ArtifactRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT artifact_json FROM artifacts WHERE company_id = ?1 AND id = ?2")
+            .map_err(sql_err)?;
+        let mut rows = stmt
+            .query_map(params![company.as_ref(), id], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        match rows.next() {
+            Some(row) => Ok(Some(serde_json::from_str(&row.map_err(sql_err)?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        artifact: &crate::ports::artifacts::ArtifactRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(artifact)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO artifacts (company_id, id, task_id, artifact_json, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id, id) DO UPDATE SET task_id = excluded.task_id, \
+             artifact_json = excluded.artifact_json, updated_ms = excluded.updated_ms",
+            params![
+                company.as_ref(),
+                artifact.id,
+                artifact.task_id,
+                json,
+                artifact.updated_at_millis as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM artifacts WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -1832,6 +1946,7 @@ mod test {
     #[tokio::test]
     async fn conformance_fact_store() {
         conformance::assert_fact_store(store()).await;
+        conformance::assert_artifact_store(store()).await;
     }
 
     #[tokio::test]

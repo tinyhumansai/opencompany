@@ -78,7 +78,8 @@ use crate::harness::policy::ApprovalPolicy;
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::types::{CompanyId, CompanyRecord, OverlayAgent, TurnStep};
 use crate::ports::{
-    CompanyStore, ContextStore, EventLog, FactStore, SecretStore, TaskStore, UsageMeter,
+    ArtifactStore, CompanyStore, ContextStore, EventLog, FactStore, SecretStore, TaskStore,
+    UsageMeter,
 };
 use crate::runtime::builder::agent_effective_grants;
 
@@ -112,6 +113,12 @@ pub struct HarnessDeps {
     ///
     /// [`TaskDispatched`]: crate::ports::types::CompanyEvent::TaskDispatched
     pub tasks: Option<Arc<dyn TaskStore>>,
+    /// The company's artifact store, so a dispatched card's output is recorded
+    /// as a versioned artifact (#187) instead of only as note text. `None`
+    /// leaves the board's behaviour exactly as before — the note is still
+    /// written either way, so an unwired artifact store loses nothing that
+    /// existed previously.
+    pub artifacts: Option<Arc<dyn ArtifactStore>>,
     /// The company's skill-delta store, so a built agent can see its effective
     /// skill set (company-dir skills ∪ operator deltas ∪ custom docs) as read
     /// tools + a prompt catalogue. `None` leaves the agent skill-less (the chat
@@ -1432,6 +1439,7 @@ description = "Builds the product."
                 workspace_root: dir.path().to_path_buf(),
                 model_override: None,
                 tasks: None,
+                artifacts: None,
                 skills: None,
                 skills_source_dir: None,
                 mcp_servers: Vec::new(),
@@ -1489,6 +1497,7 @@ description = "Builds the product."
             workspace_root: dir.path().to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: Some(source.path().to_path_buf()),
             mcp_servers: Vec::new(),
@@ -1771,6 +1780,7 @@ description = "Builds the product."
             workspace_root: dir.path().to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -1925,6 +1935,7 @@ description = "Builds the product."
             workspace_root: dir.path().to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -2231,6 +2242,7 @@ description = "Builds the product."
             workspace_root: dir.path().to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -2379,6 +2391,7 @@ description = "Sets direction."
             workspace_root: dir.path().to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),

@@ -167,6 +167,12 @@ impl Bundle {
         self.dir.join("facts.jsonl")
     }
 
+    /// Path to the versioned task-artifact log (`artifacts.jsonl`, one artifact
+    /// per line with its full version history; last-write-wins per id).
+    pub fn artifacts_jsonl(&self) -> PathBuf {
+        self.dir.join("artifacts.jsonl")
+    }
+
     /// Path to the human user directory (`users.json`, the full set as a JSON
     /// array).
     pub fn users_json(&self) -> PathBuf {

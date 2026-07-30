@@ -31,6 +31,7 @@ use crate::harness::{HarnessDeps, HarnessPool};
 /// appended; past this cap the run is finalized to `in_review` so a redirect
 /// storm can't loop forever.
 const MAX_REDIRECTS_PER_DISPATCH: u32 = 3;
+use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord};
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
@@ -118,8 +119,10 @@ impl HarnessBrain {
         let base_instruction = task_instruction(&card);
         let mut instruction = base_instruction.clone();
         let mut redirects: u32 = 0;
-
-        loop {
+        // The loop yields the run's operator-facing result on whichever path
+        // ends it, so the artifact (#187) records exactly the text the note
+        // does rather than a second, divergent rendering of the same run.
+        let result_text = loop {
             let outcome = self
                 .pool
                 // A dispatched task card carries no chat bubble (its steps are
@@ -140,34 +143,28 @@ impl HarnessBrain {
                     // A dispatched task discards its steps — the note is text-only.
                     match outcome {
                         Ok(outcome) => {
-                            card.note = Some(append_result(
-                                card.note.as_deref(),
-                                &responder,
-                                &outcome.reply,
-                            ));
+                            let result = outcome.reply;
+                            card.note =
+                                Some(append_result(card.note.as_deref(), &responder, &result));
                             card.column = "in_review".to_string();
+                            break result;
                         }
                         Err(err) => {
-                            card.note = Some(append_result(
-                                card.note.as_deref(),
-                                &responder,
-                                &format!("dispatch failed: {err}"),
-                            ));
+                            let result = format!("dispatch failed: {err}");
+                            card.note =
+                                Some(append_result(card.note.as_deref(), &responder, &result));
                             card.column = "backlog".to_string();
+                            break result;
                         }
                     }
-                    break;
                 }
                 Some(SteerAction::Cancel) => {
                     // Partial work is DISCARDED — only a cancellation note lands,
                     // and the card returns to `backlog`.
-                    card.note = Some(append_result(
-                        card.note.as_deref(),
-                        "operator",
-                        "cancelled while in flight",
-                    ));
+                    let result = "cancelled while in flight".to_string();
+                    card.note = Some(append_result(card.note.as_deref(), "operator", &result));
                     card.column = "backlog".to_string();
-                    break;
+                    break result;
                 }
                 Some(SteerAction::Pause) => {
                     // Partial work is PRESERVED in the note; the card parks in the
@@ -180,7 +177,7 @@ impl HarnessBrain {
                     };
                     card.note = Some(append_result(card.note.as_deref(), &responder, &partial));
                     card.column = "paused".to_string();
-                    break;
+                    break partial;
                 }
                 Some(SteerAction::Redirect { instruction: fresh }) => {
                     redirects += 1;
@@ -198,7 +195,7 @@ impl HarnessBrain {
                         };
                         card.note = Some(append_result(card.note.as_deref(), &responder, &last));
                         card.column = "in_review".to_string();
-                        break;
+                        break last;
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
                     // operator instruction.
@@ -209,12 +206,26 @@ impl HarnessBrain {
                     continue;
                 }
             }
-        }
+        };
 
         card.updated_at_millis = now_millis();
         tasks.upsert(&self.record.id, &card).await?;
         // `guard` drops here → the run leaves the in-flight strip.
         drop(guard);
+
+        // Issue #187: record the run's output as a versioned artifact so the
+        // Task Detail Artifacts tab has something behind it, and so a later
+        // operator edit can be diffed against what the agent actually wrote.
+        //
+        // Only a card that landed in `in_review` produces one: that is the
+        // state meaning "the agent produced something reviewable". A failure,
+        // a cancellation, or a pause writes its line to the note as before but
+        // is NOT an artifact — versioning `dispatch failed: …` strings would
+        // bury the real drafts and make the churn metric meaningless.
+        if card.column == "in_review" {
+            self.record_task_artifact(&card, &responder, &result_text)
+                .await?;
+        }
 
         // Issue #151 §3.2: answer in the conversation the card was spawned
         // from. Only a card that remembers an origin posts back — one created
@@ -234,6 +245,51 @@ impl HarnessBrain {
             reply_to: Some(crate::ports::types::ReplyTo { chat_id: origin }),
             steps: Vec::new(),
         }))
+    }
+
+    /// Records a completed dispatch's output as a versioned artifact (#187).
+    ///
+    /// A task that is dispatched, reviewed, and dispatched again is the same
+    /// deliverable evolving — so the second run appends a **version** to the
+    /// existing artifact rather than opening a second one. The artifact to
+    /// extend is the most recently updated one already attached to this card;
+    /// only the first run creates.
+    ///
+    /// A missing artifact store is a silent no-op, exactly like a missing task
+    /// store: the note is still written, so the board behaves as it did before
+    /// this issue.
+    async fn record_task_artifact(
+        &self,
+        card: &TaskRecord,
+        responder: &str,
+        body: &str,
+    ) -> Result<()> {
+        let Some(artifacts) = self.deps.artifacts.as_ref() else {
+            return Ok(());
+        };
+        let existing = artifacts
+            .list(&self.record.id, Some(&card.id))
+            .await?
+            .into_iter()
+            .max_by_key(|a| a.updated_at_millis);
+        let at = now_millis();
+        let record = match existing {
+            Some(mut found) => {
+                found.push_version(body, ArtifactAuthor::Agent, responder, at, None);
+                found
+            }
+            None => ArtifactRecord::new(
+                generate_id(),
+                &card.id,
+                &card.title,
+                ArtifactKind::Text,
+                body,
+                responder,
+                at,
+            ),
+        };
+        artifacts.upsert(&self.record.id, &record).await?;
+        Ok(())
     }
 
     /// Resolves which roster agent runs a task: its `assignee` when that names a
@@ -629,6 +685,7 @@ description = "Runs Acme."
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -772,6 +829,7 @@ description = "Builds it."
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: Some(tasks.clone()),
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -1085,6 +1143,7 @@ members = ["engineer"]
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: Some(tasks.clone()),
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -1444,6 +1503,7 @@ members = ["eng1", "eng2"]
             workspace_root: dir.path().to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -1584,6 +1644,7 @@ members = ["eng1", "eng2"]
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: Some(tasks.clone()),
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),

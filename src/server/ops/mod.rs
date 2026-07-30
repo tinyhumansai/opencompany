@@ -15,6 +15,7 @@
 //! mocks in tests, real impls when a feature is on); the OAuth write routes are
 //! compiled only under the `oauth` feature and 404 otherwise.
 
+pub mod artifacts;
 pub mod capabilities;
 pub mod channels;
 pub mod composio;
@@ -151,6 +152,7 @@ pub fn router() -> Router<AppState> {
         .merge(smtp::router())
         .merge(inbox::router())
         .merge(tasks::router())
+        .merge(artifacts::router())
         .merge(memory::router())
         .merge(workspace::router())
         .merge(skills::router())

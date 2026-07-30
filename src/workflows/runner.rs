@@ -228,6 +228,7 @@ description = "Runs Acme."
             workspace_root: dir.to_path_buf(),
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),

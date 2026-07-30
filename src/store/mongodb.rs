@@ -1294,6 +1294,85 @@ impl crate::ports::facts::FactStore for MongoStore {
 }
 
 // ---------------------------------------------------------------------------
+// ArtifactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::artifacts::ArtifactStore for MongoStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        task_id: Option<&str>,
+    ) -> Result<Vec<crate::ports::artifacts::ArtifactRecord>> {
+        // `task_id` narrows the query itself rather than filtering after the
+        // fetch, so one task's Artifacts tab does not pull the whole company.
+        let mut filter = doc! {"company_id": company.as_ref()};
+        if let Some(task_id) = task_id {
+            filter.insert("task_id", task_id);
+        }
+        let mut cursor = self
+            .collection("artifacts")
+            .find(filter)
+            .sort(doc! {"updated_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out: Vec<crate::ports::artifacts::ArtifactRecord> = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "artifact_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn get(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::artifacts::ArtifactRecord>> {
+        let found = self
+            .collection("artifacts")
+            .find_one(doc! {"company_id": company.as_ref(), "artifact_id": id})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(
+                &doc,
+                "artifact_json",
+            )?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        artifact: &crate::ports::artifacts::ArtifactRecord,
+    ) -> Result<()> {
+        self.collection("artifacts")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "artifact_id": &artifact.id},
+                doc! {"$set": {
+                    "task_id": &artifact.task_id,
+                    "artifact_json": serde_json::to_string(artifact)?,
+                    "updated_ms": artifact.updated_at_millis as i64,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("artifacts")
+            .delete_one(doc! {"company_id": company.as_ref(), "artifact_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -1787,6 +1866,7 @@ mod test {
     async fn conformance_fact_store() {
         let Some(s) = store().await else { return };
         conformance::assert_fact_store(s.clone()).await;
+        conformance::assert_artifact_store(s.clone()).await;
         drop_db(&s).await;
     }
 
