@@ -18,8 +18,15 @@ import { expect, test } from "@playwright/test";
  * Runs against the same live host as `wiring.spec.ts` (see that file's header).
  */
 
-/** Senders the deleted client-side fixture used to invent for every teammate. */
-const FIXTURE_SENDERS = ["Priya Sharma", "Weekly Digest", "Re: Spring campaign timeline"];
+/** All four senders the deleted fixture invented for every teammate. */
+const FIXTURE_SENDERS = ["Priya Sharma", "Stripe", "Weekly Digest", "Figma"];
+
+/**
+ * A subject line only the fixture ever produced. Asserted alongside the senders
+ * so a partial reintroduction — fixture bodies restored under other names —
+ * cannot slip through either.
+ */
+const FIXTURE_SUBJECTS = ["Re: Spring campaign timeline"];
 
 test("Inbox reads the host's per-agent store, not a seeded fixture", async ({ page }) => {
   // Switch on the first teammate's inbox from the Team page. The toggle writes
@@ -44,7 +51,7 @@ test("Inbox reads the host's per-agent store, not a seeded fixture", async ({ pa
   // mail this is the empty state — what matters is that it is never the fixture.
   await page.goto("/#/inbox");
   await expect(page.getByTestId("inbox-select")).toBeVisible({ timeout: 30_000 });
-  for (const sender of FIXTURE_SENDERS) {
-    await expect(page.getByText(sender, { exact: false })).toHaveCount(0);
+  for (const invented of [...FIXTURE_SENDERS, ...FIXTURE_SUBJECTS]) {
+    await expect(page.getByText(invented, { exact: false })).toHaveCount(0);
   }
 });
