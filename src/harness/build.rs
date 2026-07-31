@@ -684,6 +684,7 @@ mod tests {
             workspace_root,
             model_override: None,
             tasks: None,
+            artifacts: None,
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),

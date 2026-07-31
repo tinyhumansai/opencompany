@@ -321,6 +321,43 @@ pub trait TaskStore: Send + Sync {
 `TaskRecord` carries `{id, title, note, column, priority, assignee,
 updated_at}`. `column` ∈ `backlog|in_progress|in_review|done`.
 
+### ArtifactStore
+
+Versioned task outputs and the human-edit diff (`src/ports/artifacts.rs`,
+issue #187) — what the Task Detail **Artifacts** tab renders.
+
+```rust
+pub trait ArtifactStore: Send + Sync {
+    async fn list(&self, company: &CompanyId, task_id: Option<&str>)
+        -> Result<Vec<ArtifactRecord>>;
+    async fn get(&self, company: &CompanyId, id: &str) -> Result<Option<ArtifactRecord>>;
+    async fn upsert(&self, company: &CompanyId, artifact: &ArtifactRecord) -> Result<()>;
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
+}
+```
+
+`ArtifactRecord` carries `{id, task_id, title, kind, versions, created_at,
+updated_at}`; `ArtifactKind` ∈ `text|markdown|image|file`. Each
+`ArtifactVersion` carries `{version, body, author, author_id, created_at,
+step_seq?, note?}`; `ArtifactAuthor` ∈ `agent|operator`.
+
+**Versions are append-only.** An operator's pre-approval edit is recorded as a
+*new version by a different author*, never as a mutation of the agent's — which
+is what makes `human_edit_diff()` ("the agent wrote X, the operator shipped Y")
+answerable at any later point, and why no route rewrites a stored version.
+Editing in place would destroy the single highest-signal quality datum the
+product can produce: sustained high `churn` on an agent's artifacts means its
+instructions need work.
+
+Independent of the per-task timeline (#185). A version may cross-reference the
+step that produced it via the optional `step_seq`, but this port never reads the
+event journal, so an artifact stands on its own.
+
+Backends must uphold `store::conformance::assert_artifact_store`, which asserts
+the full ordered version history survives a round-trip — a backend that stored
+only the latest body would otherwise pass a naive check while silently
+destroying the diff.
+
 ### WorkspaceStore
 
 The Obsidian-style note tree (`src/ports/workspace.rs`), seeded from the

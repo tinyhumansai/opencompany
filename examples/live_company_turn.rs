@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_servers: Vec::new(),
         facts: None,
         events: None,
+        artifacts: None,
         delegations: opencompany::harness::orchestrator::DelegationQueue::default(),
         workflow_runner: opencompany::harness::orchestrator::WorkflowRunnerHandle::default(),
         mcp_failures: opencompany::harness::mcp_probe::McpFailureQueue::default(),

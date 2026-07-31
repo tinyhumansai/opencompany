@@ -17,6 +17,7 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::error::OpenCompanyError;
+use crate::ports::artifacts::ArtifactStore;
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
@@ -131,6 +132,7 @@ pub struct StorageHandles {
     pub tasks: Arc<dyn TaskStore>,
     pub workspace: Arc<dyn WorkspaceStore>,
     pub facts: Arc<dyn FactStore>,
+    pub artifacts: Arc<dyn ArtifactStore>,
     pub usage: Arc<dyn UsageMeter>,
     pub skills: Arc<dyn SkillStateStore>,
     pub users: Arc<dyn UserStore>,
@@ -259,6 +261,7 @@ fn open_sqlite(data_dir: &Path) -> Result<Option<StorageHandles>> {
         tasks: store.clone(),
         workspace: store.clone(),
         facts: store.clone(),
+        artifacts: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
         users: store.clone(),
@@ -294,6 +297,7 @@ async fn open_mongodb(settings: &StorageSettings) -> Result<Option<StorageHandle
         tasks: store.clone(),
         workspace: store.clone(),
         facts: store.clone(),
+        artifacts: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
         users: store.clone(),

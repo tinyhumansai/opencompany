@@ -2110,6 +2110,90 @@ async fn telegram_token_never_leaks_even_when_delivery_fails() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
+/// #187: the Artifacts tab's full loop — an agent draft, a human edit appended
+/// as a new version, and the diff between them.
+///
+/// The point of the port is that the operator's edit does **not** overwrite the
+/// agent's text, so this asserts v1 survives verbatim after the edit. A store
+/// that mutated in place would still serve a plausible-looking artifact while
+/// having destroyed the one datum the epic wants.
+#[tokio::test]
+async fn artifact_versions_capture_the_human_edit_and_diff() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    // The agent's draft.
+    let (status, created) = send(
+        &state,
+        "POST",
+        "/api/v1/company/artifacts",
+        Some(json!({
+            "taskId": "t-1",
+            "title": "Launch post",
+            "kind": "markdown",
+            "body": "alpha\nbeta\ngamma",
+            "authorId": "ceo"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["versions"].as_array().unwrap().len(), 1);
+    // No human has touched it, so no diff is offered.
+    assert!(created.get("humanEditDiff").is_none());
+
+    // The operator edits one line before approving.
+    let (status, edited) = send(
+        &state,
+        "POST",
+        &format!("/api/v1/company/artifacts/{id}/versions"),
+        Some(json!({ "body": "alpha\nBETA\ngamma" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let versions = edited["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    // v1 is untouched — the whole reason versions are append-only.
+    assert_eq!(versions[0]["body"], "alpha\nbeta\ngamma");
+    assert_eq!(versions[0]["author"], "agent");
+    assert_eq!(versions[1]["author"], "operator");
+    assert_eq!(versions[1]["note"], "operator edit before approval");
+
+    // The derived diff rides along, so the tab needs one call.
+    let diff = &edited["humanEditDiff"];
+    assert_eq!(diff["fromVersion"], 1);
+    assert_eq!(diff["toVersion"], 2);
+    assert_eq!(diff["added"], 1);
+    assert_eq!(diff["removed"], 1);
+
+    // …and is also addressable on its own.
+    let (status, standalone) = send(
+        &state,
+        "GET",
+        &format!("/api/v1/company/artifacts/{id}/diff"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(standalone["toVersion"], 2);
+
+    // Listing by task returns it; an unrelated task sees nothing.
+    let (status, listed) = send(&state, "GET", "/api/v1/company/tasks/t-1/artifacts", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let (_, empty) = send(
+        &state,
+        "GET",
+        "/api/v1/company/tasks/t-other/artifacts",
+        None,
+    )
+    .await;
+    assert_eq!(empty.as_array().unwrap().len(), 0);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
 /// #185: `GET …/tasks/{id}` assembles the header, the per-task timeline, and
 /// the lineage in one read.
 ///
@@ -2211,6 +2295,69 @@ async fn task_detail_assembles_timeline_and_lineage() {
 
     // An unknown id 404s, matching PATCH/DELETE.
     let (status, _) = send(&state, "GET", "/api/v1/company/tasks/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// #187: the diff route's argument contract, and the 404s.
+#[tokio::test]
+async fn artifact_diff_rejects_a_half_specified_range() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    let (_, created) = send(
+        &state,
+        "POST",
+        "/api/v1/company/artifacts",
+        Some(json!({ "taskId": "t-1", "title": "Draft", "body": "one" })),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // Neither bound, and no operator edit yet → nothing to diff, stated plainly
+    // rather than silently returning an empty diff.
+    let (status, _) = send(
+        &state,
+        "GET",
+        &format!("/api/v1/company/artifacts/{id}/diff"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Half a range is a 400, not a guess about the other end.
+    let (status, _) = send(
+        &state,
+        "GET",
+        &format!("/api/v1/company/artifacts/{id}/diff?from=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A version that does not exist names itself.
+    let (status, _) = send(
+        &state,
+        "GET",
+        &format!("/api/v1/company/artifacts/{id}/diff?from=1&to=9"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown artifact ids 404 on every handler that takes one.
+    let (status, _) = send(&state, "GET", "/api/v1/company/artifacts/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/artifacts/nope/versions",
+        Some(json!({ "body": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&state, "DELETE", "/api/v1/company/artifacts/nope", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     tokio::fs::remove_dir_all(&home).await.ok();

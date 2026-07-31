@@ -24,9 +24,9 @@ use crate::policy::ManifestApprovalGate;
 use crate::ports::now_millis;
 use crate::ports::types::{Actor, ApprovalId, CompanyEvent, CompanyId, Verdict};
 use crate::ports::{
-    AgentEconomy, ApprovalGate, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore,
-    TaskRecord, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
+    AgentEconomy, ApprovalGate, ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore,
+    EventLog, FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore,
+    SkillStateStore, TaskRecord, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 
 /// The board column a task must enter to be dispatched to its assignee.
@@ -54,6 +54,8 @@ pub struct OpsStores {
     pub workspace: Arc<dyn WorkspaceStore>,
     /// The durable memory-facts view.
     pub facts: Arc<dyn FactStore>,
+    /// Versioned task artifacts and their human-edit history (#187).
+    pub artifacts: Arc<dyn ArtifactStore>,
     /// The usage meter (written by the WS4 cost hook, read by WS5).
     pub usage: Arc<dyn UsageMeter>,
     /// Operator deltas over the company's skills.
@@ -390,6 +392,11 @@ impl CompanyRuntime {
     /// This company's durable memory-facts view.
     pub fn facts(&self) -> &Arc<dyn FactStore> {
         &self.ops.facts
+    }
+
+    /// This company's versioned task artifacts (#187).
+    pub fn artifacts(&self) -> &Arc<dyn ArtifactStore> {
+        &self.ops.artifacts
     }
 
     /// This company's usage meter (written by the cost hook, read by WS5).

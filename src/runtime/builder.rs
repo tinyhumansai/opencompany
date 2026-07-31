@@ -38,9 +38,9 @@ use crate::policy::ManifestApprovalGate;
 use crate::ports::WorkflowRunner;
 use crate::ports::types::{CompanyId, CompanyRecord, SecretValue, TemplateProvenance};
 use crate::ports::{
-    AgentEconomy, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
-    InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore, TaskStore,
-    ToolProvider, UsageMeter, UserStore, WorkspaceStore,
+    AgentEconomy, ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
+    FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore,
+    TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
 use crate::runtime::journal::RuntimeJournal;
@@ -167,6 +167,7 @@ pub struct RuntimeBuilder {
     tasks: Option<Arc<dyn TaskStore>>,
     workspace: Option<Arc<dyn WorkspaceStore>>,
     facts: Option<Arc<dyn FactStore>>,
+    artifacts: Option<Arc<dyn ArtifactStore>>,
     usage: Option<Arc<dyn UsageMeter>>,
     skills: Option<Arc<dyn SkillStateStore>>,
     users: Option<Arc<dyn UserStore>>,
@@ -237,6 +238,7 @@ impl RuntimeBuilder {
             tasks: None,
             workspace: None,
             facts: None,
+            artifacts: None,
             usage: None,
             skills: None,
             users: None,
@@ -338,6 +340,7 @@ impl RuntimeBuilder {
         self.tasks = Some(handles.tasks.clone());
         self.workspace = Some(handles.workspace.clone());
         self.facts = Some(handles.facts.clone());
+        self.artifacts = Some(handles.artifacts.clone());
         self.usage = Some(handles.usage.clone());
         self.skills = Some(handles.skills.clone());
         self.users = Some(handles.users.clone());
@@ -395,6 +398,12 @@ impl RuntimeBuilder {
     /// Swaps the facts store (default: fs-backed).
     pub fn with_facts(mut self, facts: Arc<dyn FactStore>) -> Self {
         self.facts = Some(facts);
+        self
+    }
+
+    /// Swaps the artifact store (default: fs-backed).
+    pub fn with_artifacts(mut self, artifacts: Arc<dyn ArtifactStore>) -> Self {
+        self.artifacts = Some(artifacts);
         self
     }
 
@@ -632,6 +641,7 @@ impl RuntimeBuilder {
             tasks: self.tasks.unwrap_or_else(|| fs_ops.clone()),
             workspace: self.workspace.unwrap_or_else(|| fs_ops.clone()),
             facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
+            artifacts: self.artifacts.unwrap_or_else(|| fs_ops.clone()),
             usage: self.usage.unwrap_or_else(|| fs_ops.clone()),
             skills: self.skills.unwrap_or_else(|| fs_ops.clone()),
             users: self.users.unwrap_or_else(|| fs_ops.clone()),
@@ -930,6 +940,7 @@ impl RuntimeBuilder {
                                 workspace_root: home.join("harness"),
                                 model_override,
                                 tasks: Some(ops.tasks.clone()),
+                                artifacts: Some(ops.artifacts.clone()),
                                 // Skill read surface (#28): the operator delta
                                 // store + the company source dir (`companies/<name>`,
                                 // held as `seed_dir`) whose `skills/` subtree
