@@ -162,6 +162,124 @@ async fn tasks_crud_round_trips_under_both_scopes() {
     tokio::fs::remove_dir_all(&home).await.ok();
 }
 
+/// #205: a card may only be assigned to somebody the company actually has.
+/// Before this the board's free-text Assignee field accepted anything, the bad
+/// value was persisted verbatim, and dispatch silently handed the work to the
+/// orchestrator instead.
+#[tokio::test]
+async fn task_writes_reject_an_off_roster_assignee() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Fetch my activity", "assignee": "Shane"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("Shane"),
+        "the refusal must name what was typed: {body}"
+    );
+
+    // A roster teammate is fine, matched case-insensitively…
+    let (status, task) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Q2 brief", "assignee": "CEO"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let id = task["id"].as_str().unwrap().to_string();
+
+    // …and so is blank — an unassigned card is not an error.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Unowned"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The same rule on PATCH, and the rejected patch leaves the card untouched.
+    let (status, _) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/tasks/{id}"),
+        Some(json!({"title": "Renamed", "assignee": "Shane"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    let card = board
+        .as_array()
+        .expect("board")
+        .iter()
+        .find(|c| c["id"] == json!(id))
+        .expect("the card survives a rejected patch")
+        .clone();
+    assert_eq!(
+        card["assignee"], "ceo",
+        "the typed key is stored as the canonical roster id"
+    );
+    assert_eq!(
+        card["title"], "Q2 brief",
+        "a rejected patch must not persist the fields it did apply"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// #205: a column the board does not render is refused too. A typo'd
+/// `in-progress` used to be persisted verbatim, hiding the card from every
+/// rendered column *and* — since only the exact literal `in_progress`
+/// edge-fires a dispatch — silently never running it.
+#[tokio::test]
+async fn task_writes_reject_a_column_the_board_cannot_render() {
+    let home = home();
+    let state = state_with_company(&home).await;
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Typo'd", "column": "in-progress"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("in_progress"),
+        "the refusal must list the columns that do exist: {body}"
+    );
+
+    let (status, task) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Fine", "column": "paused"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let id = task["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/tasks/{id}"),
+        Some(json!({"column": "reviewing"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    assert_eq!(board.as_array().expect("board")[0]["column"], "paused");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
 #[tokio::test]
 async fn steer_task_validates_statuses_and_journals_acceptance() {
     let home = home();

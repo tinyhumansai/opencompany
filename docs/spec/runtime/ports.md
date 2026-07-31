@@ -330,7 +330,21 @@ pub trait TaskStore: Send + Sync {
 ```
 
 `TaskRecord` carries `{id, title, note, column, priority, assignee,
-updated_at}`. `column` ∈ `backlog|in_progress|in_review|done`.
+updated_at}`.
+
+`column` ∈ `backlog|in_progress|paused|in_review|done` — the `BOARD_COLUMNS`
+constant in `src/ports/tasks.rs`, which is the one authority the REST write
+boundary, the dispatch edge and the harness lifecycle seam all read. (`paused`
+arrived with steering, issue #111; this line used to omit it.) Entering
+`in_progress` is what dispatches the card; nothing dispatches out of `done`.
+
+`assignee` names a **roster teammate id, a desk, or nobody** (`""`), resolved by
+`crate::runtime::assignee` against the full roster — manifest agents, operator
+overlay teammates, and desks (by id or case-insensitive name). The write plane
+rejects anything else with a `400` and stores the canonical key rather than what
+was typed; dispatch refuses a card whose assignee no longer resolves, returning
+it to `backlog` with the reason on the note, and writes the agent that actually
+worked the card back onto `assignee` so the board names the doer (issue #205).
 
 ### ArtifactStore
 

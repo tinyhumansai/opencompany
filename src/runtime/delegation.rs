@@ -30,6 +30,7 @@ use crate::harness::lifecycle;
 use crate::harness::orchestrator::{self, Delegation, DelegationQueue};
 use crate::ports::types::{CompanyId, CompanyRecord, OutboundMessage, TurnStep};
 use crate::ports::{TaskRecord, TaskStore, generate_id, now_millis};
+use crate::runtime::assignee;
 
 /// One agent turn, abstracted so delegation orchestration never touches the
 /// harness-specific [`HarnessDeps`](crate::harness::HarnessDeps).
@@ -356,14 +357,34 @@ impl<'a> DelegationRunner<'a> {
                 let Some((tasks, mut card)) = self.load_card(&task_id).await? else {
                     return Ok(DelegationOutcome::default());
                 };
-                card.assignee = assignee.clone();
+                // Issue #205: the orchestrator writes this `assignee` out of an
+                // LLM tool call, so it is exactly as capable of naming somebody
+                // who does not exist as the operator's free-text field is. Held
+                // to the same contract: an unresolvable name is not written to
+                // the card at all — leaving the previous owner in place — and
+                // the refusal is recorded in the orchestrator's own voice, so
+                // the board neither shows a phantom owner nor loses the fact
+                // that an assignment was attempted.
+                let resolved = assignee::resolve(self.record, &assignee);
+                let entry = match resolved.canonical() {
+                    Some(canonical) => {
+                        card.assignee = canonical.to_string();
+                        match note {
+                            Some(note) => format!("assigned to {assignee} — {note}"),
+                            None => format!("assigned to {assignee}"),
+                        }
+                    }
+                    None => format!(
+                        "could not assign to {assignee}: {}",
+                        resolved
+                            .rejection()
+                            .unwrap_or_else(|| "not on the roster".to_string())
+                    ),
+                };
                 card.note = Some(append_note(
                     card.note.as_deref(),
                     &self.orchestrator_id(),
-                    &match note {
-                        Some(note) => format!("assigned to {assignee} — {note}"),
-                        None => format!("assigned to {assignee}"),
-                    },
+                    &entry,
                 ));
                 // The column is untouched on purpose: dispatch fires from
                 // `CompanyRuntime::upsert_task`, which this port cannot reach.

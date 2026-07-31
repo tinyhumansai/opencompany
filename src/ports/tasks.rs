@@ -12,6 +12,49 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::ports::types::CompanyId;
 
+// ---------------------------------------------------------------------------
+// The board's column vocabulary (issue #205)
+// ---------------------------------------------------------------------------
+//
+// Transcribed once here — the port every writer already depends on — rather
+// than in the harness lifecycle seam, which is `#[cfg(feature = "openhuman")]`
+// and therefore invisible to the REST write boundary and to the default build.
+// `crate::harness::lifecycle` re-exports these so its `COLUMN_*` paths are
+// unchanged, and `CompanyRuntime`'s dispatch edge reads `COLUMN_IN_PROGRESS`
+// from here, so each literal exists in exactly one place.
+
+/// Where new work waits, and where a failed, cancelled or revised run returns.
+pub const COLUMN_BACKLOG: &str = "backlog";
+/// The dispatch column: entering it hands the card to its assignee.
+pub const COLUMN_IN_PROGRESS: &str = "in_progress";
+/// Where a steered-to-pause run parks. Resume is a `column → in_progress` PATCH.
+pub const COLUMN_PAUSED: &str = "paused";
+/// Where a finished board-created card waits for its operator reviewer.
+pub const COLUMN_IN_REVIEW: &str = "in_review";
+/// The terminal column — nothing dispatches out of it.
+pub const COLUMN_DONE: &str = "done";
+
+/// Every column the board renders, in board order — the host's half of the
+/// console's `TASK_COLUMNS` (`frontend/src/lib/tasks-sample.ts`).
+///
+/// A card's `column` is a plain string on the wire, so before #205 a typo'd or
+/// invented column was persisted verbatim and then simply never rendered: the
+/// card vanished from the board with no error, and — since only the exact
+/// literal `in_progress` edge-fires a dispatch — a typo'd `in-progress` also
+/// silently never ran. This list is what the write boundary checks against.
+pub const BOARD_COLUMNS: [&str; 5] = [
+    COLUMN_BACKLOG,
+    COLUMN_IN_PROGRESS,
+    COLUMN_PAUSED,
+    COLUMN_IN_REVIEW,
+    COLUMN_DONE,
+];
+
+/// Whether `column` names a column the board actually renders.
+pub fn is_board_column(column: &str) -> bool {
+    BOARD_COLUMNS.contains(&column)
+}
+
 /// One card on the company's task board.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

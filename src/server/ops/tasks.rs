@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::steer::{InflightEntry, SteerAction, SteerError, cap_redirect};
 use crate::error::OpenCompanyError;
-use crate::ports::tasks::TaskRecord;
+use crate::ports::tasks::{BOARD_COLUMNS, COLUMN_BACKLOG, TaskRecord, is_board_column};
 use crate::ports::types::CompanyEvent;
 use crate::ports::{generate_id, now_millis};
+use crate::runtime::assignee;
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
 
@@ -190,6 +191,56 @@ fn validate_parent(
     Ok(())
 }
 
+/// Rejects a `column` the board does not render (issue #205).
+///
+/// `column` is a free string on the wire, and nothing checked it: a typo'd
+/// `"in-progress"` was persisted verbatim, so the card disappeared from every
+/// rendered column *and* — since only the exact literal `in_progress`
+/// edge-fires a dispatch — silently never ran. Refusing at the write boundary
+/// is the cheap place to keep the board's five columns the only five.
+fn validate_column(column: &str) -> Result<(), ApiError> {
+    if is_board_column(column) {
+        return Ok(());
+    }
+    Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+        "\"{column}\" is not a board column — use one of: {}",
+        BOARD_COLUMNS.join(", ")
+    ))))
+}
+
+/// Resolves an `assignee` against the company roster, returning the canonical
+/// id to store — and rejecting one that names nobody (issue #205).
+///
+/// The board's Assignee field is free text, so "Shane" — a name this company
+/// has never had — used to be persisted verbatim and then silently dispatched
+/// to the orchestrator. A teammate id, a desk (by id or name), and blank are
+/// all accepted; a desk with no members yet is accepted too, because assigning
+/// work to a desk you are about to staff is legitimate (dispatch is where that
+/// one is refused, and it says why).
+///
+/// What is stored is the **canonical** key rather than what was typed, so the
+/// board's assignee column is one namespace of real ids and every downstream
+/// reader matches on the same string.
+///
+/// A company whose record has not been persisted yet has no roster to check
+/// against, so the value passes through unvalidated rather than being guessed
+/// at — the same permissive stance the rest of the write plane takes toward an
+/// unsaved record.
+async fn resolve_assignee(company: &ScopedCompany, assignee: String) -> Result<String, ApiError> {
+    let Some(record) = company.runtime.store().load(company.id()).await? else {
+        return Ok(assignee);
+    };
+    let resolution = assignee::resolve(&record, &assignee);
+    match resolution.canonical() {
+        Some(canonical) => Ok(canonical.to_string()),
+        None => Err(ApiError(OpenCompanyError::InvalidRequest(
+            resolution
+                .rejection()
+                .unwrap_or_else(|| format!("\"{assignee}\" is not on this company's roster")),
+        ))),
+    }
+}
+
 async fn create_task(
     company: ScopedCompany,
     Json(body): Json<CreateTask>,
@@ -204,13 +255,19 @@ async fn create_task(
         // `None` child: the card does not exist yet, so it cannot be in a cycle.
         validate_parent(parent, None, &board)?;
     }
+    // Issue #205: validated before anything is written, so a bad column or a
+    // bad assignee is a `400` the operator sees rather than a card that lands
+    // somewhere the board cannot render or hands work to a name nobody answers to.
+    let column = body.column.unwrap_or_else(|| COLUMN_BACKLOG.to_string());
+    validate_column(&column)?;
+    let assignee = resolve_assignee(&company, body.assignee.unwrap_or_default()).await?;
     let record = TaskRecord {
         id: generate_id(),
         title: body.title,
         note: body.note,
-        column: body.column.unwrap_or_else(|| "backlog".to_string()),
+        column,
         priority: body.priority.unwrap_or_else(|| "medium".to_string()),
-        assignee: body.assignee.unwrap_or_default(),
+        assignee,
         updated_at_millis: now_millis(),
         origin_chat_id: None,
         parent_task_id: body.parent_task_id,
@@ -244,14 +301,19 @@ async fn patch_task(
     if let Some(note) = body.note {
         record.note = Some(note);
     }
+    // Issue #205: a patch is validated on the same terms as a create. `record`
+    // is a local clone that is only upserted once every field has been applied,
+    // so returning the `400` from here discards the partial edit rather than
+    // persisting half of it.
     if let Some(column) = body.column {
+        validate_column(&column)?;
         record.column = column;
     }
     if let Some(priority) = body.priority {
         record.priority = priority;
     }
     if let Some(assignee) = body.assignee {
-        record.assignee = assignee;
+        record.assignee = resolve_assignee(&company, assignee).await?;
     }
     if let Some(parent_task_id) = body.parent_task_id {
         validate_parent(&parent_task_id, Some(&task_id), &board)?;

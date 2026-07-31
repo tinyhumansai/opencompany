@@ -32,6 +32,7 @@ use crate::harness::orchestrator;
 use crate::harness::orchestrator::Delegation;
 use crate::harness::run_turn::HarnessRunTurn;
 use crate::harness::{HarnessDeps, HarnessPool};
+use crate::runtime::assignee;
 use crate::runtime::delegation::{self, DelegationRunner, RunTurn};
 
 /// The most operator redirects honored within a single task dispatch (issue
@@ -106,7 +107,45 @@ impl HarnessBrain {
             return Ok(None);
         };
 
-        let responder = self.task_responder(&card.assignee);
+        // Issue #205: who works this card, resolved against the FULL roster —
+        // teammates, operator-overlay teammates and desks alike.
+        let resolution = assignee::resolve(&self.record, &card.assignee);
+        if let Some(reason) = resolution.rejection() {
+            // The card names somebody this company does not have. Before this
+            // it dispatched to the orchestrator anyway and the board kept the
+            // invalid name, so the only trace was a timeline that read "reply
+            // from ceo" on a card assigned to somebody else. Refuse instead: no
+            // turn is run (nothing was asked of the orchestrator), the card
+            // returns to `backlog` carrying the reason, and the operator is
+            // told — on the board, on the timeline, and in the thread the card
+            // came from.
+            tracing::warn!(
+                task_id = %card.id,
+                assignee = %card.assignee,
+                "[task] refusing dispatch: {reason}"
+            );
+            return self.refuse_dispatch(tasks, card, &reason).await;
+        }
+        // A blank assignee is the one legitimate miss: nobody was named, so the
+        // orchestrator picks it up.
+        let responder = resolution
+            .working_agent()
+            .unwrap_or(&self.responder)
+            .to_string();
+
+        // Link the working agent to the card, and persist it BEFORE the turn
+        // runs (#205). A card the CEO picked up used to keep `assignee = ""`
+        // for the whole run and forever after, so the board never named who was
+        // doing the work; a desk-assigned card never named the member that
+        // actually ran it. Writing it up front is what makes the board show the
+        // card "working" under a real agent while the turn is in flight — the
+        // store `upsert` here is the plain persistence path, not
+        // `CompanyRuntime::upsert_task`, so it cannot re-fire the dispatch edge.
+        if card.assignee != responder {
+            card.assignee = responder.clone();
+            card.updated_at_millis = now_millis();
+            tasks.upsert(&self.record.id, &card).await?;
+        }
 
         // Register the run so an operator can steer it mid-flight. The guard's
         // RAII `Drop` deregisters on every exit path (success, error, redirect
@@ -281,61 +320,8 @@ impl HarnessBrain {
             );
         }
 
-        if let Some(events) = self.deps.events.as_ref() {
-            // The run's reply, tagged so the per-task timeline can filter it out
-            // of the company-scoped journal.
-            //
-            // `chat_id` is the **card id**, deliberately, not the card's origin
-            // thread. `chat_history::owns` routes a reply into a desk's history
-            // by matching `chat_id` against the desk id/name, so using the
-            // origin here would inject this record into that desk's chat — a
-            // behaviour change well outside a read foundation, and a duplicate
-            // of the live post-back bubble below. A card id matches no desk, so
-            // the record stays exactly what it is: timeline material, reachable
-            // only through `task_id`. An empty string would be worse still — it
-            // folds into the General desk.
-            if let Err(err) = events
-                .append(
-                    &self.record.id,
-                    CompanyEvent::AgentReply {
-                        chat_id: card.id.clone(),
-                        agent_id: responder.clone(),
-                        text: result_text.clone(),
-                        steps: Vec::new(),
-                        task_id: Some(card.id.clone()),
-                    },
-                )
-                .await
-            {
-                tracing::warn!(
-                    task_id = %card.id,
-                    error = %err,
-                    "[task] failed to journal dispatch reply; continuing"
-                );
-            }
-            // The terminal anchor, journaled after the card's landing column is
-            // persisted so it always records a completed run. Attempted even if
-            // the reply above failed — the anchor is what closes a timeline, so
-            // dropping it is strictly worse than dropping the reply.
-            if let Err(err) = events
-                .append(
-                    &self.record.id,
-                    CompanyEvent::DeskTaskCompleted {
-                        task_id: card.id.clone(),
-                        desk: responder.clone(),
-                        output: result_text,
-                        column: card.column.clone(),
-                    },
-                )
-                .await
-            {
-                tracing::warn!(
-                    task_id = %card.id,
-                    error = %err,
-                    "[task] failed to journal task completion; continuing"
-                );
-            }
-        }
+        self.journal_task_outcome(&card, &responder, result_text)
+            .await;
 
         // Issue #151 §3.2: answer in the conversation the card was spawned
         // from. Only a card that remembers an origin posts back — one created
@@ -363,6 +349,114 @@ impl HarnessBrain {
             &self.orchestrator(),
             origin,
         )))
+    }
+
+    /// Ends a dispatch that never ran because its `assignee` names nobody this
+    /// company has (issue #205).
+    ///
+    /// Takes the same three exits a finished run does — the card is settled and
+    /// persisted, the outcome is journaled onto the task's timeline, and a card
+    /// that remembers an origin thread is answered there — so the refusal is
+    /// visible everywhere a result would have been, instead of being the silence
+    /// this issue is about. It deliberately skips the three things that belong
+    /// to a run that happened: no in-flight registration (nothing is in flight),
+    /// no MCP drain (no turn queued anything), and no artifact (`Failed` lands
+    /// in `backlog`, never a success terminal).
+    ///
+    /// Attributed to the **orchestrator**: it is the company answering for its
+    /// own roster, and the named assignee does not exist to speak.
+    async fn refuse_dispatch(
+        &self,
+        tasks: &Arc<dyn crate::ports::TaskStore>,
+        mut card: TaskRecord,
+        reason: &str,
+    ) -> Result<Option<OutboundMessage>> {
+        let orchestrator = self.orchestrator();
+        let text = format!("dispatch refused: {reason}");
+        settle(&mut card, TaskRunEnd::Failed, &orchestrator, &text);
+        card.updated_at_millis = now_millis();
+        tasks.upsert(&self.record.id, &card).await?;
+
+        self.journal_task_outcome(&card, &orchestrator, text).await;
+
+        let Some(origin) = card.origin_chat_id.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(lifecycle::relay_reply(
+            &card,
+            &orchestrator,
+            &orchestrator,
+            origin,
+        )))
+    }
+
+    /// Journals a finished dispatch onto its card's timeline (issue #185): the
+    /// run's reply, then the terminal anchor that closes the timeline.
+    ///
+    /// Every write is **best-effort** and the errors are logged, never
+    /// propagated. The card is already persisted by the time this runs, so
+    /// failing the cycle over a bookkeeping write would abandon the terminal
+    /// anchor *and* the #151 post-back for a dispatch that has in fact landed —
+    /// leaving a timeline stuck "still running" for a card the board already
+    /// shows in its terminal column. Matches the existing journal-after-persist
+    /// sites (`chat_and_emit`, `WorkflowCreated`, `TaskSteered`).
+    async fn journal_task_outcome(&self, card: &TaskRecord, responder: &str, result_text: String) {
+        let Some(events) = self.deps.events.as_ref() else {
+            return;
+        };
+        // The run's reply, tagged so the per-task timeline can filter it out of
+        // the company-scoped journal.
+        //
+        // `chat_id` is the **card id**, deliberately, not the card's origin
+        // thread. `chat_history::owns` routes a reply into a desk's history by
+        // matching `chat_id` against the desk id/name, so using the origin here
+        // would inject this record into that desk's chat — a behaviour change
+        // well outside a read foundation, and a duplicate of the live post-back
+        // bubble the caller returns. A card id matches no desk, so the record
+        // stays exactly what it is: timeline material, reachable only through
+        // `task_id`. An empty string would be worse still — it folds into the
+        // General desk.
+        if let Err(err) = events
+            .append(
+                &self.record.id,
+                CompanyEvent::AgentReply {
+                    chat_id: card.id.clone(),
+                    agent_id: responder.to_string(),
+                    text: result_text.clone(),
+                    steps: Vec::new(),
+                    task_id: Some(card.id.clone()),
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = %card.id,
+                error = %err,
+                "[task] failed to journal dispatch reply; continuing"
+            );
+        }
+        // The terminal anchor, journaled after the card's landing column is
+        // persisted so it always records a completed run. Attempted even if the
+        // reply above failed — the anchor is what closes a timeline, so dropping
+        // it is strictly worse than dropping the reply.
+        if let Err(err) = events
+            .append(
+                &self.record.id,
+                CompanyEvent::DeskTaskCompleted {
+                    task_id: card.id.clone(),
+                    desk: responder.to_string(),
+                    output: result_text,
+                    column: card.column.clone(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = %card.id,
+                error = %err,
+                "[task] failed to journal task completion; continuing"
+            );
+        }
     }
 
     /// The company orchestrator's agent id — the single voice that answers the
@@ -422,16 +516,6 @@ impl HarnessBrain {
         };
         artifacts.upsert(&self.record.id, &record).await?;
         Ok(())
-    }
-
-    /// Resolves which roster agent runs a task: its `assignee` when that names a
-    /// roster member, else the brain's default responder.
-    fn task_responder(&self, assignee: &str) -> String {
-        if !assignee.is_empty() && self.record.manifest.agents.iter().any(|a| a.id == assignee) {
-            assignee.to_string()
-        } else {
-            self.responder.clone()
-        }
     }
 
     /// Resolves which agent answers an operator message.
@@ -810,11 +894,12 @@ mod tests {
     use tinyagents::harness::message::Message;
     use tinyagents::harness::model::{ChatModel, ModelRequest, ModelResponse};
 
+    use crate::company::CompanyManifest;
     use crate::harness::provider::{HarnessModel, MockProvider};
     use crate::ports::brain::CycleHost;
     use crate::ports::types::{
-        ApprovalId, CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, ToolCall,
-        ToolResult,
+        ApprovalId, CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, OverlayAgent,
+        ToolCall, ToolResult,
     };
     use crate::store::{FsCompanyStore, FsContextStore, FsOps};
 
@@ -1089,6 +1174,31 @@ description = "Builds it."
         )
     }
 
+    /// As [`brain_with_tasks`], but the roster also carries an `eng` desk led by
+    /// the engineer — the shape `delegate_to_desk` writes into a card's
+    /// `assignee` (issue #205).
+    fn brain_with_desk_tasks(dir: &std::path::Path) -> (HarnessBrain, Arc<FsOps>) {
+        let (mut brain, tasks) = brain_with_tasks(dir);
+        brain.record.manifest.group_chats = toml::from_str::<CompanyManifest>(
+            r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+
+[[group_chat]]
+id = "eng"
+name = "Engineering desk"
+members = ["engineer"]
+"#,
+        )
+        .expect("valid manifest")
+        .group_chats;
+        (brain, tasks)
+    }
+
     /// As [`brain_with_tasks`], but with the artifact store wired to the same
     /// [`FsOps`] handle (it implements both), so a dispatch's versioned output
     /// is observable.
@@ -1158,7 +1268,10 @@ description = "Builds it."
     async fn a_card_with_no_origin_posts_back_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, tasks) = brain_with_tasks(dir.path());
-        let mut c = card("t-no-origin", "maya");
+        // A roster assignee: since #205 an off-roster one is refused outright,
+        // which would satisfy the no-post-back assertion below without ever
+        // running the dispatch this test is about.
+        let mut c = card("t-no-origin", "engineer");
         c.origin_chat_id = None;
         tasks
             .upsert(&CompanyId::new("acme"), &c)
@@ -1273,7 +1386,9 @@ description = "Builds it."
     async fn dispatched_card_with_an_origin_completes_to_done() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, tasks) = brain_with_tasks(dir.path());
-        let mut c = card("t-origin", "maya");
+        // A roster assignee: since #205 an off-roster one never runs a turn, so
+        // it would settle to `backlog` and prove nothing about the terminal.
+        let mut c = card("t-origin", "engineer");
         c.origin_chat_id = Some("strategy".to_string());
         tasks
             .upsert(&CompanyId::new("acme"), &c)
@@ -1474,13 +1589,130 @@ description = "Builds it."
         assert!(note.contains("[engineer]"), "{note:?}");
     }
 
-    /// An assignee that is not on the roster falls back to the default responder.
+    // ── Issue #205: the working agent is linked, and a bad assignee is refused ──
+
+    /// The reported bug. A card assigned to "Shane" — nobody this company has —
+    /// used to dispatch to the orchestrator anyway, keeping `assignee = "Shane"`
+    /// while the timeline read "reply from ceo" and nothing said the name was
+    /// invalid. It must now be **refused**: the card goes back to `backlog`
+    /// carrying the reason, and the orchestrator runs no turn on its behalf.
     #[tokio::test]
-    async fn task_dispatch_unknown_assignee_falls_back() {
+    async fn task_dispatch_off_roster_assignee_is_refused_not_silently_reassigned() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, tasks) = brain_with_tasks(dir.path());
         tasks
-            .upsert(&CompanyId::new("acme"), &card("t1", "ghost"))
+            .upsert(&CompanyId::new("acme"), &card("t1", "Shane"))
+            .await
+            .unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let refused = only_card(&tasks).await;
+        assert_eq!(
+            refused.column, "backlog",
+            "a card nobody can work must not sit in in_progress"
+        );
+        assert_eq!(
+            refused.assignee, "Shane",
+            "the invalid name is left as typed for the operator to correct"
+        );
+        let note = refused.note.expect("the refusal is written to the note");
+        assert!(
+            note.contains("Shane"),
+            "the operator must be told which name is not a teammate: {note:?}"
+        );
+        assert!(
+            note.contains("dispatch refused"),
+            "the note must read as a refusal, not as work the CEO did: {note:?}"
+        );
+        assert!(
+            !note.contains("mock: "),
+            "no turn may run for an assignee nobody answers to: {note:?}"
+        );
+    }
+
+    /// The other half of #205: a card the orchestrator picks up because nobody
+    /// was named gets that orchestrator written onto it, so the board names who
+    /// is actually doing the work instead of showing a blank assignee.
+    #[tokio::test]
+    async fn task_dispatch_links_the_working_agent_to_an_unassigned_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        tasks
+            .upsert(&CompanyId::new("acme"), &card("t1", ""))
+            .await
+            .unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(
+            only_card(&tasks).await.assignee,
+            "ceo",
+            "the orchestrator that worked the card must be linked to it"
+        );
+    }
+
+    /// A card assigned to a **desk** is worked by that desk's lead, and the card
+    /// is relinked to the member that ran it. `delegate_to_desk` writes a desk
+    /// id into `assignee`, so this is the shape a hand-off actually produces.
+    #[tokio::test]
+    async fn task_dispatch_routes_a_desk_assignee_to_its_lead_and_links_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_desk_tasks(dir.path());
+        tasks
+            .upsert(&CompanyId::new("acme"), &card("t1", "eng"))
+            .await
+            .unwrap();
+
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: "t1".into(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let worked = only_card(&tasks).await;
+        assert_eq!(
+            worked.assignee, "engineer",
+            "the desk's lead member did the work, so the card names them"
+        );
+        let note = worked.note.expect("note");
+        assert!(note.contains("[engineer]"), "{note:?}");
+    }
+
+    /// An **operator-overlay** teammate is a roster teammate. The narrow
+    /// `manifest.agents`-only lookup used to drop these onto the orchestrator.
+    #[tokio::test]
+    async fn task_dispatch_routes_to_an_overlay_teammate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut brain, tasks) = brain_with_tasks(dir.path());
+        brain.record.overlay_agents.push(OverlayAgent {
+            id: "nova".into(),
+            name: "Nova".into(),
+            role: "Growth".into(),
+            description: None,
+        });
+        tasks
+            .upsert(&CompanyId::new("acme"), &card("t1", "nova"))
             .await
             .unwrap();
 
@@ -1495,7 +1727,40 @@ description = "Builds it."
             .expect("cycle runs");
 
         let note = only_card(&tasks).await.note.expect("note");
-        assert!(note.contains("[ceo]"), "{note:?}");
+        assert!(
+            note.contains("[nova]"),
+            "an overlay teammate must work their own card: {note:?}"
+        );
+    }
+
+    /// A refused dispatch still answers in the thread the card came from —
+    /// otherwise a delegated hand-off to a bad assignee is silent twice over.
+    #[tokio::test]
+    async fn a_refused_dispatch_posts_the_reason_back_to_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-origin", "Shane");
+        c.origin_chat_id = Some("strategy".to_string());
+        tasks
+            .upsert(&CompanyId::new("acme"), &c)
+            .await
+            .expect("seed");
+
+        let posted = brain
+            .run_task("t-origin")
+            .await
+            .expect("run")
+            .expect("a refused card with an origin must still post back");
+        assert_eq!(
+            posted.reply_to.as_ref().map(|r| r.chat_id.as_str()),
+            Some("strategy")
+        );
+        assert_eq!(
+            posted.channel,
+            brain.orchestrator(),
+            "the orchestrator answers for its own roster"
+        );
+        assert!(posted.text.contains("Shane"), "{}", posted.text);
     }
 
     /// A dispatch for a card that no longer exists is a silent no-op, not an
@@ -1926,6 +2191,39 @@ members = ["eng1", "eng2"]
             note.contains(&format!("[{}]", brain.orchestrator())),
             "the assignment is recorded in the orchestrator's voice: {note}"
         );
+    }
+
+    /// #205: `assign_task` takes its `assignee` from an LLM tool call, so it can
+    /// name somebody the company does not have just as easily as the operator's
+    /// free-text field can. The bad name must not reach the card — the previous
+    /// owner stays, and the refusal is recorded on the note.
+    #[tokio::test]
+    async fn assign_task_refuses_an_off_roster_assignee_and_keeps_the_current_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-assign", "engineer");
+        c.column = "backlog".to_string();
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_delegation(
+                Delegation::AssignTask {
+                    task_id: "t-assign".to_string(),
+                    assignee: "Shane".to_string(),
+                    note: None,
+                },
+                None,
+            )
+            .await
+            .expect("delegation runs");
+
+        let after = only_card(&tasks).await;
+        assert_eq!(
+            after.assignee, "engineer",
+            "a name nobody answers to must not displace the real owner"
+        );
+        let note = after.note.expect("note");
+        assert!(note.contains("could not assign to Shane"), "{note}");
     }
 
     /// Approving finishes a board-created card: this is #171's `in_review →

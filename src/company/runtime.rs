@@ -29,8 +29,10 @@ use crate::ports::{
     SkillStateStore, TaskRecord, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 
-/// The board column a task must enter to be dispatched to its assignee.
-const IN_PROGRESS: &str = "in_progress";
+/// The board column a task must enter to be dispatched to its assignee. Read
+/// from the task port (#205) so this edge and the write boundary that validates
+/// the column cannot drift onto two different literals.
+use crate::ports::tasks::COLUMN_IN_PROGRESS as IN_PROGRESS;
 
 /// Whether an upsert moves a card **into** `in_progress` (the dispatch edge).
 /// A card already in `in_progress` re-saved is not a fresh dispatch.
