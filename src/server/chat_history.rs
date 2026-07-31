@@ -230,6 +230,7 @@ mod test {
 
     fn agent_reply(chat_id: &str) -> CompanyEvent {
         CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: chat_id.to_string(),
             agent_id: "ceo".to_string(),
             text: "hi".to_string(),

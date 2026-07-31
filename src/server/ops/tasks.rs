@@ -1,13 +1,19 @@
-//! Task board writes: `POST /tasks`, `PATCH /tasks/{task_id}`,
-//! `DELETE /tasks/{task_id}` under both scope forms.
+//! Task board reads and writes: `POST /tasks`, `GET /tasks`,
+//! `GET /tasks/{task_id}`, `PATCH /tasks/{task_id}`, `DELETE /tasks/{task_id}`
+//! under both scope forms.
 //!
 //! Bodies mirror the console's `TaskCard` (`frontend/src/lib/tasks-sample.ts`)
 //! in camelCase; the `assignee` is a plain desk/teammate label. Writes land in
 //! the [`TaskStore`](crate::ports::TaskStore).
+//!
+//! `GET /tasks/{task_id}` (issue #185) is the Task Detail screen's read
+//! foundation: it assembles the card header, the per-task timeline, the
+//! lineage, and the approvals trail into one response so the console makes a
+//! single call. See [`task_detail`] for the assembly and its scrub discipline.
 
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +30,21 @@ use crate::server::ops::{ScopedCompany, scoped};
 pub fn router() -> Router<AppState> {
     scoped("/tasks", post(create_task).get(list_tasks))
         // The static `/tasks/inflight` GET is registered before the dynamic
-        // `/tasks/{task_id}` so the operator strip's read never collides with a
-        // card id (`{task_id}` carries no GET anyway).
+        // `/tasks/{task_id}`, so the operator strip's read never collides with
+        // a card id.
+        //
+        // That ordering used to be belt-and-braces — `{task_id}` carried no GET
+        // at all. Issue #185 gave it one (`task_detail`), so the two now
+        // genuinely overlap on `GET /tasks/inflight` and the static segment
+        // winning is load-bearing, not incidental. Axum's router prefers a
+        // static segment over a parameter, and
+        // `inflight_read_is_not_shadowed_by_task_detail` pins it — a card can
+        // never be named `inflight`, so a regression here would silently turn
+        // the operator strip into a 404.
         .merge(scoped("/tasks/inflight", get(list_inflight)))
         .merge(scoped(
             "/tasks/{task_id}",
-            patch(patch_task).delete(delete_task),
+            get(task_detail).patch(patch_task).delete(delete_task),
         ))
         .merge(scoped("/tasks/{task_id}/steer", post(steer_task)))
 }
@@ -46,6 +61,10 @@ struct TaskCard {
     priority: String,
     assignee: String,
     updated_at: u64,
+    /// The card this one was spawned from (#185). Omitted on a lineage root so
+    /// the board's existing wire shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_task_id: Option<String>,
 }
 
 impl From<TaskRecord> for TaskCard {
@@ -58,6 +77,7 @@ impl From<TaskRecord> for TaskCard {
             priority: t.priority,
             assignee: t.assignee,
             updated_at: t.updated_at_millis,
+            parent_task_id: t.parent_task_id,
         }
     }
 }
@@ -75,6 +95,10 @@ struct CreateTask {
     priority: Option<String>,
     #[serde(default)]
     assignee: Option<String>,
+    /// Opens this card as a child of an existing one (#185). Absent for a
+    /// lineage root, which is every card the board creates today.
+    #[serde(default)]
+    parent_task_id: Option<String>,
 }
 
 /// The partial patch body (any subset; a drag sends `{column}`).
@@ -91,6 +115,10 @@ struct PatchTask {
     priority: Option<String>,
     #[serde(default)]
     assignee: Option<String>,
+    /// Re-parents the card (#185). Omitting it leaves lineage untouched — the
+    /// same partial-patch contract every other field here follows.
+    #[serde(default)]
+    parent_task_id: Option<String>,
 }
 
 /// The sub-resource path (`task_id`); the scope `id` is consumed by the extractor.
@@ -107,10 +135,75 @@ async fn list_tasks(company: ScopedCompany) -> Result<Json<Vec<TaskCard>>, ApiEr
     Ok(Json(rows.into_iter().map(TaskCard::from).collect()))
 }
 
+/// Validates a proposed `parent_task_id` against the board.
+///
+/// Rejects three things, all at the write boundary — the cheap place to keep
+/// the lineage a forest rather than discovering it is not one on read:
+///
+/// * **self-parenting**, which would make a card its own parent *and* its own
+///   child in `task_detail`;
+/// * a parent that **names no existing card**, which yields a dangling edge and
+///   a lineage whose `parent` silently reads as `None`;
+/// * a **cycle** (`t1 → t2 → t1`). Nothing hangs today because `task_detail`
+///   walks a single level, but a persisted cycle is a latent trap for any
+///   future consumer that does walk the chain — a rollup, a breadcrumb.
+///
+/// `child` is the id being parented — `None` on create, where the new card has
+/// no id on the board yet and therefore cannot be part of a cycle.
+fn validate_parent(
+    parent_task_id: &str,
+    child: Option<&str>,
+    board: &[TaskRecord],
+) -> Result<(), ApiError> {
+    if Some(parent_task_id) == child {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "a task cannot be its own parent".to_string(),
+        )));
+    }
+    if !board.iter().any(|t| t.id == parent_task_id) {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+            "parent task {parent_task_id} does not exist"
+        ))));
+    }
+    let Some(child) = child else {
+        return Ok(());
+    };
+    // Walk up from the proposed parent. Reaching `child` means the new edge
+    // would close a loop. The visited set bounds the walk even if the stored
+    // board already contains a cycle from before this validation existed.
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor = Some(parent_task_id.to_string());
+    while let Some(id) = cursor {
+        if id == child {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                "parent task {parent_task_id} would create a cycle through {child}"
+            ))));
+        }
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        cursor = board
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.parent_task_id.clone());
+    }
+    Ok(())
+}
+
 async fn create_task(
     company: ScopedCompany,
     Json(body): Json<CreateTask>,
 ) -> Result<Json<TaskCard>, ApiError> {
+    // Read → validate → write is one critical section. Two concurrent requests
+    // that each read the board before either has written would both validate
+    // against a snapshot missing the other's edge, and could persist a lineage
+    // neither request would have been allowed to create on its own.
+    let _serialized = company.runtime.task_writes.lock().await;
+    if let Some(parent) = body.parent_task_id.as_deref() {
+        let board = company.runtime.tasks().list(company.id()).await?;
+        // `None` child: the card does not exist yet, so it cannot be in a cycle.
+        validate_parent(parent, None, &board)?;
+    }
     let record = TaskRecord {
         id: generate_id(),
         title: body.title,
@@ -120,6 +213,7 @@ async fn create_task(
         assignee: body.assignee.unwrap_or_default(),
         updated_at_millis: now_millis(),
         origin_chat_id: None,
+        parent_task_id: body.parent_task_id,
     };
     company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
@@ -130,13 +224,19 @@ async fn patch_task(
     Path(TaskPath { task_id }): Path<TaskPath>,
     Json(body): Json<PatchTask>,
 ) -> Result<Json<TaskCard>, ApiError> {
-    let mut record = company
-        .runtime
-        .tasks()
-        .list(company.id())
-        .await?
-        .into_iter()
+    // As in `create_task`, the read → validate → write is one critical section:
+    // a re-parent validated against a stale board is exactly how two requests
+    // close a cycle neither of them could close alone. Held for the whole
+    // handler, which also makes the surrounding read-modify-write of the card's
+    // other fields lost-update free.
+    let _serialized = company.runtime.task_writes.lock().await;
+    // The whole board is kept (not consumed by `into_iter`) so a re-parent can
+    // be checked for existence and cycles against it.
+    let board = company.runtime.tasks().list(company.id()).await?;
+    let mut record = board
+        .iter()
         .find(|t| t.id == task_id)
+        .cloned()
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(format!("task {task_id}")))?;
     if let Some(title) = body.title {
         record.title = title;
@@ -153,6 +253,10 @@ async fn patch_task(
     if let Some(assignee) = body.assignee {
         record.assignee = assignee;
     }
+    if let Some(parent_task_id) = body.parent_task_id {
+        validate_parent(&parent_task_id, Some(&task_id), &board)?;
+        record.parent_task_id = Some(parent_task_id);
+    }
     record.updated_at_millis = now_millis();
     company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
@@ -162,6 +266,10 @@ async fn delete_task(
     company: ScopedCompany,
     Path(TaskPath { task_id }): Path<TaskPath>,
 ) -> Result<StatusCode, ApiError> {
+    // Serialized with the other board writes so a delete cannot land between a
+    // concurrent re-parent's existence check and its write, which would leave
+    // the dangling edge `validate_parent` exists to prevent.
+    let _serialized = company.runtime.task_writes.lock().await;
     if company
         .runtime
         .tasks()
@@ -173,6 +281,266 @@ async fn delete_task(
         Err(ApiError(OpenCompanyError::CompanyNotFound(format!(
             "task {task_id}"
         ))))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task detail (issue #185): the Task Detail screen's read foundation.
+// ---------------------------------------------------------------------------
+
+/// One entry on a task's timeline.
+///
+/// Deliberately the *same scrubbed vocabulary* as [`TurnStep`] rather than a
+/// raw event dump: `kind` / `status` / `label` / `detail` are already the shape
+/// the console renders for a chat bubble's steps, so the Task Detail screen
+/// reuses that renderer instead of growing a second one.
+///
+/// Nothing here can carry raw tool arguments, tool output, or call ids. The
+/// only free text that reaches `detail` is a value the producing event already
+/// scrubbed at source (`McpCallFailed.message`) or the agent's own reply text
+/// (`DeskTaskCompleted.output`), which is the same string already shown in the
+/// card's note.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineEntry {
+    /// The journal sequence this entry came from — the console's stable key,
+    /// and what makes the timeline strictly ordered.
+    seq: u64,
+    /// Epoch-millis the event was journaled.
+    at_millis: u64,
+    /// A stable wire word for what happened: `dispatched`, `reply`,
+    /// `tool_failed`, `approval`, or `completed`.
+    kind: String,
+    /// A short human label.
+    label: String,
+    /// Optional scrubbed detail (see the type docs for what may appear here).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+/// A neighbouring card in the lineage, trimmed to what a link needs.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LineageRef {
+    id: String,
+    title: String,
+    column: String,
+}
+
+impl From<&TaskRecord> for LineageRef {
+    fn from(t: &TaskRecord) -> Self {
+        Self {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            column: t.column.clone(),
+        }
+    }
+}
+
+/// The parent/children view of a task.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Lineage {
+    /// The card this one was spawned from, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<LineageRef>,
+    /// Cards spawned from this one, oldest-updated first for a stable render.
+    children: Vec<LineageRef>,
+}
+
+/// The assembled Task Detail response.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskDetail {
+    /// The card header — the same shape `GET /tasks` returns per card.
+    task: TaskCard,
+    /// The per-task event stream, oldest first.
+    timeline: Vec<TimelineEntry>,
+    /// Parent and children.
+    lineage: Lineage,
+}
+
+/// `GET …/tasks/{task_id}` — the Task Detail screen's single read (issue #185).
+///
+/// Assembles four things the console would otherwise have to stitch client-side
+/// (and could not, for the journal-derived halves):
+///
+/// * **header** — the card itself;
+/// * **timeline** — the company-scoped journal filtered down to this task. The
+///   [`TaskDispatched`](CompanyEvent::TaskDispatched) and
+///   [`DeskTaskCompleted`](CompanyEvent::DeskTaskCompleted) anchors match on
+///   their own `task_id`; the events a dispatch *produces* (replies, failed
+///   tool calls) match on the `task_id` threaded onto them by this same issue.
+///   Without that threading these events are indistinguishable from every other
+///   desk reply in the log, which is exactly why the filter could not be built
+///   before;
+/// * **approvals trail** — [`ApprovalResolved`](CompanyEvent::ApprovalResolved)
+///   events that fall inside the task's run window (its dispatch anchor through
+///   its completion anchor, or through the end of the log while it is still
+///   running). Parked effects carry no task id, so a window is the honest
+///   correlation here rather than a false-precision per-task link; entries are
+///   labelled as such so a reader is not misled;
+/// * **lineage** — parent and children, from `parent_task_id`.
+///
+/// 404s when the id names no card, matching `PATCH` / `DELETE`.
+async fn task_detail(
+    company: ScopedCompany,
+    Path(TaskPath { task_id }): Path<TaskPath>,
+) -> Result<Json<TaskDetail>, ApiError> {
+    let rows = company.runtime.tasks().list(company.id()).await?;
+    let card = rows
+        .iter()
+        .find(|t| t.id == task_id)
+        .cloned()
+        .ok_or_else(|| OpenCompanyError::CompanyNotFound(format!("task {task_id}")))?;
+
+    // Lineage is a pure board read — no journal needed.
+    let parent = card
+        .parent_task_id
+        .as_ref()
+        .and_then(|pid| rows.iter().find(|t| &t.id == pid))
+        .map(LineageRef::from);
+    let mut children: Vec<&TaskRecord> = rows
+        .iter()
+        .filter(|t| t.parent_task_id.as_deref() == Some(task_id.as_str()))
+        .collect();
+    children.sort_by_key(|t| t.updated_at_millis);
+    let children = children.into_iter().map(LineageRef::from).collect();
+
+    let timeline = task_timeline(&company, &task_id).await?;
+
+    Ok(Json(TaskDetail {
+        task: card.into(),
+        timeline,
+        lineage: Lineage { parent, children },
+    }))
+}
+
+/// How many journal events one `read_from` page pulls.
+///
+/// The scan is bounded per page rather than per request: a task's events can sit
+/// anywhere in a company's history, so the whole log must still be *traversed* —
+/// but it is never all *resident* at once.
+const TIMELINE_PAGE: usize = 512;
+
+/// Folds the company journal down to one task's timeline.
+///
+/// Oldest-first, paged. `window` opens on this task's dispatch anchor and closes
+/// on its completion anchor; untagged-but-windowed events (approvals) are only
+/// admitted while it is open, so a resolution belonging to a different task's
+/// run never leaks in.
+///
+/// **Why the scan does not stop at the first completion anchor.** A card can be
+/// re-dispatched — moved back to `in_progress` after review — which opens a
+/// second dispatch → completion cycle later in the same log. Stopping at the
+/// first `DeskTaskCompleted` would silently truncate every run after the first,
+/// which is worse than the cost it saves. Bounding the page size gives the
+/// memory win without that correctness loss; a stored per-task dispatch offset
+/// is the durable fix for the traversal cost and is left to the epic.
+async fn task_timeline(
+    company: &ScopedCompany,
+    task_id: &str,
+) -> Result<Vec<TimelineEntry>, ApiError> {
+    use crate::ports::types::EventSeq;
+
+    let mut timeline = Vec::new();
+    let mut window_open = false;
+    let mut next_seq = 0u64;
+    loop {
+        let page = company
+            .runtime
+            .events()
+            .read_from(company.id(), EventSeq::new(next_seq), TIMELINE_PAGE)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        // Advance past the last event read. `read_from` is inclusive of `seq`,
+        // so without the `+ 1` the final event of each page would be re-read
+        // forever.
+        next_seq = page
+            .last()
+            .map(|ev| ev.seq.value() + 1)
+            .unwrap_or(next_seq + 1);
+        let exhausted = page.len() < TIMELINE_PAGE;
+        fold_page(&page, task_id, &mut window_open, &mut timeline);
+        if exhausted {
+            break;
+        }
+    }
+    Ok(timeline)
+}
+
+/// Folds one page of journal events onto `timeline`, carrying the window state
+/// across pages.
+fn fold_page(
+    page: &[crate::ports::types::StoredEvent],
+    task_id: &str,
+    window_open: &mut bool,
+    timeline: &mut Vec<TimelineEntry>,
+) {
+    for ev in page {
+        let entry = match &ev.event {
+            CompanyEvent::TaskDispatched { task_id: id } if id == task_id => {
+                *window_open = true;
+                Some(("dispatched", "Dispatched".to_string(), None))
+            }
+            CompanyEvent::AgentReply {
+                agent_id,
+                text,
+                task_id: Some(id),
+                ..
+            } if id == task_id => Some((
+                "reply",
+                format!("Reply from {agent_id}"),
+                Some(text.clone()),
+            )),
+            CompanyEvent::McpCallFailed {
+                server,
+                tool,
+                message,
+                task_id: Some(id),
+                ..
+            } if id == task_id => Some((
+                "tool_failed",
+                format!("{server} · {tool} failed"),
+                Some(message.clone()),
+            )),
+            CompanyEvent::DeskTaskCompleted {
+                task_id: id,
+                desk,
+                output,
+                column,
+            } if id == task_id => {
+                *window_open = false;
+                Some((
+                    "completed",
+                    format!("Finished on {desk} → {column}"),
+                    Some(output.clone()),
+                ))
+            }
+            // Window-correlated, not id-correlated — see `task_detail`'s docs.
+            // The operator's identity is deliberately dropped: it can carry a
+            // user id, matching the SSE projection's deny-by-default stance.
+            CompanyEvent::ApprovalResolved { verdict, .. } if *window_open => Some((
+                "approval",
+                format!(
+                    "Approval {}",
+                    crate::brain::medulla::effects::verdict_word(*verdict)
+                ),
+                None,
+            )),
+            _ => None,
+        };
+        if let Some((kind, label, detail)) = entry {
+            timeline.push(TimelineEntry {
+                seq: ev.seq.value(),
+                at_millis: ev.at_millis,
+                kind: kind.to_string(),
+                label,
+                detail,
+            });
+        }
     }
 }
 

@@ -3,7 +3,8 @@ import { Mail, MoreHorizontal, Plus, Sparkles, UserPlus } from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
-import { ApiError } from "@/api/types";
+import { setInboxEnabled } from "@/api/inbox";
+import { ApiError, type TeamMemberDto } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -26,7 +27,6 @@ import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { isInboxEnabled, loadInboxes, saveInboxes, toggleInbox } from "@/lib/inbox";
 import {
   fromDto,
   initials,
@@ -50,14 +50,38 @@ export function TeamView({ client, company }: Props) {
   const [fromHost, setFromHost] = useState(false);
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [addOpen, setAddOpen] = useState(false);
-  const [inboxes, setInboxes] = useState(() => loadInboxes(company));
 
-  useEffect(() => {
-    saveInboxes(company, inboxes);
-  }, [company, inboxes]);
-
-  function toggleMemberInbox(name: string) {
-    setInboxes((s) => toggleInbox(s, name));
+  /**
+   * Give a teammate an inbox, or take it away, on the host — keyed by the
+   * roster **agent id**, which is the `InboxStore` key the Inbox page reads and
+   * the ingest webhook files mail under. Nothing is persisted client-side: if
+   * the write fails the switch goes back, so the console never claims an inbox
+   * the host doesn't have.
+   *
+   * Starter-team cards are locally-invented placeholders, not host records, so
+   * their ids are not real inbox keys — refuse rather than file mail under one.
+   */
+  async function toggleMemberInbox(member: TeamMember) {
+    if (!fromHost) {
+      toast.error("Add this teammate to your company first — an inbox needs a saved teammate.");
+      return;
+    }
+    const next = !member.inboxEnabled;
+    const apply = (enabled: boolean) =>
+      setMembers((ms) => ms.map((m) => (m.id === member.id ? { ...m, inboxEnabled: enabled } : m)));
+    apply(next);
+    try {
+      await setInboxEnabled(client, company, member.id, next);
+    } catch (error) {
+      apply(!next);
+      toast.error(
+        error instanceof ApiError && error.status === 404
+          ? "This host doesn't offer teammate inboxes yet."
+          : error instanceof Error
+            ? error.message
+            : "Couldn't change the inbox.",
+      );
+    }
   }
 
   const boot = useCallback(async () => {
@@ -85,24 +109,37 @@ export function TeamView({ client, company }: Props) {
   }, [boot]);
 
   async function addMember(fields: { name: string; role: string; description: string; inbox?: boolean }) {
+    let created: TeamMemberDto | null = null;
     try {
-      await client.addTeamMember(
+      created = await client.addTeamMember(
         { name: fields.name, role: fields.role, description: fields.description || undefined },
         company,
       );
-      // Persisted on the host — refetch so the card reflects the real record
-      // (id, merge order) rather than a locally-guessed one.
-      await boot();
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
-        // No team write plane on this host — keep the edit local-only.
+        // No team write plane on this host — keep the edit local-only. An inbox
+        // needs a persisted teammate to hang off, so it can't be enabled here.
         setMembers((m) => [...m, newMember(fields)]);
-      } else {
-        toast.error(error instanceof Error ? error.message : "Couldn't add teammate.");
+        if (fields.inbox) toast.error("This host can't persist teammates, so no inbox was created.");
+        setAddOpen(false);
         return;
       }
+      toast.error(error instanceof Error ? error.message : "Couldn't add teammate.");
+      return;
     }
-    if (fields.inbox) toggleMemberInbox(fields.name);
+
+    // Enable the inbox against the host's real agent id *before* refetching, so
+    // the reloaded roster already reports the toggle as on.
+    if (fields.inbox) {
+      try {
+        await setInboxEnabled(client, company, created.id, true);
+      } catch {
+        toast.error("Teammate added, but their inbox couldn't be switched on.");
+      }
+    }
+    // Persisted on the host — refetch so the card reflects the real record
+    // (id, merge order, inbox state) rather than a locally-guessed one.
+    await boot();
     setAddOpen(false);
   }
 
@@ -149,8 +186,8 @@ export function TeamView({ client, company }: Props) {
               <MemberCard
                 key={m.id}
                 member={m}
-                inboxOn={isInboxEnabled(inboxes, m.name)}
-                onToggleInbox={() => toggleMemberInbox(m.name)}
+                inboxOn={m.inboxEnabled}
+                onToggleInbox={() => void toggleMemberInbox(m)}
                 onRemove={() => void removeMember(m)}
               />
             ))}
@@ -182,7 +219,7 @@ function MemberCard({
   onRemove: () => void;
 }) {
   return (
-    <Card>
+    <Card data-testid="team-card">
       <CardContent className="flex h-full flex-col gap-3 py-4">
         <div className="flex items-start gap-3">
           <div
@@ -221,7 +258,12 @@ function MemberCard({
           <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
             <Mail className="size-3.5" />
             Inbox
-            <Switch checked={inboxOn} onCheckedChange={onToggleInbox} aria-label="Give this agent an inbox" />
+            <Switch
+              checked={inboxOn}
+              onCheckedChange={onToggleInbox}
+              aria-label="Give this agent an inbox"
+              data-testid="team-inbox-toggle"
+            />
           </label>
         </div>
       </CardContent>

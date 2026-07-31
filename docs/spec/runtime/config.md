@@ -33,10 +33,40 @@ Without a credential the runtime still builds, validates manifests, runs
 README promise that you can build/inspect/explore keyless. Cycles require the
 credential; feedback falls back to the local GitHub/manual-link path.
 
+## Where the credential comes from
+
+The runtime does not hold a credential — it *obtains* one, per request, from a
+two-tier source (`company::credentials`). Highest precedence first:
+
+| Tier | Env | Who sets it | Shape |
+| --- | --- | --- | --- |
+| projected file | `TINYHUMANS_TOKEN_FILE` | the hosting platform | a short-lived, audience-bound token in a file the platform **rewrites in place** (600-second expiry, so roughly every 8 minutes) |
+| static | `TINYHUMANS_API_KEY` | you | a long-lived key held for the life of the process |
+
+A hosted tenant gets the projected file and stores no secret at all: the platform
+mounts it read-only at `/var/run/secrets/tinyhumans.ai/token` and the env var
+carries that **path** — never a token value. The tier is selected only when the
+path exists, so a leftover variable under a runtime that mounts nothing (docker)
+falls through to the static tier instead of failing every request. The file is
+re-read as it rotates: a read is cached for 80% of the token's remaining TTL,
+capped at 60 seconds, and a token whose `exp` cannot be read (or has already
+passed) is not cached at all. A `401` from the backend drops the cached read, so
+the next request goes straight back to the file. Expiry is parsed out of the
+JWT **without verifying the signature** — the runtime needs the date, and the
+backend is the party that verifies the token.
+
+The static tier is what `docker compose` uses, and it is the only credential path
+available if you run this repo standalone. Standalone/self-hosted operation is
+**not supported** this milestone: it is an escape hatch, not a deployment mode.
+
+`opencompany doctor` prints the active tier as `credential_source`
+(`attested` / `static` / `none`) alongside the token-file path. Neither the
+report nor any API response ever carries the token.
+
 ## Precedence
 
 ```text
-env (OPENCOMPANY_*, TINYHUMANS_API_KEY)
+env (OPENCOMPANY_*, TINYHUMANS_TOKEN_FILE, TINYHUMANS_API_KEY)
   ⟵ ~/.opencompany/config.toml
   ⟵ company manifest
   ⟵ built-in defaults
@@ -49,7 +79,8 @@ layer set it, and what is missing for each optional capability.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `TINYHUMANS_API_KEY` | — (required for cycles) | TinyHumans credential (JWT or API key) |
+| `TINYHUMANS_TOKEN_FILE` | — | Platform-projected, audience-bound token file; rotates in place and outranks `TINYHUMANS_API_KEY` |
+| `TINYHUMANS_API_KEY` | — (required for cycles when no token file) | Static TinyHumans credential (JWT or API key) |
 | `TINYHUMANS_API_URL` | `https://api.tinyhumans.ai` | Backend base URL |
 | `OPENCOMPANY_BIND` | `127.0.0.1:8080` | HTTP bind address |
 | `OPENCOMPANY_DATA_DIR` | `~/.opencompany` | Bundle root for fs stores |

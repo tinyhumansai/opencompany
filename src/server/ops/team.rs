@@ -42,6 +42,9 @@ struct TeamMemberDto {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// Whether this teammate has an enabled inbox, so the Team page's toggle
+    /// renders the host's real state instead of a client-side guess.
+    inbox_enabled: bool,
 }
 
 /// The add-teammate body.
@@ -75,11 +78,26 @@ struct AgentPath {
 /// `GET {scope}/team` — the merged roster: manifest teammates (versioned in
 /// `company.toml`, `name: null` — the console falls back to the role) plus
 /// operator-added overlay teammates (`name` always set). Mirrors the GraphQL
-/// `resolve_team` merge (minus its `inbox_enabled` field, which has no REST
-/// consumer yet). Hosts with no persisted record yet return an empty roster,
-/// the same soft-fail the sibling `/desks` route uses, rather than 404ing.
+/// `resolve_team` merge, `inbox_enabled` included — the console's Team page is
+/// its REST consumer, so the inbox toggle reflects the [`InboxStore`] rather
+/// than a client-side guess (issue #173). Hosts with no persisted record yet
+/// return an empty roster, the same soft-fail the sibling `/desks` route uses,
+/// rather than 404ing.
+///
+/// [`InboxStore`]: crate::ports::InboxStore
 async fn list_team(company: ScopedCompany) -> Result<Json<Vec<TeamMemberDto>>, ApiError> {
     let record = company.runtime.store().load(company.id()).await?;
+    // Inbox metadata is keyed by agent id, so the roster can be tagged without
+    // a per-teammate read. An inbox that was never toggled is simply absent.
+    let enabled_inboxes: std::collections::HashMap<String, bool> = company
+        .runtime
+        .inbox()
+        .inboxes(company.id())
+        .await?
+        .into_iter()
+        .map(|meta| (meta.key, meta.enabled))
+        .collect();
+    let enabled = |id: &str| enabled_inboxes.get(id).copied().unwrap_or(false);
     let members = record
         .map(|record| {
             let mut members: Vec<TeamMemberDto> = record
@@ -91,6 +109,7 @@ async fn list_team(company: ScopedCompany) -> Result<Json<Vec<TeamMemberDto>>, A
                     name: None,
                     role: agent.role.clone(),
                     description: agent.description.clone(),
+                    inbox_enabled: enabled(&agent.id),
                 })
                 .collect();
             members.extend(record.overlay_agents.iter().map(|agent| TeamMemberDto {
@@ -98,6 +117,7 @@ async fn list_team(company: ScopedCompany) -> Result<Json<Vec<TeamMemberDto>>, A
                 name: Some(agent.name.clone()),
                 role: agent.role.clone(),
                 description: agent.description.clone(),
+                inbox_enabled: enabled(&agent.id),
             }));
             members
         })
@@ -133,6 +153,8 @@ async fn add_member(
         name: Some(agent.name),
         role: agent.role,
         description: agent.description,
+        // A brand-new teammate has no inbox until the toggle writes one.
+        inbox_enabled: false,
     }))
 }
 

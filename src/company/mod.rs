@@ -8,6 +8,10 @@
 pub mod composio;
 #[cfg(test)]
 mod content_test;
+// How this instance obtains its TinyHumans credential (projected, rotating
+// platform token vs a static key). Always compiled: the answer decides whether a
+// company can think at all, in every build.
+pub mod credentials;
 pub mod dns;
 pub mod inference;
 mod manifest;
@@ -33,6 +37,7 @@ pub mod workspace_seed;
 
 use std::path::Path;
 
+pub use credentials::{Credential, CredentialSource, TinyhumansTokenSource, TokenTier};
 pub use manifest::{LEGACY_MANIFEST_FILE, Located, MANIFEST_FILE, discover};
 pub use skill_file::{SkillDoc, load_dir_skills, parse_skill_md};
 pub use types::{

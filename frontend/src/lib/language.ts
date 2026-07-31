@@ -37,6 +37,15 @@ const EFFECT_LABELS: Record<string, string> = {
   "handle.register": "Claim a public handle",
   "handle.renew": "Renew a public handle",
   "key.rotate": "Rotate its security key",
+  // A tool call the company parked mid-conversation. The effect kind is the
+  // tool's own name, which is a runtime internal — the glossary rule above says
+  // an operator never sees one, so the gated tools get plain-language labels
+  // rather than the title-cased fallback ("Composio Execute").
+  composio_authorize: "Connect one of its accounts",
+  composio_execute: "Act in one of its connected accounts",
+  mcp_registry_tool_call: "Use a connected tool",
+  media_generate_image: "Generate an image",
+  media_generate_video: "Generate a video",
 };
 
 export function effectAction(kind: string): string {

@@ -6,17 +6,36 @@
 //! `always_approve` effect kinds and the per-agent `budget_usd_daily` /
 //! `auto_approve_under_usd` thresholds.
 //!
-//! ## Where approvals actually park (flagged seam)
+//! ## Where approvals actually park (issue #172)
 //!
 //! openhuman's [`ToolPolicy`] returns
 //! [`ToolPolicyDecision::RequireApproval`](oh::agent::tool_policy::ToolPolicyDecision::RequireApproval),
 //! which the session turn loop treats **fail-closed** — it blocks the tool call
-//! rather than suspending and resuming it inline. To realise the spec's
-//! "park → resolve → resume" flow through opencompany's [`ApprovalGate`] port
-//! and journal, the runtime/chat layer (WS3) maps the flagged tool call to an
-//! [`Effect`] via [`ApprovalPolicy::effect_for`], parks it on the gate, and
-//! re-runs the turn once the operator resolves it. That runtime wiring is the
-//! WS3 seam; this module provides the decision + the effect projection.
+//! and feeds the model a refusal rather than suspending and resuming it inline.
+//! That refusal was for a long time the *only* trace a gated call left: nothing
+//! was ever written to opencompany's [`ApprovalGate`] port or its journal, so
+//! the operator's Approvals page stayed empty however many tools an agent
+//! parked, and the work silently dead-ended.
+//!
+//! The bridge is now closed. Every `RequireApproval` this policy returns also
+//! projects the flagged call onto an opencompany [`Effect`]
+//! ([`ApprovalPolicy::effect_for`]) and pushes it onto the shared
+//! [`ApprovalRequestQueue`] carried on
+//! [`HarnessDeps`](crate::harness::HarnessDeps). The
+//! [`HarnessBrain`](crate::harness::HarnessBrain) drains that queue after the
+//! turn and parks each request through
+//! [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect), so
+//! the request lands in the journal the Approvals page reads and survives a
+//! restart. Same cheap-shared-handle pattern as the delegation and MCP-failure
+//! queues.
+//!
+//! **Still out of scope:** resume-after-approval. openhuman resolves the
+//! decision inline, so approving a parked tool call records the verdict and
+//! clears the queue but does not re-dispatch the tool — the operator re-asks.
+//! Suspending and resuming a call inside openhuman's session loop is a separate
+//! piece of work.
+
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use openhuman_core::openhuman as oh;
@@ -25,6 +44,12 @@ use oh::agent::tool_policy::{ToolPolicy, ToolPolicyDecision, ToolPolicyRequest};
 
 use crate::company::Policy;
 use crate::ports::types::{Effect, EffectGroup};
+
+/// Most approval requests parked out of a single turn. A model that keeps
+/// re-trying a blocked tool (openhuman feeds it a refusal and lets it continue)
+/// must not be able to flood the operator's queue, so the drain is bounded the
+/// same way delegation is.
+pub const MAX_APPROVAL_REQUESTS_PER_TURN: usize = 8;
 
 /// The three approval tiers, mirroring OpenHuman's security tiers 1:1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +83,71 @@ impl PolicyMode {
     }
 }
 
+/// One approval-gated tool call observed during an agent turn: the projected
+/// [`Effect`] the operator will see, plus the tool and the policy's own reason
+/// for logging.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovalRequest {
+    /// The tool the agent tried to call.
+    pub tool: String,
+    /// Why the policy flagged it (the same wording openhuman feeds the model).
+    pub reason: String,
+    /// The projected effect to park on the gate.
+    pub effect: Effect,
+}
+
+/// A shared, in-memory queue of approval-gated tool calls — the exact
+/// [`DelegationQueue`](crate::harness::orchestrator::DelegationQueue) /
+/// [`McpFailureQueue`](crate::harness::mcp_probe::McpFailureQueue) pattern.
+/// Cheap to [`Clone`] (a shared handle); the [`ApprovalPolicy`] installed on
+/// every roster agent and the [`HarnessBrain`](crate::harness::HarnessBrain)
+/// that drains it see the same queue because
+/// [`HarnessDeps`](crate::harness::HarnessDeps) clones share this handle.
+#[derive(Clone, Default)]
+pub struct ApprovalRequestQueue {
+    inner: Arc<Mutex<Vec<ApprovalRequest>>>,
+}
+
+impl ApprovalRequestQueue {
+    /// Records a gated call, ignoring one already queued for the same tool and
+    /// arguments.
+    ///
+    /// openhuman blocks the call but lets the turn continue, so a model that
+    /// re-tries the same tool would otherwise park the identical request several
+    /// times over and show the operator a queue of duplicates.
+    pub fn push(&self, request: ApprovalRequest) {
+        let mut guard = self.inner.lock().expect("approval request queue");
+        if guard.iter().any(|q| {
+            q.effect.kind == request.effect.kind && q.effect.payload == request.effect.payload
+        }) {
+            return;
+        }
+        guard.push(request);
+    }
+
+    /// Empties the queue (called before a turn so a request from a prior turn —
+    /// or from a workflow run that shares these deps — never leaks into it).
+    pub fn clear(&self) {
+        self.inner.lock().expect("approval request queue").clear();
+    }
+
+    /// Drains up to `cap` queued requests (FIFO) and discards the rest, so one
+    /// turn can never flood the operator's queue.
+    pub fn drain(&self, cap: usize) -> Vec<ApprovalRequest> {
+        let mut guard = self.inner.lock().expect("approval request queue");
+        let take = guard.len().min(cap);
+        let drained: Vec<ApprovalRequest> = guard.drain(..take).collect();
+        guard.clear();
+        drained
+    }
+
+    /// The number of queued requests (test/observability).
+    #[cfg(test)]
+    pub fn queued(&self) -> usize {
+        self.inner.lock().expect("approval request queue").len()
+    }
+}
+
 /// openhuman [`ToolPolicy`] derived from a company's manifest `[policy]` and a
 /// single agent's per-agent budget.
 pub struct ApprovalPolicy {
@@ -67,6 +157,12 @@ pub struct ApprovalPolicy {
     /// Per-agent daily spend cap; retained for the runtime budget gate. `None`
     /// leaves budget enforcement to the company-wide `[budget]` ceiling.
     budget_usd_daily: Option<f64>,
+    /// Where a `RequireApproval` decision is recorded so the runtime can park it
+    /// (issue #172). The default is a private queue nobody drains, which keeps
+    /// every non-harness construction site (and every test) behaving exactly as
+    /// before; `build_roster` installs the shared one off
+    /// [`HarnessDeps`](crate::harness::HarnessDeps).
+    requests: ApprovalRequestQueue,
 }
 
 impl ApprovalPolicy {
@@ -78,7 +174,15 @@ impl ApprovalPolicy {
             always_approve: policy.always_approve.clone(),
             auto_approve_under_usd: policy.auto_approve_under_usd,
             budget_usd_daily,
+            requests: ApprovalRequestQueue::default(),
         }
+    }
+
+    /// Installs the shared queue every `RequireApproval` decision is recorded on,
+    /// so the brain can park the request after the turn (issue #172).
+    pub fn with_requests(mut self, requests: ApprovalRequestQueue) -> Self {
+        self.requests = requests;
+        self
     }
 
     /// The resolved tier.
@@ -122,6 +226,30 @@ impl ApprovalPolicy {
             payload: args.clone(),
         }
     }
+
+    /// The one construction site for a `RequireApproval` decision (issue #172):
+    /// record the projected effect on the shared queue so the brain can park it
+    /// after the turn, then return the decision openhuman blocks the call with.
+    ///
+    /// Every `RequireApproval` arm of [`check`](ToolPolicy::check) goes through
+    /// here — a decision that skipped it would refuse the tool without ever
+    /// reaching the operator, which is exactly the bug this closes.
+    fn require_approval(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        reason: String,
+    ) -> ToolPolicyDecision {
+        self.requests.push(ApprovalRequest {
+            tool: tool.to_string(),
+            reason: reason.clone(),
+            effect: self.effect_for(tool, args),
+        });
+        log::debug!(
+            "[approval] tool '{tool}' requires operator approval — queued to park ({reason})"
+        );
+        ToolPolicyDecision::require_approval(reason)
+    }
 }
 
 #[async_trait]
@@ -135,9 +263,11 @@ impl ToolPolicy for ApprovalPolicy {
 
         // `always_approve` wins over everything, including Full autonomy.
         if self.always_requires_approval(tool) {
-            return ToolPolicyDecision::require_approval(format!(
-                "'{tool}' is in the company's always-approve list"
-            ));
+            return self.require_approval(
+                tool,
+                &request.arguments,
+                format!("'{tool}' is in the company's always-approve list"),
+            );
         }
 
         // Auto-approve small spends under the configured threshold.
@@ -154,9 +284,11 @@ impl ToolPolicy for ApprovalPolicy {
             PolicyMode::Full => ToolPolicyDecision::Allow,
             PolicyMode::Supervised => {
                 if external {
-                    ToolPolicyDecision::require_approval(format!(
-                        "'{tool}' has an external effect and this desk runs supervised"
-                    ))
+                    self.require_approval(
+                        tool,
+                        &request.arguments,
+                        format!("'{tool}' has an external effect and this desk runs supervised"),
+                    )
                 } else {
                     ToolPolicyDecision::Allow
                 }
@@ -516,5 +648,135 @@ mod tests {
         assert_eq!(effect.kind, "pay_invoice");
         assert_eq!(effect.group, EffectGroup::Spend);
         assert_eq!(effect.amount_usd, Some(12.5));
+    }
+
+    // --- The park queue (issue #172) ----------------------------------------
+
+    fn queued_policy(mode: &str, always: &[&str]) -> (ApprovalPolicy, ApprovalRequestQueue) {
+        let queue = ApprovalRequestQueue::default();
+        (
+            policy(mode, always, None).with_requests(queue.clone()),
+            queue,
+        )
+    }
+
+    /// The core of #172: a `RequireApproval` decision no longer evaporates into
+    /// the model's transcript — it is recorded, with the call projected onto the
+    /// effect the operator will see, so the runtime can park it.
+    #[tokio::test]
+    async fn require_approval_records_the_request_to_park() {
+        let (p, queue) = queued_policy("supervised", &[]);
+        let args = serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" });
+        assert!(matches!(
+            p.check(&request("composio_execute", args.clone())).await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+
+        let queued = queue.drain(MAX_APPROVAL_REQUESTS_PER_TURN);
+        assert_eq!(queued.len(), 1, "the gated call was recorded");
+        assert_eq!(queued[0].tool, "composio_execute");
+        assert_eq!(queued[0].effect.kind, "composio_execute");
+        assert_eq!(queued[0].effect.group, EffectGroup::Send);
+        assert_eq!(queued[0].effect.payload, args);
+        assert!(
+            queued[0].reason.contains("supervised"),
+            "the operator-facing reason rides along: {}",
+            queued[0].reason
+        );
+    }
+
+    /// `always_approve` parks regardless of tier — including under `full` — so
+    /// that arm has to record its request too.
+    #[tokio::test]
+    async fn always_approve_records_the_request_even_under_full_autonomy() {
+        let (p, queue) = queued_policy("full", &["payment"]);
+        assert!(matches!(
+            p.check(&request(
+                "payment.send",
+                serde_json::json!({ "amount_usd": 40.0 })
+            ))
+            .await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+        let queued = queue.drain(MAX_APPROVAL_REQUESTS_PER_TURN);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].effect.kind, "payment.send");
+        assert_eq!(queued[0].effect.amount_usd, Some(40.0));
+    }
+
+    /// Allowed and denied calls leave the queue alone: only a call actually
+    /// waiting on the operator may reach the Approvals page.
+    #[tokio::test]
+    async fn allow_and_deny_record_nothing() {
+        let (supervised, allow_queue) = queued_policy("supervised", &[]);
+        assert_eq!(
+            supervised
+                .check(&request("read_file", serde_json::json!({})))
+                .await,
+            ToolPolicyDecision::Allow
+        );
+        assert_eq!(allow_queue.queued(), 0, "an allowed call parks nothing");
+
+        let (readonly, deny_queue) = queued_policy("readonly", &[]);
+        assert!(matches!(
+            readonly
+                .check(&request("publish_post", serde_json::json!({})))
+                .await,
+            ToolPolicyDecision::Deny { .. }
+        ));
+        assert_eq!(
+            deny_queue.queued(),
+            0,
+            "a denied call is refused outright, never parked"
+        );
+    }
+
+    /// openhuman blocks a gated call but lets the turn continue, so a model that
+    /// keeps re-trying the same tool must not stack up duplicate approvals.
+    #[tokio::test]
+    async fn a_retried_call_is_recorded_once() {
+        let (p, queue) = queued_policy("supervised", &[]);
+        let args = serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" });
+        for _ in 0..3 {
+            let _ = p.check(&request("composio_execute", args.clone())).await;
+        }
+        assert_eq!(queue.queued(), 1, "the same call parks once");
+
+        // A different call to the same tool is a distinct request.
+        let _ = p
+            .check(&request(
+                "composio_execute",
+                serde_json::json!({ "tool_slug": "SLACK_POST" }),
+            ))
+            .await;
+        assert_eq!(queue.queued(), 2);
+    }
+
+    /// The drain is capped, so a runaway turn can't flood the operator's queue.
+    #[tokio::test]
+    async fn the_drain_is_capped_and_empties_the_queue() {
+        let (p, queue) = queued_policy("supervised", &[]);
+        for i in 0..(MAX_APPROVAL_REQUESTS_PER_TURN + 4) {
+            let _ = p
+                .check(&request(
+                    "composio_execute",
+                    serde_json::json!({ "tool_slug": format!("TOOL_{i}") }),
+                ))
+                .await;
+        }
+        let drained = queue.drain(MAX_APPROVAL_REQUESTS_PER_TURN);
+        assert_eq!(drained.len(), MAX_APPROVAL_REQUESTS_PER_TURN);
+        assert_eq!(queue.queued(), 0, "the overflow is discarded, not carried");
+    }
+
+    /// A queue nobody installed stays inert — the default policy behaves exactly
+    /// as it did before #172 for every non-harness construction site.
+    #[tokio::test]
+    async fn a_policy_without_a_shared_queue_still_decides_normally() {
+        let p = policy("supervised", &[], None);
+        assert!(matches!(
+            p.check(&request("send_email", serde_json::json!({}))).await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
     }
 }

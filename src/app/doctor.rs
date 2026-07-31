@@ -82,6 +82,13 @@ fn value_of(cfg: &RuntimeConfig, field: &str) -> String {
         "tinyplace_api_url" => cfg.tinyplace_api_url.clone(),
         "github_token" => redacted(&cfg.github_token).to_string(),
         "tinyhumans_credential" => redacted(&cfg.tinyhumans_credential).to_string(),
+        // A path, not a secret — printing it is how an operator confirms the pod
+        // was handed a projected identity at all.
+        "tinyhumans_token_file" => cfg
+            .tinyhumans_token_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "unset".into()),
         other => format!("<unknown field {other}>"),
     }
 }
@@ -96,11 +103,15 @@ const FIELDS: &[&str] = &[
     "tinyplace_api_url",
     "github_token",
     "tinyhumans_credential",
+    "tinyhumans_token_file",
 ];
+
+/// The name of the derived row naming the active credential tier.
+const CREDENTIAL_SOURCE_FIELD: &str = "credential_source";
 
 /// Builds a [`DoctorReport`] from resolved config and its provenance.
 pub fn report(cfg: &RuntimeConfig, prov: &ConfigProvenance) -> DoctorReport {
-    let values = FIELDS
+    let mut values: Vec<DoctorValue> = FIELDS
         .iter()
         .map(|&field| DoctorValue {
             name: field,
@@ -109,13 +120,34 @@ pub fn report(cfg: &RuntimeConfig, prov: &ConfigProvenance) -> DoctorReport {
         })
         .collect();
 
+    // The active tier, spelled out. Two rows above say what is set; this one says
+    // which of them the outbound bearer will actually come from — and it is a
+    // tier name, never a credential.
+    let source = cfg.credential_source();
+    values.push(DoctorValue {
+        name: CREDENTIAL_SOURCE_FIELD,
+        value: source.to_string(),
+        // The derived row inherits the layer of whichever field won the tier.
+        layer: match source {
+            crate::company::CredentialSource::Attested => prov.layer("tinyhumans_token_file"),
+            crate::company::CredentialSource::Static => prov.layer("tinyhumans_credential"),
+            crate::company::CredentialSource::None => None,
+        }
+        .unwrap_or(ConfigLayer::Default)
+        .label(),
+    });
+
     let cycles = DoctorCapability {
         name: "cycles",
         available: cfg.cycles_available(),
         needs: if cfg.cycles_available() {
             String::new()
-        } else if cfg.tinyhumans_credential.is_none() {
-            "needs TINYHUMANS_API_KEY".into()
+        } else if !cfg.credential_available() {
+            format!(
+                "needs {} (hosted) or {}",
+                crate::company::credentials::TOKEN_FILE_ENV,
+                crate::company::credentials::API_KEY_ENV
+            )
         } else {
             format!("needs brain_mode = hosted (currently {})", cfg.brain_mode)
         },
@@ -171,6 +203,15 @@ mod test {
             .expect("capability present")
     }
 
+    fn value<'a>(report: &'a DoctorReport, name: &str) -> &'a str {
+        report
+            .values
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.value.as_str())
+            .expect("value present")
+    }
+
     #[test]
     fn cycles_unavailable_without_credential() {
         let env = MapEnv::default();
@@ -179,7 +220,71 @@ mod test {
 
         let cycles = cap(&report, "cycles");
         assert!(!cycles.available);
-        assert_eq!(cycles.needs, "needs TINYHUMANS_API_KEY");
+        assert!(
+            cycles.needs.contains("TINYHUMANS_TOKEN_FILE")
+                && cycles.needs.contains("TINYHUMANS_API_KEY"),
+            "both tiers must be named: {}",
+            cycles.needs
+        );
+        assert_eq!(value(&report, "credential_source"), "none");
+        assert_eq!(value(&report, "tinyhumans_token_file"), "unset");
+    }
+
+    /// The hosted path: a projected token file and no static key. Cycles are
+    /// available, the tier is named `attested`, and the path (not a secret) is
+    /// printed so an operator can confirm the projection landed.
+    #[test]
+    fn projected_token_file_reports_the_attested_tier() {
+        // A real file: the attested tier is selected on the path existing, not on
+        // the variable being set, so a fixture path would report `none` here.
+        let dir = std::env::temp_dir().join(format!("oc-doctor-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "projected-token").unwrap();
+
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            path.to_str().unwrap(),
+        )]);
+        let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
+        let report = report(&cfg, &prov);
+
+        assert!(cap(&report, "cycles").available);
+        assert_eq!(value(&report, "credential_source"), "attested");
+        assert_eq!(value(&report, "tinyhumans_credential"), "missing");
+        assert_eq!(
+            value(&report, "tinyhumans_token_file"),
+            path.to_str().unwrap()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A leftover `TINYHUMANS_TOKEN_FILE` naming an unmounted path must not tell
+    /// an operator the instance is attested — doctor is the surface they check to
+    /// confirm the projection actually landed, so a false `attested` there is
+    /// worse than an honest `none`.
+    #[test]
+    fn a_token_file_that_does_not_exist_does_not_report_attested() {
+        let missing =
+            std::env::temp_dir().join(format!("oc-doctor-absent-{}", crate::ports::generate_id()));
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            missing.to_str().unwrap(),
+        )]);
+        let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
+        let report = report(&cfg, &prov);
+
+        assert!(!cap(&report, "cycles").available);
+        assert_eq!(value(&report, "credential_source"), "none");
+    }
+
+    #[test]
+    fn static_key_reports_the_static_tier() {
+        let env = MapEnv::new([(crate::company::credentials::API_KEY_ENV, "th_secret")]);
+        let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
+        let report = report(&cfg, &prov);
+        assert_eq!(value(&report, "credential_source"), "static");
     }
 
     #[test]

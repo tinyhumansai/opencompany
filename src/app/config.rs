@@ -315,14 +315,45 @@ pub struct RuntimeConfig {
     pub github_token: Option<SecretValue>,
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
     pub tinyhumans_credential: Option<SecretValue>,
+    /// Path to the platform-projected TinyHumans token file
+    /// ([`TOKEN_FILE_ENV`](crate::company::credentials::TOKEN_FILE_ENV)), when the
+    /// platform hands this instance a rotating, audience-bound identity instead of
+    /// a static key. A path, not a secret — safe to print.
+    pub tinyhumans_token_file: Option<PathBuf>,
     /// Resolved `[workspace]` data-dir layout configuration.
     pub workspace: WorkspaceConfig,
 }
 
 impl RuntimeConfig {
-    /// True when hosted cognition can run: hosted mode plus a credential.
+    /// True when hosted cognition can run: hosted mode plus a credential this
+    /// instance can **obtain** — see [`Self::credential_available`].
     pub fn cycles_available(&self) -> bool {
-        self.brain_mode == BrainMode::Hosted && self.tinyhumans_credential.is_some()
+        self.brain_mode == BrainMode::Hosted && self.credential_available()
+    }
+
+    /// Whether a TinyHumans credential can be obtained at all.
+    ///
+    /// The question is "can I get a token?", not "do I hold a secret?": a hosted
+    /// tenant holds nothing and reads a projected file that rotates in place, so
+    /// asking about a stored secret would report a perfectly healthy instance as
+    /// unable to think.
+    pub fn credential_available(&self) -> bool {
+        self.credential_source() != crate::company::CredentialSource::None
+    }
+
+    /// Which tier the credential comes from, for operator-facing output.
+    ///
+    /// Delegates to
+    /// [`TinyhumansTokenSource::source_of_parts`](crate::company::credentials::TinyhumansTokenSource::source_of_parts)
+    /// rather than restating the rule: the projected tier counts only when the
+    /// named path **exists**, so a leftover `TINYHUMANS_TOKEN_FILE` pointing at
+    /// something the runtime never mounted reports the static tier (or `none`)
+    /// instead of claiming an identity this instance cannot present.
+    pub fn credential_source(&self) -> crate::company::CredentialSource {
+        crate::company::credentials::TinyhumansTokenSource::source_of_parts(
+            self.tinyhumans_token_file.as_deref(),
+            self.tinyhumans_credential.is_some(),
+        )
     }
 }
 
@@ -343,6 +374,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "tinyhumans_credential",
                 &redacted(&self.tinyhumans_credential),
             )
+            .field("tinyhumans_token_file", &self.tinyhumans_token_file)
             .finish()
     }
 }
@@ -440,10 +472,20 @@ pub fn resolve(
     let tinyhumans_credential = resolve_opt(
         &mut prov,
         "tinyhumans_credential",
-        env.get("TINYHUMANS_API_KEY"),
+        env.get(crate::company::credentials::API_KEY_ENV),
         config_toml.and_then(|c| c.tinyhumans_api_key.clone()),
     )
     .map(SecretValue);
+
+    // The projected token file is injected by the platform, never written by an
+    // operator, so it has no `config.toml` layer to fall back to.
+    let tinyhumans_token_file = resolve_opt(
+        &mut prov,
+        "tinyhumans_token_file",
+        env.get(crate::company::credentials::TOKEN_FILE_ENV),
+        None,
+    )
+    .map(PathBuf::from);
 
     let workspace = config_toml
         .map(|c| c.workspace.resolve())
@@ -459,6 +501,7 @@ pub fn resolve(
         public_url,
         github_token,
         tinyhumans_credential,
+        tinyhumans_token_file,
         workspace,
     };
     Ok((config, prov))
@@ -673,6 +716,125 @@ mod test {
         assert!(cfg.tinyhumans_credential.is_some());
         assert!(cfg.cycles_available());
         assert_eq!(prov.layer("tinyhumans_credential"), Some(ConfigLayer::Env));
+    }
+
+    /// The hosted path: no static key at all, just a platform-projected token
+    /// file. Cycles must still be available — the instance can *obtain* a token —
+    /// and the source reads `attested`.
+    #[test]
+    fn projected_token_file_alone_enables_cycles() {
+        // The path must actually exist: the projected tier is selected on
+        // existence, not on the variable merely being set.
+        let dir = std::env::temp_dir().join(format!("oc-cfg-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "projected-token").unwrap();
+
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            path.to_str().unwrap(),
+        )]);
+        let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
+
+        assert!(cfg.tinyhumans_credential.is_none(), "no static secret held");
+        assert_eq!(cfg.tinyhumans_token_file.as_deref(), Some(path.as_path()));
+        assert!(cfg.credential_available());
+        assert!(cfg.cycles_available());
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Attested
+        );
+        assert_eq!(prov.layer("tinyhumans_token_file"), Some(ConfigLayer::Env));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The docker case: a leftover `TINYHUMANS_TOKEN_FILE` naming a path nothing
+    /// mounted must NOT report an identity this instance cannot present. Reporting
+    /// `attested` here would also make `cycles_available` true with no obtainable
+    /// bearer, so hosted cognition would be gated on a credential that does not
+    /// exist. Regression test for the config surface disagreeing with
+    /// `TinyhumansTokenSource::from_env`.
+    #[test]
+    fn a_token_file_that_does_not_exist_is_not_attested() {
+        let missing =
+            std::env::temp_dir().join(format!("oc-absent-{}", crate::ports::generate_id()));
+        assert!(!missing.exists(), "fixture path must not exist");
+
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            missing.to_str().unwrap(),
+        )]);
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::None,
+            "an unmounted path must not read as attested"
+        );
+        assert!(!cfg.credential_available());
+        assert!(!cfg.cycles_available());
+    }
+
+    /// Same unmounted path, but a static key is present: the source degrades to
+    /// the static tier rather than to `none`, matching `from_env`'s fallback.
+    #[test]
+    fn a_missing_token_file_degrades_to_the_static_tier() {
+        let missing =
+            std::env::temp_dir().join(format!("oc-absent-{}", crate::ports::generate_id()));
+        let env = MapEnv::new([
+            (
+                crate::company::credentials::TOKEN_FILE_ENV,
+                missing.to_str().unwrap(),
+            ),
+            (crate::company::credentials::API_KEY_ENV, "th_static"),
+        ]);
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Static
+        );
+        assert!(cfg.credential_available());
+    }
+
+    /// Precedence: a projected file that exists outranks a leftover static key.
+    #[test]
+    fn projected_file_outranks_a_static_key_for_the_source() {
+        let dir = std::env::temp_dir().join(format!("oc-cfg-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "projected-token").unwrap();
+
+        let env = MapEnv::new([
+            (
+                crate::company::credentials::TOKEN_FILE_ENV,
+                path.to_str().unwrap(),
+            ),
+            (crate::company::credentials::API_KEY_ENV, "th_static"),
+        ]);
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Attested
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Docker development keeps working on the static tier alone.
+        let static_only = MapEnv::new([(crate::company::credentials::API_KEY_ENV, "th_static")]);
+        let (cfg, _) = resolve(&static_only, None, &default_manifest()).unwrap();
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Static
+        );
+
+        // Neither tier configured → nothing obtainable, no cycles.
+        let (cfg, _) = resolve(&MapEnv::default(), None, &default_manifest()).unwrap();
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::None
+        );
+        assert!(!cfg.credential_available());
     }
 
     #[test]

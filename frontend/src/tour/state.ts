@@ -1,8 +1,8 @@
 // Product-tour first-run state.
 //
 // The console has no per-user preferences field on the backend yet
-// (`UserRecord` carries none), so — exactly like the workspace and inbox
-// surfaces (`lib/workspace.ts`, `lib/inbox.ts`) — we persist "has seen the
+// (`UserRecord` carries none), so — exactly like the workspace surface
+// (`lib/workspace.ts`) — we persist "has seen the
 // tour" in localStorage, keyed per company. A backend `UserRecord` flag for
 // cross-device memory is a named follow-up, out of this v1's scope.
 

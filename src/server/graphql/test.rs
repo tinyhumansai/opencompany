@@ -242,6 +242,7 @@ async fn chat_history_finds_agent_replies_under_general_and_main() {
         .append(
             runtime.id(),
             crate::ports::types::CompanyEvent::AgentReply {
+                task_id: None,
                 chat_id: "General".to_string(),
                 agent_id: "maya".to_string(),
                 text: "canonical id".to_string(),
@@ -255,6 +256,7 @@ async fn chat_history_finds_agent_replies_under_general_and_main() {
         .append(
             runtime.id(),
             crate::ports::types::CompanyEvent::AgentReply {
+                task_id: None,
                 chat_id: "main".to_string(),
                 agent_id: "maya".to_string(),
                 text: "console default-thread id".to_string(),
@@ -320,6 +322,7 @@ async fn tasks_page_reflects_upserts_and_column_filter() {
                 assignee: "maya".into(),
                 updated_at_millis: 1_700_000_000_000,
                 origin_chat_id: None,
+                parent_task_id: None,
             },
         )
         .await

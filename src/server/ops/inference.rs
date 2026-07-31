@@ -27,6 +27,7 @@ use crate::company::inference::{
 };
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
+use crate::ports::UsageMetering;
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
 
@@ -63,6 +64,20 @@ struct InferenceStatusDto {
     source: String,
     /// Whether an outbound credential is stored — never the credential itself.
     key_configured: bool,
+    /// The cognition path this company actually booted onto: `harness` (live
+    /// local inference), `hosted` (Medulla), `sidecar`, `echo` (offline — no
+    /// inference at all), or `custom`.
+    ///
+    /// Config resolving to a provider does **not** guarantee the harness path: a
+    /// build without the `openhuman` feature, or a config that fails to resolve at
+    /// boot, silently falls back to the hosted/echo brain. Reporting what the
+    /// runtime actually holds is the only honest answer (issue #174).
+    cognition: String,
+    /// Where this path's inference usage is metered: `perTurn` (the harness meters
+    /// each turn), `perCycle` (the runtime meters what the cycle reports), or
+    /// `none` (nothing to meter — the echo path runs no model, so a zero Usage
+    /// reading is the truth rather than a missing hook).
+    usage_metering: UsageMetering,
 }
 
 /// A mutating response: the resulting status plus the switch reminder.
@@ -111,6 +126,8 @@ async fn effective_status(runtime: &CompanyRuntime) -> Result<InferenceStatusDto
     let decl = resolve_effective(runtime.id(), &manifest, None, runtime.secrets().as_ref())
         .await
         .map_err(ApiError)?;
+    // What the company actually booted onto, not what the config implies.
+    let cognition = runtime.cognition();
     Ok(match decl {
         Some(d) => InferenceStatusDto {
             provider: d.provider.clone(),
@@ -119,6 +136,8 @@ async fn effective_status(runtime: &CompanyRuntime) -> Result<InferenceStatusDto
             models: d.models.clone(),
             source: source_label(d.source).to_string(),
             key_configured: d.key_configured(),
+            cognition: cognition.path.to_string(),
+            usage_metering: cognition.metering,
         },
         None => InferenceStatusDto {
             provider: "managed".to_string(),
@@ -127,6 +146,8 @@ async fn effective_status(runtime: &CompanyRuntime) -> Result<InferenceStatusDto
             models: BTreeMap::new(),
             source: "managed".to_string(),
             key_configured: false,
+            cognition: cognition.path.to_string(),
+            usage_metering: cognition.metering,
         },
     })
 }

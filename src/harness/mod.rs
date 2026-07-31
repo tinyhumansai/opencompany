@@ -47,6 +47,7 @@ pub mod memory_loop;
 pub mod orchestrator;
 pub mod policy;
 pub mod provider;
+pub mod run_turn;
 pub mod skills;
 pub mod steer;
 pub mod steps;
@@ -74,7 +75,7 @@ use crate::error::OpenCompanyError;
 use crate::harness::cost::{TurnUsage, record_turn_cost};
 use crate::harness::mcp_probe::McpFailureQueue;
 use crate::harness::orchestrator::DelegationQueue;
-use crate::harness::policy::ApprovalPolicy;
+use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::types::{CompanyId, CompanyRecord, OverlayAgent, TurnStep};
 use crate::ports::{
@@ -170,6 +171,14 @@ pub struct HarnessDeps {
     /// cheap-shared-handle pattern as [`Self::delegations`]; every string it
     /// carries is scrubbed at the source. Default is an empty queue.
     pub mcp_failures: McpFailureQueue,
+    /// The shared approval-request queue every agent's [`ApprovalPolicy`] pushes
+    /// a `RequireApproval` decision onto and the [`HarnessBrain`] drains after a
+    /// turn, parking each request through
+    /// [`CycleHost::park_effect`](crate::ports::brain::CycleHost::park_effect)
+    /// so it reaches the operator's Approvals page (issue #172). Same
+    /// cheap-shared-handle pattern as [`Self::delegations`]; the default is an
+    /// empty queue, which simply means nothing is ever parked.
+    pub approval_requests: ApprovalRequestQueue,
     /// The company's [`SecretStore`], so [`HarnessPool::ensure`] can **re-resolve**
     /// the effective MCP server set on each call and rebuild the roster when a
     /// console add/remove/enable-toggle changes it — the MCP-freshness fix (a
@@ -219,13 +228,13 @@ pub struct HarnessDeps {
     pub media: Option<toolbelt::MediaBackend>,
     /// The per-tenant Composio configuration (issue #110). `None` (the default
     /// at every construction site) fails closed — no Composio tools are wired.
-    /// [`HarnessPool::ensure`] re-resolves it from the [`SecretStore`] under
-    /// [`composio::TOKEN_KEY`](crate::harness::composio::TOKEN_KEY) each turn
-    /// (folded into the roster fingerprint) so a console token set/rotate takes
-    /// effect next turn with no restart. Only wired when a company **explicitly**
-    /// grants `composio` **and** a non-empty token is stored; the token has no
-    /// env fallback, so an absent token means no tools (never a borrowed
-    /// identity).
+    /// [`HarnessPool::ensure`] re-resolves it each turn (folded into the roster
+    /// fingerprint) so a console token set/rotate takes effect next turn with no
+    /// restart. Only wired when a company **explicitly** grants `composio` **and**
+    /// a credential can be obtained: the company's own token under
+    /// [`composio::TOKEN_KEY`](crate::harness::composio::TOKEN_KEY) if it has one,
+    /// else this instance's platform identity. With neither, no tools are wired —
+    /// never a borrowed identity.
     pub composio: Option<composio::TenantComposio>,
     /// Issue #111 — the shared registry of in-flight, steerable runs. The
     /// [`HarnessBrain`] registers a dispatched task / desk delegation here before
@@ -708,12 +717,16 @@ impl HarnessPool {
     /// secret store on this axis; others resolve to `None` (no tools). With no
     /// secret store wired this degrades to the static [`HarnessDeps::composio`].
     ///
-    /// The token has no env fallback — an absent/empty secret yields `None` (fail
-    /// closed). The backend URL resolves from
-    /// [`composio::COMPOSIO_BACKEND_URL_ENV`], then the tenant API base
-    /// [`composio::TINYHUMANS_API_URL_ENV`], then the prod default — read
-    /// process-globally so a live re-resolution keeps the override even when no
-    /// token was stored at boot.
+    /// Resolution prefers the company's own stored token and falls back to this
+    /// instance's platform identity; with neither it yields `None` (fail closed).
+    /// Both the backend URL (from [`composio::COMPOSIO_BACKEND_URL_ENV`], then the
+    /// tenant API base [`composio::TINYHUMANS_API_URL_ENV`], then the prod
+    /// default) and the platform identity are read process-globally here, so a
+    /// live re-resolution keeps them even when nothing was stored at boot.
+    ///
+    /// Re-deriving the token source every turn costs nothing — building it reads
+    /// no file — and the roster that keeps it holds one instance for its whole
+    /// lifetime, so its rotation cache still works.
     async fn resolve_composio(
         &self,
         company: &CompanyRecord,
@@ -735,6 +748,7 @@ impl HarnessPool {
                     toolkits,
                     url,
                     api_url,
+                    crate::company::TinyhumansTokenSource::from_env(&env).map(std::sync::Arc::new),
                 )
                 .await
             }
@@ -1182,7 +1196,8 @@ pub(crate) fn build_roster(
         Vec::with_capacity(company.manifest.agents.len() + company.overlay_agents.len());
 
     for manifest_agent in &company.manifest.agents {
-        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily)
+            .with_requests(deps.approval_requests.clone());
         let is_orchestrator = orchestrator.as_deref() == Some(manifest_agent.id.as_str());
         let grants = agent_effective_grants(allow, &manifest_agent.tools);
         let agent = build::build_agent(
@@ -1218,7 +1233,8 @@ pub(crate) fn build_roster(
         let manifest_agent = overlay_agent_to_manifest(overlay);
         // No per-teammate budget cap or cognition-tier hint in v1 — see
         // `overlay_agent_to_manifest`.
-        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily);
+        let agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily)
+            .with_requests(deps.approval_requests.clone());
         let grants = agent_effective_grants(allow, &manifest_agent.tools);
         let agent = build::build_agent(
             &company.id,
@@ -1448,6 +1464,7 @@ description = "Builds the product."
                 delegations: DelegationQueue::default(),
                 workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
                 mcp_failures: McpFailureQueue::default(),
+                approval_requests: ApprovalRequestQueue::default(),
                 secrets: None,
                 web_allowed_domains: Vec::new(),
                 capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1506,6 +1523,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1789,6 +1807,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -1944,6 +1963,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: Some(secrets.clone()),
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -2251,6 +2271,7 @@ description = "Builds the product."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -2400,6 +2421,7 @@ description = "Sets direction."
             delegations: DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
