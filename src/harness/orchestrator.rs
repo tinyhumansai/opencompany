@@ -724,7 +724,7 @@ impl Tool for ReviewTaskTool {
         });
         Ok(match decision {
             ReviewDecision::Approve => ToolResult::success(format!(
-                "Approved card {task_id}; it stays in review pending the done transition."
+                "Approved card {task_id}; it is complete and has moved to done."
             )),
             ReviewDecision::Revise => ToolResult::success(format!(
                 "Sent card {task_id} back to the backlog for another pass."
