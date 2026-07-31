@@ -17,13 +17,46 @@ to a `Brain` and services the brain's callbacks through a `CycleHost`.
 pub trait Brain: Send + Sync {
     async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost)
         -> Result<CycleResult>;
+
+    /// How this brain does cognition and where its usage is metered.
+    /// Defaults to an injected brain: per-cycle metering, unknown provider.
+    fn cognition(&self) -> Cognition { Cognition::default() }
 }
 
+/// Metering + diagnosis descriptor for a cognition path (issue #174).
+pub struct Cognition {
+    /// `harness` | `hosted` | `sidecar` | `echo` | `custom`.
+    pub path: &'static str,
+    /// Provider slug the path's cycle usage is metered under.
+    pub provider: &'static str,
+    pub metering: UsageMetering,
+}
+
+pub enum UsageMetering {
+    /// The path meters each agent turn itself (the openhuman harness) and MUST
+    /// report a zero `CycleResult::token_usage`, or its spend is double-counted.
+    PerTurn,
+    /// `CycleRunner` meters whatever the cycle reports (hosted Medulla reads it
+    /// off the `orch:usage` frame).
+    PerCycle,
+    /// No model runs on this path (the echo brain) — a zero Usage reading is the
+    /// truth, not a missing hook.
+    None,
+}
+```
+
+`CycleRunner` **enforces** both non-`PerCycle` arms: a path that declares
+`PerTurn` or `None` and then reports non-zero cycle usage is warned about and
+dropped, never metered. Only `PerCycle` reaches the meter.
+
+```rust
 /// Callbacks the brain makes into the host mid-cycle.
 pub trait CycleHost: Send + Sync {
     async fn call_tool(&self, call: ToolCall) -> Result<ToolResult>;
     async fn context_op(&self, op: ContextOp) -> Result<ContextOpResult>;
     async fn emit_effect(&self, effect: Effect) -> Result<EffectDisposition>;
+    /// Parks an already-decided effect for approval, without re-evaluating it.
+    async fn park_effect(&self, effect: Effect) -> Result<ApprovalId>;
 }
 
 pub enum EffectDisposition {
@@ -33,9 +66,20 @@ pub enum EffectDisposition {
 }
 ```
 
+`emit_effect` submits an effect for a **decision** — the gate evaluates it and
+executes, parks, or denies it. `park_effect` is for a brain that hosts its own
+policy layer and has **already** decided: the harness brain's openhuman
+`ApprovalPolicy` blocks a gated tool call inside the agent turn, and the
+projected call is parked as-is so the operator can see and resolve it. Passing
+it back through `emit_effect` would re-decide it against the coarser
+`ApprovalGate` taxonomy and quietly drop it (issue #172).
+
 `CycleRequest` carries `{cycle_id, company_id, events, compressed_history,
 roster, context_index}`; `CycleResult` carries channel responses, new
-compressed traces, ledger deltas, and token usage. Implementations:
+compressed traces, ledger deltas, and `token_usage` — tokens **and** cost, which
+`CycleRunner` meters onto the `UsageMeter` + ledger for every path that is not
+`PerTurn`-metered (issue #174), so hosted/sidecar cognition is accounted for and
+not only the openhuman harness. Implementations:
 `HostedMedullaBrain` (default — see
 [integrations/medulla.md](../integrations/medulla.md)), `StubBrain`
 (single TinyAgents call, offline tests), `SidecarBrain` (feature `sidecar`),
@@ -80,7 +124,28 @@ pub trait EventLog: Send + Sync {
 graph was authored + enabled via the console `POST …/workflows` route or the
 orchestrator's `create_workflow` tool; journaled best-effort after persist),
 `TaskSteered` (an operator paused, cancelled, or redirected an in-flight task
-or delegation).
+or delegation), `DeskTaskCompleted` (a dispatched board task finished its run —
+the terminal anchor a per-task timeline ends on; "completed" means the run
+stopped, not that it succeeded, and `column` carries where the card landed).
+
+### Per-task event correlation (issue #185)
+
+The journal is company-scoped, so the events a dispatch *produces* cannot be
+filtered back to their task by shape alone. `AgentReply` and `McpCallFailed`
+therefore carry an optional `task_id`, stamped by the harness when the
+producing turn ran inside a `TaskDispatched` cycle and absent for an ordinary
+chat turn. Together with the `TaskDispatched` / `DeskTaskCompleted` anchors,
+that is what `GET …/tasks/{task_id}` filters on to assemble a task's timeline.
+
+Both fields are additive — `#[serde(default, skip_serializing_if = …)]` — so
+every already-persisted event loads unchanged and an untagged event serializes
+byte-for-byte as it did before the field existed. No stored log needs
+migrating, and the cross-backend export/import round-trip is unaffected.
+
+`TaskRecord` gains `parent_task_id` on the same contract, recording the
+task-to-task edge that `origin_chat_id` (a *conversation*, shared by every
+sibling spawned in that thread, and absent entirely on a board-native card)
+cannot express. It is the parent half of the Task Detail screen's lineage.
 
 ## MemoryStore
 
@@ -310,7 +375,19 @@ pub trait UsageMeter: Send + Sync {
 ```
 
 `UsageSample` records one metered event (`SampleKind::Inference` tokens or
-`SampleKind::OauthCall`). **Retention:** backends evict samples older than
+`SampleKind::OauthCall`). **Writers** — three, and they do **not** share failure
+semantics:
+
+| Writer | Called | On write failure |
+| --- | --- | --- |
+| `metering::inference::record_inference_usage` (always compiled) | per cycle by `CycleRunner`, for every cognition path that is not `PerTurn`-metered | logs and swallows — returns `()`, so the cycle still succeeds |
+| `metering::oauth::record_oauth_call` | per connected-tool call | logs and swallows — returns `()` |
+| `harness::cost::record_turn_cost` | per turn by the openhuman harness's cost hook | **propagates** — returns `Result<()>` and `HarnessPool::run_inner` applies `?`, so a ledger or meter failure fails the turn |
+
+The per-cycle and OAuth paths hold "accounting never fails the work it accounts
+for"; the per-turn harness path deliberately does not, because it writes the
+`inference.spend` ledger entry in the same call and a silently dropped ledger
+write is a money bug. **Retention:** backends evict samples older than
 **90 days** (`RETENTION_DAYS`, the console's maximum `D90` window) on write,
 anchored to the newest observed sample for deterministic eviction. Samples are
 non-secret accounting rows; money still resolves from the ledger and `[budget]`.

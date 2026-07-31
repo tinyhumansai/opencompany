@@ -38,6 +38,25 @@
 //! (needs a backend), search tools (need engine keys), Node/NPM exec (need a
 //! managed-runtime bootstrap), and OpenHuman's sub-agent spawn tools (global
 //! registry + budget bypass — unsafe under multi-tenancy).
+//!
+//! **Contract — the dispatched company agent is a constrained, metered
+//! derivative of an OpenHuman agent** (pinned by the contract tests in
+//! [`build`](crate::harness::build)). A dispatched desk/roster agent receives
+//! the curated exec subset above (`shell` / `code` / `web`) plus its intrinsic
+//! memory / file / MCP / skill tools — and **nothing more**. Two invariants
+//! hold for every dispatched agent and are locked by test so a future change
+//! cannot silently widen or narrow the belt:
+//!
+//! * **Depth cap = 1 — no re-delegation.** The orchestrator's delegation tools
+//!   (`query_company` / `spawn_task` / `delegate_to_desk`, plus the other
+//!   orchestrator-only roster/workflow tools) are wired ONLY onto the company
+//!   orchestrator; a dispatched agent never receives them, so a dispatched turn
+//!   cannot fan work out further (the "no sub-agent re-delegation in v1"
+//!   invariant, issue #178).
+//! * **Deferred surfaces stay absent.** Raw browser automation, web-search,
+//!   Node/NPM exec, OpenHuman sub-agent spawn tools (the `subagent` namespace is
+//!   reserved but EMPTY in v1), skill *execution*, the raw memory-tree tool
+//!   surface, and `forget` are all out of a dispatched belt.
 
 use std::path::Path;
 use std::sync::Arc;

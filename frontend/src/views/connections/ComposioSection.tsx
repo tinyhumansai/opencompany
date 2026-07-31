@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, KeyRound, Loader2, LogIn, Plug, Save, Trash2 } from "lucide-react";
+import { Check, KeyRound, Loader2, LogIn, Plug, Save, ShieldCheck, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
@@ -38,13 +38,25 @@ function toolkitLabel(slug: string): string {
 }
 
 /**
- * Per-tenant Composio connection management (issue #110, Cell D). Two ways to
- * connect: a per-provider OAuth "Sign in" list driven by the granted toolkits
- * (Composio runs the hosted OAuth; we open it in a tab and poll until the
- * toolkit reports connected), and — as a fallback — a WRITE-ONLY token input
- * (the per-tenant OAuth bearer is the entire isolation lever, so it is stored
- * and never shown again). A set/clear takes effect on the agents' next turn, no
- * restart. Hidden entirely when the feature is not in the build.
+ * Per-tenant Composio connection management (issue #110, Cell D).
+ *
+ * Two layers, and they are independent:
+ *
+ * 1. **Which credential this company reaches Composio with**, reported as
+ *    `credentialSource`:
+ *    - `attested` (hosted) — the instance already holds a platform identity, so
+ *      there is nothing to paste and nothing stored here. A company that wants
+ *      to use its OWN Composio account can still override.
+ *    - `static` — a token this company pasted, or a static instance key.
+ *    - `none` — no credential can be obtained, so there is nothing to authorize
+ *      against and agents get no Composio tools.
+ * 2. **Which providers are connected**, via a per-provider OAuth "Sign in" list
+ *    driven by the granted toolkits. Composio runs the hosted OAuth; we open it
+ *    in a tab and poll until the toolkit reports connected.
+ *
+ * The pasted token is WRITE-ONLY: stored and never shown again. A set/clear
+ * takes effect on the agents' next turn, no restart. Hidden entirely when the
+ * feature is not in the build.
  */
 export function ComposioSection({ client, company }: Props) {
   const [load, setLoad] = useState<"loading" | "ready" | "unavailable">("loading");
@@ -55,6 +67,9 @@ export function ComposioSection({ client, company }: Props) {
   const [connected, setConnected] = useState<Record<string, boolean>>({});
   // toolkit slug currently mid-sign-in (open tab + poll).
   const [signingIn, setSigningIn] = useState<string | null>(null);
+  // Only meaningful in the attested state, where the paste card is an override
+  // rather than the way in.
+  const [showOverride, setShowOverride] = useState(false);
 
   const requestGeneration = useRef(0);
   const pollTimers = useRef<Record<string, number>>({});
@@ -70,8 +85,9 @@ export function ComposioSection({ client, company }: Props) {
 
   const refreshConnections = useCallback(
     async (s: ComposioStatus) => {
-      // Connections need a configured token; skip the call otherwise (it 409s).
-      if (!s.tokenConfigured || s.toolkits.length === 0) {
+      // Listing connections needs *a* credential — any tier. With none there is
+      // nothing to authorize against, and the call 409s.
+      if (s.credentialSource === "none" || s.toolkits.length === 0) {
         setConnected({});
         return;
       }
@@ -104,6 +120,7 @@ export function ComposioSection({ client, company }: Props) {
   useEffect(() => {
     setStatus(null);
     setConnected({});
+    setShowOverride(false);
     setLoad("loading");
     void refresh();
   }, [refresh]);
@@ -131,7 +148,10 @@ export function ComposioSection({ client, company }: Props) {
       setStatus(res.status);
       setToken("");
       setConnected({});
+      // Clearing an override falls back to whatever tier remains — re-probe
+      // rather than assuming there is no credential left.
       toast.success("Composio token cleared.");
+      void refreshConnections(res.status);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "Could not clear the token.");
     } finally {
@@ -182,7 +202,14 @@ export function ComposioSection({ client, company }: Props) {
 
   if (load === "unavailable") return null;
 
+  const attested = status?.credentialSource === "attested";
+  const byoToken = status?.credentialSource === "static";
+  // No credential of any tier: there is nothing to authorize a provider against.
+  const noCredential = status?.credentialSource === "none";
   const showProviders = load === "ready" && status !== null && status.toolkits.length > 0;
+  // In the attested state the paste card is a deliberate override; everywhere
+  // else it is the only way to connect, so it is always on screen.
+  const showTokenCard = !attested || showOverride || byoToken;
 
   return (
     <section className="space-y-3">
@@ -193,9 +220,9 @@ export function ComposioSection({ client, company }: Props) {
         </h3>
       </div>
       <p className="text-sm text-muted-foreground">
-        Give your agents Gmail, Slack &amp; GitHub via Composio. Sign in per provider below, or paste
-        this company&apos;s Composio OAuth token directly. Either way, the connection takes effect on
-        the next turn, no restart.
+        {attested
+          ? "Give your agents Gmail, Slack & GitHub via Composio. This company is linked through this instance's own cluster identity — there is no key to copy and nothing stored here. Sign in per provider below."
+          : "Give your agents Gmail, Slack & GitHub via Composio. Paste this company's Composio OAuth token — it is the identity the backend bills and isolates, stored securely and never shown again — then sign in per provider below. A change takes effect on the next turn, no restart."}
       </p>
 
       {load === "loading" ? (
@@ -207,12 +234,16 @@ export function ComposioSection({ client, company }: Props) {
               <Badge variant={status.granted ? "secondary" : "outline"}>
                 {status.granted ? "granted" : "not granted"}
               </Badge>
-              {status.tokenConfigured ? (
+              {attested ? (
+                <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
+                  <ShieldCheck className="size-3" /> Linked via cluster identity — nothing stored
+                </span>
+              ) : byoToken ? (
                 <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
                   <Check className="size-3" /> token set
                 </span>
               ) : (
-                <span className="text-xs text-muted-foreground">no token yet</span>
+                <span className="text-xs text-muted-foreground">not connected</span>
               )}
             </div>
           )}
@@ -229,10 +260,10 @@ export function ComposioSection({ client, company }: Props) {
             <Card>
               <CardContent className="space-y-2 py-4">
                 <p className="text-xs font-medium text-muted-foreground">Sign in per provider</p>
-                {!status.tokenConfigured && (
+                {noCredential && (
                   <p className="rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
-                    Set the Composio token below first — it is the per-tenant identity the sign-in
-                    flow authorizes against.
+                    No Composio credential is available for this company yet, so there is nothing to
+                    authorize against. Paste a token below first.
                   </p>
                 )}
                 <ul className="divide-y divide-border">
@@ -250,9 +281,7 @@ export function ComposioSection({ client, company }: Props) {
                           <Button
                             size="sm"
                             variant="outline"
-                            disabled={
-                              signingIn !== null || !status.tokenConfigured
-                            }
+                            disabled={signingIn !== null || noCredential}
                             onClick={() => void signIn(toolkit)}
                           >
                             {isSigningIn ? (
@@ -271,53 +300,64 @@ export function ComposioSection({ client, company }: Props) {
             </Card>
           )}
 
-          <Card>
-            <CardContent className="space-y-4 py-4">
-              <div className="space-y-1">
-                <Label htmlFor="composio-token" className="text-xs">
-                  Composio token (fallback){" "}
-                  {status?.tokenConfigured ? "— set, leave blank to keep" : ""}
-                </Label>
-                <p className="text-xs text-muted-foreground">
-                  Paste this company&apos;s Composio OAuth token directly if you already have one. It
-                  is stored securely and never shown again.
-                </p>
-                <Input
-                  id="composio-token"
-                  type="password"
-                  autoComplete="off"
-                  placeholder="paste the company's Composio OAuth token"
-                  value={token}
-                  onChange={(e) => setToken(e.target.value)}
-                />
-                {status && (
-                  <p className="truncate text-xs text-muted-foreground">{status.backendUrl}</p>
-                )}
-              </div>
+          {attested && !showTokenCard && (
+            <Button variant="outline" size="sm" onClick={() => setShowOverride(true)}>
+              <KeyRound className="size-4" />
+              Use your own Composio account instead
+            </Button>
+          )}
 
-              <div className="flex items-center gap-2">
-                <Button disabled={busy !== null || !token.trim()} onClick={() => void save()}>
-                  {busy === "save" ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Save className="size-4" />
+          {showTokenCard && (
+            <Card>
+              <CardContent className="space-y-4 py-4">
+                {attested && (
+                  <p className="rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+                    Optional. A token set here overrides the instance identity for this company only
+                    — use it when the company has its own Composio account. Clear it to go back to
+                    the cluster identity.
+                  </p>
+                )}
+                <div className="space-y-1">
+                  <Label htmlFor="composio-token" className="text-xs">
+                    Composio token {byoToken ? "— set (paste a new value to rotate)" : ""}
+                  </Label>
+                  <Input
+                    id="composio-token"
+                    type="password"
+                    autoComplete="off"
+                    placeholder="paste the company's Composio OAuth token"
+                    value={token}
+                    onChange={(e) => setToken(e.target.value)}
+                  />
+                  {status && (
+                    <p className="truncate text-xs text-muted-foreground">{status.backendUrl}</p>
                   )}
-                  Save token
-                </Button>
-                {status?.tokenConfigured && (
-                  <Button variant="outline" disabled={busy !== null} onClick={() => void clear()}>
-                    {busy === "clear" ? (
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <Button disabled={busy !== null || !token.trim()} onClick={() => void save()}>
+                    {busy === "save" ? (
                       <Loader2 className="size-4 animate-spin" />
                     ) : (
-                      <Trash2 className="size-4" />
+                      <Save className="size-4" />
                     )}
-                    Clear
+                    Save token
                   </Button>
-                )}
-                <KeyRound className="ml-auto size-4 text-muted-foreground" />
-              </div>
-            </CardContent>
-          </Card>
+                  {byoToken && (
+                    <Button variant="outline" disabled={busy !== null} onClick={() => void clear()}>
+                      {busy === "clear" ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="size-4" />
+                      )}
+                      Clear
+                    </Button>
+                  )}
+                  <KeyRound className="ml-auto size-4 text-muted-foreground" />
+                </div>
+              </CardContent>
+            </Card>
+          )}
         </>
       )}
     </section>

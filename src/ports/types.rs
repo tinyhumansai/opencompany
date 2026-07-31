@@ -310,6 +310,23 @@ pub enum CompanyEvent {
         /// scrubbed shape (see [`crate::harness::steps`]).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         steps: Vec<TurnStep>,
+        /// The board task this reply was produced by, when it came out of a
+        /// [`TaskDispatched`](Self::TaskDispatched) cycle rather than a chat
+        /// turn (issue #185).
+        ///
+        /// This is the correlation key the per-task timeline filters on: the
+        /// journal is company-scoped, so without it a dispatch's reply cannot
+        /// be told apart from every other desk reply in the log.
+        ///
+        /// `None` for an ordinary chat reply and for every event journaled
+        /// before this field existed. Additive in exactly the same way as
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by` / `chat`:
+        /// `#[serde(default)]` is what lets an already-persisted log load, and
+        /// `skip_serializing_if` is what keeps an untagged reply serializing
+        /// byte-for-byte as it did before this field existed, so no stored
+        /// record needs migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// The Operator deleted a durable memory fact. Journaled for the audit trail
     /// per the Operator-rights section of `docs/spec/company-brain/memory.md`.
@@ -342,6 +359,16 @@ pub enum CompanyEvent {
         status: String,
         /// A short, scrubbed, operator-facing message.
         message: String,
+        /// The board task whose dispatch turn made the failing call, when the
+        /// failure happened inside a [`TaskDispatched`](Self::TaskDispatched)
+        /// cycle (issue #185). Lets a task's failed tool calls be filtered out
+        /// of the company-scoped journal onto its own timeline.
+        ///
+        /// `None` for a failure raised during a chat turn and for every event
+        /// journaled before this field existed. Same additive contract as
+        /// [`AgentReply`](Self::AgentReply)'s `task_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// A new workflow graph was authored and enabled (issue #112), from either
     /// the console `POST …/workflows` route or the orchestrator's
@@ -384,6 +411,40 @@ pub enum CompanyEvent {
         /// mirroring [`OperatorMessage`](Self::OperatorMessage)'s `by`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
+    },
+    /// A dispatched board task finished its run (issue #185) — the terminal
+    /// anchor a per-task timeline ends on and a lineage rollup counts.
+    ///
+    /// Journaled by the harness at the end of a
+    /// [`TaskDispatched`](Self::TaskDispatched) cycle, **after** the card's
+    /// landing column has been persisted, so it always records a completed
+    /// run. "Completed" here means *the run stopped*, not *it succeeded*: a
+    /// cancelled, paused, or failed dispatch emits one too, and `column`
+    /// carries where the card actually landed. Without that, a timeline could
+    /// not distinguish "still running" from "finished badly".
+    ///
+    /// This issue only *adds* the event. #171's done-transition can consume
+    /// it; nothing here writes the board column off the back of it.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes.
+    DeskTaskCompleted {
+        /// The completed task card's id.
+        task_id: String,
+        /// The desk / agent that ran it — the resolved responder, not the
+        /// card's raw `assignee` (which may name nobody on the roster).
+        desk: String,
+        /// The run's operator-facing result text.
+        ///
+        /// This is the agent's own reply (or a short `dispatch failed: …` /
+        /// cancellation line), which is the same text already written into the
+        /// card's note — never raw tool output, arguments, or call ids.
+        output: String,
+        /// The board column the card landed in: `in_review` on a normal
+        /// finish, `backlog` on a failure or cancellation, `paused` on a
+        /// pause. Lets a reader tell a successful run from a stopped one
+        /// without re-deriving it from `output`.
+        column: String,
     },
 }
 
@@ -564,13 +625,46 @@ pub struct LedgerEntry {
     pub memo: String,
 }
 
-/// Token accounting for a cycle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Token **and cost** accounting for a cycle — what the runtime meters onto the
+/// Usage surface after the brain returns.
+///
+/// The cost fields carry no `Eq` (they are `f64`), so this type is `PartialEq`
+/// only. Both are `#[serde(default)]` so a peer that predates them still
+/// decodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Input tokens consumed.
     pub input: u64,
     /// Output tokens produced.
     pub output: u64,
+    /// Input tokens served from the provider's KV cache.
+    #[serde(default)]
+    pub cached_input: u64,
+    /// Best-available USD cost for the cycle. Zero when the path reports tokens
+    /// but bills elsewhere (the managed `/openai/v1` passthrough echoes no USD).
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+impl TokenUsage {
+    /// Whether the cycle moved no tokens and cost nothing — the guard that keeps
+    /// an idle or offline cycle from writing a meaningless usage sample.
+    ///
+    /// Includes [`Self::cached_input`]: a cache-served pass is real usage even
+    /// if a provider ever reported it without fresh input tokens.
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cached_input == 0 && self.cost_usd == 0.0
+    }
+
+    /// Folds another total into this one — how a brain accumulates the usage of
+    /// several passes into one cycle total. Token counts saturate rather than
+    /// wrap so a bogus peer value can never underflow the meter.
+    pub fn fold(&mut self, other: &TokenUsage) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
+        self.cost_usd += other.cost_usd;
+    }
 }
 
 /// Everything the brain needs to run one cycle.
@@ -1312,6 +1406,90 @@ mod test {
         serde_json::from_str(&json).expect("deserialize")
     }
 
+    // ── Issue #174: cycle usage carries cost, and folds ─────────────────────
+
+    /// A cycle with nothing to report writes nothing, and any single non-zero
+    /// field makes it real usage — including a token-less charge.
+    #[test]
+    fn token_usage_is_zero_only_when_every_field_is() {
+        assert!(TokenUsage::default().is_zero());
+        for usage in [
+            TokenUsage {
+                input: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                output: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                cached_input: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                cost_usd: 0.0001,
+                ..TokenUsage::default()
+            },
+        ] {
+            assert!(!usage.is_zero(), "{usage:?} is real usage");
+        }
+    }
+
+    /// Several model passes in one cycle accumulate into one total.
+    #[test]
+    fn token_usage_folds_passes_together() {
+        let mut total = TokenUsage::default();
+        total.fold(&TokenUsage {
+            input: 100,
+            output: 20,
+            cached_input: 10,
+            cost_usd: 0.01,
+        });
+        total.fold(&TokenUsage {
+            input: 50,
+            output: 5,
+            cached_input: 0,
+            cost_usd: 0.02,
+        });
+        assert_eq!(total.input, 150);
+        assert_eq!(total.output, 25);
+        assert_eq!(total.cached_input, 10);
+        assert!((total.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    /// A bogus peer value must never wrap the meter into a huge or tiny number.
+    #[test]
+    fn token_usage_fold_saturates_instead_of_overflowing() {
+        let mut total = TokenUsage {
+            input: u64::MAX,
+            output: u64::MAX,
+            cached_input: u64::MAX,
+            cost_usd: 0.0,
+        };
+        total.fold(&TokenUsage {
+            input: 10,
+            output: 10,
+            cached_input: 10,
+            cost_usd: 0.0,
+        });
+        assert_eq!(total.input, u64::MAX);
+        assert_eq!(total.output, u64::MAX);
+        assert_eq!(total.cached_input, u64::MAX);
+    }
+
+    /// The cost fields are additive on the wire: a peer that predates them still
+    /// decodes, and an all-zero usage still serializes them for a peer that has
+    /// them.
+    #[test]
+    fn token_usage_decodes_a_payload_without_the_cost_fields() {
+        let legacy: TokenUsage = serde_json::from_str(r#"{"input":7,"output":3}"#).unwrap();
+        assert_eq!(legacy.input, 7);
+        assert_eq!(legacy.output, 3);
+        assert_eq!(legacy.cached_input, 0);
+        assert_eq!(legacy.cost_usd, 0.0);
+        assert_eq!(round_trip(&legacy), legacy);
+    }
+
     /// The `TurnStep` wire shape is camelCase with snake_case enum values:
     /// `{kind, status, label, detail?, elapsedMs?}`. Locks the contract the
     /// console `TurnStep` mirror in `frontend/src/api/types.ts` depends on.
@@ -1406,6 +1584,7 @@ mod test {
 
         // A tool-less reply serializes without the `steps` key.
         let tool_less = CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
             text: "hi".to_string(),
@@ -1416,6 +1595,7 @@ mod test {
 
         // A reply with a timeline round-trips it.
         let with_steps = CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
             text: "done".to_string(),
@@ -1430,6 +1610,76 @@ mod test {
         let back: CompanyEvent =
             serde_json::from_str(&serde_json::to_string(&with_steps).unwrap()).unwrap();
         assert_eq!(back, with_steps);
+    }
+
+    /// #185: the `task_id` correlation key is additive in both directions —
+    /// an event journaled before it existed still loads, and an untagged event
+    /// still serializes byte-for-byte as it did before the field was added.
+    ///
+    /// That second half is the migration-free guarantee: every already-persisted
+    /// `AgentReply` / `McpCallFailed` in every company's log must round-trip
+    /// unchanged, or the cross-backend export/import comparison breaks.
+    #[test]
+    fn task_id_correlation_is_additive_and_omitted_when_absent() {
+        let legacy: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#,
+        )
+        .expect("a pre-task_id AgentReply still loads");
+        match &legacy {
+            CompanyEvent::AgentReply { task_id, .. } => assert!(task_id.is_none()),
+            other => panic!("expected AgentReply, got {other:?}"),
+        }
+
+        // An untagged reply keeps the legacy wire shape exactly.
+        let untagged = CompanyEvent::AgentReply {
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+            task_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).unwrap(),
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#
+        );
+
+        // A dispatch-produced reply carries the key and round-trips.
+        let tagged = CompanyEvent::AgentReply {
+            chat_id: "t-1".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "done".to_string(),
+            steps: Vec::new(),
+            task_id: Some("t-1".to_string()),
+        };
+        let back: CompanyEvent =
+            serde_json::from_str(&serde_json::to_string(&tagged).unwrap()).unwrap();
+        assert_eq!(back, tagged);
+
+        // Same contract on the failure event.
+        let legacy_mcp: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"McpCallFailed","server":"gh","tool":"issues","status":"credential_required","message":"needs auth"}"#,
+        )
+        .expect("a pre-task_id McpCallFailed still loads");
+        match &legacy_mcp {
+            CompanyEvent::McpCallFailed { task_id, .. } => assert!(task_id.is_none()),
+            other => panic!("expected McpCallFailed, got {other:?}"),
+        }
+    }
+
+    /// #185: the dispatch terminal round-trips, and reports where the card
+    /// landed so a stopped run is distinguishable from a successful one.
+    #[test]
+    fn desk_task_completed_round_trips() {
+        let done = CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".to_string(),
+            desk: "ceo".to_string(),
+            output: "shipped".to_string(),
+            column: "in_review".to_string(),
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains(r#""kind":"DeskTaskCompleted""#));
+        let back: CompanyEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, done);
     }
 
     #[test]
@@ -1540,6 +1790,7 @@ mod test {
     #[test]
     fn mcp_call_failed_round_trips_and_is_byte_stable() {
         let event = CompanyEvent::McpCallFailed {
+            task_id: None,
             server: "browserbase".into(),
             tool: "browse".into(),
             status: "tool_call_rejected".into(),

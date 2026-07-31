@@ -252,6 +252,7 @@ mod test {
             assignee: "maya".to_string(),
             updated_at_millis: 0,
             origin_chat_id: None,
+            parent_task_id: None,
         }
     }
 

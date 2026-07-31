@@ -27,11 +27,20 @@
 //! turn onto a [`UsageSample`](crate::ports::UsageSample); WS5 reads the meter
 //! back for the Usage/Finances surfaces. The ledger half writes through the
 //! real [`CompanyStore`] port.
+//!
+//! ## One mapping, two writers (issue #174)
+//!
+//! The sample/ledger shapes and the zero-usage guard live in
+//! [`metering::inference`](crate::metering::inference), which is compiled and
+//! tested by the default CI build; this module only converts [`TurnUsage`] into
+//! the crate-wide [`TokenUsage`] and delegates. That is what keeps the harness's
+//! per-turn metering and the runtime's per-cycle metering (every other cognition
+//! path) from drifting into two different definitions of "usage worth recording".
 
+use crate::metering::inference;
 use crate::ports::CompanyStore;
-use crate::ports::now_millis;
-use crate::ports::types::{CompanyId, LedgerEntry};
-use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
+use crate::ports::types::{CompanyId, LedgerEntry, TokenUsage};
+use crate::ports::usage::{UsageMeter, UsageSample};
 
 /// A turn's token/cost totals — a host-side mirror of openhuman's crate-private
 /// `TurnCost` (see module docs).
@@ -47,6 +56,18 @@ pub struct TurnUsage {
     pub cost_usd: f64,
 }
 
+impl TurnUsage {
+    /// This turn as the crate-wide [`TokenUsage`] the metering seam maps from.
+    fn to_token_usage(self) -> TokenUsage {
+        TokenUsage {
+            input: self.input_tokens,
+            output: self.output_tokens,
+            cached_input: self.cached_input_tokens,
+            cost_usd: self.cost_usd,
+        }
+    }
+}
+
 /// Build the `inference.spend` [`LedgerEntry`] for a turn, or `None` when the
 /// turn cost nothing.
 ///
@@ -55,39 +76,14 @@ pub struct TurnUsage {
 /// must not post a meaningless `$0.00` spend line to Finances. Its tokens are
 /// still recorded through [`usage_sample_for`] on the Usage surface.
 pub fn ledger_entry_for(turn: &TurnUsage, agent_id: &str) -> Option<LedgerEntry> {
-    if turn.cost_usd == 0.0 {
-        return None;
-    }
-    Some(LedgerEntry {
-        at_millis: now_millis(),
-        kind: "inference.spend".to_string(),
-        amount_usd: turn.cost_usd,
-        memo: agent_id.to_string(),
-    })
+    inference::inference_ledger_entry(&turn.to_token_usage(), agent_id)
 }
 
-/// Build the [`UsageSample`] for a turn, or `None` for a zero-usage turn.
+/// Build the [`UsageSample`] for a turn, or `None` for a zero-usage turn — e.g.
+/// one served by the offline [`MockProvider`](super::provider::MockProvider),
+/// whose replies carry no usage.
 pub fn usage_sample_for(turn: &TurnUsage, agent_id: &str, provider: &str) -> Option<UsageSample> {
-    if is_zero_usage(turn) {
-        return None;
-    }
-    Some(UsageSample {
-        at_millis: now_millis(),
-        agent: agent_id.to_string(),
-        provider: provider.to_string(),
-        input_tokens: turn.input_tokens,
-        output_tokens: turn.output_tokens,
-        cached_input_tokens: turn.cached_input_tokens,
-        cost_usd: turn.cost_usd,
-        kind: SampleKind::Inference,
-    })
-}
-
-/// A turn is zero-usage when it moved no tokens and cost nothing — e.g. the
-/// offline [`MockProvider`](super::provider::MockProvider), whose replies carry
-/// no usage. Such a turn writes neither a ledger entry nor a usage sample.
-fn is_zero_usage(turn: &TurnUsage) -> bool {
-    turn.input_tokens == 0 && turn.output_tokens == 0 && turn.cost_usd == 0.0
+    inference::inference_sample(&turn.to_token_usage(), agent_id, provider)
 }
 
 /// Record a completed turn's cost: append the ledger entry (always available)
@@ -118,6 +114,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::ports::types::{CompanyRecord, CompanySummary};
+    use crate::ports::usage::SampleKind;
 
     #[derive(Default)]
     struct RecordingStore {

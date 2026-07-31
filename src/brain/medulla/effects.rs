@@ -114,11 +114,26 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             tool,
             status,
             message,
+            ..
         } => (
             Role::System,
             "mcp".to_string(),
             format!("MCP call to {server}/{tool} failed ({status}): {message}"),
             "mcp.call_failed",
+        ),
+        // The dispatch terminal (#185). `output` is deliberately not wired:
+        // the landing column is what a reader needs here, and the full result
+        // text already rides the task's own timeline.
+        CompanyEvent::DeskTaskCompleted {
+            task_id,
+            desk,
+            column,
+            ..
+        } => (
+            Role::System,
+            "board".to_string(),
+            format!("Task {task_id} finished on {desk} → {column}"),
+            "task.completed",
         ),
         CompanyEvent::WorkflowCreated {
             workflow_id, name, ..

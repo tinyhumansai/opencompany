@@ -22,10 +22,11 @@ with no network dependency:
   idempotent on `(user, counterpart, session, seq)`), `POST /world-diff`, the
   read-surface views, and the Socket.IO frames (`orch:register_tools`,
   `orch:effect:<kind>` with deterministic `callId` = `{cycleId}:{kind}:{index}`,
-  `orch:effect:result`, `orch:tool_call`, `orch:tool_result`).
+  `orch:effect:result`, `orch:tool_call`, `orch:tool_result`, and `orch:usage`
+  with `callId` = `{cycleId}:usage:{index}`).
   `wire::assert_no_model` rejects any request body carrying a `model` field.
 - `medulla::transport` — the `MedullaTransport` seam abstracting the HTTP posts,
-  the per-cycle effect/tool-call stream, and the acks/answers, so the brain
+  the per-cycle effect/tool-call/usage stream, and the acks/answers, so the brain
   never depends on a concrete network client.
 - `medulla::mock` — an in-memory `MockTransport` that scripts cycle frames and
   records brain calls, driving the seam offline in tests.

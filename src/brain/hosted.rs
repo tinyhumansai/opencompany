@@ -13,8 +13,14 @@
 //!   the gate's verdict rather than a silent success.
 //! - Every **tool_call** frame is serviced through [`CycleHost::call_tool`]
 //!   (or [`CycleHost::context_op`] for the context device-tools) and answered.
+//! - Every **usage** frame is folded into the cycle's
+//!   [`TokenUsage`] total. The model runs upstream, so this frame is the only way
+//!   the host can know what a hosted cycle cost; the runtime's cycle loop meters
+//!   whatever lands here onto the Usage/Finances surfaces (issue #174). A cycle
+//!   that carries no usage frame is metered as zero rather than guessed at.
 //! - Frames are deduped on `callId`, matching the at-least-once delivery
-//!   contract, so a replay is handled exactly once.
+//!   contract, so a replay is handled exactly once — including usage reports,
+//!   which would otherwise double-charge.
 //!
 //! Cycle summaries are journaled as [`CompressedTrace`]s, spend effects become
 //! ledger deltas, and notable effects trigger a `POST /world-diff`. The brain
@@ -33,7 +39,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::Result;
-use crate::ports::brain::{Brain, CycleHost};
+use crate::metering::MEDULLA_PROVIDER;
+use crate::ports::brain::{Brain, Cognition, CycleHost, UsageMetering};
 use crate::ports::now_millis;
 use crate::ports::types::{
     CompanyId, CompressedTrace, CycleRequest, CycleResult, EffectDisposition, SecretValue,
@@ -216,6 +223,10 @@ impl Brain for HostedMedullaBrain {
         let mut new_traces = Vec::new();
         let mut ledger_deltas = Vec::new();
         let mut world_notes: Vec<WorldDiffEntry> = Vec::new();
+        // What the hosted side reported this cycle's inference cost. Folded from
+        // `orch:usage` frames; stays zero when the upstream reports none, which
+        // the runtime then meters as nothing rather than as a fake charge.
+        let mut token_usage = TokenUsage::default();
 
         for (index, event) in req.events.iter().enumerate() {
             // Prefer the durable EventLog seq; fall back to the position when a
@@ -266,6 +277,26 @@ impl Brain for HostedMedullaBrain {
                         let answer = self.service_tool_call(host, &call).await?;
                         self.transport.answer_tool_call(answer).await?;
                     }
+                    InboundFrame::Usage(usage) => {
+                        // Deduped like every other frame: delivery is
+                        // at-least-once, and a replayed usage report would
+                        // double-charge the meter and the ledger.
+                        if !seen.insert(usage.call_id.clone()) {
+                            continue;
+                        }
+                        let reported = usage.to_token_usage();
+                        tracing::debug!(
+                            session = %self.session_id,
+                            cycle = %usage.cycle_id,
+                            call_id = %usage.call_id,
+                            input = reported.input,
+                            output = reported.output,
+                            cached_input = reported.cached_input,
+                            cost_usd = reported.cost_usd,
+                            "[medulla] folding a reported usage frame into the cycle total"
+                        );
+                        token_usage.fold(&reported);
+                    }
                 }
             }
 
@@ -289,8 +320,19 @@ impl Brain for HostedMedullaBrain {
             channel_responses,
             new_traces,
             ledger_deltas,
-            token_usage: TokenUsage::default(),
+            token_usage,
         })
+    }
+
+    /// Hosted cognition: the model runs upstream, so usage arrives per cycle on
+    /// the [`USAGE`](super::medulla::wire::USAGE) frame and the runtime meters it
+    /// under [`MEDULLA_PROVIDER`].
+    fn cognition(&self) -> Cognition {
+        Cognition {
+            path: "hosted",
+            provider: MEDULLA_PROVIDER,
+            metering: UsageMetering::PerCycle,
+        }
     }
 }
 

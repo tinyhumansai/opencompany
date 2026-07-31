@@ -17,17 +17,20 @@
 //!
 //! Credentials live apart from the declarations. The outbound key is written to
 //! its own [`KEY_KEY`] secret (write-only via the console) — never inline in the
-//! runtime config blob or the manifest — and is resolved into the
-//! [`InferenceDecl`]'s private field only at build/turn time by
-//! [`resolve_effective`]. Nothing here ever serializes a credential into an API
-//! response, log line, or agent-visible output: [`InferenceDecl`] derives no
-//! `Serialize` and its `Debug` redacts the key.
+//! runtime config blob or the manifest — and is attached to the
+//! [`InferenceDecl`] as a [`Credential`] by [`resolve_effective`], then read on
+//! the request path by [`InferenceDecl::bearer`]. Deferring the read is what lets
+//! the managed tier be a *rotating* platform token rather than a value captured
+//! once at boot. Nothing here ever serializes a credential into an API response,
+//! log line, or agent-visible output: [`InferenceDecl`] derives no `Serialize`
+//! and its `Debug` redacts the credential.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::company::credentials::Credential;
 use crate::company::types::{INFERENCE_PROVIDERS, Inference};
 use crate::error::OpenCompanyError;
 use crate::ports::SecretStore;
@@ -69,30 +72,18 @@ pub enum InferenceSource {
 
 /// The platform-injected managed default (from `harness_inference_from_env`):
 /// the base URL + credential the manager supplies. Passed to
-/// [`resolve_effective`] as the lowest-precedence source. Carries no `Debug`
-/// derive so the credential never lands in a trace.
-#[derive(Clone)]
+/// [`resolve_effective`] as the lowest-precedence source.
+///
+/// The credential is a [`Credential`], not a `String`: on the hosted platform it
+/// is a projected token that rotates in place, so it is resolved per request
+/// rather than captured here.
+#[derive(Clone, Debug)]
 pub struct EnvDefault {
     /// Managed base URL (env `OPENCOMPANY_INFERENCE_URL` or the default).
     pub base_url: String,
-    /// Managed credential (`OPENCOMPANY_INFERENCE_KEY` / `TINYHUMANS_API_KEY`).
-    pub api_key: String,
-}
-
-impl std::fmt::Debug for EnvDefault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EnvDefault")
-            .field("base_url", &self.base_url)
-            .field(
-                "api_key",
-                &if self.api_key.is_empty() {
-                    "<unset>"
-                } else {
-                    "<redacted>"
-                },
-            )
-            .finish()
-    }
+    /// Managed credential — a projected platform token source, or the static
+    /// `OPENCOMPANY_INFERENCE_KEY` / `TINYHUMANS_API_KEY` value.
+    pub credential: Credential,
 }
 
 /// The on-disk runtime inference override stored under [`RUNTIME_CONFIG_KEY`].
@@ -110,12 +101,12 @@ pub struct RuntimeInference {
 }
 
 /// One company's *effective* inference configuration — the highest-precedence
-/// of runtime / manifest / env, with the credential resolved to a private field
-/// at build/turn time.
+/// of runtime / manifest / env, carrying the credential as a resolvable
+/// [`Credential`] rather than a captured value.
 ///
 /// Derives **no** `Serialize` (the key must never cross a wire) and its `Debug`
-/// redacts the key.
-#[derive(Clone)]
+/// redacts the credential.
+#[derive(Clone, Debug)]
 pub struct InferenceDecl {
     /// Provider slug — one of [`INFERENCE_PROVIDERS`].
     pub provider: String,
@@ -126,47 +117,38 @@ pub struct InferenceDecl {
     pub models: BTreeMap<String, String>,
     /// Provenance badge for the console.
     pub source: InferenceSource,
-    /// Resolved outbound credential. Empty means "no bearer" (e.g. Ollama).
-    /// Private — read only through [`api_key`](Self::api_key); never serialized.
-    api_key: String,
+    /// The outbound credential. Private — read only through
+    /// [`bearer`](Self::bearer); never serialized.
+    credential: Credential,
 }
 
 impl InferenceDecl {
-    /// The resolved outbound credential (empty = omit the bearer header). Kept
-    /// crate-internal so the request builder can read it; never serialized.
-    pub fn api_key(&self) -> &str {
-        &self.api_key
+    /// The outbound credential, unresolved. Callers on the request path want
+    /// [`bearer`](Self::bearer); this is for status and fingerprinting.
+    pub fn credential(&self) -> &Credential {
+        &self.credential
+    }
+
+    /// The bearer to present on **this** request, or `None` to omit the header
+    /// (the keyless Ollama case).
+    ///
+    /// Resolved per call rather than captured at build time: a hosted tenant's
+    /// managed credential is a projected token the platform rotates in place, so
+    /// a value captured once would go stale within minutes.
+    pub async fn bearer(&self) -> Result<Option<String>> {
+        self.credential.current().await
     }
 
     /// Whether an outbound credential is configured — the non-secret status the
-    /// read APIs surface. Never returns the value.
+    /// read APIs surface. Never returns the value, and never reads the token.
     pub fn key_configured(&self) -> bool {
-        !self.api_key.trim().is_empty()
+        self.credential.configured()
     }
 
     /// The stable telemetry slug for this provider (`managed` / `openrouter` /
     /// `byok` / `ollama`).
     pub fn telemetry_slug(&self) -> &'static str {
         provider_slug(&self.provider)
-    }
-}
-
-impl std::fmt::Debug for InferenceDecl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InferenceDecl")
-            .field("provider", &self.provider)
-            .field("base_url", &self.base_url)
-            .field("models", &self.models)
-            .field("source", &self.source)
-            .field(
-                "api_key",
-                &if self.api_key.is_empty() {
-                    "<unset>"
-                } else {
-                    "<redacted>"
-                },
-            )
-            .finish()
     }
 }
 
@@ -181,7 +163,7 @@ pub fn provider_slug(provider: &str) -> &'static str {
     }
 }
 
-/// Resolves the effective `(base_url, api_key)` for a provider.
+/// Resolves the effective `(base_url, credential)` for a provider.
 ///
 /// The `managed` kind is special: it is the *platform* brain, so it inherits the
 /// env default's base URL and credential when a source (manifest/runtime) names
@@ -193,21 +175,26 @@ fn resolve_endpoint(
     base_url_override: Option<&str>,
     key: String,
     env_default: Option<&EnvDefault>,
-) -> (String, String) {
+) -> (String, Credential) {
     let base_url_override = base_url_override.map(str::trim).filter(|s| !s.is_empty());
     if provider.trim() == "managed" {
         let base_url = base_url_override
             .map(str::to_string)
             .or_else(|| env_default.map(|e| e.base_url.clone()))
             .unwrap_or_else(|| MANAGED_BASE_URL.to_string());
-        let api_key = if !key.trim().is_empty() {
-            key
+        let credential = if !key.trim().is_empty() {
+            Credential::from_value(key)
         } else {
-            env_default.map(|e| e.api_key.clone()).unwrap_or_default()
+            env_default
+                .map(|e| e.credential.clone())
+                .unwrap_or(Credential::None)
         };
-        (base_url, api_key)
+        (base_url, credential)
     } else {
-        (effective_base_url(provider, base_url_override), key)
+        (
+            effective_base_url(provider, base_url_override),
+            Credential::from_value(key),
+        )
     }
 }
 
@@ -342,14 +329,14 @@ pub async fn resolve_effective(
     if let Some(runtime) = load_runtime_config(company, secrets).await? {
         let provider = runtime.provider.trim().to_string();
         let key = load_key(company, secrets, None).await?;
-        let (base_url, api_key) =
+        let (base_url, credential) =
             resolve_endpoint(&provider, runtime.base_url.as_deref(), key, env_default);
         return Ok(Some(InferenceDecl {
             provider,
             base_url,
             models: runtime.models,
             source: InferenceSource::Runtime,
-            api_key,
+            credential,
         }));
     }
 
@@ -362,14 +349,14 @@ pub async fn resolve_effective(
             .trim()
             .to_string();
         let key = load_key(company, secrets, manifest.api_key_secret.as_deref()).await?;
-        let (base_url, api_key) =
+        let (base_url, credential) =
             resolve_endpoint(&provider, manifest.base_url.as_deref(), key, env_default);
         return Ok(Some(InferenceDecl {
             provider,
             base_url,
             models: manifest.models.clone(),
             source: InferenceSource::Manifest,
-            api_key,
+            credential,
         }));
     }
 
@@ -380,7 +367,7 @@ pub async fn resolve_effective(
             base_url: env.base_url.clone(),
             models: BTreeMap::new(),
             source: InferenceSource::Default,
-            api_key: env.api_key.clone(),
+            credential: env.credential.clone(),
         }));
     }
 
@@ -492,6 +479,11 @@ mod tests {
 
     use async_trait::async_trait;
 
+    /// The resolved bearer for a decl, for the assertions below.
+    async fn bearer(decl: &InferenceDecl) -> Option<String> {
+        decl.bearer().await.expect("credential resolves")
+    }
+
     fn inference(provider: &str) -> Inference {
         Inference {
             provider: Some(provider.to_string()),
@@ -530,7 +522,7 @@ mod tests {
         let secrets = MemSecrets::default();
         let env = EnvDefault {
             base_url: "https://env.example/v1".into(),
-            api_key: "env-key".into(),
+            credential: Credential::from_value("env-key"),
         };
         let mut manifest = inference("openai_compatible");
         manifest.base_url = Some("https://manifest.example/v1".into());
@@ -542,7 +534,7 @@ mod tests {
             .expect("env default resolves");
         assert_eq!(decl.source, InferenceSource::Default);
         assert_eq!(decl.provider, "managed");
-        assert_eq!(decl.api_key(), "env-key");
+        assert_eq!(bearer(&decl).await.as_deref(), Some("env-key"));
 
         // Manifest beats env.
         let decl = resolve_effective(&company, &manifest, Some(&env), &secrets)
@@ -573,7 +565,7 @@ mod tests {
         assert_eq!(decl.source, InferenceSource::Runtime);
         assert_eq!(decl.provider, "openrouter");
         assert_eq!(decl.base_url, OPENROUTER_BASE_URL);
-        assert_eq!(decl.api_key(), "or-secret");
+        assert_eq!(bearer(&decl).await.as_deref(), Some("or-secret"));
         assert!(decl.key_configured());
     }
 
@@ -585,7 +577,7 @@ mod tests {
         let secrets = MemSecrets::default();
         let env = EnvDefault {
             base_url: "https://env.example/openai/v1".into(),
-            api_key: "platform-key".into(),
+            credential: Credential::from_value("platform-key"),
         };
         let decl = resolve_effective(&company, &inference("managed"), Some(&env), &secrets)
             .await
@@ -594,7 +586,7 @@ mod tests {
         assert_eq!(decl.source, InferenceSource::Manifest);
         assert_eq!(decl.provider, "managed");
         assert_eq!(decl.base_url, "https://env.example/openai/v1");
-        assert_eq!(decl.api_key(), "platform-key");
+        assert_eq!(bearer(&decl).await.as_deref(), Some("platform-key"));
     }
 
     #[tokio::test]
@@ -659,7 +651,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // The key resolves for request building…
-        assert_eq!(decl.api_key(), "sk-super-secret");
+        assert_eq!(bearer(&decl).await.as_deref(), Some("sk-super-secret"));
         // …but never appears in the Debug rendering.
         let debug = format!("{decl:?}");
         assert!(!debug.contains("sk-super-secret"), "{debug}");
@@ -695,7 +687,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(decl.api_key(), "named-secret");
+        assert_eq!(bearer(&decl).await.as_deref(), Some("named-secret"));
     }
 
     // ---- validation --------------------------------------------------------

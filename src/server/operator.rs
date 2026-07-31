@@ -630,6 +630,7 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             agent_id,
             text,
             steps,
+            task_id,
         } => {
             let mut o = envelope("agent_reply");
             o["chatId"] = json!(chat_id);
@@ -639,6 +640,11 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             // when empty so a tool-less reply's wire form is unchanged.
             if !steps.is_empty() {
                 o["steps"] = json!(steps);
+            }
+            // Correlation key for a dispatch-produced reply (#185); omitted for
+            // an ordinary chat reply so the legacy wire shape is unchanged.
+            if let Some(task_id) = task_id {
+                o["taskId"] = json!(task_id);
             }
             o
         }
@@ -655,12 +661,34 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             tool,
             status,
             message,
+            task_id,
         } => {
             let mut o = envelope("mcp_call_failed");
             o["server"] = json!(server);
             o["tool"] = json!(tool);
             o["status"] = json!(status);
             o["message"] = json!(message);
+            // Correlation key when the failing call ran inside a dispatch
+            // (#185); omitted for a chat-turn failure.
+            if let Some(task_id) = task_id {
+                o["taskId"] = json!(task_id);
+            }
+            o
+        }
+        // The dispatch terminal (#185). `output` is the agent's own reply text
+        // — the same string already written into the card's note — never raw
+        // tool output, so it is safe to project.
+        CompanyEvent::DeskTaskCompleted {
+            task_id,
+            desk,
+            output,
+            column,
+        } => {
+            let mut o = envelope("desk_task_completed");
+            o["taskId"] = json!(task_id);
+            o["desk"] = json!(desk);
+            o["output"] = json!(output);
+            o["column"] = json!(column);
             o
         }
         CompanyEvent::ApprovalResolved {
@@ -839,6 +867,7 @@ async fn run_chat(
             assignee: String::new(),
             updated_at_millis: crate::ports::now_millis(),
             origin_chat_id: None,
+            parent_task_id: None,
         };
         if let Err(err) = runtime.upsert_task(&record).await {
             tracing::warn!(error = %err, "failed to open task card for chat request");
@@ -882,6 +911,7 @@ async fn chat_and_emit(
             .append(
                 id,
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: desk.clone(),
                     agent_id: response.channel.clone(),
                     text: response.text.clone(),
@@ -1420,6 +1450,7 @@ mod test {
             delegations: crate::harness::orchestrator::DelegationQueue::default(),
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
             capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
@@ -2092,6 +2123,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: "General".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "reply under General".to_string(),
@@ -2105,6 +2137,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: "main".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "reply under main".to_string(),
@@ -2159,6 +2192,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    task_id: None,
                     chat_id: "main".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "done".to_string(),
@@ -2487,6 +2521,7 @@ mod test {
     fn projects_agent_reply_with_chat_fields_and_steps() {
         use crate::ports::types::{TurnStep, TurnStepKind, TurnStepStatus};
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "General".into(),
             agent_id: "ceo".into(),
             text: "shipped it".into(),
@@ -2513,6 +2548,7 @@ mod test {
     #[test]
     fn projects_agent_reply_omits_empty_steps() {
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            task_id: None,
             chat_id: "General".into(),
             agent_id: "ceo".into(),
             text: "hi".into(),
@@ -2521,6 +2557,65 @@ mod test {
         .expect("agent_reply is an attention signal");
         // A tool-less reply keeps the legacy wire shape — no `steps` key.
         assert!(v.get("steps").is_none());
+        // …and an uncorrelated reply carries no `taskId` either, so the
+        // pre-#185 wire shape is byte-for-byte what it was.
+        assert!(v.get("taskId").is_none());
+    }
+
+    /// #185: the correlation key rides the SSE stream when — and only when — the
+    /// event carries one. Both directions matter: its presence is what lets a
+    /// live console route a frame to the right task, and its absence is what
+    /// keeps the legacy shape intact for every ordinary chat reply.
+    #[test]
+    fn projects_task_id_only_when_the_event_is_correlated() {
+        let reply = super::project_event(&stored(CompanyEvent::AgentReply {
+            task_id: Some("t-1".into()),
+            chat_id: "t-1".into(),
+            agent_id: "ceo".into(),
+            text: "on it".into(),
+            steps: Vec::new(),
+        }))
+        .expect("agent_reply is an attention signal");
+        assert_eq!(reply["taskId"], serde_json::json!("t-1"));
+
+        let failure = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            task_id: Some("t-1".into()),
+            server: "gh".into(),
+            tool: "issues".into(),
+            status: "credential_required".into(),
+            message: "needs auth".into(),
+        }))
+        .expect("mcp_call_failed is an attention signal");
+        assert_eq!(failure["taskId"], serde_json::json!("t-1"));
+
+        let uncorrelated = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            task_id: None,
+            server: "gh".into(),
+            tool: "issues".into(),
+            status: "credential_required".into(),
+            message: "needs auth".into(),
+        }))
+        .expect("mcp_call_failed is an attention signal");
+        assert!(uncorrelated.get("taskId").is_none());
+    }
+
+    /// #185: the dispatch terminal projects all four fields. `column` is the one
+    /// that matters most — it is how a console tells a clean finish from a
+    /// cancelled or failed run without parsing `output`.
+    #[test]
+    fn projects_desk_task_completed_with_every_field() {
+        let v = super::project_event(&stored(CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".into(),
+            desk: "ceo".into(),
+            output: "shipped".into(),
+            column: "in_review".into(),
+        }))
+        .expect("desk_task_completed is an attention signal");
+        assert_eq!(v["type"], serde_json::json!("desk_task_completed"));
+        assert_eq!(v["taskId"], serde_json::json!("t-1"));
+        assert_eq!(v["desk"], serde_json::json!("ceo"));
+        assert_eq!(v["output"], serde_json::json!("shipped"));
+        assert_eq!(v["column"], serde_json::json!("in_review"));
     }
 
     #[test]
@@ -2536,6 +2631,7 @@ mod test {
     #[test]
     fn projects_mcp_call_failed_with_scrubbed_message() {
         let v = super::project_event(&stored(CompanyEvent::McpCallFailed {
+            task_id: None,
             server: "browserbase".into(),
             tool: "browse".into(),
             status: "tool_call_rejected".into(),

@@ -130,6 +130,15 @@ pub struct CompanyRuntime {
     pub(crate) steer: crate::company::steer::InflightRegistry,
     /// Held for the duration of a cycle so cycles never interleave per company.
     pub(crate) serial: TokioMutex<()>,
+    /// Held across a REST board write's read → validate → write, so two
+    /// concurrent edits cannot each validate against a snapshot that predates
+    /// the other's edge (issue #185 review).
+    ///
+    /// Deliberately **not** [`serial`](Self::serial): that lock is held for a
+    /// whole cycle, which is a live agent turn, so reusing it would park every
+    /// board edit behind an LLM call. This one is only ever held across a
+    /// couple of store round-trips.
+    pub(crate) task_writes: TokioMutex<()>,
     /// WS4: the embedded openhuman harness pool, when wired via
     /// [`RuntimeBuilder::with_harness`](crate::runtime::RuntimeBuilder::with_harness).
     /// Feature-gated so the default build is unaffected.
@@ -189,6 +198,7 @@ impl CompanyRuntime {
             workflow_runner: None,
             steer: crate::company::steer::InflightRegistry::new(),
             serial: TokioMutex::new(()),
+            task_writes: TokioMutex::new(()),
             #[cfg(feature = "openhuman")]
             harness: None,
             #[cfg(feature = "mcp")]
@@ -385,6 +395,17 @@ impl CompanyRuntime {
     /// This company's usage meter (written by the cost hook, read by WS5).
     pub fn usage(&self) -> &Arc<dyn UsageMeter> {
         &self.ops.usage
+    }
+
+    /// Which cognition path this company actually booted onto, and where that
+    /// path's inference usage is metered.
+    ///
+    /// The console's inference-status route surfaces this so an operator can tell
+    /// "no inference source resolved, so the company fell back to a path that
+    /// spends nothing" from "inference ran but the meter never saw it" — the
+    /// silent degradation that made issue #174 hard to read.
+    pub fn cognition(&self) -> crate::ports::Cognition {
+        self.brain.cognition()
     }
 
     /// This company's skill-state deltas.

@@ -448,6 +448,76 @@ fn assert_no_model_passes_clean_bodies() {
 }
 
 // ---------------------------------------------------------------------------
+// orch:usage (issue #174)
+// ---------------------------------------------------------------------------
+
+fn sample_usage_frame() -> UsageFrame {
+    UsageFrame {
+        cycle_id: "cyc:opencompany:acme:acme:0".to_string(),
+        call_id: call_id("cyc:opencompany:acme:acme:0", USAGE_CALL_KIND, 0),
+        input_tokens: 1_200,
+        output_tokens: 340,
+        cached_input_tokens: 200,
+        cost_usd: Some(0.0175),
+    }
+}
+
+#[test]
+fn usage_frame_round_trips_in_camel_case() {
+    let frame = sample_usage_frame();
+    assert_eq!(round_trip(&frame), frame);
+
+    let json = serde_json::to_value(&frame).unwrap();
+    assert_eq!(json["cycleId"], "cyc:opencompany:acme:acme:0");
+    assert_eq!(json["callId"], "cyc:opencompany:acme:acme:0:usage:0");
+    assert_eq!(json["inputTokens"], 1_200);
+    assert_eq!(json["outputTokens"], 340);
+    assert_eq!(json["cachedInputTokens"], 200);
+    assert_eq!(json["costUsd"], 0.0175);
+    // A usage report never selects a model, so it passes the model-field guard.
+    assert!(assert_no_model(&json).is_ok());
+}
+
+/// A backend that reports tokens but bills off the wire omits `costUsd`, and one
+/// that predates cache accounting omits `cachedInputTokens`. Both must decode.
+#[test]
+fn usage_frame_decodes_without_the_optional_fields() {
+    let frame: UsageFrame = serde_json::from_value(json!({
+        "cycleId": "cyc:1",
+        "callId": "cyc:1:usage:0",
+        "inputTokens": 42,
+        "outputTokens": 7,
+    }))
+    .expect("optional fields default");
+    assert_eq!(frame.cached_input_tokens, 0);
+    assert_eq!(frame.cost_usd, None);
+
+    // A missing cost is zero cost — the tokens still count as usage.
+    let usage = frame.to_token_usage();
+    assert_eq!(usage.input, 42);
+    assert_eq!(usage.output, 7);
+    assert_eq!(usage.cost_usd, 0.0);
+    assert!(!usage.is_zero());
+}
+
+#[test]
+fn usage_frame_maps_onto_the_metered_token_usage() {
+    let usage = sample_usage_frame().to_token_usage();
+    assert_eq!(usage.input, 1_200);
+    assert_eq!(usage.output, 340);
+    assert_eq!(usage.cached_input, 200);
+    assert_eq!(usage.cost_usd, 0.0175);
+}
+
+/// The event name and dedupe kind are the contract the backend emits on.
+#[test]
+fn usage_event_and_dedupe_kind_are_stable() {
+    assert_eq!(USAGE, "orch:usage");
+    assert_eq!(USAGE_CALL_KIND, "usage");
+    assert_eq!(call_id("cyc:1", USAGE_CALL_KIND, 2), "cyc:1:usage:2");
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

@@ -9,10 +9,13 @@
 //! field before it is sent.
 //!
 //! The Socket.IO half — the effect/tool-call frame stream and the acks/answers
-//! the client emits — is **stubbed** in this phase: [`Self::cycle_frames`]
-//! reports an empty cycle and the emit-side methods are no-ops, so a networked
-//! build is a compilable scaffold rather than a live client. All behavioral
-//! coverage runs against
+//! the client emits — is **stubbed** in this phase, so a networked build is a
+//! compilable scaffold rather than a live client. [`Self::cycle_frames`]
+//! therefore **fails** the cycle instead of reporting an empty one: none of
+//! `orch:effect:*`, `orch:tool_call` or `orch:usage` is bridged yet, and a cycle
+//! that completes without them looks like a successful, free, side-effect-free
+//! turn — the silent-zero-Usage failure mode issue #174 exists to remove. Fail
+//! loudly until the client is wired. All behavioral coverage runs against
 //! [`MockTransport`](super::mock::MockTransport) in the default build. Wiring a
 //! real Socket.IO client is deferred; the [`MedullaTransport`] seam isolates the
 //! choice so only this file changes.
@@ -109,11 +112,35 @@ impl MedullaTransport for HttpSocketTransport {
         Ok(())
     }
 
-    fn cycle_frames(&self, _cycle_id: &str) -> BoxStream<'static, Result<InboundFrame>> {
-        // TODO(medulla): bridge the `orch:effect:*` / `orch:tool_call` stream.
-        // Until the socket client is wired, report an empty cycle so a networked
-        // build is a compilable scaffold rather than a hang.
-        stream::once(async { Ok(InboundFrame::CycleComplete) }).boxed()
+    fn cycle_frames(&self, cycle_id: &str) -> BoxStream<'static, Result<InboundFrame>> {
+        // TODO(medulla): bridge the `orch:effect:*` / `orch:tool_call` /
+        // `orch:usage` stream. When wiring it, `orch:usage` must be forwarded as
+        // `InboundFrame::Usage` — `HostedMedullaBrain` already folds that into
+        // `CycleResult::token_usage` and `CycleRunner` meters it. Dropping it
+        // would leave the networked path unmetered exactly as issue #174
+        // described.
+        //
+        // Until then, fail the cycle rather than returning `CycleComplete`.
+        // An empty completion is indistinguishable from a real cycle that did
+        // no work and cost nothing, so it would report unmetered spend as
+        // legitimately zero and silently swallow every effect and tool call —
+        // the failure mode this issue exists to remove. An explicit error keeps
+        // a `--features medulla` build honest about being a scaffold.
+        let cycle_id = cycle_id.to_string();
+        tracing::error!(
+            cycle_id = %cycle_id,
+            "networked Medulla transport has no Socket.IO client wired: cannot receive \
+             orch:effect:*, orch:tool_call or orch:usage frames — failing the cycle instead of \
+             completing it unmetered (issue #174)"
+        );
+        stream::once(async {
+            Err(crate::error::OpenCompanyError::Unimplemented(
+                "networked Medulla Socket.IO frame stream (orch:effect:*, orch:tool_call, \
+                 orch:usage) is not wired yet — hosted cognition over HttpSocketTransport cannot \
+                 run; inject a MedullaTransport or build without `--features medulla`",
+            ))
+        })
+        .boxed()
     }
 
     async fn ack_effect(&self, _ack: EffectResult) -> Result<()> {

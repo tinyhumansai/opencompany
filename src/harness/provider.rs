@@ -44,6 +44,7 @@ use tinyagents::{Result as TaResult, TinyAgentsError};
 
 use crate::app::config::EnvSource;
 use crate::company::Inference;
+use crate::company::credentials::{Credential, TinyhumansTokenSource};
 use crate::company::inference::{self, EnvDefault, InferenceDecl};
 use crate::ports::SecretStore;
 use crate::ports::types::CompanyId;
@@ -82,24 +83,32 @@ pub trait HarnessModel: ChatModel<()> {
 }
 
 /// Resolve a [`HostedProvider`] configuration (and its default model) from the
-/// environment, or `None` when no credential is present.
+/// environment, or `None` when no credential can be obtained.
 ///
 /// Precedence, most specific first:
 ///
-/// * key — `OPENCOMPANY_INFERENCE_KEY`, else `TINYHUMANS_API_KEY`. **No key ⇒
-///   `None`**, and the runtime keeps its offline echo brain.
+/// * credential — `OPENCOMPANY_INFERENCE_KEY` if set, else the platform token
+///   source ([`TinyhumansTokenSource::from_env`]: a projected `TINYHUMANS_TOKEN_FILE`
+///   ahead of a static `TINYHUMANS_API_KEY`). **Nothing configured ⇒ `None`**, and
+///   the runtime keeps its offline echo brain.
 /// * url — `OPENCOMPANY_INFERENCE_URL`, else [`DEFAULT_TINYHUMANS_INFERENCE_URL`].
 /// * model — `OPENCOMPANY_INFERENCE_MODEL`, else [`DEFAULT_HOSTED_MODEL`].
 ///
-/// The two-name key precedence keeps a per-tenant override
-/// (`OPENCOMPANY_INFERENCE_KEY`) distinct from the platform-wide TinyHumans
-/// credential the manager injects (`TINYHUMANS_API_KEY`).
+/// `OPENCOMPANY_INFERENCE_KEY` is checked first because it is a *different*
+/// credential — a per-tenant inference key an operator supplied — not the
+/// platform's TinyHumans identity. Within the platform identity itself the
+/// documented tier order (projected file over static key) applies.
 pub fn harness_inference_from_env(
     env: &dyn EnvSource,
 ) -> Option<(HostedProviderConfig, Option<String>)> {
-    let api_key = env
+    let credential = match env
         .get("OPENCOMPANY_INFERENCE_KEY")
-        .or_else(|| env.get("TINYHUMANS_API_KEY"))?;
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+    {
+        Some(key) => Credential::from_value(key),
+        None => Credential::from_source(Arc::new(TinyhumansTokenSource::from_env(env)?)),
+    };
     let base_url = env
         .get("OPENCOMPANY_INFERENCE_URL")
         .unwrap_or_else(|| DEFAULT_TINYHUMANS_INFERENCE_URL.to_string());
@@ -111,7 +120,7 @@ pub fn harness_inference_from_env(
     Some((
         HostedProviderConfig {
             base_url,
-            api_key,
+            credential,
             extra_headers: Vec::new(),
         },
         model_override,
@@ -528,35 +537,19 @@ impl HarnessModel for MockProvider {
 }
 
 /// Configuration for the hosted inference model.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct HostedProviderConfig {
     /// Base URL of the OpenAI-compatible chat-completions API, e.g.
     /// `https://api.tinyhumans.ai/v1`. The provider POSTs to
     /// `{base_url}/chat/completions`.
     pub base_url: String,
-    /// Bearer credential for the hosted brain. Empty string omits the header.
-    pub api_key: String,
+    /// How the bearer for the hosted brain is obtained. Resolved on **every**
+    /// request, so a platform token that rotates in place is picked up without a
+    /// rebuild; [`Credential::None`] omits the header.
+    pub credential: Credential,
     /// Extra request headers to attach on every call (e.g. OpenRouter's
     /// `HTTP-Referer` / `X-Title` attribution headers).
     pub extra_headers: Vec<(String, String)>,
-}
-
-impl std::fmt::Debug for HostedProviderConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never let the credential land in a trace.
-        f.debug_struct("HostedProviderConfig")
-            .field("base_url", &self.base_url)
-            .field(
-                "api_key",
-                &if self.api_key.is_empty() {
-                    "<unset>"
-                } else {
-                    "<redacted>"
-                },
-            )
-            .field("extra_headers", &self.extra_headers)
-            .finish()
-    }
 }
 
 /// Hosted TinyHumans / Medulla inference model.
@@ -589,8 +582,9 @@ impl ChatModel<()> for HostedProvider {
     }
 
     /// Structured multi-turn chat — the path [`Agent::turn`] actually calls. The
-    /// full history reaches the backend so multi-turn context survives, and the
-    /// response's token/cost usage is parsed back out (the WS5 metering signal).
+    /// full history reaches the backend so multi-turn context survives, the bearer
+    /// is resolved fresh for this request, and the response's token/cost usage is
+    /// parsed back out (the WS5 metering signal).
     ///
     /// [`Agent::turn`]: openhuman_core::openhuman::agent::Agent
     async fn invoke(&self, _state: &(), request: ModelRequest) -> TaResult<ModelResponse> {
@@ -615,8 +609,13 @@ impl ChatModel<()> for HostedProvider {
             self.config.base_url.trim_end_matches('/')
         );
         let mut http = self.client.post(&url).json(&body);
-        if !self.config.api_key.is_empty() {
-            http = http.bearer_auth(&self.config.api_key);
+        // Resolved per request, never captured: on the hosted platform this reads
+        // a token file the cluster rewrites in place every few minutes.
+        let bearer = self.config.credential.current().await.map_err(|e| {
+            TinyAgentsError::Model(format!("resolving the TinyHumans credential: {e}"))
+        })?;
+        if let Some(bearer) = &bearer {
+            http = http.bearer_auth(bearer);
         }
         for (name, value) in &self.config.extra_headers {
             http = http.header(name, value);
@@ -628,6 +627,12 @@ impl ChatModel<()> for HostedProvider {
             .map_err(|e| TinyAgentsError::Model(format!("hosted inference request failed: {e}")))?;
         let status = response.status();
         if !status.is_success() {
+            // A rejected bearer may mean the platform rotated the token early;
+            // drop the cached read so the next turn goes back to the file rather
+            // than re-presenting what was just refused.
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.config.credential.invalidate();
+            }
             let text = response.text().await.unwrap_or_default();
             return Err(TinyAgentsError::Model(format!(
                 "hosted inference returned {status}: {text}"
@@ -657,7 +662,9 @@ pub struct RequestPlan {
     pub url: String,
     /// The concrete provider model id after tier mapping.
     pub model: String,
-    /// The bearer credential, or `None` to omit the header (e.g. Ollama).
+    /// The bearer credential for THIS request, resolved when the plan was built
+    /// (never captured at roster-build time), or `None` to omit the header (e.g.
+    /// Ollama).
     pub bearer: Option<String>,
     /// Extra request headers (OpenRouter attribution) to attach.
     pub headers: Vec<(&'static str, String)>,
@@ -671,11 +678,13 @@ pub struct RequestPlan {
 ///   `[inference].models` table; an unmapped tier passes through verbatim.
 /// * OpenRouter gets its mandatory `HTTP-Referer` / `X-Title` attribution
 ///   headers; other providers get none.
-/// * An empty resolved key omits the bearer (the Ollama / keyless case).
+/// * The bearer is resolved from the decl's [`Credential`] **here**, so every
+///   plan carries a freshly-read token; no credential omits the header entirely
+///   (the Ollama / keyless case).
 /// * `tools` (already in OpenAI wire shape via [`wire_tools`]) and `tool_choice`
 ///   are attached only when the turn exposes tools, so a bare chat turn stays
 ///   byte-identical to the pre-tool-calling body.
-pub fn request_plan(
+pub async fn request_plan(
     decl: &InferenceDecl,
     abstract_model: &str,
     messages: Vec<serde_json::Value>,
@@ -683,19 +692,17 @@ pub fn request_plan(
     max_tokens: Option<u32>,
     tools: Vec<serde_json::Value>,
     tool_choice: &ToolChoice,
-) -> RequestPlan {
+) -> anyhow::Result<RequestPlan> {
     let model = decl
         .models
         .get(abstract_model)
         .cloned()
         .unwrap_or_else(|| abstract_model.to_string());
     let url = format!("{}/chat/completions", decl.base_url.trim_end_matches('/'));
-    let key = decl.api_key().trim();
-    let bearer = if key.is_empty() {
-        None
-    } else {
-        Some(key.to_string())
-    };
+    let bearer = decl
+        .bearer()
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving the outbound inference credential: {e}"))?;
     let headers = if decl.provider == "openrouter" {
         vec![
             ("HTTP-Referer", OPENROUTER_REFERER.to_string()),
@@ -713,21 +720,26 @@ pub fn request_plan(
         body["max_tokens"] = serde_json::json!(cap);
     }
     attach_tools(&mut body, tools, tool_choice);
-    RequestPlan {
+    Ok(RequestPlan {
         url,
         model,
         bearer,
         headers,
         body,
-    }
+    })
 }
 
 /// Issues a prepared [`RequestPlan`] against `client`, returning the raw JSON
 /// payload. Every error string is scrubbed of the bearer, so a credential can
 /// never leak into a log line or an operator-visible message.
+///
+/// `credential` is the source the plan's bearer came from: a 401 invalidates it,
+/// so a token the platform rotated early is re-read on the next attempt instead
+/// of being presented again until its cache window closes.
 async fn send_plan(
     client: &reqwest::Client,
     plan: &RequestPlan,
+    credential: &Credential,
 ) -> anyhow::Result<serde_json::Value> {
     let mut request = client.post(&plan.url).json(&plan.body);
     if let Some(bearer) = &plan.bearer {
@@ -746,6 +758,9 @@ async fn send_plan(
         .map_err(|e| anyhow::anyhow!("inference request failed: {}", scrub(e.to_string())))?;
     let status = response.status();
     if !status.is_success() {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            credential.invalidate();
+        }
         let text = response.text().await.unwrap_or_default();
         return Err(anyhow::anyhow!(
             "inference returned {status}: {}",
@@ -849,8 +864,10 @@ impl ChatModel<()> for TenantProvider {
             request.max_tokens,
             wire_tools(&request.tools),
             &request.tool_choice,
-        );
-        let payload = send_plan(&self.client, &plan)
+        )
+        .await
+        .map_err(|e| TinyAgentsError::Model(e.to_string()))?;
+        let payload = send_plan(&self.client, &plan, decl.credential())
             .await
             .map_err(|e| TinyAgentsError::Model(e.to_string()))?;
         model_response_from_payload(payload)
@@ -879,8 +896,9 @@ pub async fn probe(decl: &InferenceDecl) -> anyhow::Result<()> {
         Some(16),
         Vec::new(),
         &ToolChoice::Auto,
-    );
-    let payload = send_plan(&client, &plan).await?;
+    )
+    .await?;
+    let payload = send_plan(&client, &plan, decl.credential()).await?;
     payload
         .pointer("/choices/0/message/content")
         .and_then(|c| c.as_str())
@@ -893,6 +911,36 @@ mod tests {
     use super::*;
     use crate::app::config::MapEnv;
 
+    /// A three-segment JWT whose `exp` is `secs_from_now` in the future, so the
+    /// projected-file cache window is wide open for the whole test.
+    fn jwt_with_exp(secs_from_now: u64) -> String {
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + secs_from_now;
+        let payload = serde_json::json!({ "exp": exp }).to_string();
+        let mut encoded = String::new();
+        for chunk in payload.as_bytes().chunks(3) {
+            let b = [
+                chunk[0],
+                chunk.get(1).copied().unwrap_or(0),
+                chunk.get(2).copied().unwrap_or(0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..chunk.len() + 1 {
+                encoded.push(ALPHA[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            }
+        }
+        format!("aGVhZGVy.{encoded}.c2ln")
+    }
+
+    /// The bearer a config would present right now.
+    async fn bearer_of(config: &HostedProviderConfig) -> Option<String> {
+        config.credential.current().await.expect("resolves")
+    }
+
     /// Build a single-user-message request the way the harness turn does.
     fn user_request(message: &str) -> ModelRequest {
         ModelRequest {
@@ -901,18 +949,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn env_config_prefers_specific_key_and_fills_defaults() {
+    #[tokio::test]
+    async fn env_config_prefers_specific_key_and_fills_defaults() {
         let env = MapEnv::new([("OPENCOMPANY_INFERENCE_KEY", "sk-specific")]);
         let (cfg, model) = harness_inference_from_env(&env).expect("configured");
-        assert_eq!(cfg.api_key, "sk-specific");
+        assert_eq!(bearer_of(&cfg).await.as_deref(), Some("sk-specific"));
         assert_eq!(cfg.base_url, DEFAULT_TINYHUMANS_INFERENCE_URL);
         // No explicit model → no roster-wide override (each agent keeps its tier).
         assert_eq!(model, None);
     }
 
-    #[test]
-    fn env_config_falls_back_to_tinyhumans_key_and_honors_overrides() {
+    #[tokio::test]
+    async fn env_config_falls_back_to_tinyhumans_key_and_honors_overrides() {
         let env = MapEnv::new([
             ("TINYHUMANS_API_KEY", "sk-platform"),
             (
@@ -922,7 +970,7 @@ mod tests {
             ("OPENCOMPANY_INFERENCE_MODEL", "reasoning-v1"),
         ]);
         let (cfg, model) = harness_inference_from_env(&env).expect("configured");
-        assert_eq!(cfg.api_key, "sk-platform");
+        assert_eq!(bearer_of(&cfg).await.as_deref(), Some("sk-platform"));
         assert_eq!(cfg.base_url, "https://staging-api.tinyhumans.ai/openai/v1");
         assert_eq!(model.as_deref(), Some("reasoning-v1"));
     }
@@ -931,6 +979,43 @@ mod tests {
     fn env_config_is_none_without_any_key() {
         let env = MapEnv::new([("OPENCOMPANY_INFERENCE_URL", "https://x/v1")]);
         assert!(harness_inference_from_env(&env).is_none());
+    }
+
+    /// The hosted path: no static key anywhere, just a projected token file. The
+    /// harness must still resolve a managed brain, reading the file per request.
+    #[tokio::test]
+    async fn env_config_resolves_a_projected_token_file() {
+        let dir = std::env::temp_dir().join(format!("oc-prov-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "projected-token").unwrap();
+
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            path.display().to_string(),
+        )]);
+        let (cfg, _) = harness_inference_from_env(&env).expect("configured");
+        assert_eq!(
+            cfg.credential.source(),
+            crate::company::CredentialSource::Attested
+        );
+        assert_eq!(bearer_of(&cfg).await.as_deref(), Some("projected-token"));
+
+        // A projected file outranks a static key that is still lying around.
+        let both = MapEnv::new([
+            (
+                crate::company::credentials::TOKEN_FILE_ENV,
+                path.display().to_string(),
+            ),
+            (
+                crate::company::credentials::API_KEY_ENV,
+                "th-static".to_string(),
+            ),
+        ]);
+        let (cfg, _) = harness_inference_from_env(&both).expect("configured");
+        assert_eq!(bearer_of(&cfg).await.as_deref(), Some("projected-token"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- media backend (issue #109) ---------------------------------------
@@ -989,7 +1074,7 @@ mod tests {
     fn hosted_provider_reports_managed_telemetry_id() {
         let provider = HostedProvider::new(HostedProviderConfig {
             base_url: "https://example.test/v1".to_string(),
-            api_key: String::new(),
+            credential: Credential::None,
             extra_headers: Vec::new(),
         });
         assert_eq!(provider.telemetry_provider_id(), "managed");
@@ -1202,7 +1287,7 @@ mod tests {
     fn hosted_provider_advertises_native_tool_calling() {
         let provider = HostedProvider::new(HostedProviderConfig {
             base_url: "https://example.test/v1".to_string(),
-            api_key: String::new(),
+            credential: Credential::None,
             extra_headers: Vec::new(),
         });
         let profile = provider.profile().expect("hosted profile is advertised");
@@ -1210,6 +1295,193 @@ mod tests {
             profile.tool_calling,
             "native tool calling must be advertised"
         );
+    }
+
+    /// A stub that records the `Authorization` header of every request it
+    /// answers, so a test can prove which bearer actually went out.
+    async fn spawn_auth_recorder() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap| {
+                let log = Arc::clone(&log);
+                async move {
+                    log.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                    Json(serde_json::json!({
+                        "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The rotation contract at the transport: the SAME provider instance must
+    /// present the token the projected file holds **now**, not the one it held
+    /// when the provider was built. Without this, a hosted pod keeps sending a
+    /// bearer the cluster rotated away from and every turn 401s.
+    #[tokio::test]
+    async fn hosted_provider_resolves_the_bearer_per_request() {
+        let (url, seen) = spawn_auth_recorder().await;
+        let dir = std::env::temp_dir().join(format!("oc-prov-rot-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        // No `exp` to read ⇒ never cached ⇒ every request re-reads the file.
+        std::fs::write(&path, "token-before-rotation").unwrap();
+
+        let provider = HostedProvider::new(HostedProviderConfig {
+            base_url: url,
+            credential: Credential::from_source(Arc::new(TinyhumansTokenSource::projected_file(
+                &path,
+            ))),
+            extra_headers: Vec::new(),
+        });
+
+        provider.invoke(&(), user_request("one")).await.expect("t1");
+        std::fs::write(&path, "token-after-rotation").unwrap();
+        provider.invoke(&(), user_request("two")).await.expect("t2");
+
+        let headers = seen.lock().unwrap().clone();
+        assert_eq!(
+            headers,
+            vec![
+                "Bearer token-before-rotation".to_string(),
+                "Bearer token-after-rotation".to_string()
+            ],
+            "the bearer must be resolved per request, not captured at build time"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no credential at all the header is omitted rather than sent empty.
+    #[tokio::test]
+    async fn hosted_provider_omits_the_bearer_without_a_credential() {
+        let (url, seen) = spawn_auth_recorder().await;
+        let provider = HostedProvider::new(HostedProviderConfig {
+            base_url: url,
+            credential: Credential::None,
+            extra_headers: Vec::new(),
+        });
+        provider
+            .invoke(&(), user_request("hi"))
+            .await
+            .expect("turn");
+        assert_eq!(seen.lock().unwrap().clone(), vec![String::new()]);
+    }
+
+    /// A 401 invalidates the cached read, so the next turn presents whatever the
+    /// file holds now instead of re-sending a bearer the backend just refused —
+    /// the recovery path for a token the platform rotated early.
+    #[tokio::test]
+    async fn a_rejected_bearer_forces_a_re_read_on_the_next_turn() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap| {
+                let log = Arc::clone(&log);
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let first = {
+                        let mut guard = log.lock().unwrap();
+                        guard.push(auth);
+                        guard.len() == 1
+                    };
+                    // Refuse the first bearer, accept the second.
+                    if first {
+                        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({}))).into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!("oc-prov-401-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        // A long-lived `exp` ⇒ the window would normally hold this read for the
+        // full cap, so only invalidation can explain the second value going out.
+        let long_lived = jwt_with_exp(60 * 60 * 24 * 365 * 100);
+        std::fs::write(&path, format!("stale-{long_lived}")).unwrap();
+
+        let provider = HostedProvider::new(HostedProviderConfig {
+            base_url: format!("http://{addr}"),
+            credential: Credential::from_source(Arc::new(TinyhumansTokenSource::projected_file(
+                &path,
+            ))),
+            extra_headers: Vec::new(),
+        });
+
+        provider
+            .invoke(&(), user_request("one"))
+            .await
+            .expect_err("first turn is refused");
+        std::fs::write(&path, format!("rotated-{long_lived}")).unwrap();
+        provider.invoke(&(), user_request("two")).await.expect("t2");
+
+        let headers = seen.lock().unwrap().clone();
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(headers[0].starts_with("Bearer stale-"), "{headers:?}");
+        assert!(
+            headers[1].starts_with("Bearer rotated-"),
+            "a 401 must send the next turn back to the file: {headers:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable projected file fails the turn with a model error that names
+    /// the problem — it must never silently send no bearer and get a confusing
+    /// 401 from the backend instead.
+    #[tokio::test]
+    async fn hosted_provider_surfaces_an_unreadable_token_file() {
+        let provider = HostedProvider::new(HostedProviderConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            credential: Credential::from_source(Arc::new(TinyhumansTokenSource::projected_file(
+                "/nonexistent/oc/token",
+            ))),
+            extra_headers: Vec::new(),
+        });
+        let err = provider
+            .invoke(&(), user_request("hi"))
+            .await
+            .expect_err("unreadable credential");
+        assert!(err.to_string().contains("credential"), "{err}");
     }
 
     // ---- TenantProvider (issue #56 — BYOK) --------------------------------
@@ -1274,7 +1546,9 @@ mod tests {
             None,
             Vec::new(),
             &ToolChoice::Auto,
-        );
+        )
+        .await
+        .expect("plan");
         assert_eq!(
             plan.model, "deepseek/deepseek-chat",
             "tier maps through table"
@@ -1308,7 +1582,9 @@ mod tests {
             None,
             Vec::new(),
             &ToolChoice::Auto,
-        );
+        )
+        .await
+        .expect("plan");
         assert_eq!(passthrough.model, "reasoning-v1");
     }
 
@@ -1330,7 +1606,9 @@ mod tests {
             None,
             Vec::new(),
             &ToolChoice::Auto,
-        );
+        )
+        .await
+        .expect("plan");
         assert!(plan.bearer.is_none(), "keyless Ollama sends no bearer");
         assert!(plan.headers.is_empty(), "no OpenRouter headers for Ollama");
     }

@@ -1,15 +1,28 @@
 // The live Composio API (issue #110, epic #26 Cell D): the console reads the
-// company's Composio status and writes its per-tenant OAuth bearer token through
-// the host's `.../composio` routes (REST, camelCase over the wire).
+// company's Composio status and — when a company brings its own account — writes
+// a per-company OAuth bearer token through the host's `.../composio` routes
+// (REST, camelCase over the wire).
 //
-// The token is the entire tenant-isolation lever — the backend derives the
-// Composio entity from it — so it is WRITE-ONLY: sent on `PUT .../composio/token`
-// and stored in the host's secret store; it is never returned. The read shape
-// carries only a `tokenConfigured` boolean plus non-secret routing (backend URL,
+// On the hosted platform nothing is pasted: the instance authenticates with a
+// platform-minted, audience-bound identity and Composio calls present that, which
+// the read shape reports as `credentialSource: "attested"`. The write route is the
+// per-company BYO override, and the only option when this repo is run standalone
+// — which is UNSUPPORTED. Either way the token is WRITE-ONLY: sent on
+// `PUT .../composio/token`, stored in the host's secret store, never returned. The
+// read shape carries only `credentialSource` plus non-secret routing (backend URL,
 // toolkit allowlist). Standalone functions over the shared client (mirrors
 // `api/inference.ts`), so no change to `OpenCompanyClient` is needed.
 
 import type { OpenCompanyClient } from "./client";
+
+/**
+ * Where this company's Composio credential comes from.
+ *
+ * - `attested` — the instance's own platform identity; nothing is stored here.
+ * - `static` — a token this company pasted, or a static instance key.
+ * - `none` — no credential can be obtained, so agents get no Composio tools.
+ */
+export type ComposioCredentialSource = "attested" | "static" | "none";
 
 /** The company's Composio status. Never carries the token. */
 export interface ComposioStatus {
@@ -17,8 +30,8 @@ export interface ComposioStatus {
   inBuild: boolean;
   /** Whether the company explicitly grants `composio` (a `*` wildcard does not count). */
   granted: boolean;
-  /** Whether a per-tenant token is stored — never the token itself. */
-  tokenConfigured: boolean;
+  /** Which credential this company's Composio calls present — never the credential itself. */
+  credentialSource: ComposioCredentialSource;
   /** The effective Composio backend URL (non-secret). */
   backendUrl: string;
   /** The manifest toolkit allowlist (empty = defer to the backend allowlist). */
@@ -54,8 +67,9 @@ export function getComposioStatus(
 }
 
 /**
- * Set / rotate / clear the write-only per-tenant Composio token. A non-empty
- * value rotates it; an empty string clears it.
+ * Set / rotate / clear this company's own Composio token. A non-empty value
+ * rotates it; an empty string clears it, reverting to the instance's identity
+ * where there is one.
  */
 export function setComposioToken(
   client: OpenCompanyClient,

@@ -18,6 +18,15 @@
 //!     per-company SSRF domain allowlist. The `subagent` namespace is reserved
 //!     but empty in v1. Still deferred: browser automation (needs a backend),
 //!     search (needs engine keys), and Node/NPM exec (need a managed bootstrap).
+//! * **Delegation is orchestrator-only.** `query_company` / `spawn_task` /
+//!   `delegate_to_desk` (and the other orchestrator roster/workflow tools) are
+//!   wired only when `is_orchestrator`; a **dispatched** desk/roster agent never
+//!   gets them. That is the depth cap = 1 / "no re-delegation in v1" invariant
+//!   (issue #178). The dispatched belt is thus a curated, metered derivative of
+//!   an OpenHuman agent — the exec subset above plus intrinsic memory / file /
+//!   MCP / skill tools, and nothing more. Both halves (the exact dispatched set,
+//!   and the orchestrator-vs-dispatched delegation contrast) are pinned by the
+//!   contract tests in this module's `tests` submodule.
 //! * **Workflows/skills** start empty. Parsing enabled `SKILL.md` bodies via
 //!   `openhuman::skills::ops_parse` depends on WS1's skill parsing; the seam is
 //!   the `.workflows(...)` setter.
@@ -586,5 +595,248 @@ mod tests {
         assert!(!persona.contains("   Engineer"));
         // No trailing description clause.
         assert!(persona.trim_end().ends_with("role."), "{persona}");
+    }
+
+    // --- Dispatched-agent toolbelt contract (issue #188a) -------------------
+    //
+    // These tests PIN the tool surface a dispatched company agent receives by
+    // building a real agent via `build_agent` and reading back its live
+    // `tools()` list. They lock three things so a future change can neither
+    // silently widen nor narrow the belt:
+    //
+    //   a. the EXACT set of tool names a dispatched desk agent gets (snapshot);
+    //   b. delegation tools are ABSENT for a dispatched agent but PRESENT for
+    //      the orchestrator (the depth-cap = 1 / "no re-delegation" invariant,
+    //      issue #178 — the single most important thing to pin);
+    //   c. none of the deferred families (browser / search / node / subagent-
+    //      spawn / skill-exec / memory-tree / `forget`) appear in the belt.
+    //
+    // Compiled under the module's default `--features openhuman` config (the
+    // whole `harness` module is `openhuman`-gated), so the pinned set is the
+    // openhuman-only belt: the `media` (#109) and `composio` (#110) tool arms
+    // are inert without their features and are never wired here. Their
+    // namespace mapping is pinned separately by the `namespace_of` tests in
+    // `toolbelt.rs`.
+
+    use crate::company::Policy;
+    use crate::harness::mcp_probe::McpFailureQueue;
+    use crate::harness::orchestrator::{DelegationQueue, WorkflowRunnerHandle};
+    use crate::harness::policy::ApprovalRequestQueue;
+    use crate::harness::provider::MockProvider;
+    use crate::ports::CompanyStore;
+    use crate::ports::types::{
+        ChunkAddr, ChunkHit, ChunkMeta, CompanyRecord, CompanySummary, ContextChunk, LedgerEntry,
+    };
+
+    /// A no-op context store — the belt tests never exercise memory, they only
+    /// assert the wired tool surface.
+    struct PinContext;
+    #[async_trait::async_trait]
+    impl crate::ports::ContextStore for PinContext {
+        async fn put(&self, _: &CompanyId, _: ContextChunk) -> crate::Result<ChunkAddr> {
+            Ok(ChunkAddr::new("x"))
+        }
+        async fn list(&self, _: &CompanyId, _: &str) -> crate::Result<Vec<ChunkMeta>> {
+            Ok(Vec::new())
+        }
+        async fn peek(
+            &self,
+            _: &CompanyId,
+            _: &ChunkAddr,
+            _: Option<std::ops::Range<usize>>,
+        ) -> crate::Result<String> {
+            Ok(String::new())
+        }
+        async fn search(&self, _: &CompanyId, _: &str, _: usize) -> crate::Result<Vec<ChunkHit>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A no-op company store — `build_agent` only needs a handle; nothing here
+    /// loads or persists.
+    struct PinStore;
+    #[async_trait::async_trait]
+    impl CompanyStore for PinStore {
+        async fn load(&self, _: &CompanyId) -> crate::Result<Option<CompanyRecord>> {
+            Ok(None)
+        }
+        async fn save(&self, _: &CompanyRecord) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn list(&self) -> crate::Result<Vec<CompanySummary>> {
+            Ok(Vec::new())
+        }
+        async fn append_ledger(&self, _: &CompanyId, _: LedgerEntry) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Minimal `HarnessDeps` for building a single agent: offline mock provider,
+    /// no-op stores, no meter/skills/mcp/media/composio, `AllowAll` capability
+    /// filter (identity). Workspace lands under a caller-owned tempdir.
+    fn pin_deps(workspace_root: std::path::PathBuf) -> HarnessDeps {
+        HarnessDeps {
+            provider: Arc::new(MockProvider::new("mock: ")),
+            provider_slug: "mock".to_string(),
+            context: Arc::new(PinContext),
+            store: Arc::new(PinStore),
+            meter: None,
+            workspace_root,
+            model_override: None,
+            tasks: None,
+            skills: None,
+            skills_source_dir: None,
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: DelegationQueue::default(),
+            workflow_runner: WorkflowRunnerHandle::default(),
+            mcp_failures: McpFailureQueue::default(),
+            approval_requests: ApprovalRequestQueue::default(),
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+        }
+    }
+
+    /// Build one agent under `grants` and return its live tool names, sorted, so
+    /// a snapshot compares byte-stably against a literal.
+    fn built_tool_names(grants: &[&str], is_orchestrator: bool) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deps = pin_deps(dir.path().to_path_buf());
+        let manifest_agent = ManifestAgent {
+            id: "desk".to_string(),
+            role: "Desk Lead".to_string(),
+            description: None,
+            tier: None,
+            tools: Vec::new(),
+            budget_usd_daily: None,
+        };
+        let policy = ApprovalPolicy::new(&Policy::default(), None);
+        let grants: Vec<String> = grants.iter().map(|g| g.to_string()).collect();
+        let agent = build_agent(
+            &CompanyId::new("acme"),
+            "Acme",
+            &manifest_agent,
+            policy,
+            &deps,
+            &grants,
+            &[],
+            is_orchestrator,
+        )
+        .expect("agent builds");
+        let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// (a) The EXACT tool belt a dispatched desk agent receives with the broad
+    /// `*` grant, under the openhuman-only feature set. Any tool added to or
+    /// removed from a dispatched agent flips this snapshot and fails CI — the
+    /// whole point of the pin. The set is the curated exec subset (shell / code
+    /// / web) plus the intrinsic memory + file tools; it contains NO delegation
+    /// tool and NO deferred family.
+    #[test]
+    fn dispatched_desk_agent_tool_belt_is_pinned() {
+        let names = built_tool_names(&["*"], false);
+        let expected = vec![
+            "apply_patch",
+            "csv_export",
+            "curl",
+            "edit",
+            "file_read",
+            "file_write",
+            "git_operations",
+            "glob",
+            "grep",
+            "http_request",
+            "image_info",
+            "list",
+            "memory_recall",
+            "memory_store",
+            "read_workspace_state",
+            "shell",
+            "web_fetch",
+        ];
+        assert_eq!(names, expected, "dispatched desk belt drifted: {names:?}");
+    }
+
+    /// (b) The depth-cap = 1 invariant (issue #178): a dispatched desk agent
+    /// must NEVER receive the orchestrator's delegation tools, while the
+    /// orchestrator agent MUST. Building both from the same grant and contrasting
+    /// them is the registration check that a dispatched turn cannot re-delegate.
+    #[test]
+    fn dispatched_agent_has_no_delegation_tools_but_orchestrator_does() {
+        let delegation = ["query_company", "spawn_task", "delegate_to_desk"];
+
+        let dispatched = built_tool_names(&["*"], false);
+        for tool in delegation {
+            assert!(
+                !dispatched.contains(&tool.to_string()),
+                "dispatched desk agent must NOT receive delegation tool `{tool}`: {dispatched:?}"
+            );
+        }
+
+        let orchestrator = built_tool_names(&["*"], true);
+        for tool in delegation {
+            assert!(
+                orchestrator.contains(&tool.to_string()),
+                "orchestrator agent MUST receive delegation tool `{tool}`: {orchestrator:?}"
+            );
+        }
+    }
+
+    /// (c) No deferred family leaks into a dispatched belt: raw browser
+    /// automation, web-search, Node/NPM exec, OpenHuman sub-agent spawn tools
+    /// (the `subagent` namespace is reserved but empty in v1), skill *execution*,
+    /// the raw memory-tree tool surface, and `forget`. A negative assertion, so
+    /// it stays honest even as OpenHuman renames tools upstream — the pin is
+    /// "none of these shapes appear".
+    #[test]
+    fn dispatched_belt_excludes_every_deferred_family() {
+        let names = built_tool_names(&["*"], false);
+        let forbidden = [
+            // raw browser automation
+            "browser",
+            "browser_navigate",
+            "browser_click",
+            "browser_screenshot",
+            // web search
+            "web_search",
+            "search",
+            "google_search",
+            // Node / NPM exec
+            "node",
+            "npm",
+            "run_node",
+            "run_npm",
+            // OpenHuman sub-agent spawn (subagent namespace reserved, empty v1)
+            "spawn_subagent",
+            "spawn_agent",
+            "delegate_archivist",
+            // skill execution
+            "run_skill",
+            "skill_run",
+            "run_workflow",
+            "await_workflow",
+            // raw memory-tree tool surface
+            "memory_tree",
+            "memory_tree_search",
+            "memory_tree_get",
+            // destructive memory
+            "forget",
+            "memory_forget",
+        ];
+        for tool in forbidden {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "deferred tool `{tool}` leaked into the dispatched belt: {names:?}"
+            );
+        }
     }
 }

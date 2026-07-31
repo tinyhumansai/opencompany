@@ -1,14 +1,36 @@
 //! Per-tenant Composio connection management (issue #110, epic #26 Cell D): read
-//! the company's Composio status and set its write-only OAuth bearer token.
+//! the company's Composio status and set a per-company OAuth bearer token.
 //!
-//! The token is the entire tenant-isolation lever — the backend derives the
-//! Composio entity from it — so it is **write-only** over the API: set through
-//! the `token` field, stored in the secret store under
+//! ## Where the credential normally comes from
+//!
+//! On the hosted platform a company needs to paste nothing. The instance already
+//! authenticates with a platform-minted, audience-bound identity, and Composio
+//! calls present that — the backend derives the Composio entity from it. The read
+//! shape reports this as `credentialSource: "attested"`, and there is nothing
+//! stored on the instance to leak, rotate, or lose.
+//!
+//! ## `PUT …/composio/token` — the BYO override
+//!
+//! The write route stays, and it is **not** the hosted path. It is:
+//!
+//! * the **per-company BYO override** — a company that has its own Composio
+//!   account/token can set it here, and it wins over the instance identity for
+//!   that company only; and
+//! * the escape hatch for running this repo **standalone**. This repository is
+//!   public and people do run it that way, but self-hosting is **unsupported**:
+//!   there is no platform identity to present, so pasting a token is the only way
+//!   to reach Composio at all. Do not read this as parity with the hosted
+//!   product — it is a hatch, not a deployment mode, and nothing else about
+//!   standalone operation is supported this milestone.
+//!
+//! Either way the token is **write-only** over the API: set through the `token`
+//! field, stored in the secret store under
 //! [`TOKEN_KEY`](crate::company::composio::TOKEN_KEY), and **never** echoed. The
-//! read shape carries only a `tokenConfigured` boolean plus non-secret routing
-//! (backend URL, toolkit allowlist). A token set/rotate/clear takes effect on
-//! the agents' **next turn** with no restart (the harness re-resolves it each
-//! turn and rebuilds the roster when it changes).
+//! read shape carries only `credentialSource` plus non-secret routing (backend
+//! URL, toolkit allowlist) — never a token, and never a file path. A set / rotate
+//! / clear takes effect on the agents' **next turn** with no restart (the harness
+//! re-resolves the credential each turn and rebuilds the roster when the
+//! *identity* behind it changes).
 
 use axum::Json;
 use axum::Router;
@@ -17,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::company::composio::{backend_url_or_default, store_token, token_configured};
+use crate::company::credentials::{CredentialSource, TinyhumansTokenSource};
 use crate::company::runtime::CompanyRuntime;
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
@@ -42,19 +65,25 @@ pub fn router() -> Router<AppState> {
 }
 
 /// The company's Composio status as the console renders it. **Never** carries the
-/// token — only a non-secret `tokenConfigured` flag plus routing.
+/// token — only the non-secret `credentialSource` plus routing.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ComposioStatusDto {
     /// Whether the `composio` feature is compiled into this build at all (the
     /// tools only exist under it). `false` lets the console show a "not in this
-    /// build" state rather than implying a missing token.
+    /// build" state rather than implying a missing credential.
     in_build: bool,
     /// Whether the company **explicitly** grants the `composio` namespace (a `*`
     /// wildcard does NOT count).
     granted: bool,
-    /// Whether a non-empty per-tenant token is stored — never the token itself.
-    token_configured: bool,
+    /// Where this company's Composio credential comes from:
+    ///
+    /// * `attested` — the instance's platform identity (nothing is stored here);
+    /// * `static` — a token this company pasted, or a static instance key;
+    /// * `none` — no credential can be obtained, so no tools are wired.
+    ///
+    /// A tier name, never a credential and never a path.
+    credential_source: CredentialSource,
     /// The effective Composio backend URL (env override or default). Non-secret.
     backend_url: String,
     /// The manifest toolkit allowlist (empty = defer to the backend allowlist).
@@ -70,7 +99,8 @@ struct MutationResponse {
 }
 
 /// Set-token body. `token` is write-only intake (never returned): a non-empty
-/// value rotates it, an explicit empty string clears it.
+/// value rotates the company's BYO override, an explicit empty string clears it
+/// (reverting to the instance identity, where there is one).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetToken {
@@ -105,6 +135,24 @@ struct ConnectionDto {
     connected: bool,
 }
 
+/// Which tier a company's Composio credential comes from, mirroring the harness
+/// resolver's precedence: the company's **own** stored token wins, else this
+/// instance's platform identity, else nothing.
+///
+/// Takes the environment as a seam so the matrix is testable without mutating the
+/// process environment.
+fn credential_source_for(
+    stored: bool,
+    env: &dyn crate::app::config::EnvSource,
+) -> CredentialSource {
+    if stored {
+        return CredentialSource::Static;
+    }
+    TinyhumansTokenSource::from_env(env)
+        .map(|source| source.credential_source())
+        .unwrap_or(CredentialSource::None)
+}
+
 /// Resolves the Composio status DTO for a company.
 async fn effective_status(runtime: &CompanyRuntime) -> Result<ComposioStatusDto, ApiError> {
     let record = runtime.store().load(runtime.id()).await.map_err(ApiError)?;
@@ -115,21 +163,24 @@ async fn effective_status(runtime: &CompanyRuntime) -> Result<ComposioStatusDto,
         ),
         None => (false, Vec::new()),
     };
-    let configured = token_configured(runtime.id(), runtime.secrets().as_ref())
+    // Mirrors the harness resolver: this company's own token wins, else the
+    // instance's platform identity, else nothing.
+    let stored = token_configured(runtime.id(), runtime.secrets().as_ref())
         .await
         .map_err(ApiError)?;
+    let env = crate::app::config::ProcessEnv;
     let (env_url, api_url) = {
         use crate::app::config::EnvSource;
-        let env = crate::app::config::ProcessEnv;
         (
             env.get(crate::company::composio::COMPOSIO_BACKEND_URL_ENV),
             env.get(crate::company::composio::TINYHUMANS_API_URL_ENV),
         )
     };
+    let credential_source = credential_source_for(stored, &env);
     Ok(ComposioStatusDto {
         in_build: cfg!(feature = "composio"),
         granted,
-        token_configured: configured,
+        credential_source,
         backend_url: backend_url_or_default(env_url, api_url),
         toolkits,
     })
@@ -140,7 +191,9 @@ async fn get_status(company: ScopedCompany) -> Result<Json<ComposioStatusDto>, A
     Ok(Json(effective_status(company.runtime.as_ref()).await?))
 }
 
-/// `PUT …/composio/token` — set / rotate / clear the write-only per-tenant token.
+/// `PUT …/composio/token` — set / rotate / clear this company's BYO token. See
+/// the module docs: the hosted path needs no token, and standalone operation
+/// (where this is the only option) is unsupported.
 async fn set_token(
     company: ScopedCompany,
     Json(body): Json<SetToken>,
@@ -180,8 +233,10 @@ async fn connections(company: ScopedCompany) -> Result<Json<Vec<ConnectionDto>>,
 
 /// Resolve the per-tenant Composio config (bearer + backend URL + toolkit
 /// allowlist) the way the harness roster build does, so the console dials the
-/// backend with the exact same tenant identity. A `409 Conflict` when no token
-/// is configured — the operator must set it (paste-token card) before OAuth.
+/// backend with the exact same tenant identity. A `409 Conflict` when no
+/// credential of any tier can be resolved — neither this company's own stored
+/// token nor a platform identity — in which case the operator must paste a token
+/// before OAuth.
 #[cfg(feature = "composio")]
 async fn resolve_tenant(
     runtime: &CompanyRuntime,
@@ -201,11 +256,14 @@ async fn resolve_tenant(
         toolkits,
         backend_env,
         api_env,
+        crate::company::TinyhumansTokenSource::from_env(&env).map(std::sync::Arc::new),
     )
     .await
     .ok_or_else(|| {
         ApiError(crate::error::OpenCompanyError::Conflict(
-            "no Composio token configured for this company — set the token first".to_string(),
+            "no Composio credential is available for this company — this instance has no platform \
+             identity, so paste the company's Composio token first"
+                .to_string(),
         ))
     })
 }
@@ -271,6 +329,8 @@ async fn connections_impl(_runtime: &CompanyRuntime) -> Result<Json<Vec<Connecti
 
 #[cfg(test)]
 mod tests {
+    use super::{ComposioStatusDto, CredentialSource, credential_source_for};
+
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
@@ -348,8 +408,12 @@ mod tests {
         (status, value, raw)
     }
 
+    /// The `credentialSource` matrix as the console consumes it, plus the
+    /// write-only contract. Runs with no platform identity in the environment, so
+    /// the instance contributes nothing and the company's own token is the only
+    /// credential in play: `none` → `static` → `none`.
     #[tokio::test]
-    async fn status_reports_grant_and_toolkits_then_token_round_trips_write_only() {
+    async fn credential_source_tracks_the_byo_token_and_never_carries_it() {
         let home = home();
         let state = state_with_manifest(
             &home,
@@ -357,19 +421,23 @@ mod tests {
         )
         .await;
 
-        // Initial status: granted, toolkits surfaced, no token yet.
+        // Initial status: granted, toolkits surfaced, no credential obtainable.
         let (status, dto, _) = send(&state, "GET", "/api/v1/company/composio", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(dto["granted"], true);
-        assert_eq!(dto["tokenConfigured"], false);
+        assert_eq!(dto["credentialSource"], "none");
         assert_eq!(dto["toolkits"], json!(["gmail", "github"]));
         assert!(dto.get("backendUrl").is_some());
         assert!(
             dto.get("token").is_none(),
             "status must never carry a token"
         );
+        assert!(
+            dto.get("tokenConfigured").is_none(),
+            "the boolean surface is replaced by credentialSource"
+        );
 
-        // Set the write-only token.
+        // Set the write-only BYO token → the static tier.
         let (status, resp, raw) = send(
             &state,
             "PUT",
@@ -378,15 +446,15 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{raw}");
-        assert_eq!(resp["status"]["tokenConfigured"], true);
+        assert_eq!(resp["status"]["credentialSource"], "static");
         assert!(!raw.contains(TOKEN), "PUT response leaked the token: {raw}");
 
         // GET reflects it and still never carries the token.
         let (_, dto, raw) = send(&state, "GET", "/api/v1/company/composio", None).await;
-        assert_eq!(dto["tokenConfigured"], true);
+        assert_eq!(dto["credentialSource"], "static");
         assert!(!raw.contains(TOKEN), "GET status leaked the token: {raw}");
 
-        // Clearing with "" removes it.
+        // Clearing with "" reverts to whatever the instance offers — here nothing.
         let (_, resp, _) = send(
             &state,
             "PUT",
@@ -394,9 +462,80 @@ mod tests {
             Some(json!({ "token": "" })),
         )
         .await;
-        assert_eq!(resp["status"]["tokenConfigured"], false);
+        assert_eq!(resp["status"]["credentialSource"], "none");
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The hosted shape, driven through the env seam (no process mutation): a
+    /// company that pasted nothing reads `attested` from the instance identity,
+    /// its own token still outranks that, and neither yields `none`.
+    #[test]
+    fn credential_source_matrix_follows_the_resolver_precedence() {
+        use crate::app::config::MapEnv;
+
+        let dir = std::env::temp_dir().join(format!("oc-dto-{}", crate::ports::generate_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "projected-instance-token").unwrap();
+        let projected = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            path.display().to_string(),
+        )]);
+
+        // Nothing stored + a projected instance identity → attested.
+        assert_eq!(
+            credential_source_for(false, &projected),
+            CredentialSource::Attested
+        );
+        // The company's own token outranks the instance identity.
+        assert_eq!(
+            credential_source_for(true, &projected),
+            CredentialSource::Static
+        );
+        // A static instance key is the static tier too.
+        assert_eq!(
+            credential_source_for(
+                false,
+                &MapEnv::new([(crate::company::credentials::API_KEY_ENV, "th_static")])
+            ),
+            CredentialSource::Static
+        );
+        // Neither → nothing obtainable, so no tools.
+        assert_eq!(
+            credential_source_for(false, &MapEnv::default()),
+            CredentialSource::None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The DTO's whole surface, serialized: a tier name and non-secret routing.
+    /// No token, and no token-file path either — the console never needs to know
+    /// where on disk the instance's identity lives.
+    #[test]
+    fn the_dto_carries_a_tier_name_and_nothing_secret() {
+        let dto = ComposioStatusDto {
+            in_build: true,
+            granted: true,
+            credential_source: CredentialSource::Attested,
+            backend_url: "https://api.tinyhumans.ai".to_string(),
+            toolkits: vec!["gmail".to_string()],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["credentialSource"], "attested");
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "inBuild",
+                "granted",
+                "credentialSource",
+                "backendUrl",
+                "toolkits"
+            ],
+            "the read shape must stay exactly this: {keys:?}"
+        );
     }
 
     /// A `*` wildcard grant must NOT count as a composio grant on the status
