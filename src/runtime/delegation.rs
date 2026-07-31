@@ -26,7 +26,7 @@ use crate::company::steer::{
     InflightEntry, InflightKind, InflightRegistry, SteerAction, SteerControl,
 };
 use crate::harness::TurnOutcome;
-use crate::harness::lifecycle;
+use crate::harness::lifecycle::{self, TaskRunEnd};
 use crate::harness::orchestrator::{self, Delegation, DelegationQueue};
 use crate::ports::types::{CompanyId, CompanyRecord, OutboundMessage, TurnStep};
 use crate::ports::{TaskRecord, TaskStore, generate_id, now_millis};
@@ -133,6 +133,20 @@ pub(crate) struct OperatorTurn {
     pub(crate) bubbles: Vec<OutboundMessage>,
 }
 
+/// What a **dispatched card's** turn handed off (issue #204).
+///
+/// Returned by [`DelegationRunner::handle_task_delegations`] when the turn
+/// called `delegate_to_desk` and the desk resolved to a real teammate: that
+/// teammate is now the card's assignee and has already run. `reply` is what
+/// they produced, or `None` when their run yielded nothing (an operator
+/// cancelled it mid-flight).
+pub(crate) struct TaskHandoff {
+    /// The delegate that took the card over — now its `assignee`.
+    pub(crate) delegate: String,
+    /// What the delegate produced, if anything.
+    pub(crate) reply: Option<String>,
+}
+
 /// Drives the brain-agnostic delegation orchestration over a [`RunTurn`]: run the
 /// responder's turn, drain and execute whatever it queued, and — when a desk
 /// answered synchronously — relay through exactly one more responder turn.
@@ -151,6 +165,10 @@ pub(crate) struct DelegationRunner<'a> {
     company: &'a CompanyId,
     queue: &'a DelegationQueue,
     max_delegations: usize,
+    /// The dispatched card this drain is running inside, when it is one (issue
+    /// #204). Owned rather than borrowed so a caller can hold the card mutably
+    /// while the runner runs. `None` for an operator chat turn.
+    task: Option<String>,
 }
 
 impl<'a> DelegationRunner<'a> {
@@ -173,7 +191,15 @@ impl<'a> DelegationRunner<'a> {
             company,
             queue,
             max_delegations,
+            task: None,
         }
+    }
+
+    /// Scopes this runner to a dispatched card, so anything the turn spawns
+    /// records that card as its parent (issue #185's `parent_task_id`).
+    pub(crate) fn for_task(mut self, task_id: &str) -> Self {
+        self.task = Some(task_id.to_string());
+        self
     }
 
     /// Handles one operator message end-to-end: clear stale delegations, run the
@@ -248,6 +274,124 @@ impl<'a> DelegationRunner<'a> {
         })
     }
 
+    /// Drains and executes whatever a **dispatched card's** turn queued (issue
+    /// #204), and reports the hand-off when one happened.
+    ///
+    /// Before this, `run_task` ran exactly one background turn and never
+    /// touched the queue — so when the dispatched responder (the orchestrator,
+    /// which carries the delegation tools) called `delegate_to_desk`, the
+    /// delegation was silently dropped, the turn still returned `Ok`, and the
+    /// card landed in `in_review` under the delegator with a blank assignee and
+    /// no delegate ever having run.
+    ///
+    /// The first hand-off to a desk with a resolvable lead **owns the card**:
+    /// the card is reassigned to that lead and persisted in
+    /// [`COLUMN_IN_PROGRESS`](lifecycle::COLUMN_IN_PROGRESS) *before* their turn
+    /// starts, so the board shows who is working it while they work it, and the
+    /// caller settles the card from their output afterwards. Every other
+    /// delegation — `spawn_task`, `assign_task`, `review_task`, a hand-off to a
+    /// desk nobody leads, and any further hand-off past the first — executes for
+    /// its side effect; a later hand-off's answer is appended to the note so it
+    /// is recorded rather than silently discarded.
+    ///
+    /// `chat_id` is `None` throughout: a dispatched card has no chat thread, and
+    /// stamping one would make a spawned card post back into an unrelated
+    /// conversation.
+    pub(crate) async fn handle_task_delegations(
+        &self,
+        card: &mut TaskRecord,
+        delegator: &str,
+    ) -> Result<Option<TaskHandoff>> {
+        let queued = self.queue.drain(self.max_delegations);
+        if queued.is_empty() {
+            return Ok(None);
+        }
+        tracing::debug!(
+            task_id = %card.id,
+            delegator = %delegator,
+            queued = queued.len(),
+            "[task] draining delegations queued by a dispatched turn"
+        );
+        let mut handoff: Option<TaskHandoff> = None;
+        for delegation in queued {
+            // Resolve the hand-off target BEFORE running it, so the card can be
+            // reassigned while the delegate works. `desk_lead` is pure, so the
+            // second resolution inside `run_delegation` yields the same member.
+            let lead = match &delegation {
+                Delegation::DelegateToDesk { desk, .. } => desk_lead(self.record, desk),
+                _ => None,
+            };
+            let Some(member) = lead else {
+                self.run_delegation(delegation, None).await?;
+                continue;
+            };
+            let owns_card = handoff.is_none();
+            if owns_card {
+                self.hand_card_over(card, delegator, &member, instruction_of(&delegation))
+                    .await?;
+            }
+            let reply = self
+                .run_delegation(delegation, None)
+                .await?
+                .desk_reply
+                .map(|desk| desk.reply);
+            match (owns_card, reply) {
+                (true, reply) => {
+                    handoff = Some(TaskHandoff {
+                        delegate: member,
+                        reply,
+                    });
+                }
+                // A second hand-off does not take the card over, but its answer
+                // is real work — record it rather than dropping it.
+                (false, Some(reply)) => {
+                    card.note = Some(append_note(card.note.as_deref(), &member, &reply));
+                }
+                (false, None) => {}
+            }
+        }
+        Ok(handoff)
+    }
+
+    /// Reassigns a dispatched card to the delegate taking it over and persists
+    /// it, so the board shows them working it *while* they work rather than
+    /// only once they are done (issue #204).
+    ///
+    /// The write goes through the [`TaskStore`] port, **not**
+    /// `CompanyRuntime::upsert_task`, so it cannot re-fire the
+    /// `column → in_progress` dispatch edge — the card is already in
+    /// `in_progress` and this only re-states it. No task store wired is a silent
+    /// no-op, matching every other task path on this seam.
+    async fn hand_card_over(
+        &self,
+        card: &mut TaskRecord,
+        delegator: &str,
+        member: &str,
+        instruction: &str,
+    ) -> Result<()> {
+        card.assignee = member.to_string();
+        card.note = Some(append_note(
+            card.note.as_deref(),
+            delegator,
+            &match instruction.trim() {
+                "" => format!("delegated to {member}"),
+                instruction => format!("delegated to {member}: {instruction}"),
+            },
+        ));
+        card.column = lifecycle::landing_column(TaskRunEnd::Delegated, card).to_string();
+        card.updated_at_millis = now_millis();
+        tracing::debug!(
+            task_id = %card.id,
+            delegate = %member,
+            column = %card.column,
+            "[task] card handed over to the delegate"
+        );
+        if let Some(tasks) = self.tasks {
+            tasks.upsert(self.company, card).await?;
+        }
+        Ok(())
+    }
+
     /// Executes one drained delegation.
     ///
     /// `spawn_task` opens a backlog card through the
@@ -284,15 +428,14 @@ impl<'a> DelegationRunner<'a> {
                     // so the completion can answer there instead of only landing in
                     // the note.
                     origin_chat_id: chat_id.map(str::to_string),
-                    // No parent (#185). `run_delegation` is only reached from an
-                    // orchestrator *chat* turn: `run_task` never drains the
-                    // delegation queue, and a dispatched card's responder is a desk
-                    // member, which carries no delegation tools ("no sub-agent
-                    // re-delegation in v1"). So no task is ever in scope here to be
-                    // the parent. Lineage is written through the task API's
-                    // `parentTaskId` instead; when task turns do gain delegation
-                    // tools, this is the site that stamps it.
-                    parent_task_id: None,
+                    // Lineage (#185): the dispatched card whose turn queued this
+                    // one, when the drain is running inside a task
+                    // (`for_task`) — since #204 a dispatched turn drains the
+                    // queue too, so a task IS in scope here and this is the site
+                    // that stamps it. An orchestrator *chat* turn has no task in
+                    // scope and still writes `None`; lineage for those is written
+                    // through the task API's `parentTaskId` instead.
+                    parent_task_id: self.task.clone(),
                 };
                 tasks.upsert(self.company, &card).await?;
                 Ok(DelegationOutcome::default())
@@ -456,6 +599,16 @@ impl<'a> DelegationRunner<'a> {
     /// which `orchestrator_id` already tolerates.
     fn orchestrator_id(&self) -> String {
         orchestrator::orchestrator_id(&self.record.manifest.agents).unwrap_or_default()
+    }
+}
+
+/// The instruction a hand-off carries, for the note that records it (issue
+/// #204). Empty for every other delegation kind — callers only ask this of a
+/// [`Delegation::DelegateToDesk`].
+fn instruction_of(delegation: &Delegation) -> &str {
+    match delegation {
+        Delegation::DelegateToDesk { instruction, .. } => instruction,
+        _ => "",
     }
 }
 

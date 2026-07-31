@@ -128,7 +128,12 @@ impl HarnessBrain {
         }
         // A blank assignee is the one legitimate miss: nobody was named, so the
         // orchestrator picks it up.
-        let responder = resolution
+        //
+        // Not final: a turn that hands the work off (issue #204) reassigns the
+        // card to the delegate, and from that point the delegate is the
+        // responder every downstream write credits — the note, the artifact,
+        // the journal, and the relay.
+        let mut responder = resolution
             .working_agent()
             .unwrap_or(&self.responder)
             .to_string();
@@ -186,6 +191,11 @@ impl HarnessBrain {
         // record exactly the text the note does rather than a second, divergent
         // rendering of the same run.
         let result_text = loop {
+            // Start each turn from an empty queue so nothing a prior turn (this
+            // cycle's operator message, or an earlier redirect rerun) left
+            // behind can hijack this card — the same guard
+            // `handle_operator_message` opens with.
+            self.deps.delegations.clear();
             let outcome = run_turn
                 // A dispatched task card carries no chat bubble (its steps are
                 // discarded into the note), so its live turn frames must not leak
@@ -199,13 +209,71 @@ impl HarnessBrain {
                     // A dispatched task discards its steps — the note is text-only.
                     match outcome {
                         Ok(outcome) => {
-                            // `settle` writes the note (attributed to the
-                            // assignee) and the landing column via the #186
-                            // lifecycle seam; the loop still yields the reply so
-                            // the #185/#190 completion events report the same
-                            // text that landed in the note.
-                            let result = outcome.reply;
-                            settle(&mut card, TaskRunEnd::Completed, &responder, &result);
+                            // Issue #204: the turn may have DELEGATED rather
+                            // than done the work. The dispatched responder is
+                            // the orchestrator, which carries `delegate_to_desk`
+                            // / `spawn_task`, and nothing here used to drain
+                            // what those queued — so the hand-off was dropped,
+                            // the turn still read as a clean completion, and the
+                            // card landed in `in_review` under the delegator
+                            // with the delegate never having run. Draining here
+                            // runs the delegate, reassigns the card to them, and
+                            // settles it from THEIR output.
+                            let handoff = self
+                                .delegation_runner(&run_turn)
+                                .for_task(&card.id)
+                                .handle_task_delegations(&mut card, &responder)
+                                .await?;
+                            // `settle` writes the note (attributed to whoever
+                            // actually produced the text) and the landing column
+                            // via the #186 lifecycle seam; the loop still yields
+                            // the reply so the #185/#190 completion events
+                            // report the same text that landed in the note.
+                            let result = match handoff {
+                                // The delegate answered: they own the card, and
+                                // every downstream write credits them.
+                                Some(handoff) => {
+                                    responder = handoff.delegate;
+                                    match handoff.reply {
+                                        Some(reply) => {
+                                            settle(
+                                                &mut card,
+                                                TaskRunEnd::Completed,
+                                                &responder,
+                                                &reply,
+                                            );
+                                            reply
+                                        }
+                                        // The hand-off ran but produced nothing
+                                        // (an operator cancelled it in flight).
+                                        // Partial work is discarded and the card
+                                        // returns to the backlog, exactly as a
+                                        // cancelled dispatch does — it must not
+                                        // read as finished, and it must not
+                                        // strand in `in_progress` either.
+                                        None => {
+                                            let reply =
+                                                "the delegated run was cancelled before it \
+                                                 produced anything"
+                                                    .to_string();
+                                            settle(
+                                                &mut card,
+                                                TaskRunEnd::Cancelled,
+                                                &responder,
+                                                &reply,
+                                            );
+                                            reply
+                                        }
+                                    }
+                                }
+                                // Nothing was handed off — the responder did the
+                                // work itself, as before.
+                                None => {
+                                    let result = outcome.reply;
+                                    settle(&mut card, TaskRunEnd::Completed, &responder, &result);
+                                    result
+                                }
+                            };
                             break result;
                         }
                         Err(err) => {
@@ -3101,6 +3169,19 @@ members = ["eng1", "eng2"]
         queue: orchestrator::DelegationQueue,
         pushes: StdMutex<VecDeque<Option<Delegation>>>,
         calls: std::sync::atomic::AtomicUsize,
+        /// The same task store the brain writes through, so each invoke can
+        /// snapshot the board **as that turn sees it** — the only way a test can
+        /// observe a dispatched card mid-run (issue #204).
+        tasks: Arc<FsOps>,
+        /// `(column, assignee)` of the company's card at each invoke, in order.
+        board: StdMutex<Vec<(String, String)>>,
+    }
+
+    impl DelegatingProvider {
+        /// The board snapshot each turn ran against, in invoke order.
+        fn board(&self) -> Vec<(String, String)> {
+            self.board.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -3111,6 +3192,15 @@ members = ["eng1", "eng2"]
             request: ModelRequest,
         ) -> tinyagents::Result<ModelResponse> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let snapshot = self
+                .tasks
+                .list(&CompanyId::new("acme"))
+                .await
+                .ok()
+                .and_then(|cards| cards.into_iter().next())
+                .map(|card| (card.column, card.assignee))
+                .unwrap_or_default();
+            self.board.lock().unwrap().push(snapshot);
             if let Some(Some(delegation)) = self.pushes.lock().unwrap().pop_front() {
                 self.queue.push(delegation);
             }
@@ -3140,10 +3230,13 @@ members = ["eng1", "eng2"]
         pushes: Vec<Option<Delegation>>,
     ) -> (HarnessBrain, Arc<DelegatingProvider>) {
         let queue = orchestrator::DelegationQueue::default();
+        let tasks = Arc::new(FsOps::new(dir));
         let provider = Arc::new(DelegatingProvider {
             queue: queue.clone(),
             pushes: StdMutex::new(pushes.into_iter().collect()),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            tasks: tasks.clone(),
+            board: StdMutex::new(Vec::new()),
         });
         let deps = HarnessDeps {
             provider: provider.clone(),
@@ -3153,7 +3246,7 @@ members = ["eng1", "eng2"]
             meter: None,
             workspace_root: dir.to_path_buf(),
             model_override: None,
-            tasks: Some(Arc::new(FsOps::new(dir))),
+            tasks: Some(tasks),
             skills: None,
             skills_source_dir: None,
             mcp_servers: Vec::new(),
@@ -3321,5 +3414,169 @@ members = ["eng1", "eng2"]
             "{:?}",
             result.channel_responses[0].text
         );
+    }
+
+    // --- Issue #204: a dispatched turn that delegates -----------------------
+
+    /// Seeds one dispatched card (blank assignee → the orchestrator runs it,
+    /// which is the shape that carries the delegation tools) and dispatches it.
+    async fn dispatch_card(brain: &HarnessBrain, tasks: &Arc<FsOps>, id: &str) {
+        let mut c = card(id, "");
+        c.column = "in_progress".to_string();
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+        brain
+            .run_cycle(
+                request(vec![CompanyEvent::TaskDispatched {
+                    task_id: id.to_string(),
+                }]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+    }
+
+    /// The bug: a dispatched task the CEO delegated went straight to
+    /// `in_review` under the CEO with a blank assignee, and the delegate never
+    /// ran — `run_task` ran one turn and never drained the delegation queue.
+    ///
+    /// Now the delegate actually runs, is linked as the card's assignee, and
+    /// the card only reaches `in_review` on the back of THEIR output.
+    #[tokio::test]
+    async fn a_dispatched_turn_that_delegates_runs_the_delegate_and_links_them_to_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![Some(Delegation::DelegateToDesk {
+                desk: "eng_desk".to_string(),
+                instruction: "fetch my activity".to_string(),
+            })],
+        );
+        dispatch_card(&brain, &provider.tasks.clone(), "t-deleg").await;
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the dispatched turn, then the delegate's own turn — the delegate must actually run"
+        );
+
+        let after = only_card(&provider.tasks).await;
+        assert_eq!(
+            after.assignee, "engineer",
+            "the delegate must be linked as the assignee, not left blank under the delegator"
+        );
+        assert_eq!(
+            after.column, "in_review",
+            "the card reaches review on the delegate's output"
+        );
+        let note = after.note.expect("note");
+        assert!(
+            note.contains("delegated to engineer: fetch my activity"),
+            "the hand-off is recorded in the delegator's voice: {note}"
+        );
+        // The delegate's own turn produced the result block: the mock echoes the
+        // instruction it was handed back under its own attribution.
+        let (_, delegate_block) = note
+            .split_once("[engineer] did:")
+            .unwrap_or_else(|| panic!("the delegate's output is the card's result: {note}"));
+        assert!(
+            delegate_block.contains("fetch my activity"),
+            "the delegate ran the instruction it was handed: {note}"
+        );
+
+        // …and while the delegate was working, the card showed THEM working it:
+        // its second turn ran against a card already reassigned and still in
+        // progress, not one parked in a terminal column.
+        assert_eq!(
+            provider.board()[1],
+            ("in_progress".to_string(), "engineer".to_string()),
+            "the delegate must be shown working the card while they work it"
+        );
+    }
+
+    /// The compatibility half: a dispatched turn that delegates nothing still
+    /// runs exactly one turn and settles under the agent that ran it.
+    ///
+    /// (Deliberately no assertion on `assignee` — linking the *non-delegating*
+    /// working agent to the card is issue #205's fix, and this test must not
+    /// pin the blank it leaves behind today.)
+    #[tokio::test]
+    async fn a_dispatched_turn_that_delegates_nothing_settles_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, provider) = brain_that_delegates(dir.path(), Vec::new());
+        dispatch_card(&brain, &provider.tasks.clone(), "t-plain").await;
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no delegation → one turn, no hand-off"
+        );
+        let after = only_card(&provider.tasks).await;
+        assert_eq!(after.column, "in_review");
+        assert!(
+            after.note.expect("note").contains("[chief]"),
+            "the agent that ran it owns the result"
+        );
+    }
+
+    /// A hand-off to a desk nobody leads has nowhere to go: rather than
+    /// stranding the card in `in_progress` waiting on a delegate that will
+    /// never run, the delegator's own reply settles it exactly as before.
+    #[tokio::test]
+    async fn a_hand_off_to_an_unknown_desk_settles_under_the_delegator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![Some(Delegation::DelegateToDesk {
+                desk: "ghost".to_string(),
+                instruction: "look into it".to_string(),
+            })],
+        );
+        dispatch_card(&brain, &provider.tasks.clone(), "t-ghost").await;
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unknown desk has no lead to run a second turn"
+        );
+        let after = only_card(&provider.tasks).await;
+        assert_eq!(
+            after.column, "in_review",
+            "the card must not strand in progress waiting on a delegate that cannot run"
+        );
+        assert_ne!(after.assignee, "ghost");
+    }
+
+    /// A `spawn_task` queued by a *dispatched* turn now opens its card with the
+    /// dispatched card as its parent — the lineage `run_delegation` could never
+    /// stamp while the task path did not drain the queue (issue #185's
+    /// `parent_task_id`).
+    #[tokio::test]
+    async fn a_task_spawned_by_a_dispatched_turn_records_its_parent_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, provider) = brain_that_delegates(
+            dir.path(),
+            vec![Some(Delegation::SpawnTask {
+                title: "Follow up next week".to_string(),
+                note: None,
+                assignee: None,
+            })],
+        );
+        dispatch_card(&brain, &provider.tasks.clone(), "t-parent").await;
+
+        let cards = provider.tasks.list(&CompanyId::new("acme")).await.unwrap();
+        let spawned = cards
+            .iter()
+            .find(|c| c.title == "Follow up next week")
+            .expect("the spawned card must actually be opened");
+        assert_eq!(spawned.column, "backlog");
+        assert_eq!(
+            spawned.parent_task_id.as_deref(),
+            Some("t-parent"),
+            "a card spawned inside a dispatch remembers the card it came from"
+        );
+        // The parent still settles on its own turn's reply — spawning follow-up
+        // work is not a hand-off.
+        let parent = cards.iter().find(|c| c.id == "t-parent").expect("parent");
+        assert_eq!(parent.column, "in_review");
     }
 }

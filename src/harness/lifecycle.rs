@@ -49,13 +49,17 @@ use crate::ports::types::{OutboundMessage, ReplyTo};
 /// The definitions moved to the task **port** in issue #205: this module is
 /// `#[cfg(feature = "openhuman")]`, so the REST write boundary — which now
 /// validates a card's column — could not see them. `COLUMN_IN_REVIEW` is where
-/// a card awaits the orchestrator, `COLUMN_BACKLOG` where a stopped or failed
-/// run returns it, `COLUMN_PAUSED` where a paused run parks it (resume is a
-/// plain `column → in_progress` PATCH, which re-triggers dispatch), and
-/// `COLUMN_DONE` the terminal — reached by [`landing_column`] for a delegated
-/// card and by [`review_landing_column`] for an approved board card (issue #171
-/// / PR #179).
-pub use crate::ports::tasks::{COLUMN_BACKLOG, COLUMN_DONE, COLUMN_IN_REVIEW, COLUMN_PAUSED};
+/// a card awaits the orchestrator, `COLUMN_IN_PROGRESS` where a card is being
+/// worked — where a dispatched card already is, and where one whose turn
+/// **handed the work off** stays while the delegate runs (issue #204) —
+/// `COLUMN_BACKLOG` where a stopped or failed run returns it, `COLUMN_PAUSED`
+/// where a paused run parks it (resume is a plain `column → in_progress` PATCH,
+/// which re-triggers dispatch), and `COLUMN_DONE` the terminal — reached by
+/// [`landing_column`] for a delegated card and by [`review_landing_column`] for
+/// an approved board card (issue #171 / PR #179).
+pub use crate::ports::tasks::{
+    COLUMN_BACKLOG, COLUMN_DONE, COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED,
+};
 
 /// The note attribution used for an operator-initiated stop, as opposed to a
 /// result the assignee produced.
@@ -70,6 +74,16 @@ pub const OPERATOR_ATTRIBUTION: &str = "operator";
 pub enum TaskRunEnd {
     /// The assignee finished its turn and produced a result.
     Completed,
+    /// The assignee's turn **handed the work off** to another agent rather than
+    /// doing it (issue #204). This is not an ending: the card is reassigned to
+    /// the delegate and stays in [`COLUMN_IN_PROGRESS`] while they run, and the
+    /// delegate's own ending — a [`Completed`](Self::Completed) with their
+    /// output, or a [`Cancelled`](Self::Cancelled) — settles it afterwards.
+    ///
+    /// Without this, "I finished the work" and "I handed it off" were the same
+    /// `Completed`, so a delegating dispatch landed in `in_review` under the
+    /// delegator with the delegate never having run.
+    Delegated,
     /// The turn itself errored (`dispatch failed: …`).
     Failed,
     /// An operator cancelled mid-flight. Partial work is discarded.
@@ -161,7 +175,8 @@ pub fn success_terminal_column(card: &TaskRecord) -> &'static str {
 /// The board column a run ending this way lands its card in.
 ///
 /// The single authority for that mapping. A failed or cancelled run goes back
-/// to `backlog` (it is not reviewable work); a paused one parks; everything
+/// to `backlog` (it is not reviewable work); a paused one parks; a hand-off
+/// stays in `in_progress` because the work has only changed hands; everything
 /// that produced a result goes to its [`success_terminal_column`] — `done` for
 /// a delegated card, `in_review` for a board-created one.
 pub fn landing_column(end: TaskRunEnd, card: &TaskRecord) -> &'static str {
@@ -169,6 +184,10 @@ pub fn landing_column(end: TaskRunEnd, card: &TaskRecord) -> &'static str {
         TaskRunEnd::Completed | TaskRunEnd::RedirectsExhausted => success_terminal_column(card),
         TaskRunEnd::Failed | TaskRunEnd::Cancelled => COLUMN_BACKLOG,
         TaskRunEnd::Paused => COLUMN_PAUSED,
+        // A hand-off is explicitly NOT a terminal: the delegate is running, so
+        // the card keeps the column it was dispatched in and only settles once
+        // they come back with something (issue #204).
+        TaskRunEnd::Delegated => COLUMN_IN_PROGRESS,
     }
 }
 
@@ -196,6 +215,7 @@ pub fn note_attribution(end: TaskRunEnd, responder: &str) -> String {
 pub fn relay_text(card: &TaskRecord, responder: &str, orchestrator: &str) -> String {
     let status = match card.column.as_str() {
         COLUMN_IN_REVIEW => "is ready for review",
+        COLUMN_IN_PROGRESS => "is still in progress",
         COLUMN_PAUSED => "is paused",
         COLUMN_BACKLOG => "went back to the backlog",
         COLUMN_DONE => "is done",
@@ -285,6 +305,30 @@ mod test {
             COLUMN_BACKLOG
         );
         assert_eq!(landing_column(TaskRunEnd::Paused, &board), COLUMN_PAUSED);
+        assert_eq!(
+            landing_column(TaskRunEnd::Delegated, &board),
+            COLUMN_IN_PROGRESS
+        );
+    }
+
+    /// Issue #204: handing the work off is not finishing it. A delegating turn
+    /// used to settle as `Completed`, which parked the card in its success
+    /// terminal under the *delegator* while the delegate had not even run — so
+    /// the hand-off keeps the card in progress instead, whatever its origin.
+    #[test]
+    fn a_hand_off_keeps_the_card_in_progress_rather_than_finishing_it() {
+        for card in [
+            card(COLUMN_IN_PROGRESS, None),
+            delegated_card(COLUMN_IN_PROGRESS),
+        ] {
+            let landed = landing_column(TaskRunEnd::Delegated, &card);
+            assert_eq!(landed, COLUMN_IN_PROGRESS);
+            assert_ne!(
+                landed,
+                success_terminal_column(&card),
+                "a hand-off must never reach a terminal column — the delegate has not run yet"
+            );
+        }
     }
 
     /// #171 (PR #179): a delegated card completes to `done` instead of
