@@ -5463,7 +5463,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hickory-resolver 0.24.4",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "jsonwebtoken",
  "lettre",
  "log",
