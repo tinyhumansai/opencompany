@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::steer::{InflightEntry, SteerAction, SteerError, cap_redirect};
 use crate::error::OpenCompanyError;
-use crate::ports::tasks::{BOARD_COLUMNS, COLUMN_BACKLOG, TaskRecord, is_board_column};
+use crate::ports::tasks::{BOARD_COLUMNS, COLUMN_TODO, TaskRecord, is_board_column};
 use crate::ports::types::CompanyEvent;
 use crate::ports::{generate_id, now_millis};
 use crate::runtime::assignee;
@@ -258,7 +258,12 @@ async fn create_task(
     // Issue #205: validated before anything is written, so a bad column or a
     // bad assignee is a `400` the operator sees rather than a card that lands
     // somewhere the board cannot render or hands work to a name nobody answers to.
-    let column = body.column.unwrap_or_else(|| COLUMN_BACKLOG.to_string());
+    // Issue #206: a card created here is manual entry — the board's `+` button,
+    // which now lives on To-do alone — so that is the default. It is
+    // deliberately NOT `backlog`: backlog is the unqueued pool and where the
+    // lifecycle returns work that needs another pass, so defaulting new work
+    // there mixed "nobody has picked this up" with "someone just asked for it".
+    let column = body.column.unwrap_or_else(|| COLUMN_TODO.to_string());
     validate_column(&column)?;
     let assignee = resolve_assignee(&company, body.assignee.unwrap_or_default()).await?;
     let record = TaskRecord {

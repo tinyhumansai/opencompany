@@ -335,11 +335,20 @@ pub trait TaskStore: Send + Sync {
 `TaskRecord` carries `{id, title, note, column, priority, assignee,
 updated_at}`.
 
-`column` ∈ `backlog|in_progress|paused|in_review|done` — the `BOARD_COLUMNS`
+`column` ∈ `backlog|todo|in_progress|paused|in_review|done` — the `BOARD_COLUMNS`
 constant in `src/ports/tasks.rs`, which is the one authority the REST write
-boundary, the dispatch edge and the harness lifecycle seam all read. (`paused`
-arrived with steering, issue #111; this line used to omit it.) Entering
-`in_progress` is what dispatches the card; nothing dispatches out of `done`.
+boundary, the dispatch edge and the harness lifecycle seam all read, and which
+the console mirrors in the same order. (`paused` arrived with steering, issue
+#111; this line used to omit it.) Entering `in_progress` is what dispatches the
+card; nothing dispatches out of `done`.
+
+`backlog` and `todo` are both "not started", and the split is deliberate:
+`backlog` is the unqueued pool — and where the lifecycle returns work that needs
+another pass (a failed dispatch, an orchestrator `revise` verdict) — while
+`todo` is what has been queued up next. `todo` is the board's one manual-entry
+column: the console's `+` button lives there alone and `POST …/tasks` defaults
+to it (issue #206), so an operator cannot create a card straight into
+`in_progress` or a terminal column.
 
 `assignee` names a **roster teammate id, a desk, or nobody** (`""`), resolved by
 `crate::runtime::assignee` against the full roster — manifest agents, operator

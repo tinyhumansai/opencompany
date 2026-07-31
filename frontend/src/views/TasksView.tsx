@@ -26,7 +26,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
+import { ADD_TASK_COLUMN, PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
 import { TaskDetailView } from "./TaskDetailView";
 
@@ -230,13 +230,16 @@ export function TasksView({
                   <span className="text-sm font-medium">{col.label}</span>
                   <span className="text-xs text-muted-foreground">{items.length}</span>
                 </div>
-                <button
-                  className="text-muted-foreground hover:text-foreground"
-                  aria-label={`Add task to ${col.label}`}
-                  onClick={() => setCreatingIn(col.id)}
-                >
-                  <Plus className="size-4" />
-                </button>
+                {/* New work enters the board in one place only (issue #206). */}
+                {col.id === ADD_TASK_COLUMN && (
+                  <button
+                    className="text-muted-foreground hover:text-foreground"
+                    aria-label={`Add task to ${col.label}`}
+                    onClick={() => setCreatingIn(col.id)}
+                  >
+                    <Plus className="size-4" />
+                  </button>
+                )}
               </div>
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
                 {loading && items.length === 0 ? (

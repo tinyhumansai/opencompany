@@ -18,14 +18,36 @@ export interface TaskColumn {
   label: string;
 }
 
+/**
+ * The board's columns, left to right. Must stay in step with the backend's
+ * `BOARD_COLUMNS` (`src/ports/tasks.rs`), which is the source of truth — and
+ * which the REST write boundary rejects a card against, so a column that
+ * exists only here is one the host will refuse.
+ */
 export const TASK_COLUMNS: TaskColumn[] = [
+  // The unqueued pool, and where the lifecycle returns work that needs another
+  // pass (a failed dispatch, an orchestrator `revise` verdict).
   { id: "backlog", label: "Backlog" },
+  // Queued to be worked next (issue #206). The board's manual-entry column:
+  // `ADD_TASK_COLUMN` below restricts the `+` button to it, and it is what the
+  // host's `POST …/tasks` defaults to.
+  { id: "todo", label: "To-do" },
   { id: "in_progress", label: "In progress" },
   // Where a steered-to-pause run parks (issue #111); a card here offers Resume.
   { id: "paused", label: "Paused" },
   { id: "in_review", label: "In review" },
   { id: "done", label: "Done" },
 ];
+
+/**
+ * The one column that offers the "+" add-task button (issue #206).
+ *
+ * New work enters the board in exactly one place. Offering `+` on every column
+ * — as the board used to — let an operator create a card straight into
+ * `in_progress`, `in_review`, or `done`, which either skips the dispatch edge
+ * or fabricates a terminal state for work that never ran.
+ */
+export const ADD_TASK_COLUMN = "todo";
 
 const STRATEGY = { name: "Strategy desk", tone: "sky" };
 const CREATIVE = { name: "Creative studio", tone: "violet" };
