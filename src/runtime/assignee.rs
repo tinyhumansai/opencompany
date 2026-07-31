@@ -45,6 +45,17 @@ pub enum AssigneeResolution {
     /// Names nothing on the roster. Carries the string as typed, so the
     /// operator is told back exactly what they wrote.
     Unknown(String),
+    /// Names more than one operator-added teammate: two teammates carry the
+    /// same display name. Real, but not resolvable to a single worker — kept
+    /// distinct from [`Self::Unknown`] because the fix is different (rename one
+    /// of them, or assign by id) and because silently taking the first is the
+    /// misrouting this module exists to end.
+    AmbiguousTeammate {
+        /// The string as typed.
+        raw: String,
+        /// How many teammates answer to it.
+        count: usize,
+    },
 }
 
 impl AssigneeResolution {
@@ -58,8 +69,24 @@ impl AssigneeResolution {
         match self {
             Self::Agent(id) => Some(id.as_str()),
             Self::Desk { lead, .. } => Some(lead.as_str()),
-            Self::Unassigned | Self::EmptyDesk(_) | Self::Unknown(_) => None,
+            Self::Unassigned
+            | Self::EmptyDesk(_)
+            | Self::Unknown(_)
+            | Self::AmbiguousTeammate { .. } => None,
         }
+    }
+
+    /// Whether dispatch should write the working agent back onto the card.
+    ///
+    /// True for [`Self::Unassigned`] and [`Self::Agent`] only. A **desk**
+    /// assignment is ownership and stays a desk assignment — see
+    /// [`Self::canonical`], which deliberately stores the desk id. The lead is
+    /// who runs this turn, not who the card belongs to, so writing the lead
+    /// back would erase the desk from the board the first time the card ran and
+    /// contradict the invariant `canonical()` exists to hold. The unworkable
+    /// kinds never reach the write-back: dispatch refuses them first.
+    pub fn links_working_agent(&self) -> bool {
+        matches!(self, Self::Unassigned | Self::Agent(_))
     }
 
     /// The canonical string to store for this assignee: the resolved teammate
@@ -78,7 +105,7 @@ impl AssigneeResolution {
             Self::Agent(id) => Some(id.as_str()),
             Self::Desk { desk, .. } => Some(desk.as_str()),
             Self::EmptyDesk(desk) => Some(desk.as_str()),
-            Self::Unknown(_) => None,
+            Self::Unknown(_) | Self::AmbiguousTeammate { .. } => None,
         }
     }
 
@@ -87,7 +114,7 @@ impl AssigneeResolution {
     /// desk whose members have yet to be added is a legitimate thing to do, so
     /// only [`Self::Unknown`] is refused on write.
     pub fn names_something_real(&self) -> bool {
-        !matches!(self, Self::Unknown(_))
+        !matches!(self, Self::Unknown(_) | Self::AmbiguousTeammate { .. })
     }
 
     /// The operator-facing reason this assignee cannot be worked, or `None`
@@ -106,6 +133,10 @@ add a member to the desk, or assign the card to a teammate directly"
             Self::Unknown(raw) => Some(format!(
                 "\"{raw}\" is not a teammate or a desk on this company's roster — \
 assign the card to one of them, or leave the assignee blank to hand it to the orchestrator"
+            )),
+            Self::AmbiguousTeammate { raw, count } => Some(format!(
+                "\"{raw}\" names {count} teammates on this company's roster, so there is no way \
+to tell which one you meant — rename one of them, or assign the card by teammate id"
             )),
         }
     }
@@ -134,7 +165,20 @@ pub fn resolve(record: &CompanyRecord, assignee: &str) -> AssigneeResolution {
     if let Some(id) = record.resolve_roster_agent_id(key) {
         return AssigneeResolution::Agent(id);
     }
-    AssigneeResolution::Unknown(key.to_string())
+    // Then operator-added teammates by display name. Tried only after the id
+    // namespace so a display name can never shadow a real id. `ops::team` mints
+    // these with `id: generate_id()`, so the name is the only string the
+    // operator ever sees — matching ids alone made every teammate they added
+    // unassignable on a free-text Assignee field (#214 review).
+    let by_name = record.overlay_agent_ids_by_name(key);
+    match by_name.len() {
+        0 => AssigneeResolution::Unknown(key.to_string()),
+        1 => AssigneeResolution::Agent(by_name.into_iter().next().expect("one match")),
+        count => AssigneeResolution::AmbiguousTeammate {
+            raw: key.to_string(),
+            count,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +390,115 @@ members = ["ceo"]
                 desk: "engineer".into(),
                 lead: "ceo".into(),
             }
+        );
+    }
+
+    /// An operator-added teammate is reachable by the only string the operator
+    /// ever sees. `server::ops::team` mints these with `id: generate_id()`, so
+    /// an id-only match made every teammate the operator added unassignable on
+    /// a free-text Assignee field with no picker (#214 review).
+    #[test]
+    fn an_operator_added_teammate_resolves_by_display_name() {
+        let mut record = acme();
+        record.overlay_agents.push(OverlayAgent {
+            id: "01J9XKQ2M7Z4B8N0".into(),
+            name: "Shane".into(),
+            role: "Support".into(),
+            description: None,
+        });
+        assert_eq!(
+            resolve(&record, "Shane"),
+            AssigneeResolution::Agent("01J9XKQ2M7Z4B8N0".into()),
+            "the display name is the only key the operator can discover"
+        );
+        assert_eq!(
+            resolve(&record, "shane"),
+            AssigneeResolution::Agent("01J9XKQ2M7Z4B8N0".into()),
+            "matched case-insensitively, like every other typed key"
+        );
+        assert!(resolve(&record, "Shane").rejection().is_none());
+    }
+
+    /// The id namespace still wins. A teammate whose *display name* happens to
+    /// equal a manifest *id* must not steal that id's assignments.
+    #[test]
+    fn a_display_name_cannot_shadow_a_manifest_id() {
+        let mut record = acme();
+        record.overlay_agents.push(OverlayAgent {
+            id: "01J9XKQ2M7Z4B8N0".into(),
+            name: "engineer".into(),
+            role: "Support".into(),
+            description: None,
+        });
+        assert_eq!(
+            resolve(&record, "engineer"),
+            AssigneeResolution::Agent("engineer".into()),
+            "ids are resolved before display names"
+        );
+    }
+
+    /// Two teammates sharing a display name is the operator's own doing, and it
+    /// is reported as such. Silently taking the first would reintroduce exactly
+    /// the misrouting this module exists to end.
+    #[test]
+    fn two_teammates_sharing_a_display_name_are_refused_not_guessed() {
+        let mut record = acme();
+        for id in ["01J9XKQ2M7Z4B8N0", "01J9XKQ2M7Z4B8N1"] {
+            record.overlay_agents.push(OverlayAgent {
+                id: id.into(),
+                name: "Shane".into(),
+                role: "Support".into(),
+                description: None,
+            });
+        }
+        let resolution = resolve(&record, "Shane");
+        assert_eq!(
+            resolution,
+            AssigneeResolution::AmbiguousTeammate {
+                raw: "Shane".into(),
+                count: 2,
+            }
+        );
+        assert!(resolution.working_agent().is_none());
+        assert!(resolution.canonical().is_none());
+        assert!(
+            !resolution.names_something_real(),
+            "an ambiguous name is refused at the write boundary"
+        );
+        let reason = resolution.rejection().expect("must be refused");
+        assert!(reason.contains("2 teammates"), "reason={reason}");
+        assert!(
+            reason.contains("teammate id"),
+            "the operator is told how to disambiguate: reason={reason}"
+        );
+    }
+
+    /// A desk assignment is ownership and survives dispatch. `working_agent()`
+    /// returns the desk's *lead* so the turn runs, but the card must keep the
+    /// desk id — otherwise a card assigned to `eng` silently becomes assigned
+    /// to `engineer` the first time it runs (#214 review).
+    #[test]
+    fn a_desk_assignment_is_not_relinked_to_its_lead() {
+        let record = acme();
+        let desk = resolve(&record, "eng");
+        assert_eq!(desk.working_agent(), Some("engineer"), "the lead runs it");
+        assert_eq!(
+            desk.canonical(),
+            Some("eng"),
+            "but the card stays the desk's"
+        );
+        assert!(
+            !desk.links_working_agent(),
+            "dispatch must not write the lead over a desk assignment"
+        );
+
+        assert!(
+            AssigneeResolution::Unassigned.links_working_agent(),
+            "an unassigned card DOES get the orchestrator linked to it (#205)"
+        );
+        assert!(
+            AssigneeResolution::Agent("engineer".into()).links_working_agent(),
+            "a teammate assignment is already canonical and stays linked"
         );
     }
 }

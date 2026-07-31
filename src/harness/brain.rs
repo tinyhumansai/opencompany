@@ -136,12 +136,19 @@ impl HarnessBrain {
         // Link the working agent to the card, and persist it BEFORE the turn
         // runs (#205). A card the CEO picked up used to keep `assignee = ""`
         // for the whole run and forever after, so the board never named who was
-        // doing the work; a desk-assigned card never named the member that
-        // actually ran it. Writing it up front is what makes the board show the
+        // doing the work. Writing it up front is what makes the board show the
         // card "working" under a real agent while the turn is in flight — the
         // store `upsert` here is the plain persistence path, not
         // `CompanyRuntime::upsert_task`, so it cannot re-fire the dispatch edge.
-        if card.assignee != responder {
+        //
+        // Only for an assignee that names a teammate or nobody, though. A desk
+        // assignment is ownership and stays one — `AssigneeResolution::canonical`
+        // deliberately stores the **desk** id and the REST boundary honours it;
+        // dispatch only picks which member runs *this* turn. Writing the lead
+        // back would silently turn a card assigned to `eng` into one assigned to
+        // `engineer` the first time it ran, erasing the desk from the board and
+        // breaking the very invariant `canonical()` documents (#214 review).
+        if resolution.links_working_agent() && card.assignee != responder {
             card.assignee = responder.clone();
             card.updated_at_millis = now_millis();
             tasks.upsert(&self.record.id, &card).await?;
