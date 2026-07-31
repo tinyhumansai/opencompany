@@ -4,22 +4,34 @@
 //
 // The bot token and webhook secret are write-only: they are sent on PUT and
 // stored in the host's secret store; neither is ever returned. The read shape
-// (`TelegramChannelStatus`) carries only presence booleans and the public
-// webhook URL. Mirrors `api/mcp.ts` — standalone functions over the shared
-// client, so no change to `OpenCompanyClient` is needed.
+// (`TelegramChannelStatus`) carries only presence booleans, how inbound
+// arrives, and the webhook URL when the host has a usable one. Mirrors
+// `api/mcp.ts` — standalone functions over the shared client, so no change to
+// `OpenCompanyClient` is needed.
+//
+// Issue #203: a bot token alone is a working channel. Inbound arrives over
+// `getUpdates` long-polling, which dials out and so needs no public URL; the
+// webhook is an optional hosted fast-path the host advertises (a non-null
+// `webhookUrl`) only when Telegram could actually deliver to it.
 
 import type { OpenCompanyClient } from "./client";
 
 /** The non-secret status of a company's Telegram channel. */
 export interface TelegramChannelStatus {
-  /** True once both the bot token and the webhook secret are stored. */
+  /** True once a bot token is stored — that alone is a working channel. */
   configured: boolean;
   /** Whether a bot token is stored (never the token itself). */
   tokenSet: boolean;
   /** Whether a webhook secret is stored (never the secret itself). */
   secretSet: boolean;
-  /** The URL to register with Telegram (`setWebhook`) / paste into BotFather. */
-  webhookUrl: string;
+  /**
+   * The URL to register with Telegram (`setWebhook`), or `null` when this host
+   * has no publicly reachable https URL — every local and most self-hosted
+   * deployment. Never show a webhook affordance while this is `null`.
+   */
+  webhookUrl: string | null;
+  /** Whether this host long-polls Telegram for inbound updates. */
+  polling: boolean;
 }
 
 /** The write-only config body. Only present, non-empty fields are applied. */
@@ -34,7 +46,7 @@ export interface TelegramConfigBody {
 export interface SetWebhookResult {
   ok: boolean;
   message: string;
-  webhookUrl: string;
+  webhookUrl: string | null;
 }
 
 /** Read the company's Telegram channel status. */

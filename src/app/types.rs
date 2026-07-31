@@ -179,6 +179,31 @@ impl AppConfig {
         }
     }
 
+    /// The base URL a third party can deliver an inbound webhook to, if there
+    /// is one — otherwise `None`.
+    ///
+    /// Distinct from [`Self::host_base_url`], which always answers *something*
+    /// (falling back to `http://{bind}`) because an Agent Card must carry an
+    /// endpoint. A webhook URL has no such fallback: a provider that cannot
+    /// reach the URL simply never delivers. So this is `Some` only when an
+    /// explicit `public_url` is configured **and** it is `https` — Telegram
+    /// (issue #203) refuses any other scheme for `setWebhook`, and the
+    /// `http://127.0.0.1:<port>` bind fallback is unreachable from the internet
+    /// by construction. Callers use it to decide whether to offer a webhook at
+    /// all, rather than showing an operator a URL that can never work.
+    pub fn public_webhook_base_url(&self) -> Option<&str> {
+        self.public_url
+            .as_deref()
+            .map(str::trim)
+            .map(|url| url.trim_end_matches('/'))
+            .filter(|url| {
+                url.len() > "https://".len()
+                    && url
+                        .get(.."https://".len())
+                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+            })
+    }
+
     /// Whether this host is reachable only from this machine.
     ///
     /// Gates behavior that is safe on a developer's laptop and unsafe anywhere
@@ -750,6 +775,44 @@ mod tests {
             ..AppConfig::default()
         };
         assert_eq!(public.host_base_url(), "https://acme.example");
+    }
+
+    /// Issue #203: unlike `host_base_url`, this has no bind fallback — a URL a
+    /// provider cannot reach is worse than none, because it silently swallows
+    /// every inbound delivery.
+    #[test]
+    fn public_webhook_base_url_requires_an_explicit_https_url() {
+        // The default (loopback bind, no public_url) offers no webhook — this
+        // is exactly the `http://127.0.0.1:8080/hooks/...` URL of issue #203.
+        assert_eq!(AppConfig::default().public_webhook_base_url(), None);
+
+        let with = |url: &str| AppConfig {
+            public_url: Some(url.into()),
+            ..AppConfig::default()
+        };
+        // Plain http never qualifies: Telegram's setWebhook refuses it, and a
+        // public-looking http URL is no more deliverable than a loopback one.
+        assert_eq!(with("http://acme.example").public_webhook_base_url(), None);
+        // Neither does a scheme-less or empty value.
+        assert_eq!(with("acme.example").public_webhook_base_url(), None);
+        assert_eq!(with("   ").public_webhook_base_url(), None);
+        assert_eq!(with("https://").public_webhook_base_url(), None);
+
+        assert_eq!(
+            with("https://acme.example").public_webhook_base_url(),
+            Some("https://acme.example")
+        );
+        // Surrounding whitespace and a trailing slash are normalized away, so
+        // callers can join a `/hooks/...` path without doubling the separator.
+        assert_eq!(
+            with("  https://acme.example/  ").public_webhook_base_url(),
+            Some("https://acme.example")
+        );
+        // The scheme is case-insensitive, as in any URL.
+        assert_eq!(
+            with("HTTPS://acme.example").public_webhook_base_url(),
+            Some("HTTPS://acme.example")
+        );
     }
 
     #[test]

@@ -48,6 +48,31 @@ count dropping to zero — so a schedule saved later onto a still-unwired compan
 is reported rather than swallowed by the latch. A company with no scheduled
 workflows and no runner is not misconfigured and stays silent.
 
+## Background listeners
+
+Two per-company background loops sit beside the scheduler, both spawned in
+`serve` and stopped by the same shutdown `Notify`:
+
+- `mailbox_poller.rs` — the IMAP mailbox poll (feature `imap`), on a fixed
+  interval (`OPENCOMPANY_MAIL_POLL_SECONDS`, default `60`).
+- `telegram_poller.rs` — Telegram `getUpdates` long-polling (feature
+  `telegram`), the inbound path that **needs no public URL**. It dials out to
+  `api.telegram.org`, so it works on localhost, behind NAT, and on any
+  self-hosted box — where Telegram's servers can never reach an inbound
+  `/hooks/{company}/telegram` route. Setup is the bot token alone; the loop
+  idles until one is stored and picks up a token pasted into the console on its
+  next tick, with no restart. Long-poll hold and idle back-off are
+  `OPENCOMPANY_TELEGRAM_POLL_SECONDS` (default `30`).
+
+The webhook route (`server::hooks`) stays as an optional hosted fast-path, and
+is offered only when `OPENCOMPANY_PUBLIC_URL` is a public **https** URL. The two
+paths never both consume an update: Telegram refuses `getUpdates` while a
+webhook is registered, so the poller checks `getWebhookInfo` first and stands by
+on a publicly reachable host — while on a host with no public URL a registered
+webhook can only be a dead endpoint, so it clears it and takes inbound back.
+Both paths run the same turn and share `telegram::deliver_replies`, so which one
+delivered an update is invisible downstream.
+
 ## Harness pool (`src/harness/`, feature `openhuman`)
 
 `src/harness/` embeds `openhuman_core` as a library (see

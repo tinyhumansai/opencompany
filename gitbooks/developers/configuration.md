@@ -79,6 +79,25 @@ Both optional and off by default:
 Requires the `tinyplace` feature and `serve --discoverable` to reach the
 network — see [The tiny.place economy](../overview/tiny-place.md).
 
+## Channels: Telegram
+
+Setup is a bot token and nothing else. Create a bot with @BotFather and paste
+its token under **Connections → Channels**; the host collects messages by
+long-polling Telegram (`getUpdates`), which dials *out*, so it works on
+localhost, behind NAT, and on any self-hosted box with no public URL. Needs the
+`telegram` feature for the outbound transport.
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENCOMPANY_TELEGRAM_POLL_SECONDS` | Long-poll hold and idle back-off; default `30`. |
+
+An inbound **webhook** is an optional fast-path for a publicly reachable host:
+set `OPENCOMPANY_PUBLIC_URL` to a public **https** URL and the console offers a
+webhook URL plus a secret to register with. Without one there is nothing to
+offer — Telegram cannot deliver to a private address — so the console shows no
+webhook at all, rather than a URL that silently never fires. Polling stands down
+on its own while a webhook is registered.
+
 ## Inspect what's set
 
 `opencompany doctor` reports the effective configuration, which layer set each

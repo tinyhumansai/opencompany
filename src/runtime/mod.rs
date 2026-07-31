@@ -35,6 +35,9 @@ pub mod journal;
 pub mod mailbox_poller;
 pub mod registry;
 pub mod scheduler;
+/// Issue #203: the Telegram `getUpdates` long-polling listener — the inbound
+/// path that needs no public URL, mirroring OpenHuman. See [`telegram_poller`].
+pub mod telegram_poller;
 pub mod tools;
 pub mod types;
 pub mod workflow_scheduler;

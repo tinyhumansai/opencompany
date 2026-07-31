@@ -1874,8 +1874,20 @@ async fn mcp_add_probes_without_rollback_and_persists_health() {
 use crate::company::telegram::RecordingTelegramApi;
 
 /// A running "acme" company whose host has a recording Telegram transport
-/// injected, so the inbound webhook can actually deliver a reply offline.
+/// injected, so the inbound webhook can actually deliver a reply offline. The
+/// host is loopback-only (no `public_url`) — the local/self-host shape of issue
+/// #203.
 async fn state_with_telegram(home: &std::path::Path, api: RecordingTelegramApi) -> AppState {
+    state_with_telegram_at(home, api, None).await
+}
+
+/// As [`state_with_telegram`], but with `public_url` set — the hosted shape,
+/// where Telegram can actually deliver to the `/hooks/...` route.
+async fn state_with_telegram_at(
+    home: &std::path::Path,
+    api: RecordingTelegramApi,
+    public_url: Option<&str>,
+) -> AppState {
     use crate::ports::CompanyStore;
     let store = FsCompanyStore::new(home.to_path_buf());
     let id = CompanyId::new("acme");
@@ -1901,7 +1913,11 @@ async fn state_with_telegram(home: &std::path::Path, api: RecordingTelegramApi) 
         .unwrap();
     let connections =
         crate::server::ops::ConnectionsRuntime::new().with_telegram(std::sync::Arc::new(api));
-    let state = AppState::new(AppConfig::default()).with_connections(connections);
+    let state = AppState::new(AppConfig {
+        public_url: public_url.map(str::to_string),
+        ..AppConfig::default()
+    })
+    .with_connections(connections);
     state.registry().insert(id, std::sync::Arc::new(runtime));
     crate::server::test_support::seed_fixed_admin(&state, "acme").await;
     state
@@ -1954,17 +1970,14 @@ async fn telegram_config_is_write_only_and_status_reads_back() {
     let home = home();
     let state = state_with_company(&home).await;
 
-    // Nothing configured yet.
+    // Nothing configured yet. This host binds loopback with no `public_url`, so
+    // it never offers a webhook URL (issue #203) — Telegram could not deliver
+    // to one, and inbound rides `getUpdates` polling instead.
     let (status, cfg) = send(&state, "GET", "/api/v1/company/channels/telegram", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(cfg["configured"], false);
     assert_eq!(cfg["tokenSet"], false);
-    assert!(
-        cfg["webhookUrl"]
-            .as_str()
-            .unwrap()
-            .ends_with("/hooks/acme/telegram")
-    );
+    assert!(cfg["webhookUrl"].is_null(), "unreachable host: {cfg}");
 
     // Store both credentials (write-only).
     let (status, cfg) = send(
@@ -2071,6 +2084,47 @@ async fn telegram_inbound_runs_a_turn_and_delivers_the_reply_back() {
 async fn telegram_set_webhook_registers_the_public_url() {
     let home = home();
     let api = RecordingTelegramApi::new();
+    // The hosted shape: a real public https URL Telegram can deliver to.
+    let state = state_with_telegram_at(&home, api.clone(), Some("https://acme.example")).await;
+    send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN, "webhookSecret": WEBHOOK_SECRET })),
+    )
+    .await;
+
+    // The status advertises the webhook only on such a host.
+    let (_, cfg) = send(&state, "GET", "/api/v1/company/channels/telegram", None).await;
+    assert_eq!(
+        cfg["webhookUrl"],
+        "https://acme.example/hooks/acme/telegram"
+    );
+
+    let (status, res) = send(
+        &state,
+        "POST",
+        "/api/v1/company/channels/telegram/webhook",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["ok"], true);
+    let webhooks = api.webhooks();
+    assert_eq!(webhooks.len(), 1);
+    assert_eq!(webhooks[0], "https://acme.example/hooks/acme/telegram");
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Issue #203: on a host with no public https URL, registering a webhook is
+/// refused outright. Accepting it would be actively harmful — Telegram could
+/// never deliver to the URL *and* a registration blocks `getUpdates`, so it
+/// would take down the one inbound path that does work.
+#[tokio::test]
+async fn telegram_set_webhook_is_refused_on_a_host_telegram_cannot_reach() {
+    let home = home();
+    let api = RecordingTelegramApi::new();
     let state = state_with_telegram(&home, api.clone()).await;
     send(
         &state,
@@ -2087,11 +2141,40 @@ async fn telegram_set_webhook_registers_the_public_url() {
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        res.to_string().contains("OPENCOMPANY_PUBLIC_URL"),
+        "the refusal must say how to fix it: {res}"
+    );
+    assert!(
+        api.webhooks().is_empty(),
+        "no loopback URL was ever handed to Telegram"
+    );
+
+    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// The channel is usable with a bot token alone: no webhook secret, no public
+/// URL, no `setWebhook` — the polling listener covers inbound.
+#[tokio::test]
+async fn telegram_is_configured_by_a_bot_token_alone() {
+    let home = home();
+    let api = RecordingTelegramApi::new();
+    let state = state_with_telegram(&home, api).await;
+
+    let (status, cfg) = send(
+        &state,
+        "PUT",
+        "/api/v1/company/channels/telegram",
+        Some(json!({ "botToken": BOT_TOKEN })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(res["ok"], true);
-    let webhooks = api.webhooks();
-    assert_eq!(webhooks.len(), 1);
-    assert!(webhooks[0].ends_with("/hooks/acme/telegram"));
+    assert_eq!(cfg["configured"], true, "a token is the whole setup: {cfg}");
+    assert_eq!(cfg["secretSet"], false);
+    assert!(cfg["webhookUrl"].is_null());
+    // The host has a transport wired, so it long-polls for inbound.
+    assert_eq!(cfg["polling"], true);
 
     tokio::fs::remove_dir_all(&home).await.ok();
 }

@@ -362,6 +362,43 @@ fn spawn_mailbox_poller(
     }
 }
 
+/// Starts a company's Telegram `getUpdates` long-polling listener as a
+/// background task, whenever this host has an outbound Telegram transport wired
+/// (the `telegram` feature).
+///
+/// Issue #203: this is what makes inbound Telegram work on a local or
+/// self-hosted instance, where Telegram's servers can never reach an inbound
+/// `/hooks/...` URL. It is started unconditionally rather than only when a bot
+/// token is already stored — the poller idles cheaply until one appears, so an
+/// operator who pastes a token in the console is receiving DMs on the next tick
+/// with no restart. On a publicly reachable host that opted into the webhook
+/// fast-path, the poller sees the registration and stands by.
+fn spawn_telegram_poller(
+    state: &AppState,
+    id: &str,
+    shutdown: &Arc<Notify>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let Some(api) = state.connections().telegram.clone() else {
+        return;
+    };
+    let Some(runtime) = state.registry().get(&CompanyId::new(id)) else {
+        return;
+    };
+    let poll_secs = std::env::var("OPENCOMPANY_TELEGRAM_POLL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(opencompany::runtime::telegram_poller::DEFAULT_POLL_SECONDS);
+    let webhook_capable = state.config().public_webhook_base_url().is_some();
+    let poller = opencompany::runtime::telegram_poller::TelegramPoller::new(
+        runtime,
+        api,
+        poll_secs,
+        webhook_capable,
+    );
+    handles.push(poller.spawn(shutdown.clone()));
+}
+
 /// Attaches an OpenHuman JSON-RPC transport when the `openhuman-rpc` feature is
 /// enabled and `OPENCOMPANY_OPENHUMAN_URL` is set (the attach path).
 ///
@@ -865,6 +902,7 @@ async fn main() -> Result<()> {
                     );
                 }
                 spawn_mailbox_poller(&state, &id, &shutdown, &mut scheduler_handles);
+                spawn_telegram_poller(&state, &id, &shutdown, &mut scheduler_handles);
             }
             if companies.is_empty() {
                 println!("serving with no companies; pass --company <dir> to load one");

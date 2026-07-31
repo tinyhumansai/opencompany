@@ -1,7 +1,17 @@
 //! Inbound channel webhooks: `POST /hooks/{company}/{channel}`.
 //!
-//! Today the one wired channel is Telegram. Telegram delivers each bot update
-//! to `POST /hooks/{company}/telegram` with an
+//! **The optional hosted fast-path, not the default.** Telegram can only
+//! deliver here when the host has a publicly reachable https URL, so a local or
+//! self-hosted instance receives inbound over `getUpdates` long-polling instead
+//! ([`crate::runtime::telegram_poller`], issue #203). This route stays wired
+//! either way — it costs nothing when Telegram never calls it — and the two
+//! paths run the *same* turn and share
+//! [`deliver_replies`](crate::company::telegram::deliver_replies), so which one
+//! delivered an update is invisible downstream. They never both consume the
+//! same update: Telegram refuses `getUpdates` while a webhook is registered,
+//! and the poller stands by when it sees one.
+//!
+//! Telegram delivers each bot update to `POST /hooks/{company}/telegram` with an
 //! `X-Telegram-Bot-Api-Secret-Token` header carrying the secret configured via
 //! `setWebhook`. The handler verifies that header (constant-time) against the
 //! company's stored webhook secret **before parsing anything**; an unverifiable
@@ -30,9 +40,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
-use crate::company::telegram::{
-    SECRET_TOKEN_HEADER, TELEGRAM_SECRET_KEY, TELEGRAM_TOKEN_KEY, scrub_token,
-};
+use crate::company::telegram::{SECRET_TOKEN_HEADER, TELEGRAM_SECRET_KEY, TELEGRAM_TOKEN_KEY};
 use crate::ports::types::CompanyEvent;
 use crate::server::ops::resolve;
 
@@ -145,10 +153,14 @@ async fn handle_telegram(
         .into_response()
 }
 
-/// Posts every `telegram`-channel reply back to its origin chat. Returns how
-/// many were delivered. Missing token / unwired transport / a bad chat id are
-/// logged and skipped — the turn already ran, so a delivery gap never fails the
-/// webhook. Any transport error is scrubbed of the bot token before logging.
+/// Resolves this host's transport + the company's bot token, then hands the
+/// replies to the shared
+/// [`deliver_replies`](crate::company::telegram::deliver_replies) — the same
+/// delivery the poller uses, so a reply looks identical whichever inbound path
+/// produced it. Returns how many were delivered.
+///
+/// A missing token or an unwired transport is logged and skipped: the turn
+/// already ran, so a delivery gap must never fail the webhook.
 async fn deliver_replies(
     state: &AppState,
     runtime: &CompanyRuntime,
@@ -187,34 +199,7 @@ async fn deliver_replies(
         }
     };
 
-    let mut delivered = 0usize;
-    for msg in responses {
-        if msg.channel != TELEGRAM_CHANNEL {
-            continue;
-        }
-        let Some(reply_to) = &msg.reply_to else {
-            continue;
-        };
-        let Ok(chat_id) = reply_to.chat_id.parse::<i64>() else {
-            tracing::warn!(
-                company = %runtime.id(),
-                "telegram reply has a non-numeric chat id; skipped"
-            );
-            continue;
-        };
-        match api.send_message(&token, chat_id, &msg.text).await {
-            Ok(()) => delivered += 1,
-            Err(err) => {
-                // Never let the bot token reach the log line.
-                tracing::warn!(
-                    company = %runtime.id(),
-                    "telegram delivery failed: {}",
-                    scrub_token(&err.to_string(), &token)
-                );
-            }
-        }
-    }
-    delivered
+    crate::company::telegram::deliver_replies(api.as_ref(), runtime.id(), &token, responses).await
 }
 
 #[cfg(test)]

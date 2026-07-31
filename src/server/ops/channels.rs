@@ -1,13 +1,24 @@
 //! The Telegram channel configuration write-plane: store the bot token +
-//! webhook secret (both **write-only**) and register the webhook.
+//! (optional) webhook secret — both **write-only** — and register the webhook.
 //!
 //! `GET …/channels/telegram` returns only the non-secret
-//! [`TelegramChannelStatus`] — presence booleans and the webhook URL to paste
-//! into BotFather / `setWebhook`. Neither the bot token nor the webhook secret
-//! is ever serialized into any response, by construction: they live in
+//! [`TelegramChannelStatus`]. Neither the bot token nor the webhook secret is
+//! ever serialized into any response, by construction: they live in
 //! [`SecretStore`](crate::ports::SecretStore) as raw strings under
 //! [`TELEGRAM_TOKEN_KEY`] / [`TELEGRAM_SECRET_KEY`] and this module reads them
 //! back only to *use* them (verify, deliver, `setWebhook`), never to echo them.
+//!
+//! ## A bot token is the whole setup (issue #203)
+//!
+//! Inbound arrives by `getUpdates` long-polling
+//! ([`crate::runtime::telegram_poller`]), which dials out and therefore needs
+//! no public URL — so [`TelegramChannelStatus::configured`] tracks the **bot
+//! token alone**. The webhook is an optional hosted fast-path, and this module
+//! surfaces it *only* on a host that Telegram could actually deliver to (see
+//! [`AppConfig::public_webhook_base_url`](crate::app::AppConfig::public_webhook_base_url)).
+//! On a local or self-hosted instance `webhookUrl` is `null` and `setWebhook`
+//! is refused with an explanation, rather than handing the operator a
+//! `http://127.0.0.1:<port>/hooks/…` URL that can never receive a delivery.
 //!
 //! `PUT …/channels/telegram` is a partial write: only the fields present in the
 //! body are updated, so an operator can rotate the secret without re-entering
@@ -30,29 +41,41 @@ use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
 
 /// The non-secret status of a company's Telegram channel. Carries presence
-/// booleans and the webhook URL only — never the token or the secret.
+/// booleans, how inbound arrives, and the webhook URL when there is a usable
+/// one — never the token or the secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelegramChannelStatus {
-    /// True once both the bot token and the webhook secret are stored — the
-    /// channel can then receive verified updates and reply.
+    /// True once a bot token is stored. That alone is a working channel:
+    /// inbound arrives by `getUpdates` long-polling, which needs no public URL
+    /// and no webhook secret.
     pub configured: bool,
     /// Whether a bot token is stored (never the token itself).
     pub token_set: bool,
-    /// Whether a webhook secret is stored (never the secret itself).
+    /// Whether a webhook secret is stored (never the secret itself). Only
+    /// meaningful on a host that can serve the webhook fast-path.
     pub secret_set: bool,
-    /// The URL to register with Telegram (`setWebhook`) / paste into BotFather.
-    /// Non-secret — it embeds only the public host and the company id.
-    pub webhook_url: String,
+    /// The URL to register with Telegram (`setWebhook`), or `null` when this
+    /// host has no publicly reachable https URL for Telegram to deliver to —
+    /// which is every local and most self-hosted deployments. Non-secret when
+    /// present: it embeds only the public host and the company id.
+    pub webhook_url: Option<String>,
+    /// Whether this host long-polls Telegram for inbound updates — true
+    /// whenever an outbound Telegram transport is wired. The default offline
+    /// build has none, so it neither polls nor delivers.
+    pub polling: bool,
 }
 
-/// The webhook URL Telegram should deliver this company's updates to.
-fn webhook_url(state: &AppState, company: &CompanyId) -> String {
-    format!(
-        "{}/hooks/{}/telegram",
-        state.config().host_base_url(),
-        company.as_ref()
-    )
+/// The webhook URL Telegram should deliver this company's updates to, or `None`
+/// when this host has no publicly reachable https base URL.
+///
+/// Deliberately **not** derived from
+/// [`host_base_url`](crate::app::AppConfig::host_base_url): that falls back to
+/// the bind address, which produced the `http://127.0.0.1:<port>/hooks/…` URL
+/// of issue #203 — syntactically fine, undeliverable in practice.
+fn webhook_url(state: &AppState, company: &CompanyId) -> Option<String> {
+    let base = state.config().public_webhook_base_url()?;
+    Some(format!("{base}/hooks/{}/telegram", company.as_ref()))
 }
 
 /// Reads a stored secret and reports whether it is present and non-empty.
@@ -73,10 +96,12 @@ async fn status_of(
     let token_set = is_set(runtime, TELEGRAM_TOKEN_KEY).await?;
     let secret_set = is_set(runtime, TELEGRAM_SECRET_KEY).await?;
     Ok(TelegramChannelStatus {
-        configured: token_set && secret_set,
+        // The bot token alone is a working channel — polling covers inbound.
+        configured: token_set,
         token_set,
         secret_set,
         webhook_url: webhook_url(state, runtime.id()),
+        polling: state.connections().telegram.is_some(),
     })
 }
 
@@ -192,16 +217,23 @@ struct SetWebhookResult {
     ok: bool,
     /// A prosumer-friendly description of the outcome.
     message: String,
-    /// The URL that was registered.
-    webhook_url: String,
+    /// The URL that was registered, or `null` when there was none to register.
+    webhook_url: Option<String>,
 }
 
 /// `POST …/channels/telegram/webhook` — register the webhook with Telegram.
+///
+/// The hosted fast-path only. Refused outright on a host with no publicly
+/// reachable https URL (issue #203): Telegram would accept nothing, or worse
+/// accept a URL it can never deliver to — which also blocks `getUpdates` and so
+/// would take the working polling path down with it.
 async fn set_webhook(company: ScopedCompany, State(state): State<AppState>) -> Response {
     use axum::response::IntoResponse;
 
     let runtime = &company.runtime;
-    let url = webhook_url(&state, runtime.id());
+    let Some(url) = webhook_url(&state, runtime.id()) else {
+        return unreachable_host().into_response();
+    };
 
     // Not wired without a transport (default build / no `telegram` feature).
     let Some(api) = state.connections().telegram.clone() else {
@@ -224,7 +256,7 @@ async fn set_webhook(company: ScopedCompany, State(state): State<AppState>) -> R
         Ok(()) => Json(SetWebhookResult {
             ok: true,
             message: "Webhook registered with Telegram.".to_string(),
-            webhook_url: url,
+            webhook_url: Some(url),
         })
         .into_response(),
         Err(err) => Json(SetWebhookResult {
@@ -234,7 +266,7 @@ async fn set_webhook(company: ScopedCompany, State(state): State<AppState>) -> R
                 "setWebhook failed: {}",
                 scrub_token(&err.to_string(), &token)
             ),
-            webhook_url: url,
+            webhook_url: Some(url),
         })
         .into_response(),
     }
@@ -257,6 +289,16 @@ fn missing(what: &str) -> ApiError {
     )))
 }
 
+/// A `400` for a `setWebhook` attempt on a host Telegram cannot reach.
+fn unreachable_host() -> ApiError {
+    ApiError(crate::error::OpenCompanyError::InvalidRequest(
+        "telegram cannot deliver a webhook to this host: set OPENCOMPANY_PUBLIC_URL to a public \
+         https URL first. Inbound already works without one — the bot token alone enables \
+         getUpdates polling."
+            .to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -267,13 +309,34 @@ mod test {
             configured: true,
             token_set: true,
             secret_set: true,
-            webhook_url: "https://host/hooks/acme/telegram".to_string(),
+            webhook_url: Some("https://host/hooks/acme/telegram".to_string()),
+            polling: true,
         };
         let json = serde_json::to_string(&status).unwrap();
-        // Presence booleans and the URL only — no field can carry secret bytes.
+        // Presence booleans, the mode, and the URL only — no field can carry
+        // secret bytes.
         assert!(json.contains("\"tokenSet\":true"));
         assert!(json.contains("hooks/acme/telegram"));
         assert!(!json.contains("bot_token"));
         assert!(!json.contains("webhook_secret"));
+    }
+
+    /// Issue #203: a host with no public https URL must report `null` rather
+    /// than a loopback URL Telegram can never deliver to.
+    #[test]
+    fn status_omits_the_webhook_url_on_an_unreachable_host() {
+        let local = TelegramChannelStatus {
+            configured: true,
+            token_set: true,
+            secret_set: false,
+            webhook_url: None,
+            polling: true,
+        };
+        let json = serde_json::to_string(&local).unwrap();
+        assert!(json.contains("\"webhookUrl\":null"), "{json}");
+        assert!(!json.contains("127.0.0.1"), "{json}");
+        // The channel is still fully configured — polling covers inbound.
+        assert!(json.contains("\"configured\":true"));
+        assert!(json.contains("\"polling\":true"));
     }
 }

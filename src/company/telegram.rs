@@ -1,12 +1,27 @@
 //! The Telegram channel adapter: inbound-update parsing, outbound delivery, and
 //! the token-scrubbing that keeps the bot credential out of every log and error.
 //!
-//! A company receives Telegram DMs through the signed webhook route
-//! ([`crate::server::hooks`]) and replies back into the same chat. Inbound
+//! A company receives Telegram DMs and replies back into the same chat. Inbound
 //! routing mirrors OpenHuman: a bot DM is a **web/chat turn** tagged with its
 //! origin (the Telegram `chat.id`), not a bespoke "telegram provider" — so the
 //! brain runs an ordinary company turn and the reply is addressed back with an
 //! [`OutboundMessage::reply_to`](crate::ports::types::OutboundMessage).
+//!
+//! ## Two inbound paths — polling is the default
+//!
+//! There are two ways an update reaches the company, and they are mutually
+//! exclusive at Telegram's end (it rejects `getUpdates` with `409 Conflict`
+//! while a webhook is registered):
+//!
+//! 1. **`getUpdates` long-polling** ([`crate::runtime::telegram_poller`]) — the
+//!    default, and what OpenHuman does. The host dials *out* to
+//!    `api.telegram.org`, so it works on localhost, behind NAT, and in any
+//!    self-hosted deployment with no public URL. Setup is just the bot token.
+//! 2. **The inbound webhook** ([`crate::server::hooks`]) — an optional hosted
+//!    fast-path. Telegram POSTs to `{public_url}/hooks/{company}/telegram`, so
+//!    it requires a publicly reachable **https** URL. A host without one never
+//!    surfaces it (issue #203: a `http://127.0.0.1:8091/hooks/…` webhook URL is
+//!    one Telegram's servers can never deliver to).
 //!
 //! ## Credentials are write-only
 //!
@@ -22,15 +37,16 @@
 //! ## Network seam
 //!
 //! [`TelegramApi`] is the outbound seam. The default build and every test use
-//! the in-memory [`RecordingTelegramApi`]; the real HTTPS `sendMessage` /
-//! `setWebhook` transport ([`HttpTelegramApi`]) is gated behind the `telegram`
-//! feature so the offline build links no HTTP client.
+//! the in-memory [`RecordingTelegramApi`]; the real HTTPS transport
+//! ([`HttpTelegramApi`]) is gated behind the `telegram` feature so the offline
+//! build links no HTTP client.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::error::OpenCompanyError;
+use crate::ports::types::{CompanyId, OutboundMessage};
 
 /// The channel id inbound Telegram turns and their replies are tagged with.
 pub const TELEGRAM_CHANNEL: &str = "telegram";
@@ -113,7 +129,16 @@ pub fn scrub_token(text: &str, token: &str) -> String {
     text.replace(token, "***")
 }
 
-/// The outbound Telegram seam: send a reply and (re)register the webhook.
+/// The `update_id` of a raw Telegram update, if it carries one.
+///
+/// The poller acks a batch by asking for `max(update_id) + 1` next — see
+/// [`crate::runtime::telegram_poller`].
+pub fn update_id(update: &serde_json::Value) -> Option<i64> {
+    update.get("update_id").and_then(|v| v.as_i64())
+}
+
+/// The outbound Telegram seam: poll for updates, send a reply, and manage the
+/// (optional, hosted-only) webhook registration.
 ///
 /// Mockable so every calling path is exercised offline; the real HTTPS
 /// transport is feature-gated. An implementation MUST NOT surface the `token`
@@ -129,6 +154,32 @@ pub trait TelegramApi: Send + Sync {
         text: &str,
     ) -> Result<(), OpenCompanyError>;
 
+    /// Long-polls Telegram for the next batch of raw updates
+    /// (`getUpdates`) — the inbound path that needs no public URL.
+    ///
+    /// `offset` acks every update below it: passing `max(update_id) + 1` from
+    /// the previous batch is what stops Telegram redelivering it. `None` asks
+    /// for everything Telegram still holds unconfirmed, which is exactly the
+    /// right thing after a restart — the confirmed watermark lives on
+    /// Telegram's side, so nothing already processed comes back.
+    ///
+    /// `timeout_secs` is the server-side long-poll hold: the call blocks there
+    /// until an update arrives or the timeout elapses, then returns (possibly
+    /// empty). This, not a client-side sleep, is what paces the poll loop.
+    async fn get_updates(
+        &self,
+        token: &str,
+        offset: Option<i64>,
+        timeout_secs: u64,
+    ) -> Result<Vec<serde_json::Value>, OpenCompanyError>;
+
+    /// The URL Telegram currently delivers this bot's updates to
+    /// (`getWebhookInfo`), or `None` when no webhook is registered.
+    ///
+    /// A registered webhook makes [`Self::get_updates`] fail with `409
+    /// Conflict`, so the poller checks this before it starts.
+    async fn get_webhook_info(&self, token: &str) -> Result<Option<String>, OpenCompanyError>;
+
     /// Points Telegram's webhook for bot `token` at `url`, guarded by `secret`
     /// (Telegram `setWebhook`, `secret_token` field).
     async fn set_webhook(
@@ -137,16 +188,72 @@ pub trait TelegramApi: Send + Sync {
         url: &str,
         secret: &str,
     ) -> Result<(), OpenCompanyError>;
+
+    /// Clears the bot's webhook registration (`deleteWebhook`), handing inbound
+    /// back to [`Self::get_updates`].
+    async fn delete_webhook(&self, token: &str) -> Result<(), OpenCompanyError>;
+}
+
+/// Posts every `telegram`-channel reply in `responses` back to its origin chat,
+/// returning how many were delivered.
+///
+/// Shared by both inbound paths (the webhook route and the poller) so a reply
+/// is addressed identically however the update arrived. A missing/unparseable
+/// `reply_to` chat id or a transport failure is logged and skipped rather than
+/// propagated: the turn already ran, so a delivery gap must never fail the
+/// caller. Every error is passed through [`scrub_token`] before it is logged.
+pub async fn deliver_replies(
+    api: &dyn TelegramApi,
+    company: &CompanyId,
+    token: &str,
+    responses: &[OutboundMessage],
+) -> usize {
+    let mut delivered = 0usize;
+    for msg in responses {
+        if msg.channel != TELEGRAM_CHANNEL {
+            continue;
+        }
+        let Some(reply_to) = &msg.reply_to else {
+            continue;
+        };
+        let Ok(chat_id) = reply_to.chat_id.parse::<i64>() else {
+            tracing::warn!(
+                company = %company,
+                "telegram reply has a non-numeric chat id; skipped"
+            );
+            continue;
+        };
+        match api.send_message(token, chat_id, &msg.text).await {
+            Ok(()) => delivered += 1,
+            Err(err) => {
+                // Never let the bot token reach the log line.
+                tracing::warn!(
+                    company = %company,
+                    "telegram delivery failed: {}",
+                    scrub_token(&err.to_string(), token)
+                );
+            }
+        }
+    }
+    delivered
 }
 
 /// An offline [`TelegramApi`] that records deliveries for assertions and never
-/// touches the network. It intentionally records only `(chat_id, text)` and the
-/// webhook `url` — never the token — so a test proving "delivery carries no
-/// credential" reads the recording directly.
+/// touches the network. It intentionally records only `(chat_id, text)`, the
+/// webhook `url`, and the requested poll offsets — never the token — so a test
+/// proving "delivery carries no credential" reads the recording directly.
 #[derive(Clone, Default)]
 pub struct RecordingTelegramApi {
     sent: Arc<std::sync::Mutex<Vec<(i64, String)>>>,
     webhooks: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Batches `get_updates` hands out, oldest first; empty once drained.
+    batches: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<serde_json::Value>>>>,
+    /// Every `offset` a `get_updates` call asked for, in order.
+    offsets: Arc<std::sync::Mutex<Vec<Option<i64>>>>,
+    /// The URL `get_webhook_info` reports; cleared by `delete_webhook`.
+    registered_webhook: Arc<std::sync::Mutex<Option<String>>>,
+    /// How many times `delete_webhook` was called.
+    deletes: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `send_message` fails and — modelling a real transport leaking
     /// the credential into its error URL — echoes the received token into the
     /// error text, so a scrubbing test has something to scrub.
@@ -154,7 +261,7 @@ pub struct RecordingTelegramApi {
 }
 
 impl RecordingTelegramApi {
-    /// A recording API that always accepts.
+    /// A recording API that always accepts and polls empty.
     pub fn new() -> Self {
         Self::default()
     }
@@ -166,6 +273,24 @@ impl RecordingTelegramApi {
             fail_echoing_token: true,
             ..Self::default()
         }
+    }
+
+    /// Queues one batch of raw updates for the next `get_updates` call. Batches
+    /// are handed out in the order queued; once drained, polls return empty.
+    pub fn push_updates(&self, batch: Vec<serde_json::Value>) {
+        self.batches
+            .lock()
+            .expect("telegram recorder poisoned")
+            .push_back(batch);
+    }
+
+    /// Pre-registers a webhook URL, so `get_webhook_info` reports it — the
+    /// state a poller must notice before it can long-poll.
+    pub fn set_registered_webhook(&self, url: &str) {
+        *self
+            .registered_webhook
+            .lock()
+            .expect("telegram recorder poisoned") = Some(url.to_string());
     }
 
     /// Every `(chat_id, text)` delivered so far.
@@ -182,6 +307,19 @@ impl RecordingTelegramApi {
             .lock()
             .expect("telegram recorder poisoned")
             .clone()
+    }
+
+    /// Every `offset` a `get_updates` call asked for, in order.
+    pub fn poll_offsets(&self) -> Vec<Option<i64>> {
+        self.offsets
+            .lock()
+            .expect("telegram recorder poisoned")
+            .clone()
+    }
+
+    /// How many times the webhook was deleted.
+    pub fn delete_webhook_calls(&self) -> usize {
+        self.deletes.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -205,6 +343,43 @@ impl TelegramApi for RecordingTelegramApi {
         Ok(())
     }
 
+    async fn get_updates(
+        &self,
+        _token: &str,
+        offset: Option<i64>,
+        _timeout_secs: u64,
+    ) -> Result<Vec<serde_json::Value>, OpenCompanyError> {
+        self.offsets
+            .lock()
+            .expect("telegram recorder poisoned")
+            .push(offset);
+        // Model the real API: a registered webhook makes `getUpdates` conflict.
+        if self
+            .registered_webhook
+            .lock()
+            .expect("telegram recorder poisoned")
+            .is_some()
+        {
+            return Err(OpenCompanyError::Store(
+                "telegram getUpdates returned 409 Conflict: can't use getUpdates method while webhook is active".to_string(),
+            ));
+        }
+        Ok(self
+            .batches
+            .lock()
+            .expect("telegram recorder poisoned")
+            .pop_front()
+            .unwrap_or_default())
+    }
+
+    async fn get_webhook_info(&self, _token: &str) -> Result<Option<String>, OpenCompanyError> {
+        Ok(self
+            .registered_webhook
+            .lock()
+            .expect("telegram recorder poisoned")
+            .clone())
+    }
+
     async fn set_webhook(
         &self,
         _token: &str,
@@ -215,6 +390,20 @@ impl TelegramApi for RecordingTelegramApi {
             .lock()
             .expect("telegram recorder poisoned")
             .push(url.to_string());
+        *self
+            .registered_webhook
+            .lock()
+            .expect("telegram recorder poisoned") = Some(url.to_string());
+        Ok(())
+    }
+
+    async fn delete_webhook(&self, _token: &str) -> Result<(), OpenCompanyError> {
+        self.deletes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self
+            .registered_webhook
+            .lock()
+            .expect("telegram recorder poisoned") = None;
         Ok(())
     }
 }
@@ -224,6 +413,7 @@ impl std::fmt::Debug for RecordingTelegramApi {
         f.debug_struct("RecordingTelegramApi")
             .field("sent", &self.sent().len())
             .field("webhooks", &self.webhooks().len())
+            .field("polls", &self.poll_offsets().len())
             .finish()
     }
 }
@@ -239,10 +429,58 @@ pub struct HttpTelegramApi {
 #[cfg(feature = "telegram")]
 impl HttpTelegramApi {
     /// Builds a transport over a fresh HTTPS client.
+    ///
+    /// No client-level request timeout is set: `getUpdates` deliberately blocks
+    /// server-side for its long-poll window, and a blanket timeout shorter than
+    /// that window would abort every idle poll. Each call passes its own bound
+    /// instead (see [`TelegramApi::get_updates`]).
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
         }
+    }
+
+    /// `POST /bot<token>/<method>` with `body`, returning the parsed `result`
+    /// field. Every error is scrubbed of the token before it escapes.
+    async fn call(
+        &self,
+        token: &str,
+        method: &str,
+        body: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, OpenCompanyError> {
+        let url = format!("https://api.telegram.org/bot{token}/{method}");
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                OpenCompanyError::Store(scrub_token(
+                    &format!("telegram {method} failed: {e}"),
+                    token,
+                ))
+            })?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(OpenCompanyError::Store(scrub_token(
+                &format!("telegram {method} returned {status}: {text}"),
+                token,
+            )));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            OpenCompanyError::Store(scrub_token(
+                &format!("telegram {method} returned unparseable JSON: {e}"),
+                token,
+            ))
+        })?;
+        Ok(parsed
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -262,29 +500,52 @@ impl TelegramApi for HttpTelegramApi {
         chat_id: i64,
         text: &str,
     ) -> Result<(), OpenCompanyError> {
-        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
-            .send()
-            .await
-            .map_err(|e| {
-                OpenCompanyError::Store(scrub_token(
-                    &format!("telegram sendMessage failed: {e}"),
-                    token,
-                ))
-            })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Err(OpenCompanyError::Store(scrub_token(
-                &format!("telegram sendMessage returned {status}: {body}"),
-                token,
-            )))
+        self.call(
+            token,
+            "sendMessage",
+            serde_json::json!({ "chat_id": chat_id, "text": text }),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn get_updates(
+        &self,
+        token: &str,
+        offset: Option<i64>,
+        timeout_secs: u64,
+    ) -> Result<Vec<serde_json::Value>, OpenCompanyError> {
+        let mut body = serde_json::json!({ "timeout": timeout_secs });
+        if let Some(offset) = offset {
+            body["offset"] = serde_json::json!(offset);
         }
+        // Give the transport a margin over Telegram's own long-poll hold, so a
+        // healthy idle poll returns on Telegram's schedule and only a genuinely
+        // wedged connection trips the client-side bound.
+        let budget = std::time::Duration::from_secs(timeout_secs.saturating_add(15));
+        let result = self.call(token, "getUpdates", body, budget).await?;
+        Ok(match result {
+            serde_json::Value::Array(updates) => updates,
+            _ => Vec::new(),
+        })
+    }
+
+    async fn get_webhook_info(&self, token: &str) -> Result<Option<String>, OpenCompanyError> {
+        let result = self
+            .call(
+                token,
+                "getWebhookInfo",
+                serde_json::json!({}),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        Ok(result
+            .get("url")
+            .and_then(|u| u.as_str())
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string))
     }
 
     async fn set_webhook(
@@ -293,29 +554,28 @@ impl TelegramApi for HttpTelegramApi {
         url: &str,
         secret: &str,
     ) -> Result<(), OpenCompanyError> {
-        let api = format!("https://api.telegram.org/bot{token}/setWebhook");
-        let resp = self
-            .client
-            .post(&api)
-            .json(&serde_json::json!({ "url": url, "secret_token": secret }))
-            .send()
-            .await
-            .map_err(|e| {
-                OpenCompanyError::Store(scrub_token(
-                    &format!("telegram setWebhook failed: {e}"),
-                    token,
-                ))
-            })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            Err(OpenCompanyError::Store(scrub_token(
-                &format!("telegram setWebhook returned {status}: {body}"),
-                token,
-            )))
-        }
+        self.call(
+            token,
+            "setWebhook",
+            serde_json::json!({ "url": url, "secret_token": secret }),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn delete_webhook(&self, token: &str) -> Result<(), OpenCompanyError> {
+        // `drop_pending_updates` stays false: an update that arrived while the
+        // unreachable webhook was registered is still owed a reply, and the
+        // poller picks it up on its first `getUpdates`.
+        self.call(
+            token,
+            "deleteWebhook",
+            serde_json::json!({ "drop_pending_updates": false }),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .map(|_| ())
     }
 }
 
