@@ -139,10 +139,16 @@ pub trait TaskStore: Send + Sync {
 mod test {
     use super::*;
 
-    /// The board's columns, in the order the console renders them. Pinned
-    /// because `frontend/src/lib/tasks-sample.ts` mirrors this list by hand: a
-    /// column added here and not there (or vice versa) files cards into a
-    /// column the operator cannot see.
+    /// Pins the **Rust** list's ids and their order against a literal, so a
+    /// reorder or a rename is a deliberate two-place edit rather than a
+    /// side effect.
+    ///
+    /// It does **not** protect against drift from the console's mirror in
+    /// `frontend/src/lib/tasks-sample.ts` — a Rust test cannot see the TS list,
+    /// so a column added on one side and not the other keeps this green.
+    /// Closing that gap means generating one list from the other (a build step
+    /// this crate does not have, across a separate npm build), so for now the
+    /// mirror is maintained by hand and the two lists are reviewed together.
     #[test]
     fn columns_are_ordered_and_unique() {
         assert_eq!(
