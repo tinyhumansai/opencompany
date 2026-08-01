@@ -1675,11 +1675,14 @@ members = ["engineer"]
         );
     }
 
-    /// A card assigned to a **desk** is worked by that desk's lead, and the card
-    /// is relinked to the member that ran it. `delegate_to_desk` writes a desk
-    /// id into `assignee`, so this is the shape a hand-off actually produces.
+    /// A card assigned to a **desk** is worked by that desk's lead, but the card
+    /// stays the desk's. `delegate_to_desk` writes a desk id into `assignee`, so
+    /// this is the shape a hand-off actually produces. Dispatch picks who runs
+    /// this turn, not who owns the card, so only the note names the member that
+    /// ran it — relinking the lead onto `assignee` would erase the desk from the
+    /// board the first time the card ran (#214 review).
     #[tokio::test]
-    async fn task_dispatch_routes_a_desk_assignee_to_its_lead_and_links_it() {
+    async fn task_dispatch_routes_a_desk_assignee_to_its_lead_but_keeps_the_desk() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, tasks) = brain_with_desk_tasks(dir.path());
         tasks
@@ -1699,11 +1702,14 @@ members = ["engineer"]
 
         let worked = only_card(&tasks).await;
         assert_eq!(
-            worked.assignee, "engineer",
-            "the desk's lead member did the work, so the card names them"
+            worked.assignee, "eng",
+            "a desk assignment is ownership: the card stays the desk's"
         );
         let note = worked.note.expect("note");
-        assert!(note.contains("[engineer]"), "{note:?}");
+        assert!(
+            note.contains("[engineer]"),
+            "the desk's lead member still did the work, and the note names them: {note:?}"
+        );
     }
 
     /// An **operator-overlay** teammate is a roster teammate. The narrow

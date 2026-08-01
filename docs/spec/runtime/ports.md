@@ -345,6 +345,11 @@ rejects anything else with a `400` and stores the canonical key rather than what
 was typed; dispatch refuses a card whose assignee no longer resolves, returning
 it to `backlog` with the reason on the note, and writes the agent that actually
 worked the card back onto `assignee` so the board names the doer (issue #205).
+That write-back covers an unassigned card and a card assigned to a teammate; a
+card assigned to a **desk** keeps the desk id. A desk assignment records who the
+card belongs to, and dispatch only chooses which member runs the current turn, so
+writing the lead back would erase the desk from the board the first time the card
+ran — the member that did the work is named on the note instead.
 
 ### ArtifactStore
 
