@@ -219,11 +219,37 @@ impl HarnessBrain {
                             // with the delegate never having run. Draining here
                             // runs the delegate, reassigns the card to them, and
                             // settles it from THEIR output.
-                            let handoff = self
+                            //
+                            // An errored hand-off lands exactly like an errored
+                            // turn (the `Err` arm below), and must NOT propagate
+                            // with `?`. By the time `run_delegation` can fail,
+                            // `hand_card_over` has already persisted the card as
+                            // `in_progress` reassigned to the delegate — so
+                            // unwinding here would skip both the settle and the
+                            // final `upsert` and leave the card sitting in
+                            // `in_progress` under a delegate that produced
+                            // nothing, with no result and nothing to re-dispatch
+                            // it: `task_enters_in_progress` only edge-fires on
+                            // the *transition* into that column, which already
+                            // happened. That is precisely the stranded state
+                            // this fix exists to eliminate.
+                            //
+                            // The card keeps the delegate as its assignee on the
+                            // way to `backlog` — the hand-off did happen, and a
+                            // re-dispatch should start from who it was given to.
+                            let handoff = match self
                                 .delegation_runner(&run_turn)
                                 .for_task(&card.id)
                                 .handle_task_delegations(&mut card, &responder)
-                                .await?;
+                                .await
+                            {
+                                Ok(handoff) => handoff,
+                                Err(err) => {
+                                    let result = format!("hand-off failed: {err}");
+                                    settle(&mut card, TaskRunEnd::Failed, &responder, &result);
+                                    break result;
+                                }
+                            };
                             // `settle` writes the note (attributed to whoever
                             // actually produced the text) and the landing column
                             // via the #186 lifecycle seam; the loop still yields
@@ -3175,6 +3201,13 @@ members = ["eng1", "eng2"]
         tasks: Arc<FsOps>,
         /// `(column, assignee)` of the company's card at each invoke, in order.
         board: StdMutex<Vec<(String, String)>>,
+        /// The 1-based invoke number from which every invoke ERRORS instead of
+        /// answering, so a test can make a delegate's own run fail and assert
+        /// the card still lands (issue #213 review finding 1). It is a *from*,
+        /// not an *on*: openhuman's agent loop retries a failed provider call
+        /// within the same turn, so failing one invoke only makes the turn
+        /// succeed on its retry.
+        fail_from_invoke: Option<usize>,
     }
 
     impl DelegatingProvider {
@@ -3191,7 +3224,12 @@ members = ["eng1", "eng2"]
             _state: &(),
             request: ModelRequest,
         ) -> tinyagents::Result<ModelResponse> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let invoke = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.fail_from_invoke.is_some_and(|from| invoke >= from) {
+                return Err(tinyagents::TinyAgentsError::Model(
+                    "the delegate's provider fell over".to_string(),
+                ));
+            }
             let snapshot = self
                 .tasks
                 .list(&CompanyId::new("acme"))
@@ -3229,6 +3267,17 @@ members = ["eng1", "eng2"]
         dir: &std::path::Path,
         pushes: Vec<Option<Delegation>>,
     ) -> (HarnessBrain, Arc<DelegatingProvider>) {
+        brain_that_delegates_failing_from(dir, pushes, None)
+    }
+
+    /// [`brain_that_delegates`], but every invoke from `fail_from_invoke`
+    /// (1-based) onward errors instead of answering — so a test can make the
+    /// *delegate's* run fail, retries included.
+    fn brain_that_delegates_failing_from(
+        dir: &std::path::Path,
+        pushes: Vec<Option<Delegation>>,
+        fail_from_invoke: Option<usize>,
+    ) -> (HarnessBrain, Arc<DelegatingProvider>) {
         let queue = orchestrator::DelegationQueue::default();
         let tasks = Arc::new(FsOps::new(dir));
         let provider = Arc::new(DelegatingProvider {
@@ -3237,6 +3286,7 @@ members = ["eng1", "eng2"]
             calls: std::sync::atomic::AtomicUsize::new(0),
             tasks: tasks.clone(),
             board: StdMutex::new(Vec::new()),
+            fail_from_invoke,
         });
         let deps = HarnessDeps {
             provider: provider.clone(),
@@ -3490,6 +3540,57 @@ members = ["eng1", "eng2"]
             provider.board()[1],
             ("in_progress".to_string(), "engineer".to_string()),
             "the delegate must be shown working the card while they work it"
+        );
+    }
+
+    /// An errored hand-off must not STRAND the card (issue #213 review).
+    ///
+    /// `hand_card_over` has already persisted the card as `in_progress`
+    /// reassigned to the delegate before their turn starts. If that turn then
+    /// errors and the failure is propagated out of `run_task`, the settle and
+    /// the final `upsert` are both skipped and the card sits in `in_progress`
+    /// under the delegate with no result — and nothing re-dispatches it, because
+    /// `task_enters_in_progress` only edge-fires on the *transition* into that
+    /// column and the card is already there. Exactly the state issue #204 exists
+    /// to eliminate, reintroduced through the error path.
+    ///
+    /// So an errored hand-off takes the same arm an errored turn does: settle
+    /// `Failed` → `backlog`, with the reason on the note.
+    #[tokio::test]
+    async fn a_hand_off_whose_delegate_errors_lands_in_backlog_not_stranded_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 is the dispatched orchestrator turn (queues the hand-off);
+        // invoke 2 is the delegate's own turn, which errors.
+        let (brain, provider) = brain_that_delegates_failing_from(
+            dir.path(),
+            vec![Some(Delegation::DelegateToDesk {
+                desk: "eng_desk".to_string(),
+                instruction: "fetch my activity".to_string(),
+            })],
+            Some(2),
+        );
+        dispatch_card(&brain, &provider.tasks.clone(), "t-boom").await;
+
+        let after = only_card(&provider.tasks).await;
+        assert_eq!(
+            after.column, "backlog",
+            "an errored hand-off must return the card to the backlog, never leave it stranded in \
+             progress where nothing will re-dispatch it"
+        );
+        let note = after.note.expect("note");
+        assert!(
+            note.contains("hand-off failed:"),
+            "the failure reason lands on the note: {note}"
+        );
+        assert!(
+            note.contains("delegated to engineer: fetch my activity"),
+            "the hand-off that was attempted is still recorded: {note}"
+        );
+        // The failure is the assignee's, not the operator's — a cancellation is
+        // the only ending attributed to `operator`.
+        assert!(
+            !note.contains("[operator]"),
+            "an errored run is not an operator cancellation: {note}"
         );
     }
 
