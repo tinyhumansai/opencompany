@@ -3202,7 +3202,7 @@ members = ["eng1", "eng2"]
     /// drain it after the turn.
     struct DelegatingProvider {
         queue: orchestrator::DelegationQueue,
-        pushes: StdMutex<VecDeque<Option<Delegation>>>,
+        pushes: StdMutex<VecDeque<Vec<Delegation>>>,
         calls: std::sync::atomic::AtomicUsize,
         /// The same task store the brain writes through, so each invoke can
         /// snapshot the board **as that turn sees it** — the only way a test can
@@ -3273,7 +3273,7 @@ members = ["eng1", "eng2"]
                 .map(|card| (card.column, card.assignee))
                 .unwrap_or_default();
             self.board.lock().unwrap().push(snapshot);
-            if let Some(Some(delegation)) = self.pushes.lock().unwrap().pop_front() {
+            for delegation in self.pushes.lock().unwrap().pop_front().unwrap_or_default() {
                 self.queue.push(delegation);
             }
             let message = request
@@ -3301,14 +3301,19 @@ members = ["eng1", "eng2"]
         dir: &std::path::Path,
         pushes: Vec<Option<Delegation>>,
     ) -> (HarnessBrain, Arc<DelegatingProvider>) {
-        brain_that_delegates_with(dir, pushes, TurnFaults::default())
+        brain_that_delegates_with(
+            dir,
+            pushes.into_iter().map(Vec::from_iter).collect(),
+            TurnFaults::default(),
+        )
     }
 
-    /// [`brain_that_delegates`], with scripted per-invoke faults so a test can
+    /// [`brain_that_delegates`], but each invoke pushes a whole *set* of
+    /// delegations (a single turn can queue several), and per-invoke faults can
     /// make a delegate's run fail or be cancelled mid-flight.
     fn brain_that_delegates_with(
         dir: &std::path::Path,
-        pushes: Vec<Option<Delegation>>,
+        pushes: Vec<Vec<Delegation>>,
         faults: TurnFaults,
     ) -> (HarnessBrain, Arc<DelegatingProvider>) {
         let queue = orchestrator::DelegationQueue::default();
@@ -3598,10 +3603,10 @@ members = ["eng1", "eng2"]
         // invoke 2 is the delegate's own turn, which errors.
         let (brain, provider) = brain_that_delegates_with(
             dir.path(),
-            vec![Some(Delegation::DelegateToDesk {
+            vec![vec![Delegation::DelegateToDesk {
                 desk: "eng_desk".to_string(),
                 instruction: "fetch my activity".to_string(),
-            })],
+            }]],
             TurnFaults {
                 fail_from: Some(2),
                 ..TurnFaults::default()
@@ -3646,10 +3651,10 @@ members = ["eng1", "eng2"]
         // invoke 2 is the delegate's turn, which cancels itself mid-run.
         let (brain, provider) = brain_that_delegates_with(
             dir.path(),
-            vec![Some(Delegation::DelegateToDesk {
+            vec![vec![Delegation::DelegateToDesk {
                 desk: "eng_desk".to_string(),
                 instruction: "fetch my activity".to_string(),
-            })],
+            }]],
             TurnFaults {
                 cancel_on: vec![2],
                 ..TurnFaults::default()
@@ -3672,6 +3677,61 @@ members = ["eng1", "eng2"]
         assert!(
             note.contains("[operator] the delegated run was cancelled"),
             "a cancellation is attributed to the operator: {note}"
+        );
+    }
+
+    /// A later hand-off that ANSWERS must not be discarded by an earlier one
+    /// that produced nothing (issue #213 review finding 3).
+    ///
+    /// Before this, the first hand-off owned the card unconditionally. A first
+    /// hand-off cancelled mid-flight still produced a `TaskHandoff`, so a second
+    /// hand-off in the same drain took the "does not own the card" arm: its
+    /// answer was appended to the note, but the card still settled `Cancelled`
+    /// -> `backlog` off the first. Work that ran and produced output ended up
+    /// filed under a card marked cancelled.
+    #[tokio::test]
+    async fn a_later_answering_hand_off_takes_the_card_over_from_an_earlier_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 is the dispatched orchestrator turn, queuing BOTH hand-offs.
+        // Invoke 2 is the first delegate's run, cancelled mid-flight; invoke 3
+        // is the second delegate's run, which answers.
+        let (brain, provider) = brain_that_delegates_with(
+            dir.path(),
+            vec![vec![
+                Delegation::DelegateToDesk {
+                    desk: "eng_desk".to_string(),
+                    instruction: "first attempt".to_string(),
+                },
+                Delegation::DelegateToDesk {
+                    desk: "eng_desk".to_string(),
+                    instruction: "second attempt".to_string(),
+                },
+            ]],
+            TurnFaults {
+                cancel_on: vec![2],
+                ..TurnFaults::default()
+            },
+        );
+        dispatch_card(&brain, &provider.tasks.clone(), "t-two-handoffs").await;
+
+        let after = only_card(&provider.tasks).await;
+        assert_eq!(
+            after.column, "in_review",
+            "the card settles from the hand-off that actually produced work, not from the \
+             cancelled one that preceded it"
+        );
+        assert_eq!(
+            after.assignee, "engineer",
+            "the delegate that produced the work owns the card"
+        );
+        let note = after.note.expect("note");
+        assert!(
+            note.contains("second attempt"),
+            "the answering hand-off's output is the card's result: {note}"
+        );
+        assert!(
+            !note.contains("the delegated run was cancelled before it produced anything"),
+            "an earlier cancelled hand-off must not settle a card a later one completed: {note}"
         );
     }
 

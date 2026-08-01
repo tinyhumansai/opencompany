@@ -301,15 +301,23 @@ impl<'a> DelegationRunner<'a> {
     /// card landed in `in_review` under the delegator with a blank assignee and
     /// no delegate ever having run.
     ///
-    /// The first hand-off to a desk with a resolvable lead **owns the card**:
-    /// the card is reassigned to that lead and persisted in
-    /// [`COLUMN_IN_PROGRESS`](lifecycle::COLUMN_IN_PROGRESS) *before* their turn
-    /// starts, so the board shows who is working it while they work it, and the
-    /// caller settles the card from their output afterwards. Every other
-    /// delegation — `spawn_task`, `assign_task`, `review_task`, a hand-off to a
-    /// desk nobody leads, and any further hand-off past the first — executes for
-    /// its side effect; a later hand-off's answer is appended to the note so it
-    /// is recorded rather than silently discarded.
+    /// The first hand-off to a desk with a resolvable lead that **produces
+    /// something** owns the card: the card is reassigned to that lead and
+    /// persisted in [`COLUMN_IN_PROGRESS`](lifecycle::COLUMN_IN_PROGRESS)
+    /// *before* their turn starts, so the board shows who is working it while
+    /// they work it, and the caller settles the card from their output
+    /// afterwards.
+    ///
+    /// An earlier hand-off that produced nothing (its run was cancelled
+    /// mid-flight) holds the card only *provisionally* — a later hand-off that
+    /// answers takes it over. Otherwise the card would settle from the
+    /// cancellation while work that actually ran was merely appended to the
+    /// note, filing a real deliverable under a card marked cancelled.
+    ///
+    /// Every other delegation — `spawn_task`, `assign_task`, `review_task`, a
+    /// hand-off to a desk nobody leads, and any further hand-off once one has
+    /// answered — executes for its side effect; a later hand-off's answer is
+    /// appended to the note so it is recorded rather than silently discarded.
     ///
     /// `chat_id` is `None` throughout: a dispatched card has no chat thread, and
     /// stamping one would make a spawned card post back into an unrelated
@@ -342,7 +350,15 @@ impl<'a> DelegationRunner<'a> {
                 self.run_delegation(delegation, None).await?;
                 continue;
             };
-            let owns_card = handoff.is_none();
+            // The card belongs to the first hand-off that actually PRODUCES
+            // something. A hand-off whose run was cancelled produced nothing, so
+            // it does not get to keep the card: it would settle `Cancelled` ->
+            // `backlog` while a later hand-off that really ran had its answer
+            // merely appended to the note — filing work that happened under a
+            // card marked cancelled. So an empty hand-off is *provisional* and a
+            // later one that answers takes the card over from it (issue #213
+            // review finding 3).
+            let owns_card = handoff.as_ref().is_none_or(|prior| prior.reply.is_none());
             if owns_card {
                 self.hand_card_over(card, delegator, &member, instruction_of(&delegation))
                     .await?;
