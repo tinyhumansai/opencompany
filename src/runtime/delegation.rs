@@ -110,6 +110,15 @@ pub(crate) struct DelegationOutcome {
     pub(crate) bubble: Option<OutboundMessage>,
     /// A synchronous desk reply to relay through a second orchestrator turn.
     pub(crate) desk_reply: Option<DeskReply>,
+    /// Set when an operator CANCELLED this delegation's run mid-flight, so its
+    /// reply was discarded.
+    ///
+    /// `desk_reply: None` on its own does not mean "cancelled" —
+    /// `run_delegation` also returns an empty outcome for a desk with no
+    /// resolvable lead, and for every delegation that is not a hand-off. This
+    /// flag carries the cancellation as a **fact** so a caller can report the
+    /// cause rather than inferring one from an absence (issue #213 review).
+    pub(crate) cancelled: bool,
 }
 
 /// A synchronous desk-lead answer captured for the orchestrator to relay: which
@@ -138,12 +147,20 @@ pub(crate) struct OperatorTurn {
 /// Returned by [`DelegationRunner::handle_task_delegations`] when the turn
 /// called `delegate_to_desk` and the desk resolved to a real teammate: that
 /// teammate is now the card's assignee and has already run. `reply` is what
-/// they produced, or `None` when their run yielded nothing (an operator
-/// cancelled it mid-flight).
+/// they produced.
+///
+/// A `TaskHandoff` with `reply: None` is only ever built from a run an operator
+/// actually CANCELLED — [`DelegationOutcome::cancelled`] is the input, not the
+/// absence of a reply. A hand-off that yields nothing for any *other* reason
+/// reports no hand-off at all, so the delegator's own turn settles the card
+/// (the same path a desk with no resolvable lead already takes) rather than the
+/// card being settled as a cancellation that never happened (issue #213
+/// review).
 pub(crate) struct TaskHandoff {
     /// The delegate that took the card over — now its `assignee`.
     pub(crate) delegate: String,
-    /// What the delegate produced, if anything.
+    /// What the delegate produced. `None` means their run was cancelled
+    /// mid-flight, and nothing else.
     pub(crate) reply: Option<String>,
 }
 
@@ -330,24 +347,40 @@ impl<'a> DelegationRunner<'a> {
                 self.hand_card_over(card, delegator, &member, instruction_of(&delegation))
                     .await?;
             }
-            let reply = self
-                .run_delegation(delegation, None)
-                .await?
-                .desk_reply
-                .map(|desk| desk.reply);
-            match (owns_card, reply) {
-                (true, reply) => {
+            let outcome = self.run_delegation(delegation, None).await?;
+            match (owns_card, outcome.desk_reply, outcome.cancelled) {
+                // The delegate answered: they own the card and it settles from
+                // their output.
+                (true, Some(desk), _) => {
                     handoff = Some(TaskHandoff {
                         delegate: member,
-                        reply,
+                        reply: Some(desk.reply),
                     });
                 }
-                // A second hand-off does not take the card over, but its answer
-                // is real work — record it rather than dropping it.
-                (false, Some(reply)) => {
-                    card.note = Some(append_note(card.note.as_deref(), &member, &reply));
+                // An operator cancelled their run mid-flight, so it produced
+                // nothing. Reported as a cancellation because `run_delegation`
+                // said it was one — not because the reply is missing.
+                (true, None, true) => {
+                    handoff = Some(TaskHandoff {
+                        delegate: member,
+                        reply: None,
+                    });
                 }
-                (false, None) => {}
+                // Nothing produced and NOT a cancellation. `run_delegation`'s
+                // only other empty exit for a hand-off is a desk with no
+                // resolvable lead, which cannot be reached here — the lead
+                // resolved above and `desk_lead` is pure over the same record.
+                // If it ever becomes reachable, this reports *no hand-off*, so
+                // the delegator's own reply settles the card exactly as an
+                // unresolvable desk already does, rather than telling the
+                // operator their run was cancelled when it was not.
+                (true, None, false) => {}
+                // A later hand-off does not take the card over, but its answer
+                // is real work — record it rather than dropping it.
+                (false, Some(desk), _) => {
+                    card.note = Some(append_note(card.note.as_deref(), &member, &desk.reply));
+                }
+                (false, None, _) => {}
             }
         }
         Ok(handoff)
@@ -464,10 +497,15 @@ impl<'a> DelegationRunner<'a> {
                     .run_turn
                     .run_steered(self.company, &member, &instruction, &control, chat_id)
                     .await?;
-                // A cancel issued mid-flight discards the delegated reply — nothing
-                // is relayed.
+                // A cancel issued mid-flight discards the delegated reply —
+                // nothing is relayed. Flagged as a cancellation so a caller that
+                // has to explain the empty result can name the cause instead of
+                // guessing at it (issue #213 review).
                 if matches!(control.take(), Some(SteerAction::Cancel)) {
-                    return Ok(DelegationOutcome::default());
+                    return Ok(DelegationOutcome {
+                        cancelled: true,
+                        ..DelegationOutcome::default()
+                    });
                 }
                 // Hand the teammate's answer back to RELAY through a second
                 // orchestrator turn (the CEO-relay hand-back). Their steps ride
@@ -479,6 +517,7 @@ impl<'a> DelegationRunner<'a> {
                         reply: outcome.reply,
                         steps: outcome.steps,
                     }),
+                    cancelled: false,
                 })
             }
             // ── Issue #186 part b: orchestrator lifecycle authority ─────────

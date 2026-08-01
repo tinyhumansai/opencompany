@@ -270,8 +270,17 @@ impl HarnessBrain {
                                             );
                                             reply
                                         }
-                                        // The hand-off ran but produced nothing
-                                        // (an operator cancelled it in flight).
+                                        // The hand-off ran and an operator
+                                        // CANCELLED it in flight, so it produced
+                                        // nothing. Naming the cancellation here
+                                        // is safe because `TaskHandoff` only
+                                        // carries `reply: None` for a run
+                                        // `run_delegation` reported as cancelled
+                                        // — a hand-off that ends empty for any
+                                        // other reason reports no hand-off at
+                                        // all and never reaches this arm (issue
+                                        // #213 review).
+                                        //
                                         // Partial work is discarded and the card
                                         // returns to the backlog, exactly as a
                                         // cancelled dispatch does — it must not
@@ -2940,7 +2949,7 @@ members = ["eng1", "eng2"]
 
     // --- Steer disposition (issue #111) -------------------------------------
 
-    use crate::company::steer::InflightRegistry;
+    use crate::company::steer::{InflightKind, InflightRegistry};
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
@@ -3201,13 +3210,25 @@ members = ["eng1", "eng2"]
         tasks: Arc<FsOps>,
         /// `(column, assignee)` of the company's card at each invoke, in order.
         board: StdMutex<Vec<(String, String)>>,
-        /// The 1-based invoke number from which every invoke ERRORS instead of
-        /// answering, so a test can make a delegate's own run fail and assert
-        /// the card still lands (issue #213 review finding 1). It is a *from*,
-        /// not an *on*: openhuman's agent loop retries a failed provider call
-        /// within the same turn, so failing one invoke only makes the turn
-        /// succeed on its retry.
-        fail_from_invoke: Option<usize>,
+        /// How this provider misbehaves, by invoke number.
+        faults: TurnFaults,
+        /// The same registry wired into [`HarnessDeps::steer`], so a scripted
+        /// invoke can cancel its own in-flight delegation.
+        steer: InflightRegistry,
+    }
+
+    /// How a [`DelegatingProvider`] misbehaves, keyed by 1-based invoke number
+    /// (issue #213 review).
+    #[derive(Default)]
+    struct TurnFaults {
+        /// Every invoke from here on ERRORS instead of answering, so a test can
+        /// make a delegate's own run fail. A *from*, not an *on*: openhuman's
+        /// agent loop retries a failed provider call within the same turn, so
+        /// failing a single invoke only makes the turn succeed on its retry.
+        fail_from: Option<usize>,
+        /// Invokes that CANCEL their own in-flight delegation mid-run, so the
+        /// delegated reply is discarded exactly as an operator cancel does.
+        cancel_on: Vec<usize>,
     }
 
     impl DelegatingProvider {
@@ -3225,10 +3246,23 @@ members = ["eng1", "eng2"]
             request: ModelRequest,
         ) -> tinyagents::Result<ModelResponse> {
             let invoke = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if self.fail_from_invoke.is_some_and(|from| invoke >= from) {
+            if self.faults.fail_from.is_some_and(|from| invoke >= from) {
                 return Err(tinyagents::TinyAgentsError::Model(
                     "the delegate's provider fell over".to_string(),
                 ));
+            }
+            if self.faults.cancel_on.contains(&invoke) {
+                // The delegation's own in-flight entry, not the dispatched
+                // card's — cancelling the card would end the whole run.
+                let company = CompanyId::new("acme");
+                if let Some(entry) = self
+                    .steer
+                    .list(&company)
+                    .into_iter()
+                    .find(|e| e.kind == InflightKind::Delegation)
+                {
+                    let _ = self.steer.steer(&company, &entry.key, SteerAction::Cancel);
+                }
             }
             let snapshot = self
                 .tasks
@@ -3267,26 +3301,27 @@ members = ["eng1", "eng2"]
         dir: &std::path::Path,
         pushes: Vec<Option<Delegation>>,
     ) -> (HarnessBrain, Arc<DelegatingProvider>) {
-        brain_that_delegates_failing_from(dir, pushes, None)
+        brain_that_delegates_with(dir, pushes, TurnFaults::default())
     }
 
-    /// [`brain_that_delegates`], but every invoke from `fail_from_invoke`
-    /// (1-based) onward errors instead of answering — so a test can make the
-    /// *delegate's* run fail, retries included.
-    fn brain_that_delegates_failing_from(
+    /// [`brain_that_delegates`], with scripted per-invoke faults so a test can
+    /// make a delegate's run fail or be cancelled mid-flight.
+    fn brain_that_delegates_with(
         dir: &std::path::Path,
         pushes: Vec<Option<Delegation>>,
-        fail_from_invoke: Option<usize>,
+        faults: TurnFaults,
     ) -> (HarnessBrain, Arc<DelegatingProvider>) {
         let queue = orchestrator::DelegationQueue::default();
         let tasks = Arc::new(FsOps::new(dir));
+        let steer = InflightRegistry::new();
         let provider = Arc::new(DelegatingProvider {
             queue: queue.clone(),
             pushes: StdMutex::new(pushes.into_iter().collect()),
             calls: std::sync::atomic::AtomicUsize::new(0),
             tasks: tasks.clone(),
             board: StdMutex::new(Vec::new()),
-            fail_from_invoke,
+            faults,
+            steer: steer.clone(),
         });
         let deps = HarnessDeps {
             provider: provider.clone(),
@@ -3314,7 +3349,7 @@ members = ["eng1", "eng2"]
             plan: None,
             media: None,
             composio: None,
-            steer: crate::company::steer::InflightRegistry::default(),
+            steer,
         };
         (
             HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record_with_desk()),
@@ -3561,13 +3596,16 @@ members = ["eng1", "eng2"]
         let dir = tempfile::tempdir().unwrap();
         // Invoke 1 is the dispatched orchestrator turn (queues the hand-off);
         // invoke 2 is the delegate's own turn, which errors.
-        let (brain, provider) = brain_that_delegates_failing_from(
+        let (brain, provider) = brain_that_delegates_with(
             dir.path(),
             vec![Some(Delegation::DelegateToDesk {
                 desk: "eng_desk".to_string(),
                 instruction: "fetch my activity".to_string(),
             })],
-            Some(2),
+            TurnFaults {
+                fail_from: Some(2),
+                ..TurnFaults::default()
+            },
         );
         dispatch_card(&brain, &provider.tasks.clone(), "t-boom").await;
 
@@ -3591,6 +3629,49 @@ members = ["eng1", "eng2"]
         assert!(
             !note.contains("[operator]"),
             "an errored run is not an operator cancellation: {note}"
+        );
+    }
+
+    /// A hand-off an operator cancels mid-flight produced nothing, so the card
+    /// returns to the `backlog` reported as the cancellation it actually was.
+    ///
+    /// The claim is only made because `run_delegation` reports the cancellation
+    /// as a fact (`DelegationOutcome::cancelled`); a hand-off that ends empty
+    /// for any other reason no longer reaches this arm at all (issue #213
+    /// review finding 2).
+    #[tokio::test]
+    async fn a_cancelled_hand_off_returns_the_card_to_the_backlog_as_a_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invoke 1 is the dispatched orchestrator turn (queues the hand-off);
+        // invoke 2 is the delegate's turn, which cancels itself mid-run.
+        let (brain, provider) = brain_that_delegates_with(
+            dir.path(),
+            vec![Some(Delegation::DelegateToDesk {
+                desk: "eng_desk".to_string(),
+                instruction: "fetch my activity".to_string(),
+            })],
+            TurnFaults {
+                cancel_on: vec![2],
+                ..TurnFaults::default()
+            },
+        );
+        dispatch_card(&brain, &provider.tasks.clone(), "t-cancel").await;
+
+        let after = only_card(&provider.tasks).await;
+        assert_eq!(
+            after.column, "backlog",
+            "a cancelled hand-off must not read as finished, and must not strand in progress"
+        );
+        let note = after.note.expect("note");
+        assert!(
+            note.contains("the delegated run was cancelled before it produced anything"),
+            "the cancellation is reported as the cause: {note}"
+        );
+        // A cancellation is the operator's act, so the block is theirs — not the
+        // delegate's, who never said it.
+        assert!(
+            note.contains("[operator] the delegated run was cancelled"),
+            "a cancellation is attributed to the operator: {note}"
         );
     }
 
