@@ -367,6 +367,20 @@ impl<'a> DelegationRunner<'a> {
                 // that an assignment was attempted.
                 let resolved = assignee::resolve(self.record, &assignee);
                 let entry = match resolved.canonical() {
+                    // A blank or whitespace-only `assignee` resolves to
+                    // `Unassigned`, whose canonical form is `""`. Clearing the
+                    // owner is the right write — unassigning a card is a real
+                    // thing to ask for — but there is no name to put in the
+                    // note, and `assigned to {assignee}` would record a
+                    // sentence that trails off with nothing after it. Name the
+                    // effect instead, so the timeline says what happened.
+                    Some(canonical) if canonical.is_empty() => {
+                        card.assignee = String::new();
+                        match note {
+                            Some(note) => format!("cleared the assignee — {note}"),
+                            None => "cleared the assignee".to_string(),
+                        }
+                    }
                     Some(canonical) => {
                         card.assignee = canonical.to_string();
                         match note {

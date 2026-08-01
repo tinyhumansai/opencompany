@@ -2239,6 +2239,46 @@ members = ["eng1", "eng2"]
         assert!(note.contains("could not assign to Shane"), "{note}");
     }
 
+    /// #214 review: a blank `assignee` resolves to `Unassigned`, whose canonical
+    /// form is `""`. Clearing the owner is correct — unassigning is a real
+    /// request — but the note must say so. It used to fall through the named
+    /// arm and record `assigned to ` with nothing after it.
+    #[tokio::test]
+    async fn assign_task_with_a_blank_assignee_clears_the_owner_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let mut c = card("t-assign", "engineer");
+        c.column = "backlog".to_string();
+        tasks.upsert(&CompanyId::new("acme"), &c).await.unwrap();
+
+        brain
+            .run_delegation(
+                Delegation::AssignTask {
+                    task_id: "t-assign".to_string(),
+                    assignee: "   ".to_string(),
+                    note: None,
+                },
+                None,
+            )
+            .await
+            .expect("delegation runs");
+
+        let after = only_card(&tasks).await;
+        assert_eq!(
+            after.assignee, "",
+            "a blank assignee unassigns the card, which is a legitimate write"
+        );
+        let note = after.note.expect("note");
+        assert!(
+            note.contains("cleared the assignee"),
+            "the note names the effect rather than trailing off: {note}"
+        );
+        assert!(
+            !note.contains("assigned to "),
+            "the truncated 'assigned to <nothing>' note must not come back: {note}"
+        );
+    }
+
     /// Approving finishes a board-created card: this is #171's `in_review →
     /// done` write (PR #179) for the card shape #179's own origin rule cannot
     /// reach, with the verdict recorded on the note.
