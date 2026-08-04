@@ -906,14 +906,14 @@ export function KnowledgeGraph({
           for (let i = 0; i < SYNAPSE_N; i++) {
             const el = sparkRefs.current[i];
             if (!el) continue;
-            const period = 2400 + ((i * 379) % 1700);
+            const period = 1500 + ((i * 379) % 1200);
             const t = nowT + i * 911;
             const cycle = Math.floor(t / period);
             const seg = segs[(cycle * 131 + i * 37) % segs.length];
             const u = (t % period) / period;
             el.setAttribute('cx', String(seg[0] + (seg[2] - seg[0]) * u));
             el.setAttribute('cy', String(seg[1] + (seg[3] - seg[1]) * u));
-            el.setAttribute('opacity', String(0.95 * Math.sin(Math.PI * u)));
+            el.setAttribute('opacity', String(Math.sin(Math.PI * u)));
           }
         }
       }
@@ -977,15 +977,17 @@ export function KnowledgeGraph({
           const mx = (selfPos.x + teamPos.x) / 2 + (-dy / len) * 0.12 * len;
           const my = (selfPos.y + teamPos.y) / 2 + (dx / len) * 0.12 * len;
           const seed = (hashStr(teamId) % 100) / 100;
+          // Faster than a heartbeat and out of step per spoke, so the wheel
+          // reads as busy rather than metronomic.
           const u =
             dir === 'out'
-              ? (now / 2600 + seed) % 1
-              : 1 - ((now / 3300 + seed * 1.7) % 1);
+              ? (now / 1700 + seed) % 1
+              : 1 - ((now / 2200 + seed * 1.7) % 1);
           const a = 1 - u;
           const x = a * a * selfPos.x + 2 * a * u * mx + u * u * teamPos.x;
           const y = a * a * selfPos.y + 2 * a * u * my + u * u * teamPos.y;
           el.setAttribute('transform', `translate(${x},${y})`);
-          el.setAttribute('opacity', String(0.9 * Math.sin(Math.PI * u)));
+          el.setAttribute('opacity', String(Math.sin(Math.PI * u)));
         }
       }
       raf = requestAnimationFrame(step);
@@ -1766,13 +1768,13 @@ export function KnowledgeGraph({
             const pathway = coreExpanded && l.kind === 'pillar';
             if (coreExpanded && !pathway) {
               return (
-                <path key={i} d={edgeArc(s, t)} fill="none" stroke={EDGE_COLOR[l.kind] ?? 'var(--dim)'} strokeWidth={0.9} strokeLinecap="round" opacity={0.02} style={{ transition: 'opacity 0.4s' }} />
+                <path key={i} d={edgeArc(s, t)} fill="none" stroke={EDGE_COLOR[l.kind] ?? 'var(--dim)'} strokeWidth={1} strokeLinecap="round" opacity={0.06} style={{ transition: 'opacity 0.4s' }} />
               );
             }
             if (pathway) {
               const teamColor = byId.get(t.id)?.color ?? 'var(--text)';
               return (
-                <path key={i} d={edgeArc(s, t)} fill="none" stroke={teamColor} strokeWidth={2.2} strokeLinecap="round" opacity={0.75} className="kg-ray" style={{ transition: 'opacity 0.4s' }} />
+                <path key={i} d={edgeArc(s, t)} fill="none" stroke={teamColor} strokeWidth={2.6} strokeLinecap="round" opacity={0.9} className="kg-ray" style={{ transition: 'opacity 0.4s' }} />
               );
             }
             // de-noised web: every edge wears its pillar's color at a whisper
@@ -1788,9 +1790,12 @@ export function KnowledgeGraph({
                 d={edgeArc(s, t)}
                 fill="none"
                 stroke={tint}
-                strokeWidth={incident ? 1.6 : onChain && lit ? 1.2 : 0.9}
+                strokeWidth={incident ? 2 : onChain && lit ? 1.5 : 1.1}
                 strokeLinecap="round"
-                opacity={lit ? (incident ? 0.6 : onChain ? 0.35 : 0.04) : 0.08}
+                // At rest the whole web is legible rather than a whisper; with
+                // something lit, the chain pulls further ahead of the rest than
+                // the raised floor gives back.
+                opacity={lit ? (incident ? 0.85 : onChain ? 0.55 : 0.05) : 0.2}
               />
             );
           })}
@@ -1803,8 +1808,8 @@ export function KnowledgeGraph({
           <g style={{ pointerEvents: 'none' }}>
             {commTeams.map((t) => (
               <g key={t.id}>
-                <circle ref={setCommRef(`${t.id}:out`)} r={2} fill={HUB_COLOR} opacity={0} transform="translate(-999,-999)" />
-                <circle ref={setCommRef(`${t.id}:in`)} r={2.3} fill={t.color} opacity={0} transform="translate(-999,-999)" />
+                <circle ref={setCommRef(`${t.id}:out`)} r={2.6} fill={HUB_COLOR} opacity={0} transform="translate(-999,-999)" />
+                <circle ref={setCommRef(`${t.id}:in`)} r={3} fill={t.color} opacity={0} transform="translate(-999,-999)" />
               </g>
             ))}
           </g>
@@ -1854,7 +1859,7 @@ export function KnowledgeGraph({
               const s = posById.get(l.source);
               const t = posById.get(l.target);
               if (!s || !t) return null;
-              return <line key={`vine-${i}`} x1={s.x} y1={s.y} x2={t.x} y2={t.y} stroke="var(--brain-2)" strokeWidth={0.8} opacity={0.26} />;
+              return <line key={`vine-${i}`} x1={s.x} y1={s.y} x2={t.x} y2={t.y} stroke="var(--brain-2)" strokeWidth={1.1} opacity={0.42} />;
             })}
 
             {/* branches by depth:
@@ -2017,7 +2022,7 @@ export function KnowledgeGraph({
                         ref={(el) => {
                           sparkRefs.current[i] = el;
                         }}
-                        r={0.8}
+                        r={1.1}
                         fill={SYNAPSE_COLOR}
                         opacity={0}
                       />

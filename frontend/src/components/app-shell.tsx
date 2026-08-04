@@ -7,7 +7,6 @@ import {
   MessagesSquare,
   Settings2,
   ShieldCheck,
-  Sparkles,
   SquareKanban,
   Wallet,
   Workflow,
@@ -42,7 +41,6 @@ import { Overview } from "@/views/Overview";
 import { ChatView } from "@/views/ChatView";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
-import { SkillsView } from "@/views/SkillsView";
 import { InboxView } from "@/views/InboxView";
 import { MemoryView } from "@/views/MemoryView";
 import { FeedbackView } from "@/views/FeedbackView";
@@ -66,7 +64,6 @@ export type View =
   | "chat"
   | "inbox"
   | "tasks"
-  | "skills"
   | "workspace"
   | "memory"
   | "approvals"
@@ -88,7 +85,6 @@ const NAV: NavItem[] = [
   { view: "overview", label: "Overview", icon: LayoutDashboard },
   { view: "chat", label: "Chat", icon: MessagesSquare },
   { view: "tasks", label: "Tasks", icon: SquareKanban },
-  { view: "skills", label: "Skills", icon: Sparkles },
   { view: "workspace", label: "Workspace", icon: FolderClosed },
   { view: "memory", label: "Memory", icon: Brain },
   { view: "approvals", label: "Approvals", icon: ShieldCheck },
@@ -193,7 +189,6 @@ export function AppShell({
           )}
           {view === "inbox" && <InboxView company={company} />}
           {view === "tasks" && <TasksView client={client} company={company} />}
-          {view === "skills" && <SkillsView client={client} company={company} />}
           {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (
             <Suspense
