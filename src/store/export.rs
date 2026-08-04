@@ -31,7 +31,9 @@ use crate::ports::events::EventLog;
 use crate::ports::memory::MemoryStore;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
-    CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry, StoredEvent,
+    CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry, OverlayAgent,
+    OverlayDesk, OverlayDeskMember, OverlayDeskOrder, OverlayWorkflow, StoredEvent,
+    TemplateProvenance,
 };
 
 /// Canonical bundle file and directory names, matching the fs
@@ -78,12 +80,49 @@ fn io_err(path: &Path, source: std::io::Error) -> OpenCompanyError {
 
 /// Bundle metadata persisted alongside the manifest. Carries the company id so an
 /// import can restore the original id even when it diverges from the manifest
-/// slug. The fs [`CompanyStore`] reads only `lifecycle`; the extra field is
-/// ignored there (serde skips unknown fields).
+/// slug, plus the source-template provenance so a template-launched company keeps
+/// its provenance across an export/import round-trip. The fs [`CompanyStore`]
+/// reads only `lifecycle`; the extra fields are ignored there (serde skips
+/// unknown fields).
 #[derive(Serialize, Deserialize)]
 struct BundleMeta {
     lifecycle: String,
     id: String,
+    /// The operator team overlay — teammates the operator added that the
+    /// version-controlled manifest does not know about. Preserved across the
+    /// bundle round-trip so an export→import keeps the operator-added roster.
+    /// `#[serde(default)]` loads bundles written before this field existed as an
+    /// empty overlay.
+    #[serde(default)]
+    overlay_agents: Vec<OverlayAgent>,
+    /// The operator desk-membership overlay. Preserved so operator-added desk
+    /// memberships survive an export→import. `#[serde(default)]` for back-compat
+    /// with older bundles.
+    #[serde(default)]
+    overlay_desk_members: Vec<OverlayDeskMember>,
+    /// The operator per-desk member-ordering overlay. Preserved across the bundle
+    /// round-trip so an export→import keeps the operator-defined desk hierarchy
+    /// (and therefore the routing lead). `#[serde(default)]` loads bundles written
+    /// before this field existed as an empty order.
+    #[serde(default)]
+    overlay_desk_order: Vec<OverlayDeskOrder>,
+    /// The operator-created desk overlay. Preserved so operator-created desks
+    /// survive an export→import. `#[serde(default)]` for back-compat with older
+    /// bundles.
+    #[serde(default)]
+    overlay_desks: Vec<OverlayDesk>,
+    /// The operator workflow-authoring overlay — graph bodies created from the
+    /// console or the orchestrator tool, which live on the record (never in the
+    /// read-only source tree). Preserved so console-created workflows survive an
+    /// export→import instead of being silently dropped. `#[serde(default)]` for
+    /// back-compat with older bundles.
+    #[serde(default)]
+    overlay_workflows: Vec<OverlayWorkflow>,
+    /// The source-template provenance, when the exported company carried one.
+    /// `#[serde(default)]` keeps older bundles written before provenance existed
+    /// importing cleanly (they decode to `None` — no migration).
+    #[serde(default)]
+    template_provenance: Option<TemplateProvenance>,
 }
 
 /// One exported context chunk: its content address, label, and body.
@@ -107,10 +146,26 @@ struct BundleContents {
     id: CompanyId,
     manifest: CompanyManifest,
     lifecycle: String,
+    template_provenance: Option<TemplateProvenance>,
     ledger: Vec<LedgerEntry>,
     events: Vec<StoredEvent>,
     traces: Vec<CompressedTrace>,
     context: Vec<ExportedChunk>,
+    /// The operator team overlay (operator-added teammates), carried through the
+    /// bundle so export→import preserves the operator roster.
+    overlay_agents: Vec<OverlayAgent>,
+    /// The operator desk-membership overlay, carried through the bundle so
+    /// export→import preserves operator-added desk memberships.
+    overlay_desk_members: Vec<OverlayDeskMember>,
+    /// The operator per-desk member-ordering overlay, carried through the bundle
+    /// so export→import preserves the desk hierarchy (and routing lead).
+    overlay_desk_order: Vec<OverlayDeskOrder>,
+    /// The operator-created desk overlay, carried through the bundle so
+    /// export→import preserves operator-created desks.
+    overlay_desks: Vec<OverlayDesk>,
+    /// The operator workflow-authoring overlay, carried through the bundle so
+    /// export→import preserves console-created workflow graphs.
+    overlay_workflows: Vec<OverlayWorkflow>,
 }
 
 impl BundleContents {
@@ -145,10 +200,16 @@ impl BundleContents {
             id: id.clone(),
             manifest: record.manifest,
             lifecycle: record.lifecycle,
+            template_provenance: record.template_provenance,
             ledger: record.ledger,
             events,
             traces,
             context: chunks,
+            overlay_agents: record.overlay_agents,
+            overlay_desk_members: record.overlay_desk_members,
+            overlay_desk_order: record.overlay_desk_order,
+            overlay_desks: record.overlay_desks,
+            overlay_workflows: record.overlay_workflows,
         })
     }
 
@@ -171,7 +232,12 @@ impl BundleContents {
                 manifest: self.manifest.clone(),
                 ledger: Vec::new(),
                 lifecycle: self.lifecycle.clone(),
-                overlay_agents: Vec::new(),
+                overlay_agents: self.overlay_agents.clone(),
+                overlay_desk_members: self.overlay_desk_members.clone(),
+                overlay_desk_order: self.overlay_desk_order.clone(),
+                overlay_desks: self.overlay_desks.clone(),
+                overlay_workflows: self.overlay_workflows.clone(),
+                template_provenance: self.template_provenance.clone(),
             })
             .await?;
         for entry in &self.ledger {
@@ -208,6 +274,12 @@ impl BundleContents {
         let meta = BundleMeta {
             lifecycle: self.lifecycle.clone(),
             id: self.id.as_ref().to_string(),
+            overlay_agents: self.overlay_agents.clone(),
+            overlay_desk_members: self.overlay_desk_members.clone(),
+            overlay_desk_order: self.overlay_desk_order.clone(),
+            overlay_desks: self.overlay_desks.clone(),
+            overlay_workflows: self.overlay_workflows.clone(),
+            template_provenance: self.template_provenance.clone(),
         };
         write_file(
             &dest.join(META_JSON),
@@ -280,10 +352,16 @@ impl BundleContents {
             id: CompanyId::new(meta.id),
             manifest,
             lifecycle: meta.lifecycle,
+            template_provenance: meta.template_provenance,
             ledger,
             events,
             traces,
             context,
+            overlay_agents: meta.overlay_agents,
+            overlay_desk_members: meta.overlay_desk_members,
+            overlay_desk_order: meta.overlay_desk_order,
+            overlay_desks: meta.overlay_desks,
+            overlay_workflows: meta.overlay_workflows,
         })
     }
 }
@@ -543,6 +621,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "kick off".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .expect("cycle");
@@ -726,6 +805,11 @@ mod test {
             ledger: Vec::new(),
             lifecycle: "paused".into(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
         })
         .await
         .unwrap();
@@ -767,6 +851,214 @@ mod test {
         }
     }
 
+    /// Issue #85: a template-launched company's `template_provenance` survives an
+    /// export → import round-trip intact (source_id, version, and path all carry
+    /// through the bundle's `meta.json`), so exporting then importing never
+    /// silently strips a company's origin template.
+    #[tokio::test]
+    async fn template_provenance_survives_roundtrip() {
+        let home1 = tmp_root("prov-src");
+        let home2 = tmp_root("prov-dst");
+        let dest = tmp_root("prov-bundle");
+        let id = CompanyId::new("prov-co");
+
+        let provenance = TemplateProvenance {
+            source_id: "agentic_law_firm".into(),
+            version: None,
+            path: Some("agentic_law_firm".into()),
+        };
+
+        // Register a company carrying template provenance in the source home.
+        let (s1, e1, m1, c1) = fs_ports(&home1);
+        s1.save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".into(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: Some(provenance.clone()),
+        })
+        .await
+        .unwrap();
+
+        // Export → import into a fresh home.
+        export_bundle(&id, &dest, s1, e1, m1, c1, ExportOpts::default())
+            .await
+            .unwrap();
+        let (s2, e2, m2, c2) = fs_ports(&home2);
+        let imported = import_bundle(&dest, s2.clone(), e2, m2, c2).await.unwrap();
+        assert_eq!(imported, id, "id preserved through the bundle");
+
+        // The imported record carries the identical provenance — all three fields.
+        let rec = s2.load(&id).await.unwrap().expect("imported record");
+        assert_eq!(
+            rec.template_provenance,
+            Some(provenance),
+            "template provenance lost across the bundle round-trip"
+        );
+
+        for dir in [home1, home2, dest] {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
+    /// EVERY operator overlay — the team (`overlay_agents`), desk memberships
+    /// (`overlay_desk_members`), the desk-order hierarchy (`overlay_desk_order`),
+    /// operator-created desks (`overlay_desks`), and runtime-authored workflow
+    /// graphs (`overlay_workflows`) — survives an export→import.
+    /// A prior version threaded only `overlay_desk_order` through the bundle, so a
+    /// round-trip silently ERASED operator-added teammates, desk memberships, and
+    /// operator-created desks (data loss). This asserts all four come back intact
+    /// and that the desk hierarchy still drives the routing lead.
+    #[tokio::test]
+    async fn operator_overlays_including_desk_order_survive_roundtrip() {
+        let home1 = tmp_root("order-src");
+        let home2 = tmp_root("order-dst");
+        let dest = tmp_root("order-bundle");
+        let id = CompanyId::new("order-co");
+
+        // A manifest desk whose blueprint lead is `ceo`.
+        let manifest: CompanyManifest = toml::from_str(
+            r#"
+            [company]
+            name = "Order Co"
+            output = "widgets"
+
+            [[agent]]
+            id = "ceo"
+            role = "Chief"
+
+            [[agent]]
+            id = "cto"
+            role = "Tech"
+
+            [[group_chat]]
+            id = "eng"
+            name = "Engineering"
+            members = ["ceo", "cto"]
+        "#,
+        )
+        .expect("parse manifest");
+
+        // Operator reorders the desk so `cto` becomes the lead — a non-empty order.
+        let order = vec![OverlayDeskOrder {
+            desk_id: "eng".into(),
+            ordered: vec!["cto".into(), "ceo".into()],
+        }];
+        // An operator-added teammate, not in the manifest.
+        let agents = vec![OverlayAgent {
+            id: "designer".into(),
+            name: "Dana Designer".into(),
+            role: "Design".into(),
+            description: Some("Owns the brand".into()),
+        }];
+        // That teammate added to the `eng` desk through the membership overlay.
+        let desk_members = vec![OverlayDeskMember {
+            desk_id: "eng".into(),
+            agent_id: "designer".into(),
+        }];
+        // An operator-created desk the manifest never declared.
+        let desks = vec![OverlayDesk {
+            id: "growth".into(),
+            name: "Growth".into(),
+            description: Some("Marketing pod".into()),
+            members: vec!["ceo".into()],
+        }];
+        // A workflow graph authored at runtime (issue #168). On a hosted tenant
+        // this body is the ONLY copy — a bundle that dropped it would lose the
+        // workflow outright.
+        let workflows = vec![OverlayWorkflow {
+            id: "console_flow".into(),
+            toml: "id = \"console_flow\"\nname = \"Console flow\"\n\
+                   [[node]]\nid = \"start\"\nkind = \"trigger\"\nname = \"Start\"\n"
+                .into(),
+        }];
+
+        let (s1, e1, m1, c1) = fs_ports(&home1);
+        s1.save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".into(),
+            overlay_agents: agents.clone(),
+            overlay_desk_members: desk_members.clone(),
+            overlay_desk_order: order.clone(),
+            overlay_desks: desks.clone(),
+            overlay_workflows: workflows.clone(),
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+
+        // Sanity: the override already flips the lead in the source.
+        let src_record = s1.load(&id).await.unwrap().unwrap();
+        assert_eq!(src_record.effective_desk_members("eng")[0], "cto");
+
+        export_bundle(&id, &dest, s1, e1, m1, c1, ExportOpts::default())
+            .await
+            .unwrap();
+        let (s2, e2, m2, c2) = fs_ports(&home2);
+        import_bundle(&dest, s2.clone(), e2, m2, c2).await.unwrap();
+
+        // Every overlay came across intact — not reset to an empty list.
+        let dst_record = s2.load(&id).await.unwrap().unwrap();
+        assert!(
+            !dst_record.overlay_agents.is_empty(),
+            "team overlay erased by the bundle round-trip"
+        );
+        assert_eq!(
+            dst_record.overlay_agents, agents,
+            "team overlay altered by the bundle round-trip"
+        );
+        assert!(
+            !dst_record.overlay_desk_members.is_empty(),
+            "desk-membership overlay erased by the bundle round-trip"
+        );
+        assert_eq!(
+            dst_record.overlay_desk_members, desk_members,
+            "desk-membership overlay altered by the bundle round-trip"
+        );
+        assert!(
+            !dst_record.overlay_desk_order.is_empty(),
+            "desk-order overlay erased by the bundle round-trip"
+        );
+        assert_eq!(
+            dst_record.overlay_desk_order, order,
+            "desk order overlay altered by the bundle round-trip"
+        );
+        assert!(
+            !dst_record.overlay_desks.is_empty(),
+            "operator-created desks erased by the bundle round-trip"
+        );
+        assert_eq!(
+            dst_record.overlay_desks, desks,
+            "operator-created desks altered by the bundle round-trip"
+        );
+        assert!(
+            !dst_record.overlay_workflows.is_empty(),
+            "runtime-authored workflows erased by the bundle round-trip"
+        );
+        assert_eq!(
+            dst_record.overlay_workflows, workflows,
+            "runtime-authored workflows altered by the bundle round-trip"
+        );
+        // And the hierarchy still drives routing: `cto` remains the lead after
+        // import.
+        assert_eq!(
+            dst_record.effective_desk_members("eng")[0],
+            "cto",
+            "routing lead reverted to blueprint after import"
+        );
+
+        for dir in [home1, home2, dest] {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
     #[cfg(feature = "export")]
     #[tokio::test]
     async fn tar_pack_unpack_roundtrip() {
@@ -779,6 +1071,7 @@ mod test {
             .run_cycle(vec![CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }])
             .await
             .unwrap();

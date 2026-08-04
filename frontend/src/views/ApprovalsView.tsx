@@ -58,10 +58,21 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
     setBusy(a.id);
     try {
       await client.resolveApproval(a.id, verdict, undefined, company);
-      const verb = verdict === "approve" ? "Approved" : "Declined";
-      const line = `${verb}: ${approvalSummary(a)}`;
+      // Issue #243: approving no longer just records a verdict — it hands the
+      // agent a single-use grant and re-dispatches it to make the call. The old
+      // "Approved: …" read as "done", which was the exact lie that made the
+      // missing re-dispatch invisible: the operator saw a success toast for work
+      // that had silently dead-ended. Say what is actually happening instead.
+      // Declining IS terminal, so its wording is unchanged.
+      const line =
+        verdict === "approve"
+          ? `Approved — the agent is completing the action: ${approvalSummary(a)}`
+          : `Declined: ${approvalSummary(a)}`;
       onResolved(line);
       toast.success(line);
+      // The agent's reply arrives as a journaled `AgentReply` on its own thread,
+      // so no extra plumbing is needed here — the existing feed refresh plus the
+      // per-agent DM thread (#151) surface it.
       void feed.refresh();
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : "something went wrong";

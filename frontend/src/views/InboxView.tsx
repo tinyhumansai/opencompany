@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Inbox as InboxIcon, Mail } from "lucide-react";
+// Issue #302: unmounted from the console — hidden, not retired. The host's
+// inbox routes, per-agent store and tests are unchanged; re-listing "inbox" in
+// `app-shell.tsx`'s `View`/`NAV` brings this surface straight back. Do not
+// delete it as dead code.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Inbox as InboxIcon, Mail, Send } from "lucide-react";
 
+import type { OpenCompanyClient } from "@/api/client";
+import { enabledInboxes, preview } from "@/api/inbox";
+import type { InboxDto, InboxMessageDto } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -10,53 +17,160 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import {
-  type EmailMessage,
-  enabledInboxes,
-  type Inbox,
-  loadInboxes,
-  saveInboxes,
-  slugify,
-  unreadCount,
-} from "@/lib/inbox";
 
 interface Props {
+  client: OpenCompanyClient;
   company: string | null;
 }
 
-/** An email inbox surface. Each agent with an inbox enabled gets its own. */
-export function InboxView({ company }: Props) {
-  const [store, setStore] = useState(() => loadInboxes(company));
-  const inboxes = useMemo(() => enabledInboxes(store), [store]);
-  const [activeKey, setActiveKey] = useState<string>(() => enabledInboxes(loadInboxes(company))[0]?.key ?? "");
+type Load = "loading" | "ready" | "error";
+
+/**
+ * An email inbox surface. Each teammate with an inbox enabled gets its own, read
+ * live from the host's `InboxStore` through `client.listInboxes()` /
+ * `client.inboxMessages()` — never a client-side fixture, so two teammates show
+ * two different sets of mail (issue #173). Both inbound paths file into that
+ * store, so ingest-webhook and IMAP-polled mail both land here.
+ */
+export function InboxView({ client, company }: Props) {
+  const [load, setLoad] = useState<Load>("loading");
+  const [error, setError] = useState<string | null>(null);
+  const [inboxes, setInboxes] = useState<InboxDto[]>([]);
+  const [activeKey, setActiveKey] = useState("");
+  const [messages, setMessages] = useState<InboxMessageDto[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [messagesError, setMessagesError] = useState<string | null>(null);
+  const [messagesReload, setMessagesReload] = useState(0);
   const [openId, setOpenId] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<"list" | "read">("list");
 
+  const listed = useMemo(() => enabledInboxes(inboxes), [inboxes]);
+  const active = listed.find((i) => i.key === activeKey) ?? listed[0];
+  const openMsg = messages.find((m) => m.id === openId) ?? null;
+
+  /**
+   * Generation counter for the roster fetch. Bumped on every load and on
+   * teardown, so a response that resolves after the company changed — or after
+   * a second "Try again" — is dropped instead of overwriting the newer roster,
+   * active key, and unread counts.
+   */
+  const rosterRun = useRef(0);
+
+  // The inbox roster: which teammates have an inbox, and how much is unread.
+  const loadRoster = useCallback(async () => {
+    const run = ++rosterRun.current;
+    try {
+      const rows = await client.listInboxes(company);
+      if (run !== rosterRun.current) return;
+      setInboxes(rows);
+      setActiveKey((current) =>
+        rows.some((i) => i.enabled && i.key === current)
+          ? current
+          : (enabledInboxes(rows)[0]?.key ?? ""),
+      );
+      setError(null);
+      setLoad("ready");
+    } catch (cause) {
+      // A stale failure must not bury a newer roster either — the error path is
+      // gated on the same generation as the success path.
+      if (run !== rosterRun.current) return;
+      // No fixture fallback: a host that can't serve inboxes says so rather than
+      // render invented mail.
+      setInboxes([]);
+      setError(cause instanceof Error ? cause.message : "Couldn't load inboxes.");
+      setLoad("error");
+    }
+  }, [client, company]);
+
   useEffect(() => {
-    saveInboxes(company, store);
-  }, [company, store]);
+    setLoad("loading");
+    void loadRoster();
+    // Invalidate the in-flight load when the company changes or the view
+    // unmounts, so its response can never land on the next company's state.
+    return () => {
+      rosterRun.current += 1;
+    };
+  }, [loadRoster]);
 
-  const active = inboxes.find((i) => i.key === activeKey) ?? inboxes[0];
-  const openMsg = active?.messages.find((m) => m.id === openId) ?? null;
+  // The selected inbox's mail. Refetched whenever the selection changes, so
+  // switching teammates always shows that teammate's own correspondence. The
+  // host returns append order (oldest first); the reader wants newest first.
+  const activeInboxKey = active?.key;
+  useEffect(() => {
+    if (!activeInboxKey) {
+      setMessages([]);
+      setMessagesError(null);
+      return;
+    }
+    let cancelled = false;
+    setMessagesLoading(true);
+    setMessagesError(null);
+    void (async () => {
+      try {
+        const mail = await client.inboxMessages(activeInboxKey, company);
+        if (!cancelled) setMessages(mail.slice().sort((a, b) => b.atMillis - a.atMillis));
+      } catch (cause) {
+        // A failed read is NOT an empty inbox. Rendering "no messages yet" here
+        // would be the fixture bug in a new costume: the console would state
+        // something about this teammate's mail that it does not know.
+        if (!cancelled) {
+          setMessages([]);
+          setMessagesError(
+            cause instanceof Error ? cause.message : "Couldn't load this inbox.",
+          );
+        }
+      } finally {
+        if (!cancelled) setMessagesLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, company, activeInboxKey, messagesReload]);
 
-  function openMessage(inboxKey: string, id: string) {
-    setOpenId(id);
+  async function openMessage(inboxKey: string, message: InboxMessageDto) {
+    setOpenId(message.id);
     setMobilePane("read");
-    setStore((s) => {
-      const inbox = s[inboxKey];
-      if (!inbox) return s;
-      return {
-        ...s,
-        [inboxKey]: {
-          ...inbox,
-          messages: inbox.messages.map((m) => (m.id === id ? { ...m, read: true } : m)),
-        },
-      };
-    });
+    if (message.read) return;
+    // Optimistic locally, authoritative from the host: the response carries the
+    // remaining unread count the badge renders.
+    setMessages((ms) => ms.map((m) => (m.id === message.id ? { ...m, read: true } : m)));
+    try {
+      const { unread } = await client.markInboxRead(inboxKey, [message.id], company);
+      setInboxes((is) => is.map((i) => (i.key === inboxKey ? { ...i, unread } : i)));
+    } catch {
+      // Leave the row read locally; the next roster load reconciles with the host.
+    }
   }
 
-  if (inboxes.length === 0) {
+  if (load === "loading") {
+    return (
+      <div className="flex flex-1 flex-col gap-2 p-4">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <Skeleton key={i} className="h-16 rounded-lg" />
+        ))}
+      </div>
+    );
+  }
+
+  if (load === "error") {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center text-muted-foreground">
+        <InboxIcon className="size-8" />
+        <div className="space-y-1">
+          <p className="font-medium text-foreground">Inboxes unavailable</p>
+          <p className="max-w-sm text-sm">{error}</p>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => void loadRoster()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+
+  if (listed.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center text-muted-foreground">
         <InboxIcon className="size-8" />
@@ -64,7 +178,8 @@ export function InboxView({ company }: Props) {
           <p className="font-medium text-foreground">No inboxes yet</p>
           <p className="max-w-sm text-sm">
             Give an agent its own inbox from the <span className="font-medium">Team</span> page —
-            flip on the inbox toggle for anyone who needs to receive email.
+            flip on the inbox toggle for anyone who needs to receive email. Mail sent to that
+            address shows up here.
           </p>
         </div>
       </div>
@@ -81,35 +196,63 @@ export function InboxView({ company }: Props) {
         )}
       >
         <div className="flex items-center gap-2 border-b px-3 py-2.5">
-          <Select value={active?.key} onValueChange={(v) => v && (setActiveKey(v), setOpenId(null))} items={Object.fromEntries(inboxes.map((i) => [i.key, i.name]))}>
-            <SelectTrigger className="h-8 flex-1">
+          <Select
+            value={active?.key}
+            onValueChange={(v) => v && (setActiveKey(v), setOpenId(null))}
+            items={Object.fromEntries(listed.map((i) => [i.key, i.name]))}
+          >
+            <SelectTrigger className="h-8 flex-1" data-testid="inbox-select">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {inboxes.map((i) => (
+              {listed.map((i) => (
                 <SelectItem key={i.key} value={i.key}>
                   {i.name}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-          {active && unreadCount(active) > 0 && <Badge variant="secondary">{unreadCount(active)}</Badge>}
+          {active && active.unread > 0 && <Badge variant="secondary">{active.unread}</Badge>}
         </div>
-        <div className="flex-1 overflow-y-auto">
-          {active && active.messages.length > 0 ? (
-            active.messages
-              .slice()
-              .sort((a, b) => b.at - a.at)
-              .map((m) => (
-                <MessageRow
-                  key={m.id}
-                  message={m}
-                  active={m.id === openId}
-                  onClick={() => openMessage(active.key, m.id)}
-                />
-              ))
+        <div className="flex-1 overflow-y-auto" data-testid="inbox-list">
+          {messagesLoading ? (
+            <div className="space-y-2 p-3">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <Skeleton key={i} className="h-14 rounded-lg" />
+              ))}
+            </div>
+          ) : messagesError ? (
+            <div
+              className="flex flex-col items-center gap-3 p-8 text-center text-sm text-muted-foreground"
+              data-testid="inbox-messages-error"
+            >
+              <Mail className="size-6" />
+              <div className="space-y-1">
+                <p className="font-medium text-foreground">Couldn't load this inbox</p>
+                <p className="max-w-xs">{messagesError}</p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setMessagesReload((n) => n + 1)}
+              >
+                Try again
+              </Button>
+            </div>
+          ) : messages.length > 0 ? (
+            messages.map((m) => (
+              <MessageRow
+                key={m.id}
+                message={m}
+                active={m.id === openId}
+                onClick={() => active && void openMessage(active.key, m)}
+              />
+            ))
           ) : (
-            <div className="p-8 text-center text-sm text-muted-foreground">No messages.</div>
+            <div className="p-8 text-center text-sm text-muted-foreground" data-testid="inbox-empty">
+              No messages yet. Mail sent to{" "}
+              <span className="font-medium">{active?.address || active?.key}</span> lands here.
+            </div>
           )}
         </div>
       </section>
@@ -134,42 +277,54 @@ function MessageRow({
   active,
   onClick,
 }: {
-  message: EmailMessage;
+  message: InboxMessageDto;
   active: boolean;
   onClick: () => void;
 }) {
+  const unread = !message.read && !message.outbound;
   return (
     <button
       onClick={onClick}
+      data-testid="inbox-message"
       className={cn(
         "flex w-full items-start gap-3 border-b px-3 py-3 text-left transition-colors",
         active ? "bg-accent" : "hover:bg-accent/50",
       )}
     >
-      <Avatar name={message.fromName} />
+      <Avatar name={sender(message)} />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
-          <span className={cn("truncate text-sm", !message.read && "font-semibold")}>{message.fromName}</span>
-          <span className="shrink-0 text-[11px] text-muted-foreground">{formatTime(message.at)}</span>
+          <span className={cn("truncate text-sm", unread && "font-semibold")}>{sender(message)}</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground">{formatTime(message.atMillis)}</span>
         </div>
-        <p className={cn("truncate text-sm", message.read ? "text-muted-foreground" : "font-medium")}>
-          {message.subject}
+        <p className={cn("truncate text-sm", unread ? "font-medium" : "text-muted-foreground")}>
+          {message.outbound && <Send className="mr-1 inline size-3 align-[-1px]" aria-label="Sent" />}
+          {message.subject || "(no subject)"}
         </p>
-        <p className="truncate text-xs text-muted-foreground">{message.preview}</p>
+        <p className="truncate text-xs text-muted-foreground">{preview(message.body)}</p>
       </div>
-      {!message.read && <span className="mt-1.5 size-2 shrink-0 rounded-full bg-primary" />}
+      {unread && <span className="mt-1.5 size-2 shrink-0 rounded-full bg-primary" />}
     </button>
   );
 }
 
-function Reading({ message, inbox, onBack }: { message: EmailMessage; inbox: Inbox; onBack: () => void }) {
+function Reading({
+  message,
+  inbox,
+  onBack,
+}: {
+  message: InboxMessageDto;
+  inbox: InboxDto;
+  onBack: () => void;
+}) {
+  const box = inbox.address || inbox.key;
   return (
     <>
       <div className="flex items-center gap-2 border-b px-4 py-2.5">
         <Button variant="ghost" size="icon" className="size-8 md:hidden" onClick={onBack} aria-label="Back">
           <ArrowLeft className="size-4" />
         </Button>
-        <span className="truncate text-sm font-medium">{message.subject}</span>
+        <span className="truncate text-sm font-medium">{message.subject || "(no subject)"}</span>
         <Badge variant="outline" className="ml-auto shrink-0 gap-1 text-xs">
           <InboxIcon className="size-3" /> {inbox.name}
         </Badge>
@@ -177,20 +332,33 @@ function Reading({ message, inbox, onBack }: { message: EmailMessage; inbox: Inb
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-6 py-6">
           <div className="mb-4 flex items-center gap-3">
-            <Avatar name={message.fromName} />
+            <Avatar name={sender(message)} />
             <div className="min-w-0">
-              <p className="text-sm font-medium">{message.fromName}</p>
+              <p className="text-sm font-medium">{sender(message)}</p>
               <p className="truncate text-xs text-muted-foreground">
-                {message.fromEmail} · to {slugify(inbox.name)}@company
+                {/* A sent record carries the sending box's own address and no
+                    recipient, so outbound reads as "sent from this box". */}
+                {message.outbound ? `Sent from ${box}` : `${message.fromEmail} · to ${box}`}
               </p>
             </div>
-            <span className="ml-auto shrink-0 text-xs text-muted-foreground">{formatDateTime(message.at)}</span>
+            <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+              {formatDateTime(message.atMillis)}
+            </span>
           </div>
           <div className="text-sm leading-relaxed whitespace-pre-wrap">{message.body}</div>
         </div>
       </div>
     </>
   );
+}
+
+/**
+ * The name to show for a message — ingest often supplies only an address, and a
+ * sent copy comes from the operator's own company rather than a correspondent.
+ */
+function sender(message: InboxMessageDto): string {
+  if (message.outbound) return "You";
+  return message.fromName.trim() || message.fromEmail || "Unknown sender";
 }
 
 function Avatar({ name }: { name: string }) {

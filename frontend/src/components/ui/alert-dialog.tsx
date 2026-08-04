@@ -139,14 +139,33 @@ function AlertDialogDescription({
   )
 }
 
+/**
+ * The confirm button. Like {@link AlertDialogCancel}, it renders the primitive's
+ * `Close` so confirming dismisses the dialog — otherwise the popup stays mounted
+ * and its inert backdrop swallows every later click on the app behind it.
+ *
+ * Base UI merges event handlers right-to-left, and the caller's `onClick` sits to
+ * the right of the primitive's own close handler, so the confirm handler runs
+ * *first* and the close runs after it. A handler that wants to keep the dialog
+ * open (a failed validation, say) can call `event.preventBaseUIHandler()`.
+ *
+ * That ordering is what keeps an async handler safe. Every confirm here is
+ * fire-and-forget (`onClick={() => void remove()}`), so it returns at its first
+ * `await` and the close still runs synchronously inside the same click — it can
+ * never be outrun by a continuation that later tears the dialog's owner down.
+ */
 function AlertDialogAction({
   className,
+  variant,
+  size,
   ...props
-}: React.ComponentProps<typeof Button>) {
+}: AlertDialogPrimitive.Close.Props &
+  Pick<React.ComponentProps<typeof Button>, "variant" | "size">) {
   return (
-    <Button
+    <AlertDialogPrimitive.Close
       data-slot="alert-dialog-action"
       className={cn(className)}
+      render={<Button variant={variant} size={size} />}
       {...props}
     />
   )

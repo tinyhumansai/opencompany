@@ -20,6 +20,11 @@ use crate::ports::types::{CompanyEvent, CompanyId, ToolCall, ToolResult, ToolSpe
 /// The built-in tool name the brain invokes to file feedback.
 pub const FEEDBACK_TOOL: &str = "feedback";
 
+/// The built-in tool name the brain invokes to send an email. Execution is
+/// intercepted upstream (in `CycleHostImpl::call_tool`); this provider only
+/// advertises the spec.
+pub const SEND_EMAIL_TOOL: &str = "send_email";
+
 /// A [`ToolProvider`] that adds the always-granted `feedback` tool on top of an
 /// inner provider.
 pub struct BuiltinToolProvider {
@@ -67,6 +72,28 @@ impl BuiltinToolProvider {
                     "work_ref": { "type": "string" }
                 },
                 "required": ["category", "note"]
+            }),
+        }
+    }
+
+    /// The `ToolSpec` advertised for the built-in send_email tool. Execution
+    /// is intercepted upstream in `CycleHostImpl::call_tool`; this spec only
+    /// advertises the tool to the brain.
+    fn send_email_spec() -> ToolSpec {
+        ToolSpec {
+            name: SEND_EMAIL_TOOL.to_string(),
+            description: "Send an email from your company mailbox to a recipient. The first \
+                email to a new recipient needs operator approval; replies to people who have \
+                emailed you send immediately."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["to", "subject", "body"]
             }),
         }
     }
@@ -120,6 +147,7 @@ impl ToolProvider for BuiltinToolProvider {
     async fn catalog(&self, company: &CompanyId) -> Result<Vec<ToolSpec>> {
         let mut catalog = self.inner.catalog(company).await?;
         catalog.push(Self::spec());
+        catalog.push(Self::send_email_spec());
         Ok(catalog)
     }
 
@@ -147,28 +175,45 @@ mod test {
     use crate::store::FsEventLog;
     use crate::store::paths::Bundle;
 
-    fn wiring() -> (BuiltinToolProvider, Arc<FeedbackStore>, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("oc-btool-{}", crate::ports::generate_id()));
+    /// The caller must hold the returned handle: it owns the bundle root and
+    /// removes it on drop.
+    fn wiring() -> (BuiltinToolProvider, Arc<FeedbackStore>, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("oc-btool-")
+            .tempdir()
+            .expect("tempdir");
+        let root = dir.path().to_path_buf();
         let bundle = Bundle::new(root.clone(), &CompanyId::new("acme"));
         let feedback = Arc::new(FeedbackStore::new(&bundle));
         let events: Arc<dyn EventLog> = Arc::new(FsEventLog::new(root.clone()));
         let inner: Arc<dyn ToolProvider> = Arc::new(StubToolProvider::new(vec!["email.*".into()]));
         let provider =
             BuiltinToolProvider::new(inner, feedback.clone(), events, ConsentMode::Manual);
-        (provider, feedback, root)
+        (provider, feedback, dir)
     }
 
     #[tokio::test]
     async fn catalog_includes_feedback_tool() {
-        let (provider, _fb, root) = wiring();
+        let (provider, _fb, _root) = wiring();
         let catalog = provider.catalog(&CompanyId::new("acme")).await.unwrap();
         assert!(catalog.iter().any(|t| t.name == FEEDBACK_TOOL));
-        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn catalog_advertises_send_email() {
+        let (provider, _fb, _root) = wiring();
+        let specs = provider.catalog(&CompanyId::new("acme")).await.unwrap();
+        let spec = specs
+            .iter()
+            .find(|s| s.name == "send_email")
+            .expect("send_email advertised");
+        let req = &spec.input_schema["required"];
+        assert!(req.as_array().unwrap().iter().any(|v| v == "to"));
     }
 
     #[tokio::test]
     async fn feedback_tool_captures_without_grant() {
-        let (provider, feedback, root) = wiring();
+        let (provider, feedback, _root) = wiring();
         let result = provider
             .invoke(
                 &CompanyId::new("acme"),
@@ -185,12 +230,11 @@ mod test {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].operator_words, "route broke");
         assert_eq!(items[0].category, FeedbackCategory::Bug);
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn non_feedback_tool_delegates_and_enforces_grants() {
-        let (provider, _fb, root) = wiring();
+        let (provider, _fb, _root) = wiring();
         // Ungranted tool is still rejected by the inner provider.
         let err = provider
             .invoke(
@@ -203,6 +247,5 @@ mod test {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::OpenCompanyError::ToolNotGranted(t) if t == "payment.send"));
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 }

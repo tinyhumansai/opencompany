@@ -14,12 +14,20 @@ target/
 # tree cannot be excluded (that was the packaging bug: `cargo build` failed with
 # "failed to read vendor/openhuman/Cargo.toml"). We therefore keep every
 # Cargo.toml + src/ tree and strip only the documentation, generated books,
-# desktop app, and media that bloat the raw checkout to ~300 MB. openhuman's
-# build.rs is written to tolerate a source-only build (it emits an empty raw-
-# coverage module list when tests/ is absent), and every include_str!/-bytes! in
-# openhuman's sources resolves inside src/, so a `--features openhuman` compile
-# still works from this trimmed context.
-**/docs/
+# desktop app, and media that bloat the raw checkout to ~300 MB.
+#
+# CAVEAT (why the `!` exception below): a `--features openhuman` build compiles
+# the vendored `tinyagents`, whose `src/registry/catalog.rs` does
+# `include_str!("../../docs/modules/registry/model-catalog.snapshot.json")`. A
+# blanket `**/docs/` exclude drops that file and the build fails with
+# "couldn't read .../model-catalog.snapshot.json". So we exclude docs *contents*
+# broadly but re-include every tinyagents `docs/` tree (there are three copies
+# in the nested vendor graph). Excluding `docs/**` rather than `docs/` keeps the
+# directory entry walkable, so the `!` re-include works reliably (Docker cannot
+# re-include a file whose parent directory itself was excluded). No other doc
+# file is a compile input — openhuman's own `include_str!`s all resolve in `src/`.
+**/docs/**
+!**/tinyagents/docs/**
 **/gitbooks/
 **/website/
 **/paper/

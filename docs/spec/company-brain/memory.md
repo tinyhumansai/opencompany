@@ -36,6 +36,20 @@ Memory spans three ports, not a database
 The first two ports are the brain's memory; `FactStore` is the operator's. All
 three key on `CompanyId` and travel with the export bundle.
 
+Every `ContextStore` chunk carries `ChunkMeta::stored_at_millis`, the wall-clock
+time it was stored; a chunk written before backends recorded one reports `0`.
+The console's Brain header needs it: agents write memory **only** through the
+`ContextStore`, so a freshness figure drawn from `FactStore` alone reads as
+"never updated" for any company whose operator has not hand-authored a fact.
+`GET /memory/stats` therefore reports `lastUpdatedAtMillis` as the max across
+both ports, alongside the facts-only `factsUpdatedAtMillis`.
+
+Read that stamp as a max across chunks, not as one row per body: the backends
+differ on a re-`put` of an identical body (sqlite and mongo dedupe on the
+content address and keep the first write; the fs index appends a second line),
+and neither the export bundle nor a restore preserves it — a restored chunk is
+stamped when it lands.
+
 **TinyCortex is the intended backend for `MemoryStore` and `ContextStore`**
 ([integrations/tinycortex.md](../integrations/tinycortex.md)) but is a
 choice, not a dependency: the fs default preserves the one-key promise, and

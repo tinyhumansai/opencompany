@@ -18,9 +18,12 @@ interface Props {
   loading: boolean;
   /** True when the roster came from the host rather than the starter set. */
   fromHost: boolean;
-  /** Member name → whether that agent has an inbox. */
-  hasInbox: (name: string) => boolean;
-  onToggleInbox: (name: string) => void;
+  /**
+   * Give this teammate an inbox, or take it away. Whether they have one is read
+   * from the roster (`member.inboxEnabled`), never guessed client-side, so this
+   * pane and the Inbox page agree on the same host state (issue #173).
+   */
+  onToggleInbox: (member: TeamMember) => void;
   onRemove: (id: string) => void;
   onAdd: () => void;
   onMessage: (member: TeamMember) => void;
@@ -39,7 +42,6 @@ export function MembersPane({
   members,
   loading,
   fromHost,
-  hasInbox,
   onToggleInbox,
   onRemove,
   onAdd,
@@ -83,8 +85,8 @@ export function MembersPane({
               <li key={m.id}>
                 <MemberRow
                   member={m}
-                  inboxOn={hasInbox(m.name)}
-                  onToggleInbox={() => onToggleInbox(m.name)}
+                  inboxOn={m.inboxEnabled}
+                  onToggleInbox={() => onToggleInbox(m)}
                   onRemove={() => onRemove(m.id)}
                   onMessage={() => onMessage(m)}
                 />

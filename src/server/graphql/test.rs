@@ -15,8 +15,11 @@ use crate::server::router;
 use crate::store::FsCompanyStore;
 use crate::{AppConfig, AppState};
 
-pub(crate) fn home() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("opencompany-gql-{}", crate::ports::generate_id()))
+pub(crate) fn home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("opencompany-gql-")
+        .tempdir()
+        .expect("tempdir")
 }
 
 pub(crate) fn manifest() -> CompanyManifest {
@@ -33,6 +36,11 @@ pub(crate) async fn state_with_company(home: &std::path::Path) -> AppState {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
         })
         .await
         .unwrap();
@@ -69,7 +77,8 @@ pub(crate) async fn query(app: axum::Router, body: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn companies_query_lists_the_company() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_company(&home).await);
     let value = query(
         app,
@@ -79,12 +88,12 @@ async fn companies_query_lists_the_company() {
     assert_eq!(value["data"]["companies"][0]["id"], "acme");
     assert_eq!(value["data"]["companies"][0]["name"], "Acme");
     assert_eq!(value["data"]["companies"][0]["lifecycle"], "running");
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn company_query_by_id_resolves() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_company(&home).await);
     let value = query(
         app,
@@ -92,30 +101,30 @@ async fn company_query_by_id_resolves() {
     )
     .await;
     assert_eq!(value["data"]["company"]["id"], "acme");
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn company_query_without_id_resolves_the_sole_company() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_company(&home).await);
     let value = query(app, r#"{"query":"{ company { id } }"}"#).await;
     assert_eq!(value["data"]["company"]["id"], "acme");
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn unknown_company_query_is_null() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_company(&home).await);
     let value = query(app, r#"{"query":"{ company(id: \"ghost\") { id } }"}"#).await;
     assert!(value["data"]["company"].is_null());
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn approvals_field_is_empty_before_any_park() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_company(&home).await);
     let value = query(
         app,
@@ -129,7 +138,6 @@ async fn approvals_field_is_empty_before_any_park() {
             .len(),
         0
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +178,11 @@ async fn state_with_rich_company(home: &std::path::Path) -> AppState {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
         })
         .await
         .unwrap();
@@ -188,7 +201,8 @@ async fn state_with_rich_company(home: &std::path::Path) -> AppState {
 
 #[tokio::test]
 async fn team_lists_manifest_teammates() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_rich_company(&home).await);
     let value = query(
         app,
@@ -200,12 +214,12 @@ async fn team_lists_manifest_teammates() {
     assert_eq!(team[0]["id"], "maya");
     assert_eq!(team[0]["role"], "Marketing Lead");
     assert!(team[0]["name"].is_null());
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn chats_list_the_manifest_desks() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_rich_company(&home).await);
     let value = query(
         app,
@@ -216,12 +230,126 @@ async fn chats_list_the_manifest_desks() {
     assert_eq!(chats.len(), 1);
     assert_eq!(chats[0]["id"], "general");
     assert_eq!(chats[0]["members"][0], "maya");
-    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// Issue #65: `AgentReply`s answering the console's default thread are
+/// journaled with `chat_id == "main"` (the frontend's thread id), not
+/// `"General"`. The General desk's `Chat.history` must still find them
+/// alongside a reply journaled the "canonical" way, so the operator
+/// transcript is never split by which id a given turn happened to use.
+#[tokio::test]
+async fn chat_history_finds_agent_replies_under_general_and_main() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_rich_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    runtime
+        .events()
+        .append(
+            runtime.id(),
+            crate::ports::types::CompanyEvent::AgentReply {
+                task_id: None,
+                chat_id: "General".to_string(),
+                agent_id: "maya".to_string(),
+                text: "canonical id".to_string(),
+                steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .events()
+        .append(
+            runtime.id(),
+            crate::ports::types::CompanyEvent::AgentReply {
+                task_id: None,
+                chat_id: "main".to_string(),
+                agent_id: "maya".to_string(),
+                text: "console default-thread id".to_string(),
+                steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ chat(id:\"general\"){ history(first: 10) { items { text } } } } }"}"#,
+    )
+    .await;
+    let texts: Vec<&str> = value["data"]["company"]["chat"]["history"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect();
+    assert!(texts.contains(&"canonical id"), "missing: {texts:?}");
+    assert!(
+        texts.contains(&"console default-thread id"),
+        "missing: {texts:?}"
+    );
+}
+
+/// Issue #246 + #65: the card a reply opened is projected on **both** history
+/// surfaces, from the one shared `MessageView` field. The console reads REST,
+/// but GraphQL is the paginated surface, and #65 exists precisely because the
+/// two drifting apart is how a transcript ends up meaning different things
+/// depending on which door you came in.
+#[tokio::test]
+async fn chat_history_projects_the_card_a_reply_opened() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_rich_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    for (text, task_id) in [
+        ("opened a card", Some("t-77".to_string())),
+        ("opened nothing", None),
+    ] {
+        runtime
+            .events()
+            .append(
+                runtime.id(),
+                crate::ports::types::CompanyEvent::AgentReply {
+                    task_id,
+                    chat_id: "General".to_string(),
+                    agent_id: "maya".to_string(),
+                    text: text.to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let app = router(state);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ chat(id:\"general\"){ history(first: 10) { items { text taskId } } } } }"}"#,
+    )
+    .await;
+    let items = value["data"]["company"]["chat"]["history"]["items"]
+        .as_array()
+        .unwrap();
+    let opened = items
+        .iter()
+        .find(|m| m["text"] == "opened a card")
+        .expect("the card-opening reply is in history");
+    assert_eq!(opened["taskId"], "t-77");
+    let plain = items
+        .iter()
+        .find(|m| m["text"] == "opened nothing")
+        .expect("the ordinary reply is in history");
+    assert!(
+        plain["taskId"].is_null(),
+        "an ordinary reply carries no card: {plain}"
+    );
 }
 
 #[tokio::test]
 async fn connections_reflect_manifest_intent_disconnected() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_rich_company(&home).await);
     let value = query(
         app,
@@ -233,13 +361,80 @@ async fn connections_reflect_manifest_intent_disconnected() {
     assert_eq!(conns[0]["provider"], "slack");
     assert_eq!(conns[0]["connected"], false);
     assert_eq!(conns[0]["reason"], "Post updates.");
-    tokio::fs::remove_dir_all(&home).await.ok();
+}
+
+/// The two connection projections are one shape: whatever credential tier the
+/// REST route reports for a provider, the GraphQL resolver must report the same
+/// (issue #319). They share `connect_route_from_env`, and this pins that they
+/// keep sharing it — a second copy of the resolution order is a second chance to
+/// tell the console a hosted instance can run a local Connect.
+#[tokio::test]
+async fn rest_and_graphql_agree_on_the_connection_credential_source() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_rich_company(&home).await;
+
+    let value = query(
+        router(state.clone()),
+        r#"{"query":"{ company(id:\"acme\"){ connections { provider credentialSource } } }"}"#,
+    )
+    .await;
+    let gql: Vec<(String, String)> = value["data"]["company"]["connections"]
+        .as_array()
+        .expect("connections")
+        .iter()
+        .map(|row| {
+            (
+                row["provider"].as_str().unwrap().to_string(),
+                row["credentialSource"]
+                    .as_str()
+                    .expect("every GraphQL row carries a credentialSource")
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert!(!gql.is_empty(), "expected at least one connection: {value}");
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/company/connections")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let rest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rest_rows: Vec<(String, String)> = rest
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| {
+            (
+                row["provider"].as_str().unwrap().to_string(),
+                row["credentialSource"]
+                    .as_str()
+                    .expect("every REST row carries a credentialSource")
+                    .to_string(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        rest_rows, gql,
+        "REST and GraphQL disagree on the connection credential source"
+    );
 }
 
 #[tokio::test]
 async fn tasks_page_reflects_upserts_and_column_filter() {
     use crate::ports::tasks::TaskRecord;
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with_rich_company(&home).await;
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
     runtime
@@ -250,10 +445,12 @@ async fn tasks_page_reflects_upserts_and_column_filter() {
                 id: "t1".into(),
                 title: "Launch".into(),
                 note: None,
-                column: "backlog".into(),
+                column: "todo".into(),
                 priority: "high".into(),
                 assignee: "maya".into(),
                 updated_at_millis: 1_700_000_000_000,
+                origin_chat_id: None,
+                parent_task_id: None,
             },
         )
         .await
@@ -261,7 +458,7 @@ async fn tasks_page_reflects_upserts_and_column_filter() {
     let app = router(state);
     let value = query(
         app.clone(),
-        r#"{"query":"{ company(id:\"acme\"){ tasks(column:\"backlog\"){ total items { id title column } } } }"}"#,
+        r#"{"query":"{ company(id:\"acme\"){ tasks(column:\"todo\"){ total items { id title column } } } }"}"#,
     )
     .await;
     assert_eq!(value["data"]["company"]["tasks"]["total"], 1);
@@ -274,13 +471,13 @@ async fn tasks_page_reflects_upserts_and_column_filter() {
     )
     .await;
     assert_eq!(none["data"]["company"]["tasks"]["total"], 0);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn memory_page_reflects_upserts() {
     use crate::ports::facts::{FactKind, FactRecord};
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with_rich_company(&home).await;
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
     runtime
@@ -315,12 +512,12 @@ async fn memory_page_reflects_upserts() {
             .unwrap()
             .starts_with("2023-")
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn empty_surfaces_resolve_to_empty_lists() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_rich_company(&home).await);
     let value = query(
         app,
@@ -332,12 +529,12 @@ async fn empty_surfaces_resolve_to_empty_lists() {
     assert_eq!(company["inboxes"].as_array().unwrap().len(), 0);
     assert_eq!(company["skills"].as_array().unwrap().len(), 0);
     assert_eq!(company["workflows"].as_array().unwrap().len(), 0);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn smtp_status_is_unconfigured_without_credentials() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_rich_company(&home).await);
     let value = query(
         app,
@@ -347,12 +544,12 @@ async fn smtp_status_is_unconfigured_without_credentials() {
     assert_eq!(value["data"]["company"]["smtp"]["configured"], false);
     assert_eq!(value["data"]["company"]["smtp"]["host"], "");
     assert!(value["data"]["company"]["domain"].is_null());
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn usage_is_empty_without_samples() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let app = router(state_with_rich_company(&home).await);
     let value = query(
         app,
@@ -364,13 +561,13 @@ async fn usage_is_empty_without_samples() {
     assert_eq!(usage["totals"]["connections"], 0);
     // D7 still yields a zero-filled 7-day series.
     assert_eq!(usage["series"].as_array().unwrap().len(), 7);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn usage_reflects_recorded_samples() {
     use crate::ports::usage::{SampleKind, UsageSample};
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with_rich_company(&home).await;
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
     let now = super::now_millis();
@@ -387,6 +584,7 @@ async fn usage_reflects_recorded_samples() {
                 cached_input_tokens: 0,
                 cost_usd: 0.5,
                 kind: SampleKind::Inference,
+                run_id: None,
             },
         )
         .await
@@ -402,13 +600,13 @@ async fn usage_reflects_recorded_samples() {
     assert_eq!(usage["totals"]["tokens"], 140.0);
     assert_eq!(usage["totals"]["costUsd"], 0.5);
     assert_eq!(usage["byAgent"][0]["tokens"], 140.0);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn finances_fold_the_ledger() {
     use crate::ports::types::LedgerEntry;
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with_rich_company(&home).await;
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
     let now = super::now_millis();
@@ -449,7 +647,6 @@ async fn finances_fold_the_ledger() {
     assert_eq!(fin["revenueUsd"], 10.0);
     assert_eq!(fin["netUsd"], 8.0);
     assert_eq!(fin["transactions"].as_array().unwrap().len(), 2);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 /// On the serve path a company has an on-disk source dir; `Company.skills`,
@@ -457,7 +654,8 @@ async fn finances_fold_the_ledger() {
 /// from it (and the repo-level `skills/` root) rather than the empty bundle.
 #[tokio::test]
 async fn skills_and_workflows_resolve_from_source_dir() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let id = CompanyId::new("acme");
 
     // A company source directory with a committed skill and workflow.
@@ -505,6 +703,11 @@ async fn skills_and_workflows_resolve_from_source_dir() {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
         })
         .await
         .unwrap();
@@ -537,8 +740,300 @@ async fn skills_and_workflows_resolve_from_source_dir() {
     // skillRegistry reads the repo-level shared library.
     let registry = value["data"]["skillRegistry"].as_array().unwrap();
     assert!(registry.iter().any(|s| s["id"] == "web-research"));
+}
 
-    tokio::fs::remove_dir_all(&home).await.ok();
+/// Issue #239: `install` pins the library document into the delta, so a later
+/// library edit must not rewrite an existing install. `Company.skills` has to
+/// project that pinned snapshot rather than re-reading the live library —
+/// otherwise GraphQL and REST report different `version`s for the same install,
+/// and a slug that later leaves the library loses its persisted content.
+#[tokio::test]
+async fn company_skills_project_the_pinned_snapshot_of_a_registry_install() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let id = CompanyId::new("acme");
+
+    // The shared library has moved on to a rewritten v2 of `web-research`, and
+    // never had `retired-skill` at all.
+    let skills_root = home.join("skills");
+    tokio::fs::create_dir_all(skills_root.join("web-research"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        skills_root.join("web-research/SKILL.md"),
+        "---\nname: Web Research v2\ndescription: Rewritten upstream.\ncategory: Ops\nversion: 2.0.0\n---\n# Web Research v2\n",
+    )
+    .await
+    .unwrap();
+
+    let store = FsCompanyStore::new(home.clone());
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+    let runtime = RuntimeBuilder::new(home.clone(), manifest())
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+
+    // Two registry installs, each holding the document pinned at install time.
+    for (slug, doc) in [
+        (
+            "web-research",
+            "---\nname: Web Research\ndescription: Research on the web.\ncategory: Research\nversion: 1.0.0\n---\n# Web Research\nStep one.\n",
+        ),
+        (
+            "retired-skill",
+            "---\nname: Retired Skill\ndescription: Withdrawn from the library.\ncategory: Ops\nversion: 1.0.0\n---\n# Retired Skill\nStill installed here.\n",
+        ),
+    ] {
+        runtime
+            .skills()
+            .set(
+                runtime.id(),
+                &crate::ports::skills_state::SkillState {
+                    slug: slug.to_string(),
+                    enabled: true,
+                    source: crate::ports::skills_state::SkillSource::Registry,
+                    custom_doc: Some(doc.to_string()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let state = AppState::new(AppConfig::default())
+        .with_home(home.clone())
+        .with_skills_root(skills_root);
+    state.registry().insert(id, Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+
+    let value = query(
+        router(state.clone()),
+        r#"{"query":"{ company(id:\"acme\"){ skills { id name description category source version } } skillRegistry { id version } }"}"#,
+    )
+    .await;
+    let skills = value["data"]["company"]["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 2, "both installs resolve: {value}");
+
+    let pinned = skills
+        .iter()
+        .find(|s| s["id"] == "web-research")
+        .expect("the installed library skill");
+    assert_eq!(pinned["source"], "registry");
+    assert_eq!(
+        pinned["version"], "1.0.0",
+        "the pinned revision survives a later library edit"
+    );
+    assert_eq!(pinned["name"], "Web Research");
+    assert_eq!(pinned["category"], "Research");
+
+    // A slug the library no longer serves keeps its real persisted content
+    // instead of degrading to a titleized name and a blank description.
+    let retired = skills
+        .iter()
+        .find(|s| s["id"] == "retired-skill")
+        .expect("the install whose slug left the library");
+    assert_eq!(retired["name"], "Retired Skill");
+    assert_eq!(retired["description"], "Withdrawn from the library.");
+    assert_eq!(retired["version"], "1.0.0");
+
+    // The registry tab itself is *not* pinned — it browses the live library.
+    let registry = value["data"]["skillRegistry"].as_array().unwrap();
+    assert_eq!(registry.len(), 1);
+    assert_eq!(registry[0]["id"], "web-research");
+    assert_eq!(registry[0]["version"], "2.0.0");
+}
+
+/// Issue #168: a hosted tenant has no source directory, so its workflows live
+/// only as runtime-authored bodies on the record. `Company.workflows` must
+/// resolve their real display name (not the id fallback) and `Company.workflow`
+/// must return the full graph.
+#[tokio::test]
+async fn workflows_resolve_from_the_record_overlay_with_no_source_dir() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let id = CompanyId::new("acme");
+
+    let manifest: CompanyManifest = toml::from_str(
+        "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[workflows]\nenabled = [\"hosted\"]\n",
+    )
+    .unwrap();
+    let store = FsCompanyStore::new(home.to_path_buf());
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: vec![crate::ports::types::OverlayWorkflow {
+                id: "hosted".to_string(),
+                toml: "id = \"hosted\"\nname = \"Hosted Flow\"\n\
+                       [[node]]\nid = \"n1\"\nkind = \"trigger\"\nname = \"Start\"\n\
+                       [[node]]\nid = \"n2\"\nkind = \"output\"\nname = \"Done\"\n\
+                       [[edge]]\nfrom = \"n1\"\nto = \"n2\"\n"
+                    .to_string(),
+            }],
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+
+    // Built WITHOUT `with_seed_dir` — the hosted shape.
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    assert!(
+        runtime.source_dir().is_none(),
+        "no source dir in hosted mode"
+    );
+    let state = AppState::new(AppConfig::default()).with_home(home.to_path_buf());
+    state.registry().insert(id, Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+
+    let value = query(
+        router(state),
+        r#"{"query":"{ company(id:\"acme\"){ workflows { id name enabled } workflow(id:\"hosted\"){ id name nodes { id } edges { from to } } } }"}"#,
+    )
+    .await;
+    let company = &value["data"]["company"];
+    let summaries = company["workflows"].as_array().expect("summaries");
+    assert_eq!(summaries.len(), 1, "value: {value}");
+    assert_eq!(summaries[0]["id"], "hosted");
+    // The real name from the overlay body, not the id fallback.
+    assert_eq!(summaries[0]["name"], "Hosted Flow");
+    assert_eq!(company["workflow"]["name"], "Hosted Flow");
+    assert_eq!(company["workflow"]["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(company["workflow"]["edges"].as_array().unwrap().len(), 1);
+}
+
+/// Issue #168: a runtime-authored workflow with an **empty** manifest
+/// `[workflows].enabled` must still appear in `Company.workflows`. The resolver
+/// used to drive its id set off the enabled list alone, so this returned `[]`
+/// while `Company.workflow` happily returned the full graph.
+///
+/// This used to be the ordinary post-restart state on the fs backend, because a
+/// boot rebuild overwrote the record's manifest from the seed. Issue #208 fixed
+/// that — a rebuild now merges surviving overlay ids back into `enabled` — so
+/// the state is written here *after* the build instead. The resolver's guarantee
+/// is unchanged and still worth pinning: it enumerates graph bodies on their own
+/// evidence, whatever put the record in this shape (a hand-edited record, a
+/// store written by an older build, a future writer that adds a body first).
+///
+/// Also pins REST/GraphQL agreement: both surfaces must report the same id set.
+#[tokio::test]
+async fn workflows_summary_lists_an_overlay_workflow_with_no_enabled_entry() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let id = CompanyId::new("acme");
+
+    // Nothing enabled in the manifest — the graph body is the only evidence.
+    let manifest: CompanyManifest =
+        toml::from_str("[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n").unwrap();
+
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest.clone())
+        .with_id(id.clone())
+        .build()
+        .await
+        .unwrap();
+    assert!(
+        runtime.source_dir().is_none(),
+        "no source dir in hosted mode"
+    );
+
+    // Write the enabled-less record AFTER the build. Since issue #208 a boot
+    // rebuild merges surviving overlay ids back into `[workflows].enabled`, so
+    // seeding this state before the build would be healed away — and this test
+    // is about the *resolver*, which must enumerate overlay bodies on their own
+    // evidence no matter how the record got into this shape.
+    let store = FsCompanyStore::new(home.to_path_buf());
+    store
+        .save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest.clone(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: vec![crate::ports::types::OverlayWorkflow {
+                id: "orphan".to_string(),
+                toml: "id = \"orphan\"\nname = \"Orphan Flow\"\n\
+                       [[node]]\nid = \"n1\"\nkind = \"trigger\"\nname = \"Start\"\n"
+                    .to_string(),
+            }],
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+
+    let state = AppState::new(AppConfig::default()).with_home(home.to_path_buf());
+    state.registry().insert(id, Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+
+    let value = query(
+        router(state.clone()),
+        r#"{"query":"{ company(id:\"acme\"){ workflows { id name enabled } } }"}"#,
+    )
+    .await;
+    let summaries = value["data"]["company"]["workflows"]
+        .as_array()
+        .expect("summaries");
+    assert_eq!(summaries.len(), 1, "value: {value}");
+    assert_eq!(summaries[0]["id"], "orphan");
+    assert_eq!(summaries[0]["name"], "Orphan Flow");
+    // Honest flag: the graph exists and is runnable, but the manifest does not
+    // declare it, so `enabled` reads false rather than being faked to true.
+    assert_eq!(
+        summaries[0]["enabled"], false,
+        "`enabled` reports manifest membership, not existence"
+    );
+
+    // REST and GraphQL must report the same id set.
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/company/workflows")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let rest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rest_ids: Vec<&str> = rest
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    let gql_ids: Vec<&str> = summaries
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(rest_ids, gql_ids, "REST and GraphQL disagree on the id set");
 }
 
 /// The committed SDL snapshot freezes the read contract. Regenerate with

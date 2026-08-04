@@ -54,8 +54,8 @@ use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
-    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
-    TaskResult,
+    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, OverlayBlob, SecretValue,
+    StoredEvent, TaskResult,
 };
 use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
@@ -121,7 +121,7 @@ impl MongoStore {
         // Not every index can be unique: a user holds many sessions, and an
         // address may have several login codes over time.
         let nonunique = |keys: Document| IndexModel::builder().keys(keys).build();
-        let plans: [(&str, IndexModel); 24] = [
+        let plans: [(&str, IndexModel); 28] = [
             ("companies", unique(doc! {"company_id": 1})),
             ("ledger", unique(doc! {"company_id": 1, "idx": 1})),
             ("events", unique(doc! {"company_id": 1, "seq": 1})),
@@ -167,6 +167,14 @@ impl MongoStore {
                 unique(doc! {"company_id": 1, "code_hash": 1}),
             ),
             ("login_codes", nonunique(doc! {"company_id": 1, "email": 1})),
+            ("runs", unique(doc! {"company_id": 1, "run_id": 1})),
+            // A card has many attempts, and many attempts share a status.
+            ("runs", nonunique(doc! {"company_id": 1, "task_id": 1})),
+            ("runs", nonunique(doc! {"company_id": 1, "status": 1})),
+            (
+                "run_steps",
+                unique(doc! {"company_id": 1, "run_id": 1, "step_seq": 1}),
+            ),
         ];
         for (name, index) in plans {
             self.collection(name)
@@ -286,23 +294,28 @@ impl CompanyStore for MongoStore {
             )?)?);
         }
 
-        let overlay_agents = match company.get_str("overlay_json") {
-            Ok(json) => serde_json::from_str(json)?,
-            Err(_) => Vec::new(),
+        let overlay = match company.get_str("overlay_json") {
+            Ok(json) => OverlayBlob::parse(json)?,
+            Err(_) => OverlayBlob::default(),
         };
         Ok(Some(CompanyRecord {
             id: id.clone(),
             manifest,
             ledger,
             lifecycle: get_str(&company, "lifecycle")?,
-            overlay_agents,
+            overlay_agents: overlay.agents,
+            overlay_desk_members: overlay.desk_members,
+            overlay_desk_order: overlay.desk_order,
+            overlay_desks: overlay.desks,
+            overlay_workflows: overlay.workflows,
+            template_provenance: overlay.provenance,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
-        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
+        let overlay_json = serde_json::to_string(&OverlayBlob::from_record(record))?;
         // Append-only: `save` upserts the company document, never the ledger.
         self.collection("companies")
             .update_one(
@@ -552,6 +565,7 @@ impl ContextStore for MongoStore {
                     "body": &chunk.body,
                     "len": chunk.body.len() as i64,
                     "ord": ord as i64,
+                    "stored_ms": now_millis() as i64,
                 }},
             )
             .with_options(UpdateOptions::builder().upsert(true).build())
@@ -577,6 +591,10 @@ impl ContextStore for MongoStore {
                     addr: ChunkAddr::new(get_str(&doc, "addr")?),
                     label,
                     len: get_i64(&doc, "len")? as usize,
+                    // Absent on documents written before the field existed;
+                    // those read as an unknown (`0`) store time rather than
+                    // failing the whole list.
+                    stored_at_millis: doc.get_i64("stored_ms").unwrap_or(0).max(0) as u64,
                 });
             }
         }
@@ -1285,6 +1303,264 @@ impl crate::ports::facts::FactStore for MongoStore {
 }
 
 // ---------------------------------------------------------------------------
+// ArtifactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::artifacts::ArtifactStore for MongoStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        task_id: Option<&str>,
+    ) -> Result<Vec<crate::ports::artifacts::ArtifactRecord>> {
+        // `task_id` narrows the query itself rather than filtering after the
+        // fetch, so one task's Artifacts tab does not pull the whole company.
+        let mut filter = doc! {"company_id": company.as_ref()};
+        if let Some(task_id) = task_id {
+            filter.insert("task_id", task_id);
+        }
+        let mut cursor = self
+            .collection("artifacts")
+            .find(filter)
+            .sort(doc! {"updated_ms": -1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out: Vec<crate::ports::artifacts::ArtifactRecord> = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "artifact_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn get(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::artifacts::ArtifactRecord>> {
+        let found = self
+            .collection("artifacts")
+            .find_one(doc! {"company_id": company.as_ref(), "artifact_id": id})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(
+                &doc,
+                "artifact_json",
+            )?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        artifact: &crate::ports::artifacts::ArtifactRecord,
+    ) -> Result<()> {
+        self.collection("artifacts")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "artifact_id": &artifact.id},
+                doc! {"$set": {
+                    "task_id": &artifact.task_id,
+                    "artifact_json": serde_json::to_string(artifact)?,
+                    "updated_ms": artifact.updated_at_millis as i64,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let res = self
+            .collection("artifacts")
+            .delete_one(doc! {"company_id": company.as_ref(), "artifact_id": id})
+            .await
+            .map_err(mongo_err)?;
+        Ok(res.deleted_count > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::runs::RunStore for MongoStore {
+    async fn create_run(
+        &self,
+        company: &CompanyId,
+        spec: crate::ports::runs::NewRun,
+    ) -> Result<crate::ports::runs::RunRecord> {
+        use crate::ports::runs::{RunRecord, RunStatus};
+
+        // The ordinal comes from the same atomic `$inc` counter the event and
+        // usage sequences use, keyed per card — so concurrent creates cannot
+        // collide even across processes. `next_seq` is 0-based; attempts are
+        // 1-based (`Attempt 1` is the first).
+        let attempt = self
+            .next_seq(company, &format!("run:{}", spec.task_id))
+            .await?
+            .saturating_add(1);
+        let run = RunRecord {
+            id: spec.id,
+            company: company.clone(),
+            task_id: spec.task_id,
+            agent_id: spec.agent_id,
+            attempt: attempt as u32,
+            status: RunStatus::Pending,
+            trigger_event_seq: None,
+            created_at_millis: now_millis(),
+            started_at_millis: None,
+            finished_at_millis: None,
+            error: None,
+            usage: Default::default(),
+            step_count: 0,
+        };
+        // A plain insert, not an upsert: the unique `(company_id, run_id)`
+        // index is what turns a repeated id into the port's documented
+        // conflict instead of a silently overwritten attempt.
+        let existing = self
+            .collection("runs")
+            .find_one(doc! {"company_id": company.as_ref(), "run_id": &run.id})
+            .await
+            .map_err(mongo_err)?;
+        if existing.is_some() {
+            return Err(OpenCompanyError::Conflict(format!(
+                "run '{}' already exists",
+                run.id
+            )));
+        }
+        self.collection("runs")
+            .insert_one(doc! {
+                "company_id": company.as_ref(),
+                "run_id": &run.id,
+                "task_id": &run.task_id,
+                "status": run.status.as_str(),
+                "attempt": run.attempt as i64,
+                "created_ms": run.created_at_millis as i64,
+                "run_json": serde_json::to_string(&run)?,
+            })
+            .await
+            .map_err(mongo_err)?;
+        Ok(run)
+    }
+
+    async fn get_run(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::runs::RunRecord>> {
+        let found = self
+            .collection("runs")
+            .find_one(doc! {"company_id": company.as_ref(), "run_id": id})
+            .await
+            .map_err(mongo_err)?;
+        match found {
+            Some(doc) => Ok(Some(serde_json::from_str(&get_str(&doc, "run_json")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn put_run(
+        &self,
+        company: &CompanyId,
+        run: &crate::ports::runs::RunRecord,
+    ) -> Result<()> {
+        self.collection("runs")
+            .update_one(
+                doc! {"company_id": company.as_ref(), "run_id": &run.id},
+                doc! {"$set": {
+                    "task_id": &run.task_id,
+                    "status": run.status.as_str(),
+                    "attempt": run.attempt as i64,
+                    "created_ms": run.created_at_millis as i64,
+                    "run_json": serde_json::to_string(run)?,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn list_runs(
+        &self,
+        company: &CompanyId,
+        filter: &crate::ports::runs::RunFilter,
+    ) -> Result<Vec<crate::ports::runs::RunRecord>> {
+        let mut query = doc! {"company_id": company.as_ref()};
+        if let Some(task_id) = &filter.task_id {
+            query.insert("task_id", task_id.as_str());
+        }
+        if !filter.statuses.is_empty() {
+            let statuses: Vec<&str> = filter.statuses.iter().map(|s| s.as_str()).collect();
+            query.insert("status", doc! {"$in": statuses});
+        }
+        // The canonical port ordering (see `runs::sort_newest_first`), pushed
+        // into the query so the limit truncates the right end.
+        let runs = self.collection("runs");
+        let mut find = runs
+            .find(query)
+            .sort(doc! {"created_ms": -1, "attempt": -1, "run_id": -1});
+        if let Some(limit) = filter.limit
+            && let Some(limit) = find_limit(limit)
+        {
+            find = find.limit(limit);
+        }
+        let mut cursor = find.await.map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "run_json")?)?);
+        }
+        Ok(out)
+    }
+
+    async fn append_run_step(
+        &self,
+        company: &CompanyId,
+        step: &crate::ports::runs::RunStepRecord,
+    ) -> Result<()> {
+        // Upsert on `(run_id, step_seq)`: a replayed append overwrites rather
+        // than duplicating, matching the other two backends.
+        self.collection("run_steps")
+            .update_one(
+                doc! {
+                    "company_id": company.as_ref(),
+                    "run_id": &step.run_id,
+                    "step_seq": step.step_seq as i64,
+                },
+                doc! {"$set": {
+                    "at_ms": step.at_millis as i64,
+                    "step_json": serde_json::to_string(step)?,
+                }},
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await
+            .map_err(mongo_err)?;
+        Ok(())
+    }
+
+    async fn list_run_steps(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<crate::ports::runs::RunStepRecord>> {
+        let mut cursor = self
+            .collection("run_steps")
+            .find(doc! {"company_id": company.as_ref(), "run_id": run_id})
+            .sort(doc! {"step_seq": 1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            out.push(serde_json::from_str(&get_str(&doc, "step_json")?)?);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -1677,6 +1953,11 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".into(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                template_provenance: None,
             };
             // Same template name under two tenants: distinct namespaced ids, no
             // `companies` unique-index conflict.
@@ -1774,6 +2055,28 @@ mod test {
     async fn conformance_fact_store() {
         let Some(s) = store().await else { return };
         conformance::assert_fact_store(s.clone()).await;
+        conformance::assert_artifact_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        let Some(s) = store().await else { return };
+        conformance::assert_context_chunk_stamps(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_run_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_reaper() {
+        let Some(s) = store().await else { return };
+        conformance::assert_run_reaper(s.clone()).await;
         drop_db(&s).await;
     }
 

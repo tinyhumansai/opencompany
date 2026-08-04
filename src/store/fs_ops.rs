@@ -8,6 +8,8 @@
 //! - sessions → `user-sessions.json`, login codes → `login-codes.json`
 //!   (credential material: token/code *hashes* only, never plaintext)
 //! - facts → `facts.jsonl` (last-write-wins per id, rewritten on mutate)
+//! - runs → `runs.jsonl` (last-write-wins per id) + `run-steps.jsonl`
+//!   (append-only trace, last-write-wins per `(run_id, step_seq)`)
 //! - usage → `usage.jsonl` (append-only samples)
 //! - skills → `skills.json` (operator deltas)
 //! - workspace → real folders + Markdown files under `workspace/`, indexed by
@@ -21,9 +23,13 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::error::OpenCompanyError;
+use crate::ports::artifacts::{ArtifactRecord, ArtifactStore};
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
 use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
 use crate::ports::now_millis;
+use crate::ports::runs::{
+    NewRun, RunFilter, RunRecord, RunStatus, RunStepRecord, RunStore, sort_newest_first,
+};
 use crate::ports::sessions::{SessionRecord, SessionStore};
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::tasks::{TaskRecord, TaskStore};
@@ -451,6 +457,166 @@ impl FactStore for FsOps {
 }
 
 // ---------------------------------------------------------------------------
+// ArtifactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl ArtifactStore for FsOps {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        task_id: Option<&str>,
+    ) -> Result<Vec<ArtifactRecord>> {
+        let mut artifacts = dedup_latest(
+            read_jsonl::<ArtifactRecord>(&self.bundle(company).artifacts_jsonl()).await?,
+        );
+        if let Some(task_id) = task_id {
+            artifacts.retain(|a| a.task_id == task_id);
+        }
+        artifacts.sort_by_key(|a| std::cmp::Reverse(a.updated_at_millis));
+        Ok(artifacts)
+    }
+
+    async fn get(&self, company: &CompanyId, id: &str) -> Result<Option<ArtifactRecord>> {
+        let artifacts = dedup_latest(
+            read_jsonl::<ArtifactRecord>(&self.bundle(company).artifacts_jsonl()).await?,
+        );
+        Ok(artifacts.into_iter().find(|a| a.id == id))
+    }
+
+    async fn upsert(&self, company: &CompanyId, artifact: &ArtifactRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.artifacts_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut artifacts = dedup_latest(read_jsonl::<ArtifactRecord>(&path).await?);
+        match artifacts.iter_mut().find(|a| a.id == artifact.id) {
+            Some(existing) => *existing = artifact.clone(),
+            None => artifacts.push(artifact.clone()),
+        }
+        rewrite_jsonl(&path, &artifacts).await
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let path = self.bundle(company).artifacts_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut artifacts = dedup_latest(read_jsonl::<ArtifactRecord>(&path).await?);
+        let before = artifacts.len();
+        artifacts.retain(|a| a.id != id);
+        if artifacts.len() == before {
+            return Ok(false);
+        }
+        rewrite_jsonl(&path, &artifacts).await?;
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl RunStore for FsOps {
+    async fn create_run(&self, company: &CompanyId, spec: NewRun) -> Result<RunRecord> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.runs_jsonl();
+        // The per-path lock is what makes read-max-then-write atomic. It is
+        // process-local — the documented fs-backend assumption everywhere in
+        // this file — which is why the port's `create_run` contract calls the
+        // filesystem ordinal best-effort rather than transactional.
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut runs = dedup_latest(read_jsonl::<RunRecord>(&path).await?);
+        if runs.iter().any(|r| r.id == spec.id) {
+            return Err(OpenCompanyError::Conflict(format!(
+                "run '{}' already exists",
+                spec.id
+            )));
+        }
+        let attempt = runs
+            .iter()
+            .filter(|r| r.task_id == spec.task_id)
+            .map(|r| r.attempt)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let run = RunRecord {
+            id: spec.id,
+            company: company.clone(),
+            task_id: spec.task_id,
+            agent_id: spec.agent_id,
+            attempt,
+            status: RunStatus::Pending,
+            trigger_event_seq: None,
+            created_at_millis: now_millis(),
+            started_at_millis: None,
+            finished_at_millis: None,
+            error: None,
+            usage: Default::default(),
+            step_count: 0,
+        };
+        runs.push(run.clone());
+        rewrite_jsonl(&path, &runs).await?;
+        Ok(run)
+    }
+
+    async fn get_run(&self, company: &CompanyId, id: &str) -> Result<Option<RunRecord>> {
+        let runs = dedup_latest(read_jsonl::<RunRecord>(&self.bundle(company).runs_jsonl()).await?);
+        Ok(runs.into_iter().find(|r| r.id == id))
+    }
+
+    async fn put_run(&self, company: &CompanyId, run: &RunRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.runs_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut runs = dedup_latest(read_jsonl::<RunRecord>(&path).await?);
+        match runs.iter_mut().find(|r| r.id == run.id) {
+            Some(existing) => *existing = run.clone(),
+            None => runs.push(run.clone()),
+        }
+        rewrite_jsonl(&path, &runs).await
+    }
+
+    async fn list_runs(&self, company: &CompanyId, filter: &RunFilter) -> Result<Vec<RunRecord>> {
+        let mut runs =
+            dedup_latest(read_jsonl::<RunRecord>(&self.bundle(company).runs_jsonl()).await?);
+        runs.retain(|r| filter.matches(r));
+        sort_newest_first(&mut runs);
+        if let Some(limit) = filter.limit {
+            runs.truncate(limit);
+        }
+        Ok(runs)
+    }
+
+    async fn append_run_step(&self, company: &CompanyId, step: &RunStepRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.run_steps_jsonl();
+        let line = serde_json::to_string(step)?;
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        // A genuine append: the trace only ever grows, and a replayed
+        // `(run_id, step_seq)` is folded out at read time rather than by
+        // rewriting the whole file per step.
+        append_line(&path, &line).await
+    }
+
+    async fn list_run_steps(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<RunStepRecord>> {
+        let steps = read_jsonl::<RunStepRecord>(&self.bundle(company).run_steps_jsonl()).await?;
+        Ok(dedup_steps(steps, run_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -833,15 +999,63 @@ where
     Ok(serde_json::from_str(&contents)?)
 }
 
-/// Keeps the last record per id (last-write-wins), preserving first-seen order.
-fn dedup_latest(records: Vec<FactRecord>) -> Vec<FactRecord> {
-    let mut order: Vec<String> = Vec::new();
-    let mut by_id: HashMap<String, FactRecord> = HashMap::new();
-    for record in records {
-        if !by_id.contains_key(&record.id) {
-            order.push(record.id.clone());
+/// Something a JSONL log keys its last-write-wins dedupe on.
+///
+/// Kept as a trait rather than a closure so [`dedup_latest`] reads identically
+/// at every call site; the two implementors below are the only record types
+/// stored in an id-keyed JSONL log.
+trait HasId {
+    fn record_id(&self) -> &str;
+}
+
+impl HasId for FactRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for ArtifactRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for RunRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Folds a raw `run-steps.jsonl` read down to one run's trace: the last record
+/// per `step_seq`, oldest first.
+///
+/// Steps are appended, never rewritten, so a replayed append leaves two lines
+/// with the same `(run_id, step_seq)`. Keeping the later one makes an append
+/// idempotent — the same guarantee the sqlite and MongoDB backends get from
+/// their composite primary key.
+fn dedup_steps(steps: Vec<RunStepRecord>, run_id: &str) -> Vec<RunStepRecord> {
+    let mut by_seq: HashMap<u32, RunStepRecord> = HashMap::new();
+    for step in steps {
+        if step.run_id != run_id {
+            continue;
         }
-        by_id.insert(record.id.clone(), record);
+        by_seq.insert(step.step_seq, step);
+    }
+    let mut out: Vec<RunStepRecord> = by_seq.into_values().collect();
+    out.sort_by_key(|s| s.step_seq);
+    out
+}
+
+/// Keeps the last record per id (last-write-wins), preserving first-seen order.
+fn dedup_latest<T: HasId>(records: Vec<T>) -> Vec<T> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: HashMap<String, T> = HashMap::new();
+    for record in records {
+        let id = record.record_id().to_string();
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.insert(id, record);
     }
     order
         .into_iter()
@@ -871,76 +1085,95 @@ mod test {
     use crate::store::conformance;
     use std::sync::Arc;
 
-    fn tmp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("opencompany-fsops-{}", crate::ports::generate_id()))
+    fn tmp_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("opencompany-fsops-")
+            .tempdir()
+            .expect("tempdir")
     }
 
     #[tokio::test]
     async fn conformance_task_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_task_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_user_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_user_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_session_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_session_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_login_code_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_login_code_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_fact_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_fact_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
+        conformance::assert_artifact_store(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_run_store(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_reaper() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_run_reaper(Arc::new(FsOps::new(&root))).await;
     }
 
     #[tokio::test]
     async fn conformance_usage_meter() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_usage_meter(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_usage_retention() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_usage_retention(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_skill_state_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_skill_state_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_workspace_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_workspace_store(Arc::new(FsOps::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn workspace_files_land_on_disk_under_folders() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let ops = FsOps::new(&root);
         let company = CompanyId::new("acme");
         let now = now_millis();
@@ -986,6 +1219,5 @@ mod test {
         assert!(!tokio::fs::try_exists(&disk).await.unwrap());
 
         let _ = (FactKind::Fact, SkillSource::Company, SampleKind::Inference);
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 }

@@ -28,8 +28,8 @@
 import type { Person as HostPerson } from "@/api/auth";
 import type { Skill } from "@/api/skills";
 import type { Task } from "@/api/tasks";
+import type { MemoryEntry } from "@/api/memory";
 import type { McpServer, McpTool } from "@/lib/mcp";
-import type { MemoryEntry } from "@/lib/memory";
 import type { TeamMember } from "@/lib/team";
 import { TASK_COLUMNS } from "@/lib/tasks-sample";
 import type { BrainGraphEdge, BrainGraphNode, MemoryGraph } from "./memory-core";
@@ -188,7 +188,10 @@ export function adapt(input: AdaptInput): Adapted {
   const toolLabels: Record<string, string> = {};
   const toolSlugs: string[] = [];
 
+  // Only active skills are tools an agent can actually reach for; a disabled
+  // one is installed but off, so it does not belong on anyone's tool shelf.
   for (const skill of input.skills) {
+    if (!skill.enabled) continue;
     const slug = `skill-${skill.id}`;
     toolLabels[slug] = skill.name;
     toolSlugs.push(slug);
@@ -266,6 +269,18 @@ export function adapt(input: AdaptInput): Adapted {
 }
 
 /**
+ * Which folder a memory row hangs off.
+ *
+ * An operator-authored fact carries its own taxonomy (`preference`, `person`,
+ * …); an agent's runtime chunk carries none, so it is bucketed by where it came
+ * from instead. Mirrors `MemoryView`'s type filter, so the graph and the Brain
+ * page group the same rows the same way.
+ */
+function folderOf(entry: MemoryEntry): string {
+  return entry.origin === "fact" ? (entry.kind ?? "fact") : entry.origin;
+}
+
+/**
  * The memory constellation, in the shape the core distils from.
  *
  * Each entry is a page, each memory kind is its folder hub. Entries of a kind
@@ -276,7 +291,7 @@ export function adapt(input: AdaptInput): Adapted {
 export function buildMemoryGraph(entries: MemoryEntry[]): MemoryGraph {
   const nodes: BrainGraphNode[] = [];
   const edges: BrainGraphEdge[] = [];
-  const kinds = [...new Set(entries.map((e) => e.kind))];
+  const kinds = [...new Set(entries.map(folderOf))];
 
   kinds.forEach((kind, k) => {
     const angle = (k / Math.max(1, kinds.length)) * Math.PI * 2;
@@ -299,7 +314,8 @@ export function buildMemoryGraph(entries: MemoryEntry[]): MemoryGraph {
 
   const byKind = new Map<string, string[]>();
   entries.forEach((entry) => {
-    const k = kinds.indexOf(entry.kind);
+    const folder = folderOf(entry);
+    const k = kinds.indexOf(folder);
     const angle = (k / Math.max(1, kinds.length)) * Math.PI * 2;
     // Seed each page near its folder, jittered deterministically by id so the
     // layout starts spread rather than stacked.
@@ -310,8 +326,8 @@ export function buildMemoryGraph(entries: MemoryEntry[]): MemoryGraph {
       id: entry.id,
       type: "page",
       label: entry.title,
-      folder: entry.kind,
-      kind: entry.kind,
+      folder,
+      kind: folder,
       excerpt: entry.body,
       wordCount: entry.body.split(/\s+/).filter(Boolean).length,
       tags: [entry.source],
@@ -321,13 +337,13 @@ export function buildMemoryGraph(entries: MemoryEntry[]): MemoryGraph {
       vector: [],
       chunks: 1,
     });
-    edges.push({ source: entry.id, target: `folder:${entry.kind}`, type: "member" });
-    const siblings = byKind.get(entry.kind);
+    edges.push({ source: entry.id, target: `folder:${folder}`, type: "member" });
+    const siblings = byKind.get(folder);
     if (siblings) {
       edges.push({ source: entry.id, target: siblings[siblings.length - 1], type: "similar" });
       siblings.push(entry.id);
     } else {
-      byKind.set(entry.kind, [entry.id]);
+      byKind.set(folder, [entry.id]);
     }
   });
 

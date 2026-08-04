@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::types::{ApprovalId, CompanyId, Effect, EventSeq, OutboundMessage};
+use crate::ports::types::{
+    ApprovalId, CompanyId, Effect, EventSeq, OutboundMessage, TemplateProvenance,
+};
 
 /// The outcome of one cycle: what the brain said, what effects ran or parked,
 /// and where the event log now stands.
@@ -32,6 +34,12 @@ pub struct CompanyStatus {
     pub lifecycle: String,
     /// The number of approvals currently awaiting the operator.
     pub pending_approvals: usize,
+    /// The source-template provenance recorded at launch — the stable template
+    /// id (directory slug) and, when known, its version. Absent for a company
+    /// provisioned from a raw manifest rather than a template. Drives the
+    /// console's read-only "Launched from template" line (issue #85).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_provenance: Option<TemplateProvenance>,
 }
 
 /// A parked approval as surfaced to the operator.

@@ -186,8 +186,19 @@ impl MockInferenceClient {
     }
 
     /// Sets the token usage each completion reports.
+    ///
+    /// Mutates only the token fields so a `cost_usd` already set by
+    /// [`Self::with_cost`] survives — the two builders compose in either order.
     pub fn with_tokens(mut self, input: u64, output: u64) -> Self {
-        self.token_usage = TokenUsage { input, output };
+        self.token_usage.input = input;
+        self.token_usage.output = output;
+        self
+    }
+
+    /// Sets the USD cost each completion reports, so a test can drive the
+    /// cycle-level cost metering the runtime does.
+    pub fn with_cost(mut self, cost_usd: f64) -> Self {
+        self.token_usage.cost_usd = cost_usd;
         self
     }
 

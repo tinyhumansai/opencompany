@@ -57,6 +57,60 @@ export async function verifyCode(
   return client.post<Me>(`${client.scopeFor(company)}/auth/verify`, { code });
 }
 
+/** One ecosystem sign-in button, as the host describes it. */
+export interface HubProvider {
+  /** The hub's provider slug (`google`, `github`, `twitter`). */
+  id: string;
+  /** What to put on the button. */
+  label: string;
+  /**
+   * Where to send the browser. Built by the host, never assembled here: only
+   * the host knows the hub's base URL and the origin the hub must return to,
+   * and a console guessing at either would aim a live sign-in at its guess.
+   */
+  startUrl: string;
+}
+
+/**
+ * Asks the host which ecosystem providers it can sign someone in with.
+ *
+ * An empty list is the normal answer on a self-hosted host and is not an
+ * error — it means "no ecosystem here, show the magic-link form alone". So this
+ * never throws for that case; callers only need to handle the network failing.
+ */
+export async function fetchHubProviders(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<HubProvider[]> {
+  const result = await client.get<{ providers: HubProvider[] }>(
+    `${client.scopeFor(company)}/auth/hub`,
+  );
+  return result.providers ?? [];
+}
+
+/**
+ * Turns a platform token from the hub into a session on this company.
+ *
+ * The token arrives in the URL as `?token=…&key=auth` after the hub completes
+ * OAuth and redirects back here. It is not an identity this console can read or
+ * check — it is handed straight to the host, which asks the hub whose it is and
+ * then applies this company's own roster. So this returns the same `Me` a magic
+ * link would, and the browser keeps nothing either way: the session comes back
+ * as an HttpOnly cookie and the token is stripped from the URL.
+ *
+ * The distinguishable failures are `hub_rejected` (expired or forged — sign in
+ * again), `not_a_member` (a real ecosystem account with no access here), and
+ * `hub_unavailable` (this host has no ecosystem at all). Read them off
+ * {@link ApiError.code}.
+ */
+export async function signInWithHubToken(
+  client: OpenCompanyClient,
+  company: string | null,
+  token: string,
+): Promise<Me> {
+  return client.post<Me>(`${client.scopeFor(company)}/auth/hub`, { token });
+}
+
 /** Exchanges an email and password for a session. */
 export async function loginWithPassword(
   client: OpenCompanyClient,

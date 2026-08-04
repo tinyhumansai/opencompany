@@ -116,7 +116,7 @@ export function SettingsSection({ client, company, feed, sub, onNavigate, onFlag
               </div>
             }
           >
-            <UsageView />
+            <UsageView client={client} company={company} />
           </Suspense>
         )}
       </div>

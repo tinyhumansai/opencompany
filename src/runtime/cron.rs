@@ -49,6 +49,23 @@ impl FieldSet {
     fn contains(&self, value: u32) -> bool {
         value < 64 && self.mask & (1u64 << value) != 0
     }
+
+    /// The permitted values, ascending. Used only by [`CronExpr::describe`],
+    /// which reads the parsed masks rather than re-reading the source text —
+    /// so the description can never disagree with what [`CronExpr::matches`]
+    /// will actually do.
+    fn values(&self) -> Vec<u32> {
+        (0..64).filter(|v| self.contains(*v)).collect()
+    }
+
+    /// The single permitted value, when the set holds exactly one.
+    fn single(&self) -> Option<u32> {
+        let values = self.values();
+        match values.len() {
+            1 => Some(values[0]),
+            _ => None,
+        }
+    }
 }
 
 /// A parsed 5-field cron expression.
@@ -118,6 +135,151 @@ impl CronExpr {
             cursor += MINUTE_MS;
         }
         None
+    }
+
+    /// A plain-English gloss of this schedule, or `None` when the shape is
+    /// gnarlier than a one-liner can honestly state.
+    ///
+    /// Issue #262: cron is easy to write and hard to read — `0 9 * * *` and
+    /// `9 0 * * *` are both valid and only one is 9am — and the dialect is UTC,
+    /// so an author in IST who wants a 9am report gets one at 14:30 local.
+    /// Neither mistake is *invalid*, so validation can never catch them; the
+    /// only defence is echoing the parsed meaning back.
+    ///
+    /// Derived from the parsed field masks, never from the source string, so
+    /// this cannot drift from [`matches`](Self::matches). `None` is a first-class
+    /// answer, not a failure: it means "I will not paraphrase this", and the
+    /// caller still has the next fire times, which say the same thing without
+    /// any risk of a confidently wrong gloss. Widening the covered shapes is
+    /// safe by construction — anything not recognised keeps returning `None`.
+    ///
+    /// Recognised shapes (each optionally narrowed by a weekday field):
+    ///
+    /// | Expression | Description |
+    /// |---|---|
+    /// | `* * * * *` | `Every minute` |
+    /// | `*/15 * * * *` | `Every 15 minutes` |
+    /// | `5 * * * *` | `Every hour at :05` |
+    /// | `0 9 * * *` | `Every day at 09:00 UTC` |
+    /// | `0 9 * * MON` | `Every Mon at 09:00 UTC` |
+    /// | `0 9,17 * * 1-5` | `At 09:00 and 17:00 UTC on Mon-Fri` |
+    pub fn describe(&self) -> Option<String> {
+        // A restricted month or day-of-month ("the 3rd of every other month")
+        // takes more words to state than the expression takes to read, so it is
+        // left to the next-fire times.
+        if self.month.restricted || self.dom.restricted {
+            return None;
+        }
+        let days = self.describe_weekdays()?;
+        // `on Mon-Fri` / `` — appended to whichever body is built below.
+        let on_days = days
+            .as_deref()
+            .map(|d| format!(" on {d}"))
+            .unwrap_or_default();
+
+        // An unrestricted hour means the schedule repeats within every hour.
+        if !self.hour.restricted {
+            if !self.minute.restricted {
+                return Some(format!("Every minute{on_days}"));
+            }
+            if let Some(step) = self.minute_step() {
+                return Some(format!("Every {step} minutes{on_days}"));
+            }
+            let minute = self.minute.single()?;
+            return Some(format!("Every hour at :{minute:02}{on_days}"));
+        }
+
+        // A restricted hour with a wildcard (or multi-valued) minute fires many
+        // times inside the named hours — not a clean "at HH:MM".
+        let minute = self.minute.single()?;
+        let hours = self.hour.values();
+        // Beyond a handful of hours the list stops reading as a sentence.
+        if hours.len() > 4 {
+            return None;
+        }
+        let times: Vec<String> = hours
+            .iter()
+            .map(|hour| format!("{hour:02}:{minute:02}"))
+            .collect();
+        if let [only] = times.as_slice() {
+            // `Every day at 09:00 UTC` / `Every Mon at 09:00 UTC` — the weekday
+            // replaces "day" here rather than trailing, which is how the phrase
+            // is said out loud.
+            let subject = days.unwrap_or_else(|| "day".to_string());
+            return Some(format!("Every {subject} at {only} UTC"));
+        }
+        Some(format!("At {} UTC{on_days}", join_and(&times)))
+    }
+
+    /// The weekday phrase for this expression: `None` = every day (the field is
+    /// `*`, or names all seven days), `Some("Mon-Fri")` for a contiguous run,
+    /// `Some("Mon, Wed")` for a list. The outer `Option` is `None` when the
+    /// field is too long to read as a phrase.
+    fn describe_weekdays(&self) -> Option<Option<String>> {
+        if !self.dow.restricted {
+            return Some(None);
+        }
+        let days = self.dow.values();
+        if days.len() >= WEEKDAYS.len() {
+            return Some(None);
+        }
+        let names: Vec<&'static str> = days
+            .iter()
+            .map(|d| title_case_weekday(WEEKDAYS[*d as usize]))
+            .collect();
+        // A contiguous run reads as a range; anything else as a list. More than
+        // three scattered days is a list nobody parses at a glance.
+        let contiguous = days.windows(2).all(|w| w[1] == w[0] + 1);
+        if contiguous && days.len() > 2 {
+            return Some(Some(format!("{}-{}", names[0], names[names.len() - 1])));
+        }
+        if names.len() > 3 {
+            return None;
+        }
+        Some(Some(names.join(", ")))
+    }
+
+    /// The step of an evenly-spaced minute field starting at `0`, when it has
+    /// one — `*/15` → `Some(15)`.
+    ///
+    /// Requires the step to divide 60: `*/7` yields 0,7,…,56, and the 56 → 0
+    /// wrap is a 4-minute gap, so calling it "every 7 minutes" would be a lie
+    /// once an hour.
+    fn minute_step(&self) -> Option<u32> {
+        let values = self.minute.values();
+        if values.len() < 2 || values[0] != 0 {
+            return None;
+        }
+        let step = values[1];
+        if 60 % step != 0 || values.len() as u32 != 60 / step {
+            return None;
+        }
+        values
+            .windows(2)
+            .all(|w| w[1] - w[0] == step)
+            .then_some(step)
+    }
+}
+
+/// `MON` → `Mon`. The parser's tables are upper-case; a description is prose.
+fn title_case_weekday(name: &str) -> &'static str {
+    match name {
+        "SUN" => "Sun",
+        "MON" => "Mon",
+        "TUE" => "Tue",
+        "WED" => "Wed",
+        "THU" => "Thu",
+        "FRI" => "Fri",
+        _ => "Sat",
+    }
+}
+
+/// `["09:00", "17:00"]` → `"09:00 and 17:00"`; three or more use commas.
+fn join_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [only] => only.clone(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
     }
 }
 
@@ -254,6 +416,20 @@ impl CivilTime {
             minute,
             weekday,
         }
+    }
+
+    /// Unix milliseconds at the start of this civil minute — the inverse of
+    /// [`from_unix_millis`](Self::from_unix_millis), which discards everything
+    /// below the minute, so the round trip is lossless for any time this type
+    /// can hold.
+    ///
+    /// Public so a caller that computed a fire time with
+    /// [`CronExpr::next_after`] can hand it back as an instant: the cron
+    /// preview (issue #262) sends epoch millis to the console precisely so the
+    /// UTC reading and the viewer's local reading come from ONE number and
+    /// cannot disagree.
+    pub fn unix_millis(&self) -> u64 {
+        self.floor_to_minute_millis()
     }
 
     /// Unix milliseconds at the start of this civil minute.
@@ -413,6 +589,81 @@ mod test {
         // From 2025 (not a leap year) the next 29 Feb is 2028.
         let next = expr.next_after(&at(2025, 3, 1, 0, 0)).unwrap();
         assert_eq!((next.year, next.month, next.day), (2028, 2, 29));
+    }
+
+    /// The whole point of issue #262: `0 9 * * *` and `9 0 * * *` are both
+    /// valid, differ by two characters, and mean nine hours apart. Validation
+    /// cannot help — neither is wrong — so the description is the only thing
+    /// standing between an author and a report that arrives at the wrong time.
+    #[test]
+    fn describes_the_nine_am_versus_nine_past_midnight_confusion() {
+        assert_eq!(
+            CronExpr::parse("0 9 * * *").unwrap().describe().as_deref(),
+            Some("Every day at 09:00 UTC")
+        );
+        assert_eq!(
+            CronExpr::parse("9 0 * * *").unwrap().describe().as_deref(),
+            Some("Every day at 00:09 UTC")
+        );
+    }
+
+    #[test]
+    fn describes_the_common_shapes() {
+        let describe = |expr: &str| CronExpr::parse(expr).unwrap().describe();
+        assert_eq!(describe("* * * * *").as_deref(), Some("Every minute"));
+        assert_eq!(
+            describe("*/15 * * * *").as_deref(),
+            Some("Every 15 minutes")
+        );
+        assert_eq!(describe("5 * * * *").as_deref(), Some("Every hour at :05"));
+        assert_eq!(
+            describe("0 9 * * MON").as_deref(),
+            Some("Every Mon at 09:00 UTC")
+        );
+        assert_eq!(
+            describe("0 9,17 * * 1-5").as_deref(),
+            Some("At 09:00 and 17:00 UTC on Mon-Fri")
+        );
+        assert_eq!(
+            describe("*/30 * * * 1-5").as_deref(),
+            Some("Every 30 minutes on Mon-Fri")
+        );
+        assert_eq!(
+            describe("0 8,12,17 * * *").as_deref(),
+            Some("At 08:00, 12:00 and 17:00 UTC")
+        );
+        // Every preset the console's schedule picker offers must describe —
+        // an author who picks "Daily — 09:00 UTC" from a menu should not then
+        // see a blank preview.
+        assert_eq!(describe("0 * * * *").as_deref(), Some("Every hour at :00"));
+    }
+
+    /// `describe` returning `None` is a designed answer, not a bug: the caller
+    /// still shows the next fire times, which state the schedule exactly. A
+    /// wrong paraphrase would be worse than none.
+    #[test]
+    fn declines_to_describe_gnarlier_shapes() {
+        let describe = |expr: &str| CronExpr::parse(expr).unwrap().describe();
+        assert_eq!(describe("0 0 1 * *"), None); // day-of-month restricted
+        assert_eq!(describe("0 0 * JAN-MAR *"), None); // month restricted
+        assert_eq!(describe("* 9 * * *"), None); // every minute of one hour
+        assert_eq!(describe("0 1,3,5,7,9 * * *"), None); // too many hours to list
+        // `*/7` is 0,7,…,56 — the wrap back to 0 is a 4-minute gap, so "every
+        // 7 minutes" would be wrong once an hour.
+        assert_eq!(describe("*/7 * * * *"), None);
+    }
+
+    /// The preview hands the console epoch millis so the UTC reading and the
+    /// viewer's local reading are two renderings of ONE instant.
+    #[test]
+    fn unix_millis_round_trips_a_fire_time() {
+        let expr = CronExpr::parse("0 9 * * *").unwrap();
+        let next = expr.next_after(&at(2026, 8, 2, 12, 0)).unwrap();
+        let millis = next.unix_millis();
+        let back = CivilTime::from_unix_millis(millis);
+        assert_eq!(back, next);
+        assert_eq!((back.year, back.month, back.day), (2026, 8, 3));
+        assert_eq!((back.hour, back.minute), (9, 0));
     }
 
     #[test]

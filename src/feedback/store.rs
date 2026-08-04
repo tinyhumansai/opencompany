@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::Result;
@@ -33,6 +32,16 @@ impl FeedbackStore {
     }
 
     /// Appends a feedback item to the log.
+    ///
+    /// Delegates to [`append_line`](crate::store::fs::append_line), which writes
+    /// the record **and** its newline in a single blocking `write_all` under
+    /// `O_APPEND`. Writing them as two `write_all` calls on a `tokio::fs::File`
+    /// — as this did — can surface as a `serde_json` "trailing characters" error
+    /// from [`Self::list`]: tokio's async `File` buffers internally and may
+    /// return before the kernel write lands, so the newline can be reordered or
+    /// lost against a concurrent append and two records end up on one physical
+    /// line. Identical to the corruption PR #43 removed from
+    /// `store::fs::append_line`; the feedback store was the remaining twin.
     pub async fn append(&self, item: &FeedbackItem) -> Result<()> {
         let line = serde_json::to_string(item)?;
         let _guard = self.write_lock.lock().await;
@@ -41,19 +50,7 @@ impl FeedbackStore {
                 .await
                 .map_err(|e| self.io_err(parent.to_path_buf(), e))?;
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .map_err(|e| self.io_err(self.path.clone(), e))?;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|e| self.io_err(self.path.clone(), e))?;
-        file.write_all(b"\n")
-            .await
-            .map_err(|e| self.io_err(self.path.clone(), e))?;
-        Ok(())
+        crate::store::fs::append_line(&self.path, &line).await
     }
 
     /// Lists every stored feedback item, oldest first.
@@ -143,9 +140,15 @@ mod test {
     use crate::feedback::types::{ConsentMode, FeedbackCategory, FeedbackInput, FeedbackItem};
     use crate::ports::types::CompanyId;
 
-    fn tmp_bundle() -> Bundle {
-        let root = std::env::temp_dir().join(format!("oc-feedback-{}", generate_id()));
-        Bundle::new(root, &CompanyId::new("acme"))
+    /// The caller must hold the returned handle: it owns the bundle's root and
+    /// removes it on drop.
+    fn tmp_bundle() -> (tempfile::TempDir, Bundle) {
+        let root = tempfile::Builder::new()
+            .prefix("oc-feedback-")
+            .tempdir()
+            .expect("tempdir");
+        let bundle = Bundle::new(root.path().to_path_buf(), &CompanyId::new("acme"));
+        (root, bundle)
     }
 
     fn item(note: &str) -> FeedbackItem {
@@ -164,7 +167,7 @@ mod test {
 
     #[tokio::test]
     async fn append_and_list_round_trips() {
-        let bundle = tmp_bundle();
+        let (_root, bundle) = tmp_bundle();
         let store = FeedbackStore::new(&bundle);
         assert!(store.list().await.unwrap().is_empty());
 
@@ -179,7 +182,7 @@ mod test {
 
     #[tokio::test]
     async fn update_status_records_url_without_losing_others() {
-        let bundle = tmp_bundle();
+        let (_root, bundle) = tmp_bundle();
         let store = FeedbackStore::new(&bundle);
         let a = item("a");
         let b = item("b");
@@ -202,6 +205,43 @@ mod test {
         // The other item is untouched.
         let other = all.iter().find(|i| i.id == a.id).unwrap();
         assert!(other.filed_issue_url.is_none());
+        tokio::fs::remove_dir_all(bundle.dir()).await.ok();
+    }
+
+    /// Every appended item must occupy its own physical line.
+    ///
+    /// `append` used to write the record and its `\n` as two `write_all` calls on
+    /// a `tokio::fs::File`, which buffers and can return before the kernel write
+    /// lands — so a newline could be reordered or lost and two records shared one
+    /// line, which `list` then rejects with a `serde_json` "trailing characters"
+    /// error. That is what intermittently failed
+    /// `update_status_records_url_without_losing_others` in CI. Mirrors
+    /// `store::fs::test::concurrent_appends_stay_one_record_per_line` (PR #43).
+    #[tokio::test]
+    async fn concurrent_appends_stay_one_record_per_line() {
+        let (_root, bundle) = tmp_bundle();
+        let store = std::sync::Arc::new(FeedbackStore::new(&bundle));
+
+        const N: usize = 32;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let store = store.clone();
+            set.spawn(async move { store.append(&item(&format!("note-{i}"))).await });
+        }
+        while let Some(res) = set.join_next().await {
+            res.unwrap().expect("append succeeds");
+        }
+
+        // `list` parses every line: a merged record would fail here rather than
+        // silently vanish.
+        let all = store.list().await.expect("no corrupt lines");
+        assert_eq!(all.len(), N, "every append is its own line");
+        let mut notes: Vec<String> = all.into_iter().map(|i| i.operator_words).collect();
+        notes.sort();
+        let mut want: Vec<String> = (0..N).map(|i| format!("note-{i}")).collect();
+        want.sort();
+        assert_eq!(notes, want, "all records intact");
+
         tokio::fs::remove_dir_all(bundle.dir()).await.ok();
     }
 }

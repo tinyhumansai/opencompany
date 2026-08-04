@@ -11,6 +11,19 @@ concurrency:
 permissions:
   contents: read
 
+# Issue #251. Every cargo invocation below that resolves a dependency graph
+# passes `--locked` (all of them except `cargo fmt`, which resolves nothing and
+# does not accept the flag): CI must build the graph recorded in the committed
+# `Cargo.lock` and fail loudly rather than re-resolve it in the runner. Without
+# it, a `Cargo.toml` edit whose lock was never regenerated — or a `vendor/`
+# submodule bump that moves a vendored crate's version — is absorbed silently,
+# and a semver-compatible upstream release can change what CI compiles with no
+# change to this repo, so a red run cannot be attributed to the diff.
+#
+# `--locked`, not `--frozen`. `--frozen` is `--locked` plus `--offline`, and
+# these runners have no vendored registry — they must reach crates.io to
+# download the crates the lock names. Pinning *resolution* and forbidding
+# *downloads* are separate properties; only the first is wanted here.
 jobs:
   rust:
     name: Rust
@@ -40,11 +53,235 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Issue #251. `--locked` on the compiling steps already fails a stale
+      # `Cargo.lock` — but it fails inside `Clippy` or `Build`, under a step name
+      # that says nothing about the lock, and in both jobs at once. This step is
+      # the legible version of that failure: it resolves the graph and nothing
+      # else, takes seconds, and is the first cargo invocation in the run, so a
+      # lock that does not match `Cargo.toml` — or a vendored submodule bump
+      # landed without the regenerated lock — is named as such before anything
+      # compiles.
+      #
+      # A STEP, not a separate job, on purpose: a dedicated job would pay for a
+      # second runner plus another submodule checkout — minutes of the run's
+      # wall clock — to print a message this step prints for free. `cargo
+      # metadata` reads the whole lock regardless of the feature selection, so
+      # one invocation covers every feature set CI builds.
+      - name: Verify Cargo.lock is in sync
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # No `--locked` here, and none is owed: `cargo fmt` is a `rustfmt` wrapper
+      # that never resolves the dependency graph, and `cargo-fmt` does not
+      # accept the flag.
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+  # Issue #202. The `Rust` job above builds DEFAULT FEATURES ONLY, so every line
+  # behind `openhuman` (`src/harness/**`, `src/workflows/**`, `src/runtime/`
+  # `delegation*`, and the `live_company_turn` example) and every line behind
+  # `tinycortex` (`src/store/tinycortex_engine.rs` plus its `src/store/select.rs`
+  # seam) is invisible to it — a green `Rust` check is not evidence for a diff
+  # whose lines are all feature-gated. That blind spot let a hard `E0062` in a
+  # test `HarnessDeps` literal and a failing harness test both sit on `main`.
+  # This job compiles, lints and tests that surface.
+  #
+  # Deliberately a SEPARATE job rather than extra steps on `rust`: the fast
+  # default check keeps its ~3-minute turnaround and its `Rust` check name (any
+  # branch-protection rule pinned to it is unaffected), and the two run in
+  # parallel.
+  #
+  # One combination, not a matrix. Cargo features are additive, and `tinycortex`
+  # adds no new compilation on top of an `openhuman` build — the crate is already
+  # an unconditional dependency of `openhuman_core` — so `openhuman,tinycortex`
+  # covers both rot areas in a single compile. A default/`openhuman`/
+  # `openhuman,tinycortex`/`--all-features` matrix would roughly triple CI
+  # compute for a sliver of extra coverage.
+  rust-gated:
+    name: Rust (openhuman, tinycortex)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: true
+
+      # Identical to the `rust` job's init, and for the same reason: `submodules:
+      # true` is not recursive. Keep it targeted — a plain `--recursive` over
+      # `vendor/openhuman` additionally drags in the desktop-only `tauri-cef`
+      # tree, which nothing in this build touches.
+      - name: Init vendored openhuman crate submodules
+        run: |
+          git -C vendor/openhuman submodule update --init --depth 1 \
+            vendor/tinyflows vendor/tinycortex vendor/tinyjuice \
+            vendor/tinychannels vendor/tinyplace
+          # tinycortex declares its own `tinyagents` path dependency, so its
+          # manifest must resolve too. Harmless for the default build; required
+          # for any `--features openhuman` build.
+          git -C vendor/openhuman/vendor/tinycortex submodule update --init --depth 1 \
+            vendor/tinyagents
+
+      # `--features openhuman` links system libraries the default build does not.
+      # Mirrors the builder stage of the repo `Dockerfile`: OpenSSL headers
+      # (native-tls → openssl-sys, via `motosan-ai-oauth` → `hyper-tls` in the
+      # vendored openhuman tree) and the X11 dev libs that openhuman's
+      # unconditional `rdev`/`arboard` deps link against even in a headless
+      # build. Pinning them here keeps the job immune to runner-image drift; the
+      # step is idempotent and costs well under a minute.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev \
+            libx11-dev libxi-dev libxtst-dev libxrandr-dev libxcb1-dev libxkbcommon-dev
+
+      # clippy only: `rustfmt` is feature-independent, so formatting stays fully
+      # covered by the `rust` job and re-running it here would buy nothing.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Steps are ordered to fail fast and cheap: a compile break (the `E0062`
+      # class of bug that motivated this job) surfaces before the lint pass
+      # spends time on a tree that does not build.
+      - name: Build (openhuman, tinycortex)
+        run: cargo build --locked --features openhuman,tinycortex --all-targets
+
+      # `--no-deps` is LOAD-BEARING — do not "simplify" it away. Cargo treats the
+      # vendored `[patch]` crates as local packages, so an unscoped `-D warnings`
+      # hard-fails on lints this repo neither owns nor can fix here (today:
+      # `large_enum_variant` in `vendor/tinyagents`), and the gate would never
+      # reach first-party code. Scoping to the primary package is what makes it
+      # meaningful.
+      - name: Clippy (openhuman, tinycortex)
+        run: cargo clippy --locked --no-deps --features openhuman,tinycortex --all-targets -- -D warnings
+
+      # `--lib` is LOAD-BEARING — do not widen it to a bare `cargo test`. There
+      # is no `tests/` directory, and the only other runnable target the feature
+      # set unlocks is the `live_company_turn` example, which dials a real
+      # inference backend and needs a credential. The build step above already
+      # proves it compiles; this step must never try to run it.
+      - name: Test (openhuman, tinycortex)
+        run: cargo test --locked --features openhuman,tinycortex --lib
+
+      # Catches the combination traps no single feature set can: most often a
+      # mandatory struct field constructed differently across feature arms.
+      #
+      # `--all-targets` is LOAD-BEARING (issue #288). Without it this step
+      # checks the lib and bins only, so test code behind a storage feature is
+      # compiled by NOTHING in CI: the default `rust` job runs `cargo test`
+      # without `sqlite`, and the gated steps above pin `openhuman,tinycortex`.
+      # That gap let two `E0034`s in `src/store/sqlite.rs`'s own tests sit on
+      # `main` unseen — a green check is only evidence for the surface it
+      # actually compiles.
+      #
+      # CHECK-ONLY BY DESIGN — compiling every target is not running any of
+      # them. This step must never become `cargo test`: `--all-features` also
+      # enables `mcp`, which changes what an agent's tool belt *contains*, and
+      # that contract is pinned by the dedicated narrow step below.
+      - name: Check (--all-features)
+        run: cargo check --locked --all-features --all-targets
+
+      # The tool belt the SHIPPED tenant image actually builds (issue #297).
+      #
+      # Every other lane here runs `openhuman[,tinycortex]`. `mcp` is the one
+      # feature that changes what an agent's tool belt *contains* rather than
+      # only what compiles, so no lane exercised the belt real deployments get —
+      # and `dispatched_desk_agent_tool_belt_is_pinned` was failing unseen on
+      # `main` for exactly that reason. The pin is now feature-aware, so it is
+      # correct under every combination; this step is what keeps that true.
+      #
+      # Deliberately NARROW. This feature set is a fourth distinct compile of the
+      # tree, so it runs only the belt-contract module rather than the whole
+      # suite: those tests are the entire reason the combination matters, and
+      # everything else in `--lib` is already covered by the step above. Widen it
+      # only if a second behavioural feature-divergence shows up.
+      #
+      # `--locked` per issue #251's rule for every graph-resolving invocation:
+      # this is a fourth distinct feature resolution, so without it this lane
+      # would be the one place CI silently re-resolves the dependency graph.
+      - name: Test tool-belt contract (openhuman, mcp, telegram)
+        run: cargo test --locked --features openhuman,mcp,telegram --lib harness::build::tests
+
+  # Issue #281. Both jobs above are Rust-only, so before this job existed NOTHING
+  # in CI installed Node: `frontend/` was invisible to the entire build, and a
+  # TypeScript error there passed every required check and merged. The first
+  # thing that noticed a broken console was `deploy-staging.yml`, which runs
+  # AFTER merge, or a person. Same shape as the #202 blind spot the `rust-gated`
+  # job above closed, with more force — that one hid a subset of the build, this
+  # one hid a whole language.
+  #
+  # `tsconfig.app.json` sets `noUnusedLocals` and `noUnusedParameters`, so the
+  # failure modes are easy to hit: dropping an argument from a helper is enough.
+  #
+  # A THIRD TOP-LEVEL JOB, appended after `rust-gated` rather than folded into
+  # either: it shares no setup with them (no submodules, no system packages, no
+  # toolchain), it runs in parallel so it adds nothing to the critical path, and
+  # it gets its own `Console` check name for branch protection to pin.
+  console:
+    name: Console
+    runs-on: ubuntu-latest
+    # A minute of real work. The cap exists only so a wedged registry fetch fails
+    # in ten minutes instead of burning the runner's six-hour default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # No `submodules` — unlike the Rust jobs this one resolves no vendored
+          # manifests, and `vendor/openhuman` is a large checkout to skip.
+
+      # Node 22 tracks `frontend/Dockerfile`, which builds the shipped console
+      # `FROM node:22-slim`. CI must compile on the version that produces the
+      # artifact; bump both together or this job stops being evidence for the
+      # thing that deploys.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci`, NOT `npm install` — do not "simplify" this. It is the npm half
+      # of the same property `--locked` buys the cargo steps above (issue #251):
+      # it installs strictly the tree recorded in `package-lock.json` and exits
+      # non-zero when the lock and `package.json` disagree, so a manifest edit
+      # whose lock was never regenerated is named here rather than absorbed.
+      # `npm install` would silently re-resolve and REWRITE the lock in the
+      # runner, which means CI would be typechecking a dependency tree that is
+      # not the one committed — and a green run could not be attributed to the
+      # diff. It is also the command `frontend/Dockerfile` uses.
+      - run: npm ci
+        working-directory: frontend
+
+      # Three steps, not one, because each catches something the others do not
+      # and a separate step names the failure.
+      #
+      # `typecheck` is `tsc -b`: fails fast on `src/` types.
+      - run: npm run typecheck
+        working-directory: frontend
+
+      # `typecheck:e2e` covers `frontend/test/e2e/` and `playwright.config.ts`,
+      # which `tsc -b` does NOT reach — `tsconfig.app.json` is `include: ["src"]`
+      # — so before this the Playwright specs were compiled by nothing at all.
+      # See the header of `frontend/tsconfig.e2e.json`. This does NOT run the
+      # suite: that needs a live host and is still out of CI, per #281.
+      - run: npm run typecheck:e2e
+        working-directory: frontend
+
+      # `build` runs `tsc -b` again but then invokes Vite, which additionally
+      # catches a module-resolution or plugin failure that type-checking alone
+      # never sees — a bad `@/` import or a missing asset builds a green `tsc`
+      # and a broken bundle.
+      - run: npm run build
+        working-directory: frontend
+
+      # No lint step: the package declares no lint script. Adding one is a
+      # separate decision, not something to smuggle in here.

@@ -170,11 +170,11 @@ mod test {
     use crate::store::FsSecretStore;
     use crate::{AppConfig, AppState};
 
-    fn home() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "opencompany-feedback-{}",
-            crate::ports::generate_id()
-        ))
+    fn home() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("opencompany-feedback-")
+            .tempdir()
+            .expect("tempdir")
     }
 
     fn manifest() -> CompanyManifest {
@@ -273,7 +273,8 @@ mod test {
     // redacted) → preview → mock-file with dedupe.
     #[tokio::test]
     async fn capture_scrub_preview_file_and_dedupe() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let state = state_with_company(&home, github.clone()).await;
         let app = router(state);
@@ -338,15 +339,14 @@ mod test {
         assert_eq!(value["deduped"], true);
         assert_eq!(github.created().len(), 1);
         assert_eq!(github.comments().len(), 1);
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // A provisioned instance forwards to the hub instead of filing, and what
     // crosses the boundary is the scrubbed body — not the operator's raw words.
     #[tokio::test]
     async fn provisioned_instance_forwards_scrubbed_body_and_files_nothing() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let hub = Arc::new(MockTinyHumansClient::new());
         let state = state_with_clients(&home, github.clone(), Some(hub.clone())).await;
@@ -377,15 +377,14 @@ mod test {
         assert_eq!(sent.origin, "acme");
         assert_eq!(sent.wire_type(), "bug");
         assert!(!sent.external_ref.is_empty());
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // The scrub gate runs before the destination choice, so a secret is blocked
     // rather than forwarded.
     #[tokio::test]
     async fn scrub_abort_blocks_before_forwarding() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let hub = Arc::new(MockTinyHumansClient::new());
         let state = state_with_clients(&home, github, Some(hub.clone())).await;
@@ -404,15 +403,14 @@ mod test {
             hub.forwarded().is_empty(),
             "a blocked report must not leave"
         );
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // An unreachable hub is a degraded success: the note is already stored, so
     // the operator gets a reason rather than a failed request.
     #[tokio::test]
     async fn unreachable_hub_degrades_to_local() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let hub = Arc::new(MockTinyHumansClient::new().with_failure("connection refused"));
         let state = state_with_clients(&home, github.clone(), Some(hub)).await;
@@ -430,14 +428,13 @@ mod test {
         assert!(value["reason"].is_string());
         // It must not silently fall back to filing an issue instead.
         assert!(github.created().is_empty());
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // Moderation rejection is reported as such, not as a transport failure.
     #[tokio::test]
     async fn hub_moderation_rejection_is_reported() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let hub = Arc::new(
             MockTinyHumansClient::new().with_outcome(IngestOutcome::Rejected {
@@ -457,14 +454,13 @@ mod test {
         assert_eq!(value["filed"], false);
         assert_eq!(value["destination"], "tinyhumans");
         assert_eq!(value["reason"], "off-topic");
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // Without a credential the original GitHub path is untouched.
     #[tokio::test]
     async fn unprovisioned_instance_still_files_to_github() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let state = state_with_company(&home, github.clone()).await;
         let app = router(state);
@@ -479,15 +475,14 @@ mod test {
         assert_eq!(value["filed"], true);
         assert_eq!(value["destination"], "github");
         assert_eq!(github.created().len(), 1);
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // The reports list shows what was reported and where it went, and never the
     // operator's own words.
     #[tokio::test]
     async fn list_returns_summaries_without_operator_words() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let state = state_with_company(&home, github).await;
         let app = router(state);
@@ -513,15 +508,14 @@ mod test {
         assert!(!raw.contains("payroll run crashed"), "got {raw}");
         assert!(!raw.contains("operator_words"), "got {raw}");
         assert!(!raw.contains("context_excerpt"), "got {raw}");
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     // A forwarded report stores the hub's id, which is not a URL — the list must
     // not offer it as a link.
     #[tokio::test]
     async fn list_omits_a_non_url_reference_for_forwarded_reports() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let hub = Arc::new(MockTinyHumansClient::new());
         let state = state_with_clients(&home, github, Some(hub)).await;
@@ -539,13 +533,12 @@ mod test {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["issue_status"], "forwarded");
         assert!(items[0]["filed_issue_url"].is_null());
-
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[tokio::test]
     async fn feedback_for_unknown_company_is_404() {
-        let home = home();
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
         let github = Arc::new(MockGitHubClient::new());
         let state = state_with_company(&home, github).await;
         let app = router(state);
@@ -559,6 +552,5 @@ mod test {
         // 401, not 404: authentication precedes existence, so an unauthenticated
         // caller cannot enumerate which companies this host runs.
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 }

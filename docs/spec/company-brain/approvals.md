@@ -47,6 +47,67 @@ effect emitted ─▶ evaluate ─▶ Allow ─▶ execute, journal
 - Approve executes the parked effect exactly once
   (journal-before-execute, [runtime/lifecycle.md](../runtime/lifecycle.md));
   deny feeds the refusal back so the brain replans rather than retries.
+- **Resolution is idempotent.** Resolving an approval that is no longer parked
+  — a double-submit, a retried request, two operators on the same queue —
+  is a no-op with a fixed reply. It writes no journal record and runs no
+  follow-up cycle.
+
+## Approving a blocked tool call: single-use grants
+
+Two different things park on this queue and they need opposite treatment.
+
+A **native** effect is one the runtime performs itself (an email, a workflow
+delivery). Approving it executes it, as above.
+
+A **tool call** is one an agent tried to make and the OpenHuman tool policy
+blocked. There is nothing for the runtime to execute — the parked effect's
+payload is the tool's *arguments*, and only that agent can run the tool. So
+approving it mints a **single-use grant** and re-dispatches the agent to
+re-issue the call. Without this, approving recorded a verdict and nothing ran:
+the operator had to go back and ask for the same thing again.
+
+A grant is:
+
+- **single-use** — redeeming consumes it, so one approval buys one call and
+  never standing permission;
+- **agent-scoped** — a grant minted for one desk does not admit another's
+  identical call;
+- **argument-exact** — matching is whole-value equality on the arguments. A
+  re-issue with a different recipient or amount does not match and re-parks,
+  because the operator never saw those arguments. Approve-with-edit mints
+  against the *amended* arguments;
+- **time-boxed** — 15 minutes. An approval is consent to act now, not a
+  standing authorisation. An unredeemed grant expires and the operator is told
+  the agent did not act, so re-approving is an informed choice.
+
+The lifecycle is journaled (`ApprovalGranted` → `GrantConsumed` | `GrantExpired`)
+and replayed on boot, so a restart between approving and re-issuing does not
+drop the approval. Consumed and expired grants are folded out on replay: a
+resurrected single-use grant would not be single-use.
+
+### Precedence at the tool gate
+
+A tool call is decided in this order:
+
+1. `never_do` hard-deny — **reserved**; the delegation-rule compiler is still a
+   Phase-1 stub, so no tool-level arm exists yet. It sits above the grant
+   deliberately: a grant is an operator saying yes to one call, `never_do` is
+   the company saying not ever, and the standing rule is the one meant to
+   survive a socially engineered operator.
+2. a live **grant** matching agent + tool + exact arguments → allow, once.
+3. `[policy].always_approve` → park.
+4. mode dispatch (`readonly` / `supervised` / `full`).
+
+The grant sits **above** `always_approve` on purpose. A tool on that list still
+parks the first time, which is what the list is for; but once the operator has
+approved that specific call, re-parking it would mean approval authorises
+nothing at all for precisely the tools an operator most wants to gate
+deliberately. Single-use, exact-args and agent-scope are what keep that
+narrow.
+
+Note this is the *tool* gate (`ApprovalPolicy`), which is a different path from
+the *effect* gate (`ManifestApprovalGate::evaluate`) the taxonomy above
+describes. A harness tool call parks directly and never reaches `evaluate`.
 
 ## Delegation levels (standing rules)
 

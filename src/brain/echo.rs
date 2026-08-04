@@ -9,10 +9,10 @@
 use async_trait::async_trait;
 
 use crate::Result;
-use crate::ports::brain::{Brain, CycleHost};
+use crate::ports::brain::{Brain, Cognition, CycleHost, UsageMetering};
 use crate::ports::types::{
     CompanyEvent, CompressedTrace, CycleRequest, CycleResult, Effect, EffectGroup, OutboundMessage,
-    TokenUsage,
+    ReplyTo, TokenUsage,
 };
 
 /// The offline echo brain: turns operator messages into acknowledgements.
@@ -34,6 +34,8 @@ impl EchoBrain {
             established_thread: false,
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
+            agent: None,
+            run_id: None,
         }
     }
 }
@@ -45,15 +47,50 @@ impl Brain for EchoBrain {
         for event in &req.events {
             if let CompanyEvent::OperatorMessage { text, .. } = event {
                 channel_responses.push(OutboundMessage {
+                    task_id: None,
                     channel: "operator".to_string(),
                     text: format!("You said: {text}"),
+                    steps: Vec::new(),
+                    reply_to: None,
+                });
+            }
+            if let CompanyEvent::WebhookReceived { channel, body } = event {
+                let (text, reply_to) = if channel == "telegram" {
+                    let chat_id = body
+                        .get("message")
+                        .and_then(|m| m.get("chat"))
+                        .and_then(|c| c.get("id"))
+                        .and_then(|id| id.as_i64());
+                    let user_text = body
+                        .get("message")
+                        .and_then(|m| m.get("text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    (
+                        format!("You said: {user_text}"),
+                        chat_id.map(|id| ReplyTo {
+                            chat_id: id.to_string(),
+                        }),
+                    )
+                } else {
+                    (format!("webhook on {channel}"), None)
+                };
+                channel_responses.push(OutboundMessage {
+                    task_id: None,
+                    channel: channel.clone(),
+                    text,
+                    steps: Vec::new(),
+                    reply_to,
                 });
             }
         }
         if channel_responses.is_empty() {
             channel_responses.push(OutboundMessage {
+                task_id: None,
                 channel: "operator".to_string(),
                 text: "Acknowledged.".to_string(),
+                steps: Vec::new(),
+                reply_to: None,
             });
         }
 
@@ -73,13 +110,25 @@ impl Brain for EchoBrain {
             token_usage: TokenUsage::default(),
         })
     }
+
+    /// No model is ever called here, so there is nothing to meter: a zero Usage
+    /// reading on this path is the truth, not a missing hook. Surfacing that is
+    /// what lets an operator tell "no inference configured" from "metering
+    /// broken" (issue #174).
+    fn cognition(&self) -> Cognition {
+        Cognition {
+            path: "echo",
+            provider: "none",
+            metering: UsageMetering::None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::ports::types::{
-        CompanyId, ContextOp, ContextOpResult, EffectDisposition, ToolCall, ToolResult,
+        ApprovalId, CompanyId, ContextOp, ContextOpResult, EffectDisposition, ToolCall, ToolResult,
     };
 
     /// A minimal host that records emitted effects and auto-executes them.
@@ -105,6 +154,11 @@ mod test {
             self.effects.lock().unwrap().push(effect);
             Ok(EffectDisposition::Executed)
         }
+
+        async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+            self.effects.lock().unwrap().push(effect);
+            Ok(ApprovalId::new("appr-parked"))
+        }
     }
 
     fn request(events: Vec<CompanyEvent>) -> CycleRequest {
@@ -128,6 +182,7 @@ mod test {
                 request(vec![CompanyEvent::OperatorMessage {
                     text: "hi".into(),
                     by: None,
+                    chat: None,
                 }]),
                 &host,
             )

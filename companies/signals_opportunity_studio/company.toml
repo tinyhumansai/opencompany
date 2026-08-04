@@ -24,7 +24,11 @@ id = "signal_scout"
 role = "Signal Scout"
 description = "Continuously gather raw market signals from web, forums, and inbound channels."
 tier = "subconscious"
-tools = ["web.*"]
+# `search` is listed alongside `web.*` because the two are not interchangeable:
+# `web.*` reads a URL the agent already has, `search` is the only way to find
+# one. It must appear here AND in `[tools].allow` below — the per-agent list
+# narrows the company-wide one, so either edit alone is a silent no-op (#312).
+tools = ["web.*", "search"]
 budget_usd_daily = 5.0
 
 [[agent]]
@@ -32,7 +36,7 @@ id = "opportunity_analyst"
 role = "Opportunity Analyst"
 description = "Cluster signals into pains and rank the resulting opportunities by evidence and size."
 tier = "reasoning"
-tools = ["web.*", "docs.*"]
+tools = ["web.*", "docs.*", "search"]
 budget_usd_daily = 8.0
 
 [[agent]]
@@ -40,7 +44,7 @@ id = "research_agent"
 role = "Research Agent"
 description = "Deep-dive the top opportunities and compile the operator's weekly brief."
 tier = "reasoning"
-tools = ["web.*", "docs.*"]
+tools = ["web.*", "docs.*", "search"]
 budget_usd_daily = 8.0
 
 [brain]
@@ -48,7 +52,15 @@ mode = "hosted"
 max_passes = 12
 
 [tools]
-allow = ["web.*", "docs.*"]
+# This company deliberately overrides the default belt (`["*", "media",
+# "composio"]`) down to reading and writing docs off the web — it is a research
+# studio, not a general-purpose one. `search` is added because the whole roster
+# is described as gathering signals "from web", and the grant check matches only
+# `search` / `search.` — `web.*` confers nothing towards it (#312).
+#
+# This list gates the company; each agent's own `tools` narrows it further, so
+# `search` also has to appear on the scout / analyst / research agents above.
+allow = ["web.*", "docs.*", "search"]
 
 [channels.operator]
 enabled = true

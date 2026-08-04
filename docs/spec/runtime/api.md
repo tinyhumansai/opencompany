@@ -36,21 +36,26 @@ with no `{id}`.
 
 The console's writes are a REST router family under `src/server/ops/`, each
 route registered under **both** scope forms (`…/companies/{id}/…` and the
-`…/company/…` prosumer alias) by the `scoped` helper. All reads for these
-surfaces go through GraphQL (below); these are the mutations only. Anything a
-build doesn't serve `404`s — the console treats that as "not wired yet".
+`…/company/…` prosumer alias) by the `scoped` helper. These are the mutations,
+plus **two deliberate read exceptions**: the two inbox `GET`s at the end of the
+block below, and the two workspace `GET`s (#177). Every other console read goes
+through GraphQL (see the read plane below). Anything a build doesn't serve
+`404`s — the console treats that as "not wired yet".
 
 ```text
-POST   …/tasks                              create a task card
+POST   …/tasks                              create a task card (`originChatId` records the thread it came from, #246)
 PATCH  …/tasks/{taskId}                      edit / move a task
 DELETE …/tasks/{taskId}                      delete a task
 POST   …/memory                             add a memory fact
 DELETE …/memory/{factId}                     delete a memory fact
+GET    …/workspace                          the whole tree (metadata; no bodies)
+GET    …/workspace/file/{nodeId}             one file: content + inbound backlinks
 POST   …/workspace                          create a folder/file (or upload)
 PUT    …/workspace/file/{nodeId}             write file content
 PATCH  …/workspace/{nodeId}                  rename / move
 DELETE …/workspace/{nodeId}                  delete a node
 POST   …/skills                             add a custom skill
+GET    …/skills/registry                     browse the shared skill library
 POST   …/skills/{slug}/install              install a registry/company skill
 POST   …/skills/{slug}/uninstall            uninstall a skill
 PUT    …/skills/{slug}                       enable / disable a skill
@@ -59,7 +64,32 @@ DELETE …/team/{agentId}                      remove an overlay teammate
 PUT    …/team/{agentId}/inbox                toggle a teammate's inbox
 POST   …/inboxes/{key}/read                  mark inbox messages read
 POST   …/inboxes/ingest                     HMAC-signed inbound email → inbox
+GET    …/inboxes                            list inboxes + unread counts
+GET    …/inboxes/{key}/messages              one teammate's mail (store order)
 ```
+
+The two inbox `GET`s are the read exception, and they are **REST twins of the
+`Company.inboxes` GraphQL resolver**: the operator console ships no GraphQL
+client, so without them the Inbox view had no reachable per-agent read at all
+and fell back to a client-side fixture (issue #173). They read the same
+`InboxStore` both inbound paths — the ingest webhook and the IMAP poller — file
+into, and `GET …/team` tags each teammate with `inboxEnabled` so the Team toggle
+reflects that store too. Messages come back in append order; the console sorts
+them newest-first. The GraphQL resolver stays the canonical read for any client
+that does speak GraphQL — these routes duplicate it, they do not replace it.
+
+The two workspace `GET`s are the same story one issue later (#177): the console
+had no reachable workspace read either, so the Workspace tab persisted to
+`localStorage` and the operator and the agents looked at two different trees —
+a note written by an agent through its `workspace_*` tools (#237) was invisible
+to the operator, and vice versa. They are REST twins of `Company.workspaceTree`
+/ `workspaceFile`, differing only in timestamp shape (epoch millis, matching
+every other console read, rather than ISO-8601 strings). The backlink scan is
+literally shared code (`company::workspace_links`), so the two surfaces cannot
+report different backlinks for the same note. The tree read carries metadata
+only — bodies are fetched per file, so a navigation read does not grow with the
+size of the workspace. Reading a folder id as a file is a `404`, never an empty
+note.
 
 Team writes are an **operator overlay** persisted through the store, merged
 into the manifest roster at read time — the version-controlled `company.toml`
@@ -83,11 +113,45 @@ POST   …/connections/{provider}/disconnect   drop stored OAuth tokens         
 GET    /api/v1/oauth/callback                OAuth redirect target (unscoped; state carries the company)  [feature: oauth]
 ```
 
+### The OAuth callback always redirects
+
+`/api/v1/oauth/callback` is reached by a **browser navigation**, so anything it
+returns as a body becomes the page the operator is left on. It therefore never
+answers with JSON. Every outcome redirects to the console's Connections view:
+
+- success → `…/connections?connected=<provider>`
+- failure → `…/connections?connect_error=<code>[&provider=<provider>]`
+
+`<code>` is one of a closed set — `denied`, `invalid_request`, `invalid_state`,
+`unknown_company`, `provider_disabled`, `exchange_failed`, `store_failed` — that
+the console maps to operator-facing copy. The provider's own error text is
+logged host-side but never forwarded: it is attacker-influenced and must not
+ride in a URL that lands in browser history and access logs. `provider` is
+appended only when a signature-verified `state` supplies it, so the arms that
+fire before verification omit it.
+
+### Provider catalog vs. configured providers
+
+The console's Connections view offers 11 provider tiles; `well_known()` in
+`server::ops::connections` carries built-in authorize/token URLs for three
+families only (`slack`, `google`/`gmail`, `github`). Every other tile needs
+`OPENCOMPANY_OAUTH_<P>_AUTHORIZE_URL` / `_TOKEN_URL` alongside its `_ID` /
+`_SECRET`, or it is simply not enabled on that host.
+
+This gap is **known and safe**: an unconfigured tile fails at `start` with a
+`400 provider '<p>' is not enabled on this host`, the console shows a toast, and
+the browser never navigates — so there is no broken redirect to come back from.
+Closing the gap (shipping more well-known URLs, or hiding unconfigured tiles) is
+separate work.
+
 ## Read plane — GraphQL (`/graphql`)
 
 Every console **read** is served by a single async-graphql query surface at
-`POST /graphql` (with a `GET /graphql` GraphiQL explorer in development). The
-schema is query-only — REST owns writes — and is **built once at startup** and
+`POST /graphql` (with a `GET /graphql` GraphiQL explorer in development) — the
+sole exceptions being the two inbox `GET`s and the two workspace `GET`s above,
+which exist because the console ships no GraphQL client and those two views need
+a reachable read (issues #173 and #177 respectively). The schema is
+query-only — REST otherwise owns writes — and is **built once at startup** and
 stored on `AppState`; each request injects its resolved `GqlAuth` principal.
 
 The schema is rooted at a **`Company` aggregation object** so a view fetches

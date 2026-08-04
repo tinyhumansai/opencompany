@@ -71,7 +71,12 @@ export function MessageComposer({ placeholder, disabled, onSend, compact }: Prop
   }
 
   return (
-    <div className={cn("shrink-0 px-4", compact ? "pb-3" : "pb-4")}>
+    <div
+      className={cn("shrink-0 px-4", compact ? "pb-3" : "pb-4")}
+      // The guided tour spotlights the channel composer. The thread panel's
+      // compact copy stays unlabelled so the tour can't anchor on the wrong one.
+      data-tour={compact ? undefined : "chat-composer"}
+    >
       <div className="rounded-xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40">
         {!compact && (
           <div className="flex items-center gap-0.5 border-b px-2 py-1">

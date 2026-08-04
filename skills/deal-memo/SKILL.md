@@ -2,6 +2,7 @@
 name: Deal Memo
 description: Turn diligence on an opportunity into a structured memo with a clear recommendation.
 category: Research
+version: 1.0.0
 ---
 
 # Deal Memo

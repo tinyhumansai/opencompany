@@ -44,4 +44,6 @@ pub use routes::router;
 #[cfg(test)]
 mod auth_test;
 #[cfg(test)]
+mod hub_test;
+#[cfg(test)]
 mod routes_test;

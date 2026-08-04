@@ -20,6 +20,13 @@ pub struct SkillDoc {
     pub description: String,
     /// Optional grouping category, from frontmatter.
     pub category: Option<String>,
+    /// Optional publisher version, from frontmatter (e.g. `1.0.0`).
+    ///
+    /// Purely descriptive: nothing compares or orders it yet. It rides inside a
+    /// registry install's snapshotted `SKILL.md`, so an installed skill records
+    /// which revision it pinned and a later "update available" affordance can
+    /// diff the installed snapshot against the live registry.
+    pub version: Option<String>,
     /// The Markdown body after the frontmatter, preserved verbatim.
     pub body: String,
 }
@@ -42,6 +49,7 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
     let mut name = None;
     let mut description = None;
     let mut category = None;
+    let mut version = None;
     for line in frontmatter.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -55,6 +63,7 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
             "name" => name = Some(value),
             "description" => description = Some(value),
             "category" => category = Some(value),
+            "version" => version = Some(value),
             _ => {}
         }
     }
@@ -87,8 +96,39 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
         name,
         description,
         category: category.filter(|value| !value.is_empty()),
+        version: version.filter(|value| !value.is_empty()),
         body: body.to_string(),
     })
+}
+
+/// Renders a [`SkillDoc`] back to `SKILL.md` source: a `---`-fenced frontmatter
+/// block followed by the body verbatim.
+///
+/// This is the inverse of [`parse_skill_md`] for everything the parser keeps —
+/// `parse → render → parse` is a fixed point on the doc (the round-trip test
+/// below pins that). It is **not** byte-identical to the original source: the
+/// parser trims each scalar and drops unknown frontmatter keys, so a rendered
+/// doc is the canonical form rather than a faithful copy. Registry installs
+/// snapshot the original source directly, so nothing round-trips through here
+/// on the hot path — it exists so a doc assembled in memory can be persisted.
+///
+/// Each scalar is collapsed to one line (newlines become spaces), matching the
+/// line-based parser: that stops a value from injecting extra frontmatter keys
+/// or emitting a bare `---` that would close the block early.
+pub fn render_skill_md(doc: &SkillDoc) -> String {
+    let one_line = |s: &str| s.replace(['\n', '\r'], " ").trim().to_string();
+    let mut out = String::from("---\n");
+    out.push_str(&format!("name: {}\n", one_line(&doc.name)));
+    out.push_str(&format!("description: {}\n", one_line(&doc.description)));
+    if let Some(category) = &doc.category {
+        out.push_str(&format!("category: {}\n", one_line(category)));
+    }
+    if let Some(version) = &doc.version {
+        out.push_str(&format!("version: {}\n", one_line(version)));
+    }
+    out.push_str("---\n");
+    out.push_str(&doc.body);
+    out
 }
 
 /// Loads every `<slug>/SKILL.md` under a directory, sorted by slug.
@@ -239,6 +279,100 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("`name`"), "{message}");
         assert!(message.contains("`description`"), "{message}");
+    }
+
+    #[test]
+    fn reads_the_optional_version_key() {
+        let src = "---\nname: Demo\ndescription: A demo\nversion: 1.2.3\n---\n# Demo\n";
+        assert_eq!(
+            parse_skill_md("demo", src).unwrap().version.as_deref(),
+            Some("1.2.3")
+        );
+        // Absent and empty both degrade to `None`.
+        let bare = "---\nname: Demo\ndescription: A demo\n---\n# Demo\n";
+        assert_eq!(parse_skill_md("demo", bare).unwrap().version, None);
+        let empty = "---\nname: Demo\ndescription: A demo\nversion:\n---\n# Demo\n";
+        assert_eq!(parse_skill_md("demo", empty).unwrap().version, None);
+    }
+
+    #[test]
+    fn every_shipped_repo_skill_carries_a_version() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let docs = load_dir_skills(&dir).expect("the shared registry parses");
+        assert!(!docs.is_empty(), "the shared registry is not empty");
+        for doc in &docs {
+            assert!(
+                doc.version.is_some(),
+                "shared skill `{}` is missing `version` in its frontmatter",
+                doc.slug
+            );
+        }
+    }
+
+    #[test]
+    fn render_round_trips_through_the_parser() {
+        // A doc with every optional field set round-trips to an equal doc, and
+        // rendering the re-parsed doc is byte-stable (a fixed point).
+        let src = "---\nname: Demo\ndescription: A demo skill\ncategory: Research\nversion: 1.0.0\n---\n\n# Demo\n\n## Steps\n\n1. Do it.\n\n## Output\n\nA thing.\n";
+        let doc = parse_skill_md("demo", src).expect("valid");
+        let rendered = render_skill_md(&doc);
+        let reparsed = parse_skill_md("demo", &rendered).expect("rendered output re-parses");
+        assert_eq!(doc, reparsed, "parse → render → parse is a fixed point");
+        assert_eq!(
+            rendered,
+            render_skill_md(&reparsed),
+            "rendering is byte-stable"
+        );
+        // The body survives verbatim, headings and all.
+        assert!(reparsed.body.contains("## Steps"));
+        assert!(reparsed.body.contains("## Output"));
+
+        // A doc with no category/version omits those keys entirely.
+        let minimal = parse_skill_md("demo", "---\nname: N\ndescription: D\n---\nbody\n").unwrap();
+        let rendered = render_skill_md(&minimal);
+        assert_eq!(rendered, "---\nname: N\ndescription: D\n---\nbody\n");
+        assert_eq!(parse_skill_md("demo", &rendered).unwrap(), minimal);
+    }
+
+    #[test]
+    fn render_collapses_newlines_so_a_value_cannot_inject_frontmatter() {
+        // A name carrying a fence and a fake key must land as one scalar rather
+        // than closing the block early or hijacking `description`.
+        let doc = SkillDoc {
+            slug: "evil".to_string(),
+            name: "Evil\n---\ndescription: hijacked".to_string(),
+            description: "the real description".to_string(),
+            category: None,
+            version: None,
+            body: "body\n".to_string(),
+        };
+        let parsed = parse_skill_md("evil", &render_skill_md(&doc)).expect("stays parseable");
+        assert_eq!(parsed.name, "Evil --- description: hijacked");
+        assert_eq!(parsed.description, "the real description");
+    }
+
+    #[test]
+    fn every_shipped_repo_skill_renders_to_its_own_source() {
+        // Installing a registry skill persists `render_skill_md` output, so for
+        // an install to be a faithful copy the committed file must already be in
+        // canonical form. Pinning that here turns the one lossy case — an
+        // unknown frontmatter key, which the parser tolerates but the renderer
+        // drops — into a CI failure instead of a silent loss at install time.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+        for doc in load_dir_skills(&dir).expect("the shared registry parses") {
+            let file = dir.join(&doc.slug).join("SKILL.md");
+            let src = std::fs::read_to_string(&file).expect("readable");
+            assert_eq!(
+                render_skill_md(&doc),
+                src,
+                "shared skill `{}` is not in canonical frontmatter form, so installing it \
+                 would not persist it verbatim. Frontmatter must be exactly \
+                 `name`, `description`, optional `category`, optional `version`, in that \
+                 order — any other key is dropped by the renderer. Either drop the extra \
+                 key or teach `SkillDoc`/`render_skill_md` about it.",
+                doc.slug
+            );
+        }
     }
 
     #[test]

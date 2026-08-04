@@ -87,6 +87,9 @@ pub struct UsageTotalsGql {
     pub oauth_calls: f64,
     /// Number of distinct connections used.
     pub connections: i32,
+    /// Total metered web searches (issue #238). Their USD cost is already
+    /// inside `cost_usd`; this is the call count.
+    pub search_calls: f64,
 }
 
 /// The usage read surface for a company.
@@ -159,6 +162,7 @@ impl From<UsageTotals> for UsageTotalsGql {
             cost_usd: totals.cost_usd,
             oauth_calls: totals.oauth_calls as f64,
             connections: totals.connections as i32,
+            search_calls: totals.search_calls as f64,
         }
     }
 }

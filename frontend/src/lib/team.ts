@@ -12,6 +12,19 @@ export interface TeamMember {
   description: string;
   /** Avatar tone key; derived from the id so colors stay stable. */
   tone: string;
+  /**
+   * Whether this teammate has an inbox on the host. Read from `GET …/team` and
+   * written by `PUT …/team/{id}/inbox` — never guessed client-side, so the Inbox
+   * page and this toggle agree on the same `InboxStore` state (issue #173).
+   */
+  inboxEnabled: boolean;
+  /**
+   * The teammate's daily spend cap in USD, when the company sets one. Undefined
+   * means uncapped — the card shows no budget line at all rather than "$0".
+   */
+  budgetUsdDaily?: number;
+  /** What this teammate has spent since 00:00 UTC; only meaningful with a cap. */
+  spentTodayUsd?: number;
 }
 
 const TONE_KEYS = ["sky", "violet", "amber", "emerald", "rose", "cyan", "indigo", "teal"];
@@ -42,6 +55,11 @@ export function fromDto(dto: TeamMemberDto): TeamMember {
     role: dto.role,
     description: dto.description ?? "",
     tone: toneFor(dto.id || name),
+    inboxEnabled: dto.inboxEnabled ?? false,
+    // Carried through as-is: `undefined` means uncapped and must stay
+    // `undefined`, never coalesced to `0`.
+    budgetUsdDaily: dto.budgetUsdDaily,
+    spentTodayUsd: dto.spentTodayUsd,
   };
 }
 
@@ -49,7 +67,7 @@ let n = 0;
 const id = () => `member-${n++}`;
 
 function member(name: string, role: string, description: string): TeamMember {
-  return { id: id(), name, role, description, tone: toneFor(name) };
+  return { id: id(), name, role, description, tone: toneFor(name), inboxEnabled: false };
 }
 
 /**
@@ -86,6 +104,7 @@ export function newMember(fields: { name: string; role: string; description: str
     role: fields.role.trim(),
     description: fields.description.trim(),
     tone: toneFor(memberId),
+    inboxEnabled: false,
   };
 }
 

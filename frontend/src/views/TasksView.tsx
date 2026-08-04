@@ -1,14 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Plus, Trash2 } from "lucide-react";
+import { Loader2, Play, Plus } from "lucide-react";
 
-import {
-  createTask,
-  deleteTask,
-  listTasks,
-  patchTask,
-  type PatchTask,
-  type Task,
-} from "@/api/tasks";
+import { createTask, listTasks, patchTask, type Task } from "@/api/tasks";
 import type { OpenCompanyClient } from "@/api/client";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -21,22 +14,30 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
+import { ADD_TASK_COLUMN, PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
+import { TaskDetailView } from "./TaskDetailView";
 
-const PRIORITIES = ["low", "medium", "high"] as const;
+/**
+ * Reads the `#/tasks/<id>` sub-hash, or null on the bare board. The app shell's
+ * `useHashView` only inspects the first path segment (`tasks`), so this second
+ * segment is ours to own — no app-shell change needed to route the detail.
+ */
+function readTaskDetailId(): string | null {
+  try {
+    const parts = window.location.hash.replace(/^#\/?/, "").split(/[/?]/);
+    return parts[0] === "tasks" && parts[1] ? decodeURIComponent(parts[1]) : null;
+  } catch {
+    // Malformed percent-encoding (e.g. `#/tasks/%`) throws URIError — fall back
+    // to the bare board instead of blowing up the render. Covers both the
+    // useState initializer and the hashchange handler, since both call here.
+    return null;
+  }
+}
 
 /** How often to re-poll the board, so a dispatched card's result appears. */
 const POLL_MS = 4000;
@@ -55,17 +56,26 @@ function priorityStyle(priority: string): string {
 export function TasksView({
   client,
   company,
+  onOpenThread,
 }: {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * Opens the chat thread a card came from (issue #246). Absent when the board
+   * is rendered somewhere with no conversation pane to jump to, in which case
+   * the detail screen states the origin without offering the jump.
+   */
+  onOpenThread?: (threadId: string) => void;
 }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [overCol, setOverCol] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Task | null>(null);
-  const [creatingIn, setCreatingIn] = useState<string | null>(null);
+  // The open card's id, mirrored in `#/tasks/<id>` so the detail survives a
+  // refresh and honors back/forward.
+  const [detailId, setDetailId] = useState<string | null>(readTaskDetailId);
+  const [creating, setCreating] = useState(false);
   const mounted = useRef(true);
   // A real HTML5 drag fires a trailing click; suppress it so a drag never also
   // opens the detail dialog.
@@ -95,6 +105,22 @@ export function TasksView({
     };
   }, [refresh]);
 
+  // Follow browser back/forward and manual edits of the `#/tasks/<id>` sub-hash.
+  useEffect(() => {
+    const onHash = () => setDetailId(readTaskDetailId());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const openDetail = useCallback((id: string) => {
+    window.location.hash = `/tasks/${encodeURIComponent(id)}`;
+    setDetailId(id);
+  }, []);
+  const closeDetail = useCallback(() => {
+    window.location.hash = "/tasks";
+    setDetailId(null);
+  }, []);
+
   async function moveTo(column: string) {
     const id = dragId;
     setDragId(null);
@@ -118,20 +144,63 @@ export function TasksView({
     }
   }
 
+  // Re-dispatch a paused card (issue #111): a Resume moves it back into
+  // "In progress", which is what hands it to its assignee again. Optimistic,
+  // reconciled against the server echo — the same shape as a drag-move.
+  async function resume(task: Task) {
+    setTasks((ts) => ts.map((t) => (t.id === task.id ? { ...t, column: "in_progress" } : t)));
+    try {
+      const saved = await patchTask(client, company, task.id, { column: "in_progress" });
+      setTasks((ts) => ts.map((t) => (t.id === task.id ? saved : t)));
+      toast.success("Resumed — the assignee is working on it.");
+      // The turn runs server-side; poll a touch sooner so the result shows.
+      setTimeout(() => void refresh(), 1500);
+    } catch (e) {
+      setTasks((ts) => ts.map((t) => (t.id === task.id ? { ...t, column: task.column } : t)));
+      toast.error(e instanceof Error ? e.message : "could not resume the card");
+    }
+  }
+
   function openCard(task: Task) {
     if (dragged.current) {
       dragged.current = false;
       return;
     }
-    setSelected(task);
+    openDetail(task.id);
+  }
+
+  // The detail screen replaces the board in place; the board keeps polling
+  // underneath so its state is reconciled by the time we return.
+  if (detailId) {
+    return (
+      <TaskDetailView
+        client={client}
+        company={company}
+        taskId={detailId}
+        onBack={closeDetail}
+        onNavigate={openDetail}
+        onOpenThread={onOpenThread}
+        onSaved={(saved) => setTasks((ts) => ts.map((t) => (t.id === saved.id ? saved : t)))}
+        onDeleted={(id) => setTasks((ts) => ts.filter((t) => t.id !== id))}
+      />
+    );
   }
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex items-center justify-between border-b px-4 py-3">
         <div className="flex items-center gap-2">
           <h2 className="text-sm font-semibold">Board</h2>
           <Badge variant="secondary">{tasks.length}</Badge>
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-1 h-7"
+            onClick={() => setCreating(true)}
+          >
+            <Plus className="size-4" />
+            Add task
+          </Button>
         </div>
         <p className="hidden text-xs text-muted-foreground sm:block">
           Drag a card to move it; drop into “In progress” to hand it to its assignee.
@@ -146,7 +215,7 @@ export function TasksView({
         </div>
       )}
 
-      <div className="flex flex-1 gap-4 overflow-x-auto p-4">
+      <div className="flex min-h-0 flex-1 gap-4 overflow-x-auto py-4 pl-4">
         {TASK_COLUMNS.map((col) => {
           const items = tasks.filter((t) => t.column === col.id);
           return (
@@ -159,24 +228,18 @@ export function TasksView({
               onDragLeave={() => setOverCol((c) => (c === col.id ? null : c))}
               onDrop={() => void moveTo(col.id)}
               className={cn(
-                "flex w-72 shrink-0 flex-col rounded-xl border bg-card/40 transition-colors",
+                "flex min-h-0 w-72 shrink-0 flex-col rounded-xl border bg-card/40 transition-colors",
                 overCol === col.id && "border-primary/40 bg-accent/40",
               )}
             >
-              <div className="flex items-center justify-between px-3 py-2.5">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium">{col.label}</span>
-                  <span className="text-xs text-muted-foreground">{items.length}</span>
-                </div>
-                <button
-                  className="text-muted-foreground hover:text-foreground"
-                  aria-label={`Add task to ${col.label}`}
-                  onClick={() => setCreatingIn(col.id)}
-                >
-                  <Plus className="size-4" />
-                </button>
+              {/* New work enters the board in one place only (issue #206), and
+                  that entry point now lives in the board header rather than on
+                  this column. */}
+              <div className="flex items-center gap-2 px-3 py-2.5">
+                <span className="text-sm font-medium">{col.label}</span>
+                <span className="text-xs text-muted-foreground">{items.length}</span>
               </div>
-              <div className="flex flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
+              <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
                 {loading && items.length === 0 ? (
                   <Skeleton className="h-20 rounded-lg" />
                 ) : (
@@ -186,6 +249,7 @@ export function TasksView({
                       task={t}
                       dragging={dragId === t.id}
                       onOpen={() => openCard(t)}
+                      onResume={() => void resume(t)}
                       onDragStart={() => {
                         dragged.current = true;
                         setDragId(t.id);
@@ -209,29 +273,17 @@ export function TasksView({
             </div>
           );
         })}
+        {/* Trailing gutter: flex scroll containers drop their padding-inline-end,
+            so this spacer keeps ~16px of breathing room past the last column. */}
+        <div aria-hidden className="w-4 shrink-0" />
       </div>
 
-      <TaskDetailDialog
-        task={selected}
-        onClose={() => setSelected(null)}
-        onSaved={(saved) => {
-          setTasks((ts) => ts.map((t) => (t.id === saved.id ? saved : t)));
-          setSelected(null);
-        }}
-        onDeleted={(id) => {
-          setTasks((ts) => ts.filter((t) => t.id !== id));
-          setSelected(null);
-        }}
-        client={client}
-        company={company}
-      />
-
       <CreateTaskDialog
-        column={creatingIn}
-        onClose={() => setCreatingIn(null)}
+        open={creating}
+        onClose={() => setCreating(false)}
         onCreated={(created) => {
           setTasks((ts) => [created, ...ts]);
-          setCreatingIn(null);
+          setCreating(false);
         }}
         client={client}
         company={company}
@@ -244,12 +296,14 @@ function TaskItem({
   task,
   dragging,
   onOpen,
+  onResume,
   onDragStart,
   onDragEnd,
 }: {
   task: Task;
   dragging: boolean;
   onOpen: () => void;
+  onResume: () => void;
   onDragStart: () => void;
   onDragEnd: () => void;
 }) {
@@ -262,6 +316,7 @@ function TaskItem({
       role="button"
       tabIndex={0}
       onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onOpen();
@@ -294,211 +349,88 @@ function TaskItem({
           <span className="truncate text-xs text-muted-foreground">{task.assignee}</span>
         </div>
       )}
+      {task.column === "paused" && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-3 h-7 w-full"
+          onClick={(e) => {
+            // Don't let the click bubble to the card's open handler.
+            e.stopPropagation();
+            onResume();
+          }}
+        >
+          <Play className="mr-1.5 size-3.5" />
+          Resume
+        </Button>
+      )}
     </div>
   );
 }
 
-function TaskDetailDialog({
-  task,
-  onClose,
-  onSaved,
-  onDeleted,
-  client,
-  company,
-}: {
-  task: Task | null;
-  onClose: () => void;
-  onSaved: (t: Task) => void;
-  onDeleted: (id: string) => void;
-  client: OpenCompanyClient;
-  company: string | null;
-}) {
-  const [draft, setDraft] = useState<PatchTask>({});
-  const [busy, setBusy] = useState(false);
+/** How long a derived title may run before the full prompt moves to the note. */
+const TITLE_CAP = 80;
 
-  // Reset the edit draft each time a different card is opened.
-  useEffect(() => {
-    if (task) {
-      setDraft({
-        title: task.title,
-        note: task.note ?? "",
-        column: task.column,
-        priority: task.priority,
-        assignee: task.assignee,
-      });
-    }
-  }, [task]);
-
-  if (!task) return null;
-
-  async function save() {
-    if (!task) return;
-    setBusy(true);
-    try {
-      const saved = await patchTask(client, company, task.id, draft);
-      onSaved(saved);
-      toast.success("Saved.");
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not save");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function remove() {
-    if (!task) return;
-    setBusy(true);
-    try {
-      await deleteTask(client, company, task.id);
-      onDeleted(task.id);
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not delete");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <Dialog open={!!task} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Task detail</DialogTitle>
-          <DialogDescription>
-            Edit the card, or drop it into “In progress” on the board to dispatch it.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="grid gap-3">
-          <div className="grid gap-1.5">
-            <Label htmlFor="task-title">Title</Label>
-            <Input
-              id="task-title"
-              value={draft.title ?? ""}
-              onChange={(e) => setDraft((d) => ({ ...d, title: e.target.value }))}
-            />
-          </div>
-
-          <div className="grid gap-1.5">
-            <Label htmlFor="task-note">Note / result</Label>
-            <Textarea
-              id="task-note"
-              rows={8}
-              className="font-mono text-xs"
-              value={draft.note ?? ""}
-              onChange={(e) => setDraft((d) => ({ ...d, note: e.target.value }))}
-            />
-          </div>
-
-          <div className="grid grid-cols-3 gap-3">
-            <div className="grid gap-1.5">
-              <Label>Column</Label>
-              <Select
-                value={draft.column}
-                onValueChange={(v) => setDraft((d) => ({ ...d, column: v ?? undefined }))}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {TASK_COLUMNS.map((c) => (
-                    <SelectItem key={c.id} value={c.id}>
-                      {c.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid gap-1.5">
-              <Label>Priority</Label>
-              <Select
-                value={draft.priority}
-                onValueChange={(v) => setDraft((d) => ({ ...d, priority: v ?? undefined }))}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {PRIORITIES.map((p) => (
-                    <SelectItem key={p} value={p} className="capitalize">
-                      {p}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="task-assignee">Assignee</Label>
-              <Input
-                id="task-assignee"
-                value={draft.assignee ?? ""}
-                placeholder="agent id"
-                onChange={(e) => setDraft((d) => ({ ...d, assignee: e.target.value }))}
-              />
-            </div>
-          </div>
-        </div>
-
-        <DialogFooter className="justify-between sm:justify-between">
-          <Button variant="ghost" size="sm" onClick={() => void remove()} disabled={busy}>
-            <Trash2 className="mr-1.5 size-4" />
-            Delete
-          </Button>
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={onClose} disabled={busy}>
-              Cancel
-            </Button>
-            <Button onClick={() => void save()} disabled={busy}>
-              {busy && <Loader2 className="mr-1.5 size-4 animate-spin" />}
-              Save
-            </Button>
-          </div>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
+/**
+ * Splits a prompt into the card's `{title, note}` (issue #301).
+ *
+ * The dialog asks for one thing — what needs doing — so the card's two text
+ * fields are derived rather than collected. The rule mirrors the host's own
+ * chat task-intent derivation (`src/server/operator.rs`) and `delegate_to_desk`'s
+ * `first_line(…, 80)`: the title is the prompt's first line, capped; the note
+ * carries the **full** prompt only when the title was shortened from it, so a
+ * one-liner does not duplicate itself onto its own card.
+ *
+ * The invariant that matters: the operator's full text always survives on the
+ * card, in the title or the note. Epic #183 §4's planner reads it from there.
+ */
+export function derivePromptCard(prompt: string): { title: string; note?: string } {
+  const full = prompt.trim();
+  const firstLine = full.split("\n")[0].trim();
+  const title =
+    firstLine.length > TITLE_CAP ? `${firstLine.slice(0, TITLE_CAP).trimEnd()}…` : firstLine;
+  return { title, note: title === full ? undefined : full };
 }
 
+/**
+ * New work enters the board through one prompt box (issue #301).
+ *
+ * Title/Note/Priority/Assignee used to be collected up front. They are not gone,
+ * only moved: priority and assignee default on the host (`medium`, unassigned →
+ * orchestrator) and are edited on the card afterwards, where #278 put the
+ * picker. `column` is omitted on purpose so the *server's* intake default
+ * decides where the card lands — the same spend gate the transcript's "Add to
+ * board" relies on, keeping the human drag into In progress the only thing that
+ * spends an agent turn.
+ */
 function CreateTaskDialog({
-  column,
+  open,
   onClose,
   onCreated,
   client,
   company,
 }: {
-  column: string | null;
+  open: boolean;
   onClose: () => void;
   onCreated: (t: Task) => void;
   client: OpenCompanyClient;
   company: string | null;
 }) {
-  const [title, setTitle] = useState("");
-  const [note, setNote] = useState("");
-  const [priority, setPriority] = useState("medium");
-  const [assignee, setAssignee] = useState("");
+  const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (column) {
-      setTitle("");
-      setNote("");
-      setPriority("medium");
-      setAssignee("");
-    }
-  }, [column]);
+    if (open) setPrompt("");
+  }, [open]);
 
-  if (!column) return null;
+  if (!open) return null;
 
   async function create() {
-    if (!title.trim()) return;
+    const { title, note } = derivePromptCard(prompt);
+    if (!title) return;
     setBusy(true);
     try {
-      const created = await createTask(client, company, {
-        title: title.trim(),
-        note: note.trim() || undefined,
-        column: column ?? undefined,
-        priority,
-        assignee: assignee.trim() || undefined,
-      });
+      const created = await createTask(client, company, { title, note });
       onCreated(created);
       toast.success("Task created.");
     } catch (e) {
@@ -508,70 +440,37 @@ function CreateTaskDialog({
     }
   }
 
-  const columnLabel = TASK_COLUMNS.find((c) => c.id === column)?.label ?? column;
+  const columnLabel =
+    TASK_COLUMNS.find((c) => c.id === ADD_TASK_COLUMN)?.label ?? ADD_TASK_COLUMN;
 
   return (
-    <Dialog open={!!column} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-lg">
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      {/* `sm:` — DialogContent's own `sm:max-w-sm` beats an unprefixed width. */}
+      <DialogContent className="sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>New task</DialogTitle>
           <DialogDescription>Added to “{columnLabel}”.</DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-3">
-          <div className="grid gap-1.5">
-            <Label htmlFor="new-title">Title</Label>
-            <Input
-              id="new-title"
-              autoFocus
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="What needs doing?"
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label htmlFor="new-note">Note</Label>
-            <Textarea
-              id="new-note"
-              rows={4}
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="Any detail the assignee should act on."
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="grid gap-1.5">
-              <Label>Priority</Label>
-              <Select value={priority} onValueChange={(v) => setPriority(v ?? "medium")}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {PRIORITIES.map((p) => (
-                    <SelectItem key={p} value={p} className="capitalize">
-                      {p}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="new-assignee">Assignee</Label>
-              <Input
-                id="new-assignee"
-                value={assignee}
-                placeholder="agent id"
-                onChange={(e) => setAssignee(e.target.value)}
-              />
-            </div>
-          </div>
+        <div className="grid gap-1.5">
+          <Label htmlFor="new-prompt">What needs doing?</Label>
+          <Textarea
+            id="new-prompt"
+            autoFocus
+            // Textarea is `field-sizing-content`, so `rows` is inert — a
+            // min-height is what actually gives the box room.
+            className="min-h-32 resize-y"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Describe the work. The first line becomes the card's title."
+          />
         </div>
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button onClick={() => void create()} disabled={busy || !title.trim()}>
+          <Button onClick={() => void create()} disabled={busy || !prompt.trim()}>
             {busy && <Loader2 className="mr-1.5 size-4 animate-spin" />}
             Create
           </Button>

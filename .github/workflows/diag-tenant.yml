@@ -1,0 +1,76 @@
+# Read-only-ish tenant diagnostics over the same SSH path the deploy uses.
+# Captures why a staging tenant's rollout produces no healthy pod: events,
+# statefulset status, node pressure, and (optionally) a wake that scales the
+# tenant to 1 and captures the booting pod's state + logs before it dies.
+# Output is redacted for common credential shapes before it reaches the run log.
+name: Diagnose tenant (read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: Tenant namespace to inspect
+        type: string
+        default: tenant-smoke1
+      wake:
+        description: Scale the tenant to 1 and capture the booting pod (else leave as-is)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        run: ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Dump tenant diagnostics (redacted)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          NS: ${{ inputs.namespace }}
+          WAKE: ${{ inputs.wake }}
+        run: |
+          ssh root@${SSH_HOST} "NS='${NS}' WAKE='${WAKE}' bash -s" <<'REMOTE' \
+            | sed -E 's#(mongodb(\+srv)?://[^:]+:)[^@]+@#\1***@#g; s#(Bearer )[A-Za-z0-9._-]{6,}#\1***#g; s#sntryu_[A-Za-z0-9]+#sntryu_***#g; s#((password|passwd|secret|token|apikey|api_key)[\"'"'"'=: ]+)[A-Za-z0-9._/+-]{8,}#\1***#gI'
+          set -uo pipefail
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          echo "===== CLUSTER OIDC issuer (for OPENCOMPANY_CLUSTER_ISSUER) ====="
+          kubectl get --raw /.well-known/openid-configuration 2>&1 \
+            | (jq -r '"issuer=\(.issuer)\njwks_uri=\(.jwks_uri)"' 2>/dev/null || cat) || true
+          echo "===== attestation env ON LIVE DEPLOYMENTS (audience/issuer set?) ====="
+          kubectl get deploy -A -o json 2>/dev/null \
+            | jq -r '.items[] | .metadata.namespace as $ns | .metadata.name as $n | (.spec.template.spec.containers[]?.env[]? | select(.name|test("ATTESTATION|CLUSTER_ISSUER|TENANT_SA_NAME|TENANT_NS")) | "\($ns)/\($n)  \(.name)=\(.value // "(fromSecret/ref)")")' \
+            2>/dev/null | sort -u || echo "(none set on any deployment)"
+          echo "===== statefulset status ====="
+          kubectl -n "$NS" get sts opencompany -o custom-columns=REPLICAS:.spec.replicas,READY:.status.readyReplicas,CURRENT:.status.currentReplicas,IMG:.spec.template.spec.containers[0].image 2>&1 || true
+          echo "===== describe statefulset (events tail) ====="
+          kubectl -n "$NS" describe sts opencompany 2>&1 | tail -30 || true
+          echo "===== namespace events (recent) ====="
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>&1 | tail -40 || true
+          echo "===== node pressure / allocatable ====="
+          kubectl describe nodes 2>&1 | grep -EA6 'Allocated resources|MemoryPressure|DiskPressure' | head -40 || true
+          if [ "$WAKE" = "true" ]; then
+            echo "===== WAKE: scale to 1 + capture ====="
+            kubectl -n "$NS" scale sts/opencompany --replicas=1 2>&1 || true
+            for i in $(seq 1 12); do
+              sleep 8
+              line=$(kubectl -n "$NS" get pods -o wide --no-headers 2>&1 | head -3)
+              echo "[t+$((i*8))s] $line"
+            done
+            echo "----- pod describe (events) -----"
+            kubectl -n "$NS" describe pod -l app=opencompany 2>&1 | sed -n '/Events:/,$p' | head -30 || true
+            echo "----- pod logs (current, tail 200) -----"
+            kubectl -n "$NS" logs -l app=opencompany --tail=200 --all-containers 2>&1 | tail -200 || true
+            echo "----- pod logs (previous, tail 200) -----"
+            kubectl -n "$NS" logs -l app=opencompany --previous --tail=200 --all-containers 2>&1 | tail -200 || echo "(no previous)"
+          fi
+          echo "===== done ====="
+          REMOTE

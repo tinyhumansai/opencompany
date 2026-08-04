@@ -27,8 +27,11 @@ const PLATFORM_SECRET: &str = "plat-secret";
 
 const ACME_TOML: &str = "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n";
 
-fn home() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("oc-provision-{}", crate::ports::generate_id()))
+fn home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("oc-provision-")
+        .tempdir()
+        .expect("tempdir")
 }
 
 fn platform_state(home: &std::path::Path, max_per_tenant: Option<usize>) -> AppState {
@@ -118,7 +121,8 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn provision_then_list_then_status() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -150,12 +154,12 @@ async fn provision_then_list_then_status() {
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
     assert_eq!(json_body(status).await["id"], "acme");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn provision_accepts_json_envelope_with_explicit_id() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -171,12 +175,12 @@ async fn provision_accepts_json_envelope_with_explicit_id() {
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(json_body(response).await["id"], "custom-id");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn provision_requires_platform_scope() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -196,12 +200,12 @@ async fn provision_requires_platform_scope() {
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     assert_eq!(json_body(forbidden).await["code"], "forbidden");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn invalid_manifest_is_400() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -213,12 +217,12 @@ async fn invalid_manifest_is_400() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["code"], "manifest_invalid");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn quota_rejects_when_exceeded() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, Some(1));
     let app = router(state);
 
@@ -236,12 +240,12 @@ async fn quota_rejects_when_exceeded() {
         .unwrap();
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(json_body(second).await["code"], "quota_exceeded");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn duplicate_id_conflicts() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -258,12 +262,12 @@ async fn duplicate_id_conflicts() {
         .unwrap();
     assert_eq!(dup.status(), StatusCode::CONFLICT);
     assert_eq!(json_body(dup).await["code"], "company_exists");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn provision_namespaces_id_by_workload_tenant() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     // Workload tenant is `tenant-a`.
     let state = namespaced_state(&home, "tenant-a");
     // Keep a handle on the shared ownership map to inspect what boot hydration
@@ -286,7 +290,6 @@ async fn provision_namespaces_id_by_workload_tenant() {
     // hydration filters on — so the company survives a restart.
     let id = CompanyId::new("tenant-a--acme");
     assert_eq!(observed.owner_of(&id).as_deref(), Some("tenant-a"));
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
@@ -295,7 +298,8 @@ async fn same_template_under_two_tenant_workloads_does_not_conflict() {
     // `OPENCOMPANY_TENANT_ID`, writing to one shared logical database. In a
     // shared DB the derived id `acme` used to collide; per-workload namespacing
     // keeps them distinct.
-    let home_a = home();
+    let home_a_dir = home();
+    let home_a = home_a_dir.path().to_path_buf();
     let app_a = router(namespaced_state(&home_a, "tenant-a"));
     let a = tenant_token("tenant-a", &["platform", "operator"]);
     let first = app_a
@@ -305,7 +309,8 @@ async fn same_template_under_two_tenant_workloads_does_not_conflict() {
     assert_eq!(first.status(), StatusCode::CREATED);
     assert_eq!(json_body(first).await["id"], "tenant-a--acme");
 
-    let home_b = home();
+    let home_b_dir = home();
+    let home_b = home_b_dir.path().to_path_buf();
     let app_b = router(namespaced_state(&home_b, "tenant-b"));
     let b = tenant_token("tenant-b", &["platform", "operator"]);
     let second = app_b
@@ -314,9 +319,6 @@ async fn same_template_under_two_tenant_workloads_does_not_conflict() {
         .unwrap();
     assert_eq!(second.status(), StatusCode::CREATED);
     assert_eq!(json_body(second).await["id"], "tenant-b--acme");
-
-    std::fs::remove_dir_all(&home_a).ok();
-    std::fs::remove_dir_all(&home_b).ok();
 }
 
 #[tokio::test]
@@ -324,7 +326,8 @@ async fn claim_shaped_tenant_manages_namespaced_company() {
     // Shared-single-DB workload for tenant slug `acme` (its bare
     // `OPENCOMPANY_TENANT_ID`). A full-platform token provisions the company; it
     // is namespaced `acme--acme` and its owner is recorded under the bare slug.
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = namespaced_state(&home, "acme");
     let observed = state.clone();
     let app = router(state);
@@ -370,7 +373,6 @@ async fn claim_shaped_tenant_manages_namespaced_company() {
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    std::fs::remove_dir_all(&home).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +381,8 @@ async fn claim_shaped_tenant_manages_namespaced_company() {
 
 #[tokio::test]
 async fn pause_toggles_and_chat_409() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -433,12 +436,12 @@ async fn pause_toggles_and_chat_409() {
         .await
         .unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn suspend_requires_platform_scope_and_blocks_chat() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -478,12 +481,12 @@ async fn suspend_requires_platform_scope_and_blocks_chat() {
         .await
         .unwrap();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn foreign_tenant_cannot_file_feedback() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -505,12 +508,12 @@ async fn foreign_tenant_cannot_file_feedback() {
         .unwrap();
     let denied = app.oneshot(req).await.unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn owner_cannot_resume_a_platform_suspension() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -549,12 +552,12 @@ async fn owner_cannot_resume_a_platform_suspension() {
         .unwrap();
     assert_eq!(resumed.status(), StatusCode::OK);
     assert_eq!(json_body(resumed).await["lifecycle"], "running");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn archive_removes_from_registry() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -591,12 +594,12 @@ async fn archive_removes_from_registry() {
         .await
         .unwrap();
     assert_eq!(chat.status(), StatusCode::NOT_FOUND);
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn cross_tenant_access_forbidden() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -616,12 +619,12 @@ async fn cross_tenant_access_forbidden() {
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[tokio::test]
 async fn lifecycle_transition_recorded_as_event() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = platform_state(&home, None);
     let app = router(state);
 
@@ -649,7 +652,6 @@ async fn lifecycle_transition_recorded_as_event() {
         )
     });
     assert!(found, "expected a LifecycleChanged event, got {stored:?}");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -674,8 +676,11 @@ impl Brain for EffectBrain {
             if let CompanyEvent::OperatorMessage { text, .. } = event {
                 host.emit_effect(self.effect.clone()).await?;
                 responses.push(OutboundMessage {
+                    task_id: None,
                     channel: "operator".into(),
                     text: format!("handled: {text}"),
+                    steps: Vec::new(),
+                    reply_to: None,
                 });
             }
         }
@@ -690,7 +695,8 @@ impl Brain for EffectBrain {
 
 #[tokio::test]
 async fn webhook_emitted_on_approval_requested() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     // Prosumer mode (no platform_auth) plus a recording webhook sink.
     let (webhook, sink) = WebhookConfig::recording("tenant-secret");
     let state = AppState::new(AppConfig::default())
@@ -707,6 +713,8 @@ async fn webhook_emitted_on_approval_requested() {
         established_thread: false,
         first_time_counterparty: false,
         payload: serde_json::Value::Null,
+        agent: None,
+        run_id: None,
     };
     let runtime = RuntimeBuilder::new(home.clone(), manifest)
         .with_id(CompanyId::new("acme"))
@@ -736,5 +744,4 @@ async fn webhook_emitted_on_approval_requested() {
     // The delivery carries a non-empty signature header value.
     assert!(!approval.1.is_empty());
     assert!(approval.1.starts_with("kh1="));
-    std::fs::remove_dir_all(&home).ok();
 }

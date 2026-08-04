@@ -25,10 +25,9 @@ use super::{
     connections, finances, inbox, memory_facts, skills, tasks, usage, workflows, workspace,
 };
 use crate::company::runtime::CompanyRuntime;
-use crate::ports::types::{ActorKind, CompanyEvent, CompanyId, EventSeq, StoredEvent};
-
-/// The synthetic desk pre-threading operator messages are attributed to.
-const GENERAL_DESK: &str = "General";
+use crate::ports::types::CompanyId;
+use crate::ports::types::TurnStep;
+use crate::server::chat_history::{self, MessageView, Viewer};
 
 /// The aggregation-root handle over one company. See the module docs.
 pub struct CompanyGql {
@@ -140,7 +139,9 @@ impl CompanyGql {
         memory_facts::resolve(&self.runtime, query, kind, first, offset).await
     }
 
-    /// The enabled workflows, as one-line summaries.
+    /// The company's saved workflows, as one-line summaries — seed graphs and
+    /// runtime-authored ones alike. Each carries an `enabled` flag reporting
+    /// manifest membership; listing is not gated on it.
     async fn workflows(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<WorkflowSummaryGql>> {
         workflows::resolve_summaries(ctx, &self.runtime).await
     }
@@ -182,6 +183,33 @@ impl CompanyGql {
     async fn smtp(&self) -> async_graphql::Result<SmtpStatusGql> {
         connections::resolve_smtp(&self.runtime).await
     }
+
+    /// The source-template provenance recorded at launch: the stable template
+    /// id (directory slug) and, when known, its version. Null for a company
+    /// provisioned from a raw manifest body rather than a template.
+    async fn provenance(&self) -> async_graphql::Result<Option<TemplateProvenanceGql>> {
+        let Some(record) = self.runtime.store().load(&self.id).await? else {
+            return Ok(None);
+        };
+        Ok(record.template_provenance.map(|p| TemplateProvenanceGql {
+            source_id: p.source_id,
+            version: p.version,
+            path: p.path,
+        }))
+    }
+}
+
+/// The source-template provenance of a company: where its manifest was seeded
+/// from. Mirrors [`TemplateProvenance`](crate::ports::types::TemplateProvenance).
+#[derive(SimpleObject)]
+#[graphql(name = "TemplateProvenance")]
+pub struct TemplateProvenanceGql {
+    /// The template's stable identifier — the source directory slug.
+    pub source_id: String,
+    /// The template's version, when the source exposes one.
+    pub version: Option<String>,
+    /// The source directory path the company was launched from, when recorded.
+    pub path: Option<String>,
 }
 
 impl CompanyGql {
@@ -200,6 +228,27 @@ impl CompanyGql {
             .collect();
         let enabled = |id: &str| inbox_enabled.get(id).copied().unwrap_or(false);
 
+        // Issue #304 — mirrored from the REST `list_team` deliberately: the two
+        // reads of the same roster must not drift, so the cap columns are
+        // resolved here by the same rule (one meter read, only when somebody is
+        // capped; spend paired with the cap).
+        let any_capped = record
+            .manifest
+            .agents
+            .iter()
+            .any(|agent| agent.budget_usd_daily.is_some());
+        let spend_today = if any_capped {
+            let since = crate::metering::utc_day_start_millis(crate::ports::now_millis());
+            Some(self.runtime.usage().query(&self.id, since).await?)
+        } else {
+            None
+        };
+        let spent = |id: &str| {
+            spend_today
+                .as_ref()
+                .map(|samples| crate::metering::usd_spent_by_agent(samples, id))
+        };
+
         let mut out: Vec<TeamMemberGql> = record
             .manifest
             .agents
@@ -210,6 +259,8 @@ impl CompanyGql {
                 role: agent.role.clone(),
                 description: agent.description.clone(),
                 inbox_enabled: enabled(&agent.id),
+                budget_usd_daily: agent.budget_usd_daily,
+                spent_today_usd: agent.budget_usd_daily.and_then(|_| spent(&agent.id)),
             })
             .collect();
         out.extend(record.overlay_agents.iter().map(|agent| TeamMemberGql {
@@ -218,6 +269,9 @@ impl CompanyGql {
             role: agent.role.clone(),
             description: agent.description.clone(),
             inbox_enabled: enabled(&agent.id),
+            // Overlay teammates are uncapped in v1.
+            budget_usd_daily: None,
+            spent_today_usd: None,
         }));
         Ok(out)
     }
@@ -282,6 +336,13 @@ pub struct TeamMemberGql {
     pub description: Option<String>,
     /// Whether this teammate has an enabled inbox.
     pub inbox_enabled: bool,
+    /// This teammate's manifest `budget_usd_daily` cap (issue #304), or null
+    /// when it has none. Null-vs-set is the capped/uncapped distinction — `0`
+    /// would mean "capped at nothing".
+    pub budget_usd_daily: Option<f64>,
+    /// What this teammate has spent since 00:00 UTC; non-null only alongside a
+    /// cap.
+    pub spent_today_usd: Option<f64>,
 }
 
 /// Internal desk projection shared between `chats` and `chat`.
@@ -302,22 +363,6 @@ pub struct ChatGql {
 impl ChatGql {
     fn new(runtime: Arc<CompanyRuntime>, desk: Desk) -> Self {
         Self { runtime, desk }
-    }
-
-    /// Whether a stored event belongs to this desk. `AgentReply`s match on the
-    /// desk id or name; pre-threading `OperatorMessage`s fall to the synthetic
-    /// "General" desk.
-    fn owns(&self, event: &CompanyEvent) -> bool {
-        match event {
-            CompanyEvent::AgentReply { chat_id, .. } => {
-                chat_id == &self.desk.id || chat_id == &self.desk.name
-            }
-            CompanyEvent::OperatorMessage { .. } => {
-                self.desk.id.eq_ignore_ascii_case(GENERAL_DESK)
-                    || self.desk.name.eq_ignore_ascii_case(GENERAL_DESK)
-            }
-            _ => false,
-        }
     }
 }
 
@@ -343,34 +388,13 @@ impl ChatGql {
         self.desk.members.iter().cloned().map(ID).collect()
     }
 
-    /// User id → the label their messages are attributed to.
-    ///
-    /// Prefers a display name, and falls back to the email's *local part*
-    /// rather than the whole address: a desk history is read by every member,
-    /// and it should not hand each of them everyone else's email.
-    #[graphql(skip)]
-    async fn author_labels(
-        &self,
-    ) -> async_graphql::Result<std::collections::HashMap<String, String>> {
-        let users = self.runtime.users().list_users(self.runtime.id()).await?;
-        Ok(users
-            .into_iter()
-            .map(|user| {
-                let label = user.display_name.unwrap_or_else(|| {
-                    user.email
-                        .split('@')
-                        .next()
-                        .unwrap_or("someone")
-                        .to_string()
-                });
-                (user.id, label)
-            })
-            .collect())
-    }
-
     /// The desk's message history, most-recent last. `before` is an opaque
     /// EventLog cursor (a stringified sequence position); only messages before
     /// it are returned.
+    ///
+    /// Filtering + projection is shared with the REST `GET .../chat/history`
+    /// route via [`chat_history::history_for_desk`] (issue #65) so the two
+    /// surfaces can never disagree about a desk's transcript.
     async fn history(
         &self,
         ctx: &Context<'_>,
@@ -378,35 +402,22 @@ impl ChatGql {
         before: Option<String>,
     ) -> async_graphql::Result<Page<MessageGql>> {
         let before_seq = before.as_deref().and_then(|c| c.parse::<u64>().ok());
-        let stored = self
-            .runtime
-            .events()
-            .read_from(self.runtime.id(), EventSeq::new(0), usize::MAX)
-            .await?;
-
         let viewer = match ctx.data::<GqlAuth>() {
             Ok(GqlAuth::User(user)) => Viewer::User(user.user_id.clone()),
             _ => Viewer::Operator,
         };
-        // One roster read per history, not one per message: the scan above is
-        // already O(log), and an N+1 on top of it would be worse.
-        let authors = self.author_labels().await?;
-
-        let mut messages: Vec<MessageGql> = stored
-            .into_iter()
-            .filter(|event| self.owns(&event.event))
-            .filter(|event| before_seq.is_none_or(|before| event.seq.value() < before))
-            .map(|event| MessageGql::project(event, &viewer, &authors))
-            .collect();
-
-        let total = messages.len() as i32;
-        // Keep the most recent `first`, still in chronological order.
         let first = first.max(0) as usize;
-        if messages.len() > first {
-            messages.drain(0..messages.len() - first);
-        }
+        let (messages, total) = chat_history::history_for_desk(
+            &self.runtime,
+            &self.desk.id,
+            &self.desk.name,
+            &viewer,
+            before_seq,
+            first,
+        )
+        .await?;
         Ok(Page {
-            items: messages,
+            items: messages.into_iter().map(MessageGql::from).collect(),
             total,
         })
     }
@@ -428,77 +439,63 @@ pub struct MessageGql {
     pub at_millis: f64,
     /// Whether it is the operator's own message.
     pub mine: bool,
+    /// The scrubbed processing steps behind a company reply, so a rehydrated
+    /// transcript renders the same timeline the REST route returns (issue #65
+    /// parity). Empty for operator messages and tool-less replies.
+    pub steps: Vec<MessageStepGql>,
+    /// The board card this reply is about (issue #246): the card the turn
+    /// opened, or the dispatched card it ran for (#185). Projected from the
+    /// same [`MessageView`] field the REST route reads, so the two surfaces
+    /// agree on which messages carry a card. Null on operator messages and on
+    /// every reply journaled before the field existed.
+    pub task_id: Option<ID>,
 }
 
-/// Who is reading a desk history. `mine` is relative to this.
-///
-/// There is no `From<StoredEvent> for MessageGql` any more, and there cannot
-/// be: `mine` depends on who is asking, and a `From` has no way to know. With
-/// one operator it was safe to hardcode `true`; with several users it would
-/// mark everyone's messages as everyone else's.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Viewer {
-    /// An operator or platform credential. Legacy unattributed messages are
-    /// theirs, because that is who sent them before users existed.
-    Operator,
-    /// A human collaborator, by user id.
-    User(String),
+/// One scrubbed step in a reply's processing timeline. GraphQL mirror of the
+/// wire [`TurnStep`] (`kind`/`status` are its snake_case string forms), so the
+/// GraphQL `Message` type carries the same timeline as the REST projection.
+#[derive(SimpleObject)]
+#[graphql(name = "MessageStep")]
+pub struct MessageStepGql {
+    /// The step kind (`tool_call` / `thinking` / `note`).
+    pub kind: String,
+    /// How the step ended (`ok` / `error` / `running`).
+    pub status: String,
+    /// A short, human label (never tool arguments or output).
+    pub label: String,
+    /// An optional scrubbed detail (e.g. `server · tool`, a failure cause).
+    pub detail: Option<String>,
+    /// How long the step took in milliseconds, when known.
+    pub elapsed_ms: Option<f64>,
 }
 
-impl MessageGql {
-    /// Projects a stored event for one viewer.
-    ///
-    /// `authors` maps user id → display label, resolved once per history rather
-    /// than per message.
-    pub fn project(
-        stored: StoredEvent,
-        viewer: &Viewer,
-        authors: &std::collections::HashMap<String, String>,
-    ) -> Self {
-        let id = ID(stored.seq.value().to_string());
-        let at_millis = stored.at_millis as f64;
-        match stored.event {
-            CompanyEvent::AgentReply { agent_id, text, .. } => MessageGql {
-                id,
-                channel: agent_id.clone(),
-                author: agent_id,
-                text,
-                at_millis,
-                mine: false,
-            },
-            CompanyEvent::OperatorMessage { text, by } => {
-                let (author, mine) = match &by {
-                    // Sent by a signed-in human.
-                    Some(actor) if actor.kind == ActorKind::User => {
-                        let label = authors
-                            .get(&actor.id)
-                            .cloned()
-                            .unwrap_or_else(|| "someone".to_string());
-                        (label, *viewer == Viewer::User(actor.id.clone()))
-                    }
-                    // Sent with a machine credential, or journaled before
-                    // attribution existed. Either way there is no person to
-                    // name, and it belongs to whoever holds that credential.
-                    _ => ("operator".to_string(), matches!(viewer, Viewer::Operator)),
-                };
-                MessageGql {
-                    id,
-                    channel: "operator".to_string(),
-                    author,
-                    text,
-                    at_millis,
-                    mine,
-                }
-            }
-            // `owns` never admits other variants into a history.
-            other => MessageGql {
-                id,
-                channel: "system".to_string(),
-                author: "system".to_string(),
-                text: format!("{other:?}"),
-                at_millis,
-                mine: false,
-            },
+impl From<TurnStep> for MessageStepGql {
+    fn from(step: TurnStep) -> Self {
+        // Reuse the serde snake_case forms so GraphQL and REST agree verbatim.
+        let token = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+        MessageStepGql {
+            kind: token(&serde_json::to_value(step.kind).unwrap_or_default()),
+            status: token(&serde_json::to_value(step.status).unwrap_or_default()),
+            label: step.label,
+            detail: step.detail,
+            elapsed_ms: step.elapsed_ms.map(|ms| ms as f64),
+        }
+    }
+}
+
+/// Wraps a viewer-agnostic [`MessageView`] (shared with the REST
+/// `chat/history` route, issue #65) as the GraphQL `Message` type.
+impl From<MessageView> for MessageGql {
+    fn from(view: MessageView) -> Self {
+        MessageGql {
+            id: ID(view.id),
+            channel: view.channel,
+            author: view.author,
+            text: view.text,
+            at_millis: view.at_millis,
+            mine: view.mine,
+            steps: view.steps.into_iter().map(MessageStepGql::from).collect(),
+            task_id: view.task_id.map(ID),
         }
     }
 }

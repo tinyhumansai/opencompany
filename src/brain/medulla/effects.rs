@@ -14,6 +14,7 @@ use crate::ports::types::{
     ChunkAddr, CompanyEvent, ContextChunk, ContextOp, ContextOpResult, Effect, EffectGroup,
     LedgerEntry, OutboundMessage, Verdict,
 };
+use crate::ports::workflow_runner::DeliveryStatus;
 
 use super::wire::{EffectFrame, Role, WireEvent};
 
@@ -90,6 +91,7 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             chat_id,
             agent_id,
             text,
+            ..
         } => (
             Role::Assistant,
             agent_id.clone(),
@@ -102,12 +104,110 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Deleted memory fact {fact_id}"),
             "memory.fact_deleted",
         ),
-        CompanyEvent::TaskDispatched { task_id } => (
+        CompanyEvent::TaskDispatched { task_id, .. } => (
             Role::System,
             "board".to_string(),
             format!("Dispatched task {task_id}"),
             "task.dispatched",
         ),
+        CompanyEvent::McpCallFailed {
+            server,
+            tool,
+            status,
+            message,
+            ..
+        } => (
+            Role::System,
+            "mcp".to_string(),
+            format!("MCP call to {server}/{tool} failed ({status}): {message}"),
+            "mcp.call_failed",
+        ),
+        // The dispatch terminal (#185). `output` is deliberately not wired:
+        // the landing column is what a reader needs here, and the full result
+        // text already rides the task's own timeline.
+        CompanyEvent::DeskTaskCompleted {
+            task_id,
+            desk,
+            column,
+            ..
+        } => (
+            Role::System,
+            "board".to_string(),
+            format!("Task {task_id} finished on {desk} → {column}"),
+            "task.completed",
+        ),
+        CompanyEvent::WorkflowCreated {
+            workflow_id, name, ..
+        } => (
+            Role::System,
+            "workflow".to_string(),
+            format!("Created workflow {name} ({workflow_id})"),
+            "workflow.created",
+        ),
+        // Issue #259. Id + name only, exactly like the create arm above — the
+        // variant carries no graph body precisely so this wire-out to the
+        // inference sidecar cannot leak one.
+        CompanyEvent::WorkflowUpdated {
+            workflow_id, name, ..
+        } => (
+            Role::System,
+            "workflow".to_string(),
+            format!("Updated workflow {name} ({workflow_id})"),
+            "workflow.updated",
+        ),
+        CompanyEvent::WorkflowDeleted {
+            workflow_id, name, ..
+        } => (
+            Role::System,
+            "workflow".to_string(),
+            format!("Deleted workflow {name} ({workflow_id})"),
+            "workflow.deleted",
+        ),
+        // Action-only body: the operator's redirect instruction is never wired.
+        CompanyEvent::TaskSteered {
+            task_id, action, ..
+        } => (
+            Role::System,
+            "operator".to_string(),
+            format!("Steered task {task_id} ({action})"),
+            "task.steered",
+        ),
+        // A finished workflow run (#228). Counts and the failure reason only —
+        // NOT the per-row `target` or `detail`. A delivery row's target is a
+        // recipient's email address and its detail can quote one, and this body
+        // is wired out to the inference sidecar; the console reads the full
+        // rows from the journal instead, where they belong to the operator.
+        //
+        // Issue #248 pinned this with a test rather than leaving it a comment:
+        // the exclusion is the journal-boundary half of the same rule the
+        // scheduler's log line follows, and an unpinned rule is one refactor
+        // away from not being true.
+        CompanyEvent::WorkflowRunFinished {
+            workflow_id,
+            scheduled,
+            deliveries,
+            pending_approvals,
+            error,
+            ..
+        } => {
+            let how = if *scheduled { "Scheduled" } else { "Manual" };
+            let body = match error {
+                Some(err) => format!("{how} run of workflow {workflow_id} failed: {err}"),
+                None => {
+                    let undelivered = deliveries
+                        .iter()
+                        .filter(|d| !matches!(d.status, DeliveryStatus::Sent))
+                        .count();
+                    format!(
+                        "{how} run of workflow {workflow_id} finished — {} report(s) routed, \
+                         {undelivered} not delivered, {} pending approval",
+                        deliveries.len(),
+                        pending_approvals.len(),
+                    )
+                }
+            };
+            (Role::System, "workflow".to_string(), body, "workflow.run")
+        }
     };
     WireEvent {
         seq,
@@ -143,6 +243,8 @@ pub(crate) fn effect_from_frame(frame: &EffectFrame) -> Effect {
             .or_else(|| payload_bool(payload, "first_time_counterparty"))
             .unwrap_or(false),
         payload: frame.payload.clone(),
+        agent: None,
+        run_id: None,
     }
 }
 
@@ -190,7 +292,13 @@ pub(crate) fn channel_message_from_effect(effect: &Effect) -> Option<OutboundMes
         .or_else(|| payload_str(payload, "body"))
         .or_else(|| payload_str(payload, "message"))?
         .to_string();
-    Some(OutboundMessage { channel, text })
+    Some(OutboundMessage {
+        task_id: None,
+        channel,
+        text,
+        steps: Vec::new(),
+        reply_to: None,
+    })
 }
 
 /// Records a ledger delta for an executed effect that moved money.
@@ -253,4 +361,61 @@ pub(crate) fn payload_f64(value: &Value, key: &str) -> Option<f64> {
 
 pub(crate) fn payload_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::ports::workflow_runner::{DeliveryReason, DeliveryReport};
+
+    /// A recipient address for fixtures. `.invalid` is reserved by RFC 2606 and
+    /// can never resolve, so a fixture that escapes names nobody.
+    const RECIPIENT: &str = "recipient@example.invalid";
+
+    /// **Issue #248, one layer below the log line.** A company's journal is a
+    /// single append-only log shared by chat, audit and run history, and this
+    /// function is the seam where it is wired out to the inference sidecar —
+    /// a reader that is not the tenant. A `WorkflowRunFinished` row's `target`
+    /// is a recipient's address and its `detail` quotes one on the
+    /// transport-failure arms, so neither may cross here.
+    ///
+    /// The exclusion was already written this way by #228; this pins it, so a
+    /// later "just include the detail, it is more informative" edit fails CI
+    /// instead of quietly widening the boundary.
+    #[test]
+    fn a_finished_run_wires_out_counts_without_the_recipient_or_the_transport_text() {
+        let event = CompanyEvent::WorkflowRunFinished {
+            workflow_id: "digest".to_string(),
+            scheduled: true,
+            run_id: None,
+            deliveries: vec![DeliveryReport {
+                node: "owner_summary".to_string(),
+                kind: "email".to_string(),
+                target: Some(RECIPIENT.to_string()),
+                status: DeliveryStatus::Failed,
+                detail: format!(
+                    "the mail transport refused the message: 550 5.1.1 <{RECIPIENT}>: Recipient \
+                     address rejected"
+                ),
+                reason: DeliveryReason::MailTransportRefused,
+            }],
+            pending_approvals: Vec::new(),
+            error: None,
+        };
+
+        let wired = wire_event(7, &event);
+
+        assert!(!wired.body.contains(RECIPIENT), "{}", wired.body);
+        assert!(!wired.body.contains("recipient@"), "{}", wired.body);
+        assert!(
+            !wired.body.contains("Recipient address rejected"),
+            "{}",
+            wired.body
+        );
+        assert!(!wired.body.contains("550"), "{}", wired.body);
+        // Still says what happened, in counts.
+        assert!(wired.body.contains("digest"), "{}", wired.body);
+        assert!(wired.body.contains("1 not delivered"), "{}", wired.body);
+        assert_eq!(wired.kind, "workflow.run");
+    }
 }

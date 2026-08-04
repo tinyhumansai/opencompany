@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord, ArtifactStore};
 use crate::ports::context::ContextStore;
 use crate::ports::events::EventLog;
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
@@ -29,6 +30,7 @@ use crate::ports::store::CompanyStore;
 use crate::ports::tasks::{TaskRecord, TaskStore};
 use crate::ports::types::{
     CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry,
+    TemplateProvenance,
 };
 use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
 use crate::ports::users::{InviteRecord, UserRecord, UserRole, UserStatus, UserStore};
@@ -51,7 +53,35 @@ fn sample_manifest() -> crate::company::CompanyManifest {
     toml::from_str(toml_src).expect("parse sample manifest")
 }
 
-/// Builds an empty running record for `id`.
+/// The source-template provenance the fixture seeds every record with, so the
+/// export/round-trip suite proves each backend (fs, sqlite, mongodb) persists
+/// and rehydrates it (issue #85).
+fn sample_provenance() -> TemplateProvenance {
+    TemplateProvenance {
+        source_id: "conformance_template".to_string(),
+        version: Some("1.2.3".to_string()),
+        path: Some("companies/conformance_template".to_string()),
+    }
+}
+
+/// The runtime-authored workflow graph the fixture seeds every record with, so
+/// each backend (fs, sqlite, mongodb) proves it persists and rehydrates
+/// console-created workflow bodies (issue #168) — on a hosted tenant this is the
+/// ONLY copy of that graph.
+fn sample_overlay_workflow() -> crate::ports::types::OverlayWorkflow {
+    crate::ports::types::OverlayWorkflow {
+        id: "conformance_flow".to_string(),
+        toml: "id = \"conformance_flow\"\nname = \"Conformance flow\"\n\
+               [[node]]\nid = \"start\"\nkind = \"trigger\"\nname = \"Start\"\n"
+            .to_string(),
+    }
+}
+
+/// Builds a running record for `id` carrying a non-empty desk-order overlay (so
+/// the store round-trip covers the operator desk-hierarchy field, issue #131), a
+/// runtime-authored workflow body (issue #168), and stamped with the sample
+/// template provenance (so round-trips assert it survives persistence, issue
+/// #85).
 fn record(id: &CompanyId) -> CompanyRecord {
     CompanyRecord {
         id: id.clone(),
@@ -59,6 +89,14 @@ fn record(id: &CompanyId) -> CompanyRecord {
         ledger: Vec::new(),
         lifecycle: "running".to_string(),
         overlay_agents: Vec::new(),
+        overlay_desk_members: Vec::new(),
+        overlay_desk_order: vec![crate::ports::types::OverlayDeskOrder {
+            desk_id: "studio".to_string(),
+            ordered: vec!["ceo".to_string(), "eng".to_string()],
+        }],
+        overlay_desks: Vec::new(),
+        overlay_workflows: vec![sample_overlay_workflow()],
+        template_provenance: Some(sample_provenance()),
     }
 }
 
@@ -92,6 +130,7 @@ pub async fn assert_isolation_by_company(
             CompanyEvent::OperatorMessage {
                 text: "a".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -140,6 +179,22 @@ pub async fn assert_isolation_by_company(
     // `alpha` still sees its own data.
     let loaded = store.load(&alpha).await.unwrap().expect("alpha record");
     assert_eq!(loaded.ledger.len(), 1);
+    // The operator desk-order overlay survives the store round-trip (issue #131).
+    assert_eq!(
+        loaded.overlay_desk_order,
+        vec![crate::ports::types::OverlayDeskOrder {
+            desk_id: "studio".to_string(),
+            ordered: vec!["ceo".to_string(), "eng".to_string()],
+        }],
+        "overlay_desk_order did not survive save/load"
+    );
+    // The runtime-authored workflow body survives the store round-trip too
+    // (issue #168) — losing it would delete a hosted tenant's workflow.
+    assert_eq!(
+        loaded.overlay_workflows,
+        vec![sample_overlay_workflow()],
+        "overlay_workflows did not survive save/load"
+    );
     assert_eq!(
         events
             .read_from(&alpha, EventSeq::new(0), usize::MAX)
@@ -185,6 +240,7 @@ pub async fn assert_append_only_event_and_ledger(
             CompanyEvent::OperatorMessage {
                 text: "e0".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -195,6 +251,7 @@ pub async fn assert_append_only_event_and_ledger(
             CompanyEvent::OperatorMessage {
                 text: "e1".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -211,6 +268,7 @@ pub async fn assert_append_only_event_and_ledger(
             CompanyEvent::OperatorMessage {
                 text: "e2".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -243,6 +301,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
                 CompanyEvent::OperatorMessage {
                     text: format!("a{expected}"),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -257,6 +316,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
             CompanyEvent::OperatorMessage {
                 text: "b0".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -308,6 +368,7 @@ pub async fn assert_export_totality(
         let ev = CompanyEvent::OperatorMessage {
             text: format!("event {i}"),
             by: None,
+            chat: None,
         };
         events.append(&id, ev.clone()).await.unwrap();
         appended.push(ev);
@@ -341,6 +402,21 @@ pub async fn assert_export_totality(
     assert_eq!(loaded.manifest.company.name, "Conformance Co");
     assert_eq!(loaded.lifecycle, "running");
     assert_eq!(loaded.ledger, ledger);
+    // Issue #85: the source-template provenance persists through the port and
+    // rehydrates intact — asserted here for every backend the suite runs against
+    // (fs, sqlite, mongodb), which is the cross-backend durability guarantee.
+    assert_eq!(
+        loaded.template_provenance,
+        Some(sample_provenance()),
+        "template provenance did not round-trip through the store"
+    );
+    // Issue #168: the runtime-authored graph bodies round-trip too — an export
+    // that dropped them would lose every console-created workflow.
+    assert_eq!(
+        loaded.overlay_workflows,
+        vec![sample_overlay_workflow()],
+        "overlay_workflows did not round-trip through the store"
+    );
 
     // Full event log round-trips with seqs and payloads intact.
     let read = events
@@ -481,6 +557,70 @@ pub async fn assert_inbox_store(inbox: Arc<dyn InboxStore>) {
             .unwrap()
             .is_empty()
     );
+
+    // --- has_inbound_from: the established-correspondent gate ---------------
+    //
+    // Callers use this as a SECURITY gate (a workflow may only email an address
+    // that has written in first), so the contract is asserted here rather than
+    // left to whichever backend happens to be wired. A backend that overrides
+    // the default with an indexed lookup must still satisfy every case below.
+    let from = |id: &str, mailbox: &str, sender: &str, outbound: bool| EmailRecord {
+        from_email: sender.to_string(),
+        ..email(id, mailbox, outbound, 10)
+    };
+    inbox
+        .append(&alpha, &from("c1", "ops", "ada@example.com", false))
+        .await
+        .unwrap();
+    // `grace` only ever RECEIVED mail from this company — never wrote in.
+    inbox
+        .append(&alpha, &from("c2", "ops", "grace@example.com", true))
+        .await
+        .unwrap();
+
+    assert!(
+        inbox
+            .has_inbound_from(&alpha, "ops", "ada@example.com")
+            .await
+            .unwrap(),
+        "an address that wrote in is an established correspondent"
+    );
+    assert!(
+        !inbox
+            .has_inbound_from(&alpha, "ops", "grace@example.com")
+            .await
+            .unwrap(),
+        "OUTBOUND mail must not establish a correspondent — otherwise one send \
+         would authorize the next"
+    );
+    assert!(
+        !inbox
+            .has_inbound_from(&alpha, "ops", "stranger@example.com")
+            .await
+            .unwrap()
+    );
+    // Case and surrounding whitespace do not change who someone is.
+    assert!(
+        inbox
+            .has_inbound_from(&alpha, "ops", "  Ada@EXAMPLE.com ")
+            .await
+            .unwrap()
+    );
+    // A blank needle matches nobody, rather than matching anybody.
+    assert!(!inbox.has_inbound_from(&alpha, "ops", "   ").await.unwrap());
+    // Wrong mailbox, and wrong company, both miss.
+    assert!(
+        !inbox
+            .has_inbound_from(&alpha, "ceo", "ada@example.com")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !inbox
+            .has_inbound_from(&beta, "ops", "ada@example.com")
+            .await
+            .unwrap()
+    );
 }
 
 /// Asserts the [`TaskStore`] contract: per-company isolation, upsert semantics,
@@ -496,16 +636,12 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
         priority: "medium".to_string(),
         assignee: "Strategy desk".to_string(),
         updated_at_millis: at,
+        origin_chat_id: None,
+        parent_task_id: None,
     };
 
-    tasks
-        .upsert(&alpha, &task("t1", "backlog", 1))
-        .await
-        .unwrap();
-    tasks
-        .upsert(&alpha, &task("t2", "backlog", 2))
-        .await
-        .unwrap();
+    tasks.upsert(&alpha, &task("t1", "todo", 1)).await.unwrap();
+    tasks.upsert(&alpha, &task("t2", "todo", 2)).await.unwrap();
     tasks.upsert(&beta, &task("b1", "done", 3)).await.unwrap();
 
     // Isolation + newest-first ordering.
@@ -966,6 +1102,98 @@ pub async fn assert_login_code_store(codes: Arc<dyn LoginCodeStore>) {
     );
 }
 
+/// Asserts the [`ArtifactStore`] contract: isolation, per-task filtering,
+/// version-history round-trip, upsert, and delete.
+///
+/// The version-history assertion is the load-bearing one. An artifact's whole
+/// value is that nothing is overwritten — so a backend that stored only the
+/// latest body, or that reordered versions, would still pass a naive
+/// "upsert then read back the title" check while destroying the human-edit
+/// diff. This asserts the full ordered history survives the round-trip.
+pub async fn assert_artifact_store(artifacts: Arc<dyn ArtifactStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+
+    let mut draft = ArtifactRecord::new(
+        "a1",
+        "t-1",
+        "Launch post",
+        ArtifactKind::Markdown,
+        "agent draft",
+        "ceo",
+        1,
+    );
+    draft.push_version(
+        "operator polish",
+        ArtifactAuthor::Operator,
+        "operator",
+        2,
+        Some("operator edit before approval".to_string()),
+    );
+    artifacts.upsert(&alpha, &draft).await.unwrap();
+
+    let other_task =
+        ArtifactRecord::new("a2", "t-2", "Spec", ArtifactKind::Text, "notes", "ceo", 3);
+    artifacts.upsert(&alpha, &other_task).await.unwrap();
+
+    let leak = ArtifactRecord::new(
+        "b1",
+        "t-1",
+        "Secret",
+        ArtifactKind::Text,
+        "hidden",
+        "ceo",
+        4,
+    );
+    artifacts.upsert(&beta, &leak).await.unwrap();
+
+    // Isolation: company beta's artifact is invisible to alpha, including under
+    // the same task id.
+    assert_eq!(artifacts.list(&alpha, None).await.unwrap().len(), 2);
+    assert_eq!(artifacts.list(&beta, None).await.unwrap().len(), 1);
+    let alpha_t1 = artifacts.list(&alpha, Some("t-1")).await.unwrap();
+    assert_eq!(alpha_t1.len(), 1, "task filter narrows to one card");
+    assert_eq!(alpha_t1[0].id, "a1");
+
+    // The full ordered version history round-trips, authors intact.
+    let back = artifacts
+        .get(&alpha, "a1")
+        .await
+        .unwrap()
+        .expect("a1 exists");
+    assert_eq!(back, draft, "the whole record must round-trip verbatim");
+    assert_eq!(back.versions.len(), 2);
+    assert_eq!(back.versions[0].version, 1);
+    assert_eq!(back.versions[0].author, ArtifactAuthor::Agent);
+    assert_eq!(back.versions[0].body, "agent draft");
+    assert_eq!(back.versions[1].author, ArtifactAuthor::Operator);
+    // …and therefore the human-edit diff is still computable after a round-trip.
+    let diff = back.human_edit_diff().expect("an operator edited");
+    assert_eq!((diff.from_version, diff.to_version), (1, 2));
+
+    // A missing id reads as `None`, not an error.
+    assert!(artifacts.get(&alpha, "nope").await.unwrap().is_none());
+
+    // Upsert replaces last-write-wins.
+    let mut revised = back;
+    revised.push_version("third pass", ArtifactAuthor::Agent, "ceo", 9, None);
+    artifacts.upsert(&alpha, &revised).await.unwrap();
+    let after = artifacts.get(&alpha, "a1").await.unwrap().unwrap();
+    assert_eq!(after.versions.len(), 3);
+    assert_eq!(after.latest().unwrap().version, 3);
+    assert_eq!(
+        artifacts.list(&alpha, None).await.unwrap().len(),
+        2,
+        "upsert replaces, never duplicates"
+    );
+
+    // Delete reports whether anything went, and does not touch the sibling.
+    assert!(artifacts.delete(&alpha, "a1").await.unwrap());
+    assert!(!artifacts.delete(&alpha, "a1").await.unwrap());
+    assert_eq!(artifacts.list(&alpha, None).await.unwrap().len(), 1);
+    assert_eq!(artifacts.list(&beta, None).await.unwrap().len(), 1);
+}
+
 /// Asserts the [`FactStore`] contract: isolation, query/kind filtering, upsert,
 /// and delete.
 pub async fn assert_fact_store(facts: Arc<dyn FactStore>) {
@@ -1034,6 +1262,49 @@ pub async fn assert_fact_store(facts: Arc<dyn FactStore>) {
     assert_eq!(facts.list(&alpha, None, None).await.unwrap().len(), 1);
 }
 
+/// Asserts every [`ContextStore`] stamps a stored chunk with the wall-clock
+/// time it was written, and surfaces that stamp through `list`.
+///
+/// This is what lets the Brain's "Last updated" stat move when agents write
+/// memory: agent memory and task outcomes only ever land in the `ContextStore`,
+/// so without a per-chunk stamp the stat can only reflect operator-authored
+/// facts (see `server::ops::memory::memory_stats`).
+///
+/// Deliberately says nothing about re-`put`ting an identical body: the backends
+/// genuinely differ there (sqlite/mongo dedupe on the content address and keep
+/// the first write, the fs index appends a second line), and pinning one
+/// behaviour here would assert a contract the suite's own backends do not share.
+/// Readers of the stamp take the max across chunks for that reason.
+pub async fn assert_context_chunk_stamps(context: Arc<dyn ContextStore>) {
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let before = now_millis();
+
+    context
+        .put(
+            &alpha,
+            ContextChunk {
+                label: "agent/ceo".to_string(),
+                body: "the launch slipped to Friday".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let after = now_millis();
+
+    let metas = context.list(&alpha, "").await.unwrap();
+    assert_eq!(metas.len(), 1);
+    let stamped = metas[0].stored_at_millis;
+    assert!(
+        (before..=after).contains(&stamped),
+        "a stored chunk must carry the time it was written; got {stamped}, expected within \
+         {before}..={after}"
+    );
+
+    // The stamp travels per company, like every other field on the port.
+    assert!(context.list(&beta, "").await.unwrap().is_empty());
+}
+
 /// Asserts the [`UsageMeter`] contract: isolation, record, and windowed query.
 pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     let alpha = CompanyId::new("alpha");
@@ -1047,6 +1318,7 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
         cached_input_tokens: 10,
         cost_usd: cost,
         kind: SampleKind::Inference,
+        run_id: None,
     };
 
     usage.record(&alpha, &sample(100, 0.1)).await.unwrap();
@@ -1084,6 +1356,7 @@ pub async fn assert_usage_retention(usage: Arc<dyn UsageMeter>) {
         cached_input_tokens: 10,
         cost_usd: 0.1,
         kind: SampleKind::Inference,
+        run_id: None,
     };
 
     // A fixed base far from epoch 0 so the cutoff math stays positive.
@@ -1274,4 +1547,504 @@ pub async fn assert_workspace_store(ws: Arc<dyn WorkspaceStore>) {
     let tree = ws.tree(&alpha).await.unwrap();
     assert!(tree.iter().all(|n| n.id != "root" && n.id != "child"));
     assert!(!ws.delete(&alpha, "root").await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// RunStore (issue #242)
+// ---------------------------------------------------------------------------
+//
+// Imports for this suite are function-local rather than added to the module
+// header: the header is being edited concurrently on another branch, and a
+// `use` inside the function keeps this suite a pure append.
+
+/// Asserts the [`RunStore`](crate::ports::runs::RunStore) contract: per-company
+/// isolation, per-task attempt ordinals, transition legality, the step trace,
+/// and the list filters.
+pub async fn assert_run_store(runs: Arc<dyn crate::ports::runs::RunStore>) {
+    use crate::ports::runs::{NewRun, RunFilter, RunOutcome, RunStatus, RunStepRecord};
+    use crate::ports::types::{TokenUsage, TurnStep, TurnStepKind, TurnStepStatus};
+
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let spec = |id: &str, task: &str| NewRun {
+        id: id.to_string(),
+        task_id: task.to_string(),
+        agent_id: "ceo".to_string(),
+    };
+
+    // -- create: a fresh run is Pending and nothing else ---------------------
+
+    let first = runs.create_run(&alpha, spec("r1", "card")).await.unwrap();
+    assert_eq!(first.status, RunStatus::Pending);
+    assert_eq!(first.attempt, 1, "the first attempt at a card is 1-based");
+    assert_eq!(first.company, alpha);
+    assert_eq!(first.task_id, "card");
+    assert_eq!(first.agent_id, "ceo");
+    assert_eq!(first.trigger_event_seq, None);
+    assert_eq!(first.started_at_millis, None);
+    assert_eq!(first.finished_at_millis, None);
+    assert_eq!(first.error, None);
+    assert_eq!(first.step_count, 0);
+    assert!(first.created_at_millis > 0);
+
+    // Read-back is byte-identical (the export-totality precondition).
+    assert_eq!(runs.get_run(&alpha, "r1").await.unwrap(), Some(first));
+
+    // -- attempt ordinals are per card, not per company ----------------------
+
+    let second = runs.create_run(&alpha, spec("r2", "card")).await.unwrap();
+    assert_eq!(second.attempt, 2);
+    let third = runs.create_run(&alpha, spec("r3", "card")).await.unwrap();
+    assert_eq!(third.attempt, 3);
+    let other_card = runs.create_run(&alpha, spec("r4", "other")).await.unwrap();
+    assert_eq!(
+        other_card.attempt, 1,
+        "a different card starts its own attempt count"
+    );
+
+    // A repeated id is a conflict, never a silent overwrite of a live attempt.
+    assert!(
+        runs.create_run(&alpha, spec("r1", "card")).await.is_err(),
+        "creating a run with an existing id must fail"
+    );
+
+    // -- company isolation ---------------------------------------------------
+
+    let beta_run = runs.create_run(&beta, spec("b1", "card")).await.unwrap();
+    assert_eq!(
+        beta_run.attempt, 1,
+        "attempt ordinals do not leak across companies"
+    );
+    assert!(runs.get_run(&beta, "r1").await.unwrap().is_none());
+    assert!(runs.get_run(&alpha, "b1").await.unwrap().is_none());
+    let beta_all = runs.list_runs(&beta, &RunFilter::default()).await.unwrap();
+    assert_eq!(beta_all.len(), 1);
+    assert_eq!(beta_all[0].id, "b1");
+
+    // -- begin_run: Pending → Running ---------------------------------------
+
+    let begun = runs
+        .begin_run(&alpha, "r1", EventSeq::new(7))
+        .await
+        .unwrap();
+    assert_eq!(begun.status, RunStatus::Running);
+    assert_eq!(begun.trigger_event_seq, Some(EventSeq::new(7)));
+    assert!(begun.started_at_millis.is_some());
+    assert_eq!(begun.finished_at_millis, None);
+    assert_eq!(runs.get_run(&alpha, "r1").await.unwrap(), Some(begun));
+
+    // A second begin on a live run is a caller bug, not an idempotent no-op.
+    assert!(
+        runs.begin_run(&alpha, "r1", EventSeq::new(8))
+            .await
+            .is_err(),
+        "Running → Running must be rejected"
+    );
+
+    // A transition against a run that does not exist is an error, not a
+    // silently created row.
+    assert!(
+        runs.begin_run(&alpha, "nope", EventSeq::new(1))
+            .await
+            .is_err()
+    );
+    assert!(runs.get_run(&alpha, "nope").await.unwrap().is_none());
+
+    // -- finish_run: cost, step count and terminality ------------------------
+
+    let usage = TokenUsage {
+        input: 120,
+        output: 60,
+        cached_input: 10,
+        cost_usd: 0.5,
+    };
+    let settled = runs
+        .finish_run(
+            &alpha,
+            "r1",
+            RunOutcome {
+                status: RunStatus::Succeeded,
+                error: None,
+                usage,
+                step_count: 3,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled.status, RunStatus::Succeeded);
+    assert_eq!(settled.usage, usage);
+    assert_eq!(settled.step_count, 3);
+    assert!(
+        settled.finished_at_millis.is_some(),
+        "a terminal settle stamps the finish time"
+    );
+    assert_eq!(runs.get_run(&alpha, "r1").await.unwrap(), Some(settled));
+
+    // Terminal is final: nothing moves out of it. A re-run is a NEW attempt.
+    assert!(
+        runs.finish_run(&alpha, "r1", RunOutcome::new(RunStatus::Failed))
+            .await
+            .is_err()
+    );
+    assert!(
+        runs.begin_run(&alpha, "r1", EventSeq::new(9))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        runs.get_run(&alpha, "r1").await.unwrap().unwrap().status,
+        RunStatus::Succeeded,
+        "a rejected transition leaves the row untouched"
+    );
+
+    // `finish_run` is how a run stops advancing — it can never start one.
+    assert!(
+        runs.finish_run(&alpha, "r2", RunOutcome::new(RunStatus::Running))
+            .await
+            .is_err()
+    );
+    assert!(
+        runs.finish_run(&alpha, "r2", RunOutcome::new(RunStatus::Pending))
+            .await
+            .is_err()
+    );
+
+    // -- parked runs are not finished runs (epic #183 decisions 2 and 3) -----
+
+    runs.begin_run(&alpha, "r2", EventSeq::new(10))
+        .await
+        .unwrap();
+    let parked = runs
+        .finish_run(&alpha, "r2", RunOutcome::new(RunStatus::WaitingApproval))
+        .await
+        .unwrap();
+    assert_eq!(parked.status, RunStatus::WaitingApproval);
+    assert_eq!(
+        parked.finished_at_millis, None,
+        "a parked run can still resume, so it carries no finish time"
+    );
+
+    // Re-enterable: #243 grants are single-use, so one attempt may stop for
+    // review many times.
+    let resumed = runs
+        .begin_run(&alpha, "r2", EventSeq::new(11))
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, RunStatus::Running);
+    assert_eq!(
+        resumed.started_at_millis, parked.started_at_millis,
+        "a resume keeps the moment the attempt first started"
+    );
+    runs.finish_run(&alpha, "r2", RunOutcome::new(RunStatus::WaitingApproval))
+        .await
+        .unwrap();
+    runs.begin_run(&alpha, "r2", EventSeq::new(12))
+        .await
+        .unwrap();
+
+    // Waiting-on-a-person can become waiting-on-something-else without a
+    // terminal hop in between.
+    runs.finish_run(&alpha, "r2", RunOutcome::new(RunStatus::Paused))
+        .await
+        .unwrap();
+    let repark = runs
+        .finish_run(&alpha, "r2", RunOutcome::new(RunStatus::WaitingApproval))
+        .await
+        .unwrap();
+    assert_eq!(repark.status, RunStatus::WaitingApproval);
+
+    // …and finally settles for good, carrying its reason.
+    let failed = runs
+        .finish_run(
+            &alpha,
+            "r2",
+            RunOutcome::new(RunStatus::Failed).with_error("the tool never came back"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("the tool never came back"));
+    assert!(failed.finished_at_millis.is_some());
+
+    // A run that never started can still settle — the shape a boot reaper and a
+    // dispatch that died before its first turn both need.
+    let never_ran = runs
+        .finish_run(
+            &alpha,
+            "r3",
+            RunOutcome::new(RunStatus::Cancelled).with_error("the operator withdrew the card"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(never_ran.status, RunStatus::Cancelled);
+    assert_eq!(never_ran.started_at_millis, None);
+
+    // -- the step trace ------------------------------------------------------
+
+    let step = |run_id: &str, seq: u32, label: &str| RunStepRecord {
+        run_id: run_id.to_string(),
+        step_seq: seq,
+        at_millis: 1_000 + u64::from(seq),
+        step: TurnStep {
+            kind: TurnStepKind::ToolCall,
+            status: TurnStepStatus::Ok,
+            label: label.to_string(),
+            detail: None,
+            elapsed_ms: Some(5),
+        },
+    };
+
+    assert!(
+        runs.list_run_steps(&alpha, "r1").await.unwrap().is_empty(),
+        "a run with no trace reads back empty, not missing"
+    );
+
+    runs.append_run_step(&alpha, &step("r1", 0, "Reading messages"))
+        .await
+        .unwrap();
+    runs.append_run_step(&alpha, &step("r1", 1, "Thinking"))
+        .await
+        .unwrap();
+    runs.append_run_step(&alpha, &step("r1", 2, "Writing the reply"))
+        .await
+        .unwrap();
+    // A different run's trace must not bleed into this one.
+    runs.append_run_step(&alpha, &step("r4", 0, "Somebody else's step"))
+        .await
+        .unwrap();
+    // …nor another company's.
+    runs.append_run_step(&beta, &step("r1", 0, "Beta's step"))
+        .await
+        .unwrap();
+
+    let trace = runs.list_run_steps(&alpha, "r1").await.unwrap();
+    assert_eq!(trace.len(), 3);
+    assert_eq!(
+        trace.iter().map(|s| s.step_seq).collect::<Vec<_>>(),
+        [0, 1, 2],
+        "steps read back in run order, oldest first"
+    );
+    assert_eq!(trace[1].step.label, "Thinking");
+    assert_eq!(trace[0], step("r1", 0, "Reading messages"));
+
+    assert_eq!(runs.list_run_steps(&alpha, "r4").await.unwrap().len(), 1);
+    let beta_trace = runs.list_run_steps(&beta, "r1").await.unwrap();
+    assert_eq!(beta_trace.len(), 1);
+    assert_eq!(beta_trace[0].step.label, "Beta's step");
+
+    // Re-appending the same `(run_id, step_seq)` overwrites: a retried write
+    // must not duplicate a step.
+    runs.append_run_step(&alpha, &step("r1", 1, "Thinking harder"))
+        .await
+        .unwrap();
+    let trace = runs.list_run_steps(&alpha, "r1").await.unwrap();
+    assert_eq!(
+        trace.len(),
+        3,
+        "an idempotent append does not grow the trace"
+    );
+    assert_eq!(trace[1].step.label, "Thinking harder");
+
+    // -- filters and ordering ------------------------------------------------
+
+    let all = runs.list_runs(&alpha, &RunFilter::default()).await.unwrap();
+    assert_eq!(all.len(), 4, "r1..r4");
+
+    let for_card = runs
+        .list_runs(&alpha, &RunFilter::for_task("card"))
+        .await
+        .unwrap();
+    assert_eq!(
+        for_card.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        ["r3", "r2", "r1"],
+        "one card's attempts come back newest first"
+    );
+
+    let succeeded = runs
+        .list_runs(
+            &alpha,
+            &RunFilter::default().with_status(RunStatus::Succeeded),
+        )
+        .await
+        .unwrap();
+    assert_eq!(succeeded.len(), 1);
+    assert_eq!(succeeded[0].id, "r1");
+
+    let settled_two = runs
+        .list_runs(
+            &alpha,
+            &RunFilter::default()
+                .with_status(RunStatus::Failed)
+                .with_status(RunStatus::Cancelled),
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = settled_two.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["r2", "r3"], "a multi-status filter is a union");
+
+    // Task and status compose.
+    let none = runs
+        .list_runs(
+            &alpha,
+            &RunFilter::for_task("other").with_status(RunStatus::Succeeded),
+        )
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // The limit truncates the newest end, after ordering.
+    let capped = runs
+        .list_runs(&alpha, &RunFilter::for_task("card").with_limit(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        capped.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        ["r3", "r2"]
+    );
+    assert!(
+        runs.list_runs(&alpha, &RunFilter::default().with_limit(0))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A filter that matches nothing is empty, not an error.
+    assert!(
+        runs.list_runs(&alpha, &RunFilter::for_task("no-such-card"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // -- list_stale_active ---------------------------------------------------
+
+    // r1 Succeeded, r2 Failed, r3 Cancelled, r4 still Pending.
+    let stale = runs.list_stale_active(&alpha).await.unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, "r4");
+    assert_eq!(stale[0].status, RunStatus::Pending);
+
+    runs.begin_run(&alpha, "r4", EventSeq::new(20))
+        .await
+        .unwrap();
+    let stale = runs.list_stale_active(&alpha).await.unwrap();
+    assert_eq!(stale.len(), 1, "Running is active too");
+
+    runs.finish_run(&alpha, "r4", RunOutcome::new(RunStatus::WaitingApproval))
+        .await
+        .unwrap();
+    assert!(
+        runs.list_stale_active(&alpha).await.unwrap().is_empty(),
+        "parked is not active: a run waiting on a person is not stale"
+    );
+}
+
+/// Asserts the boot-reaper contract
+/// ([`reap_orphaned_runs`](crate::ports::runs::reap_orphaned_runs)): every run
+/// left `Pending` or `Running` by a dead process is failed with the orphan
+/// reason, and every parked run is left exactly as it was.
+pub async fn assert_run_reaper(runs: Arc<dyn crate::ports::runs::RunStore>) {
+    use crate::ports::runs::{NewRun, ORPHAN_ERROR, RunFilter, RunOutcome, RunStatus};
+
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+    let spec = |id: &str, task: &str| NewRun {
+        id: id.to_string(),
+        task_id: task.to_string(),
+        agent_id: "ceo".to_string(),
+    };
+
+    // One of each state the reaper has an opinion about.
+    runs.create_run(&alpha, spec("pending", "a")).await.unwrap();
+
+    runs.create_run(&alpha, spec("running", "b")).await.unwrap();
+    runs.begin_run(&alpha, "running", EventSeq::new(1))
+        .await
+        .unwrap();
+
+    runs.create_run(&alpha, spec("review", "c")).await.unwrap();
+    runs.begin_run(&alpha, "review", EventSeq::new(2))
+        .await
+        .unwrap();
+    runs.finish_run(
+        &alpha,
+        "review",
+        RunOutcome::new(RunStatus::WaitingApproval),
+    )
+    .await
+    .unwrap();
+
+    runs.create_run(&alpha, spec("paused", "d")).await.unwrap();
+    runs.begin_run(&alpha, "paused", EventSeq::new(3))
+        .await
+        .unwrap();
+    runs.finish_run(&alpha, "paused", RunOutcome::new(RunStatus::Paused))
+        .await
+        .unwrap();
+
+    runs.create_run(&alpha, spec("done", "e")).await.unwrap();
+    runs.begin_run(&alpha, "done", EventSeq::new(4))
+        .await
+        .unwrap();
+    runs.finish_run(&alpha, "done", RunOutcome::new(RunStatus::Succeeded))
+        .await
+        .unwrap();
+
+    // Another company's stranded run must survive alpha's sweep.
+    runs.create_run(&beta, spec("beta-pending", "a"))
+        .await
+        .unwrap();
+
+    let reaped = crate::ports::runs::reap_orphaned_runs(runs.as_ref(), &alpha)
+        .await
+        .unwrap();
+    assert_eq!(reaped, 2, "exactly the Pending and Running rows");
+
+    let status = |id: &'static str| {
+        let runs = runs.clone();
+        let alpha = alpha.clone();
+        async move { runs.get_run(&alpha, id).await.unwrap().unwrap() }
+    };
+
+    let pending = status("pending").await;
+    assert_eq!(pending.status, RunStatus::Failed);
+    assert_eq!(pending.error.as_deref(), Some(ORPHAN_ERROR));
+    assert!(pending.finished_at_millis.is_some());
+
+    assert_eq!(status("running").await.status, RunStatus::Failed);
+
+    // Parked is not orphaned — reaping these would delete real pending work on
+    // every restart.
+    assert_eq!(status("review").await.status, RunStatus::WaitingApproval);
+    assert_eq!(status("review").await.error, None);
+    assert_eq!(status("paused").await.status, RunStatus::Paused);
+
+    // A terminal run is untouched, and keeps its own outcome.
+    assert_eq!(status("done").await.status, RunStatus::Succeeded);
+    assert_eq!(status("done").await.error, None);
+
+    // Isolation: beta's stranded run is still stranded.
+    assert_eq!(
+        runs.get_run(&beta, "beta-pending")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Pending
+    );
+
+    // The sweep is idempotent: a second boot finds nothing left to reclaim.
+    assert_eq!(
+        crate::ports::runs::reap_orphaned_runs(runs.as_ref(), &alpha)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        runs.list_runs(&alpha, &RunFilter::active())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

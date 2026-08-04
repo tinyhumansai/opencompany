@@ -101,10 +101,21 @@ Everything is decoupled so you can embed parts elsewhere:
 ## Build
 
 ```sh
-npm run build     # tsc typecheck + vite bundle -> dist/
-npm run preview   # serve the production build
-npm run typecheck # tsc only
+npm run build         # tsc typecheck + vite bundle -> dist/
+npm run preview       # serve the production build
+npm run typecheck     # tsc only, over src/
+npm run typecheck:e2e # tsc only, over test/ + playwright.config.ts
 ```
+
+CI runs `npm ci` and all three of `typecheck`, `typecheck:e2e` and `build` in
+the `Console` job of `.github/workflows/ci.yml`.
+
+`typecheck` covers `src/` and nothing else — `tsconfig.app.json` is
+`include: ["src"]`. The end-to-end suite is a separate TypeScript project
+([`tsconfig.e2e.json`](tsconfig.e2e.json)) with its own script, so a broken spec
+fails on its own rather than blocking `npm run build`. Type-checking the specs
+is not the same as running them — `npm run e2e` drives a live host and stays out
+of CI, so `typecheck:e2e` is all the automated coverage `test/e2e/` gets.
 
 The `dist/` can be served as static files by any web server (or mounted by the
 OpenCompany host); use `window.OPENCOMPANY_CONFIG` to point it at the API.

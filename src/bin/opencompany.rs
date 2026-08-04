@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use opencompany::company::Schedule;
-use opencompany::runtime::{CompanyScheduler, SystemClock};
+use opencompany::runtime::{CompanyScheduler, SystemClock, WorkflowScheduler};
 use opencompany::{
     AppConfig, AppState, CompanyId, CompanyManifest, Result,
     app::config::{ConfigFile, ProcessEnv, resolve},
@@ -36,7 +36,7 @@ enum Command {
         #[arg(long = "company", value_name = "DIR")]
         companies: Vec<PathBuf>,
         /// OpenCompany home holding company bundles. Defaults to
-        /// `$HOME/.opencompany/companies`.
+        /// `$HOME/.opencompany`, with bundles under `companies/<slug>`.
         #[arg(long)]
         home: Option<PathBuf>,
         /// Opt every loaded company into going public on tiny.place, regardless
@@ -84,7 +84,7 @@ enum Command {
         #[arg(long)]
         include_secrets: bool,
         /// OpenCompany home holding company bundles. Defaults to
-        /// `$HOME/.opencompany/companies`.
+        /// `$HOME/.opencompany`, with bundles under `companies/<slug>`.
         #[arg(long)]
         home: Option<PathBuf>,
     },
@@ -94,7 +94,7 @@ enum Command {
         /// Bundle `.tar` or unpacked bundle directory to import.
         path: PathBuf,
         /// OpenCompany home to import into. Defaults to
-        /// `$HOME/.opencompany/companies`.
+        /// `$HOME/.opencompany`, with bundles under `companies/<slug>`.
         #[arg(long)]
         home: Option<PathBuf>,
     },
@@ -127,15 +127,6 @@ impl From<ModeArg> for LaunchMode {
             ModeArg::Core => LaunchMode::Core,
             ModeArg::Desktop => LaunchMode::Desktop,
         }
-    }
-}
-
-/// The default OpenCompany home: `$HOME/.opencompany/companies`, falling back
-/// to a relative path when `$HOME` is unset.
-fn default_home() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".opencompany").join("companies"),
-        None => PathBuf::from(".opencompany").join("companies"),
     }
 }
 
@@ -182,6 +173,25 @@ async fn register_company(
     // The company's on-disk source directory (`companies/<name>`) seeds the
     // workspace tree on first boot and lets read resolvers find its committed
     // skills/workflows content.
+    let source_dir = company_source_dir(dir);
+    // Issue #85: this company was seeded from a template directory, so record
+    // that directory's slug as the durable source-template provenance. The
+    // builder stamps it only on first launch and carries it forward on rebuilds;
+    // a raw-manifest `POST /api/v1/companies` provision has no template dir and
+    // records no provenance.
+    let provenance = source_dir.file_name().and_then(|s| s.to_str()).map(|slug| {
+        opencompany::ports::types::TemplateProvenance {
+            source_id: slug.to_string(),
+            version: None,
+            // Record only the template directory's basename, never the raw
+            // absolute host path: `path` is exposed verbatim on the GraphQL and
+            // REST provenance surfaces, and the absolute source dir would leak
+            // the host filesystem layout + username. `slug` is already the final
+            // path component (the `file_name()` guard above makes this `None`
+            // when there is no basename, e.g. `serve --company .`).
+            path: Some(slug.to_string()),
+        }
+    });
     let mut builder = attach_tinyhumans_feedback(
         attach_harness(attach_openhuman(RuntimeBuilder::new(
             home.to_path_buf(),
@@ -189,20 +199,38 @@ async fn register_company(
         ))),
         state.config(),
     )
-    .with_seed_dir(company_source_dir(dir))
+    .with_seed_dir(source_dir.clone())
     .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
-    .with_host_base_url(state.config().host_base_url());
+    .with_host_base_url(state.config().host_base_url())
+    .with_skills_registry(state.shared_skill_registry()?);
+    if let Some(provenance) = provenance {
+        builder = builder.with_template_provenance(provenance);
+    }
     // Shared-single-DB mode: namespace the derived id with this tenant so the
     // same boot template (`OPENCOMPANY_COMPANY`) does not collide across tenants
     // in one logical database. A no-op when `tenant_namespace` is unset.
     let derived = opencompany::runtime::company_id_from_name(&name);
     let company_id = state.config().namespaced_company_id(derived);
-    builder = builder.with_id(company_id);
+    builder = builder.with_id(company_id.clone());
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
     if let Some(overlay) = state.memory_overlay() {
         builder = builder.with_memory_overlay(overlay);
+    }
+    #[cfg(feature = "smtp")]
+    if let Ok(Some(cfg)) = opencompany::server::ops::mailer::TenantMailboxConfig::from_env() {
+        // Same guard as `spawn_mailbox_poller`: the injected mailbox belongs to
+        // exactly one company (the one whose id matches its local-part). In a
+        // multi-company process, wiring it to every company would make every
+        // one of them send outbound mail from the same injected address.
+        let mailbox_slug = opencompany::server::ops::smtp::local_part(&cfg.address);
+        if company_id.as_ref() == mailbox_slug {
+            builder = builder.with_mail(opencompany::company::runtime::CompanyMail {
+                sender: std::sync::Arc::new(opencompany::server::ops::smtp::LettreMailSender),
+                smtp: cfg.smtp.clone(),
+            });
+        }
     }
     if discoverable {
         builder = builder.with_discoverable(true);
@@ -253,6 +281,116 @@ fn spawn_scheduler(
     }
 }
 
+/// Starts the process-wide workflow scheduler: one task that fires every saved
+/// workflow whose `trigger` node carries a cron (issue #169).
+///
+/// Deliberately NOT per company, unlike [`spawn_scheduler`]. Workflow schedules
+/// are runtime data — creating a workflow in the console adds a cron with no
+/// reboot, and a hosted tenant can be registered after boot — so the scheduler
+/// re-reads the registry on every tick instead of snapshotting a company's
+/// schedules at registration time.
+fn spawn_workflow_scheduler(
+    state: &AppState,
+    shutdown: &Arc<Notify>,
+) -> tokio::task::JoinHandle<()> {
+    WorkflowScheduler::new(state.registry().clone(), Arc::new(SystemClock)).spawn(shutdown.clone())
+}
+
+/// Starts a company's IMAP mailbox poller as a background task, if the
+/// platform injected mailbox credentials for this tenant.
+///
+/// Mirrors [`spawn_scheduler`]: reads [`TenantMailboxConfig::from_env`]
+/// (`Ok(None)` means the manager did not wire mail for this tenant — a no-op,
+/// not an error; `Err` logs and skips rather than aborting boot). The actual
+/// IMAP transport only exists when the crate is built with the `imap`
+/// feature, so the poll itself is feature-gated; without the feature this
+/// still validates the env (surfacing config typos) but starts nothing.
+fn spawn_mailbox_poller(
+    state: &AppState,
+    id: &str,
+    shutdown: &Arc<Notify>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let cfg = match opencompany::server::ops::mailer::TenantMailboxConfig::from_env() {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("mailbox config error: {err}");
+            return;
+        }
+    };
+    // The injected mailbox belongs to exactly one company: the one whose id
+    // equals the mailbox address's local-part. In a multi-company process
+    // every OTHER registered company must skip this poller entirely, or
+    // inbound mail addressed to one company would be filed into another's
+    // inbox.
+    let mailbox_slug = opencompany::server::ops::smtp::local_part(&cfg.address);
+    if id != mailbox_slug {
+        return;
+    }
+    #[cfg(feature = "imap")]
+    {
+        let Some(runtime) = state.registry().get(&CompanyId::new(id)) else {
+            return;
+        };
+        let receiver: Arc<dyn opencompany::server::ops::mailer::MailReceiver> =
+            Arc::new(opencompany::server::ops::imap::AsyncImapReceiver);
+        let interval = std::env::var("OPENCOMPANY_MAIL_POLL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let poller = opencompany::runtime::mailbox_poller::MailboxPoller::new(
+            runtime,
+            receiver,
+            cfg.imap.clone(),
+            cfg.address.clone(),
+            interval,
+        );
+        handles.push(poller.spawn(shutdown.clone()));
+    }
+    #[cfg(not(feature = "imap"))]
+    {
+        let _ = (state, id, shutdown, handles, cfg);
+    }
+}
+
+/// Starts a company's Telegram `getUpdates` long-polling listener as a
+/// background task, whenever this host has an outbound Telegram transport wired
+/// (the `telegram` feature).
+///
+/// Issue #203: this is what makes inbound Telegram work on a local or
+/// self-hosted instance, where Telegram's servers can never reach an inbound
+/// `/hooks/...` URL. It is started unconditionally rather than only when a bot
+/// token is already stored — the poller idles cheaply until one appears, so an
+/// operator who pastes a token in the console is receiving DMs on the next tick
+/// with no restart. On a publicly reachable host that opted into the webhook
+/// fast-path, the poller sees the registration and stands by.
+fn spawn_telegram_poller(
+    state: &AppState,
+    id: &str,
+    shutdown: &Arc<Notify>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let Some(api) = state.connections().telegram.clone() else {
+        return;
+    };
+    let Some(runtime) = state.registry().get(&CompanyId::new(id)) else {
+        return;
+    };
+    let poll_secs = std::env::var("OPENCOMPANY_TELEGRAM_POLL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(opencompany::runtime::telegram_poller::DEFAULT_POLL_SECONDS);
+    let webhook_capable = state.config().public_webhook_base_url().is_some();
+    let poller = opencompany::runtime::telegram_poller::TelegramPoller::new(
+        runtime,
+        api,
+        poll_secs,
+        webhook_capable,
+    );
+    handles.push(poller.spawn(shutdown.clone()));
+}
+
 /// Attaches an OpenHuman JSON-RPC transport when the `openhuman-rpc` feature is
 /// enabled and `OPENCOMPANY_OPENHUMAN_URL` is set (the attach path).
 ///
@@ -278,11 +416,16 @@ fn attach_openhuman(builder: RuntimeBuilder) -> RuntimeBuilder {
     }
 }
 
-/// Attaches the embedded OpenHuman harness brain when the `openhuman` feature
-/// is enabled and a hosted-inference credential is present in the environment
-/// (`TINYHUMANS_API_KEY` / `OPENCOMPANY_INFERENCE_*`). With it, `/company/chat`
-/// routes each operator message through a live company agent on the hosted
-/// brain; without a credential the runtime keeps its hosted/echo brain.
+/// Attaches the embedded OpenHuman harness under the `openhuman` feature.
+///
+/// The harness pool is **always** attached, so cognition routes through a live
+/// company agent whenever *any* inference source is configured — the managed
+/// env default (`TINYHUMANS_API_KEY` / `OPENCOMPANY_INFERENCE_*`), a manifest
+/// `[inference]` section, or a runtime console override (issue #56 — BYOK).
+/// Attaching the pool unconditionally is what unblocks a BYOK-only tenant that
+/// has no platform credential: the builder still constructs the harness brain
+/// from its manifest/runtime config. Without any source, the runtime keeps its
+/// hosted/echo brain.
 ///
 /// Without the feature this is the identity function, so the default build is
 /// unaffected.
@@ -295,12 +438,30 @@ fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
 fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
     use opencompany::app::config::ProcessEnv;
     use opencompany::harness::HarnessPool;
-    use opencompany::harness::provider::harness_inference_from_env;
+    use opencompany::harness::provider::{
+        harness_inference_from_env, media_backend_from_env, search_backend_from_env,
+    };
 
+    let builder = builder.with_harness(Arc::new(HarnessPool::new()));
+    // Issue #109: the MANAGED media-generation backend, resolved from the
+    // environment only (never a tenant secret). Absent ⇒ media tools stay unwired
+    // even for a company that grants `media` (fail-closed).
+    let builder = match media_backend_from_env(&ProcessEnv) {
+        Some(media_backend) => builder.with_media_backend(media_backend),
+        None => builder,
+    };
+    // Issue #238: the MANAGED web-search backend, on the same platform identity
+    // as managed inference and resolved from the environment only. Absent ⇒
+    // `web_search` stays unwired even for a company that grants `search`.
+    let builder = match search_backend_from_env(&ProcessEnv) {
+        Some(search_backend) => builder.with_search_backend(search_backend),
+        None => builder,
+    };
+    // The managed env default is an *optional*, lowest-precedence source; a
+    // BYOK-only tenant supplies none and still gets a harness brain from its
+    // manifest/runtime config.
     match harness_inference_from_env(&ProcessEnv) {
-        Some((config, model)) => builder
-            .with_harness(Arc::new(HarnessPool::new()))
-            .with_harness_inference(config, model),
+        Some((config, model_override)) => builder.with_harness_inference(config, model_override),
         None => builder,
     }
 }
@@ -314,6 +475,29 @@ fn attach_harness(builder: RuntimeBuilder) -> RuntimeBuilder {
 #[cfg(not(feature = "tinyhumans"))]
 fn attach_tinyhumans_feedback(builder: RuntimeBuilder, _config: &AppConfig) -> RuntimeBuilder {
     builder
+}
+
+/// Wires the hub identity exchange, when this build can reach the hub.
+///
+/// Rides the existing `tinyhumans` feature rather than earning one of its own:
+/// that flag already means "this instance talks to the hub about its
+/// credential's owner", and asking the hub whose sign-in token this is is the
+/// same conversation about the same owner.
+///
+/// Unwired, `…/auth/hub` reports no providers and the console shows only the
+/// magic-link form — which is the right answer for a self-hosted host that has
+/// no ecosystem to sign in against.
+#[cfg(not(feature = "tinyhumans"))]
+fn attach_hub_identity(state: AppState) -> AppState {
+    state
+}
+
+#[cfg(feature = "tinyhumans")]
+fn attach_hub_identity(state: AppState) -> AppState {
+    use opencompany::server::hub_identity::HttpHubIdentityExchange;
+
+    let exchange = HttpHubIdentityExchange::new(state.config().api_url.clone());
+    state.with_hub_identity(std::sync::Arc::new(exchange))
 }
 
 #[cfg(feature = "tinyhumans")]
@@ -390,10 +574,30 @@ fn connections_runtime() -> Result<opencompany::server::ops::ConnectionsRuntime>
         connections =
             connections.with_mail(Arc::new(opencompany::server::ops::smtp::LettreMailSender));
     }
+    #[cfg(feature = "telegram")]
+    {
+        connections = connections.with_telegram(Arc::new(
+            opencompany::company::telegram::HttpTelegramApi::new(),
+        ));
+    }
     if let Some(mail) = opencompany::server::ops::mailer::MailConfig::from_env()? {
         connections = connections.with_mail_credentials(mail.credentials);
     }
     Ok(connections)
+}
+
+/// Resolves the OpenCompany home and moves any legacy doubled install up before
+/// anything reads it.
+///
+/// Every command that touches bundles resolves through this rather than calling
+/// `store::resolve_home` directly. `serve` needs it or the operator's companies
+/// vanish from the console; `export` and `import` need it because otherwise an
+/// un-migrated install's first post-upgrade command is the one that fails to
+/// find its bundles. See `store::migrate` for the rules and the hosted no-op.
+fn resolve_home_migrated(flag: Option<PathBuf>) -> Result<PathBuf> {
+    let home = opencompany::store::resolve_home(flag)?;
+    opencompany::store::migrate_legacy_nest_announced(&home)?;
+    Ok(home)
 }
 
 /// Builds the four fs storage ports over `home` as trait objects.
@@ -445,7 +649,7 @@ async fn run_export(
     include_secrets: bool,
     home: Option<PathBuf>,
 ) -> Result<()> {
-    let home = home.unwrap_or_else(default_home);
+    let home = resolve_home_migrated(home)?;
     let id = CompanyId::new(company);
     let dest = out.unwrap_or_else(|| PathBuf::from(format!("{}-bundle", id.as_ref())));
     export_to_dir(&home, &id, include_secrets, &dest).await?;
@@ -466,7 +670,7 @@ async fn run_export(
 ) -> Result<()> {
     use opencompany::store::export::pack_tar;
 
-    let home = home.unwrap_or_else(default_home);
+    let home = resolve_home_migrated(home)?;
     let id = CompanyId::new(company);
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{}.tar", id.as_ref())));
 
@@ -523,7 +727,7 @@ async fn import_from_dir(dir: &std::path::Path, home: Option<PathBuf>) -> Result
     use opencompany::store::export::{find_bundle_root, import_bundle, restore_fs_artifacts};
     use opencompany::store::paths::Bundle;
 
-    let home = home.unwrap_or_else(default_home);
+    let home = resolve_home_migrated(home)?;
     let root = find_bundle_root(dir)?;
     let (store, events, memory, context) = fs_ports(&home);
     let id = import_bundle(&root, store, events, memory, context).await?;
@@ -546,7 +750,52 @@ async fn main() -> Result<()> {
             home,
             discoverable,
         }) => {
-            let home = home.unwrap_or_else(default_home);
+            // `--home` > OPENCOMPANY_DATA_DIR > $HOME/.opencompany, then any
+            // legacy doubled install is moved up before a single bundle is read.
+            let home = resolve_home_migrated(home)?;
+            // Materialize the canonical data-dir workspace layout and empty the
+            // ephemeral `tmp/` scratch so nothing stale survives a restart. The
+            // `[workspace]` section of `config.toml` (in the data dir) toggles
+            // the tmp clear; absent config keeps the default (clear on startup).
+            let data_root = opencompany::app::config::data_dir_from_env();
+            // An explicit `--home` pointing away from the data root splits one
+            // instance in two: bundles here, shared workspace there. Printed
+            // rather than `warn!`d — the default `EnvFilter` drops warnings
+            // unless RUST_LOG is set, so a `warn!` would be exactly as silent
+            // as the bug it reports.
+            if let Some(warning) = opencompany::store::home_divergence_warning(&home, &data_root) {
+                eprintln!("opencompany: {warning}");
+            }
+            let workspace_cfg = ConfigFile::load(&data_root)?
+                .map(|c| c.workspace.resolve())
+                .unwrap_or_default();
+            let layout = opencompany::store::DataLayout::new(&data_root);
+            layout.ensure(workspace_cfg.clear_tmp_on_startup).await?;
+            // Soft disk-quota alerting. Hard enforcement is the container /
+            // StorageClass layer's job (EFS access point, k8s ResourceQuota);
+            // here we surface an operator-visible warning when a workspace
+            // exceeds its configured `[workspace]` quota.
+            if let Some(limit) = workspace_cfg.storage_quota_bytes {
+                let used = layout.usage_bytes().await?;
+                if used > limit {
+                    tracing::warn!(
+                        used_bytes = used,
+                        quota_bytes = limit,
+                        data_dir = %data_root.display(),
+                        "workspace storage over quota — enforce hard limits at the container/StorageClass layer",
+                    );
+                }
+            }
+            if let Some(limit) = workspace_cfg.tmp_quota_bytes {
+                let used = layout.tmp_bytes().await?;
+                if used > limit {
+                    tracing::warn!(
+                        used_bytes = used,
+                        quota_bytes = limit,
+                        "workspace tmp/ scratch over quota",
+                    );
+                }
+            }
             // tiny.place economy + public-card configuration resolved from the
             // environment (with built-in defaults); the a2a routes and boot
             // going-public flow read these off `AppConfig`.
@@ -564,6 +813,15 @@ async fn main() -> Result<()> {
             let tenant_namespace = std::env::var("OPENCOMPANY_TENANT_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
+            // The address the platform records as this instance's creator. A
+            // provisioned company's manifest names no admin, so without this
+            // nobody is eligible to log in and there is no operator token to
+            // send the first invite with (issue #321). Treated exactly like a
+            // manifest `[users].admins` entry — a standing invite, not an
+            // account. Unset (self-hosted, local `serve`) is a full no-op.
+            let admin_email = std::env::var("OPENCOMPANY_ADMIN_EMAIL")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
             // Hosted-brain credential, resolved with the same precedence the
             // harness uses (`harness_inference_from_env`) so `/spec`'s
             // `cycles_available` reflects whether cognition can actually run.
@@ -572,12 +830,21 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .map(opencompany::ports::types::SecretValue);
-            let mut state = AppState::new(AppConfig {
+            // Honor TINYHUMANS_API_URL (e.g. staging) — the config layer reads
+            // it, but this manual AppConfig build otherwise falls to the prod
+            // default, so a staging credential could never reach staging.
+            let api_url = std::env::var("TINYHUMANS_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| AppConfig::default().api_url);
+            let state = AppState::new(AppConfig {
                 bind,
                 openhuman_root,
+                api_url,
                 tinyplace_api_url,
                 public_url,
                 tenant_namespace,
+                admin_email,
                 tinyhumans_credential,
                 ..AppConfig::default()
             })
@@ -587,6 +854,7 @@ async fn main() -> Result<()> {
                 env_usize("OPENCOMPANY_MAX_COMPANIES"),
                 env_usize("OPENCOMPANY_MAX_COMPANIES_PER_TENANT"),
             );
+            let mut state = attach_hub_identity(state);
             // Storage backend selection: fs (default) needs nothing; sqlite and
             // mongodb are opened once here and injected into every company's
             // builder. A selected-but-unavailable backend aborts boot rather
@@ -692,10 +960,17 @@ async fn main() -> Result<()> {
                         dir.display()
                     );
                 }
+                spawn_mailbox_poller(&state, &id, &shutdown, &mut scheduler_handles);
+                spawn_telegram_poller(&state, &id, &shutdown, &mut scheduler_handles);
             }
             if companies.is_empty() {
                 println!("serving with no companies; pass --company <dir> to load one");
             }
+
+            // One workflow scheduler for the whole process, started even with no
+            // companies loaded: it re-reads the registry each minute, so a
+            // company registered later is picked up without a restart.
+            scheduler_handles.push(spawn_workflow_scheduler(&state, &shutdown));
 
             // Stop the schedulers on Ctrl-C so background cycle work halts with
             // the process (lifecycle shutdown).
@@ -729,13 +1004,7 @@ async fn main() -> Result<()> {
             let env = ProcessEnv;
             // Locate config.toml under the resolved data dir (env override or
             // the default `$HOME/.opencompany`).
-            let config_dir = match std::env::var_os("OPENCOMPANY_DATA_DIR") {
-                Some(dir) => PathBuf::from(dir),
-                None => match std::env::var_os("HOME") {
-                    Some(home) => PathBuf::from(home).join(".opencompany"),
-                    None => PathBuf::from(".opencompany"),
-                },
-            };
+            let config_dir = opencompany::app::config::data_dir_from_env();
             let config_toml = ConfigFile::load(&config_dir)?;
             let manifest = match &company {
                 Some(dir) => CompanyManifest::from_path(dir)?,
@@ -790,10 +1059,113 @@ mod test {
     use super::*;
 
     #[test]
-    fn default_home_lands_under_opencompany() {
-        let home = default_home();
-        assert!(home.ends_with("companies"));
-        assert!(home.to_string_lossy().contains(".opencompany"));
+    fn the_home_flag_is_taken_verbatim() {
+        // The binary owns no home policy of its own: it delegates to
+        // `store::resolve_home`, whose precedence chain (flag >
+        // OPENCOMPANY_DATA_DIR > $HOME/.opencompany) is covered in
+        // `src/store/paths.rs`. This only pins the wiring.
+        assert_eq!(
+            opencompany::store::resolve_home(Some(PathBuf::from("/flag"))).unwrap(),
+            PathBuf::from("/flag")
+        );
+    }
+
+    #[test]
+    fn every_home_resolving_command_migrates_the_legacy_nest() {
+        // `serve`, `export`, and `import` all resolve through
+        // `resolve_home_migrated`, so an un-migrated install's first
+        // post-upgrade command is not the one that finds no bundles.
+        let home = std::env::temp_dir().join(format!(
+            "oc-bin-migrate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let nested = home.join("companies/companies/acme");
+        std::fs::create_dir_all(&nested).expect("legacy bundle");
+        std::fs::write(nested.join("company.toml"), "[company]\n").expect("manifest");
+
+        let resolved = resolve_home_migrated(Some(home.clone())).expect("resolves and migrates");
+
+        assert_eq!(resolved, home);
+        assert!(home.join("companies/acme/company.toml").exists());
+        assert!(!home.join("companies/companies").exists());
+        // The wiring is what is under test, but the bundle path it produces is
+        // the point of the whole change.
+        assert_eq!(
+            opencompany::store::Bundle::new(resolved, &CompanyId::new("acme"))
+                .dir()
+                .to_path_buf(),
+            home.join("companies/acme")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn no_command_resolves_a_home_without_migrating_it() {
+        // The test above pins the helper; this pins that the helper is the only
+        // door. A command that called `store::resolve_home` directly would read
+        // an un-migrated install and find no companies — and no runtime test
+        // would catch it, because the defect is a call that never happens. The
+        // needle is split so this assertion does not match its own source line.
+        let needle = concat!("store::", "resolve_home(");
+        let source = include_str!("opencompany.rs");
+        let production = source.split("\nmod test {").next().unwrap_or(source);
+
+        let direct: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(needle))
+            .collect();
+
+        assert_eq!(
+            direct.len(),
+            1,
+            "`resolve_home` belongs to `resolve_home_migrated` alone; found {direct:?}"
+        );
+        let (before_helper, _) = production
+            .split_once("fn resolve_home_migrated")
+            .expect("the helper is declared");
+        assert!(
+            !before_helper.contains(needle),
+            "the one call must be the one inside `resolve_home_migrated`"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_and_import_migrate_before_they_read() {
+        // Both commands run against an install whose first post-upgrade command
+        // may well be one of them, so neither may be the one that finds no
+        // bundles. Their results are irrelevant here — the migration happens
+        // before either touches a path, which is the whole point.
+        for command in ["export", "import"] {
+            let home = std::env::temp_dir().join(format!(
+                "oc-bin-{command}-migrate-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            let nested = home.join("companies/companies/acme");
+            std::fs::create_dir_all(&nested).expect("legacy bundle");
+            std::fs::write(nested.join("company.toml"), "[company]\n").expect("manifest");
+
+            match command {
+                "export" => {
+                    let out = home.join("out");
+                    let _ =
+                        run_export("acme".to_string(), Some(out), false, Some(home.clone())).await;
+                }
+                _ => {
+                    let _ = import_from_dir(&home.join("nothing-here"), Some(home.clone())).await;
+                }
+            }
+
+            assert!(
+                home.join("companies/acme/company.toml").exists(),
+                "`{command}` resolved a home without migrating it"
+            );
+            assert!(!home.join("companies/companies").exists());
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[tokio::test]
@@ -848,6 +1220,73 @@ mod test {
         assert!(
             !runtime.workspace().is_empty(runtime.id()).await.unwrap(),
             "workspace still seeds when --company is a manifest file"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Issue #85: launching from a template *directory* derives the provenance
+    /// from that directory's basename — `source_id` and `path` both the slug,
+    /// `version` faithfully `None` (the serve path exposes no template version).
+    /// Distinct from the builder-injection test in `runtime::builder`: this
+    /// exercises the serve-path derivation in `register_company` itself. Per
+    /// 8b40fa7 the stamped `path` is the basename, never the absolute host path.
+    #[tokio::test]
+    async fn register_company_stamps_provenance_from_directory() {
+        let home = std::env::temp_dir().join(format!("oc-prov-dir-{}", std::process::id()));
+        let state = AppState::new(AppConfig::default());
+        let dir = std::path::Path::new("companies/agentic_law_firm");
+
+        register_company(&state, &home, dir, false).await.unwrap();
+
+        let runtime = state.registry().sole().expect("sole company");
+        let record = runtime
+            .store()
+            .load(runtime.id())
+            .await
+            .unwrap()
+            .expect("persisted record");
+        let provenance = record
+            .template_provenance
+            .expect("a directory launch stamps template provenance");
+        assert_eq!(provenance.source_id, "agentic_law_firm");
+        assert_eq!(provenance.version, None, "serve path records no version");
+        assert_eq!(
+            provenance.path.as_deref(),
+            Some("agentic_law_firm"),
+            "path is the template basename, not the absolute host path"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Issue #85: launching from a `company.toml` *file* path normalizes to its
+    /// parent company directory before deriving provenance, so the stamped
+    /// provenance matches the directory launch exactly (basename `source_id` +
+    /// `path`, `None` version). Guards the file-path input shape of the
+    /// serve-path derivation.
+    #[tokio::test]
+    async fn register_company_stamps_provenance_from_manifest_file() {
+        let home = std::env::temp_dir().join(format!("oc-prov-file-{}", std::process::id()));
+        let state = AppState::new(AppConfig::default());
+        let file = std::path::Path::new("companies/agentic_law_firm/company.toml");
+
+        register_company(&state, &home, file, false).await.unwrap();
+
+        let runtime = state.registry().sole().expect("sole company");
+        let record = runtime
+            .store()
+            .load(runtime.id())
+            .await
+            .unwrap()
+            .expect("persisted record");
+        let provenance = record
+            .template_provenance
+            .expect("a manifest-file launch stamps provenance from the parent dir");
+        assert_eq!(provenance.source_id, "agentic_law_firm");
+        assert_eq!(provenance.version, None);
+        assert_eq!(
+            provenance.path.as_deref(),
+            Some("agentic_law_firm"),
+            "path is the template basename, not the absolute host path"
         );
         std::fs::remove_dir_all(&home).ok();
     }

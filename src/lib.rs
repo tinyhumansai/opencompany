@@ -25,6 +25,11 @@ pub mod runtime;
 pub mod server;
 pub mod store;
 pub mod tiny;
+/// Transient per-turn progress bus — the live tool-call timeline that rides the
+/// company SSE feed while a turn runs. Separate from the durable event log; the
+/// `openhuman` harness publishes, the operator SSE route subscribes. Always
+/// compiled (no `openhuman` types); no publishers in the default build.
+pub mod turn_stream;
 /// Issue #29 (epic #26): run a company's workflows on the embedded `tinyflows`
 /// engine, with agent nodes executing on the harness pool. Compiled only under
 /// the `openhuman` feature; the default build links none of it.

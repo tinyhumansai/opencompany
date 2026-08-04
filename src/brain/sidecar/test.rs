@@ -70,6 +70,11 @@ impl CycleHost for RecordingHost {
         self.effects.lock().unwrap().push(effect);
         Ok(self.disposition.clone())
     }
+
+    async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+        self.effects.lock().unwrap().push(effect);
+        Ok(ApprovalId::new("appr-parked"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +109,7 @@ fn operator_request() -> CycleRequest {
         events: vec![CompanyEvent::OperatorMessage {
             text: "hi".into(),
             by: None,
+            chat: None,
         }],
         event_seqs: Vec::new(),
         compressed_history: Vec::new(),
@@ -194,6 +200,70 @@ async fn inference_frame_invokes_host_callback_and_answers() {
     // Token usage accumulated into the cycle result.
     assert_eq!(result.token_usage.input, 11);
     assert_eq!(result.token_usage.output, 7);
+}
+
+/// `with_cost` and `with_tokens` must compose in either order. `with_tokens`
+/// used to replace the whole `TokenUsage`, so cost-first ordering silently reset
+/// `cost_usd` to zero and any fixture written that way metered a free cycle —
+/// the exact under-reporting issue #174 is about. The tokens-first ordering is
+/// already covered by `cycle_folds_multi_pass_usage`; this pins the reverse.
+#[tokio::test]
+async fn mock_inference_cost_survives_a_later_with_tokens() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(cid(), vec![inference_frame(0, "what next?")]);
+    let inference = Arc::new(
+        MockInferenceClient::new()
+            .with_text("done")
+            // Cost first — the ordering that used to lose the cost.
+            .with_cost(0.005)
+            .with_tokens(10, 4),
+    );
+    let brain = brain(transport.clone(), inference.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 10);
+    assert_eq!(result.token_usage.output, 4);
+    assert!(
+        (result.token_usage.cost_usd - 0.005).abs() < 1e-9,
+        "with_tokens must not clear a cost set by with_cost, got {}",
+        result.token_usage.cost_usd
+    );
+}
+
+/// Issue #174: the host's inference client is the only side that sees what a pass
+/// cost, so the cycle total must carry the cost too — that is what the runtime
+/// meters onto the Usage and Finances surfaces.
+#[tokio::test]
+async fn cycle_usage_carries_the_cost_of_every_pass() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![inference_frame(0, "first"), inference_frame(1, "second")],
+    );
+    let inference = Arc::new(
+        MockInferenceClient::new()
+            .with_text("done")
+            .with_tokens(10, 4)
+            .with_cost(0.005),
+    );
+    let brain = brain(transport.clone(), inference.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    // Two passes fold into one cycle total.
+    assert_eq!(result.token_usage.input, 20);
+    assert_eq!(result.token_usage.output, 8);
+    assert!((result.token_usage.cost_usd - 0.01).abs() < 1e-9);
+    assert!(!result.token_usage.is_zero());
+
+    // The sidecar reports usage per cycle; the provider that served it belongs to
+    // the host's client, not the brain.
+    let cognition = brain.cognition();
+    assert_eq!(cognition.path, "sidecar");
+    assert_eq!(cognition.metering, UsageMetering::PerCycle);
 }
 
 #[tokio::test]
@@ -368,11 +438,11 @@ use crate::company::CompanyManifest;
 use crate::ports::types::{Actor, ActorKind, Verdict};
 use crate::runtime::RuntimeBuilder;
 
-fn tmp_home() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "opencompany-sidecar-{}",
-        crate::ports::generate_id()
-    ))
+fn tmp_home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("opencompany-sidecar-")
+        .tempdir()
+        .expect("tempdir")
 }
 
 fn manifest(policy_mode: &str) -> CompanyManifest {
@@ -417,7 +487,8 @@ fn sidecar_brain_for(
 
 #[tokio::test]
 async fn e2e_inference_then_gated_send_dm_drives_a_channel_response() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(
         runtime_cid(),
@@ -442,6 +513,7 @@ async fn e2e_inference_then_gated_send_dm_drives_a_channel_response() {
         .run_cycle(vec![CompanyEvent::OperatorMessage {
             text: "how are we doing".into(),
             by: None,
+            chat: None,
         }])
         .await
         .unwrap();
@@ -463,13 +535,12 @@ async fn e2e_inference_then_gated_send_dm_drives_a_channel_response() {
     // A compressed trace was persisted to the fs-backed MemoryStore.
     let traces = rt.memory.recent_traces(rt.id(), 10).await.unwrap();
     assert!(!traces.is_empty());
-
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn e2e_supervised_effect_parks_through_the_real_gate() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(
         runtime_cid(),
@@ -487,6 +558,7 @@ async fn e2e_supervised_effect_parks_through_the_real_gate() {
         .run_cycle(vec![CompanyEvent::OperatorMessage {
             text: "file it".into(),
             by: None,
+            chat: None,
         }])
         .await
         .unwrap();
@@ -515,6 +587,4 @@ async fn e2e_supervised_effect_parks_through_the_real_gate() {
     .await
     .unwrap();
     assert!(rt.pending_approvals().is_empty());
-
-    tokio::fs::remove_dir_all(&home).await.ok();
 }

@@ -5,9 +5,11 @@ import { toast } from "sonner";
 import {
   createSkill,
   installSkill,
+  listRegistrySkills,
   listSkills,
   setSkillEnabled,
   uninstallSkill,
+  type RegistrySkill,
   type Skill,
 } from "@/api/skills";
 import type { OpenCompanyClient } from "@/api/client";
@@ -37,12 +39,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import {
-  CATEGORY_STYLES,
-  type RegistrySkill,
-  SKILL_REGISTRY,
-  type SkillCategory,
-} from "@/lib/skills";
+import { CATEGORY_STYLES, type SkillCategory } from "@/lib/skills";
 
 interface Props {
   client: OpenCompanyClient;
@@ -69,6 +66,11 @@ export function SkillsView({ client, company }: Props) {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // The shared registry, live from the host. The console holds no catalog of
+  // its own, so what an operator can browse is exactly what the host can serve.
+  const [registry, setRegistry] = useState<RegistrySkill[]>([]);
+  const [registryLoading, setRegistryLoading] = useState(true);
+  const [registryError, setRegistryError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [query, setQuery] = useState("");
   // A generation token so a response from a previous company scope (or after
@@ -77,22 +79,38 @@ export function SkillsView({ client, company }: Props) {
 
   const refresh = useCallback(async () => {
     const mine = ++gen.current;
-    try {
-      const rows = await listSkills(client, company);
-      if (mine !== gen.current) return;
-      setSkills(rows);
+    // Independent requests: a failing registry must not blank the installed
+    // list (or the reverse), so each settles on its own.
+    const [installed, shared] = await Promise.allSettled([
+      listSkills(client, company),
+      listRegistrySkills(client, company),
+    ]);
+    if (mine !== gen.current) return;
+
+    if (installed.status === "fulfilled") {
+      setSkills(installed.value);
       setError(null);
-    } catch (e) {
-      if (mine !== gen.current) return;
+    } else {
+      const e = installed.reason;
       setError(e instanceof Error ? e.message : "could not load skills");
-    } finally {
-      if (mine === gen.current) setLoading(false);
     }
+    setLoading(false);
+
+    if (shared.status === "fulfilled") {
+      setRegistry(shared.value);
+      setRegistryError(null);
+    } else {
+      const e = shared.reason;
+      setRegistryError(e instanceof Error ? e.message : "could not load the registry");
+    }
+    setRegistryLoading(false);
   }, [client, company]);
 
   useEffect(() => {
     setLoading(true);
+    setRegistryLoading(true);
     setSkills([]); // drop the previous scope's skills while the new set loads
+    setRegistry([]);
     void refresh();
     // Invalidate any in-flight request on scope change / unmount.
     return () => {
@@ -144,12 +162,12 @@ export function SkillsView({ client, company }: Props) {
     }
   }
 
-  const registry = useMemo(() => {
+  const visibleRegistry = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return SKILL_REGISTRY.filter(
+    return registry.filter(
       (s) => !q || s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q),
     );
-  }, [query]);
+  }, [query, registry]);
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -208,16 +226,36 @@ export function SkillsView({ client, company }: Props) {
               <Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search the registry…" className="pl-8" />
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {registry.map((s) => (
-                <RegistryCard
-                  key={s.id}
-                  skill={s}
-                  installed={installedIds.has(s.id)}
-                  onInstall={() => void install(s)}
-                />
-              ))}
-            </div>
+            {registryError && (
+              <Alert variant="destructive">
+                <AlertDescription>{registryError}</AlertDescription>
+              </Alert>
+            )}
+            {registryLoading ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Skeleton className="h-32 rounded-xl" />
+                <Skeleton className="h-32 rounded-xl" />
+              </div>
+            ) : visibleRegistry.length === 0 ? (
+              <Empty
+                label={
+                  registry.length === 0
+                    ? "This host serves no shared skill registry."
+                    : "No skills match that search."
+                }
+              />
+            ) : (
+              <div className="grid gap-3 sm:grid-cols-2">
+                {visibleRegistry.map((s) => (
+                  <RegistryCard
+                    key={s.id}
+                    skill={s}
+                    installed={installedIds.has(s.id)}
+                    onInstall={() => void install(s)}
+                  />
+                ))}
+              </div>
+            )}
           </TabsContent>
         </Tabs>
       </div>
@@ -250,7 +288,7 @@ function InstalledCard({
   onUninstall: () => void;
 }) {
   return (
-    <Card className={cn(!skill.enabled && "opacity-70")}>
+    <Card data-testid="installed-card" className={cn(!skill.enabled && "opacity-70")}>
       <CardContent className="space-y-2 py-4">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -294,7 +332,7 @@ function RegistryCard({
   onInstall: () => void;
 }) {
   return (
-    <Card>
+    <Card data-testid="registry-card">
       <CardContent className="space-y-2 py-4">
         <div className="flex items-center gap-2">
           <Sparkles className="size-4 text-muted-foreground" />
@@ -306,7 +344,10 @@ function RegistryCard({
             <Badge variant="outline" className={cn("capitalize", categoryStyle(skill.category))}>
               {skill.category}
             </Badge>
-            <span className="text-xs text-muted-foreground">{skill.publisher}</span>
+            <span className="text-xs text-muted-foreground">
+              {skill.publisher}
+              {skill.version ? ` · v${skill.version}` : ""}
+            </span>
           </div>
           {installed ? (
             <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">

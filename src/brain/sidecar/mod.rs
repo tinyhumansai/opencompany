@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 
 use crate::Result;
-use crate::ports::brain::{Brain, CycleHost};
+use crate::ports::brain::{Brain, Cognition, CycleHost, UsageMetering};
 use crate::ports::types::{
     CompanyId, CompressedTrace, CycleRequest, CycleResult, EffectDisposition, LedgerEntry,
     OutboundMessage, TokenUsage, ToolCall,
@@ -271,8 +271,10 @@ impl Brain for SidecarBrain {
                         passes += 1;
                         // The inference inversion: the host runs the model pass.
                         let response = self.inference.infer(request).await?;
-                        token_usage.input += response.token_usage.input;
-                        token_usage.output += response.token_usage.output;
+                        // Fold the whole total (tokens, cache hits, cost) so the
+                        // runtime can meter the cycle — the host's client is the
+                        // only side that sees what the pass actually cost.
+                        token_usage.fold(&response.token_usage);
                         self.transport.answer_inference(&call_id, response).await?;
                     }
                 }
@@ -290,6 +292,18 @@ impl Brain for SidecarBrain {
             ledger_deltas,
             token_usage,
         })
+    }
+
+    /// The sidecar reasons locally but the *host's* [`InferenceClient`] runs the
+    /// model, so the cycle's usage is real and reported per cycle — while the
+    /// provider that served it is the host client's business, not the brain's,
+    /// hence the unknown slug.
+    fn cognition(&self) -> Cognition {
+        Cognition {
+            path: "sidecar",
+            metering: UsageMetering::PerCycle,
+            ..Cognition::default()
+        }
     }
 }
 

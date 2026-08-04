@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { setInboxEnabled } from "@/api/inbox";
 import { ApiError } from "@/api/types";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
-import { isInboxEnabled, loadInboxes, saveInboxes, toggleInbox } from "@/lib/inbox";
 import { fromDto, newMember, starterTeam, type TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { AddMemberDialog, type NewMemberFields } from "./chat/AddMemberDialog";
@@ -66,11 +67,6 @@ export function ChatView({ client, company, sub, onNavigate, onReply, notices }:
   const [membersOpen, setMembersOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<"rail" | "chat">("chat");
-  const [inboxes, setInboxes] = useState(() => loadInboxes(company));
-
-  useEffect(() => {
-    saveInboxes(company, inboxes);
-  }, [company, inboxes]);
 
   const boot = useCallback(async () => {
     try {
@@ -168,9 +164,44 @@ export function ChatView({ client, company, sub, onNavigate, onReply, notices }:
     }));
   }
 
+  /**
+   * Give a teammate an inbox, or take it away, on the host — keyed by the
+   * roster **agent id**, which is the `InboxStore` key the Inbox page reads and
+   * the ingest webhook files mail under. Nothing is persisted client-side: if
+   * the write fails the switch goes back, so the console never claims an inbox
+   * the host doesn't have (issue #173).
+   *
+   * Starter-roster rows are locally-invented placeholders, not host records, so
+   * their ids are not real inbox keys — refuse rather than file mail under one.
+   */
+  async function toggleMemberInbox(member: TeamMember) {
+    if (!fromHost) {
+      toast.error("Add this teammate to your company first — an inbox needs a saved teammate.");
+      return;
+    }
+    const next = !member.inboxEnabled;
+    const apply = (enabled: boolean) =>
+      setMembers((ms) => ms.map((m) => (m.id === member.id ? { ...m, inboxEnabled: enabled } : m)));
+    apply(next);
+    try {
+      await setInboxEnabled(client, company, member.id, next);
+    } catch (error) {
+      apply(!next);
+      toast.error(
+        error instanceof ApiError && error.status === 404
+          ? "This host doesn't offer teammate inboxes yet."
+          : error instanceof Error
+            ? error.message
+            : "Couldn't change the inbox.",
+      );
+    }
+  }
+
   function addMember(fields: NewMemberFields) {
     setMembers((m) => [...m, newMember(fields)]);
-    if (fields.inbox) setInboxes((s) => toggleInbox(s, fields.name));
+    // A locally-added teammate has no host record yet, so there is no agent id
+    // to hang an inbox off — say so rather than silently dropping the request.
+    if (fields.inbox) toast.error("Save this teammate on the host before giving them an inbox.");
     setAddOpen(false);
   }
 
@@ -243,8 +274,7 @@ export function ChatView({ client, company, sub, onNavigate, onReply, notices }:
               members={members}
               loading={loadingTeam}
               fromHost={fromHost}
-              hasInbox={(name) => isInboxEnabled(inboxes, name)}
-              onToggleInbox={(name) => setInboxes((s) => toggleInbox(s, name))}
+              onToggleInbox={(m) => void toggleMemberInbox(m)}
               onRemove={(id) => setMembers((ms) => ms.filter((m) => m.id !== id))}
               onAdd={() => setAddOpen(true)}
               onMessage={(m) => selectChannel(dmChannelId(m))}

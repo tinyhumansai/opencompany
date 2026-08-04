@@ -39,6 +39,16 @@ pub enum SampleKind {
     /// An OAuth-connected tool invocation (populates the calls-by-provider
     /// chart). Wired by the runtime when a connected tool runs.
     OauthCall,
+    /// One completed metered web search (issue #238).
+    ///
+    /// Deliberately **not** [`Self::OauthCall`]. That kind is defined as
+    /// zero-cost — the money for a connected tool moves at the provider, not
+    /// through our meter — and it is what mints the calls-by-provider /
+    /// connections chart, so reusing it would both drop the cost the search
+    /// backend actually charged and invent a "connection" for a company that
+    /// has connected no account. A search is a *priced* call on the managed
+    /// platform, so it carries a real `cost_usd` and gets its own counter.
+    SearchCall,
 }
 
 /// One metered usage event.
@@ -61,6 +71,21 @@ pub struct UsageSample {
     pub cost_usd: f64,
     /// What produced the sample.
     pub kind: SampleKind,
+    /// The task **attempt** ([`RunRecord`](crate::ports::runs::RunRecord)) whose
+    /// turn produced this usage, when it ran under one (issue #242).
+    ///
+    /// Purely an attribution key: it lets "what did this attempt cost?" be
+    /// answered from the meter as well as from the run row, and "which attempts
+    /// burned this teammate's budget?" be answered at all. It changes **no**
+    /// ledger semantics — money still moves through the same `inference.spend`
+    /// entry, and [`UNATTRIBUTED_AGENT`](crate::metering::UNATTRIBUTED_AGENT)
+    /// still owns whole-company cycle usage.
+    ///
+    /// `None` for every chat turn, every workflow node, every OAuth/search call,
+    /// and every sample written before this field existed — so a backend's
+    /// stored rows need no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Durable per-company usage samples. Company A's usage MUST be invisible to

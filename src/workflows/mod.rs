@@ -14,10 +14,12 @@
 //! epic. The default build links none of it.
 
 pub mod caps;
+pub mod delivery;
 pub mod runner;
 pub mod translate;
 
 pub use caps::{HarnessAgentRunner, build_capabilities};
+pub use delivery::{DeliveryParking, WorkflowDeliveryDeps, deliver_outputs};
 pub use runner::{HarnessWorkflowRunner, run_workflow};
 pub use translate::translate;
 

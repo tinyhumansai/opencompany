@@ -27,11 +27,20 @@
 //! turn onto a [`UsageSample`](crate::ports::UsageSample); WS5 reads the meter
 //! back for the Usage/Finances surfaces. The ledger half writes through the
 //! real [`CompanyStore`] port.
+//!
+//! ## One mapping, two writers (issue #174)
+//!
+//! The sample/ledger shapes and the zero-usage guard live in
+//! [`metering::inference`](crate::metering::inference), which is compiled and
+//! tested by the default CI build; this module only converts [`TurnUsage`] into
+//! the crate-wide [`TokenUsage`] and delegates. That is what keeps the harness's
+//! per-turn metering and the runtime's per-cycle metering (every other cognition
+//! path) from drifting into two different definitions of "usage worth recording".
 
+use crate::metering::inference;
 use crate::ports::CompanyStore;
-use crate::ports::now_millis;
-use crate::ports::types::{CompanyId, LedgerEntry};
-use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
+use crate::ports::types::{CompanyId, LedgerEntry, TokenUsage};
+use crate::ports::usage::{UsageMeter, UsageSample};
 
 /// A turn's token/cost totals — a host-side mirror of openhuman's crate-private
 /// `TurnCost` (see module docs).
@@ -47,6 +56,18 @@ pub struct TurnUsage {
     pub cost_usd: f64,
 }
 
+impl TurnUsage {
+    /// This turn as the crate-wide [`TokenUsage`] the metering seam maps from.
+    fn to_token_usage(self) -> TokenUsage {
+        TokenUsage {
+            input: self.input_tokens,
+            output: self.output_tokens,
+            cached_input: self.cached_input_tokens,
+            cost_usd: self.cost_usd,
+        }
+    }
+}
+
 /// Build the `inference.spend` [`LedgerEntry`] for a turn, or `None` when the
 /// turn cost nothing.
 ///
@@ -55,44 +76,34 @@ pub struct TurnUsage {
 /// must not post a meaningless `$0.00` spend line to Finances. Its tokens are
 /// still recorded through [`usage_sample_for`] on the Usage surface.
 pub fn ledger_entry_for(turn: &TurnUsage, agent_id: &str) -> Option<LedgerEntry> {
-    if turn.cost_usd == 0.0 {
-        return None;
-    }
-    Some(LedgerEntry {
-        at_millis: now_millis(),
-        kind: "inference.spend".to_string(),
-        amount_usd: turn.cost_usd,
-        memo: agent_id.to_string(),
-    })
+    inference::inference_ledger_entry(&turn.to_token_usage(), agent_id)
 }
 
-/// Build the [`UsageSample`] for a turn, or `None` for a zero-usage turn.
-pub fn usage_sample_for(turn: &TurnUsage, agent_id: &str, provider: &str) -> Option<UsageSample> {
-    if is_zero_usage(turn) {
-        return None;
-    }
-    Some(UsageSample {
-        at_millis: now_millis(),
-        agent: agent_id.to_string(),
-        provider: provider.to_string(),
-        input_tokens: turn.input_tokens,
-        output_tokens: turn.output_tokens,
-        cached_input_tokens: turn.cached_input_tokens,
-        cost_usd: turn.cost_usd,
-        kind: SampleKind::Inference,
-    })
-}
-
-/// A turn is zero-usage when it moved no tokens and cost nothing — e.g. the
-/// offline [`MockProvider`](super::provider::MockProvider), whose replies carry
-/// no usage. Such a turn writes neither a ledger entry nor a usage sample.
-fn is_zero_usage(turn: &TurnUsage) -> bool {
-    turn.input_tokens == 0 && turn.output_tokens == 0 && turn.cost_usd == 0.0
+/// Build the [`UsageSample`] for a turn, or `None` for a zero-usage turn — e.g.
+/// one served by the offline [`MockProvider`](super::provider::MockProvider),
+/// whose replies carry no usage.
+///
+/// `run_id` attributes the sample to the task attempt the turn ran under, when
+/// it ran under one (issue #242). Stamped here rather than inside
+/// [`inference::inference_sample`] because that function is the *shared* mapping
+/// every cognition path uses and only the harness's per-turn path has a run to
+/// name — widening it would push a `None` onto four call sites that can never
+/// mean anything else.
+pub fn usage_sample_for(
+    turn: &TurnUsage,
+    agent_id: &str,
+    provider: &str,
+    run_id: Option<&str>,
+) -> Option<UsageSample> {
+    let mut sample = inference::inference_sample(&turn.to_token_usage(), agent_id, provider)?;
+    sample.run_id = run_id.map(str::to_string);
+    Some(sample)
 }
 
 /// Record a completed turn's cost: append the ledger entry (always available)
 /// and, when a [`UsageMeter`] is wired, record the usage sample. A zero-usage
 /// turn is a no-op.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_turn_cost(
     turn: &TurnUsage,
     agent_id: &str,
@@ -100,11 +111,13 @@ pub async fn record_turn_cost(
     company: &CompanyId,
     store: &dyn CompanyStore,
     meter: Option<&dyn UsageMeter>,
+    run_id: Option<&str>,
 ) -> crate::Result<()> {
     if let Some(entry) = ledger_entry_for(turn, agent_id) {
         store.append_ledger(company, entry).await?;
     }
-    if let (Some(meter), Some(sample)) = (meter, usage_sample_for(turn, agent_id, provider)) {
+    if let (Some(meter), Some(sample)) = (meter, usage_sample_for(turn, agent_id, provider, run_id))
+    {
         meter.record(company, &sample).await?;
     }
     Ok(())
@@ -118,6 +131,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::ports::types::{CompanyRecord, CompanySummary};
+    use crate::ports::usage::SampleKind;
 
     #[derive(Default)]
     struct RecordingStore {
@@ -174,7 +188,7 @@ mod tests {
     fn zero_usage_turn_produces_no_entry_or_sample() {
         let turn = TurnUsage::default();
         assert!(ledger_entry_for(&turn, "ceo").is_none());
-        assert!(usage_sample_for(&turn, "ceo", "managed").is_none());
+        assert!(usage_sample_for(&turn, "ceo", "managed", None).is_none());
     }
 
     /// The `/openai/v1` passthrough reports tokens but no USD (billing happens
@@ -188,7 +202,7 @@ mod tests {
             cached_input_tokens: 0,
             cost_usd: 0.0,
         };
-        assert!(usage_sample_for(&turn, "ceo", "managed").is_some());
+        assert!(usage_sample_for(&turn, "ceo", "managed", None).is_some());
         // No USD ⇒ no ledger entry, but the token sample still lands.
         assert!(ledger_entry_for(&turn, "ceo").is_none());
     }
@@ -214,6 +228,7 @@ mod tests {
             &CompanyId::new("acme"),
             &store,
             Some(&meter),
+            None,
         )
         .await
         .unwrap();
@@ -227,6 +242,56 @@ mod tests {
         assert_eq!(samples[0].output_tokens, 50);
     }
 
+    /// Issue #242: a turn that ran under a dispatched attempt attributes its
+    /// sample to that attempt, and one that did not stays unattributed. The
+    /// ledger entry is untouched either way — money still moves through the same
+    /// `inference.spend` line, so no accounting semantics change here.
+    #[tokio::test]
+    async fn a_sample_carries_the_attempt_its_turn_ran_under() {
+        let store = RecordingStore::default();
+        let meter = RecordingMeter::default();
+        let turn = turn_with(0.5);
+
+        record_turn_cost(
+            &turn,
+            "ceo",
+            "managed",
+            &CompanyId::new("acme"),
+            &store,
+            Some(&meter),
+            Some("run-7"),
+        )
+        .await
+        .unwrap();
+        // …and a chat turn, which belongs to no attempt.
+        record_turn_cost(
+            &turn,
+            "ceo",
+            "managed",
+            &CompanyId::new("acme"),
+            &store,
+            Some(&meter),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let samples = meter.samples.lock().unwrap();
+        assert_eq!(samples[0].run_id.as_deref(), Some("run-7"));
+        assert_eq!(samples[1].run_id, None);
+        // Attribution only — the spend itself is unchanged.
+        let ledger = store.ledger.lock().unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.iter().all(|e| e.amount_usd == 0.5));
+
+        // The field is additive on the wire: an unattributed sample serializes
+        // exactly as it did before #242.
+        let plain = serde_json::to_string(&samples[1]).expect("serialize");
+        assert!(!plain.contains("runId"), "{plain}");
+        let tagged = serde_json::to_string(&samples[0]).expect("serialize");
+        assert!(tagged.contains(r#""runId":"run-7""#), "{tagged}");
+    }
+
     #[tokio::test]
     async fn record_turn_cost_is_a_noop_for_zero_usage() {
         let store = RecordingStore::default();
@@ -238,6 +303,7 @@ mod tests {
             &CompanyId::new("acme"),
             &store,
             Some(&meter),
+            None,
         )
         .await
         .unwrap();

@@ -23,17 +23,76 @@ human_role = "Steering the company and approving anything costly"
 # every agent action, or `readonly` to block mutations entirely.
 mode = "full"
 
+[tools]
+# The company's own note tree — the same one the console's Workspace tab reads
+# and writes (issue #177). An agent-requested grant is narrowed by this list, so
+# without `workspace` here no agent below would receive even `workspace_list`.
+#
+# Both forms are needed: this list is matched with exact/glob semantics, so bare
+# `workspace` covers an agent asking for `workspace` but NOT one asking for
+# `workspace.read`, and `workspace.*` covers the sub-grants but not the bare one.
+allow = ["mcp:*", "workspace", "workspace.*"]
+
 [[agent]]
 id = "ceo"
 role = "Chief Executive"
 description = "Sets direction, answers about the company, and delegates the work."
+# The operator↔company chat responder. `orchestrator` makes the CEO answer from
+# whole-company context and delegate to the desks below. `mcp:*` grants the
+# remote MCP tool servers declared in `[[mcp_server]]`.
+tier = "orchestrator"
+# `workspace.read` is read-only by design: writes need a bare `workspace` or an
+# explicit `workspace.write`, so this cannot silently overwrite operator notes.
+tools = ["mcp:*", "workspace.read"]
 
 [[agent]]
 id = "engineer"
 role = "Engineer"
 description = "Explains how things are built and proposes technical plans."
+tools = ["mcp:*", "workspace.read"]
 
 [[agent]]
 id = "writer"
 role = "Writer"
 description = "Turns rough notes into short, clear written drafts."
+# The one agent that may edit a note, so the "an agent wrote it, the operator
+# sees it" round trip is demonstrable out of the box.
+tools = ["mcp:*", "workspace"]
+
+# Desks (group chats) the orchestrator can hand a turn to. Each desk's first
+# member is its lead; `delegate_to_desk` runs that member's turn.
+[[group_chat]]
+id = "engineering"
+name = "Engineering desk"
+description = "How things are built and technical plans."
+members = ["engineer"]
+
+[[group_chat]]
+id = "content"
+name = "Content desk"
+description = "Written drafts and copy."
+members = ["writer"]
+
+# A real, public, no-auth MCP tool server (DeepWiki — AI docs for GitHub
+# repositories). Its tools (read_wiki_structure / read_wiki_contents /
+# ask_question) reach every agent granted `mcp:*` above. Add credentialed
+# servers at runtime from the console's Connections tab.
+[[mcp_server]]
+name = "deepwiki"
+endpoint = "https://mcp.deepwiki.com/mcp"
+description = "AI-generated documentation and Q&A for public GitHub repositories."
+
+# Bring-Your-Own-Key inference. Uncomment to route this company's
+# agents through your own provider instead of the managed TinyHumans brain.
+# Omitting the section (the default) keeps the managed brain. The credential is
+# NEVER written here — set it write-only from the console's Connections tab, or
+# name a secret-store key with `api_key_secret`. You can also switch providers
+# live from the console (Connections → Inference) with no restart.
+#
+# [inference]
+# provider = "openrouter"          # managed | openrouter | openai_compatible | ollama
+# # base_url = "https://openrouter.ai/api/v1"   # defaulted for openrouter/managed
+#
+# [inference.models]               # abstract tier → concrete provider model id
+# "chat-v1" = "deepseek/deepseek-chat"
+# "reasoning-v1" = "deepseek/deepseek-r1"

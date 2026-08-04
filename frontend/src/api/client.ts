@@ -18,14 +18,22 @@ import {
   type ApiErrorBody,
   type AppSpec,
   type ApprovalSummary,
+  type CapabilityStatusDto,
+  type ChatHistoryMessageDto,
   type ChatResponse,
   type CompanyStatus,
   type ConnectionStart,
   type ConnectionState,
+  type CreateDeskInput,
+  type DeskDto,
   type FeedbackInput,
   type FeedbackResponse,
   type FeedbackSummary,
+  type FinancesDto,
+  type InboxDto,
+  type InboxMessageDto,
   type TeamMemberDto,
+  type UsageDto,
   type Verdict,
 } from "./types";
 
@@ -141,9 +149,135 @@ export class OpenCompanyClient {
     return this.request<CompanyStatus>("GET", `${this.scope(company)}`);
   }
 
-  /** Send the operator's message and return the company's reply. */
-  chat(text: string, company?: string | null): Promise<ChatResponse> {
-    return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, { text });
+  /**
+   * The company's capability-budget status (issue #108): the effective tier plan
+   * and per-tier token spend. Hosts without the surface (or with no `[plan]`)
+   * return `{ configured: false }`; callers render a "no plan configured" note.
+   */
+  capabilityStatus(company?: string | null): Promise<CapabilityStatusDto> {
+    return this.request<CapabilityStatusDto>("GET", `${this.scope(company)}/capabilities`);
+  }
+
+  /**
+   * The company's usage read (Usage view): daily token series, tokens by desk,
+   * OAuth calls by provider, and window totals over a `7d` / `30d` / `90d`
+   * range. Token figures are real-or-zero — the offline build reports a
+   * zero-filled series until the harness cost hook meters spend.
+   */
+  usage(range?: string | null, company?: string | null): Promise<UsageDto> {
+    const qs = range ? `?range=${encodeURIComponent(range)}` : "";
+    return this.request<UsageDto>("GET", `${this.scope(company)}/usage${qs}`);
+  }
+
+  /**
+   * The company's finance read (Finances view): balance, budget vs spend,
+   * revenue, spend by category, and the transaction journal. Figures are
+   * real-or-zero — the offline build reports zeroes until the ledger fills.
+   */
+  finances(company?: string | null): Promise<FinancesDto> {
+    return this.request<FinancesDto>("GET", `${this.scope(company)}/finances`);
+  }
+
+  /**
+   * Send the operator's message and return the company's reply. `chat` is the
+   * addressed desk / thread id (issue #53): the orchestrator routes an addressed
+   * message to that desk's lead, and an unaddressed one answers itself. Omitted /
+   * unknown ids fall to the orchestrator, so callers can always pass the active
+   * thread id safely.
+   */
+  chat(text: string, company?: string | null, chat?: string | null): Promise<ChatResponse> {
+    const body: { text: string; chat?: string } = { text };
+    if (chat) body.chat = chat;
+    return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, body);
+  }
+
+  /**
+   * The company's desks (group chats). Hosts that don't expose `.../desks` yet
+   * return 404 — callers fall back to the static default threads.
+   */
+  listDesks(company?: string | null): Promise<DeskDto[]> {
+    return this.request<DeskDto[]>("GET", `${this.scope(company)}/desks`);
+  }
+
+  /**
+   * Add a teammate to a desk through the operator overlay (issue #72). The
+   * teammate must be on the company roster; the desk must exist. Adding one
+   * already on the desk is a 409.
+   */
+  addDeskMember(deskId: string, agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "POST",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members`,
+      { agent_id: agentId },
+    );
+  }
+
+  /**
+   * Remove an operator-added desk member (issue #72). Only overlay members can
+   * be removed — a teammate declared on the desk in the manifest is part of the
+   * blueprint and returns a 409.
+   */
+  removeDeskMember(deskId: string, agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/members/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
+   * Set the operator's explicit member order (the desk hierarchy) for a desk
+   * (issue #131). `orderedMemberIds` is the full member list in the intended
+   * order — the first is the desk lead. Every id must be a current member; an
+   * empty list resets the desk to its blueprint order. The version-controlled
+   * manifest is never rewritten — the order lives in the overlay.
+   */
+  setDeskOrder(
+    deskId: string,
+    orderedMemberIds: string[],
+    company?: string | null,
+  ): Promise<void> {
+    return this.request<void>(
+      "PUT",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}/order`,
+      { ordered_member_ids: orderedMemberIds },
+    );
+  }
+
+  /**
+   * Create a desk through the operator overlay. `name` is required; the id is
+   * derived from it when omitted. Members are optional and must be roster
+   * teammates; the first is the desk's lead. The manifest is never rewritten and
+   * the desk survives rebuilds. A duplicate id is a 409, an invalid id/empty
+   * name a 400.
+   */
+  createDesk(input: CreateDeskInput, company?: string | null): Promise<DeskDto> {
+    return this.request<DeskDto>("POST", `${this.scope(company)}/desks`, input);
+  }
+
+  /**
+   * Delete an operator-created desk. A manifest (blueprint) desk cannot be
+   * deleted at runtime and returns a 409; an unknown id is a 404.
+   */
+  deleteDesk(deskId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/desks/${encodeURIComponent(deskId)}`,
+    );
+  }
+
+  /**
+   * A desk's persisted transcript (issue #65), so the console can rehydrate a
+   * thread on login/reload instead of always starting empty. `desk` is the
+   * thread id (as passed to {@link chat}); omitted reads the operator/General
+   * line. Hosts that don't expose `.../chat/history` yet return 404 — callers
+   * fall back to an empty transcript.
+   */
+  getChatHistory(desk?: string | null, company?: string | null): Promise<ChatHistoryMessageDto[]> {
+    const qs = desk ? `?desk=${encodeURIComponent(desk)}` : "";
+    return this.request<ChatHistoryMessageDto[]>(
+      "GET",
+      `${this.scope(company)}/chat/history${qs}`,
+    );
   }
 
   /** The approvals awaiting the operator. */
@@ -192,6 +326,58 @@ export class OpenCompanyClient {
    */
   listTeam(company?: string | null): Promise<TeamMemberDto[]> {
     return this.request<TeamMemberDto[]>("GET", `${this.scope(company)}/team`);
+  }
+
+  /**
+   * Add an operator-defined teammate (a "team overlay" agent). Persists on the
+   * host and shows up in `listTeam` afterwards — never returned by the write
+   * itself, so callers should refetch. Hosts without the write plane 404;
+   * callers fall back to a local-only add.
+   */
+  addTeamMember(
+    input: { name: string; role: string; description?: string },
+    company?: string | null,
+  ): Promise<TeamMemberDto> {
+    return this.request<TeamMemberDto>("POST", `${this.scope(company)}/team`, input);
+  }
+
+  /** Remove an operator-added teammate. 409s for a manifest teammate (can't be removed here). */
+  removeTeamMember(agentId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/team/${encodeURIComponent(agentId)}`,
+    );
+  }
+
+  /**
+   * The company's inboxes with unread counts (Inbox tab). Both inbound paths —
+   * the ingest webhook and the IMAP poller — file into the store this reads, so
+   * received mail appears here. Hosts without the surface 404; callers treat
+   * that as "no inboxes".
+   */
+  listInboxes(company?: string | null): Promise<InboxDto[]> {
+    return this.request<InboxDto[]>("GET", `${this.scope(company)}/inboxes`);
+  }
+
+  /** One inbox's messages, oldest first. */
+  inboxMessages(key: string, company?: string | null): Promise<InboxMessageDto[]> {
+    return this.request<InboxMessageDto[]>(
+      "GET",
+      `${this.scope(company)}/inboxes/${encodeURIComponent(key)}/messages`,
+    );
+  }
+
+  /** Mark inbox messages read (the given ids, or all when omitted); returns the count still unread. */
+  markInboxRead(
+    key: string,
+    ids?: string[],
+    company?: string | null,
+  ): Promise<{ unread: number }> {
+    return this.request<{ unread: number }>(
+      "POST",
+      `${this.scope(company)}/inboxes/${encodeURIComponent(key)}/read`,
+      ids ? { ids } : undefined,
+    );
   }
 
   /**

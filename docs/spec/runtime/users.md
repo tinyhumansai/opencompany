@@ -95,6 +95,47 @@ Manifest admins appear in the invite list as synthetic `manifest:` entries.
 Revoking one is refused: the manifest would re-grant it on the next login, so
 succeeding would be a lie.
 
+## Bootstrap: `OPENCOMPANY_ADMIN_EMAIL`
+
+A company the *platform* provisions has an empty `[users] admins`. The person
+who asked for it is recorded on the control plane's tenant row, which the
+manifest never sees — so nobody is eligible, and there is no operator token to
+send the first invite with. The company is unreachable by the human who created
+it (issue #321).
+
+The deployment therefore may name **one** more standing admin through the
+environment:
+
+```sh
+OPENCOMPANY_ADMIN_EMAIL=ada@example.com
+```
+
+It is the same grant as a manifest entry, not a second kind of one:
+
+- listing the address makes it *eligible*; only redeeming a link mints the user,
+  as an `admin`
+- unsetting it stops future bootstrapping and does not delete an account it
+  already created
+- it is normalized with the same `normalize_email`, so case and surrounding
+  whitespace do not matter
+- unset, empty, and whitespace-only are one behaviour — no grant at all. The
+  platform renders the variable for every tenant, so a tenant with no recorded
+  creator must be indistinguishable from a deployment predating the variable.
+
+It admits exactly that address. It is **not** "trust whoever the platform says
+owns this instance": the root of trust stays with what the company is
+configured with, never with an assertion made at sign-in time.
+
+The address appears in the invite list as a synthetic `platform:` entry, and
+revoking it is refused the same way — the error points at the variable rather
+than at `[users].admins`. An address named in both places renders once, as
+`manifest:`: that is the grant that outlives the deployment's variable.
+
+**Recovery for a company already provisioned with an empty admin list**: set the
+variable on the instance and restart it. The workload reads it at boot, and
+eligibility is evaluated per login rather than cached, so the next link request
+from that address succeeds.
+
 ## Routes
 
 Login routes are **unauthenticated by construction** (`PublicCompany`), because
@@ -194,10 +235,14 @@ can send mail never echoes it.
 
 ## Abuse and exposure
 
-- **Resend throttle**: one link per address per minute. A throttled request
-  returns the same `202` as a sent one (or the throttle is itself a membership
-  oracle) and leaves the live code alone (or anyone could invalidate a victim's
-  link on demand).
+- **Resend throttle**: one *mailed* link per address per minute. A throttled
+  request returns the same `202` as a sent one (or the throttle is itself a
+  membership oracle) and leaves the live code alone (or anyone could invalidate
+  a victim's link on demand). It does not apply where the code is echoed rather
+  than mailed — a loopback-only bind with no transport wired. There is no
+  mailbox to spare there, only the plaintext's hash is stored (so a throttled
+  answer cannot re-echo the live code), and throttling would lock the sole local
+  sign-in path for a minute after every use.
 - **Login codes are never echoed** from a host that is reachable from anywhere
   else. `dev_code` appears only on a loopback-only bind with no mail
   transport. A routable host with broken mail lets nobody in rather than

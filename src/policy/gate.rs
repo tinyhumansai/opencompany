@@ -45,6 +45,35 @@ struct ParkedEffect {
     parked_at_millis: u64,
 }
 
+/// What actually happened when a resolve reached the queue (issue #243).
+///
+/// The [`ApprovalGate`] port's `resolve` returns `Option<Effect>`, which
+/// collapses four distinct situations into one `None`: the approval was denied,
+/// it expired, it was never parked, or it was already resolved. That is enough
+/// for "should I execute the effect?" and nowhere near enough for anything else
+/// — most importantly it cannot tell "the operator denied this" from "this
+/// approval is already gone", so a double-submit (a double-click, a retried
+/// request, two operators on the same queue) looked exactly like a deny and got
+/// the full treatment: a second `ApprovalResolved` journal line and a second
+/// follow-up cycle, both describing an approval that no longer existed.
+///
+/// Returned by the concrete gate rather than widened onto the port, following
+/// the amend path — [`resolve_amended`](ManifestApprovalGate::resolve_amended) —
+/// which already reaches past the `dyn` boundary for the same reason.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResolveOutcome {
+    /// No such approval is parked: an unknown id, or one already resolved by an
+    /// earlier call. The caller must treat this as a no-op, not a deny.
+    NotParked,
+    /// The approval was parked but is past its TTL, so it resolves to a
+    /// default-deny whatever the operator asked for. It IS removed.
+    Expired,
+    /// The operator denied it. Removed; nothing to execute.
+    Denied,
+    /// The operator approved it in time. Removed, and here is the effect.
+    Approved(Effect),
+}
+
 /// The default [`ApprovalGate`]: evaluates effects against a company's
 /// `[policy]` and holds the in-memory approval queue.
 pub struct ManifestApprovalGate {
@@ -140,6 +169,35 @@ impl ManifestApprovalGate {
             return None;
         }
         Some(amended)
+    }
+
+    /// Resolves a parked approval as of `now`, reporting **which** of the four
+    /// outcomes occurred rather than collapsing them into an `Option`
+    /// (issue #243).
+    ///
+    /// The `remove` and the outcome decision are one critical section, so two
+    /// concurrent resolves of the same id cannot both win: whichever thread
+    /// takes the lock first gets `Approved` / `Denied` / `Expired`, and every
+    /// other thread finds the map empty and gets [`ResolveOutcome::NotParked`].
+    /// That is what makes an approve idempotent at the source instead of
+    /// depending on callers to check-then-act, which is racy by construction.
+    pub fn resolve_outcome(
+        &self,
+        id: &ApprovalId,
+        verdict: Verdict,
+        _by: Actor,
+        now_millis: u64,
+    ) -> ResolveOutcome {
+        let Some(parked) = self.parked.lock().expect("parked map poisoned").remove(id) else {
+            return ResolveOutcome::NotParked;
+        };
+        if now_millis.saturating_sub(parked.parked_at_millis) >= self.ttl_millis {
+            return ResolveOutcome::Expired;
+        }
+        match verdict {
+            Verdict::Approve => ResolveOutcome::Approved(parked.effect),
+            Verdict::Deny => ResolveOutcome::Denied,
+        }
     }
 
     /// Resolves a parked approval as of `now`, so expiry is testable.
@@ -278,6 +336,8 @@ mod test {
             established_thread: false,
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
+            agent: None,
+            run_id: None,
         }
     }
 
@@ -464,6 +524,108 @@ mod test {
         let future = now_millis() + 10_000;
         let resolved = gate.resolve_amended(&id, amended, operator(), future);
         assert_eq!(resolved, None);
+        assert!(gate.parked_ids().is_empty());
+    }
+
+    /// Issue #243: the four outcomes the port's `Option<Effect>` cannot tell
+    /// apart. The important pair is `Denied` vs `NotParked` — the caller must
+    /// journal and re-cycle the first and do nothing at all for the second.
+    #[tokio::test]
+    async fn resolve_outcome_distinguishes_all_four_results() {
+        let gate = ManifestApprovalGate::new(policy("supervised", None));
+        let eff = effect("filing.submit", EffectGroup::Sign);
+
+        // Unknown id.
+        assert_eq!(
+            gate.resolve_outcome(
+                &ApprovalId::new("never-parked"),
+                Verdict::Approve,
+                operator(),
+                now_millis()
+            ),
+            ResolveOutcome::NotParked
+        );
+
+        // Approved in time.
+        let id = gate.park(&company(), eff.clone()).await.unwrap();
+        assert_eq!(
+            gate.resolve_outcome(&id, Verdict::Approve, operator(), now_millis()),
+            ResolveOutcome::Approved(eff.clone())
+        );
+        // ...and resolving it a second time is NOT a deny, it is a no-op.
+        assert_eq!(
+            gate.resolve_outcome(&id, Verdict::Approve, operator(), now_millis()),
+            ResolveOutcome::NotParked,
+            "an already-resolved approval must not look like a fresh deny"
+        );
+
+        // Denied.
+        let id = gate.park(&company(), eff.clone()).await.unwrap();
+        assert_eq!(
+            gate.resolve_outcome(&id, Verdict::Deny, operator(), now_millis()),
+            ResolveOutcome::Denied
+        );
+
+        // Expired: past the TTL, an approve still resolves to a default-deny,
+        // and reports it as expiry rather than as the operator's choice.
+        let short = ManifestApprovalGate::new(policy("supervised", None)).with_ttl_millis(1000);
+        let id = short.park(&company(), eff).await.unwrap();
+        assert_eq!(
+            short.resolve_outcome(&id, Verdict::Approve, operator(), now_millis() + 10_000),
+            ResolveOutcome::Expired
+        );
+        assert!(
+            short.parked_ids().is_empty(),
+            "expiry still drains the queue"
+        );
+    }
+
+    /// Two operators (or one double-click, or a retried request) resolving the
+    /// same approval concurrently: exactly one wins.
+    ///
+    /// The `remove` and the outcome decision share a critical section precisely
+    /// so this cannot double-fire. A check-then-act caller — "is it parked? then
+    /// resolve it" — would let both threads through and execute the approved
+    /// effect twice; the at-most-once journal key would catch the *effect*, but
+    /// the duplicate journal record and the duplicate follow-up cycle would
+    /// still land.
+    #[tokio::test]
+    async fn concurrent_resolves_of_one_approval_yield_exactly_one_winner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let gate = Arc::new(ManifestApprovalGate::new(policy("supervised", None)));
+        let id = gate
+            .park(&company(), effect("filing.submit", EffectGroup::Sign))
+            .await
+            .unwrap();
+
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let not_parked = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let gate = Arc::clone(&gate);
+            let id = id.clone();
+            let approvals = Arc::clone(&approvals);
+            let not_parked = Arc::clone(&not_parked);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                match gate.resolve_outcome(&id, Verdict::Approve, operator(), now_millis()) {
+                    ResolveOutcome::Approved(_) => approvals.fetch_add(1, Ordering::SeqCst),
+                    ResolveOutcome::NotParked => not_parked.fetch_add(1, Ordering::SeqCst),
+                    other => panic!("unexpected outcome {other:?}"),
+                };
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task");
+        }
+
+        assert_eq!(approvals.load(Ordering::SeqCst), 1, "exactly one winner");
+        assert_eq!(not_parked.load(Ordering::SeqCst), 7, "the rest are no-ops");
         assert!(gate.parked_ids().is_empty());
     }
 

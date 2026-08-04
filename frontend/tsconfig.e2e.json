@@ -1,0 +1,44 @@
+// Issue #281. The Playwright suite under `test/e2e/` — and `playwright.config.ts`
+// itself — is type-checked by NOTHING without this file. `tsconfig.app.json`
+// sets `include: ["src"]` and `tsconfig.node.json` sets `include:
+// ["vite.config.ts"]`, so `npm run typecheck` (`tsc -b`, which walks only the
+// two projects `tsconfig.json` references) never compiles a spec. Running the
+// suite is the only thing that has ever checked it, and the suite needs a live
+// host, so in practice a spec that drifts from a signature it calls is caught by
+// a person or not at all.
+//
+// STANDALONE ON PURPOSE — not `composite`, and deliberately NOT added to
+// `tsconfig.json`'s `references`. A reference would pull the specs into
+// `npm run build`, making the shippable console artifact fail on a broken test
+// file; the two should be able to fail independently, and CI reports them as
+// separate steps for the same reason. `npm run typecheck:e2e` runs this project
+// on its own via `tsc -p`.
+//
+// Not an extension of `tsconfig.app.json` either: that config is a browser-app
+// project (`jsx`, `@/*` paths, `allowImportingTsExtensions`) and the specs need
+// none of it. They import `@playwright/test` and read `process.env`, so what
+// they actually require is Node types plus DOM — the latter because
+// `page.evaluate` callbacks are authored inline here but execute in the browser
+// and touch `localStorage`.
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "types": ["node"],
+
+    "strict": true,
+    // Matched to `tsconfig.app.json` rather than left at the TypeScript
+    // defaults. These two are exactly the settings that make the drift this
+    // config exists to catch fail loudly: dropping an argument from a helper, or
+    // leaving behind a locator that a rewritten assertion no longer uses.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["test", "playwright.config.ts"]
+}

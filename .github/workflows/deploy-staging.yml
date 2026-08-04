@@ -1,0 +1,231 @@
+# Build this repo's OWN image (the tenant workload) and put it in front of new
+# tenants on k3s staging.
+#
+# One repo, one image. This used to be built from the platform superproject
+# (tinyhumansai/opencompany-microservice), which meant a change here only shipped
+# when that repo's cron happened to notice the submodule pointer move. Now this
+# repo builds and publishes its own workload image, and the superproject builds
+# only the manager control plane.
+#
+# Required repository secrets:
+#   AWS_ROLE_ARN     — role assumed via OIDC to push to ECR. Its trust policy
+#                      must allow `repo:tinyhumansai/opencompany:*`.
+#   SSH_PRIVATE_KEY  — key trusted by root@ on the staging node.
+#   SSH_HOST         — staging node address.
+#
+# No PAT is needed: this repo and every crate the build compiles
+# (openhuman and its nested vendor graph) are public, so the default
+# GITHUB_TOKEN clones them all.
+name: Deploy tenant image to staging
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'frontend/**'
+      - 'companies/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'vendor/**'
+      - '.github/workflows/deploy-staging.yml'
+  workflow_dispatch:
+    inputs:
+      refresh_all_tenants:
+        description: 'Also restart already-running tenants onto the new image (disruptive: wakes idle tenants)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # assume the AWS role via OIDC to push to ECR
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: tinyhumansai/opencompany-tenant
+  K8S_NAMESPACE: opencompany-system
+  MANAGER_DEPLOY: opencompany-manager
+  # The feature set the hosted tenant ships with. Changing it changes what
+  # every tenant can do, so treat edits here as a product change, not a CI
+  # tweak. Full belt: adds mcp/media/composio (the credential/real-money tool
+  # families, fail-closed until their config exists), imap/telegram (channels),
+  # medulla (hosted brain transport), tinycortex (local memory backend), and
+  # sidecar. `sqlite` is intentionally omitted — its bundled rusqlite needs a C
+  # compiler the slim build image lacks, and it is redundant on a mongodb tenant.
+  TENANT_FEATURES: mongodb,openhuman,openhuman-rpc,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,telegram,medulla,tinycortex,sidecar
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      # Path-limited on purpose. `--features openhuman` compiles the vendored
+      # openhuman crate and its nested graph, and cargo must be able to read the
+      # manifests behind [patch.crates-io], so both of these must be present.
+      # Recursing from the repo root instead would also drag in openhuman's
+      # desktop-only submodules (tauri-cef is a heavy CEF checkout) that no
+      # server build compiles.
+      - name: Fetch build vendor submodules
+        run: git submodule update --init --recursive vendor/openhuman vendor/tinyagents
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image to ECR
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          build-args: |
+            FEATURES=${{ env.TENANT_FEATURES }}
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging-${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        run: ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Point the manager at the new tenant image
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging-${{ github.sha }}
+          REFRESH_ALL: ${{ inputs.refresh_all_tenants }}
+        run: |
+          ssh root@${SSH_HOST} \
+            "IMAGE='${IMAGE}' K8S_NAMESPACE='${{ env.K8S_NAMESPACE }}' MANAGER_DEPLOY='${{ env.MANAGER_DEPLOY }}' REFRESH_ALL='${REFRESH_ALL:-false}' bash -s" << 'EOF'
+          set -euo pipefail
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+          # The manager namespace's ecr-creds Secret expires after 12h and is
+          # refreshed every 6h by a systemd timer. Force a refresh so a deploy
+          # landing late in that window cannot fail on a stale token.
+          echo "Refreshing ECR pull secret..."
+          /usr/local/bin/ecr-refresh.sh
+
+          # Pre-pull the tenant image into the node's containerd.
+          #
+          # This is REQUIRED, not an optimisation. Tenant StatefulSets carry no
+          # imagePullSecrets, tenant namespaces have no ecr-creds, and there is no
+          # node-level registries.yaml — so a tenant pod pulling from ECR itself
+          # gets `403 Forbidden` and sits in ImagePullBackOff. containerd's image
+          # store is node-wide, so pulling here (with the credential the kubelet
+          # already holds) means every tenant's imagePullPolicy: IfNotPresent
+          # finds the image locally and never authenticates.
+          #
+          # This works because staging is a single node. The durable fix is for
+          # the manager to provision a per-tenant-namespace pull secret and set
+          # imagePullSecrets on the tenant pod spec; until that lands, this step
+          # is what makes a freshly pushed tenant image actually runnable.
+          echo "Pre-pulling ${IMAGE} into containerd..."
+          ECR_HOST="${IMAGE%%/*}"
+          PULL_USER=$(kubectl -n "${K8S_NAMESPACE}" get secret ecr-creds \
+            -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d \
+            | jq -r --arg r "${ECR_HOST}" '.auths[$r].username // "AWS"')
+          PULL_PW=$(kubectl -n "${K8S_NAMESPACE}" get secret ecr-creds \
+            -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d \
+            | jq -r --arg r "${ECR_HOST}" '.auths[$r].password')
+          if [ -z "${PULL_PW}" ] || [ "${PULL_PW}" = "null" ]; then
+            echo "ERROR: could not read an ECR credential for ${ECR_HOST} from ecr-creds" >&2
+            exit 1
+          fi
+          # Credential is passed as an argument to ctr only; never echoed.
+          # -n k8s.io is explicit on purpose: the kubelet only sees images in that
+          # containerd namespace. `k3s ctr` already defaults to it (unlike plain
+          # `ctr`, which defaults to `default`), but naming it means this does not
+          # silently break if that wrapper default ever changes.
+          k3s ctr -n k8s.io images pull --user "${PULL_USER}:${PULL_PW}" "${IMAGE}"
+
+          # Retry the check: `images ls` can lag a just-finished pull by a beat
+          # while containerd commits the record (observed failing 147ms after a
+          # successful pull, with layers still reporting `extracted`). The
+          # assertion is worth keeping — a silent pull failure would leave tenants
+          # unable to start — but it must not fail the deploy on that race.
+          present=no
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if k3s ctr -n k8s.io images ls -q | grep -Fqx "${IMAGE}"; then
+              present=yes
+              break
+            fi
+            sleep 2
+          done
+          [ "${present}" = yes ] \
+            || { echo "ERROR: ${IMAGE} is not in the k8s.io containerd namespace after pull" >&2; exit 1; }
+
+          # Tenant pods pin imagePullPolicy: IfNotPresent, so a moving tag is not
+          # re-pulled. The manager must be pointed at the immutable
+          # staging-<sha> tag, which a tag not already present locally always
+          # fetches. Never "deploy" by re-pushing :staging.
+          echo "Setting OCM_TENANT_IMAGE=${IMAGE}"
+          kubectl -n "${K8S_NAMESPACE}" set env "deploy/${MANAGER_DEPLOY}" "OCM_TENANT_IMAGE=${IMAGE}"
+
+          if ! kubectl -n "${K8S_NAMESPACE}" rollout status "deploy/${MANAGER_DEPLOY}" --timeout=300s; then
+            echo "ERROR: manager did not roll out; events and logs follow" >&2
+            kubectl -n "${K8S_NAMESPACE}" describe "deploy/${MANAGER_DEPLOY}" | tail -30 >&2
+            kubectl -n "${K8S_NAMESPACE}" logs "deploy/${MANAGER_DEPLOY}" --tail=100 >&2 || true
+            echo "Rolling back..." >&2
+            kubectl -n "${K8S_NAMESPACE}" rollout undo "deploy/${MANAGER_DEPLOY}"
+            kubectl -n "${K8S_NAMESPACE}" rollout status "deploy/${MANAGER_DEPLOY}" --timeout=180s >&2 || true
+            exit 1
+          fi
+
+          # OCM_TENANT_IMAGE only reaches a tenant when the manager PROVISIONS
+          # it — `ensure_running` calls `provision()` only when the StatefulSet is
+          # missing, and the reconciler does not re-apply manifests. So an
+          # existing tenant keeps its original image indefinitely, across
+          # scale-to-zero and wake alike; only a brand-new tenant picks this up.
+          #
+          # A `rollout restart` therefore does NOT move a tenant to a new image:
+          # it recreates the pod from the same spec. Refreshing means patching the
+          # image on the StatefulSet itself.
+          if [ "${REFRESH_ALL}" = "true" ]; then
+            echo "Moving all tenants onto ${IMAGE} (requested)..."
+            # `kubectl set image` has no -A/--all-namespaces (only `get` does), so
+            # enumerate first and patch each in its own namespace.
+            kubectl get statefulset -A -l app=opencompany \
+              -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' \
+            | while read -r ns name; do
+                [ -n "${ns}" ] || continue
+                echo "  ${ns}/${name} -> ${IMAGE}"
+                kubectl -n "${ns}" set image "statefulset/${name}" "opencompany=${IMAGE}"
+              done
+            # Report where each tenant actually landed rather than assuming the
+            # patch took: a tenant scaled to zero has no pod to roll, so
+            # `rollout status` would block forever on it.
+            kubectl get statefulset -A -l app=opencompany \
+              -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,IMAGE:.spec.template.spec.containers[?(@.name=="opencompany")].image'
+          else
+            echo "Running tenants keep their current image; re-run with refresh_all_tenants=true to move them."
+          fi
+
+          kubectl -n "${K8S_NAMESPACE}" get deploy "${MANAGER_DEPLOY}" \
+            -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="OCM_TENANT_IMAGE")]}OCM_TENANT_IMAGE={.value}{"\n"}{end}'
+          EOF

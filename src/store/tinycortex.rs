@@ -1,12 +1,17 @@
 //! TinyCortex-backed implementations of the memory and context ports.
 //!
-//! TinyCortex is the TinyHumans managed memory service. It is **not** checked
-//! out in this repository, so this module depends on nothing external: the
-//! storage seam is the [`CortexClient`] trait, and the compiled-and-tested
-//! backend is [`InMemoryCortex`], an offline in-memory implementation. A real
-//! HTTP client ([`HttpCortexClient`]) is present but inert — it returns
-//! [`OpenCompanyError::Unimplemented`] until the service is reachable through
-//! the OpenHuman seam. Nothing here touches the network.
+//! The storage seam is the company-scoped [`CortexClient`] trait. Two backends
+//! implement it:
+//!
+//! - [`InMemoryCortex`] — an offline, in-memory implementation used as the test
+//!   and no-data-dir fallback backend. It depends on nothing external and never
+//!   touches the network.
+//! - [`EngineCortex`](crate::store::tinycortex_engine::EngineCortex) (in the
+//!   sibling [`tinycortex_engine`](crate::store::tinycortex_engine) module) — the
+//!   real, in-pod, persistent engine over the vendored `tinycortex` crate. It
+//!   keeps each company's data in a durable per-company SQLite workspace and
+//!   ships in degraded lexical/recency recall mode (no embedding compute). It
+//!   also never makes a network call.
 //!
 //! [`CortexMemoryStore`] implements [`MemoryStore`] and [`CortexContextStore`]
 //! implements [`ContextStore`], both by translating each port call into a
@@ -38,6 +43,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
 use crate::ports::memory::MemoryStore;
+use crate::ports::now_millis;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyId, CompressedTrace, ContextChunk, EvictionPolicy,
     TaskResult,
@@ -109,12 +115,14 @@ struct CompanyCells {
     chunks: Vec<StoredChunk>,
 }
 
-/// A stored context chunk: its content address, label, and body.
+/// A stored context chunk: its content address, label, body, and the
+/// epoch-millis it was first stored.
 #[derive(Clone)]
 struct StoredChunk {
     addr: String,
     label: String,
     body: String,
+    stored_at_millis: u64,
 }
 
 /// An offline, in-memory [`CortexClient`] backing the cortex stores.
@@ -198,6 +206,7 @@ impl CortexClient for InMemoryCortex {
                     addr: addr.to_string(),
                     label: chunk.label,
                     body: chunk.body,
+                    stored_at_millis: now_millis(),
                 });
             }
         });
@@ -213,6 +222,7 @@ impl CortexClient for InMemoryCortex {
                     addr: ChunkAddr::new(s.addr.clone()),
                     label: s.label.clone(),
                     len: s.body.len(),
+                    stored_at_millis: s.stored_at_millis,
                 })
                 .collect()
         }))
@@ -345,72 +355,6 @@ fn snippet_around(body: &str, pos: usize, term_len: usize) -> String {
         .find(|&i| body.is_char_boundary(i))
         .unwrap_or(body.len());
     body[start..end].to_string()
-}
-
-// ---------------------------------------------------------------------------
-// Inert real client
-// ---------------------------------------------------------------------------
-
-/// A networked [`CortexClient`] that reaches TinyCortex through the OpenHuman
-/// seam.
-///
-/// TinyCortex is not checked out in this repository, so every method is inert
-/// and returns [`OpenCompanyError::Unimplemented`]. It ships compiled-but-inert
-/// so the feature graph is real; wiring it to the service — once
-/// `vendor/openhuman/vendor/tinycortex` is present — is a documented follow-up.
-/// No network dependency is added.
-#[derive(Default)]
-pub struct HttpCortexClient {
-    _private: (),
-}
-
-impl HttpCortexClient {
-    /// Builds the inert client.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl CortexClient for HttpCortexClient {
-    async fn append_trace(&self, _company: &str, _trace: CompressedTrace) -> Result<()> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn recent_traces(&self, _company: &str, _limit: usize) -> Result<Vec<CompressedTrace>> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn put_task_result(&self, _company: &str, _result: TaskResult) -> Result<()> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn archive_traces(&self, _company: &str, _policy: EvictionPolicy) -> Result<u64> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn put_chunk(&self, _company: &str, _addr: &str, _chunk: ContextChunk) -> Result<()> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn list_chunks(&self, _company: &str, _prefix: &str) -> Result<Vec<ChunkMeta>> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn peek_chunk(&self, _company: &str, _addr: &str) -> Result<Option<String>> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn search_chunks(
-        &self,
-        _company: &str,
-        _query: &str,
-        _limit: usize,
-    ) -> Result<Vec<ChunkHit>> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn hard_delete_trace(&self, _company: &str, _cycle_id: &str) -> Result<bool> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn hard_delete_chunk(&self, _company: &str, _addr: &str) -> Result<bool> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
-    async fn redact(&self, _company: &str, _needle: &str, _replacement: &str) -> Result<u64> {
-        Err(OpenCompanyError::Unimplemented("tinycortex http client"))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +536,13 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let (store, events, mem, ctx) = stores(dir.path());
         conformance::assert_export_totality(store, events, mem, ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_context_chunk_stamps(ctx).await;
     }
 
     fn company() -> CompanyId {
@@ -822,15 +773,5 @@ mod test {
         });
         assert_eq!(count, 1);
         assert_eq!(ok, Some(true));
-    }
-
-    #[tokio::test]
-    async fn http_client_is_inert() {
-        let client = HttpCortexClient::new();
-        let err = client
-            .recent_traces("acme", 1)
-            .await
-            .expect_err("http client is not implemented");
-        assert!(matches!(err, OpenCompanyError::Unimplemented(_)));
     }
 }

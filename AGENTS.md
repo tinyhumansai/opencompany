@@ -78,7 +78,16 @@ injects its environment. When developing hosted behavior, know the seams:
 
 - The manager injects `OPENCOMPANY_COMPANY`, `OPENCOMPANY_BIND=0.0.0.0:8080`,
   `OPENCOMPANY_DATA_DIR=/data`, and `OPENCOMPANY_PUBLIC_URL` into every
-  tenant container, plus — when database-per-tenant storage is enabled —
+  tenant container. `OPENCOMPANY_DATA_DIR` is the instance data root for
+  **both** the workspace layout and the company-bundle home; `docker/entrypoint.sh`
+  additionally forwards it as `--home "$OPENCOMPANY_DATA_DIR"`, which resolves
+  identically (the flag outranks the variable). Locally it is the only knob that
+  isolates two `serve` processes from each other — see
+  `docs/spec/runtime/storage.md`. It also injects `OPENCOMPANY_ADMIN_EMAIL`, the
+  address that provisioned the instance: a standing admin invite equivalent to a
+  manifest `[users].admins` entry, without which a provisioned company (whose
+  manifest names nobody) has nobody eligible to sign in — see
+  `docs/spec/runtime/users.md`. Plus — when database-per-tenant storage is enabled —
   `OPENCOMPANY_STORAGE=mongodb`, `OPENCOMPANY_MONGODB_URI` (credentials
   scoped to that tenant's database only), and `OPENCOMPANY_MONGODB_DB`.
 - In the alternative **shared-single-DB** mode (all tenants on one logical

@@ -74,9 +74,13 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # `openhuman` feature; the default build pulls none of this enormous native
 # dependency tree. `default-features = false` sheds openhuman's whole default
 # set — `tokenjuice-treesitter`, `voice`, `web3`, `media`, `meet`,
-# `flows`, and `mcp`. A company agent wants the agent loop, memory, and an
-# inference provider by default; MCP is re-enabled separately through the
-# opt-in OpenCompany `mcp` feature below. `skills` is re-enabled: cell #28
+# `flows` — none of which a company agent needs; it wants the agent
+# loop, memory, and an inference provider. `mcp` is re-enabled (issue #50):
+# per-tenant MCP tool servers reuse OpenHuman's `mcp_client` registry + HTTP
+# transport + injection-safety filter and the `mcp_list_servers` /
+# `mcp_list_tools` / `mcp_call_tool` bridge tools. Upstream `mcp = []` carries
+# no extra crates — it only recompiles the MCP client/registry modules.
+# `skills` is re-enabled: cell #28
 # surfaces a company's effective skill set to its harness agents through
 # OpenHuman's own skill *read* tools (`list_workflows` / `describe_workflow` /
 # `read_workflow_resource`), which live in the gated `openhuman::skills`
@@ -85,12 +89,18 @@ tinyagents = { path = "vendor/tinyagents", optional = true, features = ["sqlite"
 # same commit openhuman's own `vendor/tinyagents` pins: the two are a
 # lockstep pair, and a skew fails to compile (only under this feature, which
 # CI does not build).
-openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false, features = ["skills"] }
+openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false, features = ["skills", "mcp"] }
 # The openhuman `Provider`/`Memory` traits return `anyhow::Result` and log via
 # the `log` facade; both only link under the `openhuman` feature.
 anyhow = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
+# Console MCP OAuth (issue #90): base64url for PKCE (S256 challenge + verifier
+# entropy) and URL building for the `/authorize` redirect. Both are already in
+# the tree via `openhuman_core` + `reqwest`, so pinning them as direct deps adds
+# no new Cargo.lock entries; they link only under the `mcp` feature.
+base64 = { version = "0.22", optional = true }
+url = { version = "2", optional = true }
 
 # Issue #29 (epic #26): the tinyflows workflow engine, embedded directly. It is
 # host-agnostic and Config-free — `Capabilities` is a plain struct of trait
@@ -103,6 +113,16 @@ uuid = { version = "1", features = ["v4"], optional = true }
 # We deliberately do NOT enable openhuman's own `flows` feature: that drags in
 # rhai + the builder tools, defeating the point of running tinyflows directly.
 tinyflows = { version = "0.5", optional = true }
+
+# Issue #105: attribute-tolerant `<tool_call>` tag normalization in the harness
+# tool dispatcher. The staging model emits `<tool_call id="…">…</tool_call>`
+# with an attribute on the open tag, which OpenHuman's bare-literal parser never
+# matches, so the whole call leaks into chat as text and the tool never runs.
+# `AttrTolerantXmlDispatcher` (`src/harness/tool_dispatcher.rs`) strips those
+# attributes before delegating. Only links under the `openhuman` feature; regex
+# is already in the tree via `openhuman_core`, so this adds no new Cargo.lock
+# entry — it is a direct-use declaration.
+regex = { version = "1", optional = true }
 
 # Optional network client shared by the feature-gated integrations below; the
 # default build links no network crates.
@@ -144,6 +164,14 @@ rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 # Only links under the `mongodb` feature; the default build stays offline.
 mongodb = { version = "3", optional = true }
 
+# TinyCortex in-pod memory engine (local SQLite kv/vectors/entity + content
+# vault). Only links under the `tinycortex` feature. Resolved to the vendored
+# submodule via the `[patch.crates-io]` entry below — the *same* crate instance
+# `openhuman_core` already links unconditionally — so enabling this on top of an
+# `openhuman` build adds no new compilation. Backs the `EngineCortex`
+# persistent memory + context overlay; never makes a network call.
+tinycortex = { version = "0.1", optional = true }
+
 # Single-file `.tar` packing/unpacking for `opencompany export`/`import`. Pure
 # Rust, no system libs, no network. Only links under the `export` feature; the
 # port-driven bundle core works on an unpacked directory without it.
@@ -159,6 +187,21 @@ hickory-resolver = { version = "0.24", optional = true }
 # without it. Pure-Rust rustls TLS so no system libs are required.
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"], optional = true }
 
+# IMAP inbound transport + RFC822 parsing for per-teammate mail receiving. Only
+# link under the `imap` feature; the `MailReceiver` trait + offline mock compile
+# without it. Pure-Rust rustls TLS so no system libs are required.
+#
+# `async-imap` with `runtime-tokio` links no TLS of its own (unlike `lettre`,
+# it takes an already-connected stream in `Client::new`), so `AsyncImapReceiver`
+# builds the TLS connection itself: `tokio-rustls` for the handshake and
+# `webpki-roots` for the trusted root set, both already in the dependency graph
+# transitively via `lettre`'s rustls stack — declaring them directly here just
+# names the version this module actually calls.
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"], optional = true }
+mail-parser = { version = "0.11", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "1", optional = true }
+
 # Offline crypto for the tiny.place economy identity. All three are optional and
 # only link under the `tinyplace` feature; the default build pulls none of them.
 # `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
@@ -168,18 +211,49 @@ bs58 = { version = "0.5", default-features = false, features = ["std"], optional
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"], optional = true }
 
 [features]
-default = []
+# `oauth` ships in the standard build: the connection write routes
+# (authorize-url + server-side token exchange) are a first-class console
+# surface, so a company can connect GitHub end-to-end without a custom feature
+# build. It only pulls in `reqwest`, which several already-shipped features
+# (`github`, `telegram`, `medulla`, …) also depend on, so the default build
+# gains no new heavy native dependency. The read-only status route
+# (`ops::connections_read`) is un-gated and available regardless.
+default = ["oauth"]
 tiny = ["tinyagents"]
 # WS4: embed `vendor/openhuman` (`openhuman_core`) directly as the tenant agent
 # harness via `AgentBuilder`. `src/harness/` compiles only under this feature;
 # the default build stays offline and echo-brained (byte-for-byte unaffected).
-# `reqwest` is pulled in for the hosted Medulla inference `Provider`; the
+# `reqwest` is pulled in for the hosted Medulla inference model; the
 # `MockProvider` and every adapter compile without touching the network.
-openhuman = ["dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:tinyflows"]
+# Enables `tiny` so the `tinyagents` crate is in scope: the harness's inference
+# models implement its `ChatModel<()>` trait (openhuman's old `Provider` trait
+# was deleted upstream); it is the same vendored crate `openhuman_core` uses.
+openhuman = ["tiny", "dep:openhuman_core", "dep:reqwest", "dep:anyhow", "dep:log", "dep:tinyflows", "dep:regex", "dep:uuid"]
 # MCP server management and agent tools share OpenHuman's in-process registry.
 # Enabling it necessarily enables the embedded harness and OpenHuman MCP
 # domain, while the default build remains unchanged.
-mcp = ["openhuman", "openhuman_core/mcp", "dep:uuid"]
+mcp = ["openhuman", "openhuman_core/mcp", "dep:uuid", "dep:base64", "dep:url"]
+# Image/video generation tools (issue #109, epic #26 Cell B). Bridges
+# OpenHuman's `media_generation` tools (`media_generate_image`,
+# `media_generate_video`, `media_list_models`) into a company agent's toolbelt
+# behind the opt-in `media` grant namespace and a MANAGED platform credential.
+# Enabling it necessarily enables the embedded harness and OpenHuman's own
+# `media` domain; the default build links none of it. Real money moves through
+# these tools, so they are wired only when a company explicitly grants `media`
+# (never via the `*` wildcard) AND a managed credential is configured.
+media = ["openhuman", "openhuman_core/media"]
+# Per-tenant Composio tools (issue #110, epic #26 Cell D). Bridges OpenHuman's
+# backend-mode Composio surface (Gmail / Slack / GitHub via
+# `composio_list_toolkits`, `composio_list_connections`, `composio_list_tools`,
+# `composio_authorize`, `composio_execute`) into a company agent's toolbelt
+# behind the opt-in `composio` grant namespace and a per-tenant OAuth bearer
+# token. The upstream `composio` domain is not itself feature-gated, so no
+# `openhuman_core/*` subfeature is needed — enabling this only pulls in the
+# embedded harness. The default build links none of it. Tenant isolation is the
+# server-side-constructed bearer token (the backend derives the Composio entity
+# from the JWT); the token has NO env fallback and a missing token fails closed
+# (no tools wired), so a company can never reach another tenant's connections.
+composio = ["openhuman"]
 # Real HTTP transport to openhuman-core. The trait + offline mock + providers
 # compile without this; only `HttpOpenHumanRpc` is gated behind it.
 openhuman-rpc = ["dep:reqwest"]
@@ -217,12 +291,14 @@ sqlite = ["dep:rusqlite"]
 # each tenant its own database on a shared cluster. The fs stores and the
 # port-conformance suite compile without this; only `MongoStore` is gated here.
 mongodb = ["dep:mongodb"]
-# TinyCortex-backed MemoryStore + ContextStore over a mockable CortexClient.
-# TinyCortex itself is not vendored, so this feature adds no dependency: the
-# compiled backend is an offline in-memory client and the real HTTP client is
-# inert until the service is reachable through the OpenHuman seam. The fs stores
-# and the port-conformance suite compile without this.
-tinycortex = []
+# TinyCortex-backed MemoryStore + ContextStore. Pulls the vendored `tinycortex`
+# engine crate (an unconditional dep of `openhuman_core`, so no new build cost
+# under an `openhuman` build) and exposes `EngineCortex`: an in-pod, persistent,
+# per-company memory engine over the crate's local SQLite kv tier. Ships in
+# degraded lexical/recency recall mode — no embedding compute injected yet
+# (that lands in 188c2). The fs stores and the port-conformance suite compile
+# without this; the offline `InMemoryCortex` remains the test/fallback backend.
+tinycortex = ["dep:tinycortex"]
 # Node sidecar brain for self-hosters (bring-your-own-inference). Adds
 # `SidecarBrain`, which speaks the same `/orchestration/v1` wire frames as the
 # hosted brain but against a local sidecar process, with inference routed back
@@ -244,6 +320,15 @@ dns = ["dep:hickory-resolver"]
 # offline `RecordingMailSender` compile without this; only `LettreMailSender` is
 # gated here.
 smtp = ["dep:lettre"]
+# Real IMAP receive for the email surface. The `MailReceiver` trait and the
+# offline `RecordingMailReceiver` compile without this; only `AsyncImapReceiver`
+# and the RFC822 parser are gated here.
+imap = ["dep:async-imap", "dep:mail-parser", "dep:tokio-rustls", "dep:webpki-roots"]
+# Real HTTPS transport to api.telegram.org for the Telegram channel
+# (sendMessage / setWebhook). The `TelegramApi` trait, inbound parsing, token
+# scrubbing, and the offline `RecordingTelegramApi` compile without this; only
+# `HttpTelegramApi` is gated here (it needs the shared `reqwest` client).
+telegram = ["dep:reqwest"]
 # OAuth connection lifecycle (authorize-url + server-side token exchange). The
 # read-only connections catalog compiles without this; only the token-exchanging
 # write routes are gated here (they need the shared `reqwest` client).

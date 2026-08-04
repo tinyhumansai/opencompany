@@ -2,6 +2,7 @@
 name: Customer Follow-up
 description: Craft a timely, personal follow-up that moves an open customer thread forward.
 category: Ops
+version: 1.0.0
 ---
 
 # Customer Follow-up

@@ -79,7 +79,14 @@ pub struct UsageTotals {
     /// Total OAuth-connected tool calls across the window.
     pub oauth_calls: u64,
     /// Distinct connected providers seen in the window.
+    ///
+    /// Counted from the OAuth stream only: a metered web search is a call on
+    /// the managed platform, not a third-party account the company connected,
+    /// so it must never inflate this (issue #238).
     pub connections: u64,
+    /// Total metered web searches across the window (issue #238). Their USD
+    /// cost is already inside [`Self::cost_usd`]; this is the call count.
+    pub search_calls: u64,
 }
 
 /// The Usage read surface: daily series, per-teammate and per-provider

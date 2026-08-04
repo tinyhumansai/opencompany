@@ -7,6 +7,30 @@ name = "Agentic Software Company"
 output = "An entire SaaS product"
 human_role = "Product direction"
 
+[tools]
+# Full tool belt. `*` covers files/docs/shell/code/web/subagent; `media` and
+# `composio` are listed literally because `*` deliberately excludes those two
+# (real-money + per-tenant-credential) namespaces. media/composio/mcp also
+# require their Cargo features compiled into the tenant image, and each is
+# fail-closed at runtime until its credential/config is present (Composio
+# bearer, media backend, per-server MCP config).
+allow = ["*", "media", "composio"]
+
+# The Composio toolkits this company may reach. Two effects, and the second is
+# the reason this is set rather than left empty:
+#
+#  1. Runtime narrowing — a toolkit outside this list is rejected client-side,
+#     before any network call. Empty would defer to the backend's own
+#     server-enforced allowlist ("open mode"), which is not unsafe, just wider.
+#  2. The console's per-provider "Sign in" list renders from THIS list. With it
+#     empty the Connections tab shows no provider rows at all, so an operator has
+#     no way to start an OAuth handoff from the UI.
+#
+# Keep it to the toolkits a company is actually expected to use; adding one here
+# is what makes it appear in the Connections tab.
+[tools.composio]
+toolkits = ["gmail", "slack", "github"]
+
 [[agent]]
 id = "product_manager"
 role = "Product Manager"
@@ -51,6 +75,26 @@ description = "Resolve customer issues and feed insight back."
 id = "devrel"
 role = "Developer Relations"
 description = "Engage developers with demos, content, and community."
+
+# Group chats — the desks the human talks to. Each pulls in a few agents from
+# the roster above; the first member is the desk's lead (the routing target).
+[[group_chat]]
+id = "engineering"
+name = "Engineering"
+description = "Build, test, and secure the product."
+members = ["backend_engineer", "frontend_engineer", "qa_engineer", "security_engineer"]
+
+[[group_chat]]
+id = "product_design"
+name = "Product & Design"
+description = "Roadmap, specs, and the user experience."
+members = ["product_manager", "designer"]
+
+[[group_chat]]
+id = "go_to_market"
+name = "Go-to-Market"
+description = "Docs, developer relations, and customer support."
+members = ["devrel", "docs_writer", "customer_support"]
 
 # Workflow graphs to enable. The graphs live in this company's workflows/
 # directory (one file per id), not inline here.

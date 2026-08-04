@@ -7,6 +7,23 @@ name = "Agentic Law Firm"
 output = "Research, drafts, and discovery"
 human_role = "Approving filings"
 
+[tools]
+# Full tool belt plus the metered `web_search` (#238, granted here in #312): this
+# company's skills instruct agents to search broadly and cite their sources, and
+# nothing in the `web` namespace can *find* a URL — `web_fetch` / `http_request`
+# only read one the agent already has.
+#
+# Every entry below is load-bearing. `allow` REPLACES the default
+# (`["*", "media", "composio"]`); it never extends it. `*` covers
+# files/docs/shell/code/web/subagent but deliberately excludes the opt-in
+# namespaces, so `media`, `composio` and `search` are each listed literally.
+# Reducing this line to `["search"]` would silently strip the whole belt from
+# every agent in the company.
+#
+# Search spend is bounded by `[tools].search_daily_calls` (200/day by default);
+# setting it to `0` pauses search without editing this list.
+allow = ["*", "media", "composio", "search"]
+
 [[agent]]
 id = "legal_researcher"
 role = "Legal Researcher"

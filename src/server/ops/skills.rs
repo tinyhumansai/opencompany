@@ -4,21 +4,25 @@
 //! Deltas land in the [`SkillStateStore`](crate::ports::SkillStateStore); the
 //! built-in skill content stays on disk (seeded by
 //! [`RuntimeBuilder::build`](crate::runtime::RuntimeBuilder)). The `InstalledSkill`
-//! response mirrors the console (`frontend/src/lib/skills.ts`); for registry /
-//! built-in skills the name/description are best-effort (the console enriches
-//! from its catalog), while a custom skill's fields come from its `SKILL.md`.
+//! response mirrors the console's `@/api/skills` types: a custom skill's fields
+//! come from its `SKILL.md`, and so do a registry install's — install snapshots
+//! the shared library's document, so the delta is self-describing.
+//!
+//! The console holds no skill catalog of its own; it browses the shared library
+//! over `GET …/skills/registry` and installs by slug, with the host resolving
+//! the content.
 
 use std::collections::HashMap;
 use std::path::Path as FsPath;
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::company::{SkillDoc, parse_skill_md};
+use crate::company::{SkillDoc, parse_skill_md, render_skill_md};
 use crate::error::OpenCompanyError;
 use crate::ports::skills_state::{SkillSource, SkillState};
 use crate::server::error::ApiError;
@@ -27,11 +31,16 @@ use crate::server::ops::{ScopedCompany, scoped};
 
 /// The default category stamped on a skill whose doc carries none.
 const DEFAULT_CATEGORY: &str = "Ops";
+/// The publisher stamped on shared-library skills (mirrors the GraphQL type).
+const REGISTRY_PUBLISHER: &str = "OpenCompany";
 
 /// Builds the skills route fragment.
 pub fn router() -> Router<AppState> {
     scoped("/skills/{slug}/install", post(install))
         .merge(scoped("/skills/{slug}/uninstall", post(uninstall)))
+        // `registry` is a static segment, so it wins over the `{slug}` pattern
+        // above regardless of registration order (and the methods differ anyway).
+        .merge(scoped("/skills/registry", get(list_registry)))
         .merge(scoped("/skills/{slug}", put(set_enabled)))
         .merge(scoped("/skills", post(create_custom).get(list_skills)))
 }
@@ -46,6 +55,10 @@ struct InstalledSkill {
     category: String,
     source: SkillSource,
     enabled: bool,
+    /// The library revision this install snapshotted, when its doc carries one.
+    /// Lets a future "update available" affordance diff an install against the
+    /// live registry without any extra stored state.
+    version: Option<String>,
 }
 
 impl InstalledSkill {
@@ -53,7 +66,15 @@ impl InstalledSkill {
     /// `SKILL.md` for its name/description/category and falling back to a
     /// slug-derived name for registry/built-in deltas.
     fn from_state(state: &SkillState) -> Self {
-        let (name, description, category) = match &state.custom_doc {
+        let fallback = || {
+            (
+                titleize(&state.slug),
+                String::new(),
+                DEFAULT_CATEGORY.to_string(),
+                None,
+            )
+        };
+        let (name, description, category, version) = match &state.custom_doc {
             Some(doc) => match parse_skill_md(&state.slug, doc) {
                 Ok(parsed) => (
                     parsed.name,
@@ -61,18 +82,11 @@ impl InstalledSkill {
                     parsed
                         .category
                         .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
+                    parsed.version,
                 ),
-                Err(_) => (
-                    titleize(&state.slug),
-                    String::new(),
-                    DEFAULT_CATEGORY.to_string(),
-                ),
+                Err(_) => fallback(),
             },
-            None => (
-                titleize(&state.slug),
-                String::new(),
-                DEFAULT_CATEGORY.to_string(),
-            ),
+            None => fallback(),
         };
         Self {
             id: state.slug.clone(),
@@ -81,6 +95,7 @@ impl InstalledSkill {
             category,
             source: state.source,
             enabled: state.enabled,
+            version,
         }
     }
 
@@ -98,6 +113,40 @@ impl InstalledSkill {
                 .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
             source: SkillSource::Company,
             enabled,
+            version: doc.version.clone(),
+        }
+    }
+}
+
+/// One skill in the shared library, as the console's registry tab browses it.
+///
+/// Deliberately **metadata only** — no `body`. Mirrors the GraphQL
+/// `RegistrySkill` type so the two transports agree field for field.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrySkill {
+    id: String,
+    name: String,
+    description: String,
+    category: String,
+    publisher: String,
+    /// The library revision this entry ships, from frontmatter. `None` for a
+    /// skill authored before `version` existed.
+    version: Option<String>,
+}
+
+impl RegistrySkill {
+    fn from_doc(doc: &SkillDoc) -> Self {
+        Self {
+            id: doc.slug.clone(),
+            name: doc.name.clone(),
+            description: doc.description.clone(),
+            category: doc
+                .category
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
+            publisher: REGISTRY_PUBLISHER.to_string(),
+            version: doc.version.clone(),
         }
     }
 }
@@ -174,6 +223,7 @@ fn merge_effective(source_dir: Option<&FsPath>, deltas: Vec<SkillState>) -> Vec<
                     existing.description = doc.description;
                     existing.category =
                         doc.category.unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+                    existing.version = doc.version;
                 }
             }
             None => {
@@ -216,29 +266,89 @@ fn company_bundles(source_dir: Option<&FsPath>) -> Vec<InstalledSkill> {
     out
 }
 
+/// `POST …/skills/{slug}/install` — install a shared-library skill by slug.
+///
+/// **Server-authoritative.** The persisted `SKILL.md` is the shared library's own
+/// document — frontmatter *and* body verbatim, so the agent gets the whole
+/// procedure. The request body is ignored whenever the library can serve the
+/// slug: a client cannot dictate what a registry skill contains.
+///
+/// Resolution, in order:
+///
+/// 1. **Slug in the registry** → persist that document. The snapshot is pinned:
+///    a later library edit does not rewrite an existing install.
+/// 2. **Slug absent from a non-empty registry** → `404`. This is a typo or a
+///    stale client; silently persisting a stub is what produced content-less
+///    installs in the first place.
+/// 3. **Empty registry** → fall back to the client's metadata, as before. An
+///    empty registry means this host serves no shared library at all
+///    (platform-provisioned mode, no `skills_root`), so there is nothing to
+///    resolve against and refusing every install would break hosted tenants
+///    outright.
+///
+/// A *configured* library that fails to load is a `500`, never case 3: silently
+/// degrading a broken shared library to "no library" would hand the client
+/// authorship of a registry skill's contents on exactly the hosts that meant to
+/// be server-authoritative.
 async fn install(
+    State(state): State<AppState>,
     company: ScopedCompany,
     Path(SlugPath { slug }): Path<SlugPath>,
     body: Option<Json<InstallSkill>>,
 ) -> Result<Json<InstalledSkill>, ApiError> {
-    let meta = body.map(|Json(b)| b).unwrap_or_default();
-    let name = meta
-        .name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| titleize(&slug));
-    let description = meta.description.unwrap_or_default();
-    // The registry ships metadata only. Persist a real `SKILL.md` built from it
-    // (the description doubles as the body) so `EffectiveSkills::materialize`
-    // surfaces the skill to the agent instead of skipping a content-less delta.
-    let doc = skill_md(&name, &description, meta.category.as_deref(), &description);
-    let state = SkillState {
+    let registry = state.shared_skill_registry()?;
+    let doc = match registry.iter().find(|doc| doc.slug == slug) {
+        Some(doc) => render_skill_md(doc),
+        None if !registry.is_empty() => {
+            return Err(ApiError(OpenCompanyError::NotFound(
+                language::SKILL_NOT_IN_REGISTRY.to_string(),
+            )));
+        }
+        None => {
+            // No shared library backs this host. Persist a real `SKILL.md` built
+            // from the client's metadata (the description doubles as the body) so
+            // `EffectiveSkills::materialize` surfaces the skill to the agent
+            // instead of skipping a content-less delta.
+            let meta = body.map(|Json(b)| b).unwrap_or_default();
+            let name = meta
+                .name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| titleize(&slug));
+            let description = meta.description.unwrap_or_default();
+            skill_md(&name, &description, meta.category.as_deref(), &description)
+        }
+    };
+    let delta = SkillState {
         slug,
         enabled: true,
         source: SkillSource::Registry,
         custom_doc: Some(doc),
     };
-    company.runtime.skills().set(company.id(), &state).await?;
-    Ok(Json(InstalledSkill::from_state(&state)))
+    company.runtime.skills().set(company.id(), &delta).await?;
+    Ok(Json(InstalledSkill::from_state(&delta)))
+}
+
+/// `GET …/skills/registry` — the shared skill library the console's registry tab
+/// browses.
+///
+/// **Metadata only, by construction**: [`RegistrySkill`] has no `body` field, so
+/// the payload stays flat regardless of how large the library grows. Install is
+/// server-authoritative, so the client never needs a body — it posts a slug and
+/// the host resolves the content.
+///
+/// Scoped (and so authorized) like every other console route even though the
+/// library itself is host-global; the registry is not public.
+async fn list_registry(
+    State(state): State<AppState>,
+    _company: ScopedCompany,
+) -> Result<Json<Vec<RegistrySkill>>, ApiError> {
+    Ok(Json(
+        state
+            .shared_skill_registry()?
+            .iter()
+            .map(RegistrySkill::from_doc)
+            .collect(),
+    ))
 }
 
 async fn uninstall(

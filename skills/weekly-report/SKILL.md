@@ -1,6 +1,7 @@
 ---
 name: Weekly Report
 description: Compile the week's activity, decisions, and metrics into a short, skimmable report.
+version: 1.0.0
 ---
 
 # Weekly Report

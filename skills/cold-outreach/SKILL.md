@@ -2,6 +2,7 @@
 name: Cold Outreach
 description: Turn a target list into personalized first-touch messages that earn a reply, not a delete.
 category: Marketing
+version: 1.0.0
 ---
 
 # Cold Outreach

@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 
 use crate::Result;
@@ -58,18 +57,31 @@ impl PathLocks {
 }
 
 /// Appends one line (a `\n` is added) to `path`, creating the file if absent.
+///
+/// The line and its terminating newline are written in a **single** blocking
+/// `write_all` inside `spawn_blocking` (via `std::fs::OpenOptions` with
+/// `O_APPEND`), so the whole record lands as one atomic OS-level write.
+/// Tokio's async `File` buffers internally and can return before the kernel
+/// write completes, which makes concurrent-appends tests unreliable; this
+/// version always waits for the write syscall to finish before returning.
 pub(crate) async fn append_line(path: &Path, line: &str) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-        .map_err(|e| io_err(path, e))?;
-    file.write_all(line.as_bytes())
-        .await
-        .map_err(|e| io_err(path, e))?;
-    file.write_all(b"\n").await.map_err(|e| io_err(path, e))?;
-    Ok(())
+    let owned_path = path.to_path_buf();
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&owned_path)
+            .map_err(|e| io_err(&owned_path, e))?;
+        file.write_all(record.as_bytes())
+            .map_err(|e| io_err(&owned_path, e))?;
+        Ok::<_, OpenCompanyError>(())
+    })
+    .await
+    .map_err(|e| OpenCompanyError::Store(format!("spawn_blocking failed: {e}")))?
 }
 
 /// Reads a file to a string, returning an empty string if it does not exist.
@@ -121,6 +133,25 @@ struct Meta {
     /// The operator team overlay (teammates added outside the manifest).
     #[serde(default)]
     overlay_agents: Vec<crate::ports::types::OverlayAgent>,
+    /// The operator desk-membership overlay (agents added to desks at runtime).
+    #[serde(default)]
+    overlay_desk_members: Vec<crate::ports::types::OverlayDeskMember>,
+    /// The operator per-desk member-ordering overlay (desk hierarchy).
+    #[serde(default)]
+    overlay_desk_order: Vec<crate::ports::types::OverlayDeskOrder>,
+    /// The operator desk-creation overlay (desks created at runtime).
+    #[serde(default)]
+    overlay_desks: Vec<crate::ports::types::OverlayDesk>,
+    /// The operator workflow-authoring overlay (graphs created at runtime).
+    /// Absent on meta files written before runtime workflow bodies persisted
+    /// through the store, so `#[serde(default)]` keeps those loading.
+    #[serde(default)]
+    overlay_workflows: Vec<crate::ports::types::OverlayWorkflow>,
+    /// The source-template provenance stamped at launch. `None` for companies
+    /// provisioned from a raw manifest and for legacy meta files written before
+    /// provenance existed (the `#[serde(default)]` keeps those loading).
+    #[serde(default)]
+    template_provenance: Option<crate::ports::types::TemplateProvenance>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,11 +194,35 @@ impl CompanyStore for FsCompanyStore {
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
 
         let meta_src = read_optional(&bundle.meta_json()).await?;
-        let (lifecycle, overlay_agents) = if meta_src.trim().is_empty() {
-            ("running".to_string(), Vec::new())
+        let (
+            lifecycle,
+            overlay_agents,
+            overlay_desk_members,
+            overlay_desk_order,
+            overlay_desks,
+            overlay_workflows,
+            template_provenance,
+        ) = if meta_src.trim().is_empty() {
+            (
+                "running".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
         } else {
             let meta: Meta = serde_json::from_str(&meta_src)?;
-            (meta.lifecycle, meta.overlay_agents)
+            (
+                meta.lifecycle,
+                meta.overlay_agents,
+                meta.overlay_desk_members,
+                meta.overlay_desk_order,
+                meta.overlay_desks,
+                meta.overlay_workflows,
+                meta.template_provenance,
+            )
         };
 
         let ledger = read_jsonl::<LedgerEntry>(&bundle.ledger_jsonl()).await?;
@@ -178,6 +233,11 @@ impl CompanyStore for FsCompanyStore {
             ledger,
             lifecycle,
             overlay_agents,
+            overlay_desk_members,
+            overlay_desk_order,
+            overlay_desks,
+            overlay_workflows,
+            template_provenance,
         }))
     }
 
@@ -192,6 +252,11 @@ impl CompanyStore for FsCompanyStore {
         let meta = Meta {
             lifecycle: record.lifecycle.clone(),
             overlay_agents: record.overlay_agents.clone(),
+            overlay_desk_members: record.overlay_desk_members.clone(),
+            overlay_desk_order: record.overlay_desk_order.clone(),
+            overlay_desks: record.overlay_desks.clone(),
+            overlay_workflows: record.overlay_workflows.clone(),
+            template_provenance: record.template_provenance.clone(),
         };
         write_atomic(&bundle.meta_json(), &serde_json::to_string(&meta)?).await?;
         Ok(())
@@ -429,12 +494,18 @@ impl MemoryStore for FsMemoryStore {
 // ContextStore
 // ---------------------------------------------------------------------------
 
-/// A context index line pairing an address with its label and length.
+/// A context index line pairing an address with its label, length, and the
+/// epoch-millis it was first stored.
+///
+/// `stored_at_millis` defaults to `0` so index lines written before the field
+/// existed still deserialize — they simply report an unknown store time.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct IndexEntry {
     addr: String,
     label: String,
     len: usize,
+    #[serde(default)]
+    stored_at_millis: u64,
 }
 
 /// Filesystem [`ContextStore`]: content-addressed blobs plus a JSONL index.
@@ -480,6 +551,7 @@ impl ContextStore for FsContextStore {
             addr: addr.clone(),
             label: chunk.label,
             len: chunk.body.len(),
+            stored_at_millis: now_millis(),
         };
         append_line(&index_path, &serde_json::to_string(&entry)?).await?;
         Ok(ChunkAddr::new(addr))
@@ -494,6 +566,7 @@ impl ContextStore for FsContextStore {
                 addr: ChunkAddr::new(e.addr),
                 label: e.label,
                 len: e.len,
+                stored_at_millis: e.stored_at_millis,
             })
             .collect())
     }
@@ -737,8 +810,44 @@ mod test {
     use crate::store::conformance;
     use futures::StreamExt;
 
-    fn tmp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("opencompany-test-{}", generate_id()))
+    fn tmp_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("opencompany-test-")
+            .tempdir()
+            .expect("tempdir")
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_stay_one_record_per_line() {
+        // Many tasks appending to the same JSONL file must never interleave a
+        // record with another's newline (the `{a}{b}\n\n` corruption that
+        // `read_jsonl` reports as a "trailing characters" parse error). The
+        // single-write `append_line` makes each record one atomic O_APPEND
+        // write, so this holds deterministically.
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("log.jsonl");
+
+        const N: u64 = 64;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let path = path.clone();
+            set.spawn(async move {
+                let line = serde_json::to_string(&serde_json::json!({ "i": i })).unwrap();
+                append_line(&path, &line).await.unwrap();
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
+
+        // Every record parses (no merged lines) and all N are present once.
+        let rows: Vec<serde_json::Value> = read_jsonl(&path).await.expect("no corrupt lines");
+        assert_eq!(rows.len() as u64, N, "every append is its own line");
+        let mut seen: Vec<u64> = rows.iter().map(|r| r["i"].as_u64().unwrap()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..N).collect::<Vec<_>>(), "all records intact");
     }
 
     // The fs backend runs the identical port-conformance suite the sqlite
@@ -746,7 +855,8 @@ mod test {
     // stores start empty.
     #[tokio::test]
     async fn conformance_isolation_by_company() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_isolation_by_company(
             Arc::new(FsCompanyStore::new(&root)),
             Arc::new(FsEventLog::new(&root)),
@@ -754,37 +864,58 @@ mod test {
             Arc::new(FsContextStore::new(&root)),
         )
         .await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_append_only_event_and_ledger() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_append_only_event_and_ledger(
             Arc::new(FsCompanyStore::new(&root)),
             Arc::new(FsEventLog::new(&root)),
         )
         .await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_monotonic_event_seq() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_monotonic_event_seq(Arc::new(FsEventLog::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn conformance_inbox_store() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_inbox_store(Arc::new(FsInboxStore::new(&root))).await;
-        tokio::fs::remove_dir_all(&root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_context_chunk_stamps(Arc::new(FsContextStore::new(&root))).await;
+    }
+
+    /// The fs backend's migration path: index lines written before
+    /// `stored_at_millis` existed carry no such field, and must still
+    /// deserialize — reporting an unknown (`0`) store time rather than failing
+    /// the read and blanking the whole Brain list.
+    #[test]
+    fn legacy_context_index_line_without_a_stamp_still_parses() {
+        let legacy = r#"{"addr":"abc123","label":"agent/ceo","len":24}"#;
+        let entry: IndexEntry = serde_json::from_str(legacy).expect("legacy index line parses");
+        assert_eq!(entry.addr, "abc123");
+        assert_eq!(entry.label, "agent/ceo");
+        assert_eq!(entry.len, 24);
+        assert_eq!(entry.stored_at_millis, 0);
     }
 
     #[tokio::test]
     async fn conformance_export_totality() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         conformance::assert_export_totality(
             Arc::new(FsCompanyStore::new(&root)),
             Arc::new(FsEventLog::new(&root)),
@@ -792,7 +923,6 @@ mod test {
             Arc::new(FsContextStore::new(&root)),
         )
         .await;
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     fn sample_manifest() -> crate::company::CompanyManifest {
@@ -813,7 +943,8 @@ mod test {
 
     #[tokio::test]
     async fn company_store_saves_and_loads() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let store = FsCompanyStore::new(&root);
         let id = CompanyId::new("acme");
         let record = CompanyRecord {
@@ -822,6 +953,11 @@ mod test {
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
         };
         store.save(&record).await.unwrap();
 
@@ -841,12 +977,12 @@ mod test {
                 .unwrap()
                 .is_none()
         );
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn append_ledger_grows_without_rewrite() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let store = FsCompanyStore::new(&root);
         let id = CompanyId::new("acme");
         store
@@ -856,6 +992,11 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                template_provenance: None,
             })
             .await
             .unwrap();
@@ -877,12 +1018,12 @@ mod test {
         let loaded = store.load(&id).await.unwrap().unwrap();
         assert_eq!(loaded.ledger.len(), 3);
         assert_eq!(loaded.ledger[2].memo, "entry 2");
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn event_log_assigns_monotonic_seqs_and_resumes() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let log = FsEventLog::new(&root);
         let id = CompanyId::new("acme");
 
@@ -892,6 +1033,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "a".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -902,6 +1044,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "b".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -914,12 +1057,12 @@ mod test {
         let from_one = log.read_from(&id, EventSeq::new(1), 10).await.unwrap();
         assert_eq!(from_one.len(), 1);
         assert_eq!(from_one[0].seq, EventSeq::new(1));
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn event_log_subscribe_delivers_new_event() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let log = FsEventLog::new(&root);
         let id = CompanyId::new("acme");
         let mut stream = log.subscribe(&id);
@@ -929,6 +1072,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -938,15 +1082,16 @@ mod test {
             received.event,
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
-                by: None
+                by: None,
+                chat: None
             }
         );
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn memory_store_traces_tail_and_evict() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let mem = FsMemoryStore::new(&root);
         let id = CompanyId::new("acme");
         for i in 0..5 {
@@ -964,12 +1109,12 @@ mod test {
             .unwrap();
         assert_eq!(removed, 4);
         assert_eq!(mem.recent_traces(&id, 10).await.unwrap().len(), 1);
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn context_store_put_peek_search() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let ctx = FsContextStore::new(&root);
         let id = CompanyId::new("acme");
         let addr = ctx
@@ -995,12 +1140,12 @@ mod test {
         let hits = ctx.search(&id, "brown", 5).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("brown"));
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 
     #[tokio::test]
     async fn secret_store_isolates_companies() {
-        let root = tmp_root();
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
         let secrets = FsSecretStore::new(&root);
         let a = CompanyId::new("company-a");
         let b = CompanyId::new("company-b");
@@ -1015,6 +1160,5 @@ mod test {
         );
         // Company B cannot see company A's secret.
         assert_eq!(secrets.get(&b, "github_token").await.unwrap(), None);
-        tokio::fs::remove_dir_all(&root).await.ok();
     }
 }

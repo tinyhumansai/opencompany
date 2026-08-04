@@ -413,6 +413,16 @@ pub const TOOL_CALL: &str = "orch:tool_call";
 /// The Socket.IO event the client emits to answer a device tool call.
 pub const TOOL_RESULT: &str = "orch:tool_result";
 
+/// The Socket.IO event the server emits to report what a cycle's inference cost.
+///
+/// The host never touches the model on the hosted path, so without this frame it
+/// cannot know what the orchestrator spent: the whole path is structurally
+/// unmetered and the console's Usage view reads zero however much inference ran
+/// (issue #174). The frame is advisory — a cycle that carries none is metered as
+/// zero, exactly as before — so a backend that does not emit it yet stays
+/// compatible.
+pub const USAGE: &str = "orch:usage";
+
 /// The default device-tool timeout budget the server enforces (~30 s).
 pub const DEFAULT_TOOL_TIMEOUT_MS: u64 = 30_000;
 
@@ -553,6 +563,55 @@ pub struct ToolCallFrame {
     pub args: Value,
     /// The budget the client must answer within (~30 s).
     pub timeout_ms: u64,
+}
+
+/// The [`USAGE`] frame: what one wake's inference actually cost, reported by the
+/// side that owns the model.
+///
+/// The orchestrator may emit several of these per cycle (one per model pass); the
+/// client folds them into the cycle total and dedupes on [`Self::call_id`],
+/// because frame delivery is at-least-once and a replay must not double-charge
+/// the meter. Build that id with [`call_id`] and [`USAGE_CALL_KIND`], the same
+/// way effect and tool ids are derived.
+///
+/// Tokens are counted; [`Self::cost_usd`] is optional because a passthrough that
+/// bills backend-side has no USD to echo. A frame reporting neither tokens nor
+/// cost adds nothing to the cycle total, so it is metered as nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageFrame {
+    /// The cycle the usage belongs to.
+    pub cycle_id: String,
+    /// The dedupe/correlation id for this usage report.
+    pub call_id: String,
+    /// Input/prompt tokens consumed.
+    pub input_tokens: u64,
+    /// Output/completion tokens produced.
+    pub output_tokens: u64,
+    /// Input tokens served from the provider's KV cache.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    /// USD charged for the pass, when the upstream reports money.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// The `kind` segment [`UsageFrame::call_id`]s are built from, so the client and
+/// the server derive the same dedupe key.
+pub const USAGE_CALL_KIND: &str = "usage";
+
+impl UsageFrame {
+    /// This frame as the crate's [`TokenUsage`](crate::ports::types::TokenUsage),
+    /// the shape the runtime meters. A missing `costUsd` is zero cost — tokens
+    /// still count.
+    pub fn to_token_usage(&self) -> crate::ports::types::TokenUsage {
+        crate::ports::types::TokenUsage {
+            input: self.input_tokens,
+            output: self.output_tokens,
+            cached_input: self.cached_input_tokens,
+            cost_usd: self.cost_usd.unwrap_or(0.0),
+        }
+    }
 }
 
 /// The `orch:tool_result` frame the client emits to answer a tool call.

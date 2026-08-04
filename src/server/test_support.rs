@@ -5,8 +5,6 @@
 //! the one place that mints it, so the shape of "an authenticated request" is
 //! stated once rather than in every test module.
 
-#![cfg(test)]
-
 use crate::AppState;
 use crate::ports::types::CompanyId;
 use crate::ports::{SessionRecord, UserRecord, UserRole, UserStatus, generate_id, now_millis};

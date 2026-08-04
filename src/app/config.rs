@@ -207,6 +207,64 @@ pub struct ConfigFile {
     pub public_url: Option<String>,
     /// GitHub token used by GitHub-backed tools.
     pub github_token: Option<String>,
+    /// The `[workspace]` section: data-dir layout lifecycle knobs.
+    pub workspace: WorkspaceSection,
+}
+
+/// The `[workspace]` section of `config.toml`: lifecycle of the canonical
+/// data-dir layout (see [`DataLayout`](crate::store::DataLayout)).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceSection {
+    /// Empty the ephemeral `tmp/` scratch directory on startup. Default: true.
+    pub clear_tmp_on_startup: Option<bool>,
+    /// Soft quota on the whole workspace, in gibibytes. Absent or `<= 0` means
+    /// unlimited. Surfaced as an operator alert when exceeded; hard enforcement
+    /// is the container/StorageClass layer's job (EFS access point / k8s
+    /// `ResourceQuota`).
+    pub storage_quota_gb: Option<f64>,
+    /// Soft quota on the `tmp/` scratch directory, in gibibytes. Absent or
+    /// `<= 0` means unlimited.
+    pub tmp_quota_gb: Option<f64>,
+}
+
+impl WorkspaceSection {
+    /// Resolves the section against its defaults.
+    pub fn resolve(&self) -> WorkspaceConfig {
+        WorkspaceConfig {
+            clear_tmp_on_startup: self.clear_tmp_on_startup.unwrap_or(true),
+            storage_quota_bytes: gib_to_bytes(self.storage_quota_gb),
+            tmp_quota_bytes: gib_to_bytes(self.tmp_quota_gb),
+        }
+    }
+}
+
+/// Converts an optional gibibyte quota to bytes, treating absent / non-positive
+/// values as "unlimited" (`None`).
+fn gib_to_bytes(gb: Option<f64>) -> Option<u64> {
+    gb.filter(|g| *g > 0.0)
+        .map(|g| (g * 1024.0 * 1024.0 * 1024.0) as u64)
+}
+
+/// Resolved `[workspace]` configuration.
+#[derive(Clone, Debug)]
+pub struct WorkspaceConfig {
+    /// Whether the ephemeral `tmp/` scratch is cleared on startup.
+    pub clear_tmp_on_startup: bool,
+    /// Soft whole-workspace quota in bytes; `None` is unlimited.
+    pub storage_quota_bytes: Option<u64>,
+    /// Soft `tmp/` quota in bytes; `None` is unlimited.
+    pub tmp_quota_bytes: Option<u64>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            clear_tmp_on_startup: true,
+            storage_quota_bytes: None,
+            tmp_quota_bytes: None,
+        }
+    }
 }
 
 impl ConfigFile {
@@ -257,12 +315,45 @@ pub struct RuntimeConfig {
     pub github_token: Option<SecretValue>,
     /// TinyHumans hosted-brain credential, if configured. Redacted in `Debug`.
     pub tinyhumans_credential: Option<SecretValue>,
+    /// Path to the platform-projected TinyHumans token file
+    /// ([`TOKEN_FILE_ENV`](crate::company::credentials::TOKEN_FILE_ENV)), when the
+    /// platform hands this instance a rotating, audience-bound identity instead of
+    /// a static key. A path, not a secret — safe to print.
+    pub tinyhumans_token_file: Option<PathBuf>,
+    /// Resolved `[workspace]` data-dir layout configuration.
+    pub workspace: WorkspaceConfig,
 }
 
 impl RuntimeConfig {
-    /// True when hosted cognition can run: hosted mode plus a credential.
+    /// True when hosted cognition can run: hosted mode plus a credential this
+    /// instance can **obtain** — see [`Self::credential_available`].
     pub fn cycles_available(&self) -> bool {
-        self.brain_mode == BrainMode::Hosted && self.tinyhumans_credential.is_some()
+        self.brain_mode == BrainMode::Hosted && self.credential_available()
+    }
+
+    /// Whether a TinyHumans credential can be obtained at all.
+    ///
+    /// The question is "can I get a token?", not "do I hold a secret?": a hosted
+    /// tenant holds nothing and reads a projected file that rotates in place, so
+    /// asking about a stored secret would report a perfectly healthy instance as
+    /// unable to think.
+    pub fn credential_available(&self) -> bool {
+        self.credential_source() != crate::company::CredentialSource::None
+    }
+
+    /// Which tier the credential comes from, for operator-facing output.
+    ///
+    /// Delegates to
+    /// [`TinyhumansTokenSource::source_of_parts`](crate::company::credentials::TinyhumansTokenSource::source_of_parts)
+    /// rather than restating the rule: the projected tier counts only when the
+    /// named path **exists**, so a leftover `TINYHUMANS_TOKEN_FILE` pointing at
+    /// something the runtime never mounted reports the static tier (or `none`)
+    /// instead of claiming an identity this instance cannot present.
+    pub fn credential_source(&self) -> crate::company::CredentialSource {
+        crate::company::credentials::TinyhumansTokenSource::source_of_parts(
+            self.tinyhumans_token_file.as_deref(),
+            self.tinyhumans_credential.is_some(),
+        )
     }
 }
 
@@ -283,6 +374,7 @@ impl std::fmt::Debug for RuntimeConfig {
                 "tinyhumans_credential",
                 &redacted(&self.tinyhumans_credential),
             )
+            .field("tinyhumans_token_file", &self.tinyhumans_token_file)
             .finish()
     }
 }
@@ -380,10 +472,24 @@ pub fn resolve(
     let tinyhumans_credential = resolve_opt(
         &mut prov,
         "tinyhumans_credential",
-        env.get("TINYHUMANS_API_KEY"),
+        env.get(crate::company::credentials::API_KEY_ENV),
         config_toml.and_then(|c| c.tinyhumans_api_key.clone()),
     )
     .map(SecretValue);
+
+    // The projected token file is injected by the platform, never written by an
+    // operator, so it has no `config.toml` layer to fall back to.
+    let tinyhumans_token_file = resolve_opt(
+        &mut prov,
+        "tinyhumans_token_file",
+        env.get(crate::company::credentials::TOKEN_FILE_ENV),
+        None,
+    )
+    .map(PathBuf::from);
+
+    let workspace = config_toml
+        .map(|c| c.workspace.resolve())
+        .unwrap_or_default();
 
     let config = RuntimeConfig {
         bind,
@@ -395,6 +501,8 @@ pub fn resolve(
         public_url,
         github_token,
         tinyhumans_credential,
+        tinyhumans_token_file,
+        workspace,
     };
     Ok((config, prov))
 }
@@ -455,6 +563,35 @@ fn default_data_dir_str(env: &dyn EnvSource) -> String {
     }
 }
 
+/// The data directory read straight off the process environment
+/// (`OPENCOMPANY_DATA_DIR`, else `$HOME/.opencompany`) — the per-instance
+/// workspace root. For callers like `serve` and `doctor` that resolve the data
+/// root before (or without) the full [`resolve`] precedence pass.
+pub fn data_dir_from_env() -> PathBuf {
+    data_dir_from(
+        std::env::var_os("OPENCOMPANY_DATA_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure core of [`data_dir_from_env`]: resolves the data dir from the raw
+/// `OPENCOMPANY_DATA_DIR` and `HOME` values. Empty strings are treated as unset
+/// — an empty `OPENCOMPANY_DATA_DIR` would otherwise resolve to the process
+/// working directory rather than falling back to `$HOME/.opencompany`.
+fn data_dir_from(
+    data_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    let non_empty = |v: Option<std::ffi::OsString>| v.filter(|value| !value.is_empty());
+    match non_empty(data_dir) {
+        Some(dir) => PathBuf::from(dir),
+        None => match non_empty(home) {
+            Some(home) => PathBuf::from(home).join(".opencompany"),
+            None => PathBuf::from(".opencompany"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -486,6 +623,44 @@ mod test {
         assert_eq!(prov.layer("brain_mode"), Some(ConfigLayer::Manifest));
         assert_eq!(prov.layer("api_url"), Some(ConfigLayer::Default));
         assert_eq!(prov.layer("bind"), Some(ConfigLayer::Default));
+    }
+
+    #[test]
+    fn data_dir_from_treats_empty_as_unset() {
+        use std::ffi::OsString;
+        // An empty OPENCOMPANY_DATA_DIR falls back to $HOME/.opencompany, not cwd.
+        assert_eq!(
+            data_dir_from(Some(OsString::from("")), Some(OsString::from("/home/u"))),
+            PathBuf::from("/home/u/.opencompany")
+        );
+        // A set value is used verbatim.
+        assert_eq!(
+            data_dir_from(
+                Some(OsString::from("/data")),
+                Some(OsString::from("/home/u"))
+            ),
+            PathBuf::from("/data")
+        );
+        // Neither set → the relative default.
+        assert_eq!(data_dir_from(None, None), PathBuf::from(".opencompany"));
+    }
+
+    #[test]
+    fn resolve_propagates_workspace_to_runtime_config() {
+        let env = MapEnv::default();
+        let file = ConfigFile {
+            workspace: WorkspaceSection {
+                clear_tmp_on_startup: Some(false),
+                ..WorkspaceSection::default()
+            },
+            ..ConfigFile::default()
+        };
+        let (cfg, _) = resolve(&env, Some(&file), &default_manifest()).unwrap();
+        assert!(!cfg.workspace.clear_tmp_on_startup);
+
+        // An absent `[workspace]` section resolves to the default (clear on boot).
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+        assert!(cfg.workspace.clear_tmp_on_startup);
     }
 
     #[test]
@@ -541,6 +716,136 @@ mod test {
         assert!(cfg.tinyhumans_credential.is_some());
         assert!(cfg.cycles_available());
         assert_eq!(prov.layer("tinyhumans_credential"), Some(ConfigLayer::Env));
+    }
+
+    /// The hosted path: no static key at all, just a platform-projected token
+    /// file. Cycles must still be available — the instance can *obtain* a token —
+    /// and the source reads `attested`.
+    #[test]
+    fn projected_token_file_alone_enables_cycles() {
+        // The path must actually exist: the projected tier is selected on
+        // existence, not on the variable merely being set.
+        let dir = tempfile::Builder::new()
+            .prefix("oc-cfg-")
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "projected-token").unwrap();
+
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            path.to_str().unwrap(),
+        )]);
+        let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
+
+        assert!(cfg.tinyhumans_credential.is_none(), "no static secret held");
+        assert_eq!(cfg.tinyhumans_token_file.as_deref(), Some(path.as_path()));
+        assert!(cfg.credential_available());
+        assert!(cfg.cycles_available());
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Attested
+        );
+        assert_eq!(prov.layer("tinyhumans_token_file"), Some(ConfigLayer::Env));
+    }
+
+    /// The docker case: a leftover `TINYHUMANS_TOKEN_FILE` naming a path nothing
+    /// mounted must NOT report an identity this instance cannot present. Reporting
+    /// `attested` here would also make `cycles_available` true with no obtainable
+    /// bearer, so hosted cognition would be gated on a credential that does not
+    /// exist. Regression test for the config surface disagreeing with
+    /// `TinyhumansTokenSource::from_env`.
+    #[test]
+    fn a_token_file_that_does_not_exist_is_not_attested() {
+        // A real directory, but the token path inside it is never created: the
+        // fixture must name something that does not exist.
+        let dir = tempfile::Builder::new()
+            .prefix("oc-absent-")
+            .tempdir()
+            .expect("tempdir");
+        let missing = dir.path().join("token");
+        assert!(!missing.exists(), "fixture path must not exist");
+
+        let env = MapEnv::new([(
+            crate::company::credentials::TOKEN_FILE_ENV,
+            missing.to_str().unwrap(),
+        )]);
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::None,
+            "an unmounted path must not read as attested"
+        );
+        assert!(!cfg.credential_available());
+        assert!(!cfg.cycles_available());
+    }
+
+    /// Same unmounted path, but a static key is present: the source degrades to
+    /// the static tier rather than to `none`, matching `from_env`'s fallback.
+    #[test]
+    fn a_missing_token_file_degrades_to_the_static_tier() {
+        // A real directory, but the token path inside it is never created: the
+        // fixture must name something that does not exist.
+        let dir = tempfile::Builder::new()
+            .prefix("oc-absent-")
+            .tempdir()
+            .expect("tempdir");
+        let missing = dir.path().join("token");
+        let env = MapEnv::new([
+            (
+                crate::company::credentials::TOKEN_FILE_ENV,
+                missing.to_str().unwrap(),
+            ),
+            (crate::company::credentials::API_KEY_ENV, "th_static"),
+        ]);
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Static
+        );
+        assert!(cfg.credential_available());
+    }
+
+    /// Precedence: a projected file that exists outranks a leftover static key.
+    #[test]
+    fn projected_file_outranks_a_static_key_for_the_source() {
+        let dir = tempfile::Builder::new()
+            .prefix("oc-cfg-")
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join("token");
+        std::fs::write(&path, "projected-token").unwrap();
+
+        let env = MapEnv::new([
+            (
+                crate::company::credentials::TOKEN_FILE_ENV,
+                path.to_str().unwrap(),
+            ),
+            (crate::company::credentials::API_KEY_ENV, "th_static"),
+        ]);
+        let (cfg, _) = resolve(&env, None, &default_manifest()).unwrap();
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Attested
+        );
+
+        // Docker development keeps working on the static tier alone.
+        let static_only = MapEnv::new([(crate::company::credentials::API_KEY_ENV, "th_static")]);
+        let (cfg, _) = resolve(&static_only, None, &default_manifest()).unwrap();
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::Static
+        );
+
+        // Neither tier configured → nothing obtainable, no cycles.
+        let (cfg, _) = resolve(&MapEnv::default(), None, &default_manifest()).unwrap();
+        assert_eq!(
+            cfg.credential_source(),
+            crate::company::CredentialSource::None
+        );
+        assert!(!cfg.credential_available());
     }
 
     #[test]
@@ -638,6 +943,50 @@ mod test {
         let file = ConfigFile::load(&dir).unwrap().unwrap();
         assert_eq!(file.brain_mode.as_deref(), Some("sidecar"));
         assert_eq!(file.api_url.as_deref(), Some("https://x"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_section_defaults_to_clearing_tmp() {
+        // Absent `[workspace]` → default (clear on startup).
+        assert!(WorkspaceSection::default().resolve().clear_tmp_on_startup);
+        // An explicit opt-out is honored.
+        let section = WorkspaceSection {
+            clear_tmp_on_startup: Some(false),
+            ..WorkspaceSection::default()
+        };
+        assert!(!section.resolve().clear_tmp_on_startup);
+    }
+
+    #[test]
+    fn workspace_section_parses_quotas() {
+        let section = WorkspaceSection {
+            storage_quota_gb: Some(2.0),
+            tmp_quota_gb: Some(0.0), // non-positive → unlimited
+            ..WorkspaceSection::default()
+        };
+        let cfg = section.resolve();
+        assert_eq!(cfg.storage_quota_bytes, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(cfg.tmp_quota_bytes, None);
+        // Absent → unlimited.
+        assert_eq!(
+            WorkspaceSection::default().resolve().storage_quota_bytes,
+            None
+        );
+    }
+
+    #[test]
+    fn config_file_parses_workspace_section() {
+        let dir = std::env::temp_dir().join(format!("oc-cfg-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(CONFIG_FILE),
+            "[workspace]\nclear_tmp_on_startup = false\n",
+        )
+        .unwrap();
+        let file = ConfigFile::load(&dir).unwrap().unwrap();
+        assert_eq!(file.workspace.clear_tmp_on_startup, Some(false));
+        assert!(!file.workspace.resolve().clear_tmp_on_startup);
         std::fs::remove_dir_all(&dir).ok();
     }
 

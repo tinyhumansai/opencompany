@@ -2,10 +2,10 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
 import { listPeople, type Person } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
+import { listMemory, type MemoryEntry } from "@/api/memory";
 import { listSkills, type Skill } from "@/api/skills";
 import { listTasks, type Task } from "@/api/tasks";
 import type { McpServer, McpTool } from "@/lib/mcp";
-import { loadMemory, type MemoryEntry } from "@/lib/memory";
 import { fromDto, starterTeam, type TeamMember } from "@/lib/team";
 import { adapt, buildMemoryGraph } from "./overview/kg/adapter";
 import { buildKnowledgeGraph } from "./overview/kg/model";
@@ -28,6 +28,7 @@ interface Sources {
   team: TeamMember[];
   people: Person[];
   skills: Skill[];
+  memories: MemoryEntry[];
   servers: McpServer[];
   toolsByServer: Record<string, McpTool[]>;
 }
@@ -37,6 +38,7 @@ const EMPTY: Sources = {
   team: starterTeam(),
   people: [],
   skills: [],
+  memories: [],
   servers: [],
   toolsByServer: {},
 };
@@ -57,21 +59,20 @@ const EMPTY: Sources = {
 export function Overview({ client, company }: Props) {
   const [sources, setSources] = useState<Sources>(EMPTY);
 
-  // Memory is a local store, not a host surface (see `lib/memory.ts`), so it is
-  // read straight from storage — and re-read on a company switch, since it is
-  // keyed per company.
-  const memories = useMemo<MemoryEntry[]>(() => loadMemory(company), [company]);
-
   useEffect(() => {
     let live = true;
     void (async () => {
-      const [tasks, roster, people, skills, mcp] = await Promise.all([
+      const [tasks, roster, people, skills, memories, mcp] = await Promise.all([
         listTasks(client, company).catch(() => [] as Task[]),
         client.listTeam(company).catch(() => null),
         // Only an admin may list people; a member just gets no humans on the
         // graph, which is the right amount of information for them to have.
         listPeople(client, company).catch(() => [] as Person[]),
         listSkills(client, company).catch(() => [] as Skill[]),
+        // The company's real durable memory (issue #36). A host without the
+        // surface draws no constellation rather than a seeded one — the graph
+        // must never claim the company remembers something it doesn't.
+        listMemory(client, company).catch(() => [] as MemoryEntry[]),
         client.listMcpServers(company).catch(() => ({ servers: [] as McpServer[] })),
       ]);
       if (!live) return;
@@ -94,6 +95,7 @@ export function Overview({ client, company }: Props) {
         team: roster?.length ? roster.map(fromDto) : starterTeam(),
         people,
         skills,
+        memories,
         servers: mcp.servers,
         toolsByServer: Object.fromEntries(toolLists),
       });
@@ -129,12 +131,18 @@ export function Overview({ client, company }: Props) {
     [adapted],
   );
 
-  const memoryGraph = useMemo(() => buildMemoryGraph(memories), [memories]);
+  const memoryGraph = useMemo(() => buildMemoryGraph(sources.memories), [sources.memories]);
 
   return (
     // The whole viewport: the shell hides its top bar for this view, so there
     // is nothing above to subtract.
-    <div className="oc-kg h-svh min-h-0 w-full min-w-0 overflow-hidden">
+    <div
+      className="oc-kg h-svh min-h-0 w-full min-w-0 overflow-hidden"
+      // The guided tour's Overview stop anchors here. It used to spotlight the
+      // quick-action row this page had before it became the graph; the graph is
+      // the page now, so the graph is what gets spotlighted.
+      data-tour="overview-graph"
+    >
       <Suspense
         fallback={
           <div className="grid h-full place-items-center text-sm text-muted-foreground">
@@ -146,6 +154,7 @@ export function Overview({ client, company }: Props) {
           graph={graph}
           agents={adapted.agents}
           departments={adapted.departments}
+          people={adapted.people}
           tasks={adapted.tasks}
           memory={memoryGraph}
         />

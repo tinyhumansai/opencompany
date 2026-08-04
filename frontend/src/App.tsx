@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 
-import { verifyCode } from "@/api/auth";
+import { signInWithHubToken, verifyCode } from "@/api/auth";
 import { OpenCompanyClient } from "@/api/client";
 import { ApiError, type CompanyStatus } from "@/api/types";
 import { AppShell } from "@/components/app-shell";
@@ -14,7 +14,7 @@ import { resolveConfig } from "@/config";
 type Phase =
   | { kind: "loading" }
   | { kind: "error"; message: string; hint?: string }
-  | { kind: "login"; company: string | null }
+  | { kind: "login"; company: string | null; notice?: string }
   | { kind: "picker"; companies: CompanyStatus[] }
   | {
       kind: "console";
@@ -41,6 +41,34 @@ function readMagicLink(): { company: string | null; code: string } | null {
 }
 
 /**
+ * Reads `?token=&key=auth` off a hub sign-in landing.
+ *
+ * The hub appends these to the redirect URI it was given, so they arrive on a
+ * plain top-level navigation back to this console. `key=auth` is the hub's own
+ * marker for that redirect and is what distinguishes this token from the
+ * `?token=` the console config uses for a platform bearer — see `config.ts`.
+ *
+ * **Pure**, for the same reason `readMagicLink` is: StrictMode double-invokes
+ * the `useMemo` this runs in, so stripping the URL here would make the second
+ * invocation read a cleaned URL and silently drop the token.
+ *
+ * A failed sign-in comes back as `?error=` instead, which is not read here —
+ * the hub's error text is its own wording about its own flow, and this console
+ * says its piece in `hubNotice`.
+ */
+function readHubToken(): string | null {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("key") !== "auth") return null;
+  return params.get("token");
+}
+
+/** Whether the hub bounced the sign-in back with a failure rather than a token. */
+function readHubError(): boolean {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("key") === "auth" && params.get("error") !== null;
+}
+
+/**
  * Strips the magic link out of the address bar.
  *
  * The code is a single-use credential, so it must not linger in the URL, the
@@ -55,12 +83,35 @@ function clearMagicLinkFromUrl(): void {
   window.history.replaceState({}, "", window.location.pathname + (query ? `?${query}` : ""));
 }
 
+/**
+ * Strips the hub's sign-in result out of the address bar.
+ *
+ * `replaceState` rather than a push, so the token is gone from the history
+ * entry as well as from the bar — a back button that restored it would hand a
+ * live ecosystem credential to a reload, and a `Referer` carrying it would hand
+ * it to whatever the console links out to next.
+ *
+ * `company` is deliberately kept. It is not a credential, and dropping it would
+ * un-scope the console on a reload of a multi-company host.
+ */
+function clearHubResultFromUrl(): void {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("key") !== "auth") return;
+  params.delete("token");
+  params.delete("error");
+  params.delete("key");
+  const query = params.toString();
+  window.history.replaceState({}, "", window.location.pathname + (query ? `?${query}` : ""));
+}
+
 export function App() {
   const config = useMemo(() => resolveConfig(), []);
   const client = useMemo(() => new OpenCompanyClient(config), [config]);
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
   // A pure read, so StrictMode's double render is harmless.
   const magicLink = useMemo(() => readMagicLink(), []);
+  const hubToken = useMemo(() => readHubToken(), []);
+  const hubFailed = useMemo(() => readHubError(), []);
   /**
    * The in-flight redemption, so a link is redeemed exactly once.
    *
@@ -72,10 +123,11 @@ export function App() {
    */
   const redemption = useRef<Promise<unknown> | null>(null);
 
-  // Now that the code is captured in state, take it out of the URL.
+  // Now that the credential is captured in state, take it out of the URL.
   useEffect(() => {
     if (magicLink) clearMagicLinkFromUrl();
-  }, [magicLink]);
+    if (hubToken || hubFailed) clearHubResultFromUrl();
+  }, [magicLink, hubToken, hubFailed]);
 
   // An expired or revoked session anywhere in the console drops to sign-in
   // rather than showing a broken page.
@@ -91,6 +143,33 @@ export function App() {
     const set = (p: Phase) => !cancelled && setPhase(p);
 
     async function boot() {
+      // The hub bounced them back without a token (they cancelled at the
+      // provider, or the hub refused the redirect). Nothing to exchange.
+      if (hubFailed) {
+        set({
+          kind: "login",
+          company: config.company,
+          notice: "That sign-in didn't complete. Try again, or use a link below.",
+        });
+        return;
+      }
+
+      // A hub landing: exchange the platform token for a session here before
+      // anything else, for the same reason a magic link does — the session has
+      // to exist before the console asks for data.
+      if (hubToken) {
+        try {
+          redemption.current ??= signInWithHubToken(client, config.company, hubToken);
+          await redemption.current;
+        } catch (err) {
+          // A refused sign-in falls back to this company's own form rather than
+          // stranding them: the magic link still works, and it is the only
+          // thing that works on a self-hosted host anyway.
+          set({ kind: "login", company: config.company, notice: hubNotice(err) });
+          return;
+        }
+      }
+
       // A magic-link landing: redeem it before anything else, so the session
       // exists by the time the console asks for data.
       if (magicLink) {
@@ -147,7 +226,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, config.company, magicLink]);
+  }, [client, config.company, magicLink, hubToken, hubFailed]);
 
   const switchCompany = useCallback(
     async (id: string, companies: CompanyStatus[]) => {
@@ -180,6 +259,7 @@ export function App() {
         <Login
           client={client}
           company={phase.company}
+          notice={phase.notice}
           onSignedIn={() => window.location.reload()}
         />
       );
@@ -229,6 +309,28 @@ function FullScreen({ children }: { children: React.ReactNode }) {
   return (
     <div className="grid min-h-svh place-items-center bg-background p-6 text-center">{children}</div>
   );
+}
+
+/**
+ * What to tell someone whose ecosystem sign-in did not work.
+ *
+ * Each line is about the *credential* or the *host*, never about the person:
+ * "expired", "no access yet", "not connected". None of them confirms or denies
+ * that any address has an account here, which is the rule the whole sign-in
+ * surface is built around.
+ */
+function hubNotice(err: unknown): string {
+  const code = err instanceof ApiError ? err.code : "";
+  switch (code) {
+    case "hub_rejected":
+      return "That sign-in expired. Try again, or use a link below.";
+    case "not_a_member":
+      return "You're signed in to TinyHumans, but this company hasn't given you access yet. Ask an admin to invite you.";
+    case "hub_unavailable":
+      return "This host isn't connected to a TinyHumans account. Sign in with a link instead.";
+    default:
+      return "We couldn't complete that sign-in. Try a link below.";
+  }
 }
 
 function connectionError(client: OpenCompanyClient, err: unknown, company: string | null): Phase {

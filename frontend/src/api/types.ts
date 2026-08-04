@@ -2,6 +2,20 @@
 // Kept in sync with src/runtime/types.rs, src/server/operator.rs, and
 // src/feedback/{types,service}.rs.
 
+/**
+ * Where a company's manifest was seeded from — the source template's stable
+ * identity, recorded once at launch. Mirrors `TemplateProvenance` in
+ * `src/ports/types.rs`. Absent for a company provisioned from a raw manifest.
+ */
+export interface TemplateProvenance {
+  /** The template's stable id — the source directory slug. */
+  source_id: string;
+  /** The template's version, when the source exposes one. */
+  version?: string | null;
+  /** The source directory the company was launched from, when recorded. */
+  path?: string | null;
+}
+
 /** `GET /api/v1/companies` and `GET /api/v1/companies/{id}`. */
 export interface CompanyStatus {
   id: string;
@@ -9,12 +23,141 @@ export interface CompanyStatus {
   /** e.g. "running", "paused", "suspended", "archived". */
   lifecycle: string;
   pending_approvals: number;
+  /**
+   * The source-template provenance recorded at launch (issue #85). Absent for
+   * a company provisioned from a raw manifest rather than a template.
+   */
+  template_provenance?: TemplateProvenance | null;
+}
+
+/** What kind of processing step this is (drives the timeline icon). */
+export type TurnStepKind = "tool_call" | "thinking" | "note";
+
+/** How a processing step ended. */
+export type TurnStepStatus = "ok" | "error" | "running";
+
+/**
+ * One visible step in an agent turn's processing timeline. Mirrors `TurnStep`
+ * in `src/ports/types.rs`. The host folds and scrubs these from the turn's
+ * progress stream: `label`/`detail` never carry raw tool arguments, tool
+ * output, or call ids — only a safe label and an optional scrubbed detail.
+ */
+export interface TurnStep {
+  kind: TurnStepKind;
+  status: TurnStepStatus;
+  label: string;
+  /** A muted, scrubbed detail (e.g. an MCP `server · tool`, a failure cause). */
+  detail?: string;
+  /** How long a tool call took, in milliseconds, when known. */
+  elapsedMs?: number;
 }
 
 /** One channel reply from a cycle. */
 export interface OutboundMessage {
   channel: string;
   text: string;
+  /**
+   * The visible processing steps behind this reply (tool calls, thinking runs,
+   * surfaced MCP failures). Omitted by the host when empty — a memory-served or
+   * tool-less answer carries no steps, which is the tell that distinguishes it
+   * from a tool-backed one.
+   */
+  steps?: TurnStep[];
+  /** Channel-specific reply addressing (Telegram). Absent on operator messages. */
+  replyTo?: ReplyTo;
+  /**
+   * The board card this turn opened, when it opened one (issue #246). Drives
+   * the reply bubble's "card opened" chip. Absent when the turn opened nothing
+   * — which is every reply the host sent before this field existed.
+   *
+   * Only the *first* card of a turn that opened several: the journal field this
+   * is persisted into is a single id, so the claim is incomplete but never
+   * wrong. The bubble's `steps` timeline still shows every spawn.
+   */
+  taskId?: string;
+}
+
+/** Channel-specific reply addressing. Mirrors `ReplyTo` in `src/ports/types.rs`. */
+export interface ReplyTo {
+  /** The chat/thread id to deliver back to. */
+  chatId: string;
+}
+
+/** Telegram channel configuration status (no secrets). */
+export interface TelegramChannelStatus {
+  /** Whether the channel is fully configured (both token + secret stored). */
+  configured: boolean;
+  /** Whether a bot token is stored (never the token itself). */
+  tokenSet: boolean;
+  /** Whether a webhook secret is stored (never the secret itself). */
+  secretSet: boolean;
+  /** The public webhook URL to register with setWebhook. */
+  webhookUrl: string;
+}
+
+/**
+ * `GET {scope}/desks` — one desk (group chat). Mirrors `DeskDto` in
+ * `src/server/operator.rs`. The `id` doubles as the chat thread id; `members[0]`
+ * is the desk's lead.
+ */
+export interface DeskDto {
+  id: string;
+  name: string;
+  description?: string;
+  /** Effective members: manifest members unioned with overlay additions. */
+  members: string[];
+  /**
+   * The subset of `members` added through the operator overlay (issue #72).
+   * Only these can be removed at runtime; manifest members are part of the
+   * company blueprint. Omitted (undefined) when there are none.
+   */
+  overlayMembers?: string[];
+  /**
+   * Whether the whole desk was operator-created (an overlay desk) rather than
+   * declared in the manifest blueprint. The console offers a delete action only
+   * for these. Omitted (undefined/false) for blueprint desks.
+   */
+  overlayCreated?: boolean;
+}
+
+/**
+ * Body for `POST {scope}/desks` — create a desk. `name` is required; `id` is
+ * derived from the name when omitted; `members` are optional roster teammate
+ * ids (the first becomes the lead).
+ */
+export interface CreateDeskInput {
+  name: string;
+  description?: string;
+  id?: string;
+  members?: string[];
+}
+
+/**
+ * `GET {scope}/chat/history` — one persisted transcript message. Mirrors
+ * `ChatHistoryMessageDto` in `src/server/operator.rs`. Shares its filter +
+ * projection logic with the GraphQL `Chat.history` resolver, so the two can
+ * never disagree about a desk's history (issue #65).
+ */
+export interface ChatHistoryMessageDto {
+  id: string;
+  channel: string;
+  author: string;
+  text: string;
+  atMillis: number;
+  mine: boolean;
+  /**
+   * The scrubbed processing steps behind a company reply, so a rehydrated
+   * transcript renders the same timeline the live turn showed. Omitted when
+   * empty (operator messages, tool-less replies).
+   */
+  steps?: TurnStep[];
+  /**
+   * The board card this reply is about (issue #246) — the card the turn opened,
+   * or the dispatched card it ran for (#185). Projected from the same shared
+   * `MessageView` field the GraphQL `Chat.history` resolver reads, so the chip
+   * renders identically whichever surface hydrated the transcript.
+   */
+  taskId?: string;
 }
 
 /** Response of `/chat` and approval-resolution routes. */
@@ -108,7 +251,77 @@ export interface TeamMemberDto {
   name?: string;
   role: string;
   description?: string;
+  /**
+   * Whether this teammate has an enabled inbox, as the host's `InboxStore` sees
+   * it. Absent on hosts predating the field; the console reads that as `false`.
+   */
+  inboxEnabled?: boolean;
+  /**
+   * This teammate's daily spend cap in USD (manifest `budget_usd_daily`).
+   * Absent when the teammate is uncapped — absence IS the uncapped signal, so
+   * never default it to `0`, which would render a permanently exhausted
+   * teammate.
+   */
+  budgetUsdDaily?: number;
+  /**
+   * What this teammate has spent since 00:00 UTC. Sent only alongside
+   * `budgetUsdDaily`; absent for an uncapped teammate and on hosts predating
+   * the field.
+   */
+  spentTodayUsd?: number;
 }
+
+/**
+ * One teammate inbox's non-secret status, from `GET .../inboxes`. Both inbound
+ * paths (the ingest webhook and the IMAP poller) file into the same store this
+ * projects, so received mail shows up here.
+ */
+export interface InboxDto {
+  /** The inbox key (a teammate's local part / slug). */
+  key: string;
+  /** The teammate's display name. */
+  name: string;
+  /** The full address (`{key}@{domain}` when a domain is configured). */
+  address: string;
+  /** Whether the inbox is enabled on the Team page. */
+  enabled: boolean;
+  /** The number of unread received (inbound) messages. */
+  unread: number;
+}
+
+/** One email in an inbox, from `GET .../inboxes/{key}/messages`. */
+export interface InboxMessageDto {
+  id: string;
+  /** The inbox this belongs to (the teammate local part). */
+  inbox: string;
+  /** The sender's display name (may be empty). */
+  fromName: string;
+  /** The sender's email address. */
+  fromEmail: string;
+  subject: string;
+  /** Plain-text body. */
+  body: string;
+  /** When it arrived / was sent, epoch millis. */
+  atMillis: number;
+  read: boolean;
+  /** True for a sent message, false for a received one. */
+  outbound: boolean;
+}
+
+/**
+ * Which route a Connect for one provider can take on this host. Deliberately
+ * the same vocabulary as `ComposioCredentialSource` (`api/composio.ts`) — the
+ * two console surfaces answer the same question and should read the same to an
+ * operator.
+ *
+ * - `attested` — this instance carries a platform-minted identity, so
+ *   connections are the platform's to run. Nothing to register here, and the
+ *   console offers no local Connect.
+ * - `static` — a token this company already stored, or this host's own
+ *   registered provider application (the self-hosted hatch). Connect works.
+ * - `none` — neither, so no Connect can succeed on this host.
+ */
+export type ConnectionCredentialSource = "attested" | "static" | "none";
 
 /**
  * One third-party connection's state, from `GET .../connections`.
@@ -119,6 +332,12 @@ export interface ConnectionState {
   /** Provider id, matching the console's connection catalog (e.g. "slack"). */
   provider: string;
   connected: boolean;
+  /**
+   * Which credential route a Connect for this provider would take — a tier
+   * name, never a credential. Optional so a host predating issue #319 (which
+   * omits the field) still parses; the view falls back to today's behaviour.
+   */
+  credentialSource?: ConnectionCredentialSource;
   /** The connected account label, when known (e.g. an email or workspace). */
   account?: string;
 }
@@ -127,6 +346,247 @@ export interface ConnectionState {
 export interface ConnectionStart {
   /** The provider's OAuth authorize URL to redirect the operator to. */
   url: string;
+}
+
+/** The coarse health tier of an MCP server, from a probe. */
+export type McpStatus = "ok" | "needs_config" | "error" | "unknown";
+
+/**
+ * The last (scrubbed) probe outcome for an MCP server. `message` is always
+ * scrubbed on the host — it can never carry a credential, response body, or URL
+ * query string.
+ */
+export interface McpHealth {
+  status: McpStatus;
+  message: string;
+  toolCount: number;
+  checkedAtMillis: number;
+  /** A stable auth-failure reason code, when the status is a credential problem. */
+  authHint?: string;
+}
+
+/**
+ * One effective MCP tool server (issue #50), as `.../mcp/servers` returns it.
+ * The credential is never present — only the non-secret `authConfigured` flag
+ * and the last (scrubbed) probe `health`.
+ */
+export interface McpServer {
+  name: string;
+  endpoint: string;
+  description?: string;
+  /** `manifest` (committed in company.toml) or `runtime` (console-added). */
+  source: "manifest" | "runtime";
+  enabled: boolean;
+  allowedTools: string[];
+  disallowedTools: string[];
+  timeoutSecs: number;
+  /** Whether an outbound credential is stored — never the credential itself. */
+  authConfigured: boolean;
+  /** The last recorded (scrubbed) probe outcome, when the server has been probed. */
+  health?: McpHealth;
+}
+
+/**
+ * A mutating MCP response: the resulting server, a rebuild reminder, the live
+ * probe result (absent on a non-`openhuman` host), and any non-blocking
+ * endpoint advisory.
+ */
+export interface McpMutationResponse {
+  server: McpServer;
+  note: string;
+  /** The probe result from right after the mutation (the server is never rolled back). */
+  test?: McpHealth;
+  /** A non-blocking advisory (e.g. a secret-looking query string in the URL). */
+  warning?: string;
+}
+
+/** One remote tool advertised by an MCP server (live discovery). */
+export interface McpToolInfo {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema: unknown;
+}
+
+/** One capability tier's budget status (issue #108). */
+export interface CapabilityTierDto {
+  /** The exec tool namespace this tier gates (`shell` / `code` / `web` / `subagent`). */
+  namespace: string;
+  /** Tokens allowed this period. */
+  budgetTokens: number;
+  /** Tokens spent this period (company-wide — no per-tier attribution). */
+  spentTokens: number;
+  /** `budget - spent`, floored at zero. */
+  remainingTokens: number;
+  /** Whether spend has reached the threshold — the tier's tools are disabled. */
+  exhausted: boolean;
+}
+
+/**
+ * The plan-level total token ceiling (issue #188). Unlike a per-namespace tier
+ * — a *soft* gate that only trims exec tools — crossing this is a *hard* stop:
+ * the harness refuses to dispatch further turns this period. Present only when
+ * the manifest set `[plan].total_tokens`.
+ */
+export interface CapabilityTotalDto {
+  /** Total tokens allowed this period before dispatch is refused. */
+  budgetTokens: number;
+  /** Tokens spent this period. */
+  spentTokens: number;
+  /** `budget - spent`, floored at zero. */
+  remainingTokens: number;
+  /** Whether spend has reached the ceiling — dispatch is paused until reset. */
+  exhausted: boolean;
+}
+
+/**
+ * The company's capability-budget status. When no `[plan]` is configured only
+ * `configured: false` is present; the other fields accompany a configured plan.
+ */
+export interface CapabilityStatusDto {
+  configured: boolean;
+  /** The configured built-in tier name, or absent for a bare `token_budgets` plan. */
+  plan?: string | null;
+  /** Budget window (`daily` / `monthly`). */
+  period?: string;
+  /** Epoch-millis start of the current budget period. */
+  periodStartMillis?: number;
+  /** Total inference tokens spent this period. */
+  spentTokens?: number;
+  /** One row per configured tier, namespace-sorted. */
+  tiers?: CapabilityTierDto[];
+  /**
+   * The plan-level total token ceiling (issue #188), when configured. Crossing
+   * it is a hard stop — the harness refuses to dispatch further turns this
+   * period, unlike the soft per-namespace `tiers`.
+   */
+  total?: CapabilityTotalDto;
+  /**
+   * Media generation (issue #109): whether the company **explicitly** grants the
+   * real-money `media` namespace (a `*` wildcard does not count). Present
+   * regardless of whether a `[plan]` is configured.
+   */
+  mediaGranted?: boolean;
+  /** Whether the `media` feature is compiled into this build at all. */
+  mediaInBuild?: boolean;
+  /** Whether a managed media credential is configured on this build (env-only). */
+  mediaCredentialConfigured?: boolean;
+  /**
+   * Per-tenant Composio (issue #110): whether the company **explicitly** grants
+   * the `composio` namespace (a `*` wildcard does not count). Opt-in per tool
+   * grant, independent of a `[plan]`.
+   */
+  composioGranted?: boolean;
+  /** Whether the `composio` feature is compiled into this build at all. */
+  composioInBuild?: boolean;
+  /** Whether a per-tenant Composio token is stored — never the token itself. */
+  composioTokenConfigured?: boolean;
+  /**
+   * Metered web search (issue #238): whether the company **explicitly** grants
+   * the `search` namespace (a `*` wildcard does not count). Every call is a
+   * priced request on the managed platform, so it is opt-in by name.
+   */
+  searchGranted?: boolean;
+  /**
+   * Whether the harness carrying `web_search` is compiled into this build.
+   * There is no `search` Cargo feature — the tool rides the harness feature so
+   * CI actually compiles and tests it.
+   */
+  searchInBuild?: boolean;
+  /** Whether a managed search credential is configured on this build (env-only). */
+  searchCredentialConfigured?: boolean;
+  /** The company's daily `web_search` call ceiling. */
+  searchDailyCallCap?: number;
+}
+
+/** One day's token totals in the usage series (`GET .../usage`). */
+export interface UsagePointDto {
+  /** ISO day, `YYYY-MM-DD`. */
+  date: string;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** Tokens attributed to one teammate (desk) over the window. */
+export interface AgentTokensDto {
+  name: string;
+  tokens: number;
+}
+
+/** OAuth-connected calls counted for one provider over the window. */
+export interface ProviderCallsDto {
+  provider: string;
+  calls: number;
+}
+
+/** Rolled-up usage totals for the window. */
+export interface UsageTotalsDto {
+  inputTokens: number;
+  outputTokens: number;
+  tokens: number;
+  costUsd: number;
+  oauthCalls: number;
+  connections: number;
+  /**
+   * Metered web searches in the window (issue #238). Their USD cost is already
+   * inside `costUsd`; this is the call count. Deliberately separate from
+   * `oauthCalls` / `connections`, which count connected third-party accounts —
+   * a search is a platform call, not an account the company connected.
+   */
+  searchCalls: number;
+}
+
+/**
+ * `GET .../usage?range=` — the company's usage read. A REST twin of the
+ * `Company.usage(range)` GraphQL surface. Token/cost figures populate on a
+ * harness build; the offline build reports a zero-filled series (that is the
+ * real value, not a stub). `byProvider` / `oauthCalls` stay empty/zero until the
+ * OAuth-call emit lands (Phase 2).
+ */
+export interface UsageDto {
+  /** Zero-filled daily token series over the range, oldest first. */
+  series: UsagePointDto[];
+  /** Tokens per teammate (desk), highest first. */
+  byAgent: AgentTokensDto[];
+  /** OAuth calls per provider, highest first (empty until Phase 2 emit). */
+  byProvider: ProviderCallsDto[];
+  totals: UsageTotalsDto;
+}
+
+/** Spend rolled up by prosumer category (`GET .../finances`). */
+export interface CategorySpendDto {
+  category: string;
+  amount: number;
+}
+
+/** One monetary ledger movement in the finance journal. */
+export interface TransactionDto {
+  id: string;
+  /** ISO day, `YYYY-MM-DD`. */
+  date: string;
+  description: string;
+  category: string;
+  /** Absolute USD magnitude; sign is carried by `direction`. */
+  amountUsd: number;
+  direction: "in" | "out";
+}
+
+/**
+ * `GET .../finances` — the company's finance read. A REST twin of the
+ * `Company.finances` GraphQL surface: the ledger + manifest `[budget]` folded
+ * into balance, budget vs spend, revenue, spend by category, and the journal.
+ * The ledger fills on a harness build; the offline build reports zeroes.
+ * `balanceUsd` is the bookkeeping net until the wallet balance is surfaced
+ * (Phase 2).
+ */
+export interface FinancesDto {
+  balanceUsd: number;
+  budgetUsd: number;
+  spentUsd: number;
+  revenueUsd: number;
+  netUsd: number;
+  byCategory: CategorySpendDto[];
+  transactions: TransactionDto[];
 }
 
 /** Error envelope shape: `{ error, code }`. */

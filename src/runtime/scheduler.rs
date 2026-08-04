@@ -30,7 +30,7 @@ use crate::ports::types::CompanyEvent;
 use crate::runtime::cron::{CivilTime, CronExpr};
 
 /// Milliseconds in one minute.
-const MINUTE_MS: u64 = 60_000;
+pub(crate) const MINUTE_MS: u64 = 60_000;
 
 /// A source of the current wall-clock time, in unix epoch milliseconds.
 ///
@@ -166,9 +166,18 @@ impl CompanyScheduler {
     }
 
     /// Runs the per-tick maintenance that rides the same minute boundary as
-    /// scheduled fires: sweep parked approvals past their TTL to a default-deny.
+    /// scheduled fires: sweep parked approvals past their TTL to a default-deny,
+    /// then sweep single-use grants the agent never redeemed (issue #243).
+    ///
+    /// The grant sweep's ids are deliberately not folded into the return value —
+    /// callers read it as "approvals that expired", and a grant expiry is a
+    /// different event with a different meaning (the operator DID approve; the
+    /// agent simply never acted). It announces itself on the operator channel
+    /// instead.
     pub async fn tick_maintenance(&self) -> Result<Vec<crate::ports::types::ApprovalId>> {
-        self.runtime.sweep_expired_approvals().await
+        let expired = self.runtime.sweep_expired_approvals().await?;
+        self.runtime.sweep_expired_grants().await?;
+        Ok(expired)
     }
 
     /// Spawns a background task that ticks on every minute boundary until
@@ -176,10 +185,21 @@ impl CompanyScheduler {
     /// shared `shutdown` so the scheduler stops cleanly when the server does.
     pub fn spawn(mut self, shutdown: Arc<Notify>) -> JoinHandle<()> {
         tokio::spawn(async move {
+            // The `Notified` future is built ONCE and pinned across iterations,
+            // not rebuilt inside the `select!`. Boot signals with
+            // `notify_waiters()`, which wakes only the waiters registered at
+            // that instant — a future created fresh each iteration is not
+            // registered while `tick` is running, so a shutdown arriving
+            // mid-tick would be dropped and the scheduler would sleep another
+            // full minute before noticing. Polled once here, this one stays
+            // registered, and a notification delivered during `tick` is
+            // latched: the next `select!` sees it immediately.
+            let notified = shutdown.notified();
+            tokio::pin!(notified);
             loop {
                 let sleep_ms = millis_to_next_minute(self.clock.now_millis());
                 tokio::select! {
-                    _ = shutdown.notified() => break,
+                    _ = &mut notified => break,
                     _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {
                         if let Err(err) = self.tick().await {
                             tracing::warn!(company = %self.runtime.id(), %err, "scheduled cycle failed");
@@ -196,7 +216,10 @@ impl CompanyScheduler {
 
 /// Milliseconds from `now` to the next whole-minute boundary (always `>= 1` so
 /// the spawn loop never busy-spins on an exact boundary).
-fn millis_to_next_minute(now: u64) -> u64 {
+///
+/// Shared with [`WorkflowScheduler`](super::workflow_scheduler::WorkflowScheduler)
+/// so both minute-boundary loops wake on the same tick.
+pub(crate) fn millis_to_next_minute(now: u64) -> u64 {
     let into_minute = now % MINUTE_MS;
     MINUTE_MS - into_minute
 }
@@ -216,8 +239,11 @@ mod test {
     use crate::runtime::RuntimeBuilder;
     use crate::runtime::cron::CivilTime;
 
-    fn tmp_home() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("opencompany-sched-{}", crate::ports::generate_id()))
+    fn tmp_home() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("opencompany-sched-")
+            .tempdir()
+            .expect("tempdir")
     }
 
     fn manifest(policy_mode: &str) -> CompanyManifest {
@@ -269,8 +295,11 @@ mod test {
             for event in &req.events {
                 if let CompanyEvent::ScheduleFired { prompt, .. } = event {
                     responses.push(OutboundMessage {
+                        task_id: None,
                         channel: "operator".into(),
                         text: format!("scheduled: {prompt}"),
+                        steps: Vec::new(),
+                        reply_to: None,
                     });
                 }
             }
@@ -304,7 +333,8 @@ mod test {
 
     #[tokio::test]
     async fn fires_once_per_matching_minute_and_dedupes() {
-        let home = tmp_home();
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         let manifest = scheduled_manifest();
         let schedules = manifest.schedules.clone();
         let rt = Arc::new(
@@ -351,12 +381,12 @@ mod test {
             .await
             .unwrap();
         assert_eq!(events.len(), 2);
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[tokio::test]
     async fn non_matching_minute_never_fires() {
-        let home = tmp_home();
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         let manifest = scheduled_manifest();
         let schedules = manifest.schedules.clone();
         let rt = Arc::new(
@@ -370,12 +400,12 @@ mod test {
         let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 14, 9, 0)));
         let mut scheduler = CompanyScheduler::new(rt.clone(), &schedules, clock).unwrap();
         assert_eq!(scheduler.tick().await.unwrap(), 0);
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[tokio::test]
     async fn empty_schedule_set_is_a_noop() {
-        let home = tmp_home();
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         let rt = Arc::new(
             RuntimeBuilder::fs_defaults(home.clone(), manifest("full"))
                 .await
@@ -385,12 +415,12 @@ mod test {
         let mut scheduler = CompanyScheduler::new(rt, &[], clock).unwrap();
         assert!(scheduler.is_empty());
         assert_eq!(scheduler.tick().await.unwrap(), 0);
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[tokio::test]
     async fn tick_maintenance_expires_parked_approval() {
-        let home = tmp_home();
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         // A brain that parks a Sign effect so there is something to expire.
         struct ParkBrain;
         #[async_trait]
@@ -409,6 +439,8 @@ mod test {
                             established_thread: false,
                             first_time_counterparty: false,
                             payload: serde_json::Value::Null,
+                            agent: None,
+                            run_id: None,
                         })
                         .await?;
                     }
@@ -445,7 +477,6 @@ mod test {
         let expired = scheduler.tick_maintenance().await.unwrap();
         assert_eq!(expired.len(), 1);
         assert!(rt.pending_approvals().is_empty());
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     fn scheduled_manifest_supervised() -> CompanyManifest {
@@ -467,6 +498,84 @@ mod test {
         toml::from_str(toml_src).expect("parse manifest")
     }
 
+    /// A brain that parks inside its first cycle until released, so a test can
+    /// deliver a shutdown while a tick is provably in flight.
+    struct BlockingBrain {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Brain for BlockingBrain {
+        async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+            if let Some(tx) = self.started.lock().expect("started lock").take() {
+                let _ = tx.send(());
+            }
+            // Taken out of the mutex first so no guard is held across the await.
+            let release = self.release.lock().expect("release lock").take();
+            if let Some(rx) = release {
+                let _ = rx.await;
+            }
+            Ok(CycleResult {
+                channel_responses: Vec::new(),
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "blocking")],
+                ledger_deltas: Vec::new(),
+                token_usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    /// A shutdown delivered *while a tick is running* must still stop the loop.
+    ///
+    /// Boot signals with `notify_waiters()`, which wakes only the waiters
+    /// registered at that instant. A `spawn` that rebuilds `shutdown.notified()`
+    /// inside the `select!` has no waiter registered while `tick` runs — the
+    /// signal is dropped and the loop sleeps to the next minute boundary before
+    /// noticing it was asked to stop.
+    ///
+    /// The assertion is loop termination, not elapsed time: the clock is parked
+    /// 1ms before a minute boundary so the loop's sleep is 1ms, meaning a
+    /// scheduler that missed the signal keeps ticking (and never joins) while a
+    /// correct one exits on its very next iteration with nothing left to await.
+    /// The 5s bound only caps how long the failing case takes to report.
+    #[tokio::test]
+    async fn shutdown_during_a_tick_stops_the_loop() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let manifest = scheduled_manifest();
+        let schedules = manifest.schedules.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let rt = Arc::new(
+            RuntimeBuilder::new(home.clone(), manifest)
+                .with_brain(Arc::new(BlockingBrain {
+                    started: std::sync::Mutex::new(Some(started_tx)),
+                    release: std::sync::Mutex::new(Some(release_rx)),
+                }))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // Monday 2026-07-13 09:00:59.999 UTC: the schedule matches this civil
+        // minute, and `millis_to_next_minute` is therefore 1ms.
+        let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 13, 9, 0) + MINUTE_MS - 1));
+        let scheduler = CompanyScheduler::new(rt, &schedules, clock).unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let handle = scheduler.spawn(shutdown.clone());
+
+        // Signal shutdown only once the cycle is provably in flight, then let
+        // that cycle finish.
+        started_rx.await.expect("tick started");
+        shutdown.notify_waiters();
+        release_tx.send(()).expect("release the in-flight cycle");
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("scheduler kept running after a shutdown delivered mid-tick")
+            .expect("scheduler task panicked");
+    }
+
     #[tokio::test]
     async fn bad_cron_fails_construction() {
         // A scheduler over an unparsable cron surfaces the error at construction.
@@ -474,7 +583,8 @@ mod test {
             cron: "not a cron".into(),
             prompt: "x".into(),
         }];
-        let home = tmp_home();
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         let rt = Arc::new(
             RuntimeBuilder::fs_defaults(home.clone(), manifest("full"))
                 .await
@@ -482,7 +592,6 @@ mod test {
         );
         let clock = Arc::new(FakeClock::new(0));
         assert!(CompanyScheduler::new(rt, &bad, clock).is_err());
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[test]

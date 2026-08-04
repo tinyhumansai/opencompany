@@ -68,15 +68,16 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "Introduce yourself in one sentence.".to_string());
 
-    let (cfg, default_model) = harness_inference_from_env(&ProcessEnv).ok_or_else(|| {
+    let (cfg, model_override) = harness_inference_from_env(&ProcessEnv).ok_or_else(|| {
         anyhow::anyhow!(
             "no inference credential — set TINYHUMANS_API_KEY (or OPENCOMPANY_INFERENCE_KEY), \
              optionally OPENCOMPANY_INFERENCE_URL / _MODEL"
         )
     })?;
     eprintln!(
-        "[live] endpoint={}  default_model={}",
-        cfg.base_url, default_model
+        "[live] endpoint={}  model_override={}",
+        cfg.base_url,
+        model_override.as_deref().unwrap_or("<per-agent tier>")
     );
 
     let manifest: CompanyManifest = toml::from_str(MANIFEST)?;
@@ -86,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
         ledger: Vec::new(),
         lifecycle: "running".to_string(),
         overlay_agents: Vec::new(),
+        overlay_desk_members: Vec::new(),
+        overlay_desk_order: Vec::new(),
+        overlay_desks: Vec::new(),
+        overlay_workflows: Vec::new(),
+        template_provenance: None,
     };
 
     let dir = tempfile::tempdir()?;
@@ -97,18 +103,48 @@ async fn main() -> anyhow::Result<()> {
         store: Arc::new(FsCompanyStore::new(dir.path())),
         meter: Some(meter.clone()),
         workspace_root: dir.path().to_path_buf(),
-        model_override: Some(default_model.clone()),
+        model_override,
         tasks: None,
         skills: None,
         skills_source_dir: None,
+        skills_registry: std::sync::Arc::from([]),
+        mcp_servers: Vec::new(),
+        facts: None,
+        events: None,
+        artifacts: None,
+        delegations: opencompany::harness::orchestrator::DelegationQueue::default(),
+        workflow_runner: opencompany::harness::orchestrator::WorkflowRunnerHandle::default(),
+        mcp_failures: opencompany::harness::mcp_probe::McpFailureQueue::default(),
+        approval_requests: opencompany::harness::policy::ApprovalRequestQueue::default(),
+        secrets: None,
+        web_allowed_domains: Vec::new(),
+        capabilities: opencompany::harness::toolbelt::CapabilityFilter::AllowAll,
+        workflow_source_dir: None,
+        plan: None,
+        media: None,
+        composio: None,
+        steer: opencompany::company::steer::InflightRegistry::default(),
+        delivery: None,
+        search: None,
+        workspace: None,
     };
 
     let pool = HarnessPool::new();
     pool.ensure(&record, &deps).await?;
 
     println!("── prompt → ceo ──\n{prompt}\n");
-    let reply = pool.run(&record.id, "ceo", &prompt, &deps).await?;
+    let outcome = pool
+        .run(&record.id, "ceo", &prompt, &deps, Some("General"))
+        .await?;
+    let reply = outcome.reply;
     println!("── ceo reply ──\n{reply}\n");
+    if !outcome.steps.is_empty() {
+        println!("── steps ({}) ──", outcome.steps.len());
+        for step in &outcome.steps {
+            println!("  · {:?} {} [{:?}]", step.status, step.label, step.kind);
+        }
+        println!();
+    }
 
     // An empty reply means the turn ran but produced nothing — broken wiring,
     // not a valid answer. Fail loudly so this smoke never passes silently.

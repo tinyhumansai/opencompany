@@ -21,8 +21,11 @@ use crate::server::users::cookie::session_cookie_name;
 use crate::server::users::token::{OsTokens, mint_session_token, sha256_hex};
 use crate::{AppConfig, AppState};
 
-fn home() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("oc-userauth-{}", crate::ports::generate_id()))
+fn home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("oc-userauth-")
+        .tempdir()
+        .expect("tempdir")
 }
 
 fn manifest() -> CompanyManifest {
@@ -42,6 +45,11 @@ async fn state_with(home: &std::path::Path, companies: &[&str]) -> AppState {
                 ledger: Vec::new(),
                 lifecycle: "running".to_string(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                template_provenance: None,
             })
             .await
             .unwrap();
@@ -123,7 +131,8 @@ fn headers_with_cookie(company: &str, token: &str) -> axum::http::HeaderMap {
 
 #[tokio::test]
 async fn a_session_cookie_resolves_to_a_user_of_that_company() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
     let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
 
@@ -140,12 +149,12 @@ async fn a_session_cookie_resolves_to_a_user_of_that_company() {
         }
         other => panic!("expected a user principal, got {other:?}"),
     }
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn a_session_for_one_company_is_refused_for_another() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme", "globex"]).await;
     let token = seed_session(&state, "acme", UserRole::Admin, UserStatus::Active).await;
 
@@ -172,12 +181,12 @@ async fn a_session_for_one_company_is_refused_for_another() {
             .is_err(),
         "a token from another company's partition must not resolve"
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn a_user_may_address_only_their_own_company() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme", "globex"]).await;
     let token = seed_session(&state, "acme", UserRole::Admin, UserStatus::Active).await;
 
@@ -193,12 +202,12 @@ async fn a_user_may_address_only_their_own_company() {
     );
     // A user cannot even learn that other companies exist on this host.
     assert_eq!(auth.visible_companies(&state), vec![acme]);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn a_suspended_users_live_session_stops_working_immediately() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
     let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
     let acme = CompanyId::new("acme");
@@ -220,12 +229,12 @@ async fn a_suspended_users_live_session_stops_working_immediately() {
             .is_err(),
         "suspension must take effect on the next request, not at cookie expiry"
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn an_expired_session_does_not_resolve() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
     let acme = CompanyId::new("acme");
     let runtime = state.registry().get(&acme).unwrap();
@@ -272,12 +281,12 @@ async fn an_expired_session_does_not_resolve() {
             .is_err(),
         "an expired session must not resolve"
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn a_stale_or_garbage_cookie_falls_through_to_the_platform_bearer() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     // Platform mode: the hosting layer's machine credential.
     let state = AppState::new(AppConfig {
         platform_auth: Some(crate::server::platform_auth::PlatformAuthConfig::new(
@@ -315,7 +324,6 @@ async fn a_stale_or_garbage_cookie_falls_through_to_the_platform_bearer() {
         matches!(auth, GqlAuth::Platform(_)),
         "a bad cookie must degrade to the bearer path, not fail the request"
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
@@ -323,7 +331,8 @@ async fn an_anonymous_request_reaches_nothing() {
     // What used to be dev mode. With no principal at all, a write route is
     // simply closed — previously this was a 200 on every deployment, because
     // the operator token that would have guarded it could not be set.
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
 
     let app = router(state.clone());
@@ -339,14 +348,14 @@ async fn an_anonymous_request_reaches_nothing() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn a_users_session_now_reaches_their_own_companys_write_plane() {
     // The point of the change: humans are the prosumer auth story, so a member
     // of the company can drive its console surfaces.
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
     let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
 
@@ -368,7 +377,6 @@ async fn a_users_session_now_reaches_their_own_companys_write_plane() {
         "a member must be able to use their own company, got {}",
         response.status()
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
@@ -377,7 +385,8 @@ async fn a_session_cookie_cannot_reach_the_platform_plane() {
     // suspension resolve through `resolve_claims`, which cannot produce a User,
     // so no session — however admin — can create or destroy companies across
     // tenants.
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
     let token = seed_session(&state, "acme", UserRole::Admin, UserStatus::Active).await;
 
@@ -418,14 +427,14 @@ async fn a_session_cookie_cannot_reach_the_platform_plane() {
         StatusCode::UNAUTHORIZED,
         "an admin user's session must not suspend a company"
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn without_an_addressed_company_a_lone_cookie_selects_its_own() {
     // The GraphQL path: the company lives in the request body, so the cookie
     // name is the only signal.
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
     let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
 
@@ -436,14 +445,14 @@ async fn without_an_addressed_company_a_lone_cookie_selects_its_own() {
         GqlAuth::User(u) => assert_eq!(u.company, CompanyId::new("acme")),
         other => panic!("expected a user, got {other:?}"),
     }
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn without_an_addressed_company_ambiguous_cookies_resolve_no_user() {
     // Two companies' sessions in one jar (only reachable in local dev). Picking
     // one would be a guess; degrade instead.
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme", "globex"]).await;
     let acme_token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
     let globex_token = seed_session(&state, "globex", UserRole::Member, UserStatus::Active).await;
@@ -463,5 +472,4 @@ async fn without_an_addressed_company_ambiguous_cookies_resolve_no_user() {
         resolve_principal(&headers, &state, None).await.is_err(),
         "an ambiguous jar must not silently pick a company"
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }

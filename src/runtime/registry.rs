@@ -104,6 +104,13 @@ mod test {
         toml::from_str(&format!("[company]\nname = \"{name}\"\n")).unwrap()
     }
 
+    fn tmp_home() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("opencompany-reg-")
+            .tempdir()
+            .expect("tempdir")
+    }
+
     async fn runtime(home: &std::path::Path, id: &str) -> Arc<CompanyRuntime> {
         Arc::new(
             RuntimeBuilder::new(home.to_path_buf(), manifest(id))
@@ -116,8 +123,8 @@ mod test {
 
     #[tokio::test]
     async fn sole_returns_the_only_company() {
-        let home =
-            std::env::temp_dir().join(format!("opencompany-reg-{}", crate::ports::generate_id()));
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         let registry = CompanyRegistry::new();
         assert!(registry.is_empty());
         assert!(registry.sole().is_none());
@@ -131,13 +138,12 @@ mod test {
         assert!(registry.sole().is_none());
         assert_eq!(registry.len(), 2);
         assert!(registry.get(&CompanyId::new("globex")).is_some());
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 
     #[tokio::test]
     async fn remove_unregisters_the_company() {
-        let home =
-            std::env::temp_dir().join(format!("opencompany-reg-{}", crate::ports::generate_id()));
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
         let registry = CompanyRegistry::new();
         registry.insert(CompanyId::new("acme"), runtime(&home, "acme").await);
         assert!(registry.get(&CompanyId::new("acme")).is_some());
@@ -146,6 +152,5 @@ mod test {
         assert!(removed.is_some());
         assert!(registry.get(&CompanyId::new("acme")).is_none());
         assert!(registry.remove(&CompanyId::new("acme")).is_none());
-        tokio::fs::remove_dir_all(&home).await.ok();
     }
 }

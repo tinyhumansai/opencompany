@@ -2,6 +2,7 @@
 name: Hiring Screen
 description: Screen a candidate against a role's must-haves and produce a clear recommendation.
 category: Ops
+version: 1.0.0
 ---
 
 # Hiring Screen

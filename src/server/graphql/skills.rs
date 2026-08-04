@@ -16,7 +16,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::company::{SkillDoc, load_dir_skills, parse_skill_md};
 use crate::ports::skills_state::{SkillSource, SkillState};
 
-/// One skill installed in a company. Mirrors `frontend/src/lib/skills.ts`.
+/// One skill installed in a company. Mirrors the console's `@/api/skills` types.
 #[derive(SimpleObject)]
 #[graphql(name = "Skill")]
 pub struct SkillGql {
@@ -32,6 +32,8 @@ pub struct SkillGql {
     pub source: String,
     /// Whether the skill is enabled for the company.
     pub enabled: bool,
+    /// The library revision this skill's document carries, when it has one.
+    pub version: Option<String>,
 }
 
 /// One skill in the shared repo-level registry, installable into any company.
@@ -48,6 +50,9 @@ pub struct RegistrySkillGql {
     pub category: String,
     /// The publisher of the registry skill.
     pub publisher: String,
+    /// The library revision this entry ships, from frontmatter. `None` for a
+    /// skill authored before `version` existed.
+    pub version: Option<String>,
 }
 
 /// The default category when a skill doc carries none.
@@ -88,17 +93,16 @@ fn from_doc(doc: &SkillDoc, source: &str, enabled: bool) -> SkillGql {
             .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
         source: source.to_string(),
         enabled,
+        version: doc.version.clone(),
     }
 }
 
 /// The repo-level skill registry docs, loaded from the shared `skills/` library
 /// directory. Empty when no source checkout is present (platform-provisioned
-/// mode), where the registry has nothing to serve.
-fn registry_docs(state: &AppState) -> Arc<[SkillDoc]> {
-    let Some(dir) = state.skills_root() else {
-        return Arc::from([]);
-    };
-    state.skill_registry(dir).unwrap_or_else(|_| Arc::from([]))
+/// mode), where the registry has nothing to serve. A configured library that
+/// fails to load surfaces as a query error rather than as an empty registry.
+fn registry_docs(state: &AppState) -> async_graphql::Result<Arc<[SkillDoc]>> {
+    Ok(state.shared_skill_registry()?)
 }
 
 /// Resolves `Company.skills`: company-dir docs overlaid with store deltas.
@@ -107,7 +111,7 @@ pub(crate) async fn resolve_company(
     runtime: &Arc<CompanyRuntime>,
 ) -> async_graphql::Result<Vec<SkillGql>> {
     let state = ctx.data::<AppState>()?;
-    let registry = registry_docs(state);
+    let registry = registry_docs(state)?;
 
     // Base: the company's own on-disk skills (`companies/<name>/skills`), all
     // enabled by default. In platform-provisioned mode there is no source dir,
@@ -136,22 +140,41 @@ pub(crate) async fn resolve_company(
     Ok(out)
 }
 
-/// Projects a store delta with no company-dir doc into a `Skill`, enriching a
-/// registry install from the shared library and a custom skill from its own
+/// Projects a store delta with no company-dir doc into a `Skill`, reading a
+/// registry install from its pinned snapshot and a custom skill from its own
 /// `SKILL.md`.
 fn skill_from_state(st: &SkillState, registry: &[SkillDoc]) -> SkillGql {
     match st.source {
-        SkillSource::Registry => match registry.iter().find(|doc| doc.slug == st.slug) {
-            Some(doc) => from_doc(doc, "registry", st.enabled),
-            None => SkillGql {
-                id: ID(st.slug.clone()),
-                name: titleize(&st.slug),
-                description: String::new(),
-                category: DEFAULT_CATEGORY.to_string(),
-                source: "registry".to_string(),
-                enabled: st.enabled,
-            },
-        },
+        SkillSource::Registry => {
+            // The install-time snapshot is authoritative, exactly as it is for
+            // the REST projection (`InstalledSkill::from_state`): `install()`
+            // pins the library document into `custom_doc` so a later library
+            // edit does not rewrite an existing install. Reading the live
+            // library here instead would make the two transports report
+            // different `version`s for the same install, and would discard real
+            // persisted content once a slug leaves the library.
+            let pinned = st
+                .custom_doc
+                .as_deref()
+                .and_then(|src| parse_skill_md(&st.slug, src).ok());
+            // The live library is a fallback only: a pre-fix install has no
+            // snapshot, or one that does not parse.
+            match pinned
+                .as_ref()
+                .or_else(|| registry.iter().find(|doc| doc.slug == st.slug))
+            {
+                Some(doc) => from_doc(doc, "registry", st.enabled),
+                None => SkillGql {
+                    id: ID(st.slug.clone()),
+                    name: titleize(&st.slug),
+                    description: String::new(),
+                    category: DEFAULT_CATEGORY.to_string(),
+                    source: "registry".to_string(),
+                    enabled: st.enabled,
+                    version: None,
+                },
+            }
+        }
         SkillSource::Custom => {
             let doc = st
                 .custom_doc
@@ -166,6 +189,7 @@ fn skill_from_state(st: &SkillState, registry: &[SkillDoc]) -> SkillGql {
                     category: DEFAULT_CATEGORY.to_string(),
                     source: "custom".to_string(),
                     enabled: st.enabled,
+                    version: None,
                 },
             }
         }
@@ -176,6 +200,7 @@ fn skill_from_state(st: &SkillState, registry: &[SkillDoc]) -> SkillGql {
             category: DEFAULT_CATEGORY.to_string(),
             source: "company".to_string(),
             enabled: st.enabled,
+            version: None,
         },
     }
 }
@@ -185,7 +210,7 @@ pub(crate) async fn resolve_registry(
     ctx: &Context<'_>,
 ) -> async_graphql::Result<Vec<RegistrySkillGql>> {
     let state = ctx.data::<AppState>()?;
-    Ok(registry_docs(state)
+    Ok(registry_docs(state)?
         .iter()
         .map(|doc| RegistrySkillGql {
             id: ID(doc.slug.clone()),
@@ -196,6 +221,7 @@ pub(crate) async fn resolve_registry(
                 .clone()
                 .unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
             publisher: REGISTRY_PUBLISHER.to_string(),
+            version: doc.version.clone(),
         })
         .collect())
 }

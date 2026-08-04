@@ -49,6 +49,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::OpenCompanyError;
+use crate::server::ops::imap::ImapCredentials;
 use crate::server::ops::smtp::{SmtpCredentials, SmtpSecurity};
 
 /// Which transport a set of [`MailCredentials`] belongs to.
@@ -157,6 +158,115 @@ pub trait MailSender: Send + Sync {
     ) -> Result<(), OpenCompanyError>;
 }
 
+/// One inbound message produced by a [`MailReceiver`]. Plain-text body (v1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundEmail {
+    pub from_name: String,
+    pub from_email: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// One fetched-but-not-yet-acked message: the parsed [`InboundEmail`] plus the
+/// IMAP UID it was fetched under. The UID (not a sequence number, which shifts
+/// on expunge) is what [`MailReceiver::mark_seen`] takes, so filing and acking
+/// stay correctly paired even if the mailbox changes between the two calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedEmail {
+    pub uid: u32,
+    pub email: InboundEmail,
+}
+
+/// The inbound-fetch seam. Implementations fetch *new* (unseen) messages
+/// without marking them seen, and only do so once the caller confirms the
+/// message was durably filed — see [`MailReceiver::mark_seen`]. Mockable so the
+/// poller is exercised offline; the real transport is feature-gated.
+#[async_trait]
+pub trait MailReceiver: Send + Sync {
+    /// Fetches messages not yet marked `\Seen`, without setting that flag
+    /// (`UID FETCH ... BODY.PEEK[]` on the real transport) — a message stays
+    /// unseen, and so is re-fetched, until [`MailReceiver::mark_seen`] is
+    /// called for its UID.
+    async fn fetch_new(
+        &self,
+        creds: &ImapCredentials,
+    ) -> Result<Vec<FetchedEmail>, OpenCompanyError>;
+
+    /// Marks `uids` `\Seen`. Callers must only pass UIDs of messages that have
+    /// already been durably filed — this is the "ack" half of the fetch, kept
+    /// separate so a storage failure never causes an unfiled message to be
+    /// marked seen (and thus lost: it would never be re-fetched).
+    async fn mark_seen(
+        &self,
+        creds: &ImapCredentials,
+        uids: &[u32],
+    ) -> Result<(), OpenCompanyError>;
+}
+
+/// Offline mock: returns queued batches, one per `fetch_new` call, counts
+/// calls, and records every UID passed to `mark_seen`.
+pub struct RecordingMailReceiver {
+    batches: Mutex<std::collections::VecDeque<Vec<FetchedEmail>>>,
+    calls: std::sync::atomic::AtomicUsize,
+    marked: Mutex<Vec<u32>>,
+}
+
+impl RecordingMailReceiver {
+    pub fn new() -> Self {
+        Self {
+            batches: Mutex::new(std::collections::VecDeque::new()),
+            calls: Default::default(),
+            marked: Mutex::new(Vec::new()),
+        }
+    }
+    /// Queue a batch to be returned by the next `fetch_new`.
+    pub fn push_batch(&self, batch: Vec<FetchedEmail>) {
+        self.batches.lock().expect("poisoned").push_back(batch);
+    }
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Every UID passed to `mark_seen` so far, in call order.
+    pub fn marked(&self) -> Vec<u32> {
+        self.marked.lock().expect("poisoned").clone()
+    }
+}
+
+impl Default for RecordingMailReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl MailReceiver for RecordingMailReceiver {
+    async fn fetch_new(
+        &self,
+        _creds: &ImapCredentials,
+    ) -> Result<Vec<FetchedEmail>, OpenCompanyError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self
+            .batches
+            .lock()
+            .expect("poisoned")
+            .pop_front()
+            .unwrap_or_default())
+    }
+
+    async fn mark_seen(
+        &self,
+        _creds: &ImapCredentials,
+        uids: &[u32],
+    ) -> Result<(), OpenCompanyError> {
+        self.marked
+            .lock()
+            .expect("poisoned")
+            .extend_from_slice(uids);
+        Ok(())
+    }
+}
+
 /// Host-level outbound mail configuration.
 ///
 /// Resolved once, at boot, from `OPENCOMPANY_MAIL_*`. This is the platform's
@@ -238,6 +348,83 @@ impl MailConfig {
     }
 }
 
+/// A managed tenant's OWN mailbox identity, injected by the manager as
+/// `OPENCOMPANY_MAIL_*`. Distinct from the host-level `OPENCOMPANY_MAIL_HOST/...`
+/// platform-mail read by `MailConfig` (login links). Seeds the company's SMTP
+/// send credentials AND the IMAP poller config.
+#[derive(Clone)]
+pub struct TenantMailboxConfig {
+    pub address: String,
+    pub smtp: SmtpCredentials,
+    pub imap: ImapCredentials,
+}
+
+impl std::fmt::Debug for TenantMailboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the SMTP/IMAP passwords: `SmtpCredentials` derives Debug and
+        // would otherwise print its password field through this struct.
+        f.debug_struct("TenantMailboxConfig")
+            .field("address", &self.address)
+            .field("smtp_host", &self.smtp.host)
+            .field("imap_host", &self.imap.host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TenantMailboxConfig {
+    /// `Ok(None)` when unconfigured (no `OPENCOMPANY_MAIL_ADDRESS`); a *partial*
+    /// injection is a hard error.
+    pub fn from_env() -> Result<Option<Self>, OpenCompanyError> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let Some(address) = var("OPENCOMPANY_MAIL_ADDRESS") else {
+            return Ok(None);
+        };
+        let need = |k: &str| {
+            var(k).ok_or_else(|| {
+                OpenCompanyError::Config(format!(
+                    "{k} is required when OPENCOMPANY_MAIL_ADDRESS is set"
+                ))
+            })
+        };
+        let port = |k: &str| -> Result<u16, OpenCompanyError> {
+            need(k)?
+                .parse::<u16>()
+                .map_err(|_| OpenCompanyError::Config(format!("{k} must be a port number")))
+        };
+        let user = need("OPENCOMPANY_MAIL_USER")?;
+        let password = need("OPENCOMPANY_MAIL_PASSWORD")?;
+        let smtp_port = port("OPENCOMPANY_MAIL_SMTP_PORT")?;
+        // The injected env carries no SECURITY var, so derive it from the port:
+        // 465 = implicit TLS (SMTPS); everything else (587, 25, custom) = STARTTLS.
+        // STARTTLS on 465 fails the handshake, so this must match the port.
+        let security = if smtp_port == 465 {
+            SmtpSecurity::Ssl
+        } else {
+            SmtpSecurity::Starttls
+        };
+        let smtp = SmtpCredentials {
+            host: need("OPENCOMPANY_MAIL_SMTP_HOST")?,
+            port: smtp_port,
+            security,
+            username: user.clone(),
+            password: password.clone(),
+            from_name: String::new(),
+            from_email: address.clone(),
+        };
+        let imap = ImapCredentials {
+            host: need("OPENCOMPANY_MAIL_IMAP_HOST")?,
+            port: port("OPENCOMPANY_MAIL_IMAP_PORT")?,
+            username: user,
+            password,
+        };
+        Ok(Some(Self {
+            address,
+            smtp,
+            imap,
+        }))
+    }
+}
+
 /// An offline mock sender that records every send and never fails. Used by
 /// tests and any offline deployment.
 #[derive(Clone, Default)]
@@ -275,6 +462,39 @@ impl MailSender for RecordingMailSender {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Serializes tests that read/write process env (env-reading tests must
+    /// run single-threaded: `cargo test mailer:: -- --test-threads=1`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard for env-mutating tests: captures the current value of each
+    /// `key` in `keys` at construction and restores it on drop (set back if it
+    /// was `Some`, removed if it was unset) — so running this suite in a shell
+    /// that already has `OPENCOMPANY_MAIL_*` set doesn't leave those values
+    /// clobbered for whatever runs next, and restoration still happens if the
+    /// test body panics.
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys.iter().map(|&k| (k, std::env::var(k).ok())).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
 
     fn smtp_creds() -> SmtpCredentials {
         SmtpCredentials {
@@ -360,5 +580,97 @@ mod test {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "hi@acme.test");
         assert_eq!(sent[0].1.to, "ada@example.com");
+    }
+
+    #[tokio::test]
+    async fn recording_receiver_returns_queued_batches_in_order() {
+        let creds = ImapCredentials {
+            host: "h".into(),
+            port: 993,
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let rx = RecordingMailReceiver::new();
+        rx.push_batch(vec![FetchedEmail {
+            uid: 1,
+            email: InboundEmail {
+                from_name: "A".into(),
+                from_email: "a@x".into(),
+                subject: "s".into(),
+                body: "b".into(),
+            },
+        }]);
+        assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 1);
+        assert_eq!(rx.fetch_new(&creds).await.unwrap().len(), 0); // drained
+        assert_eq!(rx.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn recording_receiver_records_marked_uids() {
+        let creds = ImapCredentials {
+            host: "h".into(),
+            port: 993,
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let rx = RecordingMailReceiver::new();
+        rx.mark_seen(&creds, &[3, 4]).await.unwrap();
+        rx.mark_seen(&creds, &[5]).await.unwrap();
+        assert_eq!(rx.marked(), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn tenant_mailbox_config_parses_injected_env() {
+        // Serialize env access; set the 7 injected vars.
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarGuard::capture(&[
+            "OPENCOMPANY_MAIL_ADDRESS",
+            "OPENCOMPANY_MAIL_SMTP_HOST",
+            "OPENCOMPANY_MAIL_SMTP_PORT",
+            "OPENCOMPANY_MAIL_IMAP_HOST",
+            "OPENCOMPANY_MAIL_IMAP_PORT",
+            "OPENCOMPANY_MAIL_USER",
+            "OPENCOMPANY_MAIL_PASSWORD",
+        ]);
+        for (k, v) in [
+            ("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work"),
+            ("OPENCOMPANY_MAIL_SMTP_HOST", "mail.opencompany.work"),
+            ("OPENCOMPANY_MAIL_SMTP_PORT", "465"),
+            ("OPENCOMPANY_MAIL_IMAP_HOST", "mail.opencompany.work"),
+            ("OPENCOMPANY_MAIL_IMAP_PORT", "993"),
+            ("OPENCOMPANY_MAIL_USER", "acme@opencompany.work"),
+            ("OPENCOMPANY_MAIL_PASSWORD", "secret"),
+        ] {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let cfg = TenantMailboxConfig::from_env()
+            .unwrap()
+            .expect("configured");
+        assert_eq!(cfg.address, "acme@opencompany.work");
+        assert_eq!(cfg.imap.host, "mail.opencompany.work");
+        assert_eq!(cfg.imap.port, 993);
+        assert_eq!(cfg.smtp.from_email, "acme@opencompany.work");
+
+        // `_restore` (dropped here) puts every touched var back to whatever it
+        // was before this test ran, rather than unconditionally removing it.
+    }
+
+    #[test]
+    fn tenant_mailbox_config_absent_is_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarGuard::capture(&["OPENCOMPANY_MAIL_ADDRESS"]);
+        unsafe { std::env::remove_var("OPENCOMPANY_MAIL_ADDRESS") };
+        assert!(TenantMailboxConfig::from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn tenant_mailbox_config_partial_is_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore =
+            EnvVarGuard::capture(&["OPENCOMPANY_MAIL_ADDRESS", "OPENCOMPANY_MAIL_PASSWORD"]);
+        unsafe { std::env::set_var("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work") };
+        unsafe { std::env::remove_var("OPENCOMPANY_MAIL_PASSWORD") };
+        assert!(TenantMailboxConfig::from_env().is_err());
     }
 }

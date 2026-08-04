@@ -1,23 +1,19 @@
-// The team's workspace: a client-side file tree (folders + markdown files) the
-// operator can organize, edit, upload to, and delete. Persisted to
-// localStorage per company — the console has no file API yet, so this is a
-// local working surface (a Drive/Notion-style scratch space).
+// Pure tree helpers for the team's workspace — a real, durable file tree of
+// folders and markdown notes that lives on the **host**, in the company's
+// `WorkspaceStore`. The console reads and writes it over the `…/workspace`
+// routes in `@/api/workspace`; the company's agents read and write the same
+// tree through their workspace tools, so operator and agents share one surface.
+//
+// Nothing here persists anything. These are the derivations the view needs on
+// top of a tree it has already fetched (ordering, ancestry, wiki-link title
+// resolution). The one localStorage touch left is the *migration* pair at the
+// bottom, which exists solely to rescue notes typed into the retired
+// client-side scratchpad and is expected to become a no-op once every browser
+// has been through it once.
 
-export interface FsNode {
-  id: string;
-  name: string;
-  kind: "folder" | "file";
-  /** null = workspace root. */
-  parentId: string | null;
-  /** Markdown body for files. */
-  content?: string;
-  updatedAt: number;
-}
+export type { FsNode } from "@/api/workspace";
 
-let n = 0;
-const genId = () => `fs-${Date.now().toString(36)}-${n++}`;
-
-const now = () => Date.now();
+import type { FsNode } from "@/api/workspace";
 
 /* ---- queries ---- */
 
@@ -34,7 +30,15 @@ export function nodeById(nodes: FsNode[], id: string | null): FsNode | undefined
   return id ? nodes.find((x) => x.id === id) : undefined;
 }
 
-/** A file's display title — its name without the markdown extension. */
+/**
+ * A file's display title — its name without the markdown extension.
+ *
+ * Known divergence: this strips `.md`, `.markdown` and `.txt`, while the host's
+ * `link_target` (which computes backlinks) strips only `.md`. So a `[[link]]`
+ * to a `.txt` note styles as resolved here but is not counted as a backlink
+ * server-side. Cosmetic, and deliberately left alone — the seeder only ever
+ * creates `.md` notes, and narrowing this would silently restyle existing links.
+ */
 export function titleOf(node: FsNode): string {
   return node.name.replace(/\.(md|markdown|txt)$/i, "");
 }
@@ -43,19 +47,6 @@ export function titleOf(node: FsNode): string {
 export function fileByTitle(nodes: FsNode[], target: string): FsNode | undefined {
   const want = target.trim().toLowerCase();
   return nodes.find((x) => x.kind === "file" && titleOf(x).toLowerCase() === want);
-}
-
-/** Files whose body links to `target`'s title via `[[…]]` (backlinks). */
-export function backlinksTo(nodes: FsNode[], target: FsNode): FsNode[] {
-  const title = titleOf(target).toLowerCase();
-  const re = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
-  return nodes.filter((x) => {
-    if (x.kind !== "file" || x.id === target.id || !x.content) return false;
-    for (const m of x.content.matchAll(re)) {
-      if (m[1].trim().toLowerCase() === title) return true;
-    }
-    return false;
-  });
 }
 
 /** Ancestor folders (root → current), for breadcrumbs. */
@@ -85,114 +76,71 @@ export function subtreeIds(nodes: FsNode[], id: string): Set<string> {
   return ids;
 }
 
-/* ---- mutations (pure; return a new array) ---- */
-
-export function addFolder(nodes: FsNode[], parentId: string | null, name: string): FsNode[] {
-  return [...nodes, { id: genId(), name: name.trim() || "New folder", kind: "folder", parentId, updatedAt: now() }];
-}
-
-export function addFile(
-  nodes: FsNode[],
-  parentId: string | null,
-  name: string,
-  content = "",
-): { nodes: FsNode[]; id: string } {
-  const id = genId();
-  const fileName = ensureMdExt(name.trim() || "Untitled");
-  return {
-    nodes: [...nodes, { id, name: fileName, kind: "file", parentId, content, updatedAt: now() }],
-    id,
-  };
-}
-
-export function renameNode(nodes: FsNode[], id: string, name: string): FsNode[] {
-  const target = nodeById(nodes, id);
-  const next = target?.kind === "file" ? ensureMdExt(name.trim()) : name.trim();
-  return nodes.map((x) => (x.id === id ? { ...x, name: next || x.name, updatedAt: now() } : x));
-}
-
-export function removeNode(nodes: FsNode[], id: string): FsNode[] {
-  const ids = subtreeIds(nodes, id);
-  return nodes.filter((x) => !ids.has(x.id));
-}
-
-export function moveNode(nodes: FsNode[], id: string, newParentId: string | null): FsNode[] {
-  // Never move a folder into itself or a descendant.
-  const blocked = subtreeIds(nodes, id);
-  if (newParentId && blocked.has(newParentId)) return nodes;
-  return nodes.map((x) => (x.id === id ? { ...x, parentId: newParentId, updatedAt: now() } : x));
-}
-
-export function setContent(nodes: FsNode[], id: string, content: string): FsNode[] {
-  return nodes.map((x) => (x.id === id ? { ...x, content, updatedAt: now() } : x));
-}
-
-function ensureMdExt(name: string): string {
+/** Notes get a markdown extension unless they already carry a known one. */
+export function ensureMdExt(name: string): string {
   return /\.(md|markdown|txt)$/i.test(name) ? name : `${name}.md`;
 }
 
-/* ---- persistence ---- */
+/* ---- migration off the retired localStorage scratchpad ---- */
 
 const KEY = (company: string | null) => `oc-workspace:${company ?? "single"}`;
 
-export function loadWorkspace(company: string | null): FsNode[] {
+/**
+ * Ids the *bundled seed* used. These four nodes were app source shipped to
+ * every browser — marketing copy about a "Spring launch" campaign that belonged
+ * to no real company. They carry zero user information, so they are dropped
+ * rather than imported: pushing them into the host would inject invented
+ * content into every company's genuine workspace.
+ */
+const SEED_ID_PREFIX = "seed-";
+
+/**
+ * Notes a user actually typed into the old client-side workspace, if any.
+ *
+ * Returns only nodes the *user* authored (the retired `addFile`/`addFolder`
+ * minted `fs-…` ids); bundled seed nodes are filtered out. An empty array means
+ * there is nothing worth rescuing — either the key is absent, unparseable, or
+ * holds nothing but the seed.
+ */
+export function readLegacyLocalNodes(company: string | null): FsNode[] {
+  let raw: string | null = null;
   try {
-    const raw = localStorage.getItem(KEY(company));
-    if (raw) return JSON.parse(raw) as FsNode[];
+    raw = localStorage.getItem(KEY(company));
   } catch {
-    /* fall through to seed */
+    return [];
   }
-  return seedWorkspace();
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter(
+    (node): node is FsNode =>
+      Boolean(node) &&
+      typeof (node as FsNode).id === "string" &&
+      typeof (node as FsNode).name === "string" &&
+      ((node as FsNode).kind === "file" || (node as FsNode).kind === "folder") &&
+      !(node as FsNode).id.startsWith(SEED_ID_PREFIX),
+  );
 }
 
-export function saveWorkspace(company: string | null, nodes: FsNode[]): void {
+/** Whether the legacy key exists at all (so a seed-only key can be swept). */
+export function hasLegacyLocal(company: string | null): boolean {
   try {
-    localStorage.setItem(KEY(company), JSON.stringify(nodes));
+    return localStorage.getItem(KEY(company)) !== null;
   } catch {
-    /* storage unavailable — keep the in-memory tree */
+    return false;
   }
 }
 
-/* ---- seed ---- */
-
-function seedWorkspace(): FsNode[] {
-  const campaigns: FsNode = { id: "seed-campaigns", name: "Campaigns", kind: "folder", parentId: null, updatedAt: now() };
-  const brand: FsNode = { id: "seed-brand", name: "Brand", kind: "folder", parentId: null, updatedAt: now() };
-  return [
-    campaigns,
-    brand,
-    {
-      id: "seed-readme",
-      name: "README.md",
-      kind: "file",
-      parentId: null,
-      updatedAt: now(),
-      content:
-        "# Workspace\n\nThe team's shared space, Obsidian-style. Organize work in **folders**, " +
-        "write in **Markdown**, and link notes with `[[wiki links]]`.\n\n" +
-        "Start here:\n\n- [[Spring launch]] — the campaign in flight\n- [[Brand voice]] — how we sound\n\n" +
-        "Use the explorer on the left to browse, and the backlinks panel to see what links here.\n",
-    },
-    {
-      id: "seed-spring",
-      name: "Spring launch.md",
-      kind: "file",
-      parentId: "seed-campaigns",
-      updatedAt: now(),
-      content:
-        "# Spring launch\n\nFollows our [[Brand voice]].\n\n## Goals\n- Drive signups from the spring push\n" +
-        "- 3 hero taglines in review\n\n## Checklist\n" +
-        "- [x] Brief approved\n- [ ] Taglines drafted\n- [ ] Hero image\n- [ ] Landing page\n\n> Owner: Creative studio\n",
-    },
-    {
-      id: "seed-voice",
-      name: "Brand voice.md",
-      kind: "file",
-      parentId: "seed-brand",
-      updatedAt: now(),
-      content:
-        "# Brand voice\n\nWarm, confident, concise.\n\n| Do | Don't |\n| --- | --- |\n| Speak plainly | Use jargon |\n" +
-        "| Lead with value | Bury the point |\n",
-    },
-  ];
+/** Drop the retired scratchpad for this company. */
+export function clearLegacyLocal(company: string | null): void {
+  try {
+    localStorage.removeItem(KEY(company));
+  } catch {
+    /* storage unavailable — nothing to clear */
+  }
 }

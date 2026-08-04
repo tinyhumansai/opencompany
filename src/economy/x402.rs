@@ -22,13 +22,26 @@
 //!
 //! Isolated in [`canonical_bytes`] so it is a one-function change to reconcile
 //! with the real tiny.place server when reachable.
+//!
+//! ## The nonce comes from the OS CSPRNG
+//!
+//! `nonce` is documented as single-use and is signed into the payload above,
+//! so a counterparty's replay check is only as good as the value's
+//! unpredictability and uniqueness. It is therefore minted by [`mint_nonce`]
+//! from 256 bits of OS randomness through the same
+//! [`TokenSource`](crate::server::users::token::TokenSource) seam the user-auth
+//! secrets use — **not** from
+//! [`generate_id`](crate::ports::generate_id), whose epoch-millis-plus-counter
+//! shape is guessable from a prior value and repeats across processes that
+//! start in the same millisecond.
 
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::economy::signer::{LocalSigner, verify_b58};
 use crate::error::OpenCompanyError;
-use crate::ports::generate_id;
+use crate::server::platform_auth::b64url_encode;
+use crate::server::users::token::{OsTokens, TokenSource};
 
 /// The domain-separation tag pinning the x402 canonical layout version.
 pub const X402_DOMAIN: &str = "tiny.place-x402-v1";
@@ -88,13 +101,32 @@ pub struct X402Authorization {
     pub asset: String,
     /// The settlement network.
     pub network: String,
-    /// A single-use nonce.
+    /// A single-use nonce: 256 bits of OS randomness, base64url, 43 chars.
+    ///
+    /// Opaque to every reader — nothing parses, stores, or matches its shape —
+    /// so the counterparty only needs it to be unpredictable and unique. See
+    /// [`mint_nonce`].
     pub nonce: String,
     /// The authorization timestamp, epoch seconds.
     pub timestamp: i64,
     /// The base58 Ed25519 signature over [`canonical_bytes`].
     #[serde(rename = "signature")]
     pub signature_b58: String,
+}
+
+/// How many random bytes back an authorization nonce. 32 bytes = 256 bits,
+/// matching the user-auth secrets, so two mints colliding is not a scenario.
+const NONCE_BYTES: usize = 32;
+
+/// Mints an authorization nonce: 256 bits from `src`, base64url, 43 chars.
+///
+/// A pure function of the source bytes — no clock, no counter, no process
+/// state — which is the property that makes one nonce say nothing about the
+/// next, and makes two processes minting in the same millisecond differ.
+pub fn mint_nonce(src: &dyn TokenSource) -> String {
+    let mut bytes = [0u8; NONCE_BYTES];
+    src.fill(&mut bytes);
+    b64url_encode(&bytes)
 }
 
 /// Builds the canonical bytes an x402 authorization signs. See module docs.
@@ -136,7 +168,7 @@ fn authorize_amount(
     now: i64,
 ) -> X402Authorization {
     let agent_id = signer.agent_id();
-    let nonce = generate_id();
+    let nonce = mint_nonce(&OsTokens);
     let msg = canonical_bytes(
         &agent_id,
         &amount,
@@ -184,6 +216,8 @@ fn string_field(obj: &serde_json::Value, keys: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn sample_challenge() -> X402Challenge {
@@ -254,6 +288,99 @@ mod test {
         assert!(
             verify(&auth).is_err(),
             "changed amount must break the signature"
+        );
+    }
+
+    /// A deterministic source, for asserting minting is a pure function of its
+    /// bytes. Never use anything like this outside tests.
+    struct FixedTokens(u8);
+
+    impl TokenSource for FixedTokens {
+        fn fill(&self, out: &mut [u8]) {
+            out.fill(self.0);
+        }
+    }
+
+    #[test]
+    fn nonce_is_a_pure_function_of_the_source_bytes() {
+        // The property, not the encoding: the nonce is the CSPRNG's output and
+        // nothing else. If a clock or a counter were mixed in, two mints from
+        // the same bytes would differ.
+        assert_eq!(
+            mint_nonce(&FixedTokens(0xAB)),
+            mint_nonce(&FixedTokens(0xAB))
+        );
+        assert_ne!(
+            mint_nonce(&FixedTokens(0xAB)),
+            mint_nonce(&FixedTokens(0xCD))
+        );
+    }
+
+    #[test]
+    fn nonces_minted_in_the_same_millisecond_differ() {
+        let signer = LocalSigner::generate();
+        let ch = sample_challenge();
+        let mut seen = HashSet::new();
+        // A tight loop lands many mints inside one millisecond, which is
+        // exactly where a clock-prefixed id has only its counter left.
+        for _ in 0..1000 {
+            let auth = authorize(&signer, &ch, 1_700_000_000);
+            assert!(seen.insert(auth.nonce), "a nonce repeated");
+        }
+    }
+
+    #[test]
+    fn nonces_carry_no_monotonic_counter() {
+        let signer = LocalSigner::generate();
+        let ch = sample_challenge();
+        let minted: Vec<String> = (0..64)
+            .map(|_| authorize(&signer, &ch, 1_700_000_000).nonce)
+            .collect();
+
+        // An id built from a timestamp plus an incrementing counter sorts in
+        // mint order. Random values do not: 64 draws land sorted with
+        // probability 1/64!, so this failing means order leaked back in.
+        assert!(
+            minted.windows(2).any(|w| w[0] > w[1]),
+            "nonces arrived in ascending order, which implies a counter"
+        );
+
+        // And no shared structure: a common prefix is what a clock component
+        // would leave behind across mints in the same millisecond.
+        let first = minted[0].as_bytes();
+        assert!(
+            minted[1..]
+                .iter()
+                .any(|n| n.as_bytes().first() != first.first()),
+            "every nonce shared a leading byte, which implies a fixed prefix"
+        );
+    }
+
+    #[test]
+    fn nonce_is_url_safe_and_full_width() {
+        let auth = authorize(&LocalSigner::generate(), &sample_challenge(), 1_700_000_000);
+        // 32 bytes unpadded base64url.
+        assert_eq!(auth.nonce.len(), 43, "unexpected nonce: {}", auth.nonce);
+        assert!(
+            auth.nonce
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "nonce is not base64url: {}",
+            auth.nonce
+        );
+    }
+
+    #[test]
+    fn a_changed_nonce_breaks_the_signature() {
+        // The nonce is inside the signed payload, so replaying an
+        // authorization under a fresh nonce is not something a payer can do
+        // without the key.
+        let signer = LocalSigner::generate();
+        let mut auth = authorize(&signer, &sample_challenge(), 1_700_000_000);
+        auth.nonce = mint_nonce(&OsTokens);
+        assert!(
+            verify(&auth).is_err(),
+            "changed nonce must break the signature"
         );
     }
 

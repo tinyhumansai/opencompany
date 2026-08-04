@@ -73,6 +73,46 @@ pub trait InboxStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<EmailRecord>>;
+    /// Whether `key` holds any **inbound** mail from `from_email` — i.e. whether
+    /// that address is an established correspondent.
+    ///
+    /// A first-class port method rather than a caller-side scan because callers
+    /// use it as a *security* gate (a workflow may only email an address that
+    /// has written in first), and a gate built on a paginated read silently
+    /// weakens as the inbox grows: [`messages`](Self::messages) returns
+    /// oldest-first, so any capped page stops covering the newest mail. This
+    /// question has one right answer at every inbox size, so the port answers it.
+    ///
+    /// The default implementation reads the whole inbox. That is correct at any
+    /// size, and it is what **every** backend does today: `fs` parses its entire
+    /// append-only log on any `messages` call regardless of limit, and the
+    /// `sqlite`/`mongodb` backends store each message as an opaque
+    /// `record_json` blob with no queryable sender column, so neither can
+    /// answer this from an index without a schema migration. Overriding with a
+    /// real indexed lookup (`… WHERE from_email = ? AND NOT outbound LIMIT 1`)
+    /// is worth doing when that migration happens — correctness is not the
+    /// reason to wait, cost is.
+    ///
+    /// Matching is case-insensitive on a trimmed address, mirroring
+    /// [`normalize_email`](crate::ports::normalize_email). A blank `from_email`
+    /// is `false`, never a match-anything.
+    async fn has_inbound_from(
+        &self,
+        company: &CompanyId,
+        key: &str,
+        from_email: &str,
+    ) -> Result<bool> {
+        let needle = from_email.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .messages(company, key, usize::MAX, 0)
+            .await?
+            .iter()
+            .any(|r| !r.outbound && r.from_email.trim().to_ascii_lowercase() == needle))
+    }
+
     /// Appends one email to its addressed inbox.
     async fn append(&self, company: &CompanyId, msg: &EmailRecord) -> Result<()>;
     /// Marks messages in `key` as read — the given `ids`, or every message when

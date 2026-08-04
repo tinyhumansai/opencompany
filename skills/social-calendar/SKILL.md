@@ -2,6 +2,7 @@
 name: Social Calendar
 description: Plan a two-week social calendar mapped to themes, channels, and post-ready slots.
 category: Content
+version: 1.0.0
 ---
 
 # Social Calendar

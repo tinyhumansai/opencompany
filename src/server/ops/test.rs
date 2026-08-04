@@ -24,8 +24,11 @@ use crate::server::webhook::DefaultHashSigner;
 use crate::server::webhook::WebhookSigner;
 use crate::{AppConfig, AppState};
 
-fn home() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("opencompany-ops-{}", crate::ports::generate_id()))
+fn home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("opencompany-ops-")
+        .tempdir()
+        .expect("tempdir")
 }
 
 fn manifest() -> CompanyManifest {
@@ -43,6 +46,11 @@ async fn state_with(home: &std::path::Path, connections: ConnectionsRuntime) -> 
             ledger: Vec::new(),
             lifecycle: "running".to_string(),
             overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
         })
         .await
         .unwrap();
@@ -66,7 +74,8 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn put_domain_returns_records() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     let app = router(state);
 
@@ -87,12 +96,12 @@ async fn put_domain_returns_records() {
     assert_eq!(value["domain"], "acme.com");
     assert_eq!(value["verified"], false);
     assert_eq!(value["records"].as_array().unwrap().len(), 5);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn verify_without_resolver_is_404_not_wired() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     let app = router(state);
 
@@ -124,12 +133,12 @@ async fn verify_without_resolver_is_404_not_wired() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let value = body_json(response).await;
     assert_eq!(value["code"], "not_wired");
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn verify_with_resolver_marks_verified() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let resolver = Arc::new(StaticDnsResolver::fully_verifying("acme.com"));
     let state = state_with(&home, ConnectionsRuntime::new().with_dns(resolver)).await;
     let app = router(state);
@@ -161,12 +170,12 @@ async fn verify_with_resolver_marks_verified() {
     assert_eq!(response.status(), StatusCode::OK);
     let value = body_json(response).await;
     assert_eq!(value["verified"], true);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn put_smtp_hides_password() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     let app = router(state);
 
@@ -191,12 +200,12 @@ async fn put_smtp_hides_password() {
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value["configured"], true);
     assert_eq!(value["host"], "smtp.acme.test");
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn smtp_test_without_sender_is_404() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     let app = router(state);
 
@@ -212,12 +221,12 @@ async fn smtp_test_without_sender_is_404() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn smtp_test_sends_and_records_outbound() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let sender = Arc::new(RecordingMailSender::new());
     let state = state_with(&home, ConnectionsRuntime::new().with_mail(sender.clone())).await;
     let app = router(state);
@@ -255,12 +264,12 @@ async fn smtp_test_sends_and_records_outbound() {
     assert_eq!(value["ok"], true);
     assert_eq!(sender.sent().len(), 1);
     assert_eq!(sender.sent()[0].1.to, "ops@acme.test");
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn ingest_bad_hmac_is_401_and_no_mail() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     // Seed the ingest secret.
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
@@ -300,12 +309,12 @@ async fn ingest_bad_hmac_is_401_and_no_mail() {
             .unwrap()
             .is_empty()
     );
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn ingest_good_hmac_files_mail() {
-    let home = home();
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
     let state = state_with(&home, ConnectionsRuntime::new()).await;
     let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
     runtime
@@ -353,5 +362,4 @@ async fn ingest_good_hmac_files_mail() {
     assert_eq!(mail.len(), 1);
     assert_eq!(mail[0].from_email, "a@x.test");
     assert!(!mail[0].outbound);
-    tokio::fs::remove_dir_all(&home).await.ok();
 }

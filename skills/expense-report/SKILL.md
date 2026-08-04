@@ -2,6 +2,7 @@
 name: Expense Report
 description: Compile receipts into a categorized, reconciled expense report ready for the books.
 category: Finance
+version: 1.0.0
 ---
 
 # Expense Report

@@ -33,8 +33,10 @@ impl ApiError {
     /// The HTTP status this error maps to.
     pub fn status(&self) -> StatusCode {
         match &self.0 {
-            OpenCompanyError::CompanyNotFound(_) => StatusCode::NOT_FOUND,
-            #[cfg(feature = "mcp")]
+            OpenCompanyError::CompanyNotFound(_) | OpenCompanyError::NotFound(_) => {
+                StatusCode::NOT_FOUND
+            }
+            #[cfg(any(feature = "openhuman", feature = "mcp"))]
             OpenCompanyError::McpServerNotFound(_) => StatusCode::NOT_FOUND,
             OpenCompanyError::ManifestInvalid { .. }
             | OpenCompanyError::ManifestParse(_, _)

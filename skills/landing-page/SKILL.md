@@ -2,6 +2,7 @@
 name: Landing Page
 description: Build and A/B test a conversion-focused landing page from a brief, on-brand and measurable.
 category: Marketing
+version: 1.0.0
 ---
 
 # Landing Page

@@ -188,12 +188,22 @@ async fn provision(
         );
     }
 
+    // The shared skill library, when this host serves one. A configured library
+    // that cannot load is a server error rather than a silent empty registry —
+    // provisioning a runtime that cannot heal its registry installs would hide
+    // the misconfiguration until an agent came up skill-less.
+    let skills_registry = match state.shared_skill_registry() {
+        Ok(registry) => registry,
+        Err(err) => return ApiError(err).into_response(),
+    };
+
     // Build over the data dir, honoring the selected storage backend (fs
     // defaults when none is configured).
     let mut builder = RuntimeBuilder::new(state.home().to_path_buf(), manifest)
         .with_id(id.clone())
         .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
-        .with_host_base_url(state.config().host_base_url());
+        .with_host_base_url(state.config().host_base_url())
+        .with_skills_registry(skills_registry);
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }

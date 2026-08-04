@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::company::CompanyManifest;
 use crate::ports::ids::{generate_id, now_millis};
+use crate::ports::workflow_runner::DeliveryReport;
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -228,6 +229,15 @@ pub enum CompanyEvent {
         /// export/import and the cross-backend round-trip need no migration.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
+        /// The desk / chat thread the message targets (issue #53), so the
+        /// orchestrator brain can route an addressed message to that desk's lead
+        /// member and journal replies against it. `None` on an unaddressed
+        /// message (routed to the orchestrator) and on every event journaled
+        /// before this field existed. Like `by`, `skip_serializing_if` keeps a
+        /// pre-existing event byte-identical, so no stored record needs
+        /// migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<String>,
     },
     /// An inbound webhook fired.
     WebhookReceived {
@@ -291,6 +301,33 @@ pub enum CompanyEvent {
         agent_id: String,
         /// The reply text.
         text: String,
+        /// The scrubbed processing steps behind this reply — the same
+        /// per-bubble [`TurnStep`] timeline the live turn streams and the POST
+        /// `/chat` body carries — persisted here so a desk history reload
+        /// rehydrates the tool-call timeline, not just the text. Additive:
+        /// omitted-when-empty on the wire, so every prior log (and every
+        /// non-harness reply, which folds no steps) round-trips byte-identical.
+        /// Never carries raw tool arguments, output, or call ids — only the
+        /// scrubbed shape (see [`crate::harness::steps`]).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<TurnStep>,
+        /// The board task this reply was produced by, when it came out of a
+        /// [`TaskDispatched`](Self::TaskDispatched) cycle rather than a chat
+        /// turn (issue #185).
+        ///
+        /// This is the correlation key the per-task timeline filters on: the
+        /// journal is company-scoped, so without it a dispatch's reply cannot
+        /// be told apart from every other desk reply in the log.
+        ///
+        /// `None` for an ordinary chat reply and for every event journaled
+        /// before this field existed. Additive in exactly the same way as
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by` / `chat`:
+        /// `#[serde(default)]` is what lets an already-persisted log load, and
+        /// `skip_serializing_if` is what keeps an untagged reply serializing
+        /// byte-for-byte as it did before this field existed, so no stored
+        /// record needs migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// The Operator deleted a durable memory fact. Journaled for the audit trail
     /// per the Operator-rights section of `docs/spec/company-brain/memory.md`.
@@ -306,6 +343,235 @@ pub enum CompanyEvent {
     TaskDispatched {
         /// The id of the dispatched task card.
         task_id: String,
+        /// The [`RunRecord`](crate::ports::runs::RunRecord) this dispatch is an
+        /// attempt under (issue #242), minted at the dispatch choke point
+        /// *before* the cycle is spawned.
+        ///
+        /// Carrying it on the event is what makes the journal self-describing:
+        /// the run row and the durable log line name each other, so a reader
+        /// holding either one can find the other without re-deriving identity
+        /// from timestamps. It also keeps
+        /// [`Brain::run_cycle`](crate::ports::brain::Brain::run_cycle)'s
+        /// signature stable — the id rides the event the brain already reads
+        /// rather than a new argument every brain would have to thread.
+        ///
+        /// `None` for a dispatch whose run row could not be minted (record-keeping
+        /// never fails the work it records) and for every event journaled before
+        /// this field existed. Additive in exactly the way
+        /// [`AgentReply`](Self::AgentReply)'s `task_id` is: `#[serde(default)]`
+        /// lets an already-persisted log load, and `skip_serializing_if` keeps an
+        /// untagged dispatch serializing byte-for-byte as it did before, so no
+        /// stored record needs migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+    /// An agent's MCP tool call failed during a turn, journaled by the harness
+    /// so the operator has an audit trail of which server/tool broke and why.
+    /// The `message` is always **scrubbed** at the source (the
+    /// `OcMcpCallTool` → `HarnessBrain` drain path), so this record can never
+    /// carry a credential, response body, or URL query string. Additive: old
+    /// logs never contain it, and its presence doesn't change how any existing
+    /// variant serializes (same `by`/`chat` precedent).
+    McpCallFailed {
+        /// The MCP server the failing call targeted.
+        server: String,
+        /// The remote tool the agent tried to call.
+        tool: String,
+        /// A stable status code (e.g. `credential_required`, `tool_call_rejected`).
+        status: String,
+        /// A short, scrubbed, operator-facing message.
+        message: String,
+        /// The board task whose dispatch turn made the failing call, when the
+        /// failure happened inside a [`TaskDispatched`](Self::TaskDispatched)
+        /// cycle (issue #185). Lets a task's failed tool calls be filtered out
+        /// of the company-scoped journal onto its own timeline.
+        ///
+        /// `None` for a failure raised during a chat turn and for every event
+        /// journaled before this field existed. Same additive contract as
+        /// [`AgentReply`](Self::AgentReply)'s `task_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+    },
+    /// A new workflow graph was authored and enabled (issue #112), from either
+    /// the console `POST …/workflows` route or the orchestrator's
+    /// `create_workflow` tool. Journaled best-effort **after** the graph is
+    /// persisted and enabled, so it records a completed create — a journal
+    /// failure never rolls the create back. Additive: old logs never carry it,
+    /// and its presence doesn't change how any existing variant serializes.
+    WorkflowCreated {
+        /// The new workflow's id (its `workflows/<id>.toml` stem).
+        workflow_id: String,
+        /// The new workflow's display name.
+        name: String,
+        /// Who authored it, when known. `None` when created by a surface that
+        /// carries no attributed actor (the current create paths); kept as an
+        /// `Option` so a future attributed create needs no migration, mirroring
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
+    /// An existing workflow graph was replaced wholesale (issue #259), from the
+    /// console's `PUT …/workflows/{wid}` route. Journaled best-effort **after**
+    /// the new body is persisted, so it records a completed edit — a journal
+    /// failure never rolls the update back. Additive, same contract as
+    /// [`WorkflowCreated`](Self::WorkflowCreated).
+    ///
+    /// **The graph body is deliberately NOT carried.** A company's journal is
+    /// one append-only log shared by chat, audit and run history, and it is read
+    /// by the operator SSE projection and wired to the inference sidecar — a
+    /// TOML body on it would put the graph's full contents (agent prompts,
+    /// destination addresses) somewhere none of those readers need it. The id
+    /// and name are what an audit reader needs; the body is read from the record.
+    WorkflowUpdated {
+        /// The edited workflow's id. Never changes across an update — a rename
+        /// through `PUT` is rejected, because the id keys the union read path,
+        /// the scheduler and the run history.
+        workflow_id: String,
+        /// The workflow's display name **after** the edit (the name may change
+        /// even though the id may not).
+        name: String,
+        /// Who edited it, when known. `None` from the current unattributed
+        /// surfaces; same forward-compatible shape as
+        /// [`WorkflowCreated`](Self::WorkflowCreated)'s `by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
+    /// A workflow graph was removed (issue #259), from the console's
+    /// `DELETE …/workflows/{wid}` route. Journaled best-effort **after** the
+    /// overlay body and the manifest-enabled id are both gone, so it records a
+    /// completed delete. Additive, same contract as
+    /// [`WorkflowCreated`](Self::WorkflowCreated).
+    ///
+    /// Past [`WorkflowRunFinished`](Self::WorkflowRunFinished) entries for this
+    /// id are deliberately left in place — the journal is append-only, and what
+    /// a workflow *did* stays true after the workflow is gone. `GET
+    /// …/workflows/runs` keeps serving them.
+    WorkflowDeleted {
+        /// The removed workflow's id.
+        workflow_id: String,
+        /// Its display name at the moment it was removed, so a journal reader
+        /// need not resolve an id that no longer exists.
+        name: String,
+        /// Who removed it, when known. `None` from the current unattributed
+        /// surfaces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
+    /// An operator steered an in-flight run — paused, cancelled, or redirected a
+    /// dispatched task (or cancelled a delegation) from chat (issue #111).
+    /// Journaled best-effort **after** the steer is accepted by the in-flight
+    /// registry, so it records an accepted operator control action. Additive: old
+    /// logs never carry it, and its presence doesn't change how any existing
+    /// variant serializes (same `by` / skip-if-none precedent as
+    /// [`WorkflowCreated`](Self::WorkflowCreated)).
+    TaskSteered {
+        /// The steered run's key — the board task id, or a delegation run id.
+        task_id: String,
+        /// The action taken, as a stable wire word: `pause` / `cancel` /
+        /// `redirect`.
+        action: String,
+        /// The operator's redirect instruction (codepoint-capped), present only
+        /// on a `redirect`. Omitted from the wire otherwise, and — being
+        /// operator-authored free text — never projected onto the SSE stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruction: Option<String>,
+        /// Who steered, when known. `None` on a surface that carries no attributed
+        /// actor; kept `Option` so a future attributed steer needs no migration,
+        /// mirroring [`OperatorMessage`](Self::OperatorMessage)'s `by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
+    /// A dispatched board task finished its run (issue #185) — the terminal
+    /// anchor a per-task timeline ends on and a lineage rollup counts.
+    ///
+    /// Journaled by the harness at the end of a
+    /// [`TaskDispatched`](Self::TaskDispatched) cycle, **after** the card's
+    /// landing column has been persisted, so it always records a completed
+    /// run. "Completed" here means *the run stopped*, not *it succeeded*: a
+    /// cancelled, paused, or failed dispatch emits one too, and `column`
+    /// carries where the card actually landed. Without that, a timeline could
+    /// not distinguish "still running" from "finished badly".
+    ///
+    /// This issue only *adds* the event. #171's done-transition can consume
+    /// it; nothing here writes the board column off the back of it.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes.
+    DeskTaskCompleted {
+        /// The completed task card's id.
+        task_id: String,
+        /// The desk / agent that ran it — the resolved responder, not the
+        /// card's raw `assignee` (which may name nobody on the roster).
+        desk: String,
+        /// The run's operator-facing result text.
+        ///
+        /// This is the agent's own reply (or a short `dispatch failed: …` /
+        /// cancellation line), which is the same text already written into the
+        /// card's note — never raw tool output, arguments, or call ids.
+        output: String,
+        /// The board column the card landed in: `in_review` on a normal
+        /// finish, `todo` on a failure or cancellation, `paused` on a
+        /// pause. Lets a reader tell a successful run from a stopped one
+        /// without re-deriving it from `output`.
+        column: String,
+    },
+    /// A workflow run finished (issue #228) — the durable record of what a run
+    /// actually did, journaled from **both** entry points: the console's Run
+    /// button and the cron [`WorkflowScheduler`](crate::runtime::WorkflowScheduler).
+    ///
+    /// Before this, a run's outcome existed only in the moment. A manual run's
+    /// [`DeliveryReport`] rows lived in the console drawer until it was
+    /// dismissed; a scheduled run's reached only host stdout, which on a hosted
+    /// tenant is the platform team rather than the tenant's operator. Nothing
+    /// wrote a run outcome anywhere the console could read it back — so a report
+    /// that did not leave the building was unfindable an hour later.
+    ///
+    /// This is **not** [issue #242's `RunRecord`](crate::ports::types) and does
+    /// not replace it. That record is a *task-attempt* record minted at the task
+    /// dispatch choke point, keyed to a board task with an attempt ordinal. A
+    /// workflow run enters through a different port entirely
+    /// ([`WorkflowRunner::run`](crate::ports::WorkflowRunner::run)) and produces
+    /// host-side delivery rows per output node; it has no task and no attempt
+    /// ordinal to be keyed on.
+    ///
+    /// Journaled **best-effort, after** the run returns, so it always records a
+    /// finished run and an append failure never disturbs the run path.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes. Every optional/collection field carries
+    /// `#[serde(default)]` + `skip_serializing_if`, the same contract as
+    /// [`AgentReply`](Self::AgentReply)'s `task_id`, so a journal written before
+    /// this variant existed still loads and every already-persisted event stays
+    /// byte-identical.
+    WorkflowRunFinished {
+        /// The workflow graph that ran (its `workflows/<id>.toml` stem).
+        workflow_id: String,
+        /// Whether a cron schedule started this run rather than an operator.
+        /// The distinction is the point: a scheduled run is the
+        /// nobody-was-watching case this event exists for.
+        scheduled: bool,
+        /// A correlation id for the run, when the entry point minted one.
+        /// `None` today from both entry points — neither has a run id to give —
+        /// and kept `Option` so #242's first-class run, or any future
+        /// correlated entry point, needs no migration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// One row per attempt to route a reached `output` node's report to its
+        /// destination — the same rows a manual run hands back in its HTTP
+        /// response. Empty for a graph that routes nothing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deliveries: Vec<DeliveryReport>,
+        /// Node ids the run left waiting on a human approval.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_approvals: Vec<String>,
+        /// The error that ended the run, when it failed outright rather than
+        /// finishing with rows.
+        ///
+        /// This is the field that closes the loudest hole: today a scheduled
+        /// run's `Err` arm only warns to host stdout, so **the worst outcome is
+        /// currently the quietest**. `None` on a run that completed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 
@@ -364,6 +630,51 @@ pub struct Effect {
     pub first_time_counterparty: bool,
     /// Effect-specific payload.
     pub payload: serde_json::Value,
+    /// The roster agent whose **harness tool call** this effect was projected
+    /// from, when it was projected from one at all (issue #243).
+    ///
+    /// This is the discriminator between the two kinds of effect that reach the
+    /// same approval queue, and it exists because they need opposite treatment
+    /// on approval:
+    ///
+    /// * `None` — a *native* effect the runtime itself performs
+    ///   (`CycleHostImpl::send_email`, the workflow delivery path, a Medulla
+    ///   effect frame). Approving it means the runtime executes it, exactly as
+    ///   before this field existed.
+    /// * `Some(agent_id)` — an effect projected from a tool call openhuman
+    ///   already **blocked** inside an agent turn
+    ///   ([`ApprovalPolicy::effect_for`](crate::harness::policy::ApprovalPolicy::effect_for)).
+    ///   There is nothing for the runtime to execute: the real work is the tool,
+    ///   which only that agent can run. Approving it mints a single-use grant and
+    ///   re-dispatches the agent instead.
+    ///
+    /// Only `effect_for` ever stamps this, so `agent.is_some()` is exactly
+    /// "came from a harness tool call". Skipped when serializing and defaulted
+    /// when absent, so journal lines written before this field existed replay as
+    /// `None` — no grant, and the legacy re-ask behaviour — rather than failing
+    /// to parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The task **attempt** ([`RunRecord`](crate::ports::runs::RunRecord)) whose
+    /// turn produced this effect, when it was produced inside one at all (issue
+    /// #242).
+    ///
+    /// This is the correlation an approval needs to be answerable *about a
+    /// run*: the approvals queue is company-wide, so without it "which attempt
+    /// is waiting on me?" cannot be asked, and an attempt cannot tell whether it
+    /// parked anything of its own.
+    ///
+    /// Stamped at the **dispatch** boundary, not in
+    /// [`ApprovalPolicy::effect_for`](crate::harness::policy::ApprovalPolicy::effect_for):
+    /// the policy is per-agent and outlives any one run, so it has no run
+    /// context to stamp. An effect a *chat* turn parked therefore stays `None`,
+    /// correctly — no attempt is waiting on it.
+    ///
+    /// Skipped when serializing and defaulted when absent, exactly like
+    /// [`agent`](Self::agent), so journal lines written before this field
+    /// existed replay as `None` rather than failing to parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl Effect {
@@ -456,6 +767,21 @@ pub struct ChunkMeta {
     pub label: String,
     /// The chunk's length in bytes.
     pub len: usize,
+    /// Epoch-millis when the chunk was stored (`0` for rows written before
+    /// backends started stamping, so old data reads as "unknown" rather than
+    /// as the epoch).
+    ///
+    /// This is what lets the Brain's "Last updated" stat move when agents write
+    /// memory — they write only through this port, never to the `FactStore`
+    /// (see `server::ops::memory::memory_stats`).
+    ///
+    /// Chunks are append-only and never rewritten, so this only ever moves for
+    /// a *new* chunk. Backends differ on a re-`put` of an identical body —
+    /// sqlite/mongo dedupe on the content address and keep the first write,
+    /// the fs index appends a second line — so read freshness as the max
+    /// across chunks rather than assuming one row per body.
+    #[serde(default)]
+    pub stored_at_millis: u64,
 }
 
 /// A single ledger movement.
@@ -471,13 +797,46 @@ pub struct LedgerEntry {
     pub memo: String,
 }
 
-/// Token accounting for a cycle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Token **and cost** accounting for a cycle — what the runtime meters onto the
+/// Usage surface after the brain returns.
+///
+/// The cost fields carry no `Eq` (they are `f64`), so this type is `PartialEq`
+/// only. Both are `#[serde(default)]` so a peer that predates them still
+/// decodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Input tokens consumed.
     pub input: u64,
     /// Output tokens produced.
     pub output: u64,
+    /// Input tokens served from the provider's KV cache.
+    #[serde(default)]
+    pub cached_input: u64,
+    /// Best-available USD cost for the cycle. Zero when the path reports tokens
+    /// but bills elsewhere (the managed `/openai/v1` passthrough echoes no USD).
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+impl TokenUsage {
+    /// Whether the cycle moved no tokens and cost nothing — the guard that keeps
+    /// an idle or offline cycle from writing a meaningless usage sample.
+    ///
+    /// Includes [`Self::cached_input`]: a cache-served pass is real usage even
+    /// if a provider ever reported it without fresh input tokens.
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cached_input == 0 && self.cost_usd == 0.0
+    }
+
+    /// Folds another total into this one — how a brain accumulates the usage of
+    /// several passes into one cycle total. Token counts saturate rather than
+    /// wrap so a bogus peer value can never underflow the meter.
+    pub fn fold(&mut self, other: &TokenUsage) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
+        self.cost_usd += other.cost_usd;
+    }
 }
 
 /// Everything the brain needs to run one cycle.
@@ -658,6 +1017,20 @@ pub struct InboundMessage {
     pub from: Actor,
 }
 
+/// Channel-specific reply addressing for an [`OutboundMessage`].
+///
+/// Carries the chat/thread a reply must be delivered back to on channels whose
+/// messages are addressed to a specific conversation — chiefly Telegram, where
+/// the reply has to land in the same `chat.id` the inbound update came from.
+/// The operator channel is a single implicit surface and needs none of this.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyTo {
+    /// The chat/thread id to deliver back to. Rendered as a string so it stays
+    /// channel-agnostic (Telegram's numeric `chat.id`, a future channel's
+    /// opaque thread key) without widening the type per channel.
+    pub chat_id: String,
+}
+
 /// A message the company emits on a channel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutboundMessage {
@@ -665,6 +1038,115 @@ pub struct OutboundMessage {
     pub channel: String,
     /// The message text.
     pub text: String,
+    /// The visible processing steps behind this bubble — the agent's tool calls,
+    /// thinking runs, and any surfaced MCP failures — folded and scrubbed from
+    /// the turn's progress stream (see [`crate::harness::steps`] under the
+    /// `openhuman` feature). Per-bubble ownership: the operator bubble carries the
+    /// orchestrator's steps; a delegated desk bubble carries that desk lead's
+    /// steps.
+    ///
+    /// Additive and non-secret: the field is omitted on the wire when empty, so
+    /// every prior producer (and every non-harness brain, which emits none)
+    /// round-trips byte-identically. Never carries raw tool arguments, tool
+    /// output, or call ids — only the scrubbed [`TurnStep`] shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TurnStep>,
+    /// Where to deliver the reply, for channels addressed to a specific
+    /// chat/thread (Telegram). `None` on the operator channel and on every
+    /// message emitted before this field existed; `skip_serializing_if` keeps
+    /// such a message byte-identical on the wire, so no stored record migrates
+    /// (same `by`/`chat`/`McpCallFailed` additive precedent above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyTo>,
+    /// The board card this bubble's turn **opened**, when it opened one (issue
+    /// #246).
+    ///
+    /// A `spawn_task` used to surface nothing at all: the card appeared on the
+    /// board and the operator's reply said nothing about it, so there was no
+    /// way to tell a turn that opened work from one that only talked about it.
+    /// This is the correlation key that lets the console render a "card opened"
+    /// chip, and it is the value journaled onto
+    /// [`AgentReply::task_id`](CompanyEvent::AgentReply) so the chip survives a
+    /// transcript reload rather than existing only on the live response.
+    ///
+    /// **Only the first card of a multi-spawn turn.** The journal field it
+    /// feeds is a single optional id, and widening it to a list would break the
+    /// byte-identical round-trip every stored reply depends on. The claim it
+    /// makes — "this reply opened that card" — is therefore true but
+    /// incomplete, never false; the bubble's [`steps`](Self::steps) timeline
+    /// still shows every `spawn_task` call the turn made.
+    ///
+    /// Additive and non-secret: a card id, omitted on the wire when absent, so
+    /// every prior producer round-trips byte-identically (same `steps` /
+    /// `reply_to` precedent above).
+    ///
+    /// The wire name is pinned to `taskId` rather than inherited, because this
+    /// struct — unlike almost everything else the console reads — carries no
+    /// `rename_all`. The console sees the same card on three surfaces (this
+    /// POST response, the SSE `agent_reply` frame, and the `chat/history` DTO),
+    /// and the other two are camelCase; letting this one alone be `task_id`
+    /// would be a trap for whoever wires the next reader.
+    #[serde(default, rename = "taskId", skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+/// One visible step in an agent turn's processing timeline, surfaced in the
+/// operator chat.
+///
+/// The point of the timeline: a failed tool call becomes visible (instead of a
+/// vague acknowledgement), and a memory-served answer — which runs **zero**
+/// steps — is distinguishable from a tool-backed one. Folded from the harness
+/// progress stream by [`crate::harness::steps`] (compiled under the `openhuman`
+/// feature); every field is scrubbed there before it reaches this shape.
+///
+/// The wire form is additive and camelCase (`elapsedMs`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStep {
+    /// What kind of step this is (drives the icon in the UI).
+    pub kind: TurnStepKind,
+    /// How the step ended.
+    pub status: TurnStepStatus,
+    /// A short, human label (e.g. "Reading messages", "Thinking"). Derived from
+    /// the tool's server-computed `display_label`, else its tool name — never
+    /// from tool arguments or output.
+    pub label: String,
+    /// An optional muted detail: whitelisted, scrubbed enrichment (e.g. an MCP
+    /// `server · tool`, a delegated desk, a task title) or a plain-language
+    /// failure cause. **Never** raw tool output or arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// How long the step took in milliseconds, when known (tool calls report it;
+    /// thinking/note steps do not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+/// The kind of a [`TurnStep`], driving its icon in the timeline. Serialized in
+/// `snake_case` (`tool_call` / `thinking` / `note`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepKind {
+    /// A tool call (a paired started/completed pair, or an unmatched one).
+    ToolCall,
+    /// A run of the model's reasoning, coalesced to a single "Thinking" step.
+    Thinking,
+    /// A standalone note — e.g. a surfaced MCP failure or the cap-omission
+    /// marker.
+    Note,
+}
+
+/// How a [`TurnStep`] ended. Serialized in `snake_case` (`ok` / `error` /
+/// `running`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepStatus {
+    /// Completed successfully (or an informational step).
+    Ok,
+    /// Failed — rendered in the destructive tone.
+    Error,
+    /// Started but no completion was observed by the end of the turn.
+    Running,
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +1170,183 @@ pub struct OverlayAgent {
     pub description: Option<String>,
 }
 
+/// An operator-added desk membership that the version-controlled manifest does
+/// not know about. Persisted as an overlay on the [`CompanyRecord`] and merged
+/// into a desk's effective membership at read/resolve time; the `company.toml`
+/// is never rewritten. Only additions are modelled — a manifest-declared desk
+/// member is part of the blueprint and cannot be removed through the overlay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayDeskMember {
+    /// The desk (group-chat) id this addition targets.
+    pub desk_id: String,
+    /// The teammate id added to the desk. Resolves to a manifest agent or an
+    /// [`OverlayAgent`].
+    pub agent_id: String,
+}
+
+/// Where a company's manifest was seeded from — the source template's stable
+/// identity, recorded once at launch and carried across rebuilds.
+///
+/// A company launched from a template directory (`serve --company
+/// companies/<slug>`) records the directory slug as its stable `source_id`; a
+/// company provisioned from a raw manifest body (`POST /api/v1/companies`)
+/// carries no provenance (`CompanyRecord::template_provenance` stays `None`) —
+/// provenance is never fabricated for a manifest that did not come from a
+/// template. The blueprint (`company.toml`) is never rewritten: provenance
+/// lives only on the record/overlay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateProvenance {
+    /// The template's stable identifier — the source directory slug (or a
+    /// canonical id where one exists). Stable across rebuilds and restarts.
+    pub source_id: String,
+    /// The template's version, when the source exposes one. `None` when the
+    /// template is unversioned.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The source directory path the company was launched from, when recorded.
+    /// Optional and informational; `source_id` is the durable stable key.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// An operator-set explicit ordering (hierarchy) for one desk's effective
+/// members. Persisted as an overlay on the [`CompanyRecord`]; the version-
+/// controlled manifest is never rewritten. Applied inside
+/// [`CompanyRecord::effective_desk_members`] as a whole-set permutation: ids in
+/// `ordered` come first in the given order (so an overlay-added member can be
+/// promoted above manifest members — a whole-set reorder, which a per-member
+/// `rank` could not express), and any effective member not listed keeps today's
+/// relative order after them. Stale ids in `ordered` that are no longer members
+/// are simply ignored. An empty `ordered` (or an absent entry) reproduces the
+/// blueprint order exactly.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayDeskOrder {
+    /// The desk (group-chat) id this ordering targets.
+    pub desk_id: String,
+    /// The operator-set member id order. Listed ids sort first in this order;
+    /// unlisted effective members keep their default relative order after.
+    pub ordered: Vec<String>,
+}
+
+/// An operator-created desk (group chat) that the version-controlled manifest
+/// does not declare. Persisted as an overlay on the [`CompanyRecord`] and merged
+/// with the manifest's `[[group_chat]]` desks at read/resolve time; the
+/// `company.toml` is never rewritten. This is the desk analogue of
+/// [`OverlayAgent`] — the manifest stays authoritative and rebuild-preserved,
+/// while runtime-created desks live alongside it and survive rebuilds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayDesk {
+    /// The desk id — snake_case, unique across the manifest desks and the other
+    /// overlay desks. Doubles as the chat thread id.
+    pub id: String,
+    /// Human-readable desk name.
+    pub name: String,
+    /// What the desk is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The desk's founding member ids, in order; the first is its lead. Each
+    /// must resolve to a roster teammate (manifest agent or [`OverlayAgent`]).
+    /// Further members can still be added through the desk-member overlay.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+/// A workflow graph body authored at runtime (the console's create dialog or
+/// the orchestrator's `create_workflow` tool) and persisted on the
+/// [`CompanyRecord`] rather than written into the company source tree.
+///
+/// The source tree (`companies/<name>/workflows/<id>.toml`) is the
+/// version-controlled seed and, in hosted mode, a **read-only** crate mount —
+/// writing a graph there fails with `EROFS` (issue #168). So a created graph
+/// lands here instead, next to the enabled id, and every reader unions the two
+/// sets (see [`load_workflow_union`](crate::company::load_workflow_union)).
+///
+/// The stored value is the **rendered TOML**, already validated at create time:
+/// readers re-parse it through
+/// [`parse_workflow`](crate::company::parse_workflow), so an overlay graph
+/// passes exactly the same validation an on-disk seed file does, with no second
+/// model shape to drift. Deliberately no `name` field — the name lives inside
+/// the TOML, one source of truth.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayWorkflow {
+    /// The workflow id — what the seed file would be named (`<id>.toml`).
+    pub id: String,
+    /// The rendered, already-validated workflow graph TOML.
+    pub toml: String,
+}
+
+/// The operator overlays persisted as a single JSON blob by the string-column
+/// stores (sqlite + mongodb `overlay_json`). The filesystem store keeps the two
+/// collections as typed fields on its own `Meta` instead.
+///
+/// [`Self::parse`] accepts both the current object form and the legacy bare
+/// array (`overlay_json` held only `Vec<OverlayAgent>` before desk overlays
+/// existed), so existing rows load without a migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OverlayBlob {
+    /// The operator team overlay.
+    #[serde(default)]
+    pub agents: Vec<OverlayAgent>,
+    /// The operator desk-membership overlay.
+    #[serde(default)]
+    pub desk_members: Vec<OverlayDeskMember>,
+    /// The operator per-desk member-ordering overlay.
+    #[serde(default)]
+    pub desk_order: Vec<OverlayDeskOrder>,
+    /// The operator-created desk overlay. Absent on rows written before desk
+    /// creation existed, so `#[serde(default)]` loads them as empty.
+    #[serde(default)]
+    pub desks: Vec<OverlayDesk>,
+    /// The operator-authored workflow graph bodies. Absent on rows written
+    /// before runtime workflow authoring persisted through the store, so
+    /// `#[serde(default)]` loads them as empty.
+    #[serde(default)]
+    pub workflows: Vec<OverlayWorkflow>,
+    /// The source-template provenance recorded at launch. `None` for companies
+    /// provisioned from a raw manifest and for legacy rows written before
+    /// provenance existed (the `#[serde(default)]` keeps those rows loading).
+    #[serde(default)]
+    pub provenance: Option<TemplateProvenance>,
+}
+
+impl OverlayBlob {
+    /// Builds a blob from a record's overlay collections and provenance.
+    pub fn from_record(record: &CompanyRecord) -> Self {
+        Self {
+            agents: record.overlay_agents.clone(),
+            desk_members: record.overlay_desk_members.clone(),
+            desk_order: record.overlay_desk_order.clone(),
+            desks: record.overlay_desks.clone(),
+            workflows: record.overlay_workflows.clone(),
+            provenance: record.template_provenance.clone(),
+        }
+    }
+
+    /// Parses the persisted blob, accepting both the current object form
+    /// (`{"agents":[…],"desk_members":[…],"desks":[…]}`) and the legacy
+    /// bare-array form (`[…]`, the pre-desk-overlay value that held only agents).
+    /// When the current form parse fails, falls back to the legacy array; if
+    /// that also fails the *original* error (from the current-form parse) is
+    /// propagated so the caller sees why the object form failed rather than a
+    /// misleading "expected sequence" message. New optional keys (`desks`) are
+    /// absorbed by `#[serde(default)]`, so no migration is needed.
+    pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
+        match serde_json::from_str::<OverlayBlob>(json) {
+            Ok(blob) => Ok(blob),
+            Err(original) => serde_json::from_str::<Vec<OverlayAgent>>(json)
+                .map(|agents| Self {
+                    agents,
+                    desk_members: Vec::new(),
+                    desk_order: Vec::new(),
+                    desks: Vec::new(),
+                    workflows: Vec::new(),
+                    provenance: None,
+                })
+                .map_err(|_| original),
+        }
+    }
+}
+
 /// A durable company record: charter/roster (manifest) plus ledger and
 /// lifecycle state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -703,6 +1362,183 @@ pub struct CompanyRecord {
     /// Operator-added teammates not present in the manifest (the team overlay).
     #[serde(default)]
     pub overlay_agents: Vec<OverlayAgent>,
+    /// Operator-added desk memberships not present in the manifest (the desk
+    /// overlay). Merged into a desk's effective membership at read time.
+    #[serde(default)]
+    pub overlay_desk_members: Vec<OverlayDeskMember>,
+    /// Operator-set per-desk member orderings (the desk-hierarchy overlay).
+    /// Applied as a whole-set permutation inside [`Self::effective_desk_members`];
+    /// empty = the blueprint order. The manifest is never rewritten.
+    #[serde(default)]
+    pub overlay_desk_order: Vec<OverlayDeskOrder>,
+    /// Operator-created desks not present in the manifest (the desk-creation
+    /// overlay). Merged with the manifest's `[[group_chat]]` desks at read time.
+    #[serde(default)]
+    pub overlay_desks: Vec<OverlayDesk>,
+    /// Workflow graphs authored at runtime (console create dialog / orchestrator
+    /// `create_workflow`), persisted here instead of in the company source tree —
+    /// which is read-only in hosted mode (issue #168). Unioned with the seed
+    /// `workflows/*.toml` files by every reader; the seed wins on an id
+    /// collision. The `#[serde(default)]` keeps records written before runtime
+    /// authoring persisted through the store loading without a migration.
+    #[serde(default)]
+    pub overlay_workflows: Vec<OverlayWorkflow>,
+    /// Where this company's manifest was seeded from — the source template's
+    /// stable identity, stamped once at launch and carried across rebuilds.
+    /// `None` for companies provisioned from a raw manifest body. The
+    /// `#[serde(default)]` keeps records written before provenance existed
+    /// loading without a migration.
+    #[serde(default)]
+    pub template_provenance: Option<TemplateProvenance>,
+}
+
+impl CompanyRecord {
+    /// The effective member ids of a desk: the desk's declared members first
+    /// (from the manifest `[[group_chat]]` or, for an operator-created desk, the
+    /// [`OverlayDesk`]), then any operator-overlay member additions for that
+    /// desk, in order and deduplicated on id — then re-ordered by this desk's
+    /// operator-set [`OverlayDeskOrder`] if one exists.
+    ///
+    /// This is the single source of truth for "who is on a desk", shared by the
+    /// REST `list_desks` handler and the harness `desk_lead` resolver so the two
+    /// cannot drift. Base ordering: declared order is preserved (manifest or
+    /// [`OverlayDesk`]), overlay members are appended in insertion order. Then,
+    /// if the operator has set an explicit order for this desk, it is applied as
+    /// a whole-set permutation — listed ids come first in the operator's order
+    /// (so an overlay member can be promoted to the lead slot), and any effective
+    /// member the order does not mention keeps its base relative position after
+    /// them. With no order override the base order is returned unchanged, so the
+    /// first declared member stays the lead by default.
+    pub fn effective_desk_members(&self, desk_id: &str) -> Vec<String> {
+        let mut members: Vec<String> = self
+            .manifest
+            .group_chats
+            .iter()
+            .find(|c| c.id == desk_id)
+            .map(|c| c.members.clone())
+            .or_else(|| {
+                self.overlay_desks
+                    .iter()
+                    .find(|d| d.id == desk_id)
+                    .map(|d| d.members.clone())
+            })
+            .unwrap_or_default();
+        for add in &self.overlay_desk_members {
+            if add.desk_id == desk_id && !members.contains(&add.agent_id) {
+                members.push(add.agent_id.clone());
+            }
+        }
+        // Apply the operator-set ordering as a whole-set permutation. Listed ids
+        // sort first in the operator's order; unlisted members keep their base
+        // relative order after (stable sort). Stale ids no longer members are
+        // absent from `members`, so they simply have no effect.
+        if let Some(order) = self
+            .overlay_desk_order
+            .iter()
+            .find(|o| o.desk_id == desk_id && !o.ordered.is_empty())
+        {
+            let mut ranked: Vec<(usize, usize, String)> = members
+                .into_iter()
+                .enumerate()
+                .map(|(base_index, id)| {
+                    // Listed ids rank by their position in the operator order;
+                    // unlisted ids rank after all listed ids, keyed on their base
+                    // index so their relative order is preserved by the sort.
+                    let key = match order.ordered.iter().position(|listed| *listed == id) {
+                        Some(pos) => pos,
+                        None => order.ordered.len() + base_index,
+                    };
+                    (key, base_index, id)
+                })
+                .collect();
+            ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            members = ranked.into_iter().map(|(_, _, id)| id).collect();
+        }
+        members
+    }
+
+    /// Resolves a desk key (an id, or a case-insensitive name) to its canonical
+    /// id, searching the manifest desks first and then the operator-created
+    /// overlay desks. Lets the harness route to overlay desks by the same
+    /// id-or-name key it already accepts for manifest desks.
+    pub fn resolve_desk_id(&self, key: &str) -> Option<String> {
+        self.manifest
+            .group_chats
+            .iter()
+            .find(|c| c.id == key || c.name.eq_ignore_ascii_case(key))
+            .map(|c| c.id.clone())
+            .or_else(|| {
+                self.overlay_desks
+                    .iter()
+                    .find(|d| d.id == key || d.name.eq_ignore_ascii_case(key))
+                    .map(|d| d.id.clone())
+            })
+    }
+
+    /// Whether a desk with `desk_id` exists in either the manifest or the
+    /// operator-created overlay desks.
+    pub fn desk_exists(&self, desk_id: &str) -> bool {
+        self.manifest.group_chats.iter().any(|c| c.id == desk_id)
+            || self.overlay_desks.iter().any(|d| d.id == desk_id)
+    }
+
+    /// Whether `agent_id` names a roster teammate — a manifest agent or an
+    /// operator-overlay teammate. The desk overlay may only add ids that resolve
+    /// here.
+    pub fn is_roster_agent(&self, agent_id: &str) -> bool {
+        self.manifest.agents.iter().any(|a| a.id == agent_id)
+            || self.overlay_agents.iter().any(|a| a.id == agent_id)
+    }
+
+    /// Resolves an operator-typed teammate key to its canonical roster id,
+    /// searching manifest agents first and then the overlay teammates.
+    ///
+    /// The case-insensitive companion to [`Self::is_roster_agent`], for the one
+    /// place a human types the key by hand: a card's `assignee` (issue #205).
+    /// [`Self::resolve_desk_id`] already accepts a desk by id **or** name
+    /// case-insensitively, so an assignee naming a desk resolved while the same
+    /// string naming a teammate — `"Engineer"` for `engineer` — did not.
+    ///
+    /// Matches on **id only** (never `role`, never an overlay teammate's
+    /// display name) so the key stays one unambiguous namespace; folding the
+    /// case is what stops a typed capital reading as an unknown agent.
+    ///
+    /// [`Self::is_roster_agent`] keeps its exact-match contract: it guards the
+    /// desk overlay, whose ids are machine-written rather than typed.
+    pub fn resolve_roster_agent_id(&self, agent_key: &str) -> Option<String> {
+        self.manifest
+            .agents
+            .iter()
+            .map(|a| &a.id)
+            .chain(self.overlay_agents.iter().map(|a| &a.id))
+            .find(|id| id.eq_ignore_ascii_case(agent_key))
+            .cloned()
+    }
+
+    /// Canonical ids of operator-added teammates whose **display name** matches
+    /// `name_key` case-insensitively.
+    ///
+    /// The companion to [`Self::resolve_roster_agent_id`] for the half of the
+    /// roster that has no typable id. `server::ops::team` mints an overlay
+    /// teammate with `id: generate_id()`, so an operator who adds "Shane" never
+    /// sees anything but the name — matching on ids alone made every teammate
+    /// they added unassignable, on a board whose Assignee field is free text
+    /// with no picker. Manifest agents keep their id-only namespace: their ids
+    /// (`ceo`, `engineer`) are human-authored and typable, and
+    /// [`Self::resolve_roster_agent_id`] is tried first, so a display name can
+    /// never shadow a real id.
+    ///
+    /// Returns **every** match rather than the first, so the caller can tell a
+    /// unique name from a collision the operator created. Silently routing to
+    /// whichever teammate was added first would reintroduce exactly the
+    /// misrouting this resolver exists to end.
+    pub fn overlay_agent_ids_by_name(&self, name_key: &str) -> Vec<String> {
+        self.overlay_agents
+            .iter()
+            .filter(|a| a.name.eq_ignore_ascii_case(name_key))
+            .map(|a| a.id.clone())
+            .collect()
+    }
 }
 
 /// A compact company listing entry.
@@ -852,6 +1688,7 @@ pub struct PaymentReceipt {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::ports::workflow_runner::DeliveryStatus;
 
     fn round_trip<T>(value: &T) -> T
     where
@@ -859,6 +1696,324 @@ mod test {
     {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    // ── Issue #174: cycle usage carries cost, and folds ─────────────────────
+
+    /// A cycle with nothing to report writes nothing, and any single non-zero
+    /// field makes it real usage — including a token-less charge.
+    #[test]
+    fn token_usage_is_zero_only_when_every_field_is() {
+        assert!(TokenUsage::default().is_zero());
+        for usage in [
+            TokenUsage {
+                input: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                output: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                cached_input: 1,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                cost_usd: 0.0001,
+                ..TokenUsage::default()
+            },
+        ] {
+            assert!(!usage.is_zero(), "{usage:?} is real usage");
+        }
+    }
+
+    /// Several model passes in one cycle accumulate into one total.
+    #[test]
+    fn token_usage_folds_passes_together() {
+        let mut total = TokenUsage::default();
+        total.fold(&TokenUsage {
+            input: 100,
+            output: 20,
+            cached_input: 10,
+            cost_usd: 0.01,
+        });
+        total.fold(&TokenUsage {
+            input: 50,
+            output: 5,
+            cached_input: 0,
+            cost_usd: 0.02,
+        });
+        assert_eq!(total.input, 150);
+        assert_eq!(total.output, 25);
+        assert_eq!(total.cached_input, 10);
+        assert!((total.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    /// A bogus peer value must never wrap the meter into a huge or tiny number.
+    #[test]
+    fn token_usage_fold_saturates_instead_of_overflowing() {
+        let mut total = TokenUsage {
+            input: u64::MAX,
+            output: u64::MAX,
+            cached_input: u64::MAX,
+            cost_usd: 0.0,
+        };
+        total.fold(&TokenUsage {
+            input: 10,
+            output: 10,
+            cached_input: 10,
+            cost_usd: 0.0,
+        });
+        assert_eq!(total.input, u64::MAX);
+        assert_eq!(total.output, u64::MAX);
+        assert_eq!(total.cached_input, u64::MAX);
+    }
+
+    /// The cost fields are additive on the wire: a peer that predates them still
+    /// decodes, and an all-zero usage still serializes them for a peer that has
+    /// them.
+    #[test]
+    fn token_usage_decodes_a_payload_without_the_cost_fields() {
+        let legacy: TokenUsage = serde_json::from_str(r#"{"input":7,"output":3}"#).unwrap();
+        assert_eq!(legacy.input, 7);
+        assert_eq!(legacy.output, 3);
+        assert_eq!(legacy.cached_input, 0);
+        assert_eq!(legacy.cost_usd, 0.0);
+        assert_eq!(round_trip(&legacy), legacy);
+    }
+
+    /// The `TurnStep` wire shape is camelCase with snake_case enum values:
+    /// `{kind, status, label, detail?, elapsedMs?}`. Locks the contract the
+    /// console `TurnStep` mirror in `frontend/src/api/types.ts` depends on.
+    #[test]
+    fn turn_step_wire_shape_is_camel_case_with_snake_case_enums() {
+        let step = TurnStep {
+            kind: TurnStepKind::ToolCall,
+            status: TurnStepStatus::Error,
+            label: "Searching the web".to_string(),
+            detail: Some("brave · search".to_string()),
+            elapsed_ms: Some(1234),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["kind"], "tool_call");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["label"], "Searching the web");
+        assert_eq!(json["detail"], "brave · search");
+        assert_eq!(json["elapsedMs"], 1234);
+        assert_eq!(round_trip(&step), step);
+    }
+
+    /// A step with no detail/elapsed omits both keys, and every kind/status
+    /// value serializes to its documented snake_case token.
+    #[test]
+    fn turn_step_omits_absent_fields_and_covers_every_variant() {
+        let bare = TurnStep {
+            kind: TurnStepKind::Thinking,
+            status: TurnStepStatus::Ok,
+            label: "Thinking".to_string(),
+            detail: None,
+            elapsed_ms: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(json["kind"], "thinking");
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("detail").is_none(), "absent detail is omitted");
+        assert!(json.get("elapsedMs").is_none(), "absent elapsed is omitted");
+
+        assert_eq!(serde_json::to_value(TurnStepKind::Note).unwrap(), "note");
+        assert_eq!(
+            serde_json::to_value(TurnStepStatus::Running).unwrap(),
+            "running"
+        );
+    }
+
+    /// `OutboundMessage.steps` is additive: an empty timeline is omitted from
+    /// the wire entirely (so every prior producer round-trips byte-identically),
+    /// and a legacy `{channel, text}` payload still loads with an empty `steps`.
+    #[test]
+    fn outbound_message_steps_are_additive_and_omitted_when_empty() {
+        let no_steps = OutboundMessage {
+            task_id: None,
+            channel: "operator".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+            reply_to: None,
+        };
+        let json = serde_json::to_string(&no_steps).unwrap();
+        assert_eq!(json, r#"{"channel":"operator","text":"hi"}"#);
+
+        let legacy: OutboundMessage =
+            serde_json::from_str(r#"{"channel":"operator","text":"hi"}"#).unwrap();
+        assert!(legacy.steps.is_empty());
+
+        let with_steps = OutboundMessage {
+            task_id: None,
+            channel: "operator".to_string(),
+            text: "done".to_string(),
+            steps: vec![TurnStep {
+                kind: TurnStepKind::Note,
+                status: TurnStepStatus::Error,
+                label: "MCP: brave unavailable".to_string(),
+                detail: Some("server rejected the call".to_string()),
+                elapsed_ms: None,
+            }],
+            reply_to: None,
+        };
+        assert_eq!(round_trip(&with_steps), with_steps);
+    }
+
+    /// Issue #246: `OutboundMessage.task_id` is additive on exactly the same
+    /// terms as `steps` above — a bubble that opened no card must serialize
+    /// byte-for-byte as it did before the field existed, and a payload written
+    /// before it existed must still load. Without both halves every already-
+    /// stored response would change shape the moment this field shipped.
+    #[test]
+    fn outbound_message_task_id_is_additive_and_omitted_when_absent() {
+        let no_card = OutboundMessage {
+            task_id: None,
+            channel: "operator".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+            reply_to: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&no_card).unwrap(),
+            r#"{"channel":"operator","text":"hi"}"#,
+            "a bubble that opened no card keeps the pre-#246 wire form"
+        );
+
+        let legacy: OutboundMessage =
+            serde_json::from_str(r#"{"channel":"operator","text":"hi"}"#).unwrap();
+        assert!(legacy.task_id.is_none());
+
+        let with_card = OutboundMessage {
+            task_id: Some("t-42".to_string()),
+            channel: "operator".to_string(),
+            text: "opened one".to_string(),
+            steps: Vec::new(),
+            reply_to: None,
+        };
+        assert_eq!(round_trip(&with_card), with_card);
+        assert!(
+            serde_json::to_string(&with_card)
+                .unwrap()
+                .contains(r#""taskId":"t-42""#),
+            "the console reads the card off a camelCase key"
+        );
+    }
+
+    /// `AgentReply.steps` is additive the same way: a reply journaled before
+    /// the field existed loads with an empty timeline, and a tool-less reply
+    /// omits the key so its on-disk form is byte-identical to the legacy log.
+    #[test]
+    fn agent_reply_steps_are_additive_and_omitted_when_empty() {
+        let legacy: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#,
+        )
+        .expect("a pre-steps AgentReply still loads");
+        match &legacy {
+            CompanyEvent::AgentReply { steps, .. } => assert!(steps.is_empty()),
+            other => panic!("expected AgentReply, got {other:?}"),
+        }
+
+        // A tool-less reply serializes without the `steps` key.
+        let tool_less = CompanyEvent::AgentReply {
+            task_id: None,
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+        };
+        let json = serde_json::to_value(&tool_less).unwrap();
+        assert!(json.get("steps").is_none());
+
+        // A reply with a timeline round-trips it.
+        let with_steps = CompanyEvent::AgentReply {
+            task_id: None,
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "done".to_string(),
+            steps: vec![TurnStep {
+                kind: TurnStepKind::ToolCall,
+                status: TurnStepStatus::Ok,
+                label: "Reading messages".to_string(),
+                detail: None,
+                elapsed_ms: Some(12),
+            }],
+        };
+        let back: CompanyEvent =
+            serde_json::from_str(&serde_json::to_string(&with_steps).unwrap()).unwrap();
+        assert_eq!(back, with_steps);
+    }
+
+    /// #185: the `task_id` correlation key is additive in both directions —
+    /// an event journaled before it existed still loads, and an untagged event
+    /// still serializes byte-for-byte as it did before the field was added.
+    ///
+    /// That second half is the migration-free guarantee: every already-persisted
+    /// `AgentReply` / `McpCallFailed` in every company's log must round-trip
+    /// unchanged, or the cross-backend export/import comparison breaks.
+    #[test]
+    fn task_id_correlation_is_additive_and_omitted_when_absent() {
+        let legacy: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#,
+        )
+        .expect("a pre-task_id AgentReply still loads");
+        match &legacy {
+            CompanyEvent::AgentReply { task_id, .. } => assert!(task_id.is_none()),
+            other => panic!("expected AgentReply, got {other:?}"),
+        }
+
+        // An untagged reply keeps the legacy wire shape exactly.
+        let untagged = CompanyEvent::AgentReply {
+            chat_id: "main".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "hi".to_string(),
+            steps: Vec::new(),
+            task_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).unwrap(),
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#
+        );
+
+        // A dispatch-produced reply carries the key and round-trips.
+        let tagged = CompanyEvent::AgentReply {
+            chat_id: "t-1".to_string(),
+            agent_id: "ceo".to_string(),
+            text: "done".to_string(),
+            steps: Vec::new(),
+            task_id: Some("t-1".to_string()),
+        };
+        let back: CompanyEvent =
+            serde_json::from_str(&serde_json::to_string(&tagged).unwrap()).unwrap();
+        assert_eq!(back, tagged);
+
+        // Same contract on the failure event.
+        let legacy_mcp: CompanyEvent = serde_json::from_str(
+            r#"{"kind":"McpCallFailed","server":"gh","tool":"issues","status":"credential_required","message":"needs auth"}"#,
+        )
+        .expect("a pre-task_id McpCallFailed still loads");
+        match &legacy_mcp {
+            CompanyEvent::McpCallFailed { task_id, .. } => assert!(task_id.is_none()),
+            other => panic!("expected McpCallFailed, got {other:?}"),
+        }
+    }
+
+    /// #185: the dispatch terminal round-trips, and reports where the card
+    /// landed so a stopped run is distinguishable from a successful one.
+    #[test]
+    fn desk_task_completed_round_trips() {
+        let done = CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".to_string(),
+            desk: "ceo".to_string(),
+            output: "shipped".to_string(),
+            column: "in_review".to_string(),
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains(r#""kind":"DeskTaskCompleted""#));
+        let back: CompanyEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, done);
     }
 
     #[test]
@@ -872,6 +2027,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             }
         );
     }
@@ -884,6 +2040,7 @@ mod test {
         let event = CompanyEvent::OperatorMessage {
             text: "hi".into(),
             by: None,
+            chat: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
@@ -899,6 +2056,7 @@ mod test {
                 kind: ActorKind::User,
                 id: "u1".into(),
             }),
+            chat: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["by"]["kind"], "user");
@@ -923,6 +2081,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
             CompanyEvent::WebhookReceived {
                 channel: "email".into(),
@@ -963,6 +2122,54 @@ mod test {
     }
 
     #[test]
+    fn mcp_call_failed_round_trips_and_is_byte_stable() {
+        let event = CompanyEvent::McpCallFailed {
+            task_id: None,
+            server: "browserbase".into(),
+            tool: "browse".into(),
+            status: "tool_call_rejected".into(),
+            message: "server rejected the call".into(),
+        };
+        assert_eq!(round_trip(&event), event);
+        // The tag is emitted under `kind`, and the field set is fixed — a byte
+        // guard so a later field addition is a deliberate, tested change.
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"kind":"McpCallFailed","server":"browserbase","tool":"browse","status":"tool_call_rejected","message":"server rejected the call"}"#
+        );
+    }
+
+    #[test]
+    fn task_steered_round_trips_and_omits_empty_fields() {
+        // A plain pause: no `instruction`, no `by` — both must be OMITTED from
+        // the wire (skip_serializing_if), so old logs stay byte-stable.
+        let pause = CompanyEvent::TaskSteered {
+            task_id: "t1".into(),
+            action: "pause".into(),
+            instruction: None,
+            by: None,
+        };
+        assert_eq!(round_trip(&pause), pause);
+        assert_eq!(
+            serde_json::to_string(&pause).unwrap(),
+            r#"{"kind":"TaskSteered","task_id":"t1","action":"pause"}"#
+        );
+
+        // A redirect carries its (capped) instruction; still no actor.
+        let redirect = CompanyEvent::TaskSteered {
+            task_id: "t1".into(),
+            action: "redirect".into(),
+            instruction: Some("focus on the API".into()),
+            by: None,
+        };
+        assert_eq!(round_trip(&redirect), redirect);
+        assert_eq!(
+            serde_json::to_string(&redirect).unwrap(),
+            r#"{"kind":"TaskSteered","task_id":"t1","action":"redirect","instruction":"focus on the API"}"#
+        );
+    }
+
+    #[test]
     fn verdict_serializes_lowercase() {
         assert_eq!(
             serde_json::to_string(&Verdict::Approve).unwrap(),
@@ -984,6 +2191,8 @@ mod test {
             established_thread: true,
             first_time_counterparty: false,
             payload: serde_json::json!({"to": "@vendor"}),
+            agent: None,
+            run_id: None,
         };
         let back = round_trip(&effect);
         assert_eq!(back, effect);
@@ -1044,6 +2253,574 @@ mod test {
             }],
         };
         assert_eq!(round_trip(&card), card);
+    }
+
+    fn desk_record(toml_src: &str, overlay: Vec<OverlayDeskMember>) -> CompanyRecord {
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest: toml::from_str(toml_src).expect("parse manifest"),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: overlay,
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            template_provenance: None,
+        }
+    }
+
+    /// Like [`desk_record`] but with an explicit per-desk order overlay, for the
+    /// desk-hierarchy tests.
+    fn desk_record_ordered(
+        toml_src: &str,
+        overlay: Vec<OverlayDeskMember>,
+        order: Vec<OverlayDeskOrder>,
+    ) -> CompanyRecord {
+        let mut record = desk_record(toml_src, overlay);
+        record.overlay_desk_order = order;
+        record
+    }
+
+    /// The effective membership is the manifest members first, then overlay
+    /// additions in insertion order, deduplicated — the shared rule the REST
+    /// list and the harness desk-lead resolver both read.
+    #[test]
+    fn effective_desk_members_unions_manifest_and_overlay_deduped() {
+        let manifest = "[company]\nname = \"Acme\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n\
+             [[group_chat]]\nid = \"studio\"\nname = \"Studio\"\nmembers = [\"ceo\"]\n";
+        let record = desk_record(
+            manifest,
+            vec![
+                OverlayDeskMember {
+                    desk_id: "studio".into(),
+                    agent_id: "eng".into(),
+                },
+                // A duplicate of a manifest member is not added twice.
+                OverlayDeskMember {
+                    desk_id: "studio".into(),
+                    agent_id: "ceo".into(),
+                },
+                // An addition for a different desk is ignored here.
+                OverlayDeskMember {
+                    desk_id: "other".into(),
+                    agent_id: "eng".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            record.effective_desk_members("studio"),
+            vec!["ceo".to_string(), "eng".to_string()]
+        );
+        // An unknown desk with only an overlay addition still resolves it.
+        assert_eq!(
+            record.effective_desk_members("other"),
+            vec!["eng".to_string()]
+        );
+    }
+
+    /// A three-member manifest desk whose order override permutes the members.
+    const HIERARCHY_MANIFEST: &str = "[company]\nname = \"Acme\"\n\
+         [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+         [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n\
+         [[agent]]\nid = \"des\"\nrole = \"Designer\"\n\
+         [[group_chat]]\nid = \"studio\"\nname = \"Studio\"\nmembers = [\"ceo\", \"eng\", \"des\"]\n";
+
+    fn order(desk: &str, ids: &[&str]) -> Vec<OverlayDeskOrder> {
+        vec![OverlayDeskOrder {
+            desk_id: desk.into(),
+            ordered: ids.iter().map(|s| s.to_string()).collect(),
+        }]
+    }
+
+    /// A full permutation reorders the manifest members exactly as given.
+    #[test]
+    fn desk_order_reorders_manifest_members() {
+        let record = desk_record_ordered(
+            HIERARCHY_MANIFEST,
+            Vec::new(),
+            order("studio", &["des", "ceo", "eng"]),
+        );
+        assert_eq!(
+            record.effective_desk_members("studio"),
+            vec!["des".to_string(), "ceo".to_string(), "eng".to_string()]
+        );
+    }
+
+    /// The override can promote an overlay-added member above manifest members —
+    /// the whole-set permutation a per-member rank could not express.
+    #[test]
+    fn desk_order_promotes_overlay_member_to_lead() {
+        let record = desk_record_ordered(
+            HIERARCHY_MANIFEST,
+            vec![OverlayDeskMember {
+                desk_id: "studio".into(),
+                agent_id: "cto".into(),
+            }],
+            order("studio", &["cto", "ceo", "eng", "des"]),
+        );
+        let members = record.effective_desk_members("studio");
+        assert_eq!(members[0], "cto");
+        assert_eq!(
+            members,
+            vec![
+                "cto".to_string(),
+                "ceo".to_string(),
+                "eng".to_string(),
+                "des".to_string()
+            ]
+        );
+    }
+
+    /// An absent or empty override reproduces the base order byte-for-byte.
+    #[test]
+    fn desk_order_absent_or_empty_keeps_base_order() {
+        let base = desk_record(HIERARCHY_MANIFEST, Vec::new());
+        let base_members = base.effective_desk_members("studio");
+        assert_eq!(base_members, vec!["ceo", "eng", "des"]);
+
+        // An explicit empty override for the desk is a no-op too.
+        let empty = desk_record_ordered(HIERARCHY_MANIFEST, Vec::new(), order("studio", &[]));
+        assert_eq!(empty.effective_desk_members("studio"), base_members);
+    }
+
+    /// Ids in the override that are no longer desk members are ignored.
+    #[test]
+    fn desk_order_ignores_stale_ids() {
+        let record = desk_record_ordered(
+            HIERARCHY_MANIFEST,
+            Vec::new(),
+            order("studio", &["ghost", "des", "ceo", "eng"]),
+        );
+        // `ghost` is not a member, so it contributes nothing; the rest apply.
+        assert_eq!(
+            record.effective_desk_members("studio"),
+            vec!["des".to_string(), "ceo".to_string(), "eng".to_string()]
+        );
+    }
+
+    /// A subset override lists its ids first, then the unlisted members keep
+    /// their base relative order after.
+    #[test]
+    fn desk_order_subset_is_listed_first_then_default() {
+        let record = desk_record_ordered(HIERARCHY_MANIFEST, Vec::new(), order("studio", &["des"]));
+        // `des` promoted first; `ceo`, `eng` keep their base order behind it.
+        assert_eq!(
+            record.effective_desk_members("studio"),
+            vec!["des".to_string(), "ceo".to_string(), "eng".to_string()]
+        );
+    }
+
+    /// The persisted overlay blob round-trips the desk-order collection.
+    #[test]
+    fn overlay_blob_round_trips_desk_order() {
+        let record = desk_record_ordered(
+            HIERARCHY_MANIFEST,
+            Vec::new(),
+            order("studio", &["des", "ceo", "eng"]),
+        );
+        let blob = OverlayBlob::from_record(&record);
+        let json = serde_json::to_string(&blob).expect("serialize blob");
+        let parsed = OverlayBlob::parse(&json).expect("parse blob");
+        assert_eq!(parsed.desk_order, record.overlay_desk_order);
+    }
+
+    /// An object-form blob written before `desk_order` existed still parses, and
+    /// the legacy bare-array form still parses — both with an empty order.
+    #[test]
+    fn overlay_blob_parses_without_desk_order_key() {
+        // Object form missing the `desk_order` key (pre-#131 rows).
+        let object = r#"{"agents":[{"id":"a","name":"A","role":"r"}],"desk_members":[{"desk_id":"d","agent_id":"a"}]}"#;
+        let blob = OverlayBlob::parse(object).expect("object without desk_order");
+        assert_eq!(blob.desk_members.len(), 1);
+        assert!(blob.desk_order.is_empty());
+
+        // Legacy bare `Vec<OverlayAgent>` form.
+        let legacy = r#"[{"id":"a","name":"A","role":"r"}]"#;
+        let blob = OverlayBlob::parse(legacy).expect("legacy array");
+        assert!(blob.desk_order.is_empty());
+    }
+
+    /// `is_roster_agent` accepts both manifest agents and overlay teammates, and
+    /// rejects an unknown id — the validation the desk-add route relies on.
+    #[test]
+    fn is_roster_agent_covers_manifest_and_overlay() {
+        let manifest = "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n";
+        let mut record = desk_record(manifest, Vec::new());
+        record.overlay_agents.push(OverlayAgent {
+            id: "nova".into(),
+            name: "Nova".into(),
+            role: "Growth".into(),
+            description: None,
+        });
+        assert!(record.is_roster_agent("ceo"));
+        assert!(record.is_roster_agent("nova"));
+        assert!(!record.is_roster_agent("ghost"));
+    }
+
+    /// The persisted overlay blob reads both the current object form and the
+    /// legacy bare-`overlay_agents`-array form, so existing sqlite/mongo rows
+    /// load without a migration.
+    #[test]
+    fn overlay_blob_parses_object_and_legacy_array() {
+        let object = r#"{"agents":[{"id":"a","name":"A","role":"r"}],"desk_members":[{"desk_id":"d","agent_id":"a"}]}"#;
+        let blob = OverlayBlob::parse(object).expect("object");
+        assert_eq!(blob.agents.len(), 1);
+        assert_eq!(blob.desk_members.len(), 1);
+        // Issue #85: an object written before provenance existed omits the key;
+        // `#[serde(default)]` loads it as `None` (zero-migration back-compat).
+        assert!(blob.provenance.is_none());
+
+        // Legacy: overlay_json used to hold a bare Vec<OverlayAgent>.
+        let legacy = r#"[{"id":"a","name":"A","role":"r"}]"#;
+        let blob = OverlayBlob::parse(legacy).expect("legacy array");
+        assert_eq!(blob.agents.len(), 1);
+        assert!(blob.desk_members.is_empty());
+        assert!(blob.provenance.is_none());
+
+        // The empty-array default persisted by fresh schema.
+        let blob = OverlayBlob::parse("[]").expect("empty array");
+        assert!(blob.agents.is_empty());
+        assert!(blob.desk_members.is_empty());
+        assert!(blob.provenance.is_none());
+        assert!(blob.desks.is_empty());
+
+        // A pre-desk-creation object row (no `desks` key) loads with an empty
+        // desk overlay — no migration needed.
+        let pre_desks = r#"{"agents":[],"desk_members":[]}"#;
+        let blob = OverlayBlob::parse(pre_desks).expect("pre-desks object");
+        assert!(blob.desks.is_empty());
+    }
+
+    /// Issue #85: a record's template provenance round-trips through the
+    /// `OverlayBlob` the sqlite/mongodb stores persist, and a blob carrying
+    /// provenance re-parses with it intact.
+    #[test]
+    fn overlay_blob_carries_template_provenance() {
+        let mut record = desk_record("[company]\nname = \"Acme\"\n", Vec::new());
+        record.template_provenance = Some(TemplateProvenance {
+            source_id: "agentic_law_firm".to_string(),
+            version: Some("2.0.0".to_string()),
+            path: Some("companies/agentic_law_firm".to_string()),
+        });
+        let json = serde_json::to_string(&OverlayBlob::from_record(&record)).expect("serialize");
+        let blob = OverlayBlob::parse(&json).expect("reparse");
+        assert_eq!(blob.provenance, record.template_provenance);
+    }
+
+    /// Issue #168: a runtime-authored workflow body round-trips through the
+    /// `OverlayBlob` the sqlite/mongodb stores persist as `overlay_json`. On a
+    /// hosted tenant this blob is the ONLY copy of the graph, so a serialization
+    /// gap here would silently delete the workflow.
+    #[test]
+    fn overlay_blob_round_trips_workflows() {
+        let mut record = desk_record("[company]\nname = \"Acme\"\n", Vec::new());
+        record.overlay_workflows.push(OverlayWorkflow {
+            id: "greeter".to_string(),
+            toml: "id = \"greeter\"\nname = \"Greeter\"\n".to_string(),
+        });
+        let json = serde_json::to_string(&OverlayBlob::from_record(&record)).expect("serialize");
+        let blob = OverlayBlob::parse(&json).expect("reparse");
+        assert_eq!(blob.workflows, record.overlay_workflows);
+
+        // A row written before workflow bodies persisted (no `workflows` key)
+        // loads as empty — no migration needed.
+        let legacy = r#"{"agents":[],"desk_members":[]}"#;
+        assert!(
+            OverlayBlob::parse(legacy)
+                .expect("pre-workflows object")
+                .workflows
+                .is_empty()
+        );
+        // …and so does the legacy bare-array form.
+        assert!(
+            OverlayBlob::parse("[]")
+                .expect("legacy array")
+                .workflows
+                .is_empty()
+        );
+    }
+
+    /// An operator-created overlay desk resolves through the same
+    /// `effective_desk_members` / `resolve_desk_id` / `desk_exists` helpers the
+    /// manifest desks use, so the REST list and the harness desk-lead resolver
+    /// treat it identically. Member additions still layer on top.
+    #[test]
+    fn overlay_desk_resolves_like_a_manifest_desk() {
+        let manifest = "[company]\nname = \"Acme\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n";
+        let mut record = desk_record(manifest, Vec::new());
+        record.overlay_desks.push(OverlayDesk {
+            id: "growth".into(),
+            name: "Growth".into(),
+            description: None,
+            members: vec!["eng".into()],
+        });
+        // Resolves by id and by case-insensitive name.
+        assert_eq!(record.resolve_desk_id("growth").as_deref(), Some("growth"));
+        assert_eq!(record.resolve_desk_id("GROWTH").as_deref(), Some("growth"));
+        assert!(record.desk_exists("growth"));
+        // Founding member is the lead; a later overlay addition appends.
+        assert_eq!(
+            record.effective_desk_members("growth"),
+            vec!["eng".to_string()]
+        );
+        record.overlay_desk_members.push(OverlayDeskMember {
+            desk_id: "growth".into(),
+            agent_id: "ceo".into(),
+        });
+        assert_eq!(
+            record.effective_desk_members("growth"),
+            vec!["eng".to_string(), "ceo".to_string()]
+        );
+    }
+
+    /// The overlay blob round-trips operator-created desks through its persisted
+    /// JSON form, so a created desk survives a store save/load cycle.
+    #[test]
+    fn overlay_blob_round_trips_desks() {
+        let with_desks = r#"{"agents":[],"desk_members":[],"desks":[{"id":"growth","name":"Growth","members":["eng"]}]}"#;
+        let blob = OverlayBlob::parse(with_desks).expect("object with desks");
+        assert_eq!(blob.desks.len(), 1);
+        assert_eq!(blob.desks[0].id, "growth");
+        assert_eq!(blob.desks[0].members, vec!["eng".to_string()]);
+        // Re-serialize and re-parse — the desk survives the round trip.
+        let json = serde_json::to_string(&blob).expect("serialize");
+        let again = OverlayBlob::parse(&json).expect("reparse");
+        assert_eq!(again.desks, blob.desks);
+    }
+
+    // ── Issue #228: a workflow run's outcome is journaled ───────────────────
+
+    fn delivery(node: &str, status: DeliveryStatus) -> DeliveryReport {
+        DeliveryReport {
+            node: node.to_string(),
+            kind: "owner".to_string(),
+            target: Some("ada@example.com".to_string()),
+            status,
+            detail: "emailed the company's admin".to_string(),
+            reason: crate::ports::DeliveryReason::OwnerEmailed,
+        }
+    }
+
+    /// The full-bodied variant survives the JSONL round trip the journal puts
+    /// every event through — including the delivery rows, which are the whole
+    /// reason the event exists.
+    #[test]
+    fn workflow_run_finished_round_trips_with_every_field() {
+        let event = CompanyEvent::WorkflowRunFinished {
+            workflow_id: "digest".to_string(),
+            scheduled: true,
+            run_id: Some("run-1".to_string()),
+            deliveries: vec![
+                delivery("owner_summary", DeliveryStatus::Skipped),
+                delivery("also_sent", DeliveryStatus::Sent),
+            ],
+            pending_approvals: vec!["review".to_string()],
+            error: None,
+        };
+        assert_eq!(round_trip(&event), event);
+    }
+
+    /// The failed-run shape round-trips too. This is the arm that today only
+    /// warns to host stdout, so it is the one an operator most needs read back.
+    #[test]
+    fn workflow_run_finished_round_trips_a_failed_run() {
+        let event = CompanyEvent::WorkflowRunFinished {
+            workflow_id: "digest".to_string(),
+            scheduled: true,
+            run_id: None,
+            deliveries: Vec::new(),
+            pending_approvals: Vec::new(),
+            error: Some("agent node `worker` had no inference source".to_string()),
+        };
+        assert_eq!(round_trip(&event), event);
+    }
+
+    /// The additive contract, both halves.
+    ///
+    /// **Forward:** a minimal line — only the two required fields, exactly what
+    /// a future/older writer might emit — still loads, so no persisted journal
+    /// needs migrating.
+    ///
+    /// **Backward:** an empty run serializes to *only* those two fields. Every
+    /// optional/collection field is `skip_serializing_if`, which is what keeps
+    /// the wire form of an outcome-less run minimal rather than littered with
+    /// nulls and `[]`s.
+    #[test]
+    fn workflow_run_finished_omits_and_defaults_its_optional_fields() {
+        let json = r#"{"kind":"WorkflowRunFinished","workflow_id":"digest","scheduled":false}"#;
+        let event: CompanyEvent = serde_json::from_str(json).expect("minimal line loads");
+        assert_eq!(
+            event,
+            CompanyEvent::WorkflowRunFinished {
+                workflow_id: "digest".to_string(),
+                scheduled: false,
+                run_id: None,
+                deliveries: Vec::new(),
+                pending_approvals: Vec::new(),
+                error: None,
+            }
+        );
+        // …and serializing it back emits nothing extra.
+        let out = serde_json::to_string(&event).expect("serialize");
+        assert!(!out.contains("run_id"), "{out}");
+        assert!(!out.contains("deliveries"), "{out}");
+        assert!(!out.contains("pending_approvals"), "{out}");
+        assert!(!out.contains("error"), "{out}");
+    }
+
+    /// Issue #259's two variants pin their wire shape the same way
+    /// `WorkflowCreated` does: `kind` + `workflow_id` + `name`, with `by`
+    /// omitted entirely when absent so the common unattributed line stays the
+    /// short one.
+    #[test]
+    fn workflow_updated_and_deleted_pin_their_wire_shape() {
+        let updated = CompanyEvent::WorkflowUpdated {
+            workflow_id: "digest".to_string(),
+            name: "Daily digest".to_string(),
+            by: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&updated).expect("serialize"),
+            r#"{"kind":"WorkflowUpdated","workflow_id":"digest","name":"Daily digest"}"#
+        );
+
+        let deleted = CompanyEvent::WorkflowDeleted {
+            workflow_id: "digest".to_string(),
+            name: "Daily digest".to_string(),
+            by: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&deleted).expect("serialize"),
+            r#"{"kind":"WorkflowDeleted","workflow_id":"digest","name":"Daily digest"}"#
+        );
+
+        // Both round-trip.
+        for event in [updated, deleted] {
+            let line = serde_json::to_string(&event).expect("serialize");
+            let back: CompanyEvent = serde_json::from_str(&line).expect("deserialize");
+            assert_eq!(back, event);
+        }
+    }
+
+    /// The graph body must never reach the journal — see the variant docs. A
+    /// reader of the shared append-only log (operator SSE, the inference
+    /// sidecar) has no business seeing agent prompts or destination addresses,
+    /// and the only way a body could leak here is someone adding a field.
+    #[test]
+    fn workflow_updated_carries_no_graph_body() {
+        let line = serde_json::to_string(&CompanyEvent::WorkflowUpdated {
+            workflow_id: "digest".to_string(),
+            name: "Daily digest".to_string(),
+            by: None,
+        })
+        .expect("serialize");
+        assert!(!line.contains("toml"), "{line}");
+        assert!(!line.contains("node"), "{line}");
+        assert!(!line.contains("graph"), "{line}");
+    }
+
+    /// **The backcompat proof.** A journal written before this variant existed
+    /// still loads, line for line, and every one of those lines re-serializes
+    /// byte-identically — which is what "additive, no migration" actually
+    /// claims. Adding an enum variant cannot change how a sibling serializes,
+    /// but nothing else in the suite asserts it for the whole log, and a
+    /// regression here would corrupt an export/import round trip silently.
+    #[test]
+    fn a_journal_written_before_this_variant_still_loads_byte_identically() {
+        // Verbatim lines in the pre-#228 on-disk shapes, including the pre-`by`
+        // / pre-`chat` `OperatorMessage` and the pre-`steps` `AgentReply`.
+        let legacy = [
+            r#"{"kind":"OperatorMessage","text":"ship it"}"#,
+            r#"{"kind":"AgentReply","chat_id":"general","agent_id":"ceo","text":"on it"}"#,
+            r#"{"kind":"ScheduleFired","cron":"0 9 * * *","prompt":"daily"}"#,
+            r#"{"kind":"WorkflowCreated","workflow_id":"digest","name":"Digest"}"#,
+            r#"{"kind":"TaskDispatched","task_id":"t-1"}"#,
+            r#"{"kind":"DeskTaskCompleted","task_id":"t-1","desk":"ceo","output":"done","column":"in_review"}"#,
+        ];
+        for line in legacy {
+            let event: CompanyEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("pre-#228 journal line must still load: {line} — {e}"));
+            let again = serde_json::to_string(&event).expect("serialize");
+            assert_eq!(again, line, "pre-#228 line must re-serialize unchanged");
+        }
+    }
+
+    /// Issue #242: an effect remembers which task attempt produced it, and the
+    /// field is additive in the same way `Effect::agent` was — a journal line
+    /// written before it existed replays as `None` (no run correlation, the
+    /// pre-#242 behaviour) rather than failing to parse and taking the whole
+    /// approval queue down with it on replay.
+    #[test]
+    fn effect_run_id_round_trips_and_a_legacy_line_replays_as_none() {
+        let mut effect = Effect {
+            kind: "composio.execute".to_string(),
+            group: EffectGroup::Other,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "tool": "GMAIL_SEND_EMAIL" }),
+            agent: Some("finance".to_string()),
+            run_id: None,
+        };
+        let untagged = serde_json::to_string(&effect).expect("serialize");
+        assert!(
+            !untagged.contains("run_id"),
+            "an untagged effect's wire form must be unchanged: {untagged}"
+        );
+
+        effect.run_id = Some("run-7".to_string());
+        let tagged = serde_json::to_string(&effect).expect("serialize");
+        assert!(tagged.contains(r#""run_id":"run-7""#), "{tagged}");
+        assert_eq!(
+            effect,
+            serde_json::from_str::<Effect>(&tagged).expect("round trip")
+        );
+
+        // The pre-#242 line: same bytes, no field.
+        let legacy: Effect = serde_json::from_str(&untagged).expect("legacy effect must load");
+        assert_eq!(legacy.run_id, None);
+        assert_eq!(
+            legacy.agent.as_deref(),
+            Some("finance"),
+            "the earlier additive field must still be read alongside the new one"
+        );
+    }
+
+    /// Issue #242: the run id rides the dispatch event, and it is additive in
+    /// both directions — a tagged dispatch round-trips it, and an untagged one
+    /// serializes exactly the shape a pre-#242 journal holds (asserted verbatim
+    /// above too, but here against the *writer* rather than the reader).
+    #[test]
+    fn task_dispatched_carries_its_run_id_without_changing_the_untagged_shape() {
+        let untagged = CompanyEvent::TaskDispatched {
+            task_id: "t-1".to_string(),
+            run_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).expect("serialize"),
+            r#"{"kind":"TaskDispatched","task_id":"t-1"}"#
+        );
+
+        let tagged = CompanyEvent::TaskDispatched {
+            task_id: "t-1".to_string(),
+            run_id: Some("run-7".to_string()),
+        };
+        let line = serde_json::to_string(&tagged).expect("serialize");
+        assert!(line.contains(r#""run_id":"run-7""#), "{line}");
+        assert_eq!(
+            tagged,
+            serde_json::from_str::<CompanyEvent>(&line).expect("round trip")
+        );
+
+        // A legacy line loads as an untagged dispatch rather than failing.
+        let legacy: CompanyEvent =
+            serde_json::from_str(r#"{"kind":"TaskDispatched","task_id":"t-1"}"#).expect("legacy");
+        assert_eq!(legacy, untagged);
     }
 
     #[test]

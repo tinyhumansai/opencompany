@@ -27,10 +27,31 @@ live cognition is gated.
 | --- | --- |
 | `OPENCOMPANY_COMPANY` | The company to load (used by container images). |
 | `OPENCOMPANY_BIND` | Bind address; the platform harness injects `0.0.0.0:8080`. |
-| `OPENCOMPANY_DATA_DIR` | Where durable state lives; defaults to a local folder. |
+| `OPENCOMPANY_DATA_DIR` | Where durable state lives; defaults to a local folder. Set it to run two hosts side by side without them sharing one company store. The `--home` flag overrides it for company bundles only — the shared workspace directories still follow this variable, so isolating two hosts with `--home` alone only half-works. |
 | `OPENCOMPANY_PUBLIC_URL` | The externally reachable URL, used for discovery. |
 
 The CLI mirrors several of these as flags — see the [CLI reference](cli.md).
+
+## Inference: managed or bring-your-own (BYOK)
+
+By default agents think with the managed TinyHumans brain, keyed by
+`TINYHUMANS_API_KEY`. The managed default is also tunable by env:
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENCOMPANY_INFERENCE_KEY` | Per-tenant override for `TINYHUMANS_API_KEY`. |
+| `OPENCOMPANY_INFERENCE_URL` | Managed base URL override. |
+| `OPENCOMPANY_INFERENCE_MODEL` | Pins the **whole roster** to one workload; unset keeps each agent's tier. |
+
+A company can instead **bring its own key** (issue #56) — OpenRouter, any
+OpenAI-compatible endpoint, or a local Ollama server — via a manifest
+`[inference]` section (see [manifest spec](../../docs/spec/runtime/manifest.md))
+or, live from the operator console under **Connections → Inference**. The
+outbound key is **write-only**: it is stored server-side and never returned in
+any status/API response. Precedence is **console override > manifest
+`[inference]` > managed default**, and a switch takes effect on the agents'
+next turn with no restart. A BYOK-only tenant needs no `TINYHUMANS_API_KEY` at
+all.
 
 ## Storage backends
 
@@ -57,6 +78,25 @@ Both optional and off by default:
 
 Requires the `tinyplace` feature and `serve --discoverable` to reach the
 network — see [The tiny.place economy](../overview/tiny-place.md).
+
+## Channels: Telegram
+
+Setup is a bot token and nothing else. Create a bot with @BotFather and paste
+its token under **Connections → Channels**; the host collects messages by
+long-polling Telegram (`getUpdates`), which dials *out*, so it works on
+localhost, behind NAT, and on any self-hosted box with no public URL. Needs the
+`telegram` feature for the outbound transport.
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENCOMPANY_TELEGRAM_POLL_SECONDS` | Long-poll hold and idle back-off; default `30`. |
+
+An inbound **webhook** is an optional fast-path for a publicly reachable host:
+set `OPENCOMPANY_PUBLIC_URL` to a public **https** URL and the console offers a
+webhook URL plus a secret to register with. Without one there is nothing to
+offer — Telegram cannot deliver to a private address — so the console shows no
+webhook at all, rather than a URL that silently never fires. Polling stands down
+on its own while a webhook is registered.
 
 ## Inspect what's set
 

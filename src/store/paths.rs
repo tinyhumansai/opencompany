@@ -17,23 +17,137 @@
 //! `secrets/` and `keys/` are excluded from bundle exports (see
 //! [`Bundle::EXPORT_EXCLUDES`]) so a shared bundle never leaks the company's
 //! signing key or per-company secrets.
+//!
+//! [`resolve_home`] resolves the `<home>` root every bundle hangs off, and is
+//! the only place that decision is made. It resolves to the instance workspace
+//! root in every branch, so the single `companies/` segment above is the only
+//! one; installs predating that carry an extra level and are moved up on boot by
+//! [`migrate_legacy_nest`](crate::store::migrate::migrate_legacy_nest).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::types::CompanyId;
 
-/// Resolves the OpenCompany home root.
+/// The one environment knob that places an instance's data root. Also read by
+/// [`data_dir_from_env`](crate::app::config::data_dir_from_env) for the
+/// workspace layout, so a single value moves an entire instance.
+pub const DATA_DIR_ENV: &str = "OPENCOMPANY_DATA_DIR";
+
+/// A knob that never worked. It was documented in this module and read by a
+/// helper no binary path ever called, so exporting it silently did nothing.
+/// [`resolve_home`] now rejects it by name instead of ignoring it.
+const REMOVED_HOME_ENV: &str = "OPENCOMPANY_HOME";
+
+/// Resolves the OpenCompany home — the root every [`Bundle`] hangs off — from
+/// the `--home` flag and the process environment.
 ///
-/// Honours `OPENCOMPANY_HOME`, otherwise falls back to `~/.opencompany`
-/// (computed from `$HOME`). No `dirs` dependency.
-pub fn default_home() -> PathBuf {
-    if let Ok(home) = std::env::var("OPENCOMPANY_HOME") {
-        return PathBuf::from(home);
+/// Precedence, highest first:
+///
+/// 1. **`--home`** (`flag`). Outranks [`DATA_DIR_ENV`] and the legacy default
+///    below. It does not suppress the [`REMOVED_HOME_ENV`] rejection, which is
+///    checked ahead of every branch — see [Errors](#errors) — so `--home` wins
+///    the *choice* of root but never skips that validation.
+/// 2. **`OPENCOMPANY_DATA_DIR`** ([`DATA_DIR_ENV`]), used verbatim. This is the
+///    same value a hosted tenant's entrypoint already forwards as
+///    `--home "$OPENCOMPANY_DATA_DIR"`, so the flag and the variable resolve
+///    identically and the workspace layout and the company bundles share one
+///    root (`<root>/companies/<slug>`, matching
+///    [`DataLayout::companies_dir`](crate::store::DataLayout::companies_dir)).
+/// 3. **`$HOME/.opencompany`**, the local default. Falls back to a relative
+///    `.opencompany` when `$HOME` is unset.
+///
+/// All three branches resolve the home to the *workspace root*, so bundles land
+/// at `<root>/companies/<slug>` in every case — the layout
+/// [`DataLayout::companies_dir`](crate::store::DataLayout::companies_dir) and
+/// `docs/spec/runtime/storage.md` document. The default used to append a
+/// `companies` leaf of its own on top of the one [`Bundle::new`] adds, nesting a
+/// default local install's bundles at `~/.opencompany/companies/companies/<slug>`.
+/// That leaf is gone; existing installs are moved up on first launch by
+/// [`migrate_legacy_nest`](crate::store::migrate::migrate_legacy_nest), which `serve`,
+/// `export`, and `import` all run before touching the home.
+///
+/// An empty variable counts as unset: an empty `OPENCOMPANY_DATA_DIR` would
+/// otherwise root the instance at the process working directory.
+///
+/// # Errors
+///
+/// Fails when [`REMOVED_HOME_ENV`] is set — including when `--home` is passed,
+/// because a caller who exported it believes it is placing the data and must be
+/// told otherwise before a stale deploy script silently splits a store.
+/// Ignoring it is what made this class of mistake cost an hour rather than a
+/// minute: several hosts started with different values all shared one store, and
+/// the contaminated roster read as a product bug rather than a configuration
+/// one.
+pub fn resolve_home(flag: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_home_from(
+        flag,
+        std::env::var_os(DATA_DIR_ENV),
+        std::env::var_os(REMOVED_HOME_ENV),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure core of [`resolve_home`], taking raw environment values so the
+/// precedence chain is tested without mutating the process environment.
+fn resolve_home_from(
+    flag: Option<PathBuf>,
+    data_dir: Option<OsString>,
+    removed_home: Option<OsString>,
+    unix_home: Option<OsString>,
+) -> Result<PathBuf> {
+    let set = |value: Option<OsString>| value.filter(|value| !value.is_empty());
+
+    // Checked before the flag: a caller who exported the removed variable
+    // believes it is doing something, and must hear otherwise either way.
+    if set(removed_home).is_some() {
+        return Err(OpenCompanyError::Config(format!(
+            "{REMOVED_HOME_ENV} is not read by OpenCompany. Unset it and use \
+             {DATA_DIR_ENV} (or the --home flag) to place the instance data root."
+        )));
     }
-    let base = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join(".opencompany")
+    if let Some(flag) = flag {
+        return Ok(flag);
+    }
+    if let Some(dir) = set(data_dir) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(match set(unix_home) {
+        Some(home) => PathBuf::from(home).join(".opencompany"),
+        None => PathBuf::from(".opencompany"),
+    })
+}
+
+/// The operator warning for the one split that survives this resolution: an
+/// explicit `--home` puts company bundles in one place while the instance
+/// workspace (`memory/`, `store/`, `files/`, `logs/`, `tmp/`) stays under the
+/// data root. Isolating two hosts with `--home` alone therefore only half-works
+/// — the bundles separate, the workspace does not.
+///
+/// `data_root` is [`data_dir_from_env`](crate::app::config::data_dir_from_env).
+/// Silent in the one aligned shape, `home == data_root`, which now covers every
+/// branch of [`resolve_home`]: a hosted tenant
+/// (`--home "$OPENCOMPANY_DATA_DIR"`), `OPENCOMPANY_DATA_DIR` alone, and the
+/// untouched local default.
+///
+/// One deliberate consequence: an explicit `--home ~/.opencompany/companies`
+/// recreates the old doubled shape and now warns where the legacy default was
+/// silent. That is correct — the bundles really are one level away from the
+/// workspace there.
+pub fn home_divergence_warning(home: &Path, data_root: &Path) -> Option<String> {
+    if home == data_root {
+        return None;
+    }
+    Some(format!(
+        "company bundles resolve under {}, but the instance workspace (memory/, \
+         store/, files/, logs/, tmp/) resolves under {}. Two hosts isolated by \
+         --home alone still share that workspace — set {DATA_DIR_ENV} instead, \
+         or to the same path, to keep an instance in one place.",
+        home.display(),
+        data_root.display(),
+    ))
 }
 
 /// Converts a company id into a filesystem-safe directory name.
@@ -165,6 +279,37 @@ impl Bundle {
     /// last-write-wins per id).
     pub fn facts_jsonl(&self) -> PathBuf {
         self.dir.join("facts.jsonl")
+    }
+
+    /// Path to the versioned task-artifact log (`artifacts.jsonl`, one artifact
+    /// per line with its full version history; last-write-wins per id).
+    pub fn artifacts_jsonl(&self) -> PathBuf {
+        self.dir.join("artifacts.jsonl")
+    }
+
+    /// Path to the task-run log (`runs.jsonl`, one [`RunRecord`] per line;
+    /// last-write-wins per id).
+    ///
+    /// One shared log rather than a file per run: a run id would otherwise
+    /// become a path component, and a store must never let an id it did not
+    /// mint address the filesystem.
+    ///
+    /// [`RunRecord`]: crate::ports::runs::RunRecord
+    pub fn runs_jsonl(&self) -> PathBuf {
+        self.dir.join("runs.jsonl")
+    }
+
+    /// Path to the run step traces (`run-steps.jsonl`, one
+    /// [`RunStepRecord`] per line; last-write-wins per `(run_id, step_seq)`).
+    ///
+    /// Separate from `runs.jsonl` so a step is a **true append** — the run row
+    /// mutates on every transition and is rewritten, but a trace only ever
+    /// grows, and rewriting the whole trace per step would make a long attempt
+    /// quadratic.
+    ///
+    /// [`RunStepRecord`]: crate::ports::runs::RunStepRecord
+    pub fn run_steps_jsonl(&self) -> PathBuf {
+        self.dir.join("run-steps.jsonl")
     }
 
     /// Path to the human user directory (`users.json`, the full set as a JSON
@@ -346,15 +491,182 @@ mod test {
         assert!(Bundle::export_excludes().contains(&"secrets"));
     }
 
+    /// `resolve_home_from` with only the values a case cares about.
+    fn resolve(flag: Option<&str>, data_dir: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
+        resolve_home_from(
+            flag.map(PathBuf::from),
+            data_dir.map(OsString::from),
+            None,
+            home.map(OsString::from),
+        )
+    }
+
     #[test]
-    fn default_home_prefers_env_override() {
-        // SAFETY: single-threaded test; restores prior state.
-        let prev = std::env::var("OPENCOMPANY_HOME").ok();
-        unsafe { std::env::set_var("OPENCOMPANY_HOME", "/custom/home") };
-        assert_eq!(default_home(), PathBuf::from("/custom/home"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var("OPENCOMPANY_HOME", v) },
-            None => unsafe { std::env::remove_var("OPENCOMPANY_HOME") },
+    fn the_flag_outranks_the_data_dir_variable() {
+        // An explicit --home is never overridden by the environment.
+        assert_eq!(
+            resolve(Some("/flag"), Some("/env"), Some("/home/u")).unwrap(),
+            PathBuf::from("/flag")
+        );
+    }
+
+    #[test]
+    fn the_data_dir_variable_outranks_the_default() {
+        // The bug this file exists to fix: OPENCOMPANY_DATA_DIR is read, and
+        // used verbatim so it matches the `--home "$OPENCOMPANY_DATA_DIR"` a
+        // hosted tenant's entrypoint passes.
+        assert_eq!(
+            resolve(None, Some("/data"), Some("/home/u")).unwrap(),
+            PathBuf::from("/data")
+        );
+        // Verbatim means bundles land at <root>/companies/<slug>, i.e. exactly
+        // DataLayout::companies_dir() — one root for the whole instance.
+        let bundle = Bundle::new(
+            resolve(None, Some("/data"), Some("/home/u")).unwrap(),
+            &CompanyId::new("acme"),
+        );
+        assert_eq!(bundle.dir(), Path::new("/data/companies/acme"));
+    }
+
+    #[test]
+    fn the_default_resolves_to_the_workspace_root() {
+        // The default no longer appends a `companies` leaf on top of the one
+        // `Bundle::new` adds, so a default local install has the same
+        // single-root shape as a hosted tenant. Existing doubled installs are
+        // moved up by `store::migrate::migrate_legacy_nest` rather than orphaned.
+        assert_eq!(
+            resolve(None, None, Some("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.opencompany")
+        );
+        let bundle = Bundle::new(
+            resolve(None, None, Some("/home/u")).unwrap(),
+            &CompanyId::new("acme"),
+        );
+        assert_eq!(
+            bundle.dir(),
+            Path::new("/home/u/.opencompany/companies/acme")
+        );
+        // No $HOME keeps the relative fallback.
+        assert_eq!(
+            resolve(None, None, None).unwrap(),
+            PathBuf::from(".opencompany")
+        );
+    }
+
+    #[test]
+    fn every_branch_resolves_to_the_same_shape() {
+        // Flag, variable, and default now agree: the home is the workspace root
+        // and bundles hang off `<root>/companies/<slug>` in all three.
+        let roots = [
+            resolve(Some("/root"), None, None).unwrap(),
+            resolve(None, Some("/root"), None).unwrap(),
+            resolve(None, None, Some("/root")).unwrap(),
+        ];
+        assert_eq!(roots[0], roots[1]);
+        assert_eq!(roots[2], PathBuf::from("/root/.opencompany"));
+        for root in roots {
+            let bundle = Bundle::new(root.clone(), &CompanyId::new("acme"));
+            assert_eq!(bundle.dir(), root.join("companies").join("acme"));
         }
+    }
+
+    #[test]
+    fn an_empty_data_dir_counts_as_unset() {
+        // Empty would otherwise root the instance at the working directory.
+        assert_eq!(
+            resolve(None, Some(""), Some("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.opencompany")
+        );
+        assert_eq!(
+            resolve(None, Some(""), Some("")).unwrap(),
+            PathBuf::from(".opencompany")
+        );
+    }
+
+    #[test]
+    fn the_removed_home_variable_fails_loudly() {
+        let err = resolve_home_from(
+            None,
+            None,
+            Some(OsString::from("/custom/home")),
+            Some(OsString::from("/home/u")),
+        )
+        .expect_err("OPENCOMPANY_HOME must not be silently ignored");
+        let message = err.to_string();
+        assert!(message.contains(REMOVED_HOME_ENV), "{message}");
+        assert!(
+            message.contains(DATA_DIR_ENV),
+            "names the real knob: {message}"
+        );
+
+        // Loud even alongside an explicit --home, so the mistaken belief that
+        // the variable does something is always corrected.
+        assert!(
+            resolve_home_from(
+                Some(PathBuf::from("/flag")),
+                None,
+                Some(OsString::from("/custom/home")),
+                None,
+            )
+            .is_err()
+        );
+
+        // An empty value is not "set" and stays silent.
+        assert!(resolve_home_from(None, None, Some(OsString::new()), None).is_ok());
+    }
+
+    #[test]
+    fn aligned_roots_never_warn() {
+        // Hosted: the entrypoint passes --home "$OPENCOMPANY_DATA_DIR", and
+        // OPENCOMPANY_DATA_DIR alone lands the same way.
+        assert!(
+            home_divergence_warning(Path::new("/data"), Path::new("/data")).is_none(),
+            "one root for the whole instance is the intended shape"
+        );
+        // The default local run: both the home and the data root resolve to
+        // $HOME/.opencompany now, so an ordinary run is silent without needing a
+        // special case for a doubled shape.
+        assert!(
+            home_divergence_warning(
+                Path::new("/home/u/.opencompany"),
+                Path::new("/home/u/.opencompany"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn recreating_the_old_doubled_shape_by_hand_now_warns() {
+        // A deliberate consequence of dropping the default's `companies` leaf:
+        // an explicit --home at the old path really does put the bundles one
+        // level away from the workspace, which is exactly what this warning is
+        // for. It used to be special-cased silent.
+        let warning = home_divergence_warning(
+            Path::new("/home/u/.opencompany/companies"),
+            Path::new("/home/u/.opencompany"),
+        )
+        .expect("an explicit --home at the legacy path is a real divergence");
+        assert!(
+            warning.contains("/home/u/.opencompany/companies"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn a_split_instance_warns_with_both_roots_named() {
+        // `--home` disagreeing with a set OPENCOMPANY_DATA_DIR.
+        let warning = home_divergence_warning(Path::new("/flag"), Path::new("/data"))
+            .expect("a disagreeing flag and data root must warn");
+        assert!(warning.contains("/flag"), "{warning}");
+        assert!(warning.contains("/data"), "{warning}");
+
+        // `--home` alone, with the data root left at its default: the bundles
+        // separate but the shared workspace does not, which is the half-working
+        // isolation that made this bug expensive.
+        let warning =
+            home_divergence_warning(Path::new("/tmp/oc-a"), Path::new("/home/u/.opencompany"))
+                .expect("--home alone leaves the workspace shared and must warn");
+        assert!(warning.contains("/tmp/oc-a"), "{warning}");
+        assert!(warning.contains("/home/u/.opencompany"), "{warning}");
     }
 }

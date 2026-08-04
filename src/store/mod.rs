@@ -17,6 +17,14 @@ pub mod fs;
 /// Filesystem backends for the WS3 console ports (tasks, facts, usage,
 /// skill-state, workspace tree) over the same [`Bundle`](paths::Bundle) layout.
 pub mod fs_ops;
+/// The canonical per-instance directory layout under `OPENCOMPANY_DATA_DIR`
+/// (`companies/`, `memory/`, `store/`, `files/`, `logs/`, `tmp/`) and the
+/// startup lifecycle that creates them and, by default, clears `tmp/`.
+pub mod layout;
+/// The one-shot boot migration off the legacy doubled home layout
+/// (`companies/companies/<slug>`), run by `serve`, `export`, and `import`
+/// against the resolved home before anything reads it.
+pub mod migrate;
 pub mod paths;
 
 /// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
@@ -37,13 +45,23 @@ pub mod sqlite;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
-/// TinyCortex-backed memory and context ports over a mockable client. TinyCortex
-/// is not checked out here, so the compiled backend is an offline in-memory
-/// client; a real HTTP client (inert until the service is reachable through the
-/// OpenHuman seam) is present behind the same feature. Only links under
+/// TinyCortex-backed memory and context ports over a mockable client. The
+/// company-scoped [`CortexClient`](tinycortex::CortexClient) seam plus the
+/// offline [`InMemoryCortex`](tinycortex::InMemoryCortex) test/fallback backend;
+/// the real persistent engine lives in [`tinycortex_engine`]. Only links under
 /// `tinycortex`.
 #[cfg(feature = "tinycortex")]
 pub mod tinycortex;
+
+/// The in-pod, persistent TinyCortex memory engine
+/// ([`EngineCortex`](tinycortex_engine::EngineCortex)): a real engine-backed
+/// [`CortexClient`](tinycortex::CortexClient) over the vendored `tinycortex`
+/// crate, keeping each company's traces, task results, and context chunks in a
+/// durable per-company SQLite workspace. Ships in degraded lexical/recency recall
+/// mode (no embedding compute — that lands in 188c2). Only links under
+/// `tinycortex`.
+#[cfg(feature = "tinycortex")]
+pub mod tinycortex_engine;
 
 /// A backend-agnostic port-conformance suite: async assertions parameterized
 /// over any [`CompanyStore`](crate::ports::CompanyStore) /
@@ -60,7 +78,13 @@ pub use fs::{
     FsCompanyStore, FsContextStore, FsEventLog, FsInboxStore, FsMemoryStore, FsSecretStore,
 };
 pub use fs_ops::FsOps;
-pub use paths::{Bundle, default_home};
+pub use layout::DataLayout;
+// Only the boot entry point is re-exported here. The migration is a one-shot
+// step the binary runs before it reads anything, and its silent core and result
+// types are its own business — reachable at `store::migrate::*` for anyone
+// reading the rules, not part of the store's own surface.
+pub use migrate::migrate_legacy_nest_announced;
+pub use paths::{Bundle, DATA_DIR_ENV, home_divergence_warning, resolve_home};
 pub use select::{
     MemoryBackend, MemoryOverlay, StorageHandles, StorageKind, StorageSettings,
     open_memory_overlay, open_storage,
@@ -73,9 +97,10 @@ pub use sqlite::SqliteStore;
 pub use mongodb::MongoStore;
 
 #[cfg(feature = "tinycortex")]
-pub use tinycortex::{
-    CortexClient, CortexContextStore, CortexMemoryStore, HttpCortexClient, InMemoryCortex,
-};
+pub use tinycortex::{CortexClient, CortexContextStore, CortexMemoryStore, InMemoryCortex};
+
+#[cfg(feature = "tinycortex")]
+pub use tinycortex_engine::EngineCortex;
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 

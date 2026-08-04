@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::brain::medulla::MockTransport;
-use crate::brain::medulla::wire::{self, EffectFrame, OrchErrorCode, Role, ToolCallFrame};
+use crate::brain::medulla::wire::{
+    self, EffectFrame, OrchErrorCode, Role, ToolCallFrame, UsageFrame,
+};
 use crate::ports::types::{
     ApprovalId, ChunkAddr, ChunkHit, CompanyEvent, ContextOp, ContextOpResult, Effect,
     EffectDisposition, ToolResult, Verdict,
@@ -71,6 +73,11 @@ impl CycleHost for RecordingHost {
         self.effects.lock().unwrap().push(effect);
         Ok(self.disposition.clone())
     }
+
+    async fn park_effect(&self, effect: Effect) -> Result<ApprovalId> {
+        self.effects.lock().unwrap().push(effect);
+        Ok(ApprovalId::new("appr-parked"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +110,7 @@ fn operator_request() -> CycleRequest {
         events: vec![CompanyEvent::OperatorMessage {
             text: "hi".into(),
             by: None,
+            chat: None,
         }],
         event_seqs: Vec::new(),
         compressed_history: Vec::new(),
@@ -127,6 +135,19 @@ fn tool_call_frame(name: &str, index: usize, args: Value) -> InboundFrame {
         name: name.into(),
         args,
         timeout_ms: wire::DEFAULT_TOOL_TIMEOUT_MS,
+    })
+}
+
+/// A usage report for the cycle under test (issue #174), keyed on the same
+/// deterministic dedupe id the server would derive.
+fn usage_frame(index: usize, input: u64, output: u64, cost_usd: Option<f64>) -> InboundFrame {
+    InboundFrame::Usage(UsageFrame {
+        cycle_id: cid(),
+        call_id: wire::call_id(&cid(), wire::USAGE_CALL_KIND, index),
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: 0,
+        cost_usd,
     })
 }
 
@@ -220,6 +241,98 @@ async fn duplicate_effect_frame_is_handled_once() {
     assert_eq!(host.effects.lock().unwrap().len(), 1);
     assert_eq!(transport.acks().len(), 1);
     assert_eq!(result.channel_responses.len(), 1);
+}
+
+// ── Issue #174: usage frames make the hosted path meterable ─────────────────
+
+/// Without this the hosted path is structurally unmetered: the model runs
+/// upstream, so a reported frame is the only way the host learns what it cost.
+#[tokio::test]
+async fn usage_frames_are_folded_into_the_cycle_total() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![
+            usage_frame(0, 900, 120, Some(0.014)),
+            usage_frame(1, 300, 40, Some(0.006)),
+        ],
+    );
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 1_200);
+    assert_eq!(result.token_usage.output, 160);
+    assert!((result.token_usage.cost_usd - 0.02).abs() < 1e-9);
+    // Usage is a report, not a request: nothing is acked or answered for it.
+    assert!(transport.acks().is_empty());
+    assert!(transport.tool_answers().is_empty());
+}
+
+/// Frame delivery is at-least-once, so a replayed usage report must not
+/// double-charge the meter.
+#[tokio::test]
+async fn duplicate_usage_frame_is_counted_once() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![
+            usage_frame(0, 500, 50, Some(0.01)),
+            usage_frame(0, 500, 50, Some(0.01)),
+        ],
+    );
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 500);
+    assert_eq!(result.token_usage.output, 50);
+    assert_eq!(result.token_usage.cost_usd, 0.01);
+}
+
+/// The managed passthrough bills backend-side and echoes no USD. Tokens still
+/// count — a `costUsd`-less frame is usage, not noise.
+#[tokio::test]
+async fn a_usage_frame_without_cost_still_reports_tokens() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(cid(), vec![usage_frame(0, 42, 7, None)]);
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert_eq!(result.token_usage.input, 42);
+    assert_eq!(result.token_usage.output, 7);
+    assert_eq!(result.token_usage.cost_usd, 0.0);
+}
+
+/// A backend that does not emit the frame yet stays compatible: the cycle simply
+/// reports zero, which the runtime meters as nothing rather than as a guess.
+#[tokio::test]
+async fn a_cycle_with_no_usage_frame_reports_zero() {
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![effect_frame("send_dm", 0, json!({ "body": "hi" }))],
+    );
+    let brain = brain(transport.clone());
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert!(result.token_usage.is_zero());
+}
+
+/// The brain declares where its usage is metered so the console can tell "no
+/// inference configured" from "inference ran but nothing was metered".
+#[test]
+fn cognition_reports_the_hosted_path_and_provider() {
+    let cognition = brain(Arc::new(MockTransport::new())).cognition();
+    assert_eq!(cognition.path, "hosted");
+    assert_eq!(cognition.provider, crate::metering::MEDULLA_PROVIDER);
+    assert_eq!(cognition.metering, UsageMetering::PerCycle);
 }
 
 #[tokio::test]
@@ -353,11 +466,11 @@ use crate::company::CompanyManifest;
 use crate::ports::types::{Actor, ActorKind};
 use crate::runtime::RuntimeBuilder;
 
-fn tmp_home() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "opencompany-hosted-{}",
-        crate::ports::generate_id()
-    ))
+fn tmp_home() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("opencompany-hosted-")
+        .tempdir()
+        .expect("tempdir")
 }
 
 fn manifest(policy_mode: &str) -> CompanyManifest {
@@ -387,7 +500,8 @@ fn runtime_cid() -> String {
 
 #[tokio::test]
 async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let transport = Arc::new(MockTransport::new());
     transport.script_cycle(
         runtime_cid(),
@@ -409,6 +523,7 @@ async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
         .run_cycle(vec![CompanyEvent::OperatorMessage {
             text: "how are we doing".into(),
             by: None,
+            chat: None,
         }])
         .await
         .unwrap();
@@ -432,13 +547,12 @@ async fn e2e_operator_message_drives_tool_call_and_gated_send_dm() {
     // A compressed trace was persisted to the fs-backed MemoryStore.
     let traces = rt.memory.recent_traces(rt.id(), 10).await.unwrap();
     assert!(!traces.is_empty());
-
-    tokio::fs::remove_dir_all(&home).await.ok();
 }
 
 #[tokio::test]
 async fn e2e_supervised_effect_parks_and_acks_not_ok() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let transport = Arc::new(MockTransport::new());
     transport.script_cycle(
         runtime_cid(),
@@ -458,6 +572,7 @@ async fn e2e_supervised_effect_parks_and_acks_not_ok() {
         .run_cycle(vec![CompanyEvent::OperatorMessage {
             text: "file it".into(),
             by: None,
+            chat: None,
         }])
         .await
         .unwrap();
@@ -492,6 +607,275 @@ async fn e2e_supervised_effect_parks_and_acks_not_ok() {
     .await
     .unwrap();
     assert!(rt.pending_approvals().is_empty());
+}
 
-    tokio::fs::remove_dir_all(&home).await.ok();
+/// Issue #174 end to end: a real runtime on the hosted brain records the tokens
+/// and cost the wire reported, so the console's Usage view stops reading zero.
+#[tokio::test]
+async fn e2e_reported_usage_lands_on_the_usage_meter() {
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
+    let transport = Arc::new(MockTransport::new());
+    // `cid()` and `runtime_cid()` are the same deterministic id: company `acme`,
+    // first event at seq 0.
+    transport.script_cycle(
+        runtime_cid(),
+        vec![
+            usage_frame(0, 1_500, 260, Some(0.042)),
+            effect_frame("send_dm", 0, json!({ "body": "on it" })),
+        ],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "how are we doing".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    let samples = rt.usage().query(rt.id(), 0).await.unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].input_tokens, 1_500);
+    assert_eq!(samples[0].output_tokens, 260);
+    assert_eq!(samples[0].cost_usd, 0.042);
+    assert_eq!(samples[0].provider, crate::metering::MEDULLA_PROVIDER);
+    assert_eq!(
+        samples[0].kind,
+        crate::ports::usage::SampleKind::Inference,
+        "hosted cycles meter as inference, not as an OAuth call"
+    );
+
+    // The spend also reaches Finances as an `inference.spend` ledger entry.
+    let record = rt.store().load(rt.id()).await.unwrap().unwrap();
+    assert!(
+        record
+            .ledger
+            .iter()
+            .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND && e.amount_usd == 0.042)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #176: hosted-path delegation (durable async hand-off, no local
+// cognition) + handed-task awareness.
+// ---------------------------------------------------------------------------
+
+/// A manifest with an Engineering desk (`eng`) whose lead is `eng1`, plus a
+/// hosted brain. Used to prove hosted `delegate_to_desk` resolves the desk and
+/// records the hand-off against it.
+fn desk_manifest() -> CompanyManifest {
+    let toml_src = r#"
+        [company]
+        name = "Acme"
+
+        [brain]
+        mode = "hosted"
+
+        [tools]
+        allow = ["noop"]
+
+        [policy]
+        mode = "full"
+
+        [[agent]]
+        id = "chief"
+        role = "Chief"
+        tier = "orchestrator"
+
+        [[agent]]
+        id = "eng1"
+        role = "Engineer"
+
+        [[group_chat]]
+        id = "eng"
+        name = "Engineering"
+        members = ["eng1"]
+        "#;
+    toml::from_str(toml_src).expect("valid manifest")
+}
+
+/// The hosted catalog registered with Medulla must advertise the delegation
+/// tools on top of the manifest's own `tools.allow`, so a hosted company's
+/// orchestrator can actually delegate.
+#[tokio::test]
+async fn e2e_hosted_catalog_advertises_delegation_tools() {
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
+    let transport = Arc::new(MockTransport::new());
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "hi".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    let registered = transport.registered_tools();
+    assert_eq!(registered.len(), 1, "tools register exactly once");
+    let names: Vec<&str> = registered[0].iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"noop"), "manifest tool kept: {names:?}");
+    assert!(
+        names.contains(&"spawn_task"),
+        "spawn_task advertised: {names:?}"
+    );
+    assert!(
+        names.contains(&"delegate_to_desk"),
+        "delegate_to_desk advertised: {names:?}"
+    );
+}
+
+/// Medulla emitting a `spawn_task` tool-call on the hosted path opens a durable
+/// board card device-side and answers ok — no local cognition needed.
+#[tokio::test]
+async fn e2e_spawn_task_tool_call_opens_a_board_card() {
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        runtime_cid(),
+        vec![tool_call_frame(
+            "spawn_task",
+            0,
+            json!({ "title": "Ship the invoice flow", "assignee": "eng" }),
+        )],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "open a task to ship invoicing".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    // The tool was answered ok.
+    let answers = transport.tool_answers();
+    assert_eq!(answers.len(), 1);
+    assert!(answers[0].ok, "spawn_task answered ok: {:?}", answers[0]);
+
+    // A durable card landed on the board.
+    let cards = rt.tasks().list(rt.id()).await.unwrap();
+    assert_eq!(cards.len(), 1, "one card opened: {cards:?}");
+    assert_eq!(cards[0].title, "Ship the invoice flow");
+    assert_eq!(cards[0].assignee, "eng");
+    assert_eq!(cards[0].column, "todo");
+}
+
+/// Medulla emitting a `delegate_to_desk` tool-call resolves the desk and records
+/// a durable hand-off card assigned to that desk (so it surfaces when the desk
+/// is asked directly). An unknown desk is a clean tool error, not a lost card.
+#[tokio::test]
+async fn e2e_delegate_to_desk_tool_call_writes_a_handoff_card() {
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        runtime_cid(),
+        vec![
+            tool_call_frame(
+                "delegate_to_desk",
+                0,
+                json!({ "desk": "Engineering", "instruction": "build the invoice importer" }),
+            ),
+            tool_call_frame(
+                "delegate_to_desk",
+                1,
+                json!({ "desk": "Nonexistent", "instruction": "do a thing" }),
+            ),
+        ],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), desk_manifest())
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "have engineering build invoicing".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    let answers = transport.tool_answers();
+    assert_eq!(answers.len(), 2);
+    // First hand-off resolved the desk by name and succeeded.
+    assert!(answers[0].ok, "known desk hands off ok: {:?}", answers[0]);
+    // Unknown desk answered ok:false (clean error) and wrote no card.
+    assert!(
+        !answers[1].ok,
+        "unknown desk is a clean error: {:?}",
+        answers[1]
+    );
+
+    let cards = rt.tasks().list(rt.id()).await.unwrap();
+    assert_eq!(cards.len(), 1, "only the known desk got a card: {cards:?}");
+    // Assigned to the resolved desk id, with the lead recorded in the note.
+    assert_eq!(cards[0].assignee, "eng");
+    let note = cards[0].note.as_deref().unwrap_or_default();
+    assert!(note.contains("eng1"), "note records the lead: {note}");
+    assert!(
+        note.contains("build the invoice importer"),
+        "note carries the instruction"
+    );
+}
+
+/// The same company with no usage frame on the wire: an honest zero, and no
+/// fabricated sample.
+#[tokio::test]
+async fn e2e_a_cycle_without_usage_frames_meters_nothing() {
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
+    let transport = Arc::new(MockTransport::new());
+    transport.script_cycle(
+        runtime_cid(),
+        vec![effect_frame("send_dm", 0, json!({ "body": "on it" }))],
+    );
+
+    let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+        .with_brain_mode(BrainMode::Hosted)
+        .with_credential(SecretValue("th_live".into()))
+        .with_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+
+    rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+        text: "hello".into(),
+        by: None,
+        chat: None,
+    }])
+    .await
+    .unwrap();
+
+    assert!(rt.usage().query(rt.id(), 0).await.unwrap().is_empty());
 }

@@ -2,6 +2,7 @@
 name: Invoice Drafting
 description: Draft an accurate, itemized invoice from delivered work and ready it to send.
 category: Finance
+version: 1.0.0
 ---
 
 # Invoice Drafting

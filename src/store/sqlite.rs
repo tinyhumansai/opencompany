@@ -45,8 +45,8 @@ use crate::ports::sessions::SessionRecord;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
     ChunkAddr, ChunkHit, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompanySummary,
-    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, SecretValue, StoredEvent,
-    TaskResult,
+    CompressedTrace, ContextChunk, EventSeq, EvictionPolicy, LedgerEntry, OverlayBlob, SecretValue,
+    StoredEvent, TaskResult,
 };
 use crate::ports::users::{InviteRecord, UserRecord};
 use crate::store::content_address;
@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS context_chunks (
     label      TEXT NOT NULL,
     body       TEXT NOT NULL,
     len        INTEGER NOT NULL,
+    stored_ms  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (company_id, addr)
 );
 CREATE TABLE IF NOT EXISTS secrets (
@@ -128,6 +129,35 @@ CREATE TABLE IF NOT EXISTS facts (
     fact_json  TEXT NOT NULL,
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (company_id, id)
+);
+CREATE TABLE IF NOT EXISTS artifacts (
+    company_id    TEXT NOT NULL,
+    id            TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    artifact_json TEXT NOT NULL,
+    updated_ms    INTEGER NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE INDEX IF NOT EXISTS artifacts_by_task ON artifacts (company_id, task_id);
+CREATE TABLE IF NOT EXISTS runs (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    attempt    INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    run_json   TEXT NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE INDEX IF NOT EXISTS runs_by_task ON runs (company_id, task_id);
+CREATE INDEX IF NOT EXISTS runs_by_status ON runs (company_id, status);
+CREATE TABLE IF NOT EXISTS run_steps (
+    company_id TEXT NOT NULL,
+    run_id     TEXT NOT NULL,
+    step_seq   INTEGER NOT NULL,
+    at_ms      INTEGER NOT NULL,
+    step_json  TEXT NOT NULL,
+    PRIMARY KEY (company_id, run_id, step_seq)
 );
 CREATE TABLE IF NOT EXISTS usage_samples (
     company_id TEXT NOT NULL,
@@ -205,6 +235,39 @@ fn sql_err(e: rusqlite::Error) -> OpenCompanyError {
     OpenCompanyError::Store(format!("sqlite error: {e}"))
 }
 
+/// Adds `column` to `table` when it is absent, so an additive schema change
+/// reaches databases created before the column existed.
+///
+/// [`MIGRATIONS`] is a bundle of `CREATE TABLE IF NOT EXISTS` statements, which
+/// silently skip an already-created table — new columns would therefore never
+/// land on an existing file. `PRAGMA table_info` is the check rather than
+/// swallowing the `ALTER`'s "duplicate column name" error, so a genuine `ALTER`
+/// failure still surfaces.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let present = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(sql_err)?;
+        // `table_info` column 1 is the column name.
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(sql_err)?;
+        let mut found = false;
+        for row in rows {
+            if row.map_err(sql_err)? == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+        .map_err(sql_err)
+}
+
 /// Translates a `usize` limit into a SQLite `LIMIT` value. `usize::MAX` (the
 /// "read everything" sentinel used by export/replay) maps to `-1`, SQLite's
 /// unbounded-limit encoding.
@@ -239,6 +302,14 @@ impl SqliteStore {
 
     fn from_conn(conn: Connection) -> Result<Self> {
         conn.execute_batch(MIGRATIONS).map_err(sql_err)?;
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on a database that predates a
+        // column, so additive columns need their own idempotent step.
+        add_column_if_missing(
+            &conn,
+            "context_chunks",
+            "stored_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             conn: Arc::new(StdMutex::new(conn)),
             senders: Arc::new(StdMutex::new(HashMap::new())),
@@ -278,7 +349,7 @@ impl CompanyStore for SqliteStore {
         };
         let manifest: CompanyManifest = toml::from_str(&manifest_toml)
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
-        let overlay_agents = serde_json::from_str(&overlay_json)?;
+        let overlay = OverlayBlob::parse(&overlay_json)?;
 
         let mut stmt = conn
             .prepare("SELECT entry_json FROM ledger WHERE company_id = ?1 ORDER BY idx")
@@ -297,14 +368,19 @@ impl CompanyStore for SqliteStore {
             manifest,
             ledger,
             lifecycle,
-            overlay_agents,
+            overlay_agents: overlay.agents,
+            overlay_desk_members: overlay.desk_members,
+            overlay_desk_order: overlay.desk_order,
+            overlay_desks: overlay.desks,
+            overlay_workflows: overlay.workflows,
+            template_provenance: overlay.provenance,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
         let manifest_toml = toml::to_string(&record.manifest)
             .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
-        let overlay_json = serde_json::to_string(&record.overlay_agents)?;
+        let overlay_json = serde_json::to_string(&OverlayBlob::from_record(record))?;
         let conn = self.conn();
         // Append-only: `save` upserts the company row and never touches ledger.
         conn.execute(
@@ -549,14 +625,15 @@ impl ContextStore for SqliteStore {
         let addr = content_address(&chunk.body);
         let conn = self.conn();
         conn.execute(
-            "INSERT OR IGNORE INTO context_chunks (company_id, addr, label, body, len) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO context_chunks (company_id, addr, label, body, len, stored_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id.as_ref(),
                 addr,
                 chunk.label,
                 chunk.body,
-                chunk.body.len() as i64
+                chunk.body.len() as i64,
+                now_millis() as i64
             ],
         )
         .map_err(sql_err)?;
@@ -567,7 +644,8 @@ impl ContextStore for SqliteStore {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT addr, label, len FROM context_chunks WHERE company_id = ?1 ORDER BY rowid",
+                "SELECT addr, label, len, stored_ms FROM context_chunks \
+                 WHERE company_id = ?1 ORDER BY rowid",
             )
             .map_err(sql_err)?;
         let rows = stmt
@@ -576,17 +654,19 @@ impl ContextStore for SqliteStore {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })
             .map_err(sql_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (addr, label, len) = row.map_err(sql_err)?;
+            let (addr, label, len, stored_ms) = row.map_err(sql_err)?;
             if label.starts_with(prefix) {
                 out.push(ChunkMeta {
                     addr: ChunkAddr::new(addr),
                     label,
                     len: len as usize,
+                    stored_at_millis: stored_ms.max(0) as u64,
                 });
             }
         }
@@ -1361,6 +1441,329 @@ impl crate::ports::facts::FactStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// ArtifactStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::artifacts::ArtifactStore for SqliteStore {
+    async fn list(
+        &self,
+        company: &CompanyId,
+        task_id: Option<&str>,
+    ) -> Result<Vec<crate::ports::artifacts::ArtifactRecord>> {
+        let conn = self.conn();
+        // `task_id` is filtered in SQL (it has an index) rather than in Rust,
+        // so a company with many artifacts does not deserialize the whole set
+        // to answer one task's Artifacts tab.
+        let mut out: Vec<crate::ports::artifacts::ArtifactRecord> = Vec::new();
+        match task_id {
+            Some(task_id) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT artifact_json FROM artifacts WHERE company_id = ?1 \
+                         AND task_id = ?2 ORDER BY updated_ms DESC",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![company.as_ref(), task_id], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(sql_err)?;
+                for row in rows {
+                    out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+                }
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT artifact_json FROM artifacts WHERE company_id = ?1 \
+                         ORDER BY updated_ms DESC",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![company.as_ref()], |r| r.get::<_, String>(0))
+                    .map_err(sql_err)?;
+                for row in rows {
+                    out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::artifacts::ArtifactRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT artifact_json FROM artifacts WHERE company_id = ?1 AND id = ?2")
+            .map_err(sql_err)?;
+        let mut rows = stmt
+            .query_map(params![company.as_ref(), id], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        match rows.next() {
+            Some(row) => Ok(Some(serde_json::from_str(&row.map_err(sql_err)?)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        company: &CompanyId,
+        artifact: &crate::ports::artifacts::ArtifactRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(artifact)?;
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO artifacts (company_id, id, task_id, artifact_json, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id, id) DO UPDATE SET task_id = excluded.task_id, \
+             artifact_json = excluded.artifact_json, updated_ms = excluded.updated_ms",
+            params![
+                company.as_ref(),
+                artifact.id,
+                artifact.task_id,
+                json,
+                artifact.updated_at_millis as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn
+            .execute(
+                "DELETE FROM artifacts WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RunStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::runs::RunStore for SqliteStore {
+    async fn create_run(
+        &self,
+        company: &CompanyId,
+        spec: crate::ports::runs::NewRun,
+    ) -> Result<crate::ports::runs::RunRecord> {
+        use crate::ports::runs::{RunRecord, RunStatus};
+
+        let mut guard = self.conn();
+        // Read-max-then-insert inside one transaction, so two concurrent
+        // creates on one card cannot mint the same ordinal. This is the
+        // "transactional where the backend can do so cheaply" half of the
+        // port's `create_run` concurrency contract.
+        let tx = guard.transaction().map_err(sql_err)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM runs WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), spec.id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .unwrap_or(false);
+        if exists {
+            return Err(OpenCompanyError::Conflict(format!(
+                "run '{}' already exists",
+                spec.id
+            )));
+        }
+        let attempt: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs \
+                 WHERE company_id = ?1 AND task_id = ?2",
+                params![company.as_ref(), spec.task_id],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        let run = RunRecord {
+            id: spec.id,
+            company: company.clone(),
+            task_id: spec.task_id,
+            agent_id: spec.agent_id,
+            attempt: attempt as u32,
+            status: RunStatus::Pending,
+            trigger_event_seq: None,
+            created_at_millis: now_millis(),
+            started_at_millis: None,
+            finished_at_millis: None,
+            error: None,
+            usage: Default::default(),
+            step_count: 0,
+        };
+        tx.execute(
+            "INSERT INTO runs (company_id, id, task_id, status, attempt, created_ms, run_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                company.as_ref(),
+                run.id,
+                run.task_id,
+                run.status.as_str(),
+                run.attempt as i64,
+                run.created_at_millis as i64,
+                serde_json::to_string(&run)?,
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(run)
+    }
+
+    async fn get_run(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::runs::RunRecord>> {
+        let conn = self.conn();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT run_json FROM runs WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        match json {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn put_run(
+        &self,
+        company: &CompanyId,
+        run: &crate::ports::runs::RunRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(run)?;
+        let conn = self.conn();
+        // `status` and `task_id` are mirrored out of the blob so the indexes
+        // can answer a filtered list without deserializing every row.
+        conn.execute(
+            "INSERT INTO runs (company_id, id, task_id, status, attempt, created_ms, run_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(company_id, id) DO UPDATE SET task_id = excluded.task_id, \
+             status = excluded.status, attempt = excluded.attempt, \
+             created_ms = excluded.created_ms, run_json = excluded.run_json",
+            params![
+                company.as_ref(),
+                run.id,
+                run.task_id,
+                run.status.as_str(),
+                run.attempt as i64,
+                run.created_at_millis as i64,
+                json,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn list_runs(
+        &self,
+        company: &CompanyId,
+        filter: &crate::ports::runs::RunFilter,
+    ) -> Result<Vec<crate::ports::runs::RunRecord>> {
+        // Every predicate is pushed into SQL (both columns are indexed) so a
+        // long-lived company does not deserialize its whole run history to
+        // answer one card's Attempts list.
+        let mut sql = String::from("SELECT run_json FROM runs WHERE company_id = ?1");
+        let mut args: Vec<String> = vec![company.as_ref().to_string()];
+        if let Some(task_id) = &filter.task_id {
+            args.push(task_id.clone());
+            sql.push_str(&format!(" AND task_id = ?{}", args.len()));
+        }
+        if !filter.statuses.is_empty() {
+            let placeholders: Vec<String> = filter
+                .statuses
+                .iter()
+                .map(|status| {
+                    args.push(status.as_str().to_string());
+                    format!("?{}", args.len())
+                })
+                .collect();
+            sql.push_str(&format!(" AND status IN ({})", placeholders.join(", ")));
+        }
+        // The canonical port ordering, in SQL: see `runs::sort_newest_first`.
+        sql.push_str(" ORDER BY created_ms DESC, attempt DESC, id DESC");
+        if let Some(limit) = filter.limit {
+            sql.push_str(&format!(" LIMIT {}", sql_limit(limit)));
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn append_run_step(
+        &self,
+        company: &CompanyId,
+        step: &crate::ports::runs::RunStepRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(step)?;
+        let conn = self.conn();
+        // `(run_id, step_seq)` is the primary key, so a replayed append
+        // overwrites rather than duplicating — the same idempotence the fs
+        // backend gets by folding its JSONL.
+        conn.execute(
+            "INSERT INTO run_steps (company_id, run_id, step_seq, at_ms, step_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id, run_id, step_seq) DO UPDATE SET \
+             at_ms = excluded.at_ms, step_json = excluded.step_json",
+            params![
+                company.as_ref(),
+                step.run_id,
+                step.step_seq as i64,
+                step.at_millis as i64,
+                json,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn list_run_steps(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<crate::ports::runs::RunStepRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT step_json FROM run_steps WHERE company_id = ?1 AND run_id = ?2 \
+                 ORDER BY step_seq",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref(), run_id], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -1782,6 +2185,103 @@ mod test {
     #[tokio::test]
     async fn conformance_fact_store() {
         conformance::assert_fact_store(store()).await;
+        conformance::assert_artifact_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_chunk_stamps() {
+        conformance::assert_context_chunk_stamps(store()).await;
+    }
+
+    /// The migration path a fresh database never exercises.
+    ///
+    /// [`MIGRATIONS`] is all `CREATE TABLE IF NOT EXISTS`, which is a no-op
+    /// against a database that already has `context_chunks` — so on an existing
+    /// deployment only [`add_column_if_missing`] can add `stored_ms`. Without
+    /// it, every read of the column would fail with "no such column" and the
+    /// whole Brain list/stats surface would 500.
+    #[tokio::test]
+    async fn legacy_context_chunks_table_gains_stored_ms_on_open() {
+        // A database as it looked before the column existed, with a row in it.
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE context_chunks (
+                 company_id TEXT NOT NULL,
+                 addr       TEXT NOT NULL,
+                 label      TEXT NOT NULL,
+                 body       TEXT NOT NULL,
+                 len        INTEGER NOT NULL,
+                 PRIMARY KEY (company_id, addr)
+             );
+             INSERT INTO context_chunks (company_id, addr, label, body, len)
+             VALUES ('acme', 'legacy-addr', 'agent/ceo', 'remembered before stamps', 24);",
+        )
+        .expect("seed a pre-`stored_ms` database");
+
+        let store = SqliteStore::from_conn(conn).expect("migrations run on a legacy database");
+        let id = CompanyId::new("acme");
+
+        // The legacy row survives the migration and reports an *unknown* store
+        // time — not the epoch, and not a misleading "migrated just now".
+        // Fully qualified: `SqliteStore` implements both `ContextStore::list`
+        // and `CompanyStore::list`, and method resolution matches on the name
+        // alone — arity does not disambiguate, so the bare call is `E0034`.
+        let metas = ContextStore::list(&store, &id, "")
+            .await
+            .expect("list after migration");
+        assert_eq!(metas.len(), 1, "the legacy row must not be dropped");
+        assert_eq!(metas[0].label, "agent/ceo");
+        assert_eq!(
+            metas[0].stored_at_millis, 0,
+            "a row written before stamps existed has no store time to report"
+        );
+
+        // A write after the migration is stamped for real.
+        let before = now_millis();
+        store
+            .put(
+                &id,
+                ContextChunk {
+                    label: "agent/ops".to_string(),
+                    body: "remembered after the migration".to_string(),
+                },
+            )
+            .await
+            .expect("put into a migrated database");
+
+        let metas = ContextStore::list(&store, &id, "")
+            .await
+            .expect("list after put");
+        assert_eq!(metas.len(), 2);
+        let fresh = metas
+            .iter()
+            .find(|m| m.label == "agent/ops")
+            .expect("the new chunk is listed");
+        assert!(
+            fresh.stored_at_millis >= before,
+            "a post-migration write must carry a real stamp, got {}",
+            fresh.stored_at_millis
+        );
+
+        // Reopening an already-migrated database must not try to add the column
+        // a second time — the `ALTER` would fail with "duplicate column name".
+        add_column_if_missing(
+            &store.conn(),
+            "context_chunks",
+            "stored_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .expect("adding an existing column is a no-op, not an error");
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store() {
+        conformance::assert_run_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_reaper() {
+        conformance::assert_run_reaper(store()).await;
     }
 
     #[tokio::test]
@@ -1826,6 +2326,11 @@ mod test {
                 ledger: Vec::new(),
                 lifecycle: "running".into(),
                 overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                template_provenance: None,
             })
             .await
             .unwrap();
@@ -1835,6 +2340,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "hi".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -1885,6 +2391,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
                 by: None,
+                chat: None,
             },
         )
         .await
@@ -1894,7 +2401,8 @@ mod test {
             received.event,
             CompanyEvent::OperatorMessage {
                 text: "hi".into(),
-                by: None
+                by: None,
+                chat: None
             }
         );
     }
@@ -1979,6 +2487,7 @@ mod test {
                 CompanyEvent::OperatorMessage {
                     text: "persist".into(),
                     by: None,
+                    chat: None,
                 },
             )
             .await
@@ -1993,6 +2502,7 @@ mod test {
             CompanyEvent::OperatorMessage {
                 text: "persist".into(),
                 by: None,
+                chat: None,
             }
         );
     }

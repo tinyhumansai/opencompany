@@ -2,6 +2,7 @@
 name: Changelog Writer
 description: Turn a set of merged changes into a clear, user-facing changelog entry.
 category: Content
+version: 1.0.0
 ---
 
 # Changelog Writer

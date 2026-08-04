@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
+    "typecheck:e2e": "tsc -p tsconfig.e2e.json",
     "e2e": "playwright test",
     "e2e:headed": "playwright test --headed"
   },
@@ -26,6 +27,7 @@
     "next-themes": "^0.4.6",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-joyride": "^3.2.0",
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.0",
     "remark-gfm": "^4.0.1",

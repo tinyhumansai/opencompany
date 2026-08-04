@@ -2,6 +2,7 @@
 name: Meeting Brief
 description: Prepare a one-page brief before a meeting so the operator walks in ready to decide.
 category: Ops
+version: 1.0.0
 ---
 
 # Meeting Brief
