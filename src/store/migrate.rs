@@ -57,13 +57,15 @@ use std::path::{Path, PathBuf};
 use crate::Result;
 use crate::error::OpenCompanyError;
 
-/// The local sqlite database file, as named by
-/// [`open_storage`](crate::store::open_storage).
-const SQLITE_DB: &str = "opencompany.db";
-
-/// The database and its write-ahead-log siblings. These travel as a set: leaving
-/// a `-wal` behind either strands committed transactions or pairs a moved
-/// database with a stale log.
+/// The local sqlite database — named by
+/// [`open_storage`](crate::store::open_storage) — and its write-ahead-log
+/// siblings.
+///
+/// These travel as a set: leaving a `-wal` behind either strands committed
+/// transactions or pairs a moved database with a stale log. The whole slice is
+/// also the *detector*, not just the payload — a run that moved the database and
+/// then died is recognised by whichever member it left behind, which is what
+/// makes the move resumable without a migration journal.
 const LEGACY_SQLITE_FILES: &[&str] =
     &["opencompany.db", "opencompany.db-wal", "opencompany.db-shm"];
 
