@@ -21,11 +21,24 @@ import { lifecycle } from "@/lib/language";
 import { DISCORD_INVITE_URL } from "@/lib/links";
 import { cn } from "@/lib/utils";
 
+// The lifecycle row carries its state in the label as well as the dot — a
+// coloured dot alone puts the whole signal on hue, which a colourblind reader
+// or a glance at the collapsed rail can miss.
 const TONE_DOT: Record<string, string> = {
   live: "bg-emerald-500",
   idle: "bg-amber-500",
   stopped: "bg-rose-500",
 };
+
+const TONE_TEXT: Record<string, string> = {
+  live: "text-emerald-600 dark:text-emerald-400",
+  idle: "text-amber-600 dark:text-amber-400",
+  stopped: "text-rose-600 dark:text-rose-400",
+};
+
+// Discord's brand blurple, lifted a step in dark mode so it clears the
+// sidebar's surface instead of sinking into it.
+const DISCORD_BLURPLE = "text-[#5865f2] dark:text-[#7f8ffa]";
 
 interface Props {
   /** The company's lifecycle, shown as a dot + label. */
@@ -66,7 +79,10 @@ export function SidebarControls({
       {/* Company state. Not a control — `cursor-default` and inert, so it does
           not read as something to press. */}
       <SidebarMenuItem>
-        <SidebarMenuButton tooltip={label} className="cursor-default hover:bg-transparent">
+        <SidebarMenuButton
+          tooltip={label}
+          className={cn("cursor-default font-medium hover:bg-transparent", TONE_TEXT[tone])}
+        >
           <span className="flex size-4 items-center justify-center">
             <span
               className={cn(
@@ -124,6 +140,7 @@ export function SidebarControls({
       <SidebarMenuItem>
         <SidebarMenuButton
           tooltip="Join our Discord"
+          className={cn(DISCORD_BLURPLE, "hover:text-[#5865f2] dark:hover:text-[#7f8ffa]")}
           render={<a href={DISCORD_INVITE_URL} target="_blank" rel="noreferrer" />}
         >
           <DiscordIcon className="size-4" />
