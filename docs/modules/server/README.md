@@ -36,7 +36,8 @@ address check for `{id}`, operator + `sole()` for the alias).
 
 | Surface (`ops::*`) | Routes |
 |---|---|
-| `tasks` | `POST …/tasks`, `PATCH`/`DELETE …/tasks/{id}` |
+| `tasks` | `POST …/tasks`, `PATCH`/`DELETE …/tasks/{id}`, `GET …/tasks/{id}` (the Task Detail read, #185) |
+| `task_export` | `GET …/tasks/{id}/export` (the task's record as a document, #352) |
 | `memory` | `POST …/memory`, `DELETE …/memory/{id}` (journals `MemoryFactDeleted`) |
 | `workspace` | `GET …/workspace`, `GET …/workspace/file/{id}`, `POST …/workspace`, `PUT …/workspace/file/{id}`, `PATCH`/`DELETE …/workspace/{id}` (the two `GET`s are REST twins of the GraphQL reads — the console has no GraphQL client, #177) |
 | `skills` | `POST …/skills`, `GET …/skills/registry`, `POST …/skills/{slug}/install\|uninstall`, `PUT …/skills/{slug}` |
@@ -47,6 +48,54 @@ address check for `{id}`, operator + `sole()` for the alias).
 | `smtp` | `PUT …/smtp`, `POST …/smtp/test` |
 | `connections` (feature `oauth`) | `POST …/connections/{provider}/start\|disconnect`, `GET /api/v1/oauth/callback` |
 | `workflows` | `POST …/workflows`, `GET …/workflows`, `GET …/workflows/runs`, `POST …/workflows/cron/preview`, `GET …/workflows/{wid}`, `PUT …/workflows/{wid}`, `DELETE …/workflows/{wid}`, `POST …/workflows/{wid}/run` |
+
+### Exporting a task's record (issue #352)
+
+`GET …/tasks/{taskId}/export` answers **one self-contained HTML file** carrying
+what the Task Detail screen shows: the header and the worked/waiting split, the
+whole ordered timeline with its details expanded, the sign-offs, every artifact
+revision and the human-edit diff, and the neighbouring cards. `Content-Type:
+text/html`, `Content-Disposition: attachment`, so `curl -OJ` lands a named file
+and the console's Export button downloads one.
+
+**Why HTML rather than Markdown or PDF.** The bar in epic #184 is "a
+non-technical person can read it unaided", which already rules out the JSON the
+screen fetches. HTML opens by double-click on any machine with no reader
+installed and nothing to explain; it keeps the **proportional waiting bands**
+(#305) that are the entire point of the worked/waiting work — a four-hour wait
+must not look like a four-second one, which is exactly what a text format
+flattens; and the reader's own browser prints it to the PDF a client asks for by
+name. It also costs **no new dependency**: the document is `format!` plus
+inlined CSS, no templating engine, no PDF crate, no headless browser. Markdown
+was rejected because it loses the proportions and, opened in a text editor by
+the non-technical reader this exists for, shows raw `##` and `|`. PDF was
+rejected because generating one means a new rendering stack for an artifact the
+browser already produces from this file.
+
+**Why the server renders it.** One implementation serves the console button and
+an automated caller alike, so an audit or scheduled export needs no second
+renderer. A client-side document would live only inside the React view — the
+same place the record is stuck today.
+
+**Redaction is structural, not procedural.** The handler renders
+`tasks::assemble_detail` and `artifacts::artifacts_for_task` — the *same values*
+`GET …/tasks/{id}` and the Artifacts tab return. It never reads the event log
+itself, so there is no second path whose scrubbing could drift from the
+console's; `detail` text is scrubbed at source before either caller sees it.
+Everything interpolated is HTML-escaped, so a card titled `<script>…</script>`
+renders as text in a file that will be opened in a browser and forwarded on.
+
+**Exporting is a pure read** — no journal entry, no column change, no state on
+the task. A test compares the board rows and the journal length across the call,
+because an audit export that modifies what it audits is worse than none.
+
+**Approvals, until #333 lands.** An approval carries no task id yet, so the
+sign-offs section renders the `approval` timeline entries — resolutions that
+fell inside the card's run window — and says so in the document rather than
+implying a per-task link it cannot make. When #333 (PR #349) merges,
+`TaskDetail` gains an `approvals[]` keyed by a real id: the section should read
+that instead, pending sign-offs start appearing, and the correlation caveat
+comes out with the same edit.
 
 ### Reading a trigger's cron back (issue #262)
 

@@ -3234,6 +3234,118 @@ async fn inflight_read_is_not_shadowed_by_task_detail() {
     );
 }
 
+/// #352: `GET …/tasks/{id}/export` answers a downloadable HTML document, built
+/// from the same read the console consumes, and changes nothing.
+///
+/// The last clause is an acceptance criterion in its own right and the one thing
+/// the renderer's own tests cannot see: a document that quietly journalled an
+/// "exported" event, or touched the card's column or `updatedAt`, would make an
+/// audit export a modification of the thing being audited. So the board row and
+/// the journal length are both compared across the call.
+#[tokio::test]
+async fn task_export_serves_a_readable_document_and_alters_nothing() {
+    use crate::ports::types::{CompanyEvent, EventSeq};
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+
+    runtime
+        .tasks()
+        .upsert(
+            &company,
+            &TaskRecord {
+                id: "t-1".into(),
+                title: "Launch post".into(),
+                note: Some("Write the launch post.".into()),
+                column: "in_review".into(),
+                priority: "high".into(),
+                assignee: "writer".into(),
+                updated_at_millis: 1,
+                origin_chat_id: None,
+                parent_task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    for event in [
+        CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+        },
+        CompanyEvent::AgentReply {
+            chat_id: "t-1".into(),
+            agent_id: "writer".into(),
+            text: "First draft is up.".into(),
+            steps: Vec::new(),
+            task_id: Some("t-1".into()),
+        },
+    ] {
+        runtime.events().append(&company, event).await.unwrap();
+    }
+
+    let before_board = runtime.tasks().list(&company).await.unwrap();
+    let before_events = runtime
+        .events()
+        .read_from(&company, EventSeq::new(0), usize::MAX)
+        .await
+        .unwrap()
+        .len();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/company/tasks/t-1/export")
+        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let disposition = response
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(content_type, "text/html; charset=utf-8");
+    assert_eq!(
+        disposition, "attachment; filename=\"task-launch-post.html\"",
+        "the export must download as a named file"
+    );
+
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(bytes.to_vec()).expect("the document is utf-8");
+    assert!(html.starts_with("<!doctype html>"));
+    // It carries the record, in words: the card, its status as a label, and the
+    // work that happened — assembled through the same `assemble_detail` the
+    // JSON read serves, so the scrub cannot differ.
+    assert!(html.contains("Launch post"));
+    assert!(html.contains("<dd>In review</dd>"));
+    assert!(html.contains("First draft is up."));
+
+    // Nothing moved.
+    let after_board = runtime.tasks().list(&company).await.unwrap();
+    assert_eq!(after_board, before_board, "exporting altered the board");
+    let after_events = runtime
+        .events()
+        .read_from(&company, EventSeq::new(0), usize::MAX)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(after_events, before_events, "exporting journalled an event");
+
+    // An unknown card is a 404, matching the detail read it is built on.
+    let (status, _) = send(&state, "GET", "/api/v1/company/tasks/nope/export", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// #185 review follow-up: pin the two timeline branches the first test skipped —
 /// `tool_failed`, and the window-correlated `approval` arm.
 ///

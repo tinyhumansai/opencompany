@@ -143,6 +143,21 @@ export function getTaskDetail(
   );
 }
 
+/**
+ * The task's record as a self-contained HTML document (#352).
+ *
+ * The host renders it, so the console's job is delivery, not layout: the same
+ * document reaches a `curl` or a scheduled job. Returns the file's text; the
+ * caller saves it.
+ */
+export function exportTaskRecord(
+  client: OpenCompanyClient,
+  company: string | null,
+  id: string,
+): Promise<string> {
+  return client.getText(`${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/export`);
+}
+
 export function createTask(
   client: OpenCompanyClient,
   company: string | null,

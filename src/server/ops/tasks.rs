@@ -53,19 +53,19 @@ pub fn router() -> Router<AppState> {
 /// A task card as the console renders it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskCard {
-    id: String,
-    title: String,
+pub(crate) struct TaskCard {
+    pub(crate) id: String,
+    pub(crate) title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
-    column: String,
-    priority: String,
-    assignee: String,
-    updated_at: u64,
+    pub(crate) note: Option<String>,
+    pub(crate) column: String,
+    pub(crate) priority: String,
+    pub(crate) assignee: String,
+    pub(crate) updated_at: u64,
     /// The card this one was spawned from (#185). Omitted on a lineage root so
     /// the board's existing wire shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
-    parent_task_id: Option<String>,
+    pub(crate) parent_task_id: Option<String>,
     /// The chat thread this card was opened from (issue #246).
     ///
     /// `TaskRecord::origin_chat_id` has existed since #151 (it is what lets a
@@ -75,7 +75,7 @@ struct TaskCard {
     /// which is every card the board created before this, so the existing wire
     /// shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
-    origin_chat_id: Option<String>,
+    pub(crate) origin_chat_id: Option<String>,
 }
 
 impl From<TaskRecord> for TaskCard {
@@ -399,20 +399,20 @@ async fn delete_task(
 /// card's note.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TimelineEntry {
+pub(crate) struct TimelineEntry {
     /// The journal sequence this entry came from — the console's stable key,
     /// and what makes the timeline strictly ordered.
-    seq: u64,
+    pub(crate) seq: u64,
     /// Epoch-millis the event was journaled.
-    at_millis: u64,
+    pub(crate) at_millis: u64,
     /// A stable wire word for what happened: `dispatched`, `reply`,
     /// `tool_failed`, `approval`, or `completed`.
-    kind: String,
+    pub(crate) kind: String,
     /// A short human label.
-    label: String,
+    pub(crate) label: String,
     /// Optional scrubbed detail (see the type docs for what may appear here).
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub(crate) detail: Option<String>,
     /// For an `approval` entry: how long the company sat waiting on the
     /// operator before this resolution landed (issue #305).
     ///
@@ -427,16 +427,16 @@ struct TimelineEntry {
     /// parked when this task was dispatched charges only the part of its wait
     /// that overlapped this run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    waited_millis: Option<u64>,
+    pub(crate) waited_millis: Option<u64>,
 }
 
 /// A neighbouring card in the lineage, trimmed to what a link needs.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LineageRef {
-    id: String,
-    title: String,
-    column: String,
+pub(crate) struct LineageRef {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) column: String,
 }
 
 impl From<&TaskRecord> for LineageRef {
@@ -452,24 +452,24 @@ impl From<&TaskRecord> for LineageRef {
 /// The parent/children view of a task.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Lineage {
+pub(crate) struct Lineage {
     /// The card this one was spawned from, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    parent: Option<LineageRef>,
+    pub(crate) parent: Option<LineageRef>,
     /// Cards spawned from this one, oldest-updated first for a stable render.
-    children: Vec<LineageRef>,
+    pub(crate) children: Vec<LineageRef>,
 }
 
 /// The assembled Task Detail response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskDetail {
+pub(crate) struct TaskDetail {
     /// The card header — the same shape `GET /tasks` returns per card.
-    task: TaskCard,
+    pub(crate) task: TaskCard,
     /// The per-task event stream, oldest first.
-    timeline: Vec<TimelineEntry>,
+    pub(crate) timeline: Vec<TimelineEntry>,
     /// Parent and children.
-    lineage: Lineage,
+    pub(crate) lineage: Lineage,
     /// Epoch-millis the company started waiting on an operator *right now*
     /// (issue #305), or `None` when nothing is currently parked for this run.
     ///
@@ -479,7 +479,7 @@ struct TaskDetail {
     /// screen most needs to see. Set only while the run window is open, and
     /// only from approvals parked at or after the window opened.
     #[serde(skip_serializing_if = "Option::is_none")]
-    waiting_since: Option<u64>,
+    pub(crate) waiting_since: Option<u64>,
 }
 
 /// `GET …/tasks/{task_id}` — the Task Detail screen's single read (issue #185).
@@ -509,6 +509,23 @@ async fn task_detail(
     company: ScopedCompany,
     Path(TaskPath { task_id }): Path<TaskPath>,
 ) -> Result<Json<TaskDetail>, ApiError> {
+    Ok(Json(assemble_detail(&company, &task_id).await?))
+}
+
+/// Assembles the Task Detail read. [`task_detail`] serves it as JSON; the
+/// export document (issue #352) renders the *same value* to HTML.
+///
+/// That sharing is the export's redaction guarantee, and the reason this is a
+/// function rather than a body inlined into the handler. An exporter that read
+/// the journal itself would be a second, unreviewed path to the same events —
+/// one scrub away from disagreeing with the console about what an operator is
+/// allowed to see. Here there is nothing to keep in step: the document renders
+/// what the screen renders because it is handed the identical value.
+pub(crate) async fn assemble_detail(
+    company: &ScopedCompany,
+    task_id: &str,
+) -> Result<TaskDetail, ApiError> {
+    let task_id = task_id.to_string();
     let rows = company.runtime.tasks().list(company.id()).await?;
     let card = rows
         .iter()
@@ -529,7 +546,7 @@ async fn task_detail(
     children.sort_by_key(|t| t.updated_at_millis);
     let children = children.into_iter().map(LineageRef::from).collect();
 
-    let (timeline, open_window_at) = task_timeline(&company, &task_id).await?;
+    let (timeline, open_window_at) = task_timeline(company, &task_id).await?;
 
     // The live wait (issue #305). Only meaningful while a run window is open —
     // a parked approval on a finished task belongs to whatever runs next, not to
@@ -546,12 +563,12 @@ async fn task_detail(
             .min()
     });
 
-    Ok(Json(TaskDetail {
+    Ok(TaskDetail {
         task: card.into(),
         timeline,
         lineage: Lineage { parent, children },
         waiting_since,
-    }))
+    })
 }
 
 /// How many journal events one `read_from` page pulls.

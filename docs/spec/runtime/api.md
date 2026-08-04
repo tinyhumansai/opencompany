@@ -46,6 +46,7 @@ through GraphQL (see the read plane below). Anything a build doesn't serve
 POST   …/tasks                              create a task card (`originChatId` records the thread it came from, #246)
 PATCH  …/tasks/{taskId}                      edit / move a task
 DELETE …/tasks/{taskId}                      delete a task
+GET    …/tasks/{taskId}/export               the task's record as a readable HTML document (#352)
 POST   …/memory                             add a memory fact
 DELETE …/memory/{factId}                     delete a memory fact
 GET    …/workspace                          the whole tree (metadata; no bodies)

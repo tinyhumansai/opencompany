@@ -3,7 +3,8 @@
 // timeline, and a controls bar; a 4s visibility-gated poll keeps it live while
 // the card is open. Cost/₹ is intentionally absent everywhere. The Artifacts tab is
 // its own self-fetching surface (#306, over #187's routes); Discussion stays an
-// honest stub pending its own backend.
+// honest stub pending its own backend. Export (#352) is a host-rendered
+// document the controls bar downloads — the console lays out none of it.
 
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
 import {
@@ -17,6 +18,7 @@ import {
   CornerDownRight,
   CornerUpLeft,
   CornerUpRight,
+  Download,
   Hourglass,
   Loader2,
   MessageSquare,
@@ -30,6 +32,7 @@ import {
 } from "lucide-react";
 
 import {
+  exportTaskRecord,
   getTaskDetail,
   listInflight,
   patchTask,
@@ -683,6 +686,7 @@ function ControlBar({
             <Pencil className="mr-1.5 size-3.5" />
             Edit
           </Button>
+          <ExportButton task={task} client={client} company={company} />
         </div>
       </div>
 
@@ -1072,6 +1076,80 @@ function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
       )}
     </div>
   );
+}
+
+/**
+ * Exports the task's record as a document (#352).
+ *
+ * The host renders it — one implementation, so a scripted export gets the same
+ * file — and this is delivery only: fetch the document through the authenticated
+ * client, then hand it to the browser as a download. A plain `<a href>` would be
+ * simpler but would drop the `Authorization` header the platform-token
+ * deployment needs, so the bytes come back through `getText` and go out through
+ * an object URL.
+ *
+ * Read-only by construction: the button triggers a GET, and the screen does not
+ * reload after it, because nothing about the task changed.
+ */
+function ExportButton({
+  task,
+  client,
+  company,
+}: {
+  task: Task;
+  client: OpenCompanyClient;
+  company: string | null;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  async function download() {
+    setBusy(true);
+    try {
+      const html = await exportTaskRecord(client, company, task.id);
+      const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `task-${fileSlug(task.title) || task.id}.html`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      // Freed on the next tick: revoking synchronously can beat the click in
+      // some browsers and save an empty file.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      toast.success("Record downloaded. Open it in any browser, or print it to PDF.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "could not export the task");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-8"
+      disabled={busy}
+      title="Download this task's record as a document"
+      onClick={() => void download()}
+    >
+      {busy ? (
+        <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+      ) : (
+        <Download className="mr-1.5 size-3.5" />
+      )}
+      Export
+    </Button>
+  );
+}
+
+/** `Launch post` → `launch-post`, for the downloaded file's name. */
+function fileSlug(title: string): string {
+  return title
+    .slice(0, 60)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function EmptyState({ title, body }: { title: string; body: string }) {

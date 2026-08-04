@@ -109,13 +109,13 @@ struct DiffQuery {
 /// human-edit diff, so the Artifacts tab needs one call rather than two.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ArtifactView {
+pub(crate) struct ArtifactView {
     #[serde(flatten)]
-    artifact: ArtifactRecord,
+    pub(crate) artifact: ArtifactRecord,
     /// The agent→operator diff, when a human has edited. Omitted otherwise, so
     /// an unedited artifact carries no empty scaffolding.
     #[serde(skip_serializing_if = "Option::is_none")]
-    human_edit_diff: Option<ArtifactDiff>,
+    pub(crate) human_edit_diff: Option<ArtifactDiff>,
 }
 
 impl From<ArtifactRecord> for ArtifactView {
@@ -132,12 +132,25 @@ async fn list_for_task(
     company: ScopedCompany,
     Path(TaskPath { task_id }): Path<TaskPath>,
 ) -> Result<Json<Vec<ArtifactView>>, ApiError> {
+    Ok(Json(artifacts_for_task(&company, &task_id).await?))
+}
+
+/// One task's artifacts as the Artifacts tab receives them, newest first.
+///
+/// Shared with the export document (issue #352) for the same reason
+/// [`assemble_detail`](super::tasks::assemble_detail) is: the exported record
+/// must show what the tab shows, and the way to guarantee that is to hand both
+/// the same value rather than to keep two reads honest by review.
+pub(crate) async fn artifacts_for_task(
+    company: &ScopedCompany,
+    task_id: &str,
+) -> Result<Vec<ArtifactView>, ApiError> {
     let rows = company
         .runtime
         .artifacts()
-        .list(company.id(), Some(&task_id))
+        .list(company.id(), Some(task_id))
         .await?;
-    Ok(Json(rows.into_iter().map(ArtifactView::from).collect()))
+    Ok(rows.into_iter().map(ArtifactView::from).collect())
 }
 
 /// `GET …/artifacts/{artifact_id}` — one artifact with its full history.
