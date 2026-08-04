@@ -31,8 +31,8 @@ use crate::ports::events::EventLog;
 use crate::ports::memory::MemoryStore;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
-    CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry, OverlayAgent,
-    OverlayDesk, OverlayDeskMember, OverlayDeskOrder, OverlayWorkflow, StoredEvent,
+    BudgetOverride, CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry,
+    OverlayAgent, OverlayDesk, OverlayDeskMember, OverlayDeskOrder, OverlayWorkflow, StoredEvent,
     TemplateProvenance,
 };
 
@@ -118,6 +118,12 @@ struct BundleMeta {
     /// back-compat with older bundles.
     #[serde(default)]
     overlay_workflows: Vec<OverlayWorkflow>,
+    /// The operator-set per-teammate daily spend caps (issue #343). Preserved so
+    /// an export→import keeps the caps an operator set from the console, rather
+    /// than silently reverting every teammate to its manifest default.
+    /// `#[serde(default)]` for back-compat with older bundles.
+    #[serde(default)]
+    overlay_budgets: Vec<BudgetOverride>,
     /// The source-template provenance, when the exported company carried one.
     /// `#[serde(default)]` keeps older bundles written before provenance existed
     /// importing cleanly (they decode to `None` — no migration).
@@ -166,6 +172,9 @@ struct BundleContents {
     /// The operator workflow-authoring overlay, carried through the bundle so
     /// export→import preserves console-created workflow graphs.
     overlay_workflows: Vec<OverlayWorkflow>,
+    /// The operator-set per-teammate daily spend caps, carried through the
+    /// bundle so export→import preserves console-set budgets (issue #343).
+    overlay_budgets: Vec<BudgetOverride>,
 }
 
 impl BundleContents {
@@ -210,6 +219,7 @@ impl BundleContents {
             overlay_desk_order: record.overlay_desk_order,
             overlay_desks: record.overlay_desks,
             overlay_workflows: record.overlay_workflows,
+            overlay_budgets: record.overlay_budgets,
         })
     }
 
@@ -237,6 +247,7 @@ impl BundleContents {
                 overlay_desk_order: self.overlay_desk_order.clone(),
                 overlay_desks: self.overlay_desks.clone(),
                 overlay_workflows: self.overlay_workflows.clone(),
+                overlay_budgets: self.overlay_budgets.clone(),
                 template_provenance: self.template_provenance.clone(),
             })
             .await?;
@@ -279,6 +290,7 @@ impl BundleContents {
             overlay_desk_order: self.overlay_desk_order.clone(),
             overlay_desks: self.overlay_desks.clone(),
             overlay_workflows: self.overlay_workflows.clone(),
+            overlay_budgets: self.overlay_budgets.clone(),
             template_provenance: self.template_provenance.clone(),
         };
         write_file(
@@ -330,6 +342,23 @@ impl BundleContents {
 
         let meta: BundleMeta = serde_json::from_str(&read_to_string(&src.join(META_JSON)).await?)?;
 
+        // A bundle is the one place `overlay_budgets` arrives from outside this
+        // process, so it is the one place the "at most one override per teammate"
+        // invariant can be violated by data we did not write. Refuse rather than
+        // resolve: `CompanyRecord::effective_budget` reads the first match, so
+        // importing two rows for one teammate would apply whichever the bundle
+        // happened to serialize first — possibly the obsolete one, possibly the
+        // looser one, and with somebody else's name on the attribution. A bundle
+        // that disagrees with itself about a spend cap has no right answer to
+        // pick, and picking silently is how a revoked allowance comes back.
+        if let Some(agent_id) = BudgetOverride::duplicate_agent_id(&meta.overlay_budgets) {
+            return Err(OpenCompanyError::Store(format!(
+                "invalid {META_JSON}: {} carries more than one budget override for teammate \
+                 '{agent_id}'; at most one is allowed",
+                meta.id
+            )));
+        }
+
         let ledger = read_jsonl::<LedgerEntry>(&src.join(LEDGER_JSONL)).await?;
         let events = read_jsonl::<StoredEvent>(&src.join(EVENTS_JSONL)).await?;
         let traces =
@@ -362,6 +391,7 @@ impl BundleContents {
             overlay_desk_order: meta.overlay_desk_order,
             overlay_desks: meta.overlay_desks,
             overlay_workflows: meta.overlay_workflows,
+            overlay_budgets: meta.overlay_budgets,
         })
     }
 }
@@ -809,6 +839,7 @@ mod test {
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         })
         .await
@@ -880,6 +911,7 @@ mod test {
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: Some(provenance.clone()),
         })
         .await
@@ -989,6 +1021,7 @@ mod test {
             overlay_desk_order: order.clone(),
             overlay_desks: desks.clone(),
             overlay_workflows: workflows.clone(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         })
         .await
@@ -1052,6 +1085,217 @@ mod test {
             dst_record.effective_desk_members("eng")[0],
             "cto",
             "routing lead reverted to blueprint after import"
+        );
+
+        for dir in [home1, home2, dest] {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
+    /// A manifest naming two capped teammates, so a round-trip that dropped the
+    /// overrides would fall back to real caps rather than to "uncapped" — the
+    /// regression would still show as the *wrong* numbers, not as absent ones.
+    fn budget_manifest() -> CompanyManifest {
+        toml::from_str(
+            r#"
+            [company]
+            name = "Budget Co"
+            output = "widgets"
+
+            [[agent]]
+            id = "ceo"
+            role = "Chief"
+            budget_usd_daily = 5.0
+
+            [[agent]]
+            id = "cto"
+            role = "Tech"
+            budget_usd_daily = 9.0
+        "#,
+        )
+        .expect("parse manifest")
+    }
+
+    fn admin_actor() -> Actor {
+        Actor {
+            kind: ActorKind::User,
+            id: "user-admin".into(),
+        }
+    }
+
+    /// Issue #343: **all three** budget states survive an export→import — not
+    /// just the empty overlay every other fixture carries.
+    ///
+    /// The three are only distinct if serialization keeps them distinct, and two
+    /// of the three collapse into each other under the obvious mistakes:
+    /// `Some(0.0)` becomes `None` if the field is ever serialized with
+    /// `skip_serializing_if = "is_zero"`-style cleverness, and an explicit `None`
+    /// becomes "no entry at all" if the row is dropped when it carries no cap.
+    /// Either collapse is a silent unrecoverable change to a spend cap: a
+    /// teammate an admin muted starts spending again, or a teammate an admin
+    /// deliberately uncapped inherits the manifest's cap back. Attribution is
+    /// asserted alongside the cap because a restored cap nobody appears to have
+    /// set is its own defect.
+    #[tokio::test]
+    async fn budget_overrides_survive_roundtrip_including_zero_and_explicit_none() {
+        let home1 = tmp_root("budget-src");
+        let home2 = tmp_root("budget-dst");
+        let dest = tmp_root("budget-bundle");
+        let id = CompanyId::new("budget-co");
+
+        let budgets = vec![
+            // Cap of exactly zero: "this teammate may not spend", NOT "no cap".
+            BudgetOverride {
+                agent_id: "ceo".into(),
+                budget_usd_daily: Some(0.0),
+                set_by: admin_actor(),
+                at_millis: 1_700_000_000_000,
+            },
+            // Explicitly uncapped, beating the manifest's $9.
+            BudgetOverride {
+                agent_id: "cto".into(),
+                budget_usd_daily: None,
+                set_by: admin_actor(),
+                at_millis: 1_700_000_000_001,
+            },
+        ];
+
+        let (s1, e1, m1, c1) = fs_ports(&home1);
+        s1.save(&CompanyRecord {
+            id: id.clone(),
+            manifest: budget_manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".into(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: budgets.clone(),
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+
+        // Sanity: both overrides already beat the manifest in the source.
+        let src_record = s1.load(&id).await.unwrap().unwrap();
+        assert_eq!(src_record.effective_budget("ceo"), Some(0.0));
+        assert_eq!(src_record.effective_budget("cto"), None);
+
+        export_bundle(&id, &dest, s1, e1, m1, c1, ExportOpts::default())
+            .await
+            .unwrap();
+        let (s2, e2, m2, c2) = fs_ports(&home2);
+        import_bundle(&dest, s2.clone(), e2, m2, c2).await.unwrap();
+
+        let dst_record = s2.load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            dst_record.overlay_budgets, budgets,
+            "budget overrides altered by the bundle round-trip"
+        );
+
+        // Cap, attribution and timestamp, read the way every surface reads them.
+        assert_eq!(
+            dst_record.effective_budget("ceo"),
+            Some(0.0),
+            "a zero cap must survive as zero, not decay into uncapped"
+        );
+        assert_eq!(
+            dst_record.effective_budget("cto"),
+            None,
+            "an explicitly-uncapped override must survive and still beat the manifest's $9"
+        );
+        let ceo = dst_record.budget_override("ceo").expect("ceo attribution");
+        assert_eq!(ceo.set_by, admin_actor());
+        assert_eq!(ceo.at_millis, 1_700_000_000_000);
+        let cto = dst_record.budget_override("cto").expect(
+            "an explicitly-uncapped override must keep its attribution row — it is exactly the \
+             case an operator needs to see attributed",
+        );
+        assert_eq!(cto.set_by, admin_actor());
+        assert_eq!(cto.at_millis, 1_700_000_000_001);
+
+        for dir in [home1, home2, dest] {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
+    /// Issue #343: a bundle carrying two overrides for one teammate is **refused**
+    /// at import, not silently reduced to whichever row deserialized first.
+    ///
+    /// Import is the only boundary where `overlay_budgets` arrives from outside
+    /// this process, so it is the only place the write path's one-per-teammate
+    /// invariant can be broken. The two rows here disagree ($0 versus $50, set by
+    /// different people), which is the point: there is no correct row to pick,
+    /// and picking silently would either mute a teammate or restore an allowance
+    /// an admin revoked, with the wrong name on the attribution either way.
+    #[tokio::test]
+    async fn a_bundle_with_duplicate_budget_overrides_is_rejected() {
+        let home1 = tmp_root("dup-src");
+        let home2 = tmp_root("dup-dst");
+        let dest = tmp_root("dup-bundle");
+        let id = CompanyId::new("dup-co");
+
+        let (s1, e1, m1, c1) = fs_ports(&home1);
+        s1.save(&CompanyRecord {
+            id: id.clone(),
+            manifest: budget_manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".into(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+        export_bundle(&id, &dest, s1, e1, m1, c1, ExportOpts::default())
+            .await
+            .unwrap();
+
+        // Forge the tampered/foreign bundle by rewriting its meta.json — the shape
+        // an import can be handed but the write path can never produce.
+        let meta_path = dest.join(META_JSON);
+        let mut meta: BundleMeta =
+            serde_json::from_str(&tokio::fs::read_to_string(&meta_path).await.unwrap()).unwrap();
+        meta.overlay_budgets = vec![
+            BudgetOverride {
+                agent_id: "ceo".into(),
+                budget_usd_daily: Some(0.0),
+                set_by: admin_actor(),
+                at_millis: 1_700_000_000_000,
+            },
+            BudgetOverride {
+                agent_id: "ceo".into(),
+                budget_usd_daily: Some(50.0),
+                set_by: Actor {
+                    kind: ActorKind::User,
+                    id: "user-other".into(),
+                },
+                at_millis: 1_700_000_000_002,
+            },
+        ];
+        tokio::fs::write(&meta_path, serde_json::to_string(&meta).unwrap())
+            .await
+            .unwrap();
+
+        let (s2, e2, m2, c2) = fs_ports(&home2);
+        let err = import_bundle(&dest, s2.clone(), e2, m2, c2)
+            .await
+            .expect_err("import must refuse a bundle with two overrides for one teammate");
+        let message = err.to_string();
+        assert!(
+            message.contains("ceo") && message.contains("budget override"),
+            "the refusal must name the teammate so an operator can fix the bundle: {message}"
+        );
+
+        // And nothing was written: a refused import must not half-apply.
+        assert!(
+            s2.load(&id).await.unwrap().is_none(),
+            "a rejected bundle must not persist a partial company record"
         );
 
         for dir in [home1, home2, dest] {

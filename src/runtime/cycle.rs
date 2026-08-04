@@ -882,6 +882,7 @@ fn cycle_task_id(
             | CompanyEvent::WorkflowDeleted { .. }
             | CompanyEvent::WorkflowRunFinished { .. }
             | CompanyEvent::TaskSteered { .. }
+            | CompanyEvent::TaskDiscussionPosted { .. }
             | CompanyEvent::DeskTaskCompleted { .. } => continue,
         };
         let Some(candidate) = candidate else { continue };

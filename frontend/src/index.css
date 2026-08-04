@@ -118,6 +118,84 @@
     --sidebar-ring: oklch(0.556 0 0);
 }
 
+/*
+ * Knowledge-graph tokens.
+ *
+ * The Overview's graph is written against its own palette names. They are
+ * mapped onto the console's theme here and scoped to `.oc-kg`, so the graph
+ * gets the vocabulary it expects without leaking a second set of colour names
+ * into the rest of the app. Sources are the `--color-*` aliases rather than the
+ * raw vars, so the mapping is not a self-reference.
+ */
+/*
+ * The graph's own hues live at `:root` so Tailwind can resolve the `@theme`
+ * entries below at build time — a `@theme` value pointing at a variable that
+ * only exists deeper in the tree does not register, and the utility silently
+ * falls back to `currentColor` (which paints every frame stark white).
+ */
+:root {
+    /* Slot 1 blue leads, as it does in every other chart in the console;
+       pillars burn slot 2 orange and tools slot 3 aqua. */
+    --kg-accent: #2a78d6;
+    --kg-ok: #008300;
+    --kg-warn: #a87400;
+    --kg-brain-1: #eb6834;
+    --kg-brain-2: #1baf7a;
+}
+
+.dark {
+    --kg-accent: #3987e5;
+    --kg-warn: #eda100;
+    --kg-brain-1: #d95926;
+    --kg-brain-2: #199e70;
+}
+
+@theme {
+    --color-os-bg: var(--background);
+    --color-os-surface: var(--card);
+    --color-os-border: var(--border);
+    --color-os-border-strong: var(--input);
+    --color-os-text: var(--foreground);
+    --color-os-muted: var(--muted-foreground);
+    --color-os-dim: var(--muted-foreground);
+    --color-os-accent: var(--kg-accent);
+    --color-os-ok: var(--kg-ok);
+    --color-os-warn: var(--kg-warn);
+    --color-os-err: var(--destructive);
+    /* The graph's own corner scale: barely rounded, so the diagram chrome
+       stays distinct from the console's rounded cards. */
+    --radius-sm-t: 2px;
+    --radius-md-t: 4px;
+    --radius-lg-t: 6px;
+}
+
+/*
+ * The unprefixed names the ported graph writes inline as `var(--…)`. Scoped to
+ * the graph so a second set of colour names never leaks into the rest of the
+ * app. `--border` is deliberately absent: the console already defines it, and
+ * aliasing it to its own `--color-border` alias would be a cycle.
+ */
+.oc-kg {
+    --ease: cubic-bezier(0.32, 0.72, 0, 1);
+    --bg: var(--background);
+    --surface: var(--card);
+    --border-strong: var(--input);
+    --text: var(--foreground);
+    --text-2: var(--muted-foreground);
+    --text-3: var(--muted-foreground);
+    --muted: var(--muted-foreground);
+    --dim: var(--muted-foreground);
+    --accent: var(--kg-accent);
+    --accent-soft: color-mix(in oklab, var(--kg-accent) 12%, transparent);
+    --accent-line: color-mix(in oklab, var(--kg-accent) 30%, transparent);
+    --ok: var(--kg-ok);
+    --warn: var(--kg-warn);
+    --err: var(--destructive);
+    --brain-1: var(--kg-brain-1);
+    --brain-2: var(--kg-brain-2);
+    --kg-tool: var(--kg-brain-2);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

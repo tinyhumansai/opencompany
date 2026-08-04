@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex as TokioMutex;
 
@@ -149,7 +150,14 @@ pub struct CompanyRuntime {
     /// pre-#243 native-execute behaviour.
     pub(crate) grants: GrantSet,
     /// Held for the duration of a cycle so cycles never interleave per company.
-    pub(crate) serial: TokioMutex<()>,
+    ///
+    /// `Arc`-shared rather than owned so a rebuilt runtime can inherit the *same*
+    /// lock (issue #290). Two runtimes for one company each holding their own
+    /// mutex would mean two cycles running at once against a store whose `save`
+    /// writes the whole record, which is exactly the invariant this exists to
+    /// hold. Handing the lock over is also what makes
+    /// [`quiesce`](Self::quiesce)'s drain meaningful across the swap.
+    pub(crate) serial: Arc<TokioMutex<()>>,
     /// Held across a REST board write's read → validate → write, so two
     /// concurrent edits cannot each validate against a snapshot that predates
     /// the other's edge (issue #185 review).
@@ -158,7 +166,17 @@ pub struct CompanyRuntime {
     /// whole cycle, which is a live agent turn, so reusing it would park every
     /// board edit behind an LLM call. This one is only ever held across a
     /// couple of store round-trips.
-    pub(crate) task_writes: TokioMutex<()>,
+    ///
+    /// `Arc`-shared for the same reason as [`serial`](Self::serial): a rebuild
+    /// inherits it rather than minting a second one.
+    pub(crate) task_writes: Arc<TokioMutex<()>>,
+    /// Set while this runtime is being replaced (issue #290). Once set, every
+    /// cycle entry point refuses with [`OpenCompanyError::Quiescing`] so the
+    /// in-flight turn can drain and the successor takes over at a point with no
+    /// live cycle. Never cleared by the runtime itself: either the successor
+    /// replaces it in the registry, or the rebuild failed and
+    /// [`resume`](Self::resume) puts this one back to work.
+    pub(crate) quiesced: Arc<AtomicBool>,
     /// WS4: the embedded openhuman harness pool, when wired via
     /// [`RuntimeBuilder::with_harness`](crate::runtime::RuntimeBuilder::with_harness).
     /// Feature-gated so the default build is unaffected.
@@ -219,8 +237,9 @@ impl CompanyRuntime {
             workflow_runner: None,
             steer: crate::company::steer::InflightRegistry::new(),
             grants,
-            serial: TokioMutex::new(()),
-            task_writes: TokioMutex::new(()),
+            serial: Arc::new(TokioMutex::new(())),
+            task_writes: Arc::new(TokioMutex::new(())),
+            quiesced: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "openhuman")]
             harness: None,
             #[cfg(feature = "mcp")]
@@ -309,6 +328,17 @@ impl CompanyRuntime {
         &self.events
     }
 
+    /// This company's runtime journal — the at-most-once effect log and the
+    /// durable approval queue.
+    ///
+    /// Exposed so a rebuild can prove it handed the *same* journal to the
+    /// successor: a second `RuntimeJournal` over one path is the corruption
+    /// hazard [`RuntimeHandover`](crate::runtime::RuntimeHandover) exists to
+    /// prevent, and "we passed it along" is only checkable if it is readable.
+    pub fn journal(&self) -> &Arc<RuntimeJournal> {
+        &self.journal
+    }
+
     /// This company's durable record store.
     pub fn store(&self) -> &Arc<dyn CompanyStore> {
         &self.store
@@ -389,22 +419,7 @@ impl CompanyRuntime {
             let task_id = task.id.clone();
             let run_id = self.open_run(task).await;
             let runtime = Arc::clone(self);
-            tokio::spawn(async move {
-                if let Err(err) = runtime
-                    .run_cycle(vec![CompanyEvent::TaskDispatched {
-                        task_id: task_id.clone(),
-                        run_id,
-                    }])
-                    .await
-                {
-                    tracing::warn!(
-                        company = %runtime.id,
-                        task = %task_id,
-                        error = %err,
-                        "task dispatch cycle failed"
-                    );
-                }
-            });
+            tokio::spawn(async move { runtime.run_dispatch_cycle(task_id, run_id).await });
             return;
         }
         // Default build / no harness: the board stays inert. The card rests in
@@ -412,6 +427,79 @@ impl CompanyRuntime {
         // minted either — nothing is attempting the card, so an attempt row would
         // be a fiction.
         let _ = task;
+    }
+
+    /// The body of a dispatch's detached cycle (issue #242), split out of the
+    /// `tokio::spawn` so the quiesce path below is reachable from a test.
+    ///
+    /// Owns the settle for the one dispatch failure the cycle's own terminality
+    /// backstop cannot see — see [`abandon_run`](Self::abandon_run).
+    #[cfg(feature = "openhuman")]
+    async fn run_dispatch_cycle(self: Arc<Self>, task_id: String, run_id: Option<String>) {
+        let Err(err) = self
+            .run_cycle(vec![CompanyEvent::TaskDispatched {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+            }])
+            .await
+        else {
+            return;
+        };
+        // Issue #290 meets issue #242. `ensure_accepting` refuses *before*
+        // `CycleRunner` takes the serial lock, so a dispatch that lands in the
+        // window while this runtime is being replaced never reaches `begin_run`
+        // — and the backstop inside the cycle only settles rows that cycle
+        // started. Every other dispatch failure is already covered in there.
+        // Left alone, the row minted a moment ago would sit `Pending` for the
+        // rest of the process's life: a card reading as under way by an attempt
+        // that never began, which nothing re-drives, and which the rebuild
+        // deliberately does *not* run the boot reaper to clean up.
+        if let Some(id) = run_id.as_deref()
+            && matches!(err, OpenCompanyError::Quiescing(_))
+        {
+            self.abandon_run(id).await;
+        }
+        tracing::warn!(
+            company = %self.id,
+            task = %task_id,
+            error = %err,
+            "task dispatch cycle failed"
+        );
+    }
+
+    /// Settles an attempt whose cycle was refused before it could start
+    /// (issue #290).
+    ///
+    /// `Pending` → terminal is exactly the move the transition table names for
+    /// "a dispatch that failed before the first turn"
+    /// ([`RunStatus::can_transition_to`](crate::ports::runs::RunStatus::can_transition_to)),
+    /// so this needs no new state — only a caller willing to use it.
+    ///
+    /// Recorded as [`RunStatus::Failed`](crate::ports::runs::RunStatus::Failed)
+    /// rather than `Cancelled`, for the same reason the boot reaper picks
+    /// `Failed`: the runtime went away underneath a card an operator had just
+    /// dispatched, and that is something they need to see and re-drive, not an
+    /// intentional stop filed quietly away. The reason string is its own
+    /// constant ([`RUNTIME_REPLACED_ERROR`](crate::ports::runs::RUNTIME_REPLACED_ERROR))
+    /// so a run list can tell "we swapped your runtime" apart from "the host
+    /// died". The card itself stays in `in_progress`, which is where every other
+    /// failed dispatch cycle leaves it.
+    ///
+    /// Best-effort and logged, never propagated: the dispatch has already
+    /// failed, and a bookkeeping write cannot make that better or worse.
+    #[cfg(feature = "openhuman")]
+    async fn abandon_run(&self, run_id: &str) {
+        let outcome = crate::ports::runs::RunOutcome::new(crate::ports::runs::RunStatus::Failed)
+            .with_error(crate::ports::runs::RUNTIME_REPLACED_ERROR);
+        if let Err(err) = self.ops.runs.finish_run(&self.id, run_id, outcome).await {
+            tracing::warn!(
+                company = %self.id,
+                run = %run_id,
+                error = %err,
+                "[runs] could not settle an attempt refused by a quiescing runtime; it stays \
+                 Pending until the next boot reaps it"
+            );
+        }
     }
 
     /// Mints this dispatch's [`RunStatus::Pending`] attempt row and returns its
@@ -526,8 +614,76 @@ impl CompanyRuntime {
         self.economy.is_some()
     }
 
+    /// Stops this runtime accepting new cycles, then waits for the one in flight
+    /// to finish (issue #290).
+    ///
+    /// The two halves are both necessary and neither is sufficient. Setting the
+    /// flag alone leaves a turn mid-cycle, and a successor that started writing
+    /// the same journal underneath it would interleave two records onto one line
+    /// — a parse failure that bricks the *next* boot, not just this one. Waiting
+    /// on [`serial`](Self::serial) alone would race: a cycle queued behind the
+    /// one in flight would acquire the lock the moment it dropped and the drain
+    /// would return to a runtime that is busy again.
+    ///
+    /// The `serial` guard is deliberately released before returning. It is
+    /// handed to the successor by [`RuntimeHandover`](crate::runtime::RuntimeHandover),
+    /// so holding it here would park the successor's first cycle behind a guard
+    /// this runtime no longer has any reason to own.
+    ///
+    /// What this does **not** drain: work that never takes `serial`. Detached
+    /// task dispatches and scheduled workflow runs each clone an
+    /// `Arc<CompanyRuntime>` and run a cycle, so they *are* covered — they either
+    /// completed before the flag was set or they are the turn being waited on.
+    /// A harness tool call already in flight inside that turn finishes on the old
+    /// pool, which the successor then inherits.
+    pub async fn quiesce(&self) {
+        self.quiesced.store(true, Ordering::SeqCst);
+        // Acquiring proves the in-flight cycle (if any) has finished.
+        let _drained = self.serial.lock().await;
+    }
+
+    /// Puts a quiesced runtime back to work.
+    ///
+    /// Called when a rebuild fails: a company left quiesced would refuse every
+    /// cycle forever, which is a far worse outcome than the stale brain the
+    /// rebuild was trying to replace.
+    pub fn resume(&self) {
+        self.quiesced.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this runtime has stopped accepting cycles pending a swap.
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesced.load(Ordering::SeqCst)
+    }
+
+    /// Adopts the serialising mutexes of the runtime this one replaces
+    /// (issue #290), so the cycle and board-write invariants span the swap
+    /// instead of lapsing at it.
+    ///
+    /// Called by the [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) on a
+    /// rebuild, before the successor is registered and therefore before anything
+    /// can be holding either lock through *this* runtime.
+    pub fn adopt_locks(&mut self, serial: Arc<TokioMutex<()>>, task_writes: Arc<TokioMutex<()>>) {
+        self.serial = serial;
+        self.task_writes = task_writes;
+    }
+
+    /// Rejects a cycle on a runtime that is being replaced.
+    ///
+    /// Separate from [`ensure_running`](Self::ensure_running): that one reads a
+    /// durable lifecycle an operator chose (paused, archived) and renders `409`;
+    /// this one is a process-local window that clears itself within a turn and
+    /// renders `503`.
+    fn ensure_accepting(&self) -> Result<()> {
+        if self.is_quiesced() {
+            return Err(OpenCompanyError::Quiescing(self.id.as_ref().to_string()));
+        }
+        Ok(())
+    }
+
     /// Runs one cycle over a batch of events, returning what happened.
     pub async fn run_cycle(&self, events: Vec<CompanyEvent>) -> Result<CycleReport> {
+        self.ensure_accepting()?;
         CycleRunner::new(self).run(events).await
     }
 
@@ -539,6 +695,11 @@ impl CompanyRuntime {
         verdict: Verdict,
         by: Actor,
     ) -> Result<CycleReport> {
+        // Checked before the gate is touched, not inside the follow-up cycle: a
+        // resolution that journaled the verdict and then failed to run its
+        // follow-up would leave the brain permanently unaware of an approval the
+        // operator had already granted.
+        self.ensure_accepting()?;
         CycleRunner::new(self)
             .resolve_approval(id, verdict, by)
             .await
@@ -555,6 +716,7 @@ impl CompanyRuntime {
         amended_payload: serde_json::Value,
         by: Actor,
     ) -> Result<CycleReport> {
+        self.ensure_accepting()?;
         CycleRunner::new(self)
             .resolve_approval_amended(id, amended_payload, by)
             .await
@@ -957,5 +1119,104 @@ mod tests {
                 .attempt,
             2
         );
+    }
+
+    /// Issue #290 against issue #242's write path: a card dragged into
+    /// `in_progress` while this runtime is being replaced must not leave an
+    /// attempt row claiming to be pending forever.
+    ///
+    /// The board write is deliberately *not* gated on the quiesce — only cycles
+    /// are — so this window is reachable, and the refusal happens before
+    /// `CycleRunner` starts the run, which puts it out of reach of the cycle's
+    /// own terminality backstop. A rebuild also skips the boot reaper by design,
+    /// so nothing else would ever clean the row up.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_dispatch_refused_by_a_quiescing_runtime_settles_its_attempt() {
+        use std::sync::Arc;
+
+        use crate::ports::TaskRecord;
+        use crate::ports::runs::{RUNTIME_REPLACED_ERROR, RunStatus};
+        use crate::ports::tasks::COLUMN_IN_PROGRESS;
+
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-run-quiesce-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest: crate::company::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .expect("manifest");
+        let id = crate::ports::types::CompanyId::new("acme");
+        let runtime = Arc::new(
+            crate::runtime::RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+                .with_id(id.clone())
+                .build()
+                .await
+                .expect("runtime"),
+        );
+
+        let card = TaskRecord {
+            id: "t-1".to_string(),
+            title: "Ship it".to_string(),
+            note: None,
+            column: COLUMN_IN_PROGRESS.to_string(),
+            priority: "medium".to_string(),
+            assignee: "ceo".to_string(),
+            updated_at_millis: 0,
+            origin_chat_id: None,
+            parent_task_id: None,
+        };
+
+        // Positive control: on a live runtime the cycle runs, so the row is
+        // settled by the backstop inside it and never reaches the path below.
+        let live = runtime.open_run(&card).await.expect("an attempt");
+        Arc::clone(&runtime)
+            .run_dispatch_cycle(card.id.clone(), Some(live.clone()))
+            .await;
+        let settled = runtime
+            .runs()
+            .get_run(&id, &live)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            settled.status.is_terminal(),
+            "the ordinary dispatch path still settles its own row"
+        );
+        assert_ne!(
+            settled.error.as_deref(),
+            Some(RUNTIME_REPLACED_ERROR),
+            "the live path must not be settled by the quiesce handler"
+        );
+
+        // The window this test exists for.
+        let stranded = runtime.open_run(&card).await.expect("an attempt");
+        runtime.quiesce().await;
+        Arc::clone(&runtime)
+            .run_dispatch_cycle(card.id.clone(), Some(stranded.clone()))
+            .await;
+
+        let abandoned = runtime
+            .runs()
+            .get_run(&id, &stranded)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            abandoned.status,
+            RunStatus::Failed,
+            "an attempt whose cycle was refused must not stay Pending"
+        );
+        assert_eq!(
+            abandoned.error.as_deref(),
+            Some(RUNTIME_REPLACED_ERROR),
+            "and it must say the runtime was swapped, not that the host died"
+        );
+        assert!(
+            abandoned.started_at_millis.is_none(),
+            "it never started, so it has no start time"
+        );
+        assert!(abandoned.finished_at_millis.is_some());
     }
 }

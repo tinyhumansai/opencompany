@@ -134,8 +134,25 @@ prompt = "Weekly review and operator digest"
     meter or a failing meter, dispatch **runs** (bricking a teammate's
     cognition with no operator recourse is worse than a day of overspend),
     while a priced tool call **parks** (a human can wave that one through).
-  - **Operator-added (overlay) teammates are uncapped in v1.** Only manifest
-    `[[agent]]` entries carry the field.
+  Since issue #343 the manifest value is a **default, not the last word**. An
+  admin can set, change or clear a teammate's cap from the console
+  (`PUT`/`DELETE …/team/{agentId}/budget`); the override is stored on the
+  company record, wins over `budget_usd_daily` everywhere the cap is read
+  ([`CompanyRecord::effective_budget`] is the single reconciliation point), and
+  takes effect on the teammate's **next dispatch** — no restart, no redeploy.
+  That matters most on a hosted tenant, where `company.toml` is baked into the
+  container image and an operator has no way to edit it. Three stored states,
+  kept deliberately distinct: no override (the manifest applies), a cap of `x`
+  (`0` included, meaning "may not spend"), and an explicit "uncapped" that beats
+  a manifest cap. `DELETE` drops the override so the manifest applies again,
+  which no `PUT` body can express. Writes are admin-only and record who set the
+  cap and when.
+
+  - **Operator-added (overlay) teammates carry no manifest cap**, because they
+    have no `[[agent]]` entry — but since #343 they can be capped through a
+    console override like anyone else, including at creation.
+
+  [`CompanyRecord::effective_budget`]: ../../../src/ports/types.rs
 - **`[brain]`** selects the `Brain` implementation. `hosted` requires a
   TinyHumans credential at runtime; `sidecar` requires the `sidecar` feature.
 - **`[inference]`** (issue #56 — BYOK) routes the company's agents through a
@@ -156,6 +173,14 @@ prompt = "Weekly review and operator digest"
   neither. The status route reports that state as `restartRequired` — a resolved
   config next to a non-harness `cognition` — and the console says "restart"
   instead of "next turn" for it (issue #266).
+  Since issue #290 that save **rebuilds the company's runtime in place** rather
+  than asking for a restart the operator may have no way to perform: a hosted
+  tenant's unit of restart is its container, and the control plane has no button
+  for it. `PUT …/inference` quiesces the running runtime, hands its live state to
+  a successor, and swaps the registry — see
+  [runtime rebuild](rebuild.md). `restartRequired` remains on the read shape and
+  stays honest: it is still `true` on a host that wired no rebuilder, which is
+  when a restart genuinely is the only route.
   Saving `managed` from the console is a *revert* (`DELETE …/inference`) and
   carries no credential, so the console refuses that save while a key is still
   typed in the form rather than dropping it and reporting success (issue #265).

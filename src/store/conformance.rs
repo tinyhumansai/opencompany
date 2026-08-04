@@ -77,11 +77,49 @@ fn sample_overlay_workflow() -> crate::ports::types::OverlayWorkflow {
     }
 }
 
+/// The operator-set daily spend caps the fixture seeds every record with, so
+/// each backend (fs, sqlite, mongodb) proves a console-set budget survives
+/// persistence (issue #343).
+///
+/// Deliberately **three** rows, because the field's whole point is that the
+/// three states stay apart across a round-trip: an ordinary cap, a legitimate
+/// `0.0` cap, and an entry whose `budget_usd_daily` is `None` — "explicitly
+/// uncapped", which beats a manifest cap. A backend that collapsed the last one
+/// into "no row" (or into `0.0`) would silently re-impose the very cap the
+/// operator cleared, and only this fixture would catch it.
+fn sample_budget_overrides() -> Vec<crate::ports::types::BudgetOverride> {
+    use crate::ports::types::{Actor, ActorKind, BudgetOverride};
+    let admin = Actor {
+        kind: ActorKind::User,
+        id: "user-conformance".to_string(),
+    };
+    vec![
+        BudgetOverride {
+            agent_id: "ceo".to_string(),
+            budget_usd_daily: Some(12.5),
+            set_by: admin.clone(),
+            at_millis: 1_700_000_000_000,
+        },
+        BudgetOverride {
+            agent_id: "eng".to_string(),
+            budget_usd_daily: Some(0.0),
+            set_by: admin.clone(),
+            at_millis: 1_700_000_000_001,
+        },
+        BudgetOverride {
+            agent_id: "writer".to_string(),
+            budget_usd_daily: None,
+            set_by: admin,
+            at_millis: 1_700_000_000_002,
+        },
+    ]
+}
+
 /// Builds a running record for `id` carrying a non-empty desk-order overlay (so
 /// the store round-trip covers the operator desk-hierarchy field, issue #131), a
-/// runtime-authored workflow body (issue #168), and stamped with the sample
-/// template provenance (so round-trips assert it survives persistence, issue
-/// #85).
+/// runtime-authored workflow body (issue #168), a populated budget-override set
+/// (issue #343), and stamped with the sample template provenance (so round-trips
+/// assert it survives persistence, issue #85).
 fn record(id: &CompanyId) -> CompanyRecord {
     CompanyRecord {
         id: id.clone(),
@@ -96,6 +134,7 @@ fn record(id: &CompanyId) -> CompanyRecord {
         }],
         overlay_desks: Vec::new(),
         overlay_workflows: vec![sample_overlay_workflow()],
+        overlay_budgets: sample_budget_overrides(),
         template_provenance: Some(sample_provenance()),
     }
 }
@@ -194,6 +233,22 @@ pub async fn assert_isolation_by_company(
         loaded.overlay_workflows,
         vec![sample_overlay_workflow()],
         "overlay_workflows did not survive save/load"
+    );
+    // The operator-set daily spend caps survive the store round-trip (issue
+    // #343), all three states intact — a cap, a real `0.0`, and the explicitly-
+    // uncapped `None`. Collapsing the last one would silently restore the
+    // manifest cap the operator had cleared.
+    assert_eq!(
+        loaded.overlay_budgets,
+        sample_budget_overrides(),
+        "overlay_budgets did not survive save/load"
+    );
+    assert!(
+        loaded
+            .overlay_budgets
+            .iter()
+            .any(|entry| entry.agent_id == "writer" && entry.budget_usd_daily.is_none()),
+        "the explicitly-uncapped override decayed into an absent or zeroed entry"
     );
     assert_eq!(
         events
@@ -416,6 +471,14 @@ pub async fn assert_export_totality(
         loaded.overlay_workflows,
         vec![sample_overlay_workflow()],
         "overlay_workflows did not round-trip through the store"
+    );
+    // Issue #343: the console-set daily caps round-trip on every backend. This
+    // is what makes "no redeploy" durable rather than in-memory — a cap raised
+    // from the Team page has to still be raised after the process restarts.
+    assert_eq!(
+        loaded.overlay_budgets,
+        sample_budget_overrides(),
+        "overlay_budgets did not round-trip through the store"
     );
 
     // Full event log round-trips with seqs and payloads intact.

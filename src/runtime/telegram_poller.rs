@@ -72,6 +72,10 @@ pub enum PollOutcome {
 /// Drives one company's Telegram inbound over `getUpdates` long-polling.
 pub struct TelegramPoller {
     runtime: Arc<CompanyRuntime>,
+    /// When set, the runtime to drive is looked up here every tick so a runtime
+    /// swap (issue #290) reaches inbound Telegram. `None` keeps the boot
+    /// snapshot.
+    registry: Option<crate::runtime::CompanyRegistry>,
     api: Arc<dyn TelegramApi>,
     /// Long-poll hold handed to `getUpdates`, and the idle back-off.
     poll: Duration,
@@ -105,6 +109,7 @@ impl TelegramPoller {
     ) -> Self {
         Self {
             runtime,
+            registry: None,
             api,
             poll: Duration::from_secs(poll_secs.max(1)),
             webhook_capable,
@@ -112,6 +117,27 @@ impl TelegramPoller {
             offset: None,
             handshaked: false,
         }
+    }
+
+    /// Issue #290: re-read `registry` for this company on every tick, instead of
+    /// driving the `Arc<CompanyRuntime>` snapshotted at boot.
+    ///
+    /// Without this, a runtime swap never reaches this loop: it keeps driving a
+    /// runtime that has been replaced and quiesced, so every inbound message
+    /// fails. Opted into by the boot path, so existing callers keep the snapshot
+    /// behaviour.
+    pub fn following(mut self, registry: crate::runtime::CompanyRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// The runtime to drive this tick: whatever is registered now, else the
+    /// snapshot taken at construction.
+    fn runtime(&self) -> Arc<CompanyRuntime> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(self.runtime.id()))
+            .unwrap_or_else(|| self.runtime.clone())
     }
 
     /// The bot token for this company, or `None` when unset/blank. An empty
@@ -187,7 +213,8 @@ impl TelegramPoller {
             self.offset = None;
             self.handshaked = false;
         }
-        if self.runtime.ensure_running().await.is_err() {
+        let runtime = self.runtime();
+        if runtime.ensure_running().await.is_err() {
             return Ok(PollOutcome::Idle);
         }
         if !self.handshaked && !self.handshake(&token).await? {
@@ -228,20 +255,15 @@ impl TelegramPoller {
                 channel: TELEGRAM_CHANNEL.to_string(),
                 body: update,
             };
-            match self.runtime.run_cycle(vec![event]).await {
+            match runtime.run_cycle(vec![event]).await {
                 Ok(report) => {
                     turns += 1;
-                    deliver_replies(
-                        self.api.as_ref(),
-                        self.runtime.id(),
-                        &token,
-                        &report.responses,
-                    )
-                    .await;
+                    deliver_replies(self.api.as_ref(), runtime.id(), &token, &report.responses)
+                        .await;
                 }
                 Err(err) => {
                     tracing::warn!(
-                        company = %self.runtime.id(),
+                        company = %runtime.id(),
                         "telegram polled cycle failed: {}",
                         scrub_token(&err.to_string(), &token)
                     );
