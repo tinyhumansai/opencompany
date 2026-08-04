@@ -497,5 +497,6 @@ fn the_header_names_the_conversation_the_task_came_from() {
     // Whitespace is not an origin.
     let mut blank = detail();
     blank.task.origin_chat_id = Some("   ".to_string());
-    assert!(!render_document("Acme Co", &blank, &[], T0).contains("Opened from"));
+    let blank_html = render_document("Acme Co", &blank, &[], T0);
+    assert!(!blank_html.contains("Opened from"));
 }

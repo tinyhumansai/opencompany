@@ -3273,6 +3273,11 @@ async fn task_export_serves_a_readable_document_and_alters_nothing() {
     for event in [
         CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
+            // `None` is the honest value here, not a placeholder: this fixture
+            // journals a dispatch directly rather than going through the choke
+            // point that mints a run row (#242), and the export renders the
+            // timeline, which does not read `run_id`.
+            run_id: None,
         },
         CompanyEvent::AgentReply {
             chat_id: "t-1".into(),

@@ -234,7 +234,8 @@ fn render_document(
         .map(str::trim)
         .filter(|c| !c.is_empty())
     {
-        fact(&mut out, "Opened from", &format!("the {chat} conversation"));
+        let origin = format!("the {chat} conversation");
+        fact(&mut out, "Opened from", &origin);
     }
     out.push_str("</dl>\n");
     if detail.durations.waiting_live {
@@ -410,7 +411,10 @@ fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
             if let Some(note) = v.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 out.push_str(&format!("<p class=\"lede\">{}</p>\n", escape(note)));
             }
-            out.push_str(&format!("<div class=\"body\">{}</div>\n", body_html(&v.body)));
+            out.push_str(&format!(
+                "<div class=\"body\">{}</div>\n",
+                body_html(&v.body)
+            ));
             out.push_str("</div>\n");
         }
 
