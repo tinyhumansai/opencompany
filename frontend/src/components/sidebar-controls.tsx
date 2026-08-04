@@ -43,10 +43,11 @@ interface Props {
  * The sidebar's standing controls.
  *
  * No page carries a header of its own any more, so what is left of the old top
- * bar lives here: the company's state, the switcher, and the collapse toggle.
- * Theming and flagging are deliberately absent — Settings owns both, under
- * Appearance and "Something off?", and a second entry point would just be two
- * places to keep in step.
+ * bar lives here: the company's state and the switcher. Collapsing is its own
+ * control at the top of the sidebar (`SidebarCollapseToggle`). Theming and
+ * flagging are deliberately absent — Settings owns both, under Appearance and
+ * "Something off?", and a second entry point would just be two places to keep
+ * in step.
  */
 export function SidebarControls({
   lifecycleState,
@@ -57,7 +58,6 @@ export function SidebarControls({
   view,
   onNavigate,
 }: Props) {
-  const { toggleSidebar, state } = useSidebar();
   const { label, tone } = lifecycle(lifecycleState);
 
   return (
@@ -130,12 +130,31 @@ export function SidebarControls({
         </SidebarMenuButton>
       </SidebarMenuItem>
 
+    </SidebarMenu>
+  );
+}
+
+/**
+ * The collapse toggle, at the top of the sidebar.
+ *
+ * It sits above the nav rather than among the footer controls and wears the
+ * primary color, because it is the one control here that acts on the sidebar
+ * itself — everything below it navigates. The inverted fill also keeps it
+ * findable once the rail is collapsed to icons.
+ */
+export function SidebarCollapseToggle() {
+  const { toggleSidebar, state } = useSidebar();
+  const collapsed = state === "collapsed";
+
+  return (
+    <SidebarMenu>
       <SidebarMenuItem>
         <SidebarMenuButton
-          tooltip={state === "collapsed" ? "Expand sidebar" : "Collapse sidebar"}
+          tooltip={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           onClick={toggleSidebar}
+          className="bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/90 active:text-primary-foreground"
         >
-          <PanelLeft />
+          <PanelLeft className={cn("transition-transform", collapsed && "rotate-180")} />
           <span>Collapse</span>
         </SidebarMenuButton>
       </SidebarMenuItem>

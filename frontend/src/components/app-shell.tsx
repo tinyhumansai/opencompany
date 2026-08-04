@@ -23,6 +23,7 @@ import {
   SidebarFooter,
   SidebarGroup,
   SidebarGroupLabel,
+  SidebarHeader,
   SidebarInset,
   SidebarMenu,
   SidebarMenuBadge,
@@ -32,7 +33,7 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar";
 import { FeedbackDialog } from "@/components/feedback-dialog";
-import { SidebarControls } from "@/components/sidebar-controls";
+import { SidebarCollapseToggle, SidebarControls } from "@/components/sidebar-controls";
 import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
 import { Overview } from "@/views/Overview";
@@ -149,9 +150,10 @@ export function AppShell({
   return (
     <SidebarProvider>
       <Sidebar collapsible="icon">
-        {/* The company header that used to sit above the nav is gone, so the
-            first group needs its own breathing room off the top edge. */}
-        <SidebarContent className="pt-2">
+        <SidebarHeader>
+          <SidebarCollapseToggle />
+        </SidebarHeader>
+        <SidebarContent>
           {NAV.map((group) => (
             <SidebarGroup key={group.label}>
               <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
