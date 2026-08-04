@@ -696,7 +696,12 @@ mod test {
             .await
             .unwrap();
         journal
-            .record_parked(&theirs, &effect(), 1_100, TaskLink::Task { id: "t-2".into() })
+            .record_parked(
+                &theirs,
+                &effect(),
+                1_100,
+                TaskLink::Task { id: "t-2".into() },
+            )
             .await
             .unwrap();
         // No card behind it (a workflow delivery, an operator-chat turn).
@@ -783,7 +788,10 @@ mod test {
             .record_parked(&fresh, &effect(), 5_000, TaskLink::Unlinked)
             .await
             .unwrap();
-        assert_eq!(journal.approval_task(&fresh), Some(Some(TaskLink::Unlinked)));
+        assert_eq!(
+            journal.approval_task(&fresh),
+            Some(Some(TaskLink::Unlinked))
+        );
 
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
         let fresh_line = raw

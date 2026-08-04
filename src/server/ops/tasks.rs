@@ -599,16 +599,18 @@ async fn task_detail(
         .runtime
         .pending_approvals()
         .into_iter()
-        .filter(|a| match approval_owner(&a.id, &task_id, &origins, &task_runs) {
-            ApprovalOwner::Mine => true,
-            ApprovalOwner::NotMine => false,
-            // The legacy rule, kept only for a park that recorded neither key:
-            // inside an open window and parked at or after it opened, so a
-            // backlog item is not re-attributed to this dispatch.
-            ApprovalOwner::Unrecorded => {
-                open_window_at.is_some_and(|opened_at| a.at_millis >= opened_at)
-            }
-        })
+        .filter(
+            |a| match approval_owner(&a.id, &task_id, &origins, &task_runs) {
+                ApprovalOwner::Mine => true,
+                ApprovalOwner::NotMine => false,
+                // The legacy rule, kept only for a park that recorded neither key:
+                // inside an open window and parked at or after it opened, so a
+                // backlog item is not re-attributed to this dispatch.
+                ApprovalOwner::Unrecorded => {
+                    open_window_at.is_some_and(|opened_at| a.at_millis >= opened_at)
+                }
+            },
+        )
         .collect();
 
     // The live wait (issue #305): waiting started when the first of them parked.
@@ -872,7 +874,8 @@ fn fold_page(
                 // is all there is. Scoped by the window being open at this
                 // point in the fold, which is where a resolution sits.
                 ApprovalOwner::Unrecorded => window_opened_at.is_some(),
-            } => {
+            } =>
+            {
                 let origin = origins.get(approval_id);
                 // The approval id joins the resolution back to the journal's
                 // park instant. Clamping to the window's opening keeps a wait

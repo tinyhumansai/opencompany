@@ -3446,7 +3446,12 @@ async fn task_timeline_reports_the_wait_an_approval_actually_caused() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at, TaskLink::Task { id: "t-1".into() })
+        .record_parked(
+            &id,
+            &parked_effect(),
+            parked_at,
+            TaskLink::Task { id: "t-1".into() },
+        )
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -3522,7 +3527,12 @@ async fn expired_approval_is_labelled_as_an_expiry_and_carries_its_wait() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at, TaskLink::Task { id: "t-1".into() })
+        .record_parked(
+            &id,
+            &parked_effect(),
+            parked_at,
+            TaskLink::Task { id: "t-1".into() },
+        )
         .await
         .unwrap();
     // Re-park into the gate at epoch 0 so it is unambiguously past any TTL.
@@ -3803,6 +3813,7 @@ async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals(
             &company,
             CompanyEvent::TaskDispatched {
                 task_id: "t-2".into(),
+                run_id: None,
             },
         )
         .await
@@ -3887,7 +3898,12 @@ async fn a_resolved_approval_reports_its_verdict_and_wait_on_the_tab() {
     let parked_at = dispatched_at + 20;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at, TaskLink::Task { id: "t-1".into() })
+        .record_parked(
+            &id,
+            &parked_effect(),
+            parked_at,
+            TaskLink::Task { id: "t-1".into() },
+        )
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -4127,7 +4143,9 @@ async fn a_pre_333_approval_falls_back_to_the_run_window() {
         "at_millis": dispatched_at + 5,
     });
     let path = Bundle::new(&home, runtime.id()).journal_jsonl();
-    tokio::fs::write(&path, format!("{legacy}\n")).await.unwrap();
+    tokio::fs::write(&path, format!("{legacy}\n"))
+        .await
+        .unwrap();
     runtime.journal.load().await.unwrap();
 
     let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;

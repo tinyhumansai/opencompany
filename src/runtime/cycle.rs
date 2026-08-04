@@ -3220,9 +3220,15 @@ mod test {
             Some("t-1".into())
         );
         // An approval with no origin at all claims nothing.
-        assert_eq!(cycle_task_id(&[resolved("appr-unknown")], approval_task), None);
+        assert_eq!(
+            cycle_task_id(&[resolved("appr-unknown")], approval_task),
+            None
+        );
         // Nor does a pre-#333 one.
-        assert_eq!(cycle_task_id(&[resolved("appr-legacy")], approval_task), None);
+        assert_eq!(
+            cycle_task_id(&[resolved("appr-legacy")], approval_task),
+            None
+        );
         // Nothing task-shaped at all.
         assert_eq!(cycle_task_id(&[chat()], approval_task), None);
         // Two different cards in one batch: refuse to guess rather than hand one
