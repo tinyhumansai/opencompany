@@ -1,5 +1,4 @@
-import { Building2, Flag, Monitor, Moon, PanelLeft, Sun } from "lucide-react";
-import { useTheme } from "next-themes";
+import { Building2, PanelLeft } from "lucide-react";
 
 import type { CompanyStatus } from "@/api/types";
 
@@ -34,15 +33,16 @@ interface Props {
   activeCompany: string | null;
   onSwitchCompany: (id: string) => void;
   onBackToPicker?: () => void;
-  onFlag: () => void;
 }
 
 /**
- * The controls that used to live in each page's top bar.
+ * The sidebar's standing controls.
  *
- * They sit in the sidebar now so no page carries a header of its own — every
- * view gets its whole frame. Each one is a sidebar menu row, so all of them
- * collapse to a tooltipped icon along with the rest of the nav.
+ * No page carries a header of its own any more, so what is left of the old top
+ * bar lives here: the company's state, the switcher, and the collapse toggle.
+ * Theming and flagging are deliberately absent — Settings owns both, under
+ * Appearance and "Something off?", and a second entry point would just be two
+ * places to keep in step.
  */
 export function SidebarControls({
   lifecycleState,
@@ -50,9 +50,7 @@ export function SidebarControls({
   activeCompany,
   onSwitchCompany,
   onBackToPicker,
-  onFlag,
 }: Props) {
-  const { setTheme } = useTheme();
   const { toggleSidebar, state } = useSidebar();
   const { label, tone } = lifecycle(lifecycleState);
 
@@ -102,34 +100,6 @@ export function SidebarControls({
           </DropdownMenu>
         </SidebarMenuItem>
       )}
-
-      <SidebarMenuItem>
-        <SidebarMenuButton tooltip="Flag something" onClick={onFlag}>
-          <Flag />
-          <span>Flag something</span>
-        </SidebarMenuButton>
-      </SidebarMenuItem>
-
-      <SidebarMenuItem>
-        <DropdownMenu>
-          <DropdownMenuTrigger render={<SidebarMenuButton tooltip="Change theme" />}>
-            <Sun className="rotate-0 scale-100 transition-all dark:-rotate-90 dark:scale-0" />
-            <Moon className="absolute rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
-            <span>Theme</span>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" side="right">
-            <DropdownMenuItem onClick={() => setTheme("light")}>
-              <Sun className="size-4" /> Light
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => setTheme("dark")}>
-              <Moon className="size-4" /> Dark
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => setTheme("system")}>
-              <Monitor className="size-4" /> System
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarMenuItem>
 
       <SidebarMenuItem>
         <SidebarMenuButton

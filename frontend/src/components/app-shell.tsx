@@ -210,7 +210,6 @@ export function AppShell({
             activeCompany={company}
             onSwitchCompany={onSwitchCompany}
             onBackToPicker={onBackToPicker}
-            onFlag={() => setFeedbackOpen(true)}
           />
         </SidebarFooter>
         <SidebarRail />
