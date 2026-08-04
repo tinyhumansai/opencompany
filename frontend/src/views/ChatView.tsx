@@ -236,12 +236,13 @@ export function ChatView({
     setSending(true);
     try {
       // A real desk channel's id doubles as its thread id (`deskFromDto`), so
-      // addressing by it routes to that desk's lead instead of the
-      // orchestrator. A DM's id is console-local (`dmChannelId`), not a host
-      // thread — passing it would be an unknown id, which the host already
-      // falls back on, but omitting it here says plainly that a DM has no
-      // addressed thread of its own.
-      const chatId = active.kind === "channel" ? active.id : undefined;
+      // addressing by it routes to that desk's lead. A DM's id is
+      // console-local (`dmChannelId`), not a host thread — but `chat` also
+      // accepts a roster teammate id directly (`responder_for` in
+      // `src/harness/brain.rs`), which is exactly what a DM's `member.id`
+      // is, so a DM addresses that teammate the same way a desk addresses
+      // its lead.
+      const chatId = active.kind === "channel" ? active.id : active.member?.id;
       const reply = await client.chat(text, company, chatId);
       const replies = reply.responses.length
         ? reply.responses.map((r) =>

@@ -41,10 +41,12 @@ import { toast } from "sonner";
 
 import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
 import { CONNECTION_PROVIDERS } from "@/lib/connections";
+import { defaultDesks } from "@/lib/desks";
+import { fromDto } from "@/lib/team";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { ChatView } from "@/views/ChatView";
-import { DEFAULT_CHANNEL, type Transcripts } from "@/views/chat/model";
+import { DEFAULT_CHANNEL, deskFromDto, dmChannelId, type Transcripts } from "@/views/chat/model";
 import { Conversation } from "@/views/Conversation";
 import { TeamView } from "@/views/TeamView";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -295,6 +297,29 @@ export function AppShell({
         });
     };
 
+    // Same rehydration, into `transcripts` instead of `threads` — the Chat
+    // workspace's own transcript store. Chat's channel id and the host's
+    // thread id agree for a desk (`deskFromDto` keeps `DeskDto.id`
+    // untouched), but not for a DM: the channel id is the console-local
+    // `dmChannelId`, while the thread id `getChatHistory`/`chat` read is the
+    // roster agent id (see `ChatView`'s `send`) — so this takes both.
+    const hydrateChannel = (channelId: string, threadId: string) => {
+      client
+        .getChatHistory(threadId, company)
+        .then((entries) => {
+          if (cancelled || entries.length === 0) return;
+          const hydrated = fromHistory(entries);
+          setTranscripts((t) => {
+            const known = new Set((t[channelId] ?? []).map((m) => m.id));
+            const fresh = hydrated.filter((m) => !known.has(m.id));
+            return fresh.length === 0 ? t : { ...t, [channelId]: [...fresh, ...(t[channelId] ?? [])] };
+          });
+        })
+        .catch(() => {
+          /* host without `/chat/history`, or offline — channel stays empty */
+        });
+    };
+
     client
       .listDesks(company)
       .then(async (desks) => {
@@ -320,12 +345,17 @@ export function AppShell({
           });
         });
         resolved.forEach((t) => hydrate(t.id));
+
+        const chatDesks = desks.length ? desks.map(deskFromDto) : defaultDesks();
+        chatDesks.forEach((d) => hydrateChannel(d.id, d.id));
+        team.map(fromDto).forEach((m) => hydrateChannel(dmChannelId(m), m.id));
       })
       .catch(() => {
         // Host without `/desks`, or offline — keep the static default
         // threads, but the operator/General line still deserves a
         // rehydration attempt (it's the one every deployment has).
         defaultThreads().forEach((t) => hydrate(t.id));
+        defaultDesks().forEach((d) => hydrateChannel(d.id, d.id));
       });
 
     return () => {
