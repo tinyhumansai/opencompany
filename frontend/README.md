@@ -15,19 +15,19 @@ goes through [`src/lib/language.ts`](src/lib/language.ts).
 
 ## What's inside
 
-A dashboard shell (collapsible sidebar + topbar, light/dark/system theme) wraps
-one company's views. Navigation is **hash-routed** (`#/conversation`), so views
-are linkable and survive a refresh.
+A dashboard shell (collapsible sidebar, light/dark/system theme) wraps one
+company's views. Navigation is **hash-routed** (`#/chat`, and `#/chat/strategy`
+or `#/settings/people` for a view with sub-pages), so every surface is linkable
+and survives a refresh.
 
 | View | What it does |
 |---|---|
-| **Overview** | Status, pending-approval and conversation stat cards, quick actions |
-| **Conversation** | WhatsApp-style two-pane chat: a thread list (company line + desks) on the left, the selected transcript + composer on the right |
+| **Overview** | The company's knowledge graph, full-bleed — see [`src/views/overview/README.md`](src/views/overview/README.md) |
+| **Chat** | A channel-and-DM workspace: channel rail, threaded timeline, composer, thread panel, and the roster in a side pane — see [`src/views/chat/README.md`](src/views/chat/README.md) |
 | **Tasks** | A built-in Kanban board (drag cards between columns) |
 | **Approvals** | The inbox of things parked for your decision, with approve/decline |
 | **Workflows** | A read-only [React Flow](https://reactflow.dev) canvas of how work is routed (lazy-loaded) |
-| **Connections** | OAuth connection catalog (Gmail, Slack, GitHub, …); degrades to read-only when the host has no connections surface |
-| **Settings** | Connection details, lifecycle controls (pause/resume/suspend/archive), appearance |
+| **Settings** | A section with its own nav: General (connection, lifecycle, domain, mail), People, Connections, MCP Servers |
 | **Feedback** | The scrub-then-preview feedback flow, plus a Join-our-Discord nudge |
 
 ## Run it
@@ -78,7 +78,7 @@ The same build works against any host/company. Resolution order (first wins):
 
 ## Architecture & backend contract
 
-The console introduces many surfaces (Team, Skills, Workspace, Memory, Usage,
+The console introduces many surfaces (Skills, Workspace, Memory, Usage,
 Finances, Connections, Inbox, Domain/SMTP, …). Most are built to a **seam +
 client-side fallback** pattern so the host-side APIs can land incrementally.
 [`ARCHITECTURE.md`](ARCHITECTURE.md) is the full brief: every surface, its data,
@@ -95,7 +95,7 @@ Everything is decoupled so you can embed parts elsewhere:
 - [`src/api/types.ts`](src/api/types.ts) — the API payload types, mirrored from
   the Rust server.
 - [`src/views/`](src/views/) and [`src/components/`](src/components/) —
-  prop-driven views and pieces (`Conversation`, `TasksView`, `WorkflowsView`,
+  prop-driven views and pieces (`ChatView`, `TasksView`, `WorkflowsView`,
   `FeedbackForm`, …).
 
 ## Build

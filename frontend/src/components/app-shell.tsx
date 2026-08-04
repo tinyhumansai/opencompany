@@ -11,7 +11,6 @@ import {
   ShieldCheck,
   Sparkles,
   SquareKanban,
-  Users,
   Wallet,
   Workflow,
 } from "lucide-react";
@@ -36,13 +35,10 @@ import { FeedbackDialog } from "@/components/feedback-dialog";
 import { SidebarControls } from "@/components/sidebar-controls";
 import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
-import { type ChatMessage, makeMessage } from "@/lib/chat";
-import { defaultThreads } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
-import { Conversation } from "@/views/Conversation";
+import { ChatView } from "@/views/ChatView";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
-import { TeamView } from "@/views/TeamView";
 import { SkillsView } from "@/views/SkillsView";
 import { InboxView } from "@/views/InboxView";
 import { MemoryView } from "@/views/MemoryView";
@@ -66,10 +62,9 @@ const FinancesView = lazy(() =>
 
 export type View =
   | "overview"
-  | "conversation"
+  | "chat"
   | "inbox"
   | "tasks"
-  | "team"
   | "skills"
   | "workspace"
   | "memory"
@@ -96,10 +91,9 @@ const NAV: NavGroup[] = [
     label: "Operate",
     items: [
       { view: "overview", label: "Overview", icon: LayoutDashboard },
-      { view: "conversation", label: "Conversation", icon: MessagesSquare },
+      { view: "chat", label: "Chat", icon: MessagesSquare },
       { view: "inbox", label: "Inbox", icon: Inbox },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
-      { view: "team", label: "Team", icon: Users },
       { view: "skills", label: "Skills", icon: Sparkles },
       { view: "workspace", label: "Workspace", icon: FolderClosed },
       { view: "memory", label: "Memory", icon: Brain },
@@ -142,24 +136,15 @@ export function AppShell({
   const [view, sub, navigate] = useHashView<View>(VIEWS, "overview");
   // Most call sites only ever change the top-level view.
   const setView = (next: View) => navigate(next);
-  const [threads, setThreads] = useState(defaultThreads);
-  const [activeThreadId, setActiveThreadId] = useState("main");
   const [feedbackOpen, setFeedbackOpen] = useState(false);
+  // System lines raised outside chat (an approval decision, say). Chat owns
+  // the transcripts now, so the shell hands it an append-only log to fold in.
+  const [notices, setNotices] = useState<string[]>([]);
   const feed = useCompany(client, company, initialStatus);
 
   const pending = feed.status.pending_approvals;
 
-  const setThreadMessages = (
-    threadId: string,
-    updater: (m: ChatMessage[]) => ChatMessage[],
-  ) =>
-    setThreads((ts) =>
-      ts.map((t) => (t.id === threadId ? { ...t, messages: updater(t.messages) } : t)),
-    );
-
-  // Approval decisions and other events land in the active thread's transcript.
-  const noteSystem = (line: string) =>
-    setThreadMessages(activeThreadId, (m) => [...m, makeMessage("system", line)]);
+  const noteSystem = (line: string) => setNotices((n) => [...n, line]);
 
   return (
     <SidebarProvider>
@@ -209,20 +194,18 @@ export function AppShell({
           {view === "overview" && (
             <Overview client={client} company={company} />
           )}
-          {view === "conversation" && (
-            <Conversation
+          {view === "chat" && (
+            <ChatView
               client={client}
               company={company}
-              threads={threads}
-              activeId={activeThreadId}
-              onSelect={setActiveThreadId}
-              setMessages={setThreadMessages}
+              sub={sub}
+              onNavigate={(channelId) => navigate("chat", channelId)}
               onReply={() => void feed.refresh()}
+              notices={notices}
             />
           )}
           {view === "inbox" && <InboxView company={company} />}
           {view === "tasks" && <TasksView client={client} company={company} />}
-          {view === "team" && <TeamView client={client} company={company} />}
           {view === "skills" && <SkillsView client={client} company={company} />}
           {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (
@@ -242,7 +225,7 @@ export function AppShell({
               company={company}
               feed={feed}
               onResolved={noteSystem}
-              onGoToConversation={() => setView("conversation")}
+              onGoToConversation={() => setView("chat")}
             />
           )}
           {view === "workflows" && (
