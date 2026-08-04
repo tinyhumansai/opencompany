@@ -220,6 +220,37 @@ card happened to be running, along with that card's `waitingSince` — the exact
 misattribution this issue exists to end. So a host from #333 onward always
 writes one of the first two, and absence means one thing only.
 
+#### Which key is authoritative
+
+Two keys correlate an approval to work, and they are kept **both**:
+`Effect.run_id` (issue #242) is **attempt-level**, and `ApprovalParked.task` is
+**card-level**. The read side resolves them in this order:
+
+```text
+card = if let Some(run_id) = effect.run_id { run_store.get(run_id).task_id }  // authoritative
+       else { approval_parked.task }                                          // fallback
+// neither recorded → genuinely unlinked, and NOT the run-window fallback
+```
+
+`run_id` wins wherever it is present because a `RunRecord` names its card, so a
+run id resolves to a task — while a task id can never say which *attempt*
+parked an approval. #183 settled that repeat trips through review are normal,
+so two attempts on one card is the expected case, and only `run_id` separates
+them.
+
+It cannot be the only key, though: `run_id` is `None` by design for every park
+with no attempt behind it — a chat turn, a workflow delivery, a scheduler tick,
+and the hosted brain's own gate — whereas `task` is stamped in
+`CycleHostImpl::park`, which *every* park path passes through. Neither key is a
+superset of the other, so "pick one" is not available. The card-level key also
+inherits through a resolution (an `ApprovalResolved` whose approval was itself
+parked for a card keeps that card), which the attempt-level one does not do.
+
+This is why the three-state link above is load-bearing rather than pedantic:
+with two keys, "unlinked because chat-parked — no run and no card" has to stay
+distinguishable from "not stamped because it predates #333", and only the
+second may fall back to the run window.
+
 A batch is ambiguous — and stamps nothing — when it names two different cards,
 or when it carries a card's dispatch alongside a turn that is its own work (an
 operator message, a webhook, a schedule tick, an inbound A2A task, or a

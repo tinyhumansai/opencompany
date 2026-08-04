@@ -3976,7 +3976,7 @@ async fn a_task_with_no_approvals_of_its_own_reports_an_empty_list() {
 /// a scheduler tick — parked while a card is mid-run must not be absorbed by
 /// that card (#333 review follow-up).
 ///
-/// This is the case the first cut of `approval_belongs_to` got wrong. It tested
+/// This is the case the first cut of the ownership test got wrong. It tested
 /// `origins.get(id).and_then(|o| o.task_id)`, which is `None` both for a park
 /// that recorded no card *and* for a pre-#333 park that could not record one —
 /// so every unlinked park since #333 fell through to the run window and landed
@@ -4014,6 +4014,86 @@ async fn an_unlinked_approval_is_not_absorbed_by_the_running_card() {
     assert!(
         body.get("waitingSince").is_none(),
         "nor may it make that card read as waiting on the operator",
+    );
+}
+
+/// The two correlation keys, in the order the read side resolves them: the
+/// attempt (`run_id`, #242) is authoritative wherever it is present, and the
+/// parked card link (#333) is the fallback for every park with no attempt
+/// behind it.
+///
+/// Neither key is a superset of the other, which is why both are kept. A
+/// `RunRecord` names its card, so a run id resolves to a task — but a task id
+/// can never say which *attempt* parked an approval, and #183 settled that
+/// repeat trips through review are normal. Meanwhile `run_id` is `None` by
+/// design for a chat turn, a workflow delivery, or the hosted brain's gate, so
+/// it cannot be the only key either.
+#[tokio::test]
+async fn the_attempt_id_outranks_the_card_link_when_both_are_present() {
+    use crate::ports::runs::NewRun;
+    use crate::ports::types::ApprovalId;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    // Two attempts at this card, and one at another — the case a card-level key
+    // alone cannot tell apart.
+    for (id, task) in [("run-a", "t-1"), ("run-b", "t-1"), ("run-c", "t-other")] {
+        runtime
+            .runs()
+            .create_run(
+                &company,
+                NewRun {
+                    id: id.to_string(),
+                    task_id: task.to_string(),
+                    agent_id: "ceo".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let under_run = |run: &str| {
+        let mut effect = parked_effect();
+        effect.run_id = Some(run.to_string());
+        effect
+    };
+
+    // Parked under this card's *second* attempt, and stamped Unlinked at the
+    // card level. The run id is authoritative, so it still lands here.
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-attempt-2"),
+            &under_run("run-b"),
+            dispatched_at + 5,
+            TaskLink::Unlinked,
+        )
+        .await
+        .unwrap();
+    // Parked under another card's attempt, but stamped with *our* card. The run
+    // id outranks the link, so it must not appear.
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-elsewhere"),
+            &under_run("run-c"),
+            dispatched_at + 6,
+            TaskLink::Task { id: "t-1".into() },
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let approvals = body["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(
+        approvals[0]["id"], "appr-attempt-2",
+        "the attempt id decides ownership, not the card link",
     );
 }
 

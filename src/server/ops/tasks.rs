@@ -571,24 +571,42 @@ async fn task_detail(
     children.sort_by_key(|t| t.updated_at_millis);
     let children = children.into_iter().map(LineageRef::from).collect();
 
-    let (timeline, mut approvals, open_window_at) = task_timeline(&company, &task_id).await?;
+    // This card's attempts (issue #242), as a set of run ids. One query, bounded
+    // by the card's own attempt count — and the authoritative half of the
+    // correlation: a run id resolves to exactly one card, so "was this approval
+    // parked under one of *my* attempts" is answerable without opening a run.
+    let task_runs: std::collections::HashSet<String> = company
+        .runtime
+        .runs()
+        .list_runs(
+            company.id(),
+            &crate::ports::runs::RunFilter::for_task(task_id.clone()),
+        )
+        .await?
+        .into_iter()
+        .map(|run| run.id)
+        .collect();
 
-    // The still-parked half (issue #333), on the same three-way rule as
-    // `approval_belongs_to` below — see there for why "belongs to no card" and
-    // "no card was recorded" must not be the same test.
-    //
-    // An approval carrying this task's id is this task's whatever the window is
-    // doing. One recorded as unlinked is nobody's, so it is not adopted here.
-    // Only a park with no link at all — pre-#333 — keeps the old rule: inside an
-    // open window, parked at or after it opened, so a backlog item is not
-    // re-attributed to this dispatch.
+    let origins = company.runtime.approval_origins();
+    let (timeline, mut approvals, open_window_at) =
+        task_timeline(&company, &task_id, &origins, &task_runs).await?;
+
+    // The still-parked half (issue #333), on exactly the resolution order
+    // `approval_owner` documents below — run id first, then the parked
+    // card link, and the run window only for a park that recorded neither.
     let pending: Vec<crate::runtime::types::ApprovalSummary> = company
         .runtime
         .pending_approvals()
         .into_iter()
-        .filter(|a| match &a.task {
-            Some(link) => link.task_id() == Some(task_id.as_str()),
-            None => open_window_at.is_some_and(|opened_at| a.at_millis >= opened_at),
+        .filter(|a| match approval_owner(&a.id, &task_id, &origins, &task_runs) {
+            ApprovalOwner::Mine => true,
+            ApprovalOwner::NotMine => false,
+            // The legacy rule, kept only for a park that recorded neither key:
+            // inside an open window and parked at or after it opened, so a
+            // backlog item is not re-attributed to this dispatch.
+            ApprovalOwner::Unrecorded => {
+                open_window_at.is_some_and(|opened_at| a.at_millis >= opened_at)
+            }
         })
         .collect();
 
@@ -653,12 +671,13 @@ const TIMELINE_PAGE: usize = 512;
 async fn task_timeline(
     company: &ScopedCompany,
     task_id: &str,
+    origins: &std::collections::HashMap<
+        crate::ports::types::ApprovalId,
+        crate::runtime::journal::ApprovalOrigin,
+    >,
+    task_runs: &std::collections::HashSet<String>,
 ) -> Result<(Vec<TimelineEntry>, Vec<TaskApproval>, Option<u64>), ApiError> {
     use crate::ports::types::EventSeq;
-
-    // One snapshot for the whole fold, not a lookup per event: the fold is a
-    // pure function over it, and the journal lock is never held while paging.
-    let origins = company.runtime.approval_origins();
 
     let mut timeline = Vec::new();
     let mut approvals = Vec::new();
@@ -684,7 +703,8 @@ async fn task_timeline(
         fold_page(
             &page,
             task_id,
-            &origins,
+            origins,
+            task_runs,
             &mut window_opened_at,
             &mut timeline,
             &mut approvals,
@@ -696,36 +716,73 @@ async fn task_timeline(
     Ok((timeline, approvals, window_opened_at))
 }
 
-/// Whether a resolved approval belongs to `task_id` (issue #333).
+/// What an approval's recorded keys say about who owns it.
 ///
-/// Three cases, not two — which is the correction to this function's first
-/// cut. It matched on `origins.get(id).and_then(|o| o.task_id)`, collapsing
-/// *no origin recorded* and *origin recorded, belonging to no card* into the
-/// same `None`, and sent both to the run window. Since #333 every unlinked park
-/// records itself as such, so that second case is not rare — it is every
-/// workflow delivery, every chat turn, every scheduler tick — and each one
-/// landed on whatever card happened to be running.
+/// Three states, deliberately — the whole correction this makes to #333's first
+/// cut. That version asked `origins.get(id).and_then(|o| o.task_id)`, which is
+/// `None` both for *no origin recorded* and for *origin recorded, belonging to
+/// no card*, and sent both to the run window. Since #333 every unlinked park
+/// records itself as such, so the second case is not rare — it is every workflow
+/// delivery, every chat turn, every scheduler tick, and the hosted brain's own
+/// gate — and each one landed on whatever card happened to be running, dragging
+/// that card's `waitingSince` with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ApprovalOwner {
+    /// Recorded as belonging to the card being read.
+    Mine,
+    /// Recorded as belonging to a different card, or to no card at all.
+    NotMine,
+    /// Neither key recorded — a park written before #333. The **only** state
+    /// that may fall back to the run-window heuristic, and the caller decides
+    /// how, because the resolved and still-parked halves scope it differently.
+    Unrecorded,
+}
+
+/// Which card owns an approval, resolved attempt-first (issues #333 + #242).
 ///
-/// * a recorded owner wins outright: another card's approval is excluded even
-///   mid-window, which is the acceptance criterion this issue turns on;
-/// * a recorded [`TaskLink::Unlinked`] belongs to no card, so it belongs to
-///   this one either — no window, no guess;
-/// * only a *missing* link falls back to the run window. That is exclusively a
-///   park written before #333, so existing history keeps rendering as it did
-///   rather than silently emptying.
-fn approval_belongs_to(
+/// Both keys are kept, and the order between them is load-bearing, because
+/// neither is a superset of the other:
+///
+/// 1. **`run_id` — attempt-level, authoritative.** A
+///    [`RunRecord`](crate::ports::runs::RunRecord) names its card, so a run id
+///    resolves to a task; a task id can never resolve to a run. #183 settled
+///    that repeat trips through review are normal, so two attempts on one card
+///    is the expected case, and only this key separates them. Checked against
+///    `task_runs`, this card's own attempt ids.
+/// 2. **the parked [`TaskLink`] — card-level, the fallback.** `run_id` is
+///    `None` by design wherever no attempt is behind the park — a chat turn, a
+///    workflow delivery, a scheduler tick, the hosted brain's gate — and those
+///    parks are stamped here instead, in `CycleHostImpl::park`, which every
+///    park path passes through. So the run id cannot be the only key without
+///    losing all of them.
+/// 3. **neither recorded** — and only then is the answer "unknown" rather than
+///    "unlinked". A park that recorded a link saying `Unlinked` is a *resolved*
+///    answer: it belongs to no card, so it does not belong to this one either.
+fn approval_owner(
     approval_id: &crate::ports::types::ApprovalId,
     task_id: &str,
     origins: &std::collections::HashMap<
         crate::ports::types::ApprovalId,
         crate::runtime::journal::ApprovalOrigin,
     >,
-    window_opened_at: Option<u64>,
-) -> bool {
-    match origins.get(approval_id).map(|o| &o.task) {
-        Some(Some(link)) => link.task_id() == Some(task_id),
-        // No origin record at all, or one from before the link existed.
-        Some(None) | None => window_opened_at.is_some(),
+    task_runs: &std::collections::HashSet<String>,
+) -> ApprovalOwner {
+    let Some(origin) = origins.get(approval_id) else {
+        return ApprovalOwner::Unrecorded;
+    };
+    // 1. The attempt wins wherever there is one.
+    if let Some(run_id) = origin.run_id.as_deref() {
+        return if task_runs.contains(run_id) {
+            ApprovalOwner::Mine
+        } else {
+            ApprovalOwner::NotMine
+        };
+    }
+    // 2. Otherwise the card the parking cycle stamped. 3. Or nothing at all.
+    match &origin.task {
+        Some(link) if link.task_id() == Some(task_id) => ApprovalOwner::Mine,
+        Some(_) => ApprovalOwner::NotMine,
+        None => ApprovalOwner::Unrecorded,
     }
 }
 
@@ -735,9 +792,11 @@ fn approval_belongs_to(
 /// `window_opened_at` is both the window flag and its anchor: `Some(at)` while
 /// a dispatch is open, `None` once it closes. `origins` is the journal snapshot
 /// the approval arm joins against to recover waiting time (#305) and the owning
-/// task (#333); keeping it a parameter leaves this a pure function of its
-/// inputs. Resolved approvals land on `approvals` as well as on the timeline —
-/// same row, two surfaces.
+/// task (#333), and `task_runs` this card's attempt ids (#242), the
+/// authoritative half of that ownership test — see [`approval_owner`]. Both are
+/// parameters rather than lookups so this stays a pure function of its inputs.
+/// Resolved approvals land on `approvals` as well as on the timeline — same
+/// row, two surfaces.
 fn fold_page(
     page: &[crate::ports::types::StoredEvent],
     task_id: &str,
@@ -745,6 +804,7 @@ fn fold_page(
         crate::ports::types::ApprovalId,
         crate::runtime::journal::ApprovalOrigin,
     >,
+    task_runs: &std::collections::HashSet<String>,
     window_opened_at: &mut Option<u64>,
     timeline: &mut Vec<TimelineEntry>,
     approvals: &mut Vec<TaskApproval>,
@@ -795,7 +855,7 @@ fn fold_page(
                 ))
             }
             // Id-correlated (#333), falling back to the window only for an
-            // approval parked before that id existed — see `approval_belongs_to`.
+            // park that recorded neither key — see `approval_owner`.
             // The operator's identity is deliberately dropped: it can carry a
             // user id, matching the SSE projection's deny-by-default stance.
             // Only `by.kind` is read, which names a category and never a person.
@@ -803,7 +863,14 @@ fn fold_page(
                 approval_id,
                 verdict,
                 by,
-            } if approval_belongs_to(approval_id, task_id, origins, *window_opened_at) => {
+            } if match approval_owner(approval_id, task_id, origins, task_runs) {
+                ApprovalOwner::Mine => true,
+                ApprovalOwner::NotMine => false,
+                // Pre-#333: neither key recorded, so the old window heuristic
+                // is all there is. Scoped by the window being open at this
+                // point in the fold, which is where a resolution sits.
+                ApprovalOwner::Unrecorded => window_opened_at.is_some(),
+            } => {
                 let origin = origins.get(approval_id);
                 // The approval id joins the resolution back to the journal's
                 // park instant. Clamping to the window's opening keeps a wait

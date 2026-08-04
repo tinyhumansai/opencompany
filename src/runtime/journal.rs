@@ -205,7 +205,24 @@ pub struct ApprovalOrigin {
     pub kind: String,
     /// Which board task the parking cycle was dispatched for. `None` only for a
     /// pre-#333 journal line — see [`TaskLink`].
+    ///
+    /// The **card-level** key, and the fallback one: it cannot say which of a
+    /// card's attempts parked the approval. See [`run_id`](Self::run_id).
     pub task: Option<TaskLink>,
+    /// The attempt this approval was parked under
+    /// ([`Effect::run_id`](crate::ports::types::Effect::run_id), issue #242),
+    /// copied off the effect at park time so the read side need not re-open it.
+    ///
+    /// The **attempt-level** key, and the authoritative one where present: a
+    /// [`RunRecord`](crate::ports::runs::RunRecord) names its card, so a run id
+    /// resolves to a task, while a task id can never resolve to a run. #183
+    /// settled that repeat trips through review are normal, so two attempts on
+    /// one card is the expected case — and only this key tells them apart.
+    ///
+    /// `None` by design for every park with no attempt behind it: a chat turn,
+    /// a workflow delivery, a scheduler tick, and the hosted brain's own gate.
+    /// That is why it cannot be the only key — see [`task`](Self::task).
+    pub run_id: Option<String>,
 }
 
 /// In-memory state rebuilt from (and kept in sync with) `journal.jsonl`.
@@ -287,6 +304,7 @@ impl RuntimeJournal {
                             at_millis,
                             kind: effect.kind.clone(),
                             task: task.clone(),
+                            run_id: effect.run_id.clone(),
                         },
                     );
                     state.parked.insert(id, (effect, at_millis, task));
@@ -361,6 +379,7 @@ impl RuntimeJournal {
                     at_millis,
                     kind: effect.kind.clone(),
                     task: Some(task.clone()),
+                    run_id: effect.run_id.clone(),
                 },
             );
             state
@@ -708,6 +727,7 @@ mod test {
                 at_millis: 1_000,
                 kind: "filing.submit".into(),
                 task: Some(TaskLink::Task { id: "t-1".into() }),
+                run_id: None,
             }),
         );
         assert_eq!(
