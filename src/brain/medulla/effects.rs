@@ -428,4 +428,34 @@ mod test {
         assert!(wired.body.contains("1 not delivered"), "{}", wired.body);
         assert_eq!(wired.kind, "workflow.run");
     }
+
+    /// **Issue #335, the same pin one variant over.** A discussion post is
+    /// operator free text that no agent consumes in v1 — the tab is a note on a
+    /// card, not a prompt box. This function wires the journal out to the
+    /// inference sidecar, so quoting a post's text here would make it exactly
+    /// the prompt surface the design says it is not, without anybody choosing
+    /// that.
+    ///
+    /// The exclusion is what makes "agents do not participate" a property of the
+    /// code rather than a sentence in a doc, so it is asserted rather than
+    /// described: a later "include the message, it is more informative" edit
+    /// fails CI.
+    #[test]
+    fn a_discussion_post_wires_out_the_card_without_the_message_text() {
+        let event = CompanyEvent::TaskDiscussionPosted {
+            task_id: "t-42".to_string(),
+            // The shape of message the exclusion exists for: an operator pasting
+            // something into a thread nobody said would be read by a model.
+            text: "the staging key is sk-live-not-a-real-secret".to_string(),
+            by: None,
+        };
+
+        let wired = wire_event(11, &event);
+
+        assert!(!wired.body.contains("sk-live"), "{}", wired.body);
+        assert!(!wired.body.contains("staging key"), "{}", wired.body);
+        // Still says what happened: a human posted, and on which card.
+        assert!(wired.body.contains("t-42"), "{}", wired.body);
+        assert_eq!(wired.kind, "task.discussion_posted");
+    }
 }
