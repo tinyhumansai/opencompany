@@ -109,9 +109,10 @@ const NAV: NavItem[] = [
  * rebuild for Conversation and Team): their host routes, stores and e2e specs
  * are untouched, and re-listing one in `NAV` above is all it takes to bring it
  * back. Conversation and Team are the surfaces the Chat workspace replaces —
- * everything they can do it can do in one screen — but they keep answering
- * `#/conversation` and `#/team` until the chat covers the last of what they
- * still do better (a desk's persisted transcript, a teammate's budget line).
+ * everything they can do it can do in one screen, including the teammate
+ * budget controls `MembersPane` ported from Team (issue #360) — but they
+ * keep answering `#/conversation` and `#/team` until the chat covers the
+ * last of what they still do better (a desk's persisted transcript).
  */
 const HIDDEN_VIEWS: View[] = [
   "feedback",

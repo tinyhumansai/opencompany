@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { toast } from "sonner";
 
+import { listPeople, me as fetchMe, type Person } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
 import { setInboxEnabled } from "@/api/inbox";
-import { ApiError } from "@/api/types";
+import { ApiError, type TeamMemberDto } from "@/api/types";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { defaultDesks, type Desk } from "@/lib/desks";
 import { fromDto, newMember, starterTeam, type TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { AddMemberDialog, type NewMemberFields } from "./chat/AddMemberDialog";
+import { BudgetDialog } from "./chat/BudgetDialog";
 import { ChannelRail } from "./chat/ChannelRail";
 import { ChatHeader } from "./chat/ChatHeader";
 import { MembersPane } from "./chat/MembersPane";
@@ -77,6 +79,13 @@ export function ChatView({
   const [membersOpen, setMembersOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<"rail" | "chat">("chat");
+  const [isAdmin, setIsAdmin] = useState(false);
+  // Who set which cap (issue #360, ported from the retired Team page). Only
+  // an admin may read the user directory, so this stays empty for a member —
+  // the attribution line degrades to "an admin" rather than disappearing.
+  const [people, setPeople] = useState<Person[]>([]);
+  // The member whose budget dialog is open, if any.
+  const [budgetFor, setBudgetFor] = useState<TeamMember | null>(null);
 
   const boot = useCallback(async () => {
     try {
@@ -97,10 +106,82 @@ export function ChatView({
     }
   }, [client, company]);
 
+  /**
+   * Hiding the budget controls from a non-admin is **courtesy, not
+   * enforcement**. The host refuses the write with a 403 whatever this says;
+   * showing an operator a control they cannot use is the only thing this
+   * prevents.
+   */
+  const loadViewer = useCallback(async () => {
+    let admin = false;
+    try {
+      admin = (await fetchMe(client, company)).role === "admin";
+    } catch {
+      // No user plane on this host, or not signed in — treat as non-admin.
+    }
+    setIsAdmin(admin);
+    if (!admin) {
+      setPeople([]);
+      return;
+    }
+    try {
+      setPeople(await listPeople(client, company));
+    } catch {
+      // Attribution falls back to "an admin"; not worth a toast.
+      setPeople([]);
+    }
+  }, [client, company]);
+
   useEffect(() => {
     setLoadingTeam(true);
     void boot();
-  }, [boot]);
+    void loadViewer();
+  }, [boot, loadViewer]);
+
+  /** A human label for whoever set a cap — never a raw user id. */
+  function whoSet(userId: string): string {
+    const person = people.find((p) => p.id === userId);
+    return person?.displayName?.trim() || person?.email || "an admin";
+  }
+
+  const budgetError = (error: unknown, fallback: string): string => {
+    if (error instanceof ApiError) {
+      if (error.status === 404) return "This host doesn't support console budgets yet.";
+      return error.message;
+    }
+    return error instanceof Error ? error.message : fallback;
+  };
+
+  /**
+   * Set, change, or remove a teammate's daily cap.
+   *
+   * `cap` is `null` to remove the cap and a number to set one — `0` included,
+   * which caps the teammate at nothing. The two are different states on the
+   * host and must stay different here, which is why this takes `number |
+   * null` and never an optional.
+   */
+  async function applyBudget(member: TeamMember, cap: number | null) {
+    try {
+      const row = await client.setTeamBudget(member.id, cap, company);
+      // Update the one card from the host's answer rather than refetching the
+      // roster: the response IS the new state, so a refetch could only disagree.
+      setMembers((ms) => ms.map((m) => (m.id === member.id ? { ...m, ...fromDto(row) } : m)));
+      toast.success(cap === null ? "Daily cap removed." : `Daily cap set to $${cap.toFixed(2)}.`);
+    } catch (error) {
+      toast.error(budgetError(error, "Couldn't change the daily cap."));
+    }
+  }
+
+  /** Drop the override so the company's own default applies again. */
+  async function resetBudget(member: TeamMember) {
+    try {
+      const row = await client.clearTeamBudgetOverride(member.id, company);
+      setMembers((ms) => ms.map((m) => (m.id === member.id ? { ...m, ...fromDto(row) } : m)));
+      toast.success("Reset to the company default.");
+    } catch (error) {
+      toast.error(budgetError(error, "Couldn't reset the daily cap."));
+    }
+  }
 
   // The company's real desks, when the host exposes them — a company with its
   // own desks gets its own channels instead of the generic strategy/creative/
@@ -219,12 +300,73 @@ export function ChatView({
     }
   }
 
-  function addMember(fields: NewMemberFields) {
-    setMembers((m) => [...m, newMember(fields)]);
-    // A locally-added teammate has no host record yet, so there is no agent id
-    // to hang an inbox off — say so rather than silently dropping the request.
-    if (fields.inbox) toast.error("Save this teammate on the host before giving them an inbox.");
+  /**
+   * Persist a new teammate through the host (issue #360's Team-page add path),
+   * falling back to a local-only add for a host without the write plane yet —
+   * the same 404 fallback `boot` uses for the roster read itself.
+   */
+  async function addMember(fields: NewMemberFields) {
+    let created: TeamMemberDto | null = null;
+    try {
+      created = await client.addTeamMember(
+        { name: fields.name, role: fields.role, description: fields.description || undefined },
+        company,
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        // No team write plane on this host — keep the add local-only.
+        setMembers((m) => [...m, newMember(fields)]);
+      } else {
+        toast.error(error instanceof Error ? error.message : "Couldn't add teammate.");
+        return;
+      }
+    }
+    if (created) {
+      const member = fromDto(created);
+      setMembers((m) => [...m, member]);
+      // A successful host add proves the write plane exists, even for a
+      // company that opened on the starter roster (fromHost still false from
+      // `boot`) — flip it so this and later actions (inbox, budget) target
+      // the host instead of refusing on a now-stale local-only guard.
+      setFromHost(true);
+      // A host-backed add has a real agent id, so the inbox request can go
+      // straight through rather than waiting for a second save.
+      if (fields.inbox) {
+        try {
+          await setInboxEnabled(client, company, member.id, true);
+          setMembers((ms) => ms.map((m) => (m.id === member.id ? { ...m, inboxEnabled: true } : m)));
+        } catch {
+          toast.error("Couldn't enable the inbox — add it from the member's actions menu.");
+        }
+      }
+    } else if (fields.inbox) {
+      // A locally-added teammate has no host record yet, so there is no agent
+      // id to hang an inbox off — say so rather than silently dropping it.
+      toast.error("Save this teammate on the host before giving them an inbox.");
+    }
     setAddOpen(false);
+  }
+
+  /**
+   * Drop a teammate from the roster through the host when it has a record of
+   * them; a manifest teammate can't be removed (409) and a starter-roster row
+   * has no host record at all, so both fall back to a local-only removal.
+   */
+  async function removeMember(member: TeamMember) {
+    if (!fromHost) {
+      setMembers((ms) => ms.filter((m) => m.id !== member.id));
+      return;
+    }
+    try {
+      await client.removeTeamMember(member.id, company);
+      setMembers((ms) => ms.filter((m) => m.id !== member.id));
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        toast.error("This teammate is defined in the company manifest and can't be removed here.");
+      } else {
+        toast.error(error instanceof Error ? error.message : "Couldn't remove teammate.");
+      }
+    }
   }
 
   function selectChannel(id: string) {
@@ -297,15 +439,34 @@ export function ChatView({
               loading={loadingTeam}
               fromHost={fromHost}
               onToggleInbox={(m) => void toggleMemberInbox(m)}
-              onRemove={(id) => setMembers((ms) => ms.filter((m) => m.id !== id))}
+              onRemove={(id) => {
+                const member = members.find((m) => m.id === id);
+                if (member) void removeMember(member);
+              }}
               onAdd={() => setAddOpen(true)}
               onMessage={(m) => selectChannel(dmChannelId(m))}
+              canEditBudget={isAdmin && fromHost}
+              onEditBudget={setBudgetFor}
+              onRemoveCap={(m) => void applyBudget(m, null)}
+              onResetBudget={(m) => void resetBudget(m)}
+              setByLabel={(m) => (m.budgetSetBy ? whoSet(m.budgetSetBy) : undefined)}
             />
           )}
         </div>
       </div>
 
-      <AddMemberDialog open={addOpen} onOpenChange={setAddOpen} onAdd={addMember} />
+      <AddMemberDialog open={addOpen} onOpenChange={setAddOpen} onAdd={(fields) => void addMember(fields)} />
+      <BudgetDialog
+        member={budgetFor}
+        onOpenChange={(open) => {
+          if (!open) setBudgetFor(null);
+        }}
+        onSave={(cap) => {
+          const target = budgetFor;
+          setBudgetFor(null);
+          if (target) void applyBudget(target, cap);
+        }}
+      />
     </div>
   );
 }
