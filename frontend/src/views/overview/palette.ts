@@ -38,6 +38,11 @@ export const TONE_MARK: Record<Tone, string> = {
  */
 export const BRANCH_MARK: Record<string, string> = {
   company: "text-foreground",
+  // The core stays achromatic. It is not a fourth category competing with the
+  // three branches — it is what they all sit around — and giving it a hue
+  // would put a fourth colour on screen that no gate would pass beside the
+  // other three.
+  memory: "text-foreground",
   work: "text-[#2a78d6] dark:text-[#3987e5]",
   capability: "text-[#eb6834] dark:text-[#d95926]",
   tools: "text-[#1baf7a] dark:text-[#199e70]",

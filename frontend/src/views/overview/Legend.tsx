@@ -12,6 +12,7 @@ import { BRANCH_OF, type NodeKind } from "./graph";
 
 /** Legend order: the chain as it reads outward from the company. */
 const ORDER: { kind: NodeKind; label: string }[] = [
+  { kind: "memory", label: "Memories" },
   { kind: "desk", label: "Teammates" },
   { kind: "card", label: "Cards" },
   { kind: "capability", label: "Skill areas" },

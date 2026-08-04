@@ -8,6 +8,7 @@
 import type { Task } from "@/api/tasks";
 import type { Skill } from "@/api/skills";
 import type { McpServer, McpTool } from "@/lib/mcp";
+import type { MemoryEntry } from "@/lib/memory";
 import { TASK_COLUMNS } from "@/lib/tasks-sample";
 import type { TeamMember } from "@/lib/team";
 import { isOpen, ownedBy } from "./pulse";
@@ -21,11 +22,20 @@ import { isOpen, ownedBy } from "./pulse";
  * server advertises tools. Nothing is joined across those branches, because
  * the host stores no edge that would justify it.
  */
-export type NodeKind = "company" | "desk" | "card" | "capability" | "skill" | "server" | "tool";
+export type NodeKind =
+  | "company"
+  | "memory"
+  | "desk"
+  | "card"
+  | "capability"
+  | "skill"
+  | "server"
+  | "tool";
 
 /** The branch each kind belongs to. Drives hue: one hue per branch. */
-export const BRANCH_OF: Record<NodeKind, "company" | "work" | "capability" | "tools"> = {
+export const BRANCH_OF: Record<NodeKind, "company" | "memory" | "work" | "capability" | "tools"> = {
   company: "company",
+  memory: "memory",
   desk: "work",
   card: "work",
   capability: "capability",
@@ -33,6 +43,13 @@ export const BRANCH_OF: Record<NodeKind, "company" | "work" | "capability" | "to
   server: "tools",
   tool: "tools",
 };
+
+/**
+ * Memories hang off the company like hubs do, but they are not hubs: they live
+ * in the core disc at the centre rather than on the ring, and nothing hangs off
+ * them.
+ */
+export const isHubKind = (kind: NodeKind): boolean => kind !== "company" && kind !== "memory";
 
 export interface GraphNode {
   id: string;
@@ -78,6 +95,7 @@ interface BuildInput {
   servers: McpServer[];
   /** Tools per server id. Absent for a server that isn't connected. */
   toolsByServer: Record<string, McpTool[]>;
+  memories: MemoryEntry[];
 }
 
 /**
@@ -97,6 +115,20 @@ export function buildGraph(input: BuildInput): Graph {
       parent: null,
     },
   ];
+
+  // The core: what the company remembers. These sit at the centre rather than
+  // on the ring, so the middle of the graph shows its knowledge instead of an
+  // opaque dot standing in for it.
+  for (const entry of input.memories) {
+    nodes.push({
+      id: `memory:${entry.id}`,
+      kind: "memory",
+      label: entry.title,
+      sub: entry.kind,
+      parent: COMPANY_ID,
+      payload: entry,
+    });
+  }
 
   for (const member of input.members) {
     const own = input.tasks.filter((t) => ownedBy(t, member));
@@ -167,6 +199,11 @@ export function buildGraph(input: BuildInput): Graph {
     }
   }
 
+  return index(nodes);
+}
+
+/** Build the lookup maps and the hub list a `Graph` carries. */
+function index(nodes: GraphNode[]): Graph {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const children = new Map<string, string[]>();
   for (const node of nodes) {
@@ -175,8 +212,8 @@ export function buildGraph(input: BuildInput): Graph {
     if (list) list.push(node.id);
     else children.set(node.parent, [node.id]);
   }
-
-  return { nodes, byId, children, hubs: children.get(COMPANY_ID) ?? [] };
+  const hubs = (children.get(COMPANY_ID) ?? []).filter((id) => isHubKind(byId.get(id)!.kind));
+  return { nodes, byId, children, hubs };
 }
 
 export interface LayoutOptions {
@@ -227,7 +264,9 @@ export function layoutGraph(graph: Graph, options: LayoutOptions): Map<string, P
     leaves.forEach((leafId, j) => {
       const t = leaves.length === 1 ? 0.5 : j / (leaves.length - 1);
       const angle = centre - usable / 2 + usable * t;
-      placed.set(leafId, { ...polar(leafRing, angle), r: 7.5, ring: 2, angle });
+      // Big enough to wear its icon and be clicked; small enough that a busy
+      // hub's leaves do not merge into an arc.
+      placed.set(leafId, { ...polar(leafRing, angle), r: 10, ring: 2, angle });
     });
   });
 
@@ -281,16 +320,7 @@ export function withoutKinds(graph: Graph, hidden: Set<NodeKind>): Graph {
     if (node.parent && !keep.has(node.parent)) continue;
     keep.add(node.id);
   }
-  const nodes = graph.nodes.filter((n) => keep.has(n.id));
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const children = new Map<string, string[]>();
-  for (const node of nodes) {
-    if (!node.parent) continue;
-    const list = children.get(node.parent);
-    if (list) list.push(node.id);
-    else children.set(node.parent, [node.id]);
-  }
-  return { nodes, byId, children, hubs: children.get(COMPANY_ID) ?? [] };
+  return index(graph.nodes.filter((n) => keep.has(n.id)));
 }
 
 function columnLabel(column: string): string {

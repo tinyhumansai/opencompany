@@ -7,6 +7,7 @@ import type { View } from "@/components/app-shell";
 import { StatusPill } from "@/components/status-pill";
 import type { CompanyFeed } from "@/hooks/use-company";
 import type { McpServer, McpTool } from "@/lib/mcp";
+import { loadMemory, type MemoryEntry } from "@/lib/memory";
 import { fromDto, starterTeam, type TeamMember } from "@/lib/team";
 import { AgentGraph } from "./overview/AgentGraph";
 import {
@@ -60,9 +61,18 @@ export function Overview({ feed, client, company, onNavigate }: Props) {
   const [sources, setSources] = useState<Sources>(EMPTY);
   const [focusId, setFocusId] = useState<string>(COMPANY_ID);
   const [hidden, setHidden] = useState<Set<NodeKind>>(() => new Set());
+  const [coreOpen, setCoreOpen] = useState(false);
+
+  // Memory is a local store, not a host surface (see `lib/memory.ts`), so it is
+  // read straight from storage rather than fetched — and re-read on a company
+  // switch, since it is keyed per company.
+  const memories = useMemo<MemoryEntry[]>(() => loadMemory(company), [company]);
 
   // A node id from the last company means nothing in this one.
-  useEffect(() => setFocusId(COMPANY_ID), [company]);
+  useEffect(() => {
+    setFocusId(COMPANY_ID);
+    setCoreOpen(false);
+  }, [company]);
 
   useEffect(() => {
     let live = true;
@@ -111,8 +121,9 @@ export function Overview({ feed, client, company, onNavigate }: Props) {
         skills: sources.skills,
         servers: sources.servers,
         toolsByServer: sources.toolsByServer,
+        memories,
       }),
-    [status.name, status.lifecycle, sources],
+    [status.name, status.lifecycle, sources, memories],
   );
 
   const counts = useMemo(() => countsByKind(full), [full]);
@@ -157,7 +168,16 @@ export function Overview({ feed, client, company, onNavigate }: Props) {
           keeps the sunburst clear of the inspector on a wide screen, where the
           panel is pinned rather than stacked. */}
       <div className="absolute inset-x-2 bottom-14 top-2 lg:right-[19.5rem]">
-        <AgentGraph graph={graph} focusId={focusId} onFocus={setFocusId} />
+        <AgentGraph
+          graph={graph}
+          focusId={focusId}
+          coreOpen={coreOpen}
+          onFocus={setFocusId}
+          onToggleCore={() => {
+            setCoreOpen((open) => !open);
+            setFocusId(COMPANY_ID);
+          }}
+        />
       </div>
 
       {/* Who, and how things stand, in one line. */}

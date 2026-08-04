@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { approvalSummary, money, timeAgo } from "@/lib/language";
 import type { McpServer, McpTool } from "@/lib/mcp";
+import { KIND_STYLES, type MemoryEntry } from "@/lib/memory";
 import { PRIORITY_STYLES, type TaskPriority } from "@/lib/tasks-sample";
 import { initials, TEAM_TONES, type TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
@@ -21,6 +22,7 @@ import { BRANCH_OF, COMPANY_ID, type Graph, type GraphNode, type NodeKind } from
 /** Which console surface each kind belongs to, for the "open in full" button. */
 const SURFACE: Record<NodeKind, { view: View; label: string }> = {
   company: { view: "approvals", label: "Approvals" },
+  memory: { view: "memory", label: "Open memory" },
   desk: { view: "team", label: "Open team" },
   card: { view: "tasks", label: "Open board" },
   capability: { view: "skills", label: "Open skills" },
@@ -48,6 +50,7 @@ export function Inspector(props: Props) {
 
 function CompanyPane({ graph, status, approvals, openCards, now, onFocus, onNavigate }: Props) {
   const hubs = graph.hubs.map((id) => graph.byId.get(id)!).filter(Boolean);
+  const memories = graph.nodes.filter((n) => n.kind === "memory");
 
   return (
     <Shell
@@ -59,6 +62,15 @@ function CompanyPane({ graph, status, approvals, openCards, now, onFocus, onNavi
         <Fact label="Open cards" value={String(openCards)} />
         <Fact label="Waiting on you" value={String(status.pending_approvals)} />
       </dl>
+
+      {memories.length > 0 && (
+        <Section label={`Memory core · ${memories.length}`}>
+          <NodeList nodes={memories.slice(0, 6)} onFocus={onFocus} />
+          <Button variant="outline" size="sm" className="w-full" onClick={() => onNavigate("memory")}>
+            Open memory <ArrowRight className="size-4" />
+          </Button>
+        </Section>
+      )}
 
       <Section label="Parked for your decision">
         {approvals.length === 0 ? (
@@ -158,6 +170,25 @@ function Detail({ node, now }: { node: GraphNode; now: number }) {
             </Badge>
             <Badge variant="secondary" className="text-[10px]">
               updated {timeAgo(task.updatedAt, now)}
+            </Badge>
+          </div>
+        </div>
+      );
+    }
+    case "memory": {
+      const entry = node.payload as MemoryEntry;
+      return (
+        <div className="space-y-2">
+          <p className="text-xs leading-relaxed text-muted-foreground">{entry.body}</p>
+          <div className="flex flex-wrap gap-1.5">
+            <Badge variant="outline" className={cn("text-[10px]", KIND_STYLES[entry.kind])}>
+              {entry.kind}
+            </Badge>
+            <Badge variant="secondary" className="text-[10px]">
+              captured by {entry.source}
+            </Badge>
+            <Badge variant="secondary" className="text-[10px]">
+              updated {timeAgo(entry.updatedAt, now)}
             </Badge>
           </div>
         </div>
