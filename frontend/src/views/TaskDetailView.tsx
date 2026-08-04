@@ -50,6 +50,7 @@ import {
   steerTask,
   type DiscussionMessage,
   type InflightRun,
+  type IrreversibleEffect,
   type StepStatus,
   type SteerAction,
   type Task,
@@ -95,6 +96,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { effectDone } from "@/lib/language";
 import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
 import { ArtifactsTab } from "./ArtifactsTab";
@@ -372,6 +374,8 @@ export function TaskDetailView({
             <ControlBar
               task={detail.task}
               inflight={inflight}
+              irreversible={detail.irreversibleEffects}
+              historyIncomplete={detail.historyIncomplete}
               client={client}
               company={company}
               onChanged={load}
@@ -580,6 +584,8 @@ function DetailHeader({
 function ControlBar({
   task,
   inflight,
+  irreversible,
+  historyIncomplete,
   client,
   company,
   onChanged,
@@ -588,6 +594,13 @@ function ControlBar({
 }: {
   task: Task;
   inflight: InflightRun | null;
+  /**
+   * What a retry would do again (#351). Empty means Retry stays one click —
+   * unless `historyIncomplete` says the empty is a gap rather than an all-clear.
+   */
+  irreversible: IrreversibleEffect[];
+  /** Whether the journal holds executed history it cannot describe (#351). */
+  historyIncomplete: boolean;
   client: OpenCompanyClient;
   company: string | null;
   onChanged: () => Promise<void> | void;
@@ -730,16 +743,14 @@ function ControlBar({
             )}
           </>
         ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-8"
+          <RetryButton
+            label={resumeLabel}
+            title={task.title}
+            irreversible={irreversible}
+            historyIncomplete={historyIncomplete}
             disabled={busy}
-            onClick={() => void patchColumn()}
-          >
-            <Play className="mr-1.5 size-3.5" />
-            {resumeLabel}
-          </Button>
+            onConfirm={() => void patchColumn()}
+          />
         )}
 
         <div className="ml-auto flex items-center gap-2">
@@ -1849,19 +1860,143 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+/**
+ * Retry / Resume (#351): one click when the previous attempt did nothing that
+ * cannot be taken back, and a confirmation naming what it did when it did.
+ *
+ * Re-entering a run re-runs its effects. Cancel on this same bar has always
+ * been gated, while Retry — the control that can send a second payment or
+ * submit a second filing — was a bare `patchColumn()`. The gate is conditional
+ * on purpose: a dialog that appears every time is a dialog that gets clicked
+ * through, and most retries are of a task that only read and replied.
+ *
+ * Nothing here re-derives risk from the timeline. The host answers with the
+ * effects its journal recorded as executed, and an empty list means the journal
+ * has nothing irreversible against this card — but only when
+ * `historyIncomplete` is false. That flag is the honest half: a journal written
+ * before #351 holds executed keys with no description, so "empty" there means
+ * "cannot say", and the dialog opens anyway to say exactly that rather than
+ * pass a gap off as an all-clear.
+ *
+ * Each row is what the runtime *committed to run*. The record is written before
+ * the effect is performed — that ordering is what makes effects at-most-once —
+ * and nothing ever re-attempts it, so an interrupted one still belongs on this
+ * list. The footnote says so; the sentences stay in the past tense because
+ * "must be assumed to have happened" is what an operator has to act on.
+ *
+ * Scope: **Task Detail only.** The board's own re-dispatch — dragging a card
+ * back into `in_progress` — has the same shape and the same read available to
+ * it, and is deliberately left for a follow-up rather than half-done here.
+ */
+function RetryButton({
+  label,
+  title,
+  irreversible,
+  historyIncomplete,
+  disabled,
+  onConfirm,
+}: {
+  label: string;
+  title: string;
+  irreversible: IrreversibleEffect[];
+  historyIncomplete: boolean;
+  disabled: boolean;
+  onConfirm: () => void;
+}) {
+  // Nothing to warn about and nothing unaccounted for: the plain button, wired
+  // straight through, exactly as it behaved before this existed.
+  if (irreversible.length === 0 && !historyIncomplete) {
+    return (
+      <Button variant="outline" size="sm" className="h-8" disabled={disabled} onClick={onConfirm}>
+        <Play className="mr-1.5 size-3.5" />
+        {label}
+      </Button>
+    );
+  }
+
+  const named = irreversible.length;
+
+  return (
+    <ConfirmButton
+      trigger={
+        <Button variant="outline" size="sm" className="h-8" disabled={disabled}>
+          <Play className="mr-1.5 size-3.5" />
+          {label}
+        </Button>
+      }
+      title={`${label} “${title}”?`}
+      description={
+        named === 0
+          ? "Running this again may repeat whatever the last attempt did."
+          : named === 1
+            ? "This task already did something that cannot be undone. Running it again may do it a second time."
+            : `This task already did ${named} things that cannot be undone. Running it again may do them a second time.`
+      }
+      details={
+        <div className="space-y-2 text-left">
+          {named > 0 && (
+            <ul className="space-y-1.5 rounded-lg border bg-muted/40 p-3 text-xs">
+              {irreversible.map((e, i) => (
+                // Two effects of the same kind can land in the same millisecond,
+                // so the index carries the uniqueness the pair cannot.
+                <li key={`${e.kind}-${e.atMillis}-${i}`} className="flex items-start gap-2">
+                  <AlertCircle
+                    className="mt-px size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+                    aria-hidden
+                  />
+                  <span className="min-w-0 flex-1">{effectDone(e.kind, e.amountUsd)}</span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {timeOf(e.atMillis)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {historyIncomplete && (
+            // The list is short, not wrong. Say which, rather than let a
+            // truncated list read as the whole story.
+            <p className="text-xs text-muted-foreground">
+              Some of this company’s earlier activity was recorded before it kept a description, so
+              {named > 0 ? " this list may be incomplete." : " nothing here can be listed."}
+            </p>
+          )}
+          {named > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              Each is recorded the moment it was committed, so one that was interrupted still
+              appears — nothing is ever retried on its own.
+            </p>
+          )}
+        </div>
+      }
+      confirmLabel={`${label} anyway`}
+      cancelLabel="Leave it alone"
+      onConfirm={onConfirm}
+    />
+  );
+}
+
 /** An AlertDialog-gated button, mirroring the confirm pattern used elsewhere. */
 function ConfirmButton({
   trigger,
   title,
   description,
+  details,
   confirmLabel,
+  cancelLabel = "Keep running",
   destructive,
   onConfirm,
 }: {
   trigger: ReactElement;
   title: string;
   description: string;
+  /**
+   * Block content rendered under the description (#351) — a list of what
+   * already happened. A sibling of the description rather than a child of it:
+   * the description renders a `<p>`, and a `<ul>` inside one is invalid HTML.
+   */
+  details?: ReactElement;
   confirmLabel: string;
+  cancelLabel?: string;
   destructive?: boolean;
   onConfirm: () => void;
 }) {
@@ -1873,8 +2008,9 @@ function ConfirmButton({
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {details}
         <AlertDialogFooter>
-          <AlertDialogCancel>Keep running</AlertDialogCancel>
+          <AlertDialogCancel>{cancelLabel}</AlertDialogCancel>
           <AlertDialogAction
             onClick={onConfirm}
             className={

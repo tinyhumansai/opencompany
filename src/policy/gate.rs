@@ -224,6 +224,34 @@ impl ManifestApprovalGate {
         }
     }
 
+    /// Whether this effect is one a person would want to know had **already
+    /// happened** before re-running the work that produced it (issue #351).
+    ///
+    /// It is the supervised checkpoint taxonomy read as a question about the
+    /// past rather than the future: signing, publishing, touching identity,
+    /// spending at or over the cap, first contact with a counterparty. Those
+    /// are the effects `evaluate_supervised` refuses to wave through, and they
+    /// are refused precisely because they cannot be taken back.
+    ///
+    /// Deliberately **mode-independent**. A `full`-mode company executes every
+    /// one of these without ever parking it, which is exactly the case this
+    /// warning exists for: the operator was never asked, so the retry dialog is
+    /// the first and only place they learn a filing was already submitted.
+    /// Asking the same taxonomy the same way for every mode also means a
+    /// company that later tightens its policy does not retroactively change
+    /// what its history says it did.
+    ///
+    /// Delegating to [`evaluate_supervised`](Self::evaluate_supervised) rather
+    /// than restating the rules is the point: two copies of "which effects are
+    /// irreversible" would drift, and the copy in the retry dialog would drift
+    /// silently — nobody notices a warning that stopped naming something.
+    pub fn is_irreversible(&self, effect: &Effect) -> bool {
+        matches!(
+            self.evaluate_supervised(effect),
+            PolicyDecision::RequireApproval
+        )
+    }
+
     /// The supervised-mode checkpoint taxonomy.
     fn evaluate_supervised(&self, effect: &Effect) -> PolicyDecision {
         let cap = self.policy.auto_approve_under_usd;
@@ -627,6 +655,74 @@ mod test {
         assert_eq!(approvals.load(Ordering::SeqCst), 1, "exactly one winner");
         assert_eq!(not_parked.load(Ordering::SeqCst), 7, "the rest are no-ops");
         assert!(gate.parked_ids().is_empty());
+    }
+
+    /// Issue #351: the irreversibility question, answered by the same taxonomy
+    /// that decides what parks — and answered the same way whatever mode the
+    /// company runs in.
+    ///
+    /// The mode-independence is the part worth pinning. A `full`-mode company
+    /// executes a filing without ever parking it, so the retry dialog is the
+    /// only place anybody will ever be told it happened; a predicate that read
+    /// the company's mode would say "nothing to warn about" in exactly the
+    /// configuration that needs the warning most.
+    #[test]
+    fn irreversibility_follows_the_supervised_taxonomy_in_every_mode() {
+        for mode in ["supervised", "full", "readonly"] {
+            let gate = ManifestApprovalGate::new(policy(mode, Some(100.0)));
+
+            for group in [
+                EffectGroup::Sign,
+                EffectGroup::Publish,
+                EffectGroup::Identity,
+            ] {
+                assert!(
+                    gate.is_irreversible(&effect("filing.submit", group)),
+                    "{mode}: {group:?} is irreversible by construction",
+                );
+            }
+
+            // Spend: the cap decides, strictly.
+            let mut under = effect("x402.spend", EffectGroup::Spend);
+            under.amount_usd = Some(99.0);
+            assert!(!gate.is_irreversible(&under), "{mode}: under the cap");
+            let mut at_cap = effect("x402.spend", EffectGroup::Spend);
+            at_cap.amount_usd = Some(100.0);
+            assert!(gate.is_irreversible(&at_cap), "{mode}: at the cap");
+
+            // Send: first contact is the irreversible half.
+            let mut established = effect("email.send", EffectGroup::Send);
+            established.established_thread = true;
+            assert!(!gate.is_irreversible(&established), "{mode}: a live thread");
+            let mut cold = effect("email.send", EffectGroup::Send);
+            cold.first_time_counterparty = true;
+            assert!(gate.is_irreversible(&cold), "{mode}: first contact");
+
+            // A read changes nothing and warns about nothing.
+            assert!(
+                !gate.is_irreversible(&effect("web.search", EffectGroup::Other)),
+                "{mode}: an ordinary read must not raise a retry warning",
+            );
+        }
+    }
+
+    /// `always_approve` is a *parking* rule, not an irreversibility one, so it
+    /// deliberately does not leak into the warning.
+    ///
+    /// Both live on the same policy block and it would be easy to fold them
+    /// together. They answer different questions: `always_approve` is "ask me
+    /// first", which an operator sets for anything they want a say in, while
+    /// this dialog claims something cannot be taken back. Widening it would
+    /// warn about routine work and teach people to click through.
+    #[tokio::test]
+    async fn always_approve_does_not_widen_what_counts_as_irreversible() {
+        let gate = ManifestApprovalGate::new(policy("supervised", Some(100.0)));
+        let mut cheap = effect("payment.send", EffectGroup::Spend);
+        cheap.amount_usd = Some(1.0);
+        // `payment.send` is in the default always_approve list, so it parks...
+        assert_eq!(decide(&gate, &cheap).await, PolicyDecision::RequireApproval);
+        // ...but a dollar under a hundred-dollar cap is not irreversible.
+        assert!(!gate.is_irreversible(&cheap));
     }
 
     #[tokio::test]

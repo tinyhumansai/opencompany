@@ -85,6 +85,8 @@ fn detail_at(waiting_since: Option<u64>) -> TaskDetail {
         task: card("Launch post"),
         durations: TaskDurations::compute(&timeline, waiting_since, T0 + 900_000),
         timeline,
+        irreversible_effects: Vec::new(),
+        history_incomplete: false,
         discussion: Vec::new(),
         discussion_has_more: false,
         lineage: Lineage {

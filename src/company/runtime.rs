@@ -43,7 +43,7 @@ fn task_enters_in_progress(prev_column: Option<&str>, next_column: &str) -> bool
 }
 use crate::runtime::CycleRunner;
 use crate::runtime::grants::{GRANT_TTL_MILLIS, GrantSet};
-use crate::runtime::journal::RuntimeJournal;
+use crate::runtime::journal::{ExecutedEffect, RuntimeJournal};
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::ops::mailer::MailSender;
 use crate::server::ops::smtp::SmtpCredentials;
@@ -837,6 +837,28 @@ impl CompanyRuntime {
     /// [`pending_approvals`](Self::pending_approvals).
     pub fn approval_park_instants(&self) -> std::collections::HashMap<ApprovalId, u64> {
         self.journal.park_instants()
+    }
+
+    /// The irreversible effects a task has already executed, oldest first
+    /// (issue #351).
+    ///
+    /// What the retry dialog names. Read from the journal's executed record —
+    /// the same append-only set that makes effects at-most-once — so it reports
+    /// what was committed to run rather than what a timeline label says an agent
+    /// intended.
+    pub fn irreversible_effects(&self, task_id: &str) -> Vec<ExecutedEffect> {
+        self.journal.irreversible_effects(task_id)
+    }
+
+    /// Whether this company's journal holds executed history it cannot describe
+    /// (issue #351) — a record written before descriptions existed.
+    ///
+    /// The companion to [`irreversible_effects`](Self::irreversible_effects):
+    /// an empty list only means "nothing irreversible for this card" while this
+    /// is `false`. When it is `true` the console confirms a retry regardless and
+    /// says so, rather than showing an all-clear it cannot stand behind.
+    pub fn has_undescribed_history(&self) -> bool {
+        self.journal.has_undescribed_history()
     }
 
     /// The approvals currently awaiting the operator.

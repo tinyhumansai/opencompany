@@ -204,6 +204,72 @@ break the byte-identical round-trip, so the claim is incomplete but never wrong.
 Both `chat/history` surfaces (REST and GraphQL) project it from the shared
 `MessageView`, so the chip survives a transcript reload on either.
 
+### What a retry would repeat (issue #351)
+
+Re-entering a run re-runs its effects, and the two facts needed to warn about
+that already existed separately: the gate classifies `Sign` / `Publish` /
+`Identity` / capped `Spend` / first-contact `Send` as the effects it refuses to
+wave through, and the journal's executed-key set records what was committed to
+run. Neither reached the operator, because the key is opaque — it answers "has
+this run?" and nothing else.
+
+`EffectExecuted` therefore carries an optional `ExecutedEffect` alongside the
+key: the effect kind, its amount, the board task it ran for, and whether the
+gate called it irreversible. The classification is made **at execution time**,
+by `ManifestApprovalGate::is_irreversible` (which delegates to the supervised
+taxonomy, so there is one copy of the rules), and it is deliberately
+mode-independent: a `full`-mode company executes a filing without ever parking
+it, which is precisely when a retry dialog is the only warning anyone gets.
+
+There is **no payload**. The record is read back onto an operator's screen
+through `GET …/tasks/{task_id}`, which scrubs by construction, so recipients and
+message bodies are never retained in the first place.
+
+The task attribution comes from the cycle that ran the effect. Under
+`supervised` an irreversible effect never executes in the cycle that emitted it
+— it parks, and the operator's approval opens a fresh cycle carrying only
+`ApprovalResolved` — so `ApprovalParked` also gains an optional `task_id`, and
+the approved execution reads the card back off it. Without that, every effect
+that went through the approval gate the way the policy intends would be
+attributed to nothing.
+
+**Committed, not completed.** The record is written *before* the effect is
+performed — that ordering is the at-most-once guarantee — and a failed perform
+leaves it standing. So an entry means "this was committed, and the runtime will
+never re-attempt it", which is what the warning needs: the operator has to
+assume it happened, because nothing will finish it and nothing will retry it. It
+does not mean the effect is known to have completed, and the dialog's wording
+says so rather than rendering the list as flat fact.
+
+**Approved tool calls are described at redemption.** An approved effect carrying
+an `agent` is settled by minting a single-use grant, not by
+`execute_effect_once` — the tool then runs inside the agent's next turn — so it
+writes no `EffectExecuted` line at all. `GrantConsumed` therefore carries the
+same optional `ExecutedEffect`, built from the park record (retained past
+resolution, payload scrubbed, superseded by an approve-with-edit) joined to the
+gate's classification. It is attached at **redemption** rather than at minting,
+because a grant that expires unredeemed is a call that never ran and must not
+appear on a warning.
+
+**A journal that cannot describe itself says so.** Both fields are additive: a
+line written before #351 replays as a committed key with no description, which
+keeps the at-most-once guarantee exact and simply contributes no warning. That
+makes an empty list ambiguous on an upgraded company, so replay raises a
+company-wide flag when it reads an undescribed executed key, surfaced as
+`historyIncomplete` on `GET …/tasks/{task_id}`. With it set the console confirms
+a retry regardless and says earlier activity cannot be described, instead of
+presenting the gap as an all-clear. The flag is company-wide rather than
+per-task by necessity — an undescribed record carries no card either. The
+related pre-#351 case it cannot detect directly: an approval parked before the
+upgrade has no `task_id`, and that record is byte-identical to a legitimately
+card-less park written today, so flagging it would misreport every company that
+has ever parked an approval from operator chat.
+
+**Scope.** Task Detail only. The board's own re-dispatch — dragging a card back
+into `in_progress` (`company/runtime.rs`, `upsert_task` → `dispatch_task`) — has
+the same shape and now has this read available to it, and is deliberately left
+for a follow-up rather than half-gated here.
+
 ## MemoryStore
 
 The equivalent of Medulla's `CyclePersistence`; TinyCortex is the target
