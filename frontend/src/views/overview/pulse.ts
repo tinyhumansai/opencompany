@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // The two predicates the graph adapter needs from the board.
 //
 // Pure: no fetching, no clock, no randomness — so the same cards always shape

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Our host's data, shaped into the knowledge graph's five-ring org model.
 //
 // ## What is real, and what is not
@@ -15,13 +17,13 @@
 // | human → department  | nothing (sign-in tells us who, not what) | **derived** |
 // | department → workflow | nothing (no flow API yet)   | **derived** |
 //
-// The two derived edges are placeholders: a company manifest has no department
-// field and no per-agent tool list, so this module invents a plausible
-// structure rather than leaving three of the five rings empty. That is a
-// deliberate, and temporary, lie — `DERIVED_NOTICE` is rendered in the UI so
-// nobody reads the org chart as something the company declared. When
-// `[[agent]]` grows `department` and `tools`, delete `assignDepartment` and
-// `assignTools` and read them straight through.
+// The four derived edges are placeholders: a company manifest has no department
+// field and no per-agent tool list, there is no flow API, and signing in says
+// who somebody is rather than what they work on. This module invents a
+// plausible structure rather than leaving most of the five rings empty. That is
+// a deliberate, and temporary, lie — `DERIVED_NOTICE` is the standing caveat.
+// As each field lands upstream, delete the matching `assign*` helper (or
+// `WORKFLOW_TEMPLATES`) and read the real value straight through.
 
 import type { Person as HostPerson } from "@/api/auth";
 import type { Skill } from "@/api/skills";

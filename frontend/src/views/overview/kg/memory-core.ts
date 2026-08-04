@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * The store shape this module distils from. Declared here rather than imported
  * so the core stays self-contained: anything that can produce these fields —
@@ -28,7 +30,7 @@ export type BrainGraphEdge = {
 
 /**
  * The Notes-style memory core at the center of the /brain knowledge graph:
- * Alex rendered as the constellation of his actual brain-store notes.
+ * The company rendered as the constellation of everything it remembers.
  *
  * `distillMemoryGraph` shrinks the full BrainGraph (hundreds of pages, 64-dim
  * vectors) into a readable mini constellation — the most-linked notes, their
@@ -62,7 +64,7 @@ export type MemoryGraph = { nodes: MemoryNode[]; edges: MemoryEdge[] };
 
 type BrainGraphSlice = { nodes: BrainGraphNode[]; edges: BrainGraphEdge[] };
 
-// Open-graph density. Deliberately LOW: smoothness beats richness (Alex:
+// Open-graph density. Deliberately LOW: smoothness beats richness (
 // "remove a lot of the nodes to the point where it's no longer buggy"). Every
 // element here repaints on every camera frame while zoomed in fullscreen.
 const DEFAULT_MAX_PAGES = 120;
@@ -99,7 +101,7 @@ export function distillMemoryGraph(
         a.id.localeCompare(b.id),
     );
   let pages = ranked.slice(0, maxPages);
-  // centerFolder quota: the spotlighted folder (Alex: "populate Claude
+  // centerFolder quota: the spotlighted folder ("populate
   // Archive") is guaranteed a slice of the cap even though its notes are
   // weakly wikilinked — the lowest-ranked outsiders make room.
   if (centerFolder) {
@@ -218,7 +220,7 @@ function assignLinkClusters(nodes: MemoryNode[], edges: MemoryEdge[]): MemoryNod
 const FORCE_ITERS = 260;
 const D_MIN = 0.056;
 // linked mass reaches past unit 1.0 to hug the drawn disc border (which sits
-// at (R_CORE + 10) / R_CORE ≈ 1.19 units) — Alex: notes very close to the
+// at (R_CORE + 10) / R_CORE ≈ 1.19 units) — notes very close to the
 // end of the circle. The orphan halo rings just outside the mass.
 const BLOB_FILL = 1.05;
 const COMPONENT_RING = 0.6;
@@ -504,7 +506,7 @@ export type ViewSize = { w: number; h: number };
 export type CameraState = {
   /** a department tree is focused (frames the whole canvas — the tree fills it) */
   focusedTeam: boolean;
-  /** the Alex memory core is expanded */
+  /** the memory core is expanded */
   coreExpanded: boolean;
   /** live position of the core (the self anchor moves in tree mode) */
   coreCenter: { x: number; y: number };
@@ -541,7 +543,7 @@ function frameOn(view: ViewSize, c: { x: number; y: number }, frac: number): Rec
  * out: a selected memory note beats the core dive, the core dive beats an org
  * selection, an org selection beats the resting/tree full frame.
  */
-// the resting/tree frame breathes out a touch beyond the canvas (Alex,
+// the resting/tree frame breathes out a touch beyond the canvas (
 // 2026-07-12: "a bit more zoomed out") — it also reveals the flank trees'
 // off-canvas sweep, so the wheel reads bigger than the frame
 const ZOOM_OUT_PAD = 0.06;

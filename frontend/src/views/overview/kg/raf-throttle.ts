@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * Coalesce rapid calls so the wrapped fn runs at most once per animation frame
  * (falls back to a ~16ms timer off-browser, e.g. in tests/SSR). Used to cap

@@ -1,12 +1,12 @@
 'use client';
 
+// SPDX-License-Identifier: GPL-3.0-or-later
 import {
   ArrowLeft, ChevronRight, ClipboardList, FileText, ListChecks, Server, User, UserCog, Wrench, X, type LucideIcon,
 } from 'lucide-react';
 import type { ToolWiki } from './agent-wiki';
-import type { Personnel } from './personnel';
 import type { MemoryNode } from './memory-core';
-import type { Person, RosterClient, SopTask } from './schemas';
+import type { Person, SopTask } from './schemas';
 
 export type AgentLite = { id: string; name: string; role: string; model: string };
 export type ToolLite = { id: string; slug: string; name: string; mcp: boolean };
@@ -94,7 +94,7 @@ export function DeptOverviewCard({
   dept, head, agents, tools, onAgent, onTool, onPerson,
 }: {
   dept: DeptLite;
-  head: Personnel | null;
+  head: Person | null;
   agents: AgentLite[];
   tools: ToolLite[];
   onAgent: (id: string) => void;
@@ -143,7 +143,7 @@ export function DeptOverviewCard({
  * instance, reports-to, sub-agents), the tools it holds, and its last run.
  */
 export function AgentHarnessCard({
-  agent, task, parentName, parentAgentId, subAgents, lastRun, headName, runLabel,
+  agent, task, parentName, parentAgentId, subAgents, lastRun, runLabel,
   onBack, onClose, onTool, onAgent, onTask,
 }: {
   agent: { name: string; role: string; model: string; tier: string; instance: string; description: string; tools: string[] };
@@ -154,7 +154,6 @@ export function AgentHarnessCard({
   lastRun: { ok: boolean; summary: string } | null;
   /** relative time of the last run, precomputed by the caller */
   runLabel?: string | null;
-  headName?: string | null;
   onBack?: () => void;
   onClose?: () => void;
   onTool?: (slug: string) => void;
@@ -198,11 +197,6 @@ export function AgentHarnessCard({
               ) : (
                 parentName
               )}
-            </span>
-          )}
-          {headName && (
-            <span>
-              <span className="text-os-dim">human lead</span> {headName}
             </span>
           )}
           {subAgents.length > 0 && (
@@ -285,89 +279,8 @@ export function ToolDetailCard({
   );
 }
 
-export type ClientLite = RosterClient;
 
-// stages that count as "this is a client", across funnel and Attio wording
-const ACTIVE_STAGES = new Set(['converted', 'won', 'closed won', 'closed-won', 'active']);
-const isActiveClient = (status: string) => ACTIVE_STAGES.has(status.toLowerCase());
-
-/** The Clients pillar roster: every client by venture, pipeline underneath. */
-export function ClientRosterCard({
-  clients, color, onClose,
-}: {
-  clients: ClientLite[];
-  color: string;
-  onClose?: () => void;
-}) {
-  const source = clients[0]?.source ?? 'funnel';
-  const isLost = (status: string) => status.toLowerCase().includes('lost');
-  const converted = clients.filter((c) => isActiveClient(c.status));
-  const pipeline = clients.filter((c) => !isActiveClient(c.status) && !isLost(c.status));
-  const lost = clients.filter((c) => !isActiveClient(c.status) && isLost(c.status)).length;
-  const ventures = [...new Set(converted.map((c) => c.venture).filter(Boolean))].sort();
-  const unventured = converted.filter((c) => !c.venture);
-  return (
-    <div className="flex h-full flex-col">
-      <PanelHeader
-        title="Client roster"
-        sub={`${converted.length} active · ${pipeline.length} in pipeline${lost > 0 ? ` · ${lost} lost` : ''} · ${source === 'attio' ? 'live · Attio' : 'seeded · funnel'}`}
-        color={color}
-        onClose={onClose}
-      />
-      <div className="flex-1 overflow-y-auto px-3 py-2.5">
-        {ventures.map((v) => (
-          <div key={v} className="mb-4">
-            <SectionLabel icon={UserCog}>{v.replace(/-/g, ' ')}</SectionLabel>
-            <div className="flex flex-col gap-1.5">
-              {converted
-                .filter((c) => c.venture === v)
-                .map((c) => (
-                  <Row
-                    key={c.id}
-                    color={color}
-                    title={c.name}
-                    sub={c.amountUsd ? `$${c.amountUsd.toLocaleString('en-US')}` : 'active client'}
-                  />
-                ))}
-            </div>
-          </div>
-        ))}
-        {unventured.length > 0 && (
-          <div className="mb-4">
-            <SectionLabel icon={UserCog}>clients</SectionLabel>
-            <div className="flex flex-col gap-1.5">
-              {unventured.map((c) => (
-                <Row
-                  key={c.id}
-                  color={color}
-                  title={c.name}
-                  sub={c.amountUsd ? `$${c.amountUsd.toLocaleString('en-US')}` : c.status}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-        {converted.length === 0 && (
-          <p className="mb-4 font-mono text-[10.5px] text-os-dim">No active clients yet.</p>
-        )}
-        {pipeline.length > 0 && (
-          <div>
-            <SectionLabel icon={ClipboardList}>in pipeline ({pipeline.length})</SectionLabel>
-            <div className="flex flex-col gap-1">
-              {pipeline.map((c) => (
-                <span key={c.id} className="truncate font-mono text-[10.5px] text-os-dim">
-                  {c.name} · {c.status.replace(/_/g, ' ')}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** Memory note detail: one page from Alex's brain-store constellation. */
+/** Memory note detail: one note from the company's memory constellation. */
 export function MemoryNoteCard({
   note, color, onBack, onClose,
 }: {
@@ -378,7 +291,7 @@ export function MemoryNoteCard({
 }) {
   return (
     <div className="flex h-full flex-col">
-      <PanelHeader title={note.label} sub="memory · brain-store" color={color} onBack={onBack} onClose={onClose} />
+      <PanelHeader title={note.label} sub="memory" color={color} onBack={onBack} onClose={onClose} />
       <div className="flex-1 overflow-y-auto px-3 py-2.5">
         <div className="mb-3 flex items-center gap-2">
           <span
@@ -501,7 +414,7 @@ export function GraphHumanDetailCard({
 export function PersonDetailCard({
   person, deptName, color, agents, onBack, onClose,
 }: {
-  person: Personnel;
+  person: Person;
   deptName: string;
   color: string;
   agents: AgentLite[];
@@ -515,7 +428,7 @@ export function PersonDetailCard({
         <p className="mb-3 text-[11px] leading-relaxed text-os-muted">
           Leads <span className="font-semibold" style={{ color }}>{deptName}</span> — manages {agents.length} agent{agents.length === 1 ? '' : 's'}.
         </p>
-        <SectionLabel icon={FileText}>context · brain-store/people/{person.name.toLowerCase()}.md</SectionLabel>
+        <SectionLabel icon={FileText}>context</SectionLabel>
         <div className="mb-4"><WikiLink label={`${person.name.toLowerCase()}.md`} /></div>
         <SectionLabel icon={User}>manages</SectionLabel>
         <div className="flex flex-col gap-1">

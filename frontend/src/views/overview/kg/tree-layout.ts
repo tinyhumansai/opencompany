@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * Organic tree layout for the focused G-Brain department.
  *
@@ -288,7 +290,7 @@ export function treeLayout(input: TreeLayoutInput): TreeLayoutResult {
 export type FocusWheel = { hub: Pt; scale: number; stage: number; squeeze: number };
 
 /**
- * The wheel you turn INTO (Alex, 2026-07-12): while a pillar is focused the
+ * The wheel you turn INTO: while a pillar is focused the
  * background wheel is not a diagram floating mid-canvas — it becomes a huge
  * apparatus whose hub sinks BELOW the bottom edge, enlarged so its pillar ring
  * passes exactly through the focused tree's team band. The focused sector
@@ -300,7 +302,7 @@ export type FocusWheel = { hub: Pt; scale: number; stage: number; squeeze: numbe
  * rigid wheel the neighbors would hang ~60° down the rim (below the canvas),
  * so a step read as "rising from the bottom". Squeezed, the neighbors hold at
  * the canvas SIDES and a turn sweeps laterally along the top arc — the motion
- * Alex asked for: from left and right, not from below.
+ * the arrows imply: from left and right, not from below.
  */
 export function focusWheel(width: number, height: number, ringR: number[]): FocusWheel {
   const hub = { x: width / 2, y: height * 1.3 };
@@ -339,7 +341,7 @@ export function cyclicDeltaF(from: number, to: number, n: number): number {
 }
 
 /**
- * The visible top of the wheel (Alex, 2026-07-12): pillars ride the RIM of
+ * The visible top of the wheel: pillars ride the RIM of
  * a huge wheel whose apex is the stage (the focused tree's team band). Offset
  * is in sectors — 0 at the apex, ±1 at the canvas edges a touch below it,
  * beyond that the rim has left the canvas. Feeding a smoothly-eased float

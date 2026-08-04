@@ -1,5 +1,6 @@
 'use client';
 
+// SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useState } from 'react';
 import { ArrowLeft, ChevronLeft, ChevronRight } from 'lucide-react';
 import type { ToolWiki } from './agent-wiki';
@@ -71,7 +72,7 @@ export function KnowledgeGraphFullscreen({
         {/* vault search — top-left while the Notes core is open */}
         {searchSlot && <div className="absolute left-5 top-5 z-10">{searchSlot}</div>}
 
-        {/* pillar selector — compact, TOP-LEFT (Alex: convenient, not in
+        {/* pillar selector — compact, TOP-LEFT: convenient, not in
             the graph's way): current pillar + one dot per pillar to jump */}
         {!coreOpen && (
           <div className="absolute left-5 top-5 z-20 flex items-center gap-2.5 rounded-sm-t border border-os-border-strong bg-os-bg/85 px-2.5 py-1.5 backdrop-blur">

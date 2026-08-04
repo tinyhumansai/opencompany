@@ -1,15 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 import type { Agent, Department, Person, SopTask, Workflow } from './schemas';
 
 /**
- * The operating-knowledge graph that powers the /brain force graph — Alex's
- * life and the org in one. Five concentric rings: Alex at the core (ring 0),
- * the life pillars / teams tinted by their life-area color (ring 1), the
- * written-out SOP tasks — the actual jobs (ring 2), the workers who do them —
- * AI agents AND human employees (ring 3), and the software tools they use
- * (ring 4). Each task is done by exactly ONE worker and each worker owns
- * exactly ONE task (the monogamy rule; the seed tests enforce it). Pure data;
- * icons live in the component, colors are carried on the nodes that have a
- * brand one.
+ * The company's operating graph: who it is, how it is divided, what it runs,
+ * who does that work, and what they reach for.
+ *
+ * Five concentric rings, read outward from the centre:
+ *
+ * | Ring | What |
+ * |---|---|
+ * | 0 | the company itself |
+ * | 1 | its departments, each tinted with its own colour |
+ * | 2 | the written-out SOP tasks, and the workflows a department runs |
+ * | 3 | the workers — AI agents and humans — plus each workflow's stages |
+ * | 4 | the tools those workers use |
+ *
+ * An SOP task is done by exactly one worker; a workflow passes through several,
+ * one per stage. Pure data — icons live in the component, and only nodes with a
+ * colour of their own carry one.
  */
 export type KGNodeKind = 'self' | 'team' | 'workflow' | 'task' | 'step' | 'employee' | 'person' | 'tool';
 
@@ -17,8 +26,10 @@ export type KGNode = {
   id: string;
   kind: KGNodeKind;
   label: string;
-  ring: number; // 0 = Alex core → 4 = outer (tools)
-  color?: string; // life-area tint (teams)
+  ring: number; // 0 = the company at the core → 4 = the outer tool ring
+  color?: string; // the department's own colour (teams only)
+  /** A department's place on the wheel; absent on every other kind. */
+  order?: number;
 };
 
 export type KGEdgeKind = 'pillar' | 'flow' | 'stage' | 'next' | 'runs' | 'sop' | 'does' | 'member' | 'uses' | 'reports';
@@ -41,30 +52,21 @@ const RING: Record<KGNodeKind, number> = {
 export const SELF_ID = 'self';
 
 /**
- * Display order for the graph only (not the sidebar/org/roadmap): Finances rides
- * immediately next to Sales so the revenue + payment-processor story sits together.
+ * Where each department sits on the wheel.
+ *
+ * Read off the `order` the department itself declares, carried onto its node
+ * when the graph is built. Anything without one sorts to the end, alphabetically
+ * among its peers, so the wheel is stable whatever it is handed.
  */
-export const GRAPH_DEPT_ORDER = [
-  'dept-sales',
-  'dept-finance',
-  'dept-clients',
-  'dept-marketing-growth',
-  'dept-tech',
-  'dept-comms',
-] as const;
-
-/** Rank a department id for graph layout; unknown ids sort after the known five. */
-export function graphDeptRank(deptId: string): number {
-  const i = (GRAPH_DEPT_ORDER as readonly string[]).indexOf(deptId);
-  return i < 0 ? GRAPH_DEPT_ORDER.length + 1 : i;
-}
-
-/** Order any dept-keyed list by the graph display order (Finances beside Sales). */
 export function orderGraphDepartments<T>(items: T[], deptIdOf: (item: T) => string): T[] {
-  return [...items].sort((a, b) => graphDeptRank(deptIdOf(a)) - graphDeptRank(deptIdOf(b)));
+  const rank = (item: T) => {
+    const node = item as { order?: number };
+    return typeof node.order === 'number' ? node.order : Number.MAX_SAFE_INTEGER;
+  };
+  return [...items].sort((a, b) => rank(a) - rank(b) || deptIdOf(a).localeCompare(deptIdOf(b)));
 }
 
-/** 'comms-feed' → 'Comms Feed' */
+/** 'design-review' → 'Design Review' */
 function prettify(slug: string): string {
   return slug
     .split(/[-_]/)
@@ -78,9 +80,9 @@ export function workerNodeId(kind: SopTask['assigneeKind'], assigneeId: string):
 }
 
 /**
- * Tool node id → tool slug. Tools shared by several departments are split
- * into one node per department (`tool:attio@dept-sales`) so no line has to
- * cross the whole wheel to a far-away shelf; single-department tools keep
+ * Tool node id → tool slug. A tool reached from several departments is split
+ * into one node per department (`tool:slack@dept-growth`) so no line has to
+ * cross the whole wheel to a far-away shelf; a single-department tool keeps
  * the plain `tool:slug` id.
  */
 export function toolSlugOf(nodeId: string): string {
@@ -93,22 +95,23 @@ export function buildKnowledgeGraph(
   people: Person[] = [],
   tasks: SopTask[] = [],
   workflows: Workflow[] = [],
+  /** What to call the node at the centre. */
+  selfLabel = 'This company',
 ): KnowledgeGraph {
   const nodes: KGNode[] = [];
   const edges: KGEdge[] = [];
 
-  // Alex at the core — every pillar hangs off him (the life-at-the-core idea
-  // folded in from the old life map).
-  nodes.push({ id: SELF_ID, kind: 'self', label: 'Alex', ring: RING.self });
+  // The company at the core — every department hangs off it.
+  nodes.push({ id: SELF_ID, kind: 'self', label: selfLabel, ring: RING.self });
 
-  // Teams / life pillars (ring 1) — only departments that actually have workers,
-  // tinted with their life-area color.
+  // Departments (ring 1) — only the ones that actually have somebody in them,
+  // each tinted with its own colour.
   const usedDepts = new Set([...agents.map((a) => a.departmentId), ...people.map((p) => p.departmentId)]);
   for (const d of departments) {
     if (!usedDepts.has(d.id)) continue;
     // The pillar's tint comes from the department record itself.
     const color = d.color;
-    nodes.push({ id: `team:${d.id}`, kind: 'team', label: d.name, ring: RING.team, color });
+    nodes.push({ id: `team:${d.id}`, kind: 'team', label: d.name, ring: RING.team, color, order: d.order });
     edges.push({ source: SELF_ID, target: `team:${d.id}`, kind: 'pillar' });
   }
 
@@ -155,7 +158,7 @@ export function buildKnowledgeGraph(
 
   // First pass: which departments touch each tool? A tool used from several
   // departments is DUPLICATED — one copy per department — so its lines stay
-  // local instead of crossing the wheel (Alex: no messy long edges).
+  // local instead of crossing the wheel — no messy long edges.
   const deptsOfTool = new Map<string, Set<string>>();
   const workerRows: { nodeId: string; kind: 'employee' | 'person'; label: string; deptId: string; tools: string[] }[] = [
     ...agents.map((a) => ({ nodeId: `emp:${a.id}`, kind: 'employee' as const, label: a.name, deptId: a.departmentId, tools: a.tools })),

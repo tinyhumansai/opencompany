@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
 // The record shapes the knowledge graph is built from.
 //
 // The graph, its layout, and its detail cards were written against a five-ring
@@ -76,13 +78,4 @@ export interface AgentRun {
   tokensIn?: number | null;
   tokensOut?: number | null;
   costUsd?: number | null;
-}
-
-export interface RosterClient {
-  id: string;
-  name: string;
-  venture: string;
-  status: string;
-  amountUsd: number | null;
-  source: "attio" | "funnel";
 }
