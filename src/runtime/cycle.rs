@@ -823,11 +823,19 @@ async fn recipient_is_established(rt: &CompanyRuntime, to: &str) -> bool {
 /// * **two cards** — two `TaskDispatched` events, or a dispatch plus a
 ///   resolution belonging to a different card;
 /// * **a card and a non-card turn** — an operator chat message, a webhook, a
-///   schedule tick or an inbound A2A task batched alongside a dispatch. That
-///   turn's parked effect is not the card's work, and stamping it with the
-///   card's id is the same misattribution one level down. (Issue #357 guards
-///   this seam at a finer grain, per *attempt*, with a queue-position boundary;
-///   this rule only has to stop the cross-turn leak.)
+///   schedule tick, an inbound A2A task, a payment or a filed feedback item
+///   batched alongside a dispatch. That turn's parked effect is not the card's
+///   work, and stamping it with the card's id is the same misattribution one
+///   level down. (Issue #357 guards this seam at a finer grain, per *attempt*,
+///   with a queue-position boundary; this rule only has to stop the cross-turn
+///   leak.)
+///
+/// The match over [`CompanyEvent`] is **exhaustive on purpose** — no wildcard.
+/// Every variant is classified as one of: names a card, rivals a card, or is a
+/// record of something that already happened. A new variant should not silently
+/// default to "harmless"; a new *inbound trigger* defaulting that way is exactly
+/// how the misattribution above comes back. Adding one now fails the build until
+/// somebody decides which of the three it is.
 ///
 /// An unstamped park is recorded as
 /// [`TaskLink::Unlinked`](crate::runtime::journal::TaskLink::Unlinked): honest,
@@ -854,12 +862,27 @@ fn cycle_task_id(
                     Some(None) | None => continue,
                 }
             }
-            // A turn that is its own work, riding the same batch as a dispatch.
+            // An inbound trigger that is its own work, riding the same batch as
+            // a dispatch. Its parked effect is not the card's.
             CompanyEvent::OperatorMessage { .. }
             | CompanyEvent::WebhookReceived { .. }
             | CompanyEvent::ScheduleFired { .. }
-            | CompanyEvent::A2aTaskReceived { .. } => return None,
-            _ => continue,
+            | CompanyEvent::A2aTaskReceived { .. }
+            | CompanyEvent::PaymentReceived { .. }
+            | CompanyEvent::FeedbackFiled { .. } => return None,
+            // Records of something that already happened, not triggers for new
+            // work: they neither name a card nor compete with one, so they pass
+            // through without affecting the stamp.
+            CompanyEvent::LifecycleChanged { .. }
+            | CompanyEvent::AgentReply { .. }
+            | CompanyEvent::MemoryFactDeleted { .. }
+            | CompanyEvent::McpCallFailed { .. }
+            | CompanyEvent::WorkflowCreated { .. }
+            | CompanyEvent::WorkflowUpdated { .. }
+            | CompanyEvent::WorkflowDeleted { .. }
+            | CompanyEvent::WorkflowRunFinished { .. }
+            | CompanyEvent::TaskSteered { .. }
+            | CompanyEvent::DeskTaskCompleted { .. } => continue,
         };
         let Some(candidate) = candidate else { continue };
         match &found {
@@ -3262,6 +3285,51 @@ mod test {
                 approval_task,
             ),
             None,
+        );
+        // A payment and a filed feedback item are inbound triggers too — they
+        // drive their own turn, so neither may inherit the card's stamp.
+        assert_eq!(
+            cycle_task_id(
+                &[
+                    dispatched("t-1"),
+                    CompanyEvent::PaymentReceived {
+                        amount_usd: 10.0,
+                        memo: "invoice".into(),
+                    },
+                ],
+                approval_task,
+            ),
+            None,
+        );
+        assert_eq!(
+            cycle_task_id(
+                &[
+                    dispatched("t-1"),
+                    CompanyEvent::FeedbackFiled {
+                        note: "it mis-filed".into(),
+                    },
+                ],
+                approval_task,
+            ),
+            None,
+        );
+        // A record of something that already happened is not a rival: it names
+        // no card and competes for none, so the dispatch still stamps.
+        assert_eq!(
+            cycle_task_id(
+                &[
+                    dispatched("t-1"),
+                    CompanyEvent::DeskTaskCompleted {
+                        task_id: "t-9".into(),
+                        desk: "ops".into(),
+                        column: "done".into(),
+                        output: String::new(),
+                    },
+                ],
+                approval_task,
+            ),
+            Some("t-1".into()),
+            "a completion record must not disqualify the batch",
         );
         // And a resolution known to belong to no card is a rival trigger too,
         // not a neutral event — it is somebody's work, just not a card's.

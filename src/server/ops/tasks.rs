@@ -587,9 +587,8 @@ async fn task_detail(
         .map(|run| run.id)
         .collect();
 
-    let origins = company.runtime.approval_origins();
     let (timeline, mut approvals, open_window_at) =
-        task_timeline(&company, &task_id, &origins, &task_runs).await?;
+        task_timeline(&company, &task_id, &task_runs).await?;
 
     // The still-parked half (issue #333), on exactly the resolution order
     // `approval_owner` documents below — run id first, then the parked
@@ -598,8 +597,9 @@ async fn task_detail(
         .runtime
         .pending_approvals()
         .into_iter()
-        .filter(
-            |a| match approval_owner(&a.id, &task_id, &origins, &task_runs) {
+        .filter(|a| {
+            let origin = company.runtime.approval_origin(&a.id);
+            match approval_owner(origin.as_ref(), &task_id, &task_runs) {
                 ApprovalOwner::Mine => true,
                 ApprovalOwner::NotMine => false,
                 // The legacy rule, kept only for a park that recorded neither key:
@@ -608,8 +608,8 @@ async fn task_detail(
                 ApprovalOwner::Unrecorded => {
                     open_window_at.is_some_and(|opened_at| a.at_millis >= opened_at)
                 }
-            },
-        )
+            }
+        })
         .collect();
 
     // The live wait (issue #305): waiting started when the first of them parked.
@@ -673,13 +673,15 @@ const TIMELINE_PAGE: usize = 512;
 async fn task_timeline(
     company: &ScopedCompany,
     task_id: &str,
-    origins: &std::collections::HashMap<
-        crate::ports::types::ApprovalId,
-        crate::runtime::journal::ApprovalOrigin,
-    >,
     task_runs: &std::collections::HashSet<String>,
 ) -> Result<(Vec<TimelineEntry>, Vec<TaskApproval>, Option<u64>), ApiError> {
-    use crate::ports::types::EventSeq;
+    use crate::ports::types::{ApprovalId, EventSeq};
+
+    // Per-id, not a snapshot. The origin index is unbounded and never pruned
+    // (see `ApprovalOrigin`), while a fold resolves only the approval events on
+    // its own pages — and this route is polled, so a snapshot would copy the
+    // company's whole approval history every few seconds.
+    let approval_origin = |id: &ApprovalId| company.runtime.approval_origin(id);
 
     let mut timeline = Vec::new();
     let mut approvals = Vec::new();
@@ -705,7 +707,7 @@ async fn task_timeline(
         fold_page(
             &page,
             task_id,
-            origins,
+            approval_origin,
             task_runs,
             &mut window_opened_at,
             &mut timeline,
@@ -762,15 +764,11 @@ enum ApprovalOwner {
 ///    "unlinked". A park that recorded a link saying `Unlinked` is a *resolved*
 ///    answer: it belongs to no card, so it does not belong to this one either.
 fn approval_owner(
-    approval_id: &crate::ports::types::ApprovalId,
+    origin: Option<&crate::runtime::journal::ApprovalOrigin>,
     task_id: &str,
-    origins: &std::collections::HashMap<
-        crate::ports::types::ApprovalId,
-        crate::runtime::journal::ApprovalOrigin,
-    >,
     task_runs: &std::collections::HashSet<String>,
 ) -> ApprovalOwner {
-    let Some(origin) = origins.get(approval_id) else {
+    let Some(origin) = origin else {
         return ApprovalOwner::Unrecorded;
     };
     // 1. The attempt wins wherever there is one.
@@ -793,20 +791,21 @@ fn approval_owner(
 /// across pages.
 ///
 /// `window_opened_at` is both the window flag and its anchor: `Some(at)` while
-/// a dispatch is open, `None` once it closes. `origins` is the journal snapshot
-/// the approval arm joins against to recover waiting time (#305) and the owning
+/// a dispatch is open, `None` once it closes. `approval_origin` resolves what an
+/// approval was when it parked, to recover waiting time (#305) and the owning
 /// task (#333), and `task_runs` this card's attempt ids (#242), the
-/// authoritative half of that ownership test — see [`approval_owner`]. Both are
-/// parameters rather than lookups so this stays a pure function of its inputs.
+/// authoritative half of that ownership test — see [`approval_owner`]. The
+/// origin arrives as a per-id lookup rather than a snapshot: that index is
+/// unbounded and never pruned, and this route is polled. Both are parameters so
+/// this stays a pure function of its inputs.
 /// Resolved approvals land on `approvals` as well as on the timeline — same
 /// row, two surfaces.
 fn fold_page(
     page: &[crate::ports::types::StoredEvent],
     task_id: &str,
-    origins: &std::collections::HashMap<
-        crate::ports::types::ApprovalId,
-        crate::runtime::journal::ApprovalOrigin,
-    >,
+    approval_origin: impl Fn(
+        &crate::ports::types::ApprovalId,
+    ) -> Option<crate::runtime::journal::ApprovalOrigin>,
     task_runs: &std::collections::HashSet<String>,
     window_opened_at: &mut Option<u64>,
     timeline: &mut Vec<TimelineEntry>,
@@ -866,7 +865,7 @@ fn fold_page(
                 approval_id,
                 verdict,
                 by,
-            } if match approval_owner(approval_id, task_id, origins, task_runs) {
+            } if match approval_owner(approval_origin(approval_id).as_ref(), task_id, task_runs) {
                 ApprovalOwner::Mine => true,
                 ApprovalOwner::NotMine => false,
                 // Pre-#333: neither key recorded, so the old window heuristic
@@ -875,7 +874,8 @@ fn fold_page(
                 ApprovalOwner::Unrecorded => window_opened_at.is_some(),
             } =>
             {
-                let origin = origins.get(approval_id);
+                let origin = approval_origin(approval_id);
+                let origin = origin.as_ref();
                 // The approval id joins the resolution back to the journal's
                 // park instant. Clamping to the window's opening keeps a wait
                 // that began before this task was dispatched from charging its

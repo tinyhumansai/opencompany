@@ -456,6 +456,26 @@ impl RuntimeJournal {
             .clone()
     }
 
+    /// What one approval was when it parked, without cloning the whole
+    /// [`origins`](State::origins) map.
+    ///
+    /// The read path resolves a bounded number of ids per request — the
+    /// approval events on one page of the fold, plus the parked queue — so it
+    /// takes this per id rather than a snapshot. [`approval_origins`] copies an
+    /// index that grows with every approval ever parked and is never pruned, and
+    /// the task-detail route is polled, so a snapshot there costs the whole
+    /// history on every poll.
+    ///
+    /// [`approval_origins`]: Self::approval_origins
+    pub fn approval_origin(&self, id: &ApprovalId) -> Option<ApprovalOrigin> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .origins
+            .get(id)
+            .cloned()
+    }
+
     /// The task link recorded for one approval, without cloning the whole
     /// [`origins`](State::origins) map.
     ///

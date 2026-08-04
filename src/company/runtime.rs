@@ -673,6 +673,16 @@ impl CompanyRuntime {
     /// operator (issue #305) and which card the sign-off belonged to
     /// (issue #333). Delegates to the journal so the `pub(crate)` field stays
     /// encapsulated, mirroring [`pending_approvals`](Self::pending_approvals).
+    /// What one approval was when it parked (issues #305 + #333).
+    ///
+    /// The per-id form of [`approval_origins`](Self::approval_origins), and what
+    /// the Task Detail read actually uses: that index is unbounded and never
+    /// pruned, so cloning it per request would cost the company's whole approval
+    /// history on every poll of a route the console polls.
+    pub fn approval_origin(&self, id: &ApprovalId) -> Option<ApprovalOrigin> {
+        self.journal.approval_origin(id)
+    }
+
     pub fn approval_origins(&self) -> std::collections::HashMap<ApprovalId, ApprovalOrigin> {
         self.journal.approval_origins()
     }
