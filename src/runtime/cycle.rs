@@ -2715,14 +2715,21 @@ mod test {
             Some("t-42".to_string()),
         );
 
-        // Irreversible: a filing, which the taxonomy never waves through.
+        // Irreversible: signing a contract, which the taxonomy never waves
+        // through.
+        //
+        // Deliberately NOT `filing.submit`. That kind is in
+        // `DEFAULT_ALWAYS_APPROVE`, and `always_approve` outranks the mode — so
+        // it would park even here and execute nothing. `contract.accept` is the
+        // case this test is about: `full` mode signs it with nobody asked, and
+        // the retry dialog is the only place anybody will ever be told.
         host.gate_effect(Effect {
-            kind: "filing.submit".into(),
+            kind: "contract.accept".into(),
             group: EffectGroup::Sign,
             amount_usd: None,
             established_thread: false,
             first_time_counterparty: false,
-            payload: serde_json::json!({ "form": "annual-return" }),
+            payload: serde_json::json!({ "counterparty": "annual-return" }),
             agent: None,
         })
         .await
@@ -2742,7 +2749,7 @@ mod test {
 
         let named = rt.irreversible_effects("t-42");
         assert_eq!(named.len(), 1, "{named:?}");
-        assert_eq!(named[0].kind, "filing.submit");
+        assert_eq!(named[0].kind, "contract.accept");
         assert!(named[0].irreversible);
         assert!(
             rt.irreversible_effects("t-other").is_empty(),
