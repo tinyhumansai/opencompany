@@ -283,6 +283,31 @@ impl Bundle {
         self.dir.join("artifacts.jsonl")
     }
 
+    /// Path to the task-run log (`runs.jsonl`, one [`RunRecord`] per line;
+    /// last-write-wins per id).
+    ///
+    /// One shared log rather than a file per run: a run id would otherwise
+    /// become a path component, and a store must never let an id it did not
+    /// mint address the filesystem.
+    ///
+    /// [`RunRecord`]: crate::ports::runs::RunRecord
+    pub fn runs_jsonl(&self) -> PathBuf {
+        self.dir.join("runs.jsonl")
+    }
+
+    /// Path to the run step traces (`run-steps.jsonl`, one
+    /// [`RunStepRecord`] per line; last-write-wins per `(run_id, step_seq)`).
+    ///
+    /// Separate from `runs.jsonl` so a step is a **true append** — the run row
+    /// mutates on every transition and is rewritten, but a trace only ever
+    /// grows, and rewriting the whole trace per step would make a long attempt
+    /// quadratic.
+    ///
+    /// [`RunStepRecord`]: crate::ports::runs::RunStepRecord
+    pub fn run_steps_jsonl(&self) -> PathBuf {
+        self.dir.join("run-steps.jsonl")
+    }
+
     /// Path to the human user directory (`users.json`, the full set as a JSON
     /// array).
     pub fn users_json(&self) -> PathBuf {

@@ -564,6 +564,7 @@ async fn park_cold_recipient(
             "body": text,
         }),
         agent: None,
+        run_id: None,
     };
 
     match park_effect(parking, &record.id, effect).await {

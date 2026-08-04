@@ -53,6 +53,7 @@ pub mod memory_loop;
 pub mod orchestrator;
 pub mod policy;
 pub mod provider;
+pub mod run_trace;
 pub mod run_turn;
 pub mod search;
 /// End-to-end proof that the #238 `web_search` tool is reachable from a real
@@ -419,7 +420,7 @@ impl CompanyAgent {
     /// per-turn *local* — deliberately not a [`HarnessDeps`] field — so parallel
     /// turns never collide.
     pub async fn run(&self, message: &str) -> crate::Result<(TurnOutcome, Vec<TurnUsage>)> {
-        self.run_with_steer(message, None, None).await
+        self.run_with_steer(message, None, None, None).await
     }
 
     /// Runs one turn with an optional operator **steer** control installed
@@ -437,11 +438,20 @@ impl CompanyAgent {
     /// empty-response class, the one-shot retry is **skipped** — a cancel (or
     /// pause) issued before any text is produced must not silently restart the
     /// work. With no steer this is byte-identical to the pre-#111 `run`.
+    ///
+    /// When `run_sink` is `Some`, the same collector also writes each step
+    /// through to the [`RunStore`](crate::ports::RunStore) as it arrives, so a
+    /// dispatched card's trace is durable *during* the run rather than only
+    /// after it (issue #242). The await lives in the collector task, never in
+    /// the model loop, so a slow store slows only trace persistence. `None`
+    /// (chat turns, workflow nodes, every test) is byte-identical to the prior
+    /// buffer-only behaviour.
     pub async fn run_with_steer(
         &self,
         message: &str,
         steer: Option<&SteerControl>,
         stream: Option<crate::turn_stream::TurnStreamCtx>,
+        run_sink: Option<Arc<run_trace::RunTraceSink>>,
     ) -> crate::Result<(TurnOutcome, Vec<TurnUsage>)> {
         // Per-turn progress sink + an always-draining collector, so a burst of
         // events never blocks the turn loop on a full channel.
@@ -472,6 +482,11 @@ impl CompanyAgent {
                             .with_chat(ctx.chat_id.clone()),
                     );
                     seq += 1;
+                }
+                // Durable half (#242): persist the step before moving on, so a
+                // process killed mid-run keeps every step written so far.
+                if let Some(sink) = &run_sink {
+                    sink.record(&event).await;
                 }
                 events.push(event);
             }
@@ -956,6 +971,7 @@ impl HarnessPool {
             deps,
             None,
             LiveStream::On { chat_id },
+            None,
         )
         .await
     }
@@ -972,8 +988,16 @@ impl HarnessPool {
         message: &str,
         deps: &HarnessDeps,
     ) -> crate::Result<TurnOutcome> {
-        self.run_inner(company, agent_id, message, deps, None, LiveStream::Off)
-            .await
+        self.run_inner(
+            company,
+            agent_id,
+            message,
+            deps,
+            None,
+            LiveStream::Off,
+            None,
+        )
+        .await
     }
 
     /// Routes a message to one agent with an operator **steer** control installed
@@ -982,6 +1006,12 @@ impl HarnessPool {
     /// [`run`](Self::run) — same retrieve→inject, cost accounting, and
     /// memory-writeback. The steer hook fires only between tool-loop iterations.
     /// `chat_id` routes the live turn-stream frames exactly as in [`run`](Self::run).
+    ///
+    /// `run_sink` is the dispatched attempt this turn belongs to, when it
+    /// belongs to one (issue #242) — a desk turn a *dispatched card* handed its
+    /// work to records into the card's run, while the same delegation reached
+    /// from operator chat passes `None`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_steered(
         &self,
         company: &CompanyId,
@@ -990,6 +1020,7 @@ impl HarnessPool {
         deps: &HarnessDeps,
         control: &SteerControl,
         chat_id: Option<&str>,
+        run_sink: Option<Arc<run_trace::RunTraceSink>>,
     ) -> crate::Result<TurnOutcome> {
         self.run_inner(
             company,
@@ -998,6 +1029,7 @@ impl HarnessPool {
             deps,
             Some(control),
             LiveStream::On { chat_id },
+            run_sink,
         )
         .await
     }
@@ -1014,6 +1046,7 @@ impl HarnessPool {
         message: &str,
         deps: &HarnessDeps,
         control: &SteerControl,
+        run_sink: Option<Arc<run_trace::RunTraceSink>>,
     ) -> crate::Result<TurnOutcome> {
         self.run_inner(
             company,
@@ -1022,10 +1055,12 @@ impl HarnessPool {
             deps,
             Some(control),
             LiveStream::Off,
+            run_sink,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
         company: &CompanyId,
@@ -1034,6 +1069,7 @@ impl HarnessPool {
         deps: &HarnessDeps,
         steer: Option<&SteerControl>,
         live: LiveStream<'_>,
+        run_sink: Option<Arc<run_trace::RunTraceSink>>,
     ) -> crate::Result<TurnOutcome> {
         let agent = {
             let guard = self.agents.read().await;
@@ -1213,7 +1249,19 @@ impl HarnessPool {
             }),
             LiveStream::Off => None,
         };
-        let (outcome, turn_costs) = agent.run_with_steer(&augmented, steer, stream_ctx).await?;
+        let (outcome, turn_costs) = agent
+            .run_with_steer(&augmented, steer, stream_ctx, run_sink.clone())
+            .await?;
+        // Issue #242: fold this turn's spend into the attempt it belongs to.
+        // Per turn, not once at the end, so a redirect re-run and a delegate's
+        // turn both count — an attempt's cost is what the attempt spent. This is
+        // a second *reader* of `turn_costs`, not a second writer: the ledger and
+        // the usage meter below stay the only places money is recorded.
+        if let Some(sink) = run_sink.as_ref() {
+            for turn_cost in &turn_costs {
+                sink.add_usage(turn_cost);
+            }
+        }
         // Attribute cost to the provider this turn actually resolved to. With a
         // per-tenant [`TenantProvider`](crate::harness::provider::TenantProvider)
         // a console BYOK switch changes the slug between turns, so read it live
@@ -1227,6 +1275,10 @@ impl HarnessPool {
                 company,
                 deps.store.as_ref(),
                 deps.meter.as_deref(),
+                // Issue #242: attribute the sample to the attempt this turn ran
+                // under, so "what did this run cost?" is answerable from the
+                // meter as well as from the run row.
+                run_sink.as_ref().map(|s| s.run_id()),
             )
             .await?;
         }
@@ -2130,7 +2182,7 @@ description = "Builds the product."
         let control = SteerControl::new();
         control.request(SteerAction::Cancel);
         let (_outcome, usages) = agent
-            .run_with_steer("hi", Some(&control), None)
+            .run_with_steer("hi", Some(&control), None, None)
             .await
             .expect("runs");
         assert_eq!(
@@ -2762,6 +2814,7 @@ description = "Sets direction."
                     cached_input_tokens: 0,
                     cost_usd: 0.0,
                     kind: crate::ports::SampleKind::Inference,
+                    run_id: None,
                 },
             )
             .await
@@ -2917,6 +2970,7 @@ description = "Sets direction."
                     cached_input_tokens: 0,
                     cost_usd: 0.0,
                     kind: crate::ports::SampleKind::Inference,
+                    run_id: None,
                 },
             )
             .await
@@ -3030,6 +3084,7 @@ description = "Builds the product."
             cached_input_tokens: 0,
             cost_usd: usd,
             kind: crate::ports::SampleKind::Inference,
+            run_id: None,
         }
     }
 

@@ -180,6 +180,163 @@ pub fn fold_steps(events: Vec<AgentProgress>) -> Vec<TurnStep> {
     steps
 }
 
+/// The incremental counterpart of [`fold_steps`]: the same projection, but
+/// yielding each step **as it happens** with the ordinal it occupies, so a
+/// durable trace can be written during the turn instead of only at its end
+/// (issue #242).
+///
+/// The difference that matters is *when*, not *what*. [`fold_steps`] can only
+/// produce anything once the turn is over, which is why killing the host
+/// mid-run used to leave no trace at all. This yields:
+///
+/// * a `ToolCallStarted` → a new ordinal carrying a
+///   [`Running`](TurnStepStatus::Running) step;
+/// * its matching `ToolCallCompleted` → **the same ordinal again**, finalized.
+///   `RunStore::append_run_step` is keyed on `(run_id, step_seq)` and replaces
+///   on a match, so re-yielding the ordinal finalizes the row in place exactly
+///   as `fold_steps` finalizes the entry in place;
+/// * a completion with no observed start → its own new ordinal, standalone;
+/// * the first `ThinkingDelta` of a run → one coalesced "Thinking" ordinal,
+///   with consecutive deltas yielding nothing.
+///
+/// Materialize every yield in ordinal order and the result is byte-identical to
+/// `fold_steps` over the same event stream (pinned by
+/// `incremental_trace_converges_on_the_folded_timeline`), with **two** deliberate
+/// exceptions:
+///
+/// * **An unfinished call.** A start whose completion never arrives — because
+///   the process died mid-tool-call — stays persisted as `Running`. That is not
+///   a divergence to paper over, it is the whole point: the persisted trace
+///   records what was actually observed, and "this tool call was still in
+///   flight" is the truth about a killed run.
+/// * **Past 50 steps, the two lengths part.** `fold_steps` truncates at
+///   [`MAX_STEPS`] and appends an omission note, because it builds a chat bubble
+///   and a bubble that scrolls forever is unreadable. The trace has no such
+///   limit here; [`run_trace::MAX_RUN_STEPS`](super::run_trace::MAX_RUN_STEPS)
+///   bounds what is persisted, an order of magnitude higher. A record of what an
+///   attempt did should not be truncated at the length a *message* wants to be.
+///   Note that the convergence test runs a handful of events, so it pins the
+///   shared prefix, not this boundary.
+///
+/// **Run-scoped, not turn-scoped.** One instance spans every turn of an
+/// attempt — the redirect re-runs and a delegate's turn — so ordinals stay
+/// dense and unique across the run rather than restarting per turn and
+/// overwriting earlier rows.
+#[derive(Debug, Default)]
+pub(crate) struct StepTrace {
+    /// The next ordinal to hand out. Also the number of steps yielded so far.
+    next: u32,
+    /// `call_id` → the ordinal and label its start claimed, so the completion
+    /// finalizes that row keeping the richer start-time label.
+    running: std::collections::HashMap<String, (u32, String)>,
+    /// Whether the most recent step is an open "Thinking" run.
+    thinking_open: bool,
+}
+
+impl StepTrace {
+    /// Feeds one progress event, yielding the ordinal + step to persist when the
+    /// event maps to one.
+    pub(crate) fn push(&mut self, event: &AgentProgress) -> Option<(u32, TurnStep)> {
+        match event {
+            AgentProgress::ToolCallStarted {
+                call_id,
+                tool_name,
+                display_label,
+                ..
+            } => {
+                self.thinking_open = false;
+                let label = label_for(display_label.clone(), tool_name);
+                let seq = self.claim();
+                self.running.insert(call_id.clone(), (seq, label.clone()));
+                Some((
+                    seq,
+                    TurnStep {
+                        kind: TurnStepKind::ToolCall,
+                        status: TurnStepStatus::Running,
+                        label,
+                        detail: None,
+                        elapsed_ms: None,
+                    },
+                ))
+            }
+            AgentProgress::ToolCallCompleted {
+                call_id,
+                tool_name,
+                success,
+                output,
+                arguments,
+                elapsed_ms,
+                failure,
+                ..
+            } => {
+                self.thinking_open = false;
+                let status = if *success {
+                    TurnStepStatus::Ok
+                } else {
+                    TurnStepStatus::Error
+                };
+                let detail = if *success {
+                    enrich_detail(tool_name, arguments.as_ref())
+                } else {
+                    error_detail(failure.as_ref(), output, tool_name)
+                };
+                let (seq, label) = match self.running.remove(call_id) {
+                    Some(found) => found,
+                    // No observed start — surface it standalone, exactly as the
+                    // fold does.
+                    None => (self.claim(), humanize(tool_name)),
+                };
+                Some((
+                    seq,
+                    TurnStep {
+                        kind: TurnStepKind::ToolCall,
+                        status,
+                        label,
+                        detail,
+                        elapsed_ms: Some(*elapsed_ms),
+                    },
+                ))
+            }
+            AgentProgress::ThinkingDelta { .. } if !self.thinking_open => {
+                self.thinking_open = true;
+                Some((
+                    self.claim(),
+                    TurnStep {
+                        kind: TurnStepKind::Thinking,
+                        status: TurnStepStatus::Ok,
+                        label: "Thinking".to_string(),
+                        detail: None,
+                        elapsed_ms: None,
+                    },
+                ))
+            }
+            // Visible assistant text closes a thinking run without a step of its
+            // own; everything else contributes nothing and does not break the
+            // coalescing. Both match `fold_steps`.
+            AgentProgress::TextDelta { .. } => {
+                self.thinking_open = false;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// How many ordinals have been handed out. Test-only: the sink tracks what
+    /// actually landed in the store, which is not the same number when a write
+    /// fails or the cap bites.
+    #[cfg(test)]
+    pub(crate) fn emitted(&self) -> u32 {
+        self.next
+    }
+
+    /// Takes the next ordinal.
+    fn claim(&mut self) -> u32 {
+        let seq = self.next;
+        self.next = self.next.saturating_add(1);
+        seq
+    }
+}
+
 /// Map one live [`AgentProgress`] event to a scrubbed [`TurnStreamEvent`] for
 /// the transient [`turn_stream`](crate::turn_stream) bus, or `None` for events
 /// with no operator-facing live frame (text/thinking/args deltas, iteration and
@@ -724,6 +881,103 @@ mod tests {
             !detail.contains(SECRET),
             "remote output must never surface as detail: {detail}"
         );
+    }
+
+    /// Materializes a [`StepTrace`] over `events` the way the run store does:
+    /// each yield writes to its ordinal, replacing whatever was there.
+    fn materialize(events: &[AgentProgress]) -> Vec<TurnStep> {
+        let mut trace = StepTrace::default();
+        let mut rows: Vec<Option<TurnStep>> = Vec::new();
+        for event in events {
+            if let Some((seq, step)) = trace.push(event) {
+                let idx = seq as usize;
+                if rows.len() <= idx {
+                    rows.resize(idx + 1, None);
+                }
+                rows[idx] = Some(step);
+            }
+        }
+        assert_eq!(
+            rows.len() as u32,
+            trace.emitted(),
+            "ordinals must be dense — a gap means a row nothing ever writes"
+        );
+        rows.into_iter()
+            .map(|row| row.expect("every claimed ordinal is written"))
+            .collect()
+    }
+
+    /// Issue #242: the incremental trace and the final fold are the SAME
+    /// timeline. If they can drift, the persisted run trace and the chat bubble
+    /// tell an operator two different stories about one turn — which is exactly
+    /// the failure the shared scrubbing helpers exist to prevent.
+    #[test]
+    fn incremental_trace_converges_on_the_folded_timeline() {
+        let events = vec![
+            thinking("hmm"),
+            thinking("still hmm"),
+            started("c1", "mcp_call_tool", Some("Searching the web")),
+            completed(
+                "c1",
+                "mcp_call_tool",
+                true,
+                "ok",
+                Some(serde_json::json!({ "server": "brave", "tool": "search" })),
+                None,
+            ),
+            text("here you go"),
+            thinking("again"),
+            started("c2", "spawn_task", None),
+            completed(
+                "c2",
+                "spawn_task",
+                false,
+                "boom",
+                None,
+                Some(classified(ToolFailureClass::Timeout, "it timed out")),
+            ),
+            // A completion whose start was never observed — the standalone arm.
+            completed("c3", "query_company", true, "ok", None, None),
+        ];
+
+        assert_eq!(materialize(&events), fold_steps(events.clone()));
+    }
+
+    /// The one deliberate divergence, stated as a property rather than left to
+    /// be discovered: a tool call still in flight when the stream ends is
+    /// persisted `Running`. The fold agrees here (it also leaves an unmatched
+    /// start running), and that is what makes a killed run's partial trace
+    /// honest instead of fabricated.
+    #[test]
+    fn an_unfinished_tool_call_is_persisted_as_running() {
+        let events = vec![
+            started("c1", "mcp_call_tool", Some("Searching the web")),
+            // …and the host dies here.
+        ];
+        let rows = materialize(&events);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, TurnStepStatus::Running);
+        assert_eq!(rows[0].label, "Searching the web");
+        assert_eq!(rows, fold_steps(events));
+    }
+
+    /// Ordinals are run-scoped, not turn-scoped: a second turn on the same
+    /// trace continues where the first stopped. Restarting per turn would make
+    /// turn 2 overwrite turn 1's rows, since the store keys on
+    /// `(run_id, step_seq)`.
+    #[test]
+    fn ordinals_continue_across_turns_of_one_run() {
+        let mut trace = StepTrace::default();
+        let first = trace
+            .push(&started("c1", "spawn_task", None))
+            .expect("turn 1 step");
+        assert_eq!(first.0, 0);
+        // …turn 1 ends, turn 2 begins on the same run.
+        let second = trace
+            .push(&started("c9", "spawn_task", None))
+            .expect("turn 2 step");
+        assert_eq!(second.0, 1, "turn 2 must not reuse turn 1's ordinals");
+        assert_eq!(trace.emitted(), 2);
     }
 
     /// `stream_event_from` (the live-bus counterpart of `fold_steps`) maps a

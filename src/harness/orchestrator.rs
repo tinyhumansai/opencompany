@@ -539,7 +539,7 @@ fn summarize_event(event: &CompanyEvent) -> String {
     match event {
         CompanyEvent::OperatorMessage { .. } => "operator message".to_string(),
         CompanyEvent::AgentReply { agent_id, .. } => format!("reply from {agent_id}"),
-        CompanyEvent::TaskDispatched { task_id } => format!("task dispatched: {task_id}"),
+        CompanyEvent::TaskDispatched { task_id, .. } => format!("task dispatched: {task_id}"),
         CompanyEvent::ScheduleFired { cron, .. } => format!("schedule fired: {cron}"),
         CompanyEvent::WebhookReceived { channel, .. } => format!("webhook on {channel}"),
         CompanyEvent::A2aTaskReceived { from, .. } => format!("A2A task from {from}"),
@@ -2169,6 +2169,7 @@ members = ["nobody"]
             company: company.clone(),
             event: CompanyEvent::TaskDispatched {
                 task_id: "t-1".to_string(),
+                run_id: None,
             },
             at_millis: 1,
         }];

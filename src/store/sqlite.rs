@@ -139,6 +139,26 @@ CREATE TABLE IF NOT EXISTS artifacts (
     PRIMARY KEY (company_id, id)
 );
 CREATE INDEX IF NOT EXISTS artifacts_by_task ON artifacts (company_id, task_id);
+CREATE TABLE IF NOT EXISTS runs (
+    company_id TEXT NOT NULL,
+    id         TEXT NOT NULL,
+    task_id    TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    attempt    INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    run_json   TEXT NOT NULL,
+    PRIMARY KEY (company_id, id)
+);
+CREATE INDEX IF NOT EXISTS runs_by_task ON runs (company_id, task_id);
+CREATE INDEX IF NOT EXISTS runs_by_status ON runs (company_id, status);
+CREATE TABLE IF NOT EXISTS run_steps (
+    company_id TEXT NOT NULL,
+    run_id     TEXT NOT NULL,
+    step_seq   INTEGER NOT NULL,
+    at_ms      INTEGER NOT NULL,
+    step_json  TEXT NOT NULL,
+    PRIMARY KEY (company_id, run_id, step_seq)
+);
 CREATE TABLE IF NOT EXISTS usage_samples (
     company_id TEXT NOT NULL,
     seq        INTEGER NOT NULL,
@@ -1526,6 +1546,224 @@ impl crate::ports::artifacts::ArtifactStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// RunStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl crate::ports::runs::RunStore for SqliteStore {
+    async fn create_run(
+        &self,
+        company: &CompanyId,
+        spec: crate::ports::runs::NewRun,
+    ) -> Result<crate::ports::runs::RunRecord> {
+        use crate::ports::runs::{RunRecord, RunStatus};
+
+        let mut guard = self.conn();
+        // Read-max-then-insert inside one transaction, so two concurrent
+        // creates on one card cannot mint the same ordinal. This is the
+        // "transactional where the backend can do so cheaply" half of the
+        // port's `create_run` concurrency contract.
+        let tx = guard.transaction().map_err(sql_err)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM runs WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), spec.id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .unwrap_or(false);
+        if exists {
+            return Err(OpenCompanyError::Conflict(format!(
+                "run '{}' already exists",
+                spec.id
+            )));
+        }
+        let attempt: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs \
+                 WHERE company_id = ?1 AND task_id = ?2",
+                params![company.as_ref(), spec.task_id],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        let run = RunRecord {
+            id: spec.id,
+            company: company.clone(),
+            task_id: spec.task_id,
+            agent_id: spec.agent_id,
+            attempt: attempt as u32,
+            status: RunStatus::Pending,
+            trigger_event_seq: None,
+            created_at_millis: now_millis(),
+            started_at_millis: None,
+            finished_at_millis: None,
+            error: None,
+            usage: Default::default(),
+            step_count: 0,
+        };
+        tx.execute(
+            "INSERT INTO runs (company_id, id, task_id, status, attempt, created_ms, run_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                company.as_ref(),
+                run.id,
+                run.task_id,
+                run.status.as_str(),
+                run.attempt as i64,
+                run.created_at_millis as i64,
+                serde_json::to_string(&run)?,
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(run)
+    }
+
+    async fn get_run(
+        &self,
+        company: &CompanyId,
+        id: &str,
+    ) -> Result<Option<crate::ports::runs::RunRecord>> {
+        let conn = self.conn();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT run_json FROM runs WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        match json {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn put_run(
+        &self,
+        company: &CompanyId,
+        run: &crate::ports::runs::RunRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(run)?;
+        let conn = self.conn();
+        // `status` and `task_id` are mirrored out of the blob so the indexes
+        // can answer a filtered list without deserializing every row.
+        conn.execute(
+            "INSERT INTO runs (company_id, id, task_id, status, attempt, created_ms, run_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(company_id, id) DO UPDATE SET task_id = excluded.task_id, \
+             status = excluded.status, attempt = excluded.attempt, \
+             created_ms = excluded.created_ms, run_json = excluded.run_json",
+            params![
+                company.as_ref(),
+                run.id,
+                run.task_id,
+                run.status.as_str(),
+                run.attempt as i64,
+                run.created_at_millis as i64,
+                json,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn list_runs(
+        &self,
+        company: &CompanyId,
+        filter: &crate::ports::runs::RunFilter,
+    ) -> Result<Vec<crate::ports::runs::RunRecord>> {
+        // Every predicate is pushed into SQL (both columns are indexed) so a
+        // long-lived company does not deserialize its whole run history to
+        // answer one card's Attempts list.
+        let mut sql = String::from("SELECT run_json FROM runs WHERE company_id = ?1");
+        let mut args: Vec<String> = vec![company.as_ref().to_string()];
+        if let Some(task_id) = &filter.task_id {
+            args.push(task_id.clone());
+            sql.push_str(&format!(" AND task_id = ?{}", args.len()));
+        }
+        if !filter.statuses.is_empty() {
+            let placeholders: Vec<String> = filter
+                .statuses
+                .iter()
+                .map(|status| {
+                    args.push(status.as_str().to_string());
+                    format!("?{}", args.len())
+                })
+                .collect();
+            sql.push_str(&format!(" AND status IN ({})", placeholders.join(", ")));
+        }
+        // The canonical port ordering, in SQL: see `runs::sort_newest_first`.
+        sql.push_str(" ORDER BY created_ms DESC, attempt DESC, id DESC");
+        if let Some(limit) = filter.limit {
+            sql.push_str(&format!(" LIMIT {}", sql_limit(limit)));
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+
+    async fn append_run_step(
+        &self,
+        company: &CompanyId,
+        step: &crate::ports::runs::RunStepRecord,
+    ) -> Result<()> {
+        let json = serde_json::to_string(step)?;
+        let conn = self.conn();
+        // `(run_id, step_seq)` is the primary key, so a replayed append
+        // overwrites rather than duplicating — the same idempotence the fs
+        // backend gets by folding its JSONL.
+        conn.execute(
+            "INSERT INTO run_steps (company_id, run_id, step_seq, at_ms, step_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id, run_id, step_seq) DO UPDATE SET \
+             at_ms = excluded.at_ms, step_json = excluded.step_json",
+            params![
+                company.as_ref(),
+                step.run_id,
+                step.step_seq as i64,
+                step.at_millis as i64,
+                json,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn list_run_steps(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<crate::ports::runs::RunStepRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT step_json FROM run_steps WHERE company_id = ?1 AND run_id = ?2 \
+                 ORDER BY step_seq",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref(), run_id], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row.map_err(sql_err)?)?);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -2034,6 +2272,16 @@ mod test {
             "INTEGER NOT NULL DEFAULT 0",
         )
         .expect("adding an existing column is a no-op, not an error");
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store() {
+        conformance::assert_run_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_reaper() {
+        conformance::assert_run_reaper(store()).await;
     }
 
     #[tokio::test]

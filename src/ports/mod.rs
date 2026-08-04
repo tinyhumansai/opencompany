@@ -19,6 +19,7 @@ pub mod facts;
 pub mod inbox;
 pub mod login_codes;
 pub mod memory;
+pub mod runs;
 pub mod secrets;
 pub mod sessions;
 pub mod skills_state;
@@ -46,6 +47,10 @@ pub use ids::{generate_id, now_millis};
 pub use inbox::{EmailRecord, InboxMeta, InboxStore};
 pub use login_codes::{LoginCodeRecord, LoginCodeStore};
 pub use memory::MemoryStore;
+pub use runs::{
+    NewRun, RunFilter, RunOutcome, RunRecord, RunStatus, RunStepRecord, RunStore,
+    reap_orphaned_runs,
+};
 pub use secrets::SecretStore;
 pub use sessions::{SessionRecord, SessionStore};
 pub use skills_state::{SkillSource, SkillState, SkillStateStore};
@@ -91,6 +96,7 @@ mod test {
         _users: &dyn crate::ports::users::UserStore,
         _sessions: &dyn crate::ports::sessions::SessionStore,
         _login_codes: &dyn crate::ports::login_codes::LoginCodeStore,
+        _runs: &dyn crate::ports::runs::RunStore,
         _workflow_runner: &dyn crate::ports::workflow_runner::WorkflowRunner,
     ) {
     }

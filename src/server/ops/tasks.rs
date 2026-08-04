@@ -874,7 +874,10 @@ fn fold_page(
             continue;
         }
         let entry = match &ev.event {
-            CompanyEvent::TaskDispatched { task_id: id } if id == task_id => {
+            // `..` since #357: the variant gained `run_id`, which this
+            // projection has no use for — the anchor is the instant, not the
+            // attempt.
+            CompanyEvent::TaskDispatched { task_id: id, .. } if id == task_id => {
                 window_opened_at = Some(ev.at_millis);
                 Some(("dispatched", "Dispatched".to_string(), None, None))
             }

@@ -95,6 +95,24 @@ pub struct ArtifactVersion {
     /// Why this revision exists (e.g. `"operator edit before approval"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The task **attempt** ([`RunRecord`](crate::ports::runs::RunRecord)) that
+    /// produced this revision, when an agent turn under one did (issue #242).
+    ///
+    /// Per *version*, not per record, because that is the granularity the
+    /// question has: a card dispatched twice produces v1 under the first attempt
+    /// and v2 under the second, and a record-level field would remember only the
+    /// later one — losing the link the first attempt's row needs to point at
+    /// what it actually wrote. The record-level answer is still available as
+    /// `latest().run_id`.
+    ///
+    /// `None` for an operator edit (no attempt produced it), for a revision
+    /// written by an untracked dispatch, and for every artifact stored before
+    /// this field existed. Artifacts are persisted as a JSON blob on every
+    /// backend (`artifact_json` on sqlite, a document on MongoDB, a file on the
+    /// filesystem), so this needs **no schema migration** and a pre-#242 record
+    /// loads with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// A versioned output of one task.
@@ -144,6 +162,7 @@ impl ArtifactRecord {
                 created_at_millis: at_millis,
                 step_seq: None,
                 note: None,
+                run_id: None,
             }],
             created_at_millis: at_millis,
             updated_at_millis: at_millis,
@@ -183,9 +202,23 @@ impl ArtifactRecord {
             created_at_millis: at_millis,
             step_seq: None,
             note,
+            run_id: None,
         });
         self.updated_at_millis = at_millis;
         next
+    }
+
+    /// Stamps the newest revision with the attempt that produced it (#242).
+    ///
+    /// A separate call rather than a sixth parameter on
+    /// [`push_version`](Self::push_version) / [`new`](Self::new): only the
+    /// dispatch path has a run to name, and widening those signatures would make
+    /// every operator-edit and test call site pass a `None` it has no meaning
+    /// for. A no-op on an empty record.
+    pub fn stamp_run(&mut self, run_id: impl Into<String>) {
+        if let Some(latest) = self.versions.last_mut() {
+            latest.run_id = Some(run_id.into());
+        }
     }
 
     /// The diff of what a human changed before approving: the last
@@ -390,7 +423,55 @@ mod test {
             created_at_millis: n as u64,
             step_seq: None,
             note: None,
+            run_id: None,
         }
+    }
+
+    /// Issue #242: the attempt that wrote a revision is recorded **on that
+    /// revision**, so a card dispatched twice keeps both links rather than the
+    /// second attempt erasing the first's. And because artifacts are stored as a
+    /// JSON blob on every backend, a record written before the field existed
+    /// loads with `None` — no schema migration, no backfill.
+    #[test]
+    fn each_revision_remembers_the_attempt_that_wrote_it() {
+        let mut a = ArtifactRecord::new("a1", "t-1", "Draft", ArtifactKind::Text, "one", "ceo", 1);
+        a.stamp_run("run-1");
+        a.push_version("two", ArtifactAuthor::Agent, "ceo", 2, None);
+        a.stamp_run("run-2");
+        // An operator edit names no attempt — nobody's run produced it.
+        a.push_version("three", ArtifactAuthor::Operator, "operator", 3, None);
+
+        assert_eq!(a.version(1).unwrap().run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            a.version(2).unwrap().run_id.as_deref(),
+            Some("run-2"),
+            "the second attempt must not overwrite the first attempt's link"
+        );
+        assert_eq!(a.version(3).unwrap().run_id, None);
+
+        let json = serde_json::to_string(&a).expect("serialize");
+        assert_eq!(a, serde_json::from_str(&json).expect("round trip"));
+        assert!(json.contains(r#""runId":"run-1""#), "{json}");
+
+        // A pre-#242 blob is exactly what an unstamped record serializes to —
+        // the field is skipped when absent — so it must still load, with `None`.
+        let unstamped =
+            ArtifactRecord::new("a2", "t-1", "Draft", ArtifactKind::Text, "one", "ceo", 1);
+        let legacy = serde_json::to_string(&unstamped).expect("serialize");
+        assert!(!legacy.contains("runId"), "{legacy}");
+        let loaded: ArtifactRecord =
+            serde_json::from_str(&legacy).expect("a pre-#242 artifact blob must still load");
+        assert!(loaded.versions.iter().all(|v| v.run_id.is_none()));
+    }
+
+    /// Stamping an artifact with no revisions is a no-op rather than a panic —
+    /// the accessors already tolerate an empty record, and so must this.
+    #[test]
+    fn stamping_an_empty_record_is_a_no_op() {
+        let mut a = ArtifactRecord::new("a1", "t-1", "Draft", ArtifactKind::Text, "one", "ceo", 1);
+        a.versions.clear();
+        a.stamp_run("run-1");
+        assert!(a.versions.is_empty());
     }
 
     #[test]

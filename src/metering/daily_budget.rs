@@ -135,6 +135,7 @@ mod tests {
             cached_input_tokens: 0,
             cost_usd: cost,
             kind,
+            run_id: None,
         }
     }
 

@@ -41,6 +41,7 @@
 //!   would double-journal the timeline's terminal anchor.
 
 use crate::ports::TaskRecord;
+use crate::ports::runs::RunStatus;
 use crate::ports::types::{OutboundMessage, ReplyTo};
 
 /// The board's column vocabulary, re-exported so every `lifecycle::COLUMN_*`
@@ -193,6 +194,73 @@ pub fn landing_column(end: TaskRunEnd, card: &TaskRecord) -> &'static str {
         // the card keeps the column it was dispatched in and only settles once
         // they come back with something (issue #204).
         TaskRunEnd::Delegated => COLUMN_IN_PROGRESS,
+    }
+}
+
+/// The [`RunStatus`] a run ending this way settles into (issue #242).
+///
+/// The board column and the run status answer two different questions about the
+/// same ending — *where does the card go* and *how did the attempt end* — so
+/// both are decided here, from the one [`TaskRunEnd`], rather than one of them
+/// being re-derived from the other. Deriving the status from the landing column
+/// would be actively wrong: `Failed` and `Cancelled` both land in
+/// [`COLUMN_TODO`] and are emphatically not the same outcome.
+///
+/// The mapping, and why:
+///
+/// * [`Completed`](TaskRunEnd::Completed) and
+///   [`RedirectsExhausted`](TaskRunEnd::RedirectsExhausted) →
+///   [`Succeeded`](RunStatus::Succeeded). Both produced a result and both land
+///   in the card's success terminal; spending the redirect budget is how the
+///   run *ended*, not evidence that it failed.
+/// * [`Failed`](TaskRunEnd::Failed) → [`Failed`](RunStatus::Failed), carrying
+///   the reason.
+/// * [`Cancelled`](TaskRunEnd::Cancelled) →
+///   [`Cancelled`](RunStatus::Cancelled) — an operator stopped it, which is
+///   neither a success nor a defect.
+/// * [`Paused`](TaskRunEnd::Paused) → [`Paused`](RunStatus::Paused). Epic #183
+///   decision 2: an operator pause is resolved by *resuming*, not by a person
+///   approving something, so it is `Paused` and never `WaitingApproval`.
+/// * [`Delegated`](TaskRunEnd::Delegated) → [`Paused`](RunStatus::Paused). A
+///   hand-off is not an ending at all — the card stays in
+///   [`COLUMN_IN_PROGRESS`] — and it is unreachable as a run settle today,
+///   because `run_task` awaits the delegate inside the same attempt. Named
+///   anyway so this mapping is exhaustive: if a future path ever settles a run
+///   on a hand-off, the attempt is waiting on *something other than a person*
+///   (the delegate), which decision 2 makes `Paused` — non-terminal and
+///   resumable — rather than a terminal status that would file unfinished work
+///   as done.
+pub fn run_status_for(end: TaskRunEnd) -> RunStatus {
+    match end {
+        TaskRunEnd::Completed | TaskRunEnd::RedirectsExhausted => RunStatus::Succeeded,
+        TaskRunEnd::Failed => RunStatus::Failed,
+        TaskRunEnd::Cancelled => RunStatus::Cancelled,
+        TaskRunEnd::Paused | TaskRunEnd::Delegated => RunStatus::Paused,
+    }
+}
+
+/// The [`RunStatus`] an attempt settles into, given how it ended **and**
+/// whether it left a person something to act on (issue #242).
+///
+/// `parked_approvals` counts the approval requests this attempt's own turns
+/// parked. A run that otherwise succeeded while parking at least one finishes
+/// [`RunStatus::WaitingApproval`] rather than [`RunStatus::Succeeded`] — epic
+/// #183 decision 2 in its purest form: *who* unblocks the work decides where it
+/// parks, and here a person does.
+///
+/// A run that failed, was cancelled or was paused keeps the status its ending
+/// gave it. The operator has a bigger problem than a pending approval, and
+/// relabelling a failure as "waiting on you" would hide the reason it stopped.
+///
+/// [`RunStatus::WaitingApproval`] is terminal-in-v1 (resuming an approved
+/// attempt is its own issue) and deliberately **re-enterable across attempts**:
+/// the re-dispatch that follows an approval is a *new* run which can wait again.
+/// That is what keeps #243's single-use, argument-exact grants coherent instead
+/// of forcing an operator to batch several approvals into one.
+pub fn settled_run_status(end: TaskRunEnd, parked_approvals: usize) -> RunStatus {
+    match run_status_for(end) {
+        RunStatus::Succeeded if parked_approvals > 0 => RunStatus::WaitingApproval,
+        settled => settled,
     }
 }
 
@@ -441,6 +509,108 @@ mod test {
             review_note(ReviewDecision::Approve, Some("   ")),
             "reviewed: approved"
         );
+    }
+
+    /// Issue #242: every `TaskRunEnd` maps to exactly one `RunStatus`, and the
+    /// mapping is pinned exhaustively so a new ending cannot be added without a
+    /// deliberate decision about how its attempt reads.
+    #[test]
+    fn run_status_is_decided_per_ending_not_re_derived_from_the_column() {
+        assert_eq!(run_status_for(TaskRunEnd::Completed), RunStatus::Succeeded);
+        assert_eq!(
+            run_status_for(TaskRunEnd::RedirectsExhausted),
+            RunStatus::Succeeded,
+            "spending the redirect budget is how the run ended, not a failure"
+        );
+        assert_eq!(run_status_for(TaskRunEnd::Failed), RunStatus::Failed);
+        assert_eq!(run_status_for(TaskRunEnd::Cancelled), RunStatus::Cancelled);
+        assert_eq!(run_status_for(TaskRunEnd::Paused), RunStatus::Paused);
+        assert_eq!(run_status_for(TaskRunEnd::Delegated), RunStatus::Paused);
+
+        // The reason this cannot be derived from `landing_column`: two endings
+        // share a column and are emphatically not the same outcome.
+        let board = card(COLUMN_IN_REVIEW, None);
+        assert_eq!(
+            landing_column(TaskRunEnd::Failed, &board),
+            landing_column(TaskRunEnd::Cancelled, &board)
+        );
+        assert_ne!(
+            run_status_for(TaskRunEnd::Failed),
+            run_status_for(TaskRunEnd::Cancelled)
+        );
+    }
+
+    /// Epic #183 decision 2 at the settle boundary: only a *person* being
+    /// required parks a run in review. An operator pause is resolved by
+    /// resuming, so no ending alone may produce `WaitingApproval` — that status
+    /// is minted solely by a parked approval.
+    #[test]
+    fn no_lifecycle_ending_alone_parks_a_run_in_review() {
+        for end in ALL_ENDINGS {
+            assert_ne!(
+                run_status_for(end),
+                RunStatus::WaitingApproval,
+                "{end:?} must not claim a person is needed on the strength of the ending alone"
+            );
+            assert_eq!(
+                settled_run_status(end, 0),
+                run_status_for(end),
+                "with nothing parked, the settle is exactly the ending's status"
+            );
+        }
+    }
+
+    /// Every `TaskRunEnd`, so a table-driven test cannot silently miss a new
+    /// variant (the exhaustive `match` in `run_status_for` breaks first).
+    const ALL_ENDINGS: [TaskRunEnd; 6] = [
+        TaskRunEnd::Completed,
+        TaskRunEnd::RedirectsExhausted,
+        TaskRunEnd::Failed,
+        TaskRunEnd::Cancelled,
+        TaskRunEnd::Paused,
+        TaskRunEnd::Delegated,
+    ];
+
+    /// Epic #183 decision 2: a run that did its work but left an approval for a
+    /// **person** to act on is in review, not done. Only a success is
+    /// reclassified — a failure, a cancellation and a pause keep the reason they
+    /// stopped, because relabelling them "waiting on you" would hide it.
+    #[test]
+    fn a_parked_approval_turns_a_success_into_review_and_nothing_else() {
+        assert_eq!(
+            settled_run_status(TaskRunEnd::Completed, 1),
+            RunStatus::WaitingApproval
+        );
+        assert_eq!(
+            settled_run_status(TaskRunEnd::RedirectsExhausted, 3),
+            RunStatus::WaitingApproval,
+            "a redirect-capped run that parked something still needs a person"
+        );
+
+        for end in [
+            TaskRunEnd::Failed,
+            TaskRunEnd::Cancelled,
+            TaskRunEnd::Paused,
+            TaskRunEnd::Delegated,
+        ] {
+            assert_eq!(
+                settled_run_status(end, 2),
+                run_status_for(end),
+                "{end:?} must keep the reason it stopped rather than reading as a review"
+            );
+        }
+    }
+
+    /// The review stop is **not** terminal-by-accident: it is non-terminal and
+    /// re-enterable, which is what lets a re-dispatched card wait on a second
+    /// approval instead of forcing #243's single-use grants to be batched.
+    #[test]
+    fn the_review_stop_stays_re_enterable() {
+        let review = settled_run_status(TaskRunEnd::Completed, 1);
+        assert!(review.is_parked());
+        assert!(!review.is_terminal());
+        assert!(RunStatus::Running.can_transition_to(review));
+        assert!(review.can_transition_to(RunStatus::Running));
     }
 
     #[test]

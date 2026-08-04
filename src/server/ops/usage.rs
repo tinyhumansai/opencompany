@@ -240,6 +240,7 @@ mod tests {
                         cached_input_tokens: 0,
                         cost_usd: 0.25,
                         kind: SampleKind::Inference,
+                        run_id: None,
                     },
                 )
                 .await
