@@ -113,20 +113,29 @@ export function buildKnowledgeGraph(
 
   // Departments (ring 1) — only the ones that actually have somebody in them,
   // each tinted with its own colour.
+  //
+  // `usedDepts` names every department id an agent or person *claims*; `drawn`
+  // is the subset that actually got a `team:<id>` node below. A caller can
+  // hand in a department id that isn't in `departments` at all (an admin
+  // person forced onto a department the roster doesn't have, say) — edges
+  // below must check `drawn`, not `usedDepts`, or they point `forceLink` at a
+  // node that was never created and it throws.
   const usedDepts = new Set([...agents.map((a) => a.departmentId), ...people.map((p) => p.departmentId)]);
+  const drawn = new Set<string>();
   for (const d of departments) {
     if (!usedDepts.has(d.id)) continue;
     // The pillar's tint comes from the department record itself.
     const color = d.color;
     nodes.push({ id: `team:${d.id}`, kind: 'team', label: d.name, ring: RING.team, color, order: d.order });
     edges.push({ source: SELF_ID, target: `team:${d.id}`, kind: 'pillar' });
+    drawn.add(d.id);
   }
 
   // SOP tasks (ring 2) — the written-out jobs. Each hangs off its department
   // and hands the chain to exactly one worker below.
   const assignedWorkers = new Set<string>();
   for (const t of tasks) {
-    if (!usedDepts.has(t.departmentId)) continue;
+    if (!drawn.has(t.departmentId)) continue;
     nodes.push({ id: `task:${t.id}`, kind: 'task', label: t.title, ring: RING.task });
     edges.push({ source: `team:${t.departmentId}`, target: `task:${t.id}`, kind: 'sop' });
     const worker = workerNodeId(t.assigneeKind, t.assigneeId);
@@ -137,15 +146,15 @@ export function buildKnowledgeGraph(
   // Workflows (ring 2) — the multi-step routines a department runs. Unlike an
   // SOP task, a flow passes through several workers, so it draws one `runs`
   // edge per agent it touches.
-  const agentDeptIds = new Set(agents.map((a) => a.id));
+  const agentIds = new Set(agents.map((a) => a.id));
   for (const f of workflows) {
-    if (!usedDepts.has(f.departmentId)) continue;
+    if (!drawn.has(f.departmentId)) continue;
     nodes.push({ id: `flow:${f.id}`, kind: 'workflow', label: f.name, ring: RING.workflow });
     edges.push({ source: `team:${f.departmentId}`, target: `flow:${f.id}`, kind: 'flow' });
 
     // Each stage is its own node, chained to the next so the flow reads as a
     // sequence rather than a bag, and handed to the agent who performs it.
-    const runners = f.agentIds.filter((id) => agentDeptIds.has(id));
+    const runners = f.agentIds.filter((id) => agentIds.has(id));
     let prevStep: string | null = null;
     f.stages.forEach((stage, i) => {
       const stepId = `step:${f.id}:${i}`;
@@ -160,8 +169,6 @@ export function buildKnowledgeGraph(
       }
     });
   }
-
-  const agentIds = new Set(agents.map((a) => a.id));
 
   // First pass: which departments touch each tool? A tool used from several
   // departments is DUPLICATED — one copy per department — so its lines stay
@@ -184,7 +191,7 @@ export function buildKnowledgeGraph(
     nodes.push({ id: w.nodeId, kind: w.kind, label: w.label, ring: RING[w.kind] });
     // Workers reach their team through their task; only a worker with no task
     // (a data gap the seed tests forbid) falls back to a direct member edge.
-    if (!assignedWorkers.has(w.nodeId) && usedDepts.has(w.deptId)) {
+    if (!assignedWorkers.has(w.nodeId) && drawn.has(w.deptId)) {
       edges.push({ source: w.nodeId, target: `team:${w.deptId}`, kind: 'member' });
     }
     for (const slug of w.tools) {

@@ -154,10 +154,21 @@ const WORKFLOW_TEMPLATES: Omit<Workflow, "agentIds">[] = [
  * on. Admins sit with Operations — administering the company *is* operations —
  * and everyone else is spread deterministically across the departments that
  * exist, so humans read as part of the org rather than piled on one pillar.
+ *
+ * `departments` here is already filtered to the ones with an agent in them
+ * (see `adapt` below), so it may not include Operations at all — a roster
+ * that's all engineers and designers, say. Pointing an admin at "dept-ops"
+ * regardless would hand `buildKnowledgeGraph` a department id no `team:`
+ * node exists for, and it throws building the force-link edges. Falling back
+ * to the same spread everyone else gets keeps every returned id inside
+ * `departments`.
  */
 export function assignHumanDepartment(person: HostPerson, departments: Department[]): string {
-  if (person.role === "admin") return "dept-ops";
   if (departments.length === 0) return "dept-ops";
+  if (person.role === "admin") {
+    const ops = departments.find((d) => d.id === "dept-ops");
+    if (ops) return ops.id;
+  }
   return departments[hash(person.email) % departments.length].id;
 }
 

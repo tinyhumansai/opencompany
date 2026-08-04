@@ -85,9 +85,17 @@ export function distillMemoryGraph(
   const centerFolder = opts.centerFolder;
   const centerQuota = Math.min(opts.centerQuota ?? 32, maxPages);
 
+  // Ranks by content connectivity for the maxPages cap: `wikilink` for a real
+  // vault, `similar` for this console's producer (adapter.ts), which has no
+  // wikilinks and chains same-kind entries with `similar` instead. `member`
+  // stays excluded — folder plumbing, not knowledge structure — so a page
+  // isn't ranked up just for existing; counting only `wikilink` here (and not
+  // `similar`, unlike the post-selection `links` count below) meant this
+  // producer's degree was always empty and the cap fell back to word count,
+  // which could truncate a sibling chain and orphan the survivor.
   const degree = new Map<string, number>();
   for (const e of graph.edges) {
-    if (e.type !== 'wikilink') continue;
+    if (e.type === 'member') continue;
     degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
     degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
   }
