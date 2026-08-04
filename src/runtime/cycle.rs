@@ -44,6 +44,7 @@ use crate::runtime::delegation_tools::{
     unknown_desk_message,
 };
 use crate::runtime::grants::GrantedCall;
+use crate::runtime::journal::TaskLink;
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
@@ -134,7 +135,10 @@ impl<'a> CycleRunner<'a> {
             company.clone(),
             cycle_id.clone(),
             self.rt,
-            cycle_task_id(&request.events, &self.rt.journal.approval_origins()),
+            // Per-id lookups, not a snapshot: the origins map is unbounded and
+            // never pruned, and a cycle needs the link for at most the couple of
+            // `ApprovalResolved` ids in its own batch.
+            cycle_task_id(&request.events, |id| self.rt.journal.approval_task(id)),
         );
         let result = self.rt.brain.run_cycle(request, &host).await?;
 
@@ -697,21 +701,53 @@ async fn recipient_is_established(rt: &CompanyRuntime, to: &str) -> bool {
 ///   the same card's work — so a run that needs two sign-offs keeps both,
 ///   instead of losing the link the moment the first one is granted.
 ///
-/// **An ambiguous batch yields `None`.** Two dispatched cards in one cycle
-/// cannot both own an effect parked by it, and guessing one would hand a task
-/// approvals that are not its own — the precise failure this issue exists to
-/// end. Unlinked is honest; the read side falls back to the run window there.
+/// **An ambiguous batch yields `None`.** A cycle is the unit of batching, not
+/// of work: several triggers can ride one, and only some of them belong to a
+/// card. Two rival triggers therefore mean no stamp at all, because guessing
+/// one would hand a task approvals that are not its own — the precise failure
+/// this issue exists to end. Two kinds of rivalry, both disqualifying:
+///
+/// * **two cards** — two `TaskDispatched` events, or a dispatch plus a
+///   resolution belonging to a different card;
+/// * **a card and a non-card turn** — an operator chat message, a webhook, a
+///   schedule tick or an inbound A2A task batched alongside a dispatch. That
+///   turn's parked effect is not the card's work, and stamping it with the
+///   card's id is the same misattribution one level down. (Issue #357 guards
+///   this seam at a finer grain, per *attempt*, with a queue-position boundary;
+///   this rule only has to stop the cross-turn leak.)
+///
+/// An unstamped park is recorded as
+/// [`TaskLink::Unlinked`](crate::runtime::journal::TaskLink::Unlinked): honest,
+/// and deliberately *not* a fall-back to the run window, which would put the
+/// approval right back on whichever card was running.
 fn cycle_task_id(
     events: &[CompanyEvent],
-    origins: &std::collections::HashMap<ApprovalId, crate::runtime::journal::ApprovalOrigin>,
+    approval_task: impl Fn(&ApprovalId) -> Option<Option<TaskLink>>,
 ) -> Option<String> {
     let mut found: Option<String> = None;
     for event in events {
         let candidate = match event {
             CompanyEvent::TaskDispatched { task_id } => Some(task_id.clone()),
             CompanyEvent::ApprovalResolved { approval_id, .. } => {
-                origins.get(approval_id).and_then(|o| o.task_id.clone())
+                match approval_task(approval_id) {
+                    // Resolved an approval that belongs to a card: this cycle
+                    // continues that card's work.
+                    Some(Some(link)) => match link.task_id() {
+                        Some(id) => Some(id.to_string()),
+                        // Known to belong to no card — a rival turn, not a
+                        // neutral event.
+                        None => return None,
+                    },
+                    // A pre-#333 park, or an id with no origin at all: nothing
+                    // is claimed either way, so it neither stamps nor blocks.
+                    Some(None) | None => continue,
+                }
             }
+            // A turn that is its own work, riding the same batch as a dispatch.
+            CompanyEvent::OperatorMessage { .. }
+            | CompanyEvent::WebhookReceived { .. }
+            | CompanyEvent::ScheduleFired { .. }
+            | CompanyEvent::A2aTaskReceived { .. } => return None,
             _ => continue,
         };
         let Some(candidate) = candidate else { continue };
@@ -809,7 +845,12 @@ impl<'a> CycleHostImpl<'a> {
             .await?;
         self.rt
             .journal
-            .record_parked(&approval_id, &effect, now_millis(), self.task_id.as_deref())
+            .record_parked(
+                &approval_id,
+                &effect,
+                now_millis(),
+                TaskLink::from_task_id(self.task_id.as_deref()),
+            )
             .await?;
         self.parked
             .lock()
@@ -2386,7 +2427,7 @@ mod test {
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
-            .record_parked(&approval_id, &effect, now_millis(), None)
+            .record_parked(&approval_id, &effect, now_millis(), TaskLink::Unlinked)
             .await
             .unwrap();
 
@@ -2450,7 +2491,7 @@ mod test {
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
-            .record_parked(&approval_id, &effect, now_millis(), None)
+            .record_parked(&approval_id, &effect, now_millis(), TaskLink::Unlinked)
             .await
             .unwrap();
 
@@ -2499,7 +2540,7 @@ mod test {
                 .unwrap();
             let id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
             rt.journal
-                .record_parked(&id, &effect, now_millis(), None)
+                .record_parked(&id, &effect, now_millis(), TaskLink::Unlinked)
                 .await
                 .unwrap();
             id
@@ -2700,16 +2741,55 @@ mod test {
         let pending = rt.pending_approvals();
         assert_eq!(pending.len(), 1);
         assert_eq!(
-            pending[0].task_id.as_deref(),
-            Some("t-42"),
+            pending[0].task,
+            Some(TaskLink::Task {
+                id: "t-42".to_string()
+            }),
             "the parked approval must name the card that asked for it",
         );
         assert_eq!(
             rt.approval_origins()
                 .get(&pending[0].id)
-                .and_then(|o| o.task_id.clone()),
-            Some("t-42".into()),
+                .and_then(|o| o.task.clone()),
+            Some(TaskLink::Task {
+                id: "t-42".to_string()
+            }),
             "and the link must outlive the queue entry",
+        );
+    }
+
+    /// A cycle with no card behind it records the park as *explicitly* unlinked
+    /// rather than leaving the link blank (#333 review follow-up).
+    ///
+    /// The blank is reserved for pre-#333 journal lines, and it is the only
+    /// thing the read side still window-guesses on. If a chat turn's park were
+    /// written that way too, every one of them would land on whatever card
+    /// happened to be mid-run — the bug this issue exists to close.
+    #[tokio::test]
+    async fn a_cycle_with_no_card_parks_explicitly_unlinked() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_mail(CompanyMail {
+                sender: sender.clone(),
+                smtp: test_smtp("ceo@acme.test"),
+            })
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-chat".into(), &rt, None);
+
+        host.send_email(serde_json::json!({ "to": "new@ext.com", "subject": "s", "body": "b" }))
+            .await
+            .unwrap();
+
+        let pending = rt.pending_approvals();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].task,
+            Some(TaskLink::Unlinked),
+            "an unlinked park must say so, not leave the link absent",
         );
     }
 
@@ -2718,16 +2798,16 @@ mod test {
     #[test]
     fn cycle_task_id_reads_a_dispatch_inherits_a_resolution_and_refuses_to_guess() {
         use crate::ports::types::{Actor, ActorKind, ApprovalId, Verdict};
-        use crate::runtime::journal::ApprovalOrigin;
 
-        let origins = std::collections::HashMap::from([(
-            ApprovalId::new("appr-1"),
-            ApprovalOrigin {
-                at_millis: 1,
-                kind: "filing.submit".into(),
-                task_id: Some("t-1".into()),
-            },
-        )]);
+        // The lookup a live cycle does per id, stubbed: `appr-1` belongs to a
+        // card, `appr-none` is a recorded unlinked park, `appr-legacy` is a
+        // pre-#333 line, and anything else has no origin at all.
+        let approval_task = |id: &ApprovalId| match id.as_ref() {
+            "appr-1" => Some(Some(TaskLink::Task { id: "t-1".into() })),
+            "appr-none" => Some(Some(TaskLink::Unlinked)),
+            "appr-legacy" => Some(None),
+            _ => None,
+        };
         let dispatched = |id: &str| CompanyEvent::TaskDispatched {
             task_id: id.to_string(),
         };
@@ -2740,41 +2820,68 @@ mod test {
             },
         };
 
+        let chat = || CompanyEvent::OperatorMessage {
+            text: "hi".into(),
+            by: None,
+            chat: None,
+        };
+
         // A dispatch names the card outright.
         assert_eq!(
-            cycle_task_id(&[dispatched("t-1")], &origins),
+            cycle_task_id(&[dispatched("t-1")], approval_task),
             Some("t-1".into())
         );
         // A follow-up cycle inherits it from the approval it is resolving, so a
         // run needing two sign-offs keeps the link through the first.
         assert_eq!(
-            cycle_task_id(&[resolved("appr-1")], &origins),
+            cycle_task_id(&[resolved("appr-1")], approval_task),
             Some("t-1".into())
         );
-        // An approval that belonged to no card leaves the cycle unlinked.
-        assert_eq!(cycle_task_id(&[resolved("appr-unknown")], &origins), None);
+        // An approval with no origin at all claims nothing.
+        assert_eq!(cycle_task_id(&[resolved("appr-unknown")], approval_task), None);
+        // Nor does a pre-#333 one.
+        assert_eq!(cycle_task_id(&[resolved("appr-legacy")], approval_task), None);
         // Nothing task-shaped at all.
-        assert_eq!(
-            cycle_task_id(
-                &[CompanyEvent::OperatorMessage {
-                    text: "hi".into(),
-                    by: None,
-                    chat: None,
-                }],
-                &origins
-            ),
-            None
-        );
+        assert_eq!(cycle_task_id(&[chat()], approval_task), None);
         // Two different cards in one batch: refuse to guess rather than hand one
         // of them the other's approvals.
         assert_eq!(
-            cycle_task_id(&[dispatched("t-1"), dispatched("t-2")], &origins),
+            cycle_task_id(&[dispatched("t-1"), dispatched("t-2")], approval_task),
             None
         );
         // The same card twice is not ambiguous.
         assert_eq!(
-            cycle_task_id(&[dispatched("t-1"), resolved("appr-1")], &origins),
+            cycle_task_id(&[dispatched("t-1"), resolved("appr-1")], approval_task),
             Some("t-1".into())
+        );
+
+        // Review follow-up: a cycle is a batch, not a turn. A chat message
+        // riding the same batch as a dispatch is its own work, and an effect it
+        // parks is not the card's — so the batch is ambiguous, exactly as two
+        // cards would be. Same for a webhook, a schedule tick, or an A2A task.
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1"), chat()], approval_task),
+            None,
+            "a chat turn batched with a dispatch must not be stamped with the card",
+        );
+        assert_eq!(
+            cycle_task_id(
+                &[
+                    dispatched("t-1"),
+                    CompanyEvent::ScheduleFired {
+                        cron: "* * * * *".into(),
+                        prompt: "tick".into(),
+                    },
+                ],
+                approval_task,
+            ),
+            None,
+        );
+        // And a resolution known to belong to no card is a rival trigger too,
+        // not a neutral event — it is somebody's work, just not a card's.
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1"), resolved("appr-none")], approval_task),
+            None,
         );
     }
 

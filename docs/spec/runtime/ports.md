@@ -198,21 +198,53 @@ which showed nothing while an approval was actually waiting and let a second
 card worked in that window absorb the first's sign-offs.
 
 The link is recorded where the approval is: the runtime journal's
-`ApprovalParked` record gains an optional `task_id`, stamped by the cycle that
-parked the effect. A cycle knows which card it is working from its own trigger
+`ApprovalParked` record gains a `task` field, stamped by the cycle that parked
+the effect. A cycle knows which card it is working from its own trigger
 events — a `TaskDispatched`, or an `ApprovalResolved` whose approval was itself
 parked for a card, which is how a run needing two sign-offs keeps the link
-through the first. A batch naming two different cards stamps nothing rather
-than guessing.
+through the first.
+
+`task` is a two-armed link, not an optional id, and the distinction is the
+whole correctness of the feature:
+
+| On disk | Means | Read side |
+| --- | --- | --- |
+| `{"link":"task","id":"t-1"}` | that card owns it | shows on `t-1`, and only there |
+| `{"link":"unlinked"}` | no card owns it | shows on no card |
+| *absent* | written before #333 | falls back to the run window |
+
+An optional id collapses the middle row into the last one, and the middle row
+is not an edge case: every workflow delivery, operator-chat turn and scheduler
+tick parks unlinked. Treating those as "unknown" sends each of them to whatever
+card happened to be running, along with that card's `waitingSince` — the exact
+misattribution this issue exists to end. So a host from #333 onward always
+writes one of the first two, and absence means one thing only.
+
+A batch is ambiguous — and stamps nothing — when it names two different cards,
+or when it carries a card's dispatch alongside a turn that is its own work (an
+operator message, a webhook, a schedule tick, an inbound A2A task, or a
+resolution of an approval known to belong to no card). A cycle is a unit of
+batching, not of work, so "the card this cycle is for" is only well defined
+when nothing else rides along. Issue #357 guards the same seam per *attempt*
+with a queue-position boundary; this rule only has to stop the cross-turn leak.
 
 The journal keeps a per-approval origin index (park instant, effect kind,
-task) for the life of the file, because the parked effect is dropped from the
-queue on resolution and nothing else can answer what a resolved approval was.
+task link) because the parked effect is dropped from the queue on resolution
+and nothing else can answer what a resolved approval was.
 `GET …/tasks/{task_id}` returns `approvals[]` from it, joined by id.
 
-The field is additive on the same contract as the rest: a journal line written
-before #333 replays with no task, and those — and only those — keep the old
-run-window correlation, so existing history still renders.
+**That index is unbounded.** It holds one entry per approval ever parked, for
+the life of the process, and is never pruned — resolution and expiry remove the
+queue entry but deliberately not the origin. #333 widens each entry from a
+`u64` to a `u64` plus two `String`s (the effect kind, and the task id when
+linked). No journal rotation exists today, so replaying every `ApprovalParked`
+line on `load` is the only path to rebuild it, and it is the correct one. If
+rotation is ever added, this index is the first thing that must survive it: a
+rotated-away park line silently makes its approval unreadable.
+
+The field is additive on the same contract as the rest — a pre-#333 line
+replays with no link and keeps the old run-window correlation, so existing
+history still renders.
 
 ## MemoryStore
 

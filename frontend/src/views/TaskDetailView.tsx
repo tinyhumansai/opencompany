@@ -296,7 +296,15 @@ export function TaskDetailView({
 
   // Only tick the 1s clock while something is actually running: a dispatch
   // window is open, or the task is parked on an operator right now.
-  const ticking = Boolean(worked?.live) || Boolean(waiting?.live);
+  //
+  // The pending-approval term is not redundant with `waiting?.live`. That one
+  // derives from `waitingSince`, which the server gates on an *open run
+  // window* (#305) — so a finished card that still has a sign-off outstanding
+  // reports no `waitingSince` at all, and the Approvals tab's "waiting Xs"
+  // froze at whatever it read on mount. Since #333 the backend deliberately
+  // returns that row, so the clock has to keep up with it.
+  const awaitingApproval = Boolean(detail?.approvals.some((a) => a.status === "pending"));
+  const ticking = Boolean(worked?.live) || Boolean(waiting?.live) || awaitingApproval;
   useEffect(() => {
     if (!ticking) return;
     const timer = window.setInterval(() => {
@@ -1090,7 +1098,28 @@ function ApprovalsTab({ approvals, now }: { approvals: TaskApproval[]; now: numb
                   <ShieldCheck className="size-3.5 shrink-0 text-muted-foreground" />
                 )}
                 <span className="min-w-0 flex-1 truncate font-medium">{a.kind}</span>
-                <span className={cn("shrink-0 text-[11px]", status.className)}>{status.label}</span>
+                {/*
+                 * A pending row is the one thing on this tab the operator can
+                 * act on, and the tab itself cannot approve or deny — so the
+                 * status doubles as the way out, to the Approvals page where
+                 * the decision lives. Decided rows have nothing to go to.
+                 */}
+                {pending ? (
+                  <a
+                    href="#/approvals"
+                    className={cn(
+                      "shrink-0 text-[11px] underline-offset-2 hover:underline",
+                      status.className,
+                    )}
+                    title="Review this on the Approvals page"
+                  >
+                    {status.label}
+                  </a>
+                ) : (
+                  <span className={cn("shrink-0 text-[11px]", status.className)}>
+                    {status.label}
+                  </span>
+                )}
                 {waited !== undefined && (
                   <span className="shrink-0 text-[11px] tabular-nums text-amber-700 dark:text-amber-400">
                     {pending ? "waiting" : "waited"} {formatDuration(waited)}

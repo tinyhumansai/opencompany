@@ -573,17 +573,21 @@ async fn task_detail(
 
     let (timeline, mut approvals, open_window_at) = task_timeline(&company, &task_id).await?;
 
-    // The still-parked half (issue #333). An approval carrying this task's id is
-    // this task's whatever the window is doing; one carrying no id at all is a
-    // pre-#333 park, and keeps the old rule — inside an open window, parked at
-    // or after it opened, so a backlog item is not re-attributed to this
-    // dispatch.
+    // The still-parked half (issue #333), on the same three-way rule as
+    // `approval_belongs_to` below — see there for why "belongs to no card" and
+    // "no card was recorded" must not be the same test.
+    //
+    // An approval carrying this task's id is this task's whatever the window is
+    // doing. One recorded as unlinked is nobody's, so it is not adopted here.
+    // Only a park with no link at all — pre-#333 — keeps the old rule: inside an
+    // open window, parked at or after it opened, so a backlog item is not
+    // re-attributed to this dispatch.
     let pending: Vec<crate::runtime::types::ApprovalSummary> = company
         .runtime
         .pending_approvals()
         .into_iter()
-        .filter(|a| match a.task_id.as_deref() {
-            Some(owner) => owner == task_id,
+        .filter(|a| match &a.task {
+            Some(link) => link.task_id() == Some(task_id.as_str()),
             None => open_window_at.is_some_and(|opened_at| a.at_millis >= opened_at),
         })
         .collect();
@@ -694,11 +698,21 @@ async fn task_timeline(
 
 /// Whether a resolved approval belongs to `task_id` (issue #333).
 ///
-/// The id wins whenever there is one: an approval parked for another card is
-/// excluded even mid-window, which is the acceptance criterion this issue turns
-/// on. Only an approval with no recorded task — parked by a build older than
-/// #333 — falls back to the run window, so existing history keeps rendering
-/// exactly as it did instead of silently emptying.
+/// Three cases, not two — which is the correction to this function's first
+/// cut. It matched on `origins.get(id).and_then(|o| o.task_id)`, collapsing
+/// *no origin recorded* and *origin recorded, belonging to no card* into the
+/// same `None`, and sent both to the run window. Since #333 every unlinked park
+/// records itself as such, so that second case is not rare — it is every
+/// workflow delivery, every chat turn, every scheduler tick — and each one
+/// landed on whatever card happened to be running.
+///
+/// * a recorded owner wins outright: another card's approval is excluded even
+///   mid-window, which is the acceptance criterion this issue turns on;
+/// * a recorded [`TaskLink::Unlinked`] belongs to no card, so it belongs to
+///   this one either — no window, no guess;
+/// * only a *missing* link falls back to the run window. That is exclusively a
+///   park written before #333, so existing history keeps rendering as it did
+///   rather than silently emptying.
 fn approval_belongs_to(
     approval_id: &crate::ports::types::ApprovalId,
     task_id: &str,
@@ -708,9 +722,10 @@ fn approval_belongs_to(
     >,
     window_opened_at: Option<u64>,
 ) -> bool {
-    match origins.get(approval_id).and_then(|o| o.task_id.as_deref()) {
-        Some(owner) => owner == task_id,
-        None => window_opened_at.is_some(),
+    match origins.get(approval_id).map(|o| &o.task) {
+        Some(Some(link)) => link.task_id() == Some(task_id),
+        // No origin record at all, or one from before the link existed.
+        Some(None) | None => window_opened_at.is_some(),
     }
 }
 

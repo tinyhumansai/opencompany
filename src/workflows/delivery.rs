@@ -661,8 +661,15 @@ async fn park_effect(
     if let Err(err) = parking
         .journal
         // No board task is behind a workflow delivery, so the approval is
-        // parked unlinked (issue #333).
-        .record_parked(&approval_id, &effect, now_millis(), None)
+        // parked explicitly unlinked (issue #333) — recorded as "belongs to no
+        // card" rather than left blank, so no task's Approvals tab adopts it by
+        // happening to be mid-run when it parked.
+        .record_parked(
+            &approval_id,
+            &effect,
+            now_millis(),
+            crate::runtime::journal::TaskLink::Unlinked,
+        )
         .await
     {
         // Roll back to "never parked". Both steps deliberately swallow their own

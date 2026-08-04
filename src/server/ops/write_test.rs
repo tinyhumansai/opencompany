@@ -13,6 +13,7 @@ use crate::ports::facts::{FactKind, FactRecord};
 use crate::ports::tasks::TaskRecord;
 use crate::ports::types::{CompanyId, CompanyRecord, ContextChunk};
 use crate::runtime::RuntimeBuilder;
+use crate::runtime::journal::TaskLink;
 use crate::server::router;
 use crate::store::FsCompanyStore;
 use crate::{AppConfig, AppState};
@@ -3440,7 +3441,7 @@ async fn task_timeline_reports_the_wait_an_approval_actually_caused() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at, Some("t-1"))
+        .record_parked(&id, &parked_effect(), parked_at, TaskLink::Task { id: "t-1".into() })
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -3516,7 +3517,7 @@ async fn expired_approval_is_labelled_as_an_expiry_and_carries_its_wait() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at, Some("t-1"))
+        .record_parked(&id, &parked_effect(), parked_at, TaskLink::Task { id: "t-1".into() })
         .await
         .unwrap();
     // Re-park into the gate at epoch 0 so it is unambiguously past any TTL.
@@ -3569,7 +3570,7 @@ async fn a_wait_that_began_before_dispatch_is_clamped_to_the_run_window() {
             &id,
             &parked_effect(),
             dispatched_at - 3_600_000,
-            Some("t-1"),
+            TaskLink::Task { id: "t-1".into() },
         )
         .await
         .unwrap();
@@ -3629,7 +3630,7 @@ async fn a_currently_parked_approval_surfaces_as_a_live_wait() {
             &ApprovalId::new("appr-live"),
             &parked_effect(),
             parked_at,
-            Some("t-1"),
+            TaskLink::Task { id: "t-1".into() },
         )
         .await
         .unwrap();
@@ -3728,7 +3729,7 @@ async fn a_parked_approval_appears_on_its_own_task() {
             &ApprovalId::new("appr-mine"),
             &parked_effect(),
             parked_at,
-            Some("t-1"),
+            TaskLink::Task { id: "t-1".into() },
         )
         .await
         .unwrap();
@@ -3807,7 +3808,12 @@ async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals(
         let id = ApprovalId::new(id);
         runtime
             .journal
-            .record_parked(&id, &parked_effect(), dispatched_at + 5, Some(owner))
+            .record_parked(
+                &id,
+                &parked_effect(),
+                dispatched_at + 5,
+                TaskLink::Task { id: owner.into() },
+            )
             .await
             .unwrap();
         runtime.journal.record_resolved(&id).await.unwrap();
@@ -3876,7 +3882,7 @@ async fn a_resolved_approval_reports_its_verdict_and_wait_on_the_tab() {
     let parked_at = dispatched_at + 20;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at, Some("t-1"))
+        .record_parked(&id, &parked_effect(), parked_at, TaskLink::Task { id: "t-1".into() })
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -3921,9 +3927,10 @@ async fn a_resolved_approval_reports_its_verdict_and_wait_on_the_tab() {
 /// A task with no approvals reports an empty list, not a fabricated one — the
 /// honest empty state the console renders.
 ///
-/// Includes the case that made the old window wrong in the other direction: an
-/// approval belonging to *nothing* (a workflow delivery) parked mid-window used
-/// to be absorbed by whatever card happened to be running.
+/// Covers *another card's* approval parked mid-window. The case where the
+/// approval belongs to nothing at all is
+/// [`an_unlinked_approval_is_not_absorbed_by_the_running_card`], which is a
+/// different fact and was the one the old window got wrong.
 #[tokio::test]
 async fn a_task_with_no_approvals_of_its_own_reports_an_empty_list() {
     use crate::ports::types::ApprovalId;
@@ -3941,7 +3948,9 @@ async fn a_task_with_no_approvals_of_its_own_reports_an_empty_list() {
             &ApprovalId::new("appr-elsewhere"),
             &parked_effect(),
             dispatched_at + 5,
-            Some("t-other"),
+            TaskLink::Task {
+                id: "t-other".into(),
+            },
         )
         .await
         .unwrap();
@@ -3959,11 +3968,17 @@ async fn a_task_with_no_approvals_of_its_own_reports_an_empty_list() {
     );
 }
 
-/// An approval parked by a build older than #333 carries no task id at all. It
-/// keeps the pre-#333 run-window correlation rather than vanishing, so existing
-/// history still renders.
+/// An approval that belongs to **no** card — a workflow delivery, a chat turn,
+/// a scheduler tick — parked while a card is mid-run must not be absorbed by
+/// that card (#333 review follow-up).
+///
+/// This is the case the first cut of `approval_belongs_to` got wrong. It tested
+/// `origins.get(id).and_then(|o| o.task_id)`, which is `None` both for a park
+/// that recorded no card *and* for a pre-#333 park that could not record one —
+/// so every unlinked park since #333 fell through to the run window and landed
+/// on whatever happened to be running, dragging `waitingSince` with it.
 #[tokio::test]
-async fn a_pre_333_approval_falls_back_to_the_run_window() {
+async fn an_unlinked_approval_is_not_absorbed_by_the_running_card() {
     use crate::ports::types::ApprovalId;
 
     let home_dir = home();
@@ -3972,16 +3987,63 @@ async fn a_pre_333_approval_falls_back_to_the_run_window() {
     let company = CompanyId::new("acme");
     let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
 
+    // The shape `workflows::delivery` writes: parked mid-window, owned by
+    // nothing, and recorded as such.
     runtime
         .journal
         .record_parked(
-            &ApprovalId::new("appr-legacy"),
+            &ApprovalId::new("appr-delivery"),
             &parked_effect(),
             dispatched_at + 5,
-            None,
+            TaskLink::Unlinked,
         )
         .await
         .unwrap();
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["approvals"].as_array().unwrap().is_empty(),
+        "an approval owned by no card must not appear on a card: {:?}",
+        body["approvals"],
+    );
+    assert!(
+        body.get("waitingSince").is_none(),
+        "nor may it make that card read as waiting on the operator",
+    );
+}
+
+/// An approval parked by a build older than #333 carries no link at all. It
+/// keeps the pre-#333 run-window correlation rather than vanishing, so existing
+/// history still renders.
+///
+/// The legacy line is written **raw and replayed**, not produced by
+/// `record_parked` — which is the point. Since #333 there is no way to record a
+/// park without a link, so the only source of a missing one is a file written
+/// by an older host, and that is exactly what this pins. Contrast
+/// [`an_unlinked_approval_is_not_absorbed_by_the_running_card`]: same "no task
+/// id", opposite outcome, because one is unrecorded and the other is recorded.
+#[tokio::test]
+async fn a_pre_333_approval_falls_back_to_the_run_window() {
+    use crate::ports::types::ApprovalId;
+    use crate::store::paths::Bundle;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    // A journal line as an older host wrote it: no `task` key whatsoever.
+    let legacy = json!({
+        "record": "ApprovalParked",
+        "id": "appr-legacy",
+        "effect": parked_effect(),
+        "at_millis": dispatched_at + 5,
+    });
+    let path = Bundle::new(&home, runtime.id()).journal_jsonl();
+    tokio::fs::write(&path, format!("{legacy}\n")).await.unwrap();
+    runtime.journal.load().await.unwrap();
 
     let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
     let approvals = body["approvals"].as_array().unwrap();

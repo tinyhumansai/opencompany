@@ -46,8 +46,7 @@ enum JournalRecord {
         effect: Effect,
         /// Epoch-millis the effect was parked.
         at_millis: u64,
-        /// The board task whose dispatch cycle parked this effect, when it was
-        /// parked inside one (issue #333).
+        /// Which board task this effect was parked for (issue #333).
         ///
         /// This is the correlation key that makes a task's Approvals tab
         /// possible. Before it, an approval carried nothing tying it to a card,
@@ -55,14 +54,19 @@ enum JournalRecord {
         /// running" — a time window, which a second task worked in the same
         /// window silently absorbs.
         ///
-        /// `None` for an approval no board task is behind: a workflow delivery,
-        /// an operator-chat turn, a scheduler tick. Skipped when serializing and
-        /// defaulted when absent, so journal lines written before this field
-        /// existed replay as `None` — the pre-#333 window correlation, which the
-        /// read side still falls back to for exactly those lines — rather than
-        /// failing to parse.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        task_id: Option<String>,
+        /// **Always written from #333 onward**, as either
+        /// [`TaskLink::Task`] or [`TaskLink::Unlinked`] — never omitted. That is
+        /// the whole point of the enum over a bare `Option<String>`: "parked for
+        /// no card" and "parked by a host that did not record cards" are
+        /// different facts, and only the second may fall back to the run window.
+        /// Collapsing them sent every workflow delivery, chat turn and scheduler
+        /// tick to whatever card happened to be running.
+        ///
+        /// `None` therefore means exactly one thing: a journal line written
+        /// before this field existed. `#[serde(default)]` is what lets those
+        /// replay instead of failing to parse.
+        #[serde(default)]
+        task: Option<TaskLink>,
     },
     /// A parked approval that has since been resolved (approved or denied).
     ApprovalResolved {
@@ -118,6 +122,49 @@ enum JournalRecord {
     },
 }
 
+/// Which board task an approval was parked for (issue #333).
+///
+/// Two arms rather than an `Option<String>` because "no card is behind this
+/// one" is a *recorded* fact, not a missing one. A host from #333 onward always
+/// writes one of these; an absent link (`Option<TaskLink>::None`) means only
+/// that the line predates the field.
+///
+/// The distinction is the whole correctness of the tab. Every unlinked park —
+/// a workflow delivery ([`crate::workflows`]), an operator-chat turn, a
+/// scheduler tick — is a deliberate `Unlinked`, and must *not* be re-attributed
+/// to whatever card happened to be running when it parked. Only a genuinely
+/// pre-#333 line keeps the old run-window correlation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "link", rename_all = "snake_case")]
+pub enum TaskLink {
+    /// Parked inside a board task's dispatch cycle — that card owns it.
+    Task {
+        /// The owning board task's id.
+        id: String,
+    },
+    /// Parked with no board task behind it, recorded as such.
+    Unlinked,
+}
+
+impl TaskLink {
+    /// The owning task's id, or `None` for [`Unlinked`](Self::Unlinked).
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Task { id } => Some(id.as_str()),
+            Self::Unlinked => None,
+        }
+    }
+
+    /// Builds a link from an optional task id — `None` becoming an explicit
+    /// [`Unlinked`](Self::Unlinked) rather than a missing link.
+    pub fn from_task_id(task_id: Option<&str>) -> Self {
+        match task_id {
+            Some(id) => Self::Task { id: id.to_string() },
+            None => Self::Unlinked,
+        }
+    }
+}
+
 /// A parked approval awaiting resolution.
 #[derive(Clone, Debug)]
 pub struct PendingApproval {
@@ -127,9 +174,9 @@ pub struct PendingApproval {
     pub effect: Effect,
     /// Epoch-millis the effect was parked.
     pub at_millis: u64,
-    /// The board task this approval was parked for (issue #333), or `None` when
-    /// no card is behind it.
-    pub task_id: Option<String>,
+    /// Which board task this approval was parked for (issue #333). `None` only
+    /// for a journal line written before the link existed — see [`TaskLink`].
+    pub task: Option<TaskLink>,
 }
 
 /// What an approval *was*, retained for the whole life of the journal — after
@@ -139,24 +186,33 @@ pub struct PendingApproval {
 /// [`CompanyEvent::ApprovalResolved`](crate::ports::CompanyEvent::ApprovalResolved)
 /// carries only an id, a verdict and an actor. So without this index a resolved
 /// approval is unreadable: the read side cannot say what was approved, when it
-/// parked, or which task it belonged to. Entries are therefore **never
-/// removed** — the index has the same append-only lifetime as the file it is
-/// replayed from, and costs one small record per approval ever parked.
+/// parked, or which task it belonged to.
+///
+/// **Entries are never removed, and the map is unbounded.** It has the same
+/// append-only lifetime as the journal file it is replayed from: one resident
+/// entry per approval ever parked, for the life of the process, growing
+/// without a ceiling. #333 widens each entry from a `u64` to a `u64` plus two
+/// `String`s (the effect kind and, when linked, the task id). No rotation
+/// exists today, so `load` rebuilding this from every `ApprovalParked` line is
+/// the only path — and it is the correct one. If journal rotation ever lands,
+/// this index is the first thing that has to survive it, because a rotated-away
+/// park line silently turns its approval unreadable.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ApprovalOrigin {
     /// Epoch-millis the effect was parked.
     pub at_millis: u64,
     /// The parked effect's dotted kind, e.g. `payment.send`.
     pub kind: String,
-    /// The board task the parking cycle was dispatched for, when there was one.
-    pub task_id: Option<String>,
+    /// Which board task the parking cycle was dispatched for. `None` only for a
+    /// pre-#333 journal line — see [`TaskLink`].
+    pub task: Option<TaskLink>,
 }
 
 /// In-memory state rebuilt from (and kept in sync with) `journal.jsonl`.
 #[derive(Default)]
 struct State {
     executed: HashSet<String>,
-    parked: HashMap<ApprovalId, (Effect, u64, Option<String>)>,
+    parked: HashMap<ApprovalId, (Effect, u64, Option<TaskLink>)>,
     /// What each approval was when it parked, retained after it leaves `parked`.
     ///
     /// This is what makes waiting time readable (issue #305) and what links a
@@ -223,17 +279,17 @@ impl RuntimeJournal {
                     id,
                     effect,
                     at_millis,
-                    task_id,
+                    task,
                 } => {
                     state.origins.insert(
                         id.clone(),
                         ApprovalOrigin {
                             at_millis,
                             kind: effect.kind.clone(),
-                            task_id: task_id.clone(),
+                            task: task.clone(),
                         },
                     );
-                    state.parked.insert(id, (effect, at_millis, task_id));
+                    state.parked.insert(id, (effect, at_millis, task));
                 }
                 JournalRecord::ApprovalResolved { id } => {
                     state.parked.remove(&id);
@@ -283,16 +339,20 @@ impl RuntimeJournal {
         .await
     }
 
-    /// Records a newly parked approval, tagged with the board task whose
-    /// dispatch cycle parked it (issue #333) — `None` when no card is behind it.
+    /// Records a newly parked approval and which board task it belongs to
+    /// (issue #333).
+    ///
+    /// `task` is deliberately **not** an `Option`: every caller must say which
+    /// it is, [`TaskLink::Task`] or [`TaskLink::Unlinked`], so that a missing
+    /// link can only ever mean "written before #333". A caller with an
+    /// `Option<&str>` in hand converts with [`TaskLink::from_task_id`].
     pub async fn record_parked(
         &self,
         id: &ApprovalId,
         effect: &Effect,
         at_millis: u64,
-        task_id: Option<&str>,
+        task: TaskLink,
     ) -> Result<()> {
-        let task_id = task_id.map(str::to_string);
         {
             let mut state = self.state.lock().expect("journal state poisoned");
             state.origins.insert(
@@ -300,18 +360,18 @@ impl RuntimeJournal {
                 ApprovalOrigin {
                     at_millis,
                     kind: effect.kind.clone(),
-                    task_id: task_id.clone(),
+                    task: Some(task.clone()),
                 },
             );
             state
                 .parked
-                .insert(id.clone(), (effect.clone(), at_millis, task_id.clone()));
+                .insert(id.clone(), (effect.clone(), at_millis, Some(task.clone())));
         }
         self.append(&JournalRecord::ApprovalParked {
             id: id.clone(),
             effect: effect.clone(),
             at_millis,
-            task_id,
+            task: Some(task),
         })
         .await
     }
@@ -377,6 +437,25 @@ impl RuntimeJournal {
             .clone()
     }
 
+    /// The task link recorded for one approval, without cloning the whole
+    /// [`origins`](State::origins) map.
+    ///
+    /// The map is unbounded and never pruned (see [`ApprovalOrigin`]), so a
+    /// caller that needs the link for a couple of known ids — every cycle does,
+    /// via [`cycle_task_id`](crate::runtime::cycle) — must not pay a full clone
+    /// per cycle to read them. `approval_origins` stays the right call for a
+    /// fold that will look up an unknown number of ids.
+    ///
+    /// The outer `Option` is "no such approval"; the inner is a pre-#333 line.
+    pub fn approval_task(&self, id: &ApprovalId) -> Option<Option<TaskLink>> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .origins
+            .get(id)
+            .map(|o| o.task.clone())
+    }
+
     /// Records a minted single-use grant (issue #243).
     ///
     /// Called *before* the grant enters the live set, so the ordering failure
@@ -440,11 +519,11 @@ impl RuntimeJournal {
         let mut out: Vec<PendingApproval> = state
             .parked
             .iter()
-            .map(|(id, (effect, at_millis, task_id))| PendingApproval {
+            .map(|(id, (effect, at_millis, task))| PendingApproval {
                 id: id.clone(),
                 effect: effect.clone(),
                 at_millis: *at_millis,
-                task_id: task_id.clone(),
+                task: task.clone(),
             })
             .collect();
         out.sort_by(|a, b| {
@@ -556,7 +635,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-1");
         journal
-            .record_parked(&id, &effect(), now_millis(), None)
+            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked)
             .await
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
@@ -593,16 +672,16 @@ mod test {
         let theirs = ApprovalId::new("appr-theirs");
         let orphan = ApprovalId::new("appr-orphan");
         journal
-            .record_parked(&mine, &effect(), 1_000, Some("t-1"))
+            .record_parked(&mine, &effect(), 1_000, TaskLink::Task { id: "t-1".into() })
             .await
             .unwrap();
         journal
-            .record_parked(&theirs, &effect(), 1_100, Some("t-2"))
+            .record_parked(&theirs, &effect(), 1_100, TaskLink::Task { id: "t-2".into() })
             .await
             .unwrap();
         // No card behind it (a workflow delivery, an operator-chat turn).
         journal
-            .record_parked(&orphan, &effect(), 1_200, None)
+            .record_parked(&orphan, &effect(), 1_200, TaskLink::Unlinked)
             .await
             .unwrap();
 
@@ -612,7 +691,7 @@ mod test {
         assert_eq!(
             pending
                 .iter()
-                .filter(|p| p.task_id.as_deref() == Some("t-1"))
+                .filter(|p| p.task.as_ref().and_then(TaskLink::task_id) == Some("t-1"))
                 .count(),
             1,
             "the parked queue must name the task, not just the effect",
@@ -627,20 +706,30 @@ mod test {
             Some(&ApprovalOrigin {
                 at_millis: 1_000,
                 kind: "filing.submit".into(),
-                task_id: Some("t-1".into()),
+                task: Some(TaskLink::Task { id: "t-1".into() }),
             }),
         );
         assert_eq!(
-            origins.get(&theirs).and_then(|o| o.task_id.clone()),
-            Some("t-2".into()),
+            origins.get(&theirs).and_then(|o| o.task.clone()),
+            Some(TaskLink::Task { id: "t-2".into() }),
             "a second task's approval keeps its own id, so neither absorbs the other",
         );
-        assert_eq!(origins.get(&orphan).and_then(|o| o.task_id.clone()), None);
+        // Recorded as deliberately unlinked — *not* as a missing link, which is
+        // what tells the read side never to fall back to the run window for it.
+        assert_eq!(
+            origins.get(&orphan).and_then(|o| o.task.clone()),
+            Some(TaskLink::Unlinked),
+        );
     }
 
-    /// A journal line written before #333 has no `task_id` at all. It must
-    /// replay as an unlinked approval rather than failing to parse — the read
-    /// side falls back to the old run-window correlation for exactly these.
+    /// A journal line written before #333 has no `task` key at all. It must
+    /// replay with **no link** rather than failing to parse — and that absence
+    /// is what the read side falls back to the old run-window correlation for.
+    ///
+    /// The distinction this pins is the one the whole feature rests on: a
+    /// missing key replays as `None`, while a park this host recorded as having
+    /// no card behind it replays as `Some(Unlinked)`. Both are "no task id",
+    /// and they must not be confused.
     #[tokio::test]
     async fn a_pre_333_parked_line_replays_with_no_task() {
         let dir = tmp_dir();
@@ -659,20 +748,31 @@ mod test {
         journal.load().await.expect("a pre-#333 line still replays");
         let id = ApprovalId::new("appr-legacy");
         assert_eq!(journal.pending().len(), 1);
-        assert_eq!(journal.pending()[0].task_id, None);
+        assert_eq!(journal.pending()[0].task, None, "no key means no link");
         assert_eq!(
             journal.approval_origins().get(&id).map(|o| o.at_millis),
             Some(4_000),
         );
+        assert_eq!(journal.approval_task(&id), Some(None));
 
-        // And the field is omitted on the way back out, so an unlinked approval
-        // does not grow a `"task_id": null` in the file.
+        // A park this host records with no card behind it is a *different*
+        // fact, written explicitly, and must not read back as the legacy shape.
+        let fresh = ApprovalId::new("appr-new");
         journal
-            .record_parked(&ApprovalId::new("appr-new"), &effect(), 5_000, None)
+            .record_parked(&fresh, &effect(), 5_000, TaskLink::Unlinked)
             .await
             .unwrap();
+        assert_eq!(journal.approval_task(&fresh), Some(Some(TaskLink::Unlinked)));
+
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(!raw.contains("task_id"), "{raw}");
+        let fresh_line = raw
+            .lines()
+            .find(|l| l.contains("appr-new"))
+            .expect("the new park was appended");
+        assert!(
+            fresh_line.contains(r#""link":"unlinked""#),
+            "an unlinked park must say so on disk: {fresh_line}",
+        );
     }
 
     #[tokio::test]
@@ -682,7 +782,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-exp");
         journal
-            .record_parked(&id, &effect(), now_millis(), None)
+            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked)
             .await
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
@@ -706,7 +806,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-amend");
         journal
-            .record_parked(&id, &effect(), now_millis(), None)
+            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked)
             .await
             .unwrap();
 
@@ -747,11 +847,11 @@ mod test {
         let resolved = ApprovalId::new("appr-resolved");
         let expired = ApprovalId::new("appr-expired");
         journal
-            .record_parked(&resolved, &effect(), 1_000, None)
+            .record_parked(&resolved, &effect(), 1_000, TaskLink::Unlinked)
             .await
             .unwrap();
         journal
-            .record_parked(&expired, &effect(), 2_000, None)
+            .record_parked(&expired, &effect(), 2_000, TaskLink::Unlinked)
             .await
             .unwrap();
 
@@ -878,7 +978,7 @@ mod test {
 
         let parked_id = ApprovalId::new("appr-parked");
         journal
-            .record_parked(&parked_id, &effect(), 500, None)
+            .record_parked(&parked_id, &effect(), 500, TaskLink::Unlinked)
             .await
             .unwrap();
         journal

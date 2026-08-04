@@ -173,11 +173,16 @@ export interface ApprovalSummary {
   amount_usd: number | null;
   at_millis: number;
   /**
-   * The board task this approval was parked for (#333). Absent when no card is
-   * behind it (a workflow delivery, an operator-chat turn) or when it was
-   * parked by a host older than #333.
+   * Which board task this approval was parked for (#333). Mirrors `TaskLink` in
+   * `src/runtime/journal.rs`.
+   *
+   * Three states, deliberately: `{link: "task"}` is owned by that card,
+   * `{link: "unlinked"}` is owned by no card (a workflow delivery, an
+   * operator-chat turn, a scheduler tick), and *absent* means the park predates
+   * the field. Only the last one is ambiguous — the server keeps a run-window
+   * heuristic for it, and for nothing else.
    */
-  task_id?: string;
+  task?: { link: "task"; id: string } | { link: "unlinked" };
 }
 
 export type Verdict = "approve" | "deny";

@@ -618,7 +618,7 @@ impl CompanyRuntime {
                 kind: p.effect.kind,
                 amount_usd: p.effect.amount_usd,
                 at_millis: p.at_millis,
-                task_id: p.task_id,
+                task: p.task,
             })
             .collect()
     }
