@@ -7,13 +7,10 @@ import {
   LayoutDashboard,
   type LucideIcon,
   MessagesSquare,
-  Plug,
   Settings2,
   ShieldCheck,
   Sparkles,
   SquareKanban,
-  Blocks,
-  UserCog,
   Users,
   Wallet,
   Workflow,
@@ -46,14 +43,11 @@ import { Conversation } from "@/views/Conversation";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
 import { TeamView } from "@/views/TeamView";
-import { PeopleView } from "@/views/PeopleView";
 import { SkillsView } from "@/views/SkillsView";
 import { InboxView } from "@/views/InboxView";
 import { MemoryView } from "@/views/MemoryView";
-import { ConnectionsView } from "@/views/ConnectionsView";
-import { McpServersView } from "@/views/McpServersView";
-import { SettingsView } from "@/views/SettingsView";
 import { FeedbackView } from "@/views/FeedbackView";
+import { SettingsSection } from "@/views/SettingsSection";
 
 // React Flow is heavy and only used here — load it on demand.
 const WorkflowsView = lazy(() =>
@@ -72,7 +66,6 @@ const FinancesView = lazy(() =>
 
 export type View =
   | "overview"
-  | "people"
   | "conversation"
   | "inbox"
   | "tasks"
@@ -84,8 +77,6 @@ export type View =
   | "workflows"
   | "usage"
   | "finances"
-  | "connections"
-  | "mcp"
   | "settings"
   | "feedback";
 
@@ -121,9 +112,6 @@ const NAV: NavGroup[] = [
     items: [
       { view: "usage", label: "Usage", icon: ChartColumnBig },
       { view: "finances", label: "Finances", icon: Wallet },
-      { view: "connections", label: "Connections", icon: Plug },
-      { view: "mcp", label: "MCP Servers", icon: Blocks },
-      { view: "people", label: "People", icon: UserCog },
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
   },
@@ -151,7 +139,9 @@ export function AppShell({
   onSwitchCompany,
   onBackToPicker,
 }: Props) {
-  const [view, setView] = useHashView<View>(VIEWS, "overview");
+  const [view, sub, navigate] = useHashView<View>(VIEWS, "overview");
+  // Most call sites only ever change the top-level view.
+  const setView = (next: View) => navigate(next);
   const [threads, setThreads] = useState(defaultThreads);
   const [activeThreadId, setActiveThreadId] = useState("main");
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -233,7 +223,6 @@ export function AppShell({
           {view === "inbox" && <InboxView company={company} />}
           {view === "tasks" && <TasksView client={client} company={company} />}
           {view === "team" && <TeamView client={client} company={company} />}
-          {view === "people" && <PeopleView client={client} company={company} />}
           {view === "skills" && <SkillsView client={client} company={company} />}
           {view === "memory" && <MemoryView company={company} />}
           {view === "workspace" && (
@@ -289,10 +278,15 @@ export function AppShell({
               <FinancesView />
             </Suspense>
           )}
-          {view === "connections" && <ConnectionsView client={client} company={company} />}
-          {view === "mcp" && <McpServersView client={client} company={company} />}
           {view === "settings" && (
-            <SettingsView client={client} company={company} feed={feed} onFlag={() => setFeedbackOpen(true)} />
+            <SettingsSection
+              client={client}
+              company={company}
+              feed={feed}
+              sub={sub}
+              onNavigate={(page) => navigate("settings", page)}
+              onFlag={() => setFeedbackOpen(true)}
+            />
           )}
           {view === "feedback" && <FeedbackView client={client} company={company} />}
         </main>
