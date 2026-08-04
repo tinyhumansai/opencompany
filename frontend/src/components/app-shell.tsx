@@ -518,7 +518,15 @@ export function AppShell({
         <SidebarRail />
       </Sidebar>
 
-      <SidebarInset className="min-h-0">
+      {/* `min-w-0`: the inset is a flex item beside the sidebar, and a flex
+          item's default `min-width: auto` floors it at its content's
+          min-content width. That floor won — the inset measured a full window
+          wide while sitting a sidebar's width to the right of the origin, so
+          its last ~256px hung past the right edge of the window inside a
+          wrapper that clips and cannot scroll. On the task board that clipped
+          strip held the "Done" column, which is why a card could not be dragged
+          into it (issue #334); every view was losing the same strip. */}
+      <SidebarInset className="min-h-0 min-w-0">
         <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {view === "overview" && (
             <Overview client={client} company={company} />

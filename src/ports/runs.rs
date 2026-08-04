@@ -51,6 +51,16 @@ use crate::ports::types::{CompanyId, EventSeq, TokenUsage, TurnStep};
 pub const ORPHAN_ERROR: &str =
     "the host restarted while this attempt was running, so its outcome was lost";
 
+/// The `error` stamped on an attempt whose dispatch was refused because the
+/// company's runtime was being replaced (issue #290).
+///
+/// Deliberately distinct from [`ORPHAN_ERROR`]. That one means the host process
+/// died and nothing is left to say what happened; this one means the process is
+/// perfectly healthy and the company's runtime was swapped underneath a card an
+/// operator had just dispatched, which is a retry-me rather than an incident.
+pub const RUNTIME_REPLACED_ERROR: &str =
+    "the company runtime was being replaced when this card was dispatched, so it never started";
+
 // ---------------------------------------------------------------------------
 // RunStatus
 // ---------------------------------------------------------------------------
@@ -583,6 +593,19 @@ fn check_transition(run: &RunRecord, next: RunStatus) -> Result<()> {
 /// Together those mean any active row observed at boot belongs to an attempt
 /// that no longer exists. This is a proof, not a timeout heuristic — nothing
 /// here guesses at staleness from a clock.
+///
+/// ## The proof is about *boot*, and only boot (issue #290)
+///
+/// Invariant 3 is the load-bearing one and it is the one a
+/// [runtime rebuild](crate::runtime::rebuild_company) breaks: a rebuild calls
+/// [`RuntimeBuilder::build`](crate::runtime::RuntimeBuilder::build) a second
+/// time in a live process, where cycles *have* run and may hold rows that are
+/// genuinely in flight. Calling this from there would settle live attempts as
+/// dead, which is the precise corruption the sweep exists to clean up — so
+/// `build()` suppresses it whenever a
+/// [`RuntimeHandover`](crate::runtime::RuntimeHandover) is present. Any future
+/// caller owes the same argument: this function reclaims rows it can *prove* are
+/// abandoned, and outside boot that proof does not exist.
 ///
 /// **Parked runs are never touched.** `WaitingApproval` and `Paused` are
 /// waiting on a person or an external condition, not on a process; reaping them

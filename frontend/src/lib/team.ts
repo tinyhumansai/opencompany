@@ -19,12 +19,26 @@ export interface TeamMember {
    */
   inboxEnabled: boolean;
   /**
-   * The teammate's daily spend cap in USD, when the company sets one. Undefined
-   * means uncapped — the card shows no budget line at all rather than "$0".
+   * The teammate's daily spend cap in USD, as the host will enforce it — an
+   * admin's console override when one is set, otherwise the company's own
+   * default. Undefined means uncapped: the card shows no budget line at all
+   * rather than "$0".
    */
   budgetUsdDaily?: number;
   /** What this teammate has spent since 00:00 UTC; only meaningful with a cap. */
   spentTodayUsd?: number;
+  /**
+   * The admin who last set this teammate's cap from the console, when one did.
+   * Undefined means the cap (if any) is just the company default.
+   *
+   * Its presence is what makes "set" and "reset to default" different actions
+   * in the UI, and it is set even for an override that removed a cap — so an
+   * operator can see that a person uncapped this teammate rather than that it
+   * was never capped.
+   */
+  budgetSetBy?: string;
+  /** When that cap was set (epoch millis). Paired with `budgetSetBy`. */
+  budgetSetAtMillis?: number;
 }
 
 const TONE_KEYS = ["sky", "violet", "amber", "emerald", "rose", "cyan", "indigo", "teal"];
@@ -60,6 +74,10 @@ export function fromDto(dto: TeamMemberDto): TeamMember {
     // `undefined`, never coalesced to `0`.
     budgetUsdDaily: dto.budgetUsdDaily,
     spentTodayUsd: dto.spentTodayUsd,
+    // Same rule for the attribution — `undefined` means "no override stored",
+    // which the card renders differently from "an admin set this".
+    budgetSetBy: dto.budgetSetBy,
+    budgetSetAtMillis: dto.budgetSetAtMillis,
   };
 }
 

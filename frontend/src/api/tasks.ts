@@ -138,6 +138,28 @@ export interface TimelineEntry {
   waitedMillis?: number;
 }
 
+/**
+ * One message in a task's discussion thread (#335).
+ *
+ * The thread is the card's own, not a filtered view of company chat: it is
+ * journaled per task and served by the task-detail read, so a message posted
+ * here belongs to this card and nowhere else.
+ */
+export interface DiscussionMessage {
+  /** The journal sequence — the stable render key, and the thread's order. */
+  seq: number;
+  /** Epoch-millis the message was journaled. */
+  atMillis: number;
+  /**
+   * Who posted, as a label: a roster display name (or an email's local part),
+   * `someone` for a poster no longer on the roster, `operator` for a post made
+   * with a machine credential. The host never sends a user id or an email here.
+   */
+  author: string;
+  /** The message text, exactly as posted. */
+  text: string;
+}
+
 /** A neighbouring card in the lineage, trimmed to what a link needs (#185). */
 export interface LineageRef {
   id: string;
@@ -159,6 +181,23 @@ export interface TaskDetail {
   task: Task;
   /** The per-task event stream, oldest first. */
   timeline: TimelineEntry[];
+  /**
+   * The card's discussion thread, oldest first (#335).
+   *
+   * Carried on this read rather than fetched by the tab, so it refreshes on the
+   * screen's existing 4s poll: a message another operator posts appears here
+   * without a reload. Empty for a card nobody has posted on.
+   *
+   * Only the newest page of the thread — the host caps it so a long discussion
+   * is not re-serialized on every poll. Older messages come from the same read
+   * with `discussionBefore`.
+   */
+  discussion: DiscussionMessage[];
+  /**
+   * Whether the thread continues before {@link discussion}'s oldest message —
+   * i.e. whether "load earlier" has anything to load.
+   */
+  discussionHasMore: boolean;
   /** Parent and children. */
   lineage: TaskLineage;
   /**
@@ -184,14 +223,47 @@ export interface TaskDetail {
  * The Task Detail screen's single read (#185): assembles the card header, the
  * per-task timeline, the approvals trail (as `approval` timeline rows), and the
  * lineage into one response. 404s when the id names no card.
+ *
+ * `discussionBefore` walks *backwards* through the discussion: pass the `seq` of
+ * the oldest message held and the response carries the page before it. Omitted
+ * (the poll's shape) it returns the newest page — the thread is capped host-side
+ * so a long one is not re-sent whole every 4s.
  */
 export function getTaskDetail(
   client: OpenCompanyClient,
   company: string | null,
   id: string,
+  discussionBefore?: number,
 ): Promise<TaskDetail> {
+  const query =
+    discussionBefore === undefined
+      ? ""
+      : `?discussionBefore=${encodeURIComponent(discussionBefore)}`;
   return client.get<TaskDetail>(
-    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`,
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}${query}`,
+  );
+}
+
+/**
+ * Post a message to a task's discussion thread (#335).
+ *
+ * Answers `201` with the stored message, so the caller can render it at once;
+ * the next {@link getTaskDetail} poll returns the same message under the same
+ * `seq`. Rejects an empty message with a `400` and an unknown card with a `404`;
+ * a very long message is truncated by the host rather than refused.
+ *
+ * Posting runs no agent turn: this is a note on the card, not a way to ask for
+ * work. Dispatching stays the board's column drag.
+ */
+export function postTaskDiscussion(
+  client: OpenCompanyClient,
+  company: string | null,
+  id: string,
+  text: string,
+): Promise<DiscussionMessage> {
+  return client.post<DiscussionMessage>(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/discussion`,
+    { text },
   );
 }
 

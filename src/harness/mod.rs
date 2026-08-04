@@ -96,7 +96,7 @@ use crate::harness::mcp_probe::McpFailureQueue;
 use crate::harness::orchestrator::DelegationQueue;
 use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};
 use crate::ports::skills_state::{SkillState, SkillStateStore};
-use crate::ports::types::{CompanyId, CompanyRecord, OverlayAgent, TurnStep};
+use crate::ports::types::{BudgetOverride, CompanyId, CompanyRecord, OverlayAgent, TurnStep};
 use crate::ports::{
     ArtifactStore, CompanyStore, ContextStore, EventLog, FactStore, SecretStore, TaskStore,
     UsageMeter,
@@ -637,6 +637,20 @@ pub struct HarnessPool {
     /// process restart (the regression this fixes). With no skill store wired
     /// the delta set is always empty — stable fingerprint, no rebuild.
     skill_fingerprints: RwLock<HashMap<CompanyId, u64>>,
+    /// Fingerprint of the operator budget-override set the cached roster was
+    /// built from, keyed by company (issue #343). Drives budget freshness:
+    /// [`ensure`](Self::ensure) re-resolves the overrides from
+    /// [`HarnessDeps::store`] on every call and rebuilds the roster whenever a
+    /// cap is set, changed, cleared or reset — so a budget edited on the console
+    /// Team page reaches the dispatch gate and the per-agent
+    /// [`ApprovalPolicy`](policy::ApprovalPolicy) on the company's **next** turn,
+    /// with no restart and no redeploy. That is the entire point of #343: the
+    /// cap is enforced from the roster, and without this axis every other
+    /// fingerprint is stable on a budget-only change, so the fast path would
+    /// reuse a roster still carrying the old cap until the process restarted.
+    /// A company that never sets an override keeps an empty set and a stable
+    /// fingerprint — no rebuild, byte-identical to the pre-#343 behaviour.
+    budget_fingerprints: RwLock<HashMap<CompanyId, u64>>,
 }
 
 impl Default for HarnessPool {
@@ -668,6 +682,7 @@ impl HarnessPool {
             capability_fingerprints: RwLock::new(HashMap::new()),
             composio_fingerprints: RwLock::new(HashMap::new()),
             skill_fingerprints: RwLock::new(HashMap::new()),
+            budget_fingerprints: RwLock::new(HashMap::new()),
         }
     }
 
@@ -698,14 +713,27 @@ impl HarnessPool {
     /// when every other axis (MCP, overlay, capability, composio) is unchanged.
     /// With no skill store wired the delta set is empty and the fingerprint is
     /// stable — no rebuild, exactly as before.
+    ///
+    /// **Budget freshness (issue #343)**: the operator's per-teammate daily
+    /// spend caps ride the same live [`HarnessDeps::store`] read as the overlay
+    /// agents and are fingerprinted alongside them, so a cap set, raised,
+    /// cleared or reset from the console Team page rebuilds the roster and is
+    /// enforced on the company's **next** dispatch. Nothing downstream had to
+    /// change for this: the L1 gate in [`Self::run`] reads
+    /// [`CompanyAgent::budget_usd_daily`] and the policy arm reads the
+    /// [`ApprovalPolicy`](policy::ApprovalPolicy) both roster-built here, so
+    /// rebuilding the roster *is* the enforcement update. That is what makes
+    /// "no restart, no redeploy" a property of the design rather than a claim.
     pub async fn ensure(&self, company: &CompanyRecord, deps: &HarnessDeps) -> crate::Result<()> {
         // Re-resolve + fingerprint the effective MCP set (cheap; no rebuild yet).
         let effective_mcp = self.resolve_effective_mcp(company, deps).await;
         let mcp_fp = mcp_fingerprint(&effective_mcp);
 
-        // Re-resolve + fingerprint the live overlay-agent set the same way.
-        let overlay_agents = self.resolve_effective_overlay(company, deps).await;
+        // Re-resolve + fingerprint the live overlay-agent set the same way, and
+        // the operator budget overrides riding the same store read (issue #343).
+        let (overlay_agents, overlay_budgets) = self.resolve_effective_overlay(company, deps).await;
         let overlay_fp = overlay_fingerprint(&overlay_agents);
+        let budget_fp = budget_fingerprint(&overlay_budgets);
 
         // Re-resolve + fingerprint the tenant's capability filter (issue #108):
         // a per-tenant, per-period, fail-closed budget read from the meter. With
@@ -742,12 +770,14 @@ impl HarnessPool {
             let capability_fingerprints = self.capability_fingerprints.read().await;
             let composio_fingerprints = self.composio_fingerprints.read().await;
             let skill_fingerprints = self.skill_fingerprints.read().await;
+            let budget_fingerprints = self.budget_fingerprints.read().await;
             if agents.contains_key(&company.id)
                 && mcp_fingerprints.get(&company.id) == Some(&mcp_fp)
                 && overlay_fingerprints.get(&company.id) == Some(&overlay_fp)
                 && capability_fingerprints.get(&company.id) == Some(&capability_fp)
                 && composio_fingerprints.get(&company.id) == Some(&composio_fp)
                 && skill_fingerprints.get(&company.id) == Some(&skill_fp)
+                && budget_fingerprints.get(&company.id) == Some(&budget_fp)
             {
                 return Ok(());
             }
@@ -771,6 +801,11 @@ impl HarnessPool {
         // built from the live-resolved overlay set, not `company.overlay_agents`.
         let mut fresh_company = company.clone();
         fresh_company.overlay_agents = overlay_agents;
+        // Same treatment for the budget overrides (issue #343): `build_roster`
+        // resolves every agent's cap through `fresh_company.effective_budget`,
+        // so installing the live set here is what carries a console budget edit
+        // into the roster the very next turn runs on.
+        fresh_company.overlay_budgets = overlay_budgets;
         let roster = build_roster(&fresh_company, &fresh_deps, &skill_deltas)?;
 
         let mut agents = self.agents.write().await;
@@ -795,6 +830,10 @@ impl HarnessPool {
             .write()
             .await
             .insert(company.id.clone(), skill_fp);
+        self.budget_fingerprints
+            .write()
+            .await
+            .insert(company.id.clone(), budget_fp);
         Ok(())
     }
 
@@ -896,21 +935,30 @@ impl HarnessPool {
         }
     }
 
-    /// Re-resolves the company's live overlay-agent set (issue #71): reloads the
-    /// [`CompanyRecord`] from [`HarnessDeps::store`] so a teammate added through
-    /// the console `POST .../team` route or the orchestrator's `add_agent` tool
-    /// reaches the roster on the company's next `ensure` call — the same
-    /// live-re-resolution pattern as [`Self::resolve_effective_mcp`]. A missing
-    /// record or a store error degrades to the `company` snapshot passed in
-    /// (never worse than the pre-#71 always-static behaviour).
+    /// Re-resolves the company's live overlay-agent set (issue #71) **and** its
+    /// operator budget overrides (issue #343): reloads the [`CompanyRecord`]
+    /// from [`HarnessDeps::store`] so a teammate added through the console
+    /// `POST .../team` route or the orchestrator's `add_agent` tool, and a cap
+    /// written through `PUT .../team/{id}/budget`, both reach the roster on the
+    /// company's next `ensure` call — the same live-re-resolution pattern as
+    /// [`Self::resolve_effective_mcp`]. A missing record or a store error
+    /// degrades to the `company` snapshot passed in (never worse than the
+    /// pre-#71 always-static behaviour).
+    ///
+    /// The two collections share **one** store round-trip deliberately: they
+    /// come off the same record, and splitting them would double the per-turn
+    /// read for no gain.
     async fn resolve_effective_overlay(
         &self,
         company: &CompanyRecord,
         deps: &HarnessDeps,
-    ) -> Vec<OverlayAgent> {
+    ) -> (Vec<OverlayAgent>, Vec<BudgetOverride>) {
         match deps.store.load(&company.id).await {
-            Ok(Some(record)) => record.overlay_agents,
-            _ => company.overlay_agents.clone(),
+            Ok(Some(record)) => (record.overlay_agents, record.overlay_budgets),
+            _ => (
+                company.overlay_agents.clone(),
+                company.overlay_budgets.clone(),
+            ),
         }
     }
 
@@ -944,6 +992,15 @@ impl HarnessPool {
     #[cfg(test)]
     pub async fn skill_fingerprint_of(&self, company: &CompanyId) -> Option<u64> {
         self.skill_fingerprints.read().await.get(company).copied()
+    }
+
+    /// The current budget-override fingerprint for a company (test-only), so a
+    /// budget-freshness test can assert the roster was actually rebuilt after a
+    /// console cap change rather than inferring it from the refusal (issue
+    /// #343). This is the observable that makes "no restart" testable.
+    #[cfg(test)]
+    pub async fn budget_fingerprint_of(&self, company: &CompanyId) -> Option<u64> {
+        self.budget_fingerprints.read().await.get(company).copied()
     }
 
     /// Routes a message to one agent and returns its reply, recording the turn's
@@ -1409,6 +1466,47 @@ fn overlay_fingerprint(agents: &[OverlayAgent]) -> u64 {
     hasher.finish()
 }
 
+/// A stable fingerprint of a company's operator budget-override set (issue
+/// #343), used to detect a cap set / changed / cleared / reset between
+/// [`HarnessPool::ensure`] calls. Mirrors [`overlay_fingerprint`]'s shape; a
+/// [`BudgetOverride`] holds no secret.
+///
+/// Two details carry weight:
+///
+/// - The set is **sorted by `agent_id`** first, because the write routes push
+///   and retain rather than maintain an order, and an order-sensitive hash would
+///   rebuild the roster (dropping live agent sessions) on a save that changed
+///   nothing an agent can observe.
+/// - The cap is hashed as an `Option` **discriminant plus `f64::to_bits`**, not
+///   through `PartialEq`. `f64` is not `Hash`, and going through bits is also
+///   what keeps `Some(0.0)` distinct from `None` in the hash — the very
+///   distinction the issue insists must not collapse. `to_bits` additionally
+///   makes the hash total over values `PartialEq` would call incomparable.
+fn budget_fingerprint(overrides: &[BudgetOverride]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut ordered: Vec<&BudgetOverride> = overrides.iter().collect();
+    ordered.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+
+    let mut hasher = DefaultHasher::new();
+    ordered.len().hash(&mut hasher);
+    for entry in ordered {
+        entry.agent_id.hash(&mut hasher);
+        match entry.budget_usd_daily {
+            Some(cap) => {
+                1u8.hash(&mut hasher);
+                cap.to_bits().hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    // Attribution is deliberately NOT hashed: who set the cap and when changes
+    // nothing an agent can act on, and folding it in would rebuild the roster
+    // (discarding live sessions) every time the same value was re-saved.
+    hasher.finish()
+}
+
 /// A stable fingerprint of a company's operator skill-delta set (issue #41),
 /// used to detect a skill authored / edited / enabled / disabled between
 /// [`HarnessPool::ensure`] calls. Mirrors [`mcp_fingerprint`]'s shape.
@@ -1469,7 +1567,13 @@ pub(crate) fn build_roster(
         Vec::with_capacity(company.manifest.agents.len() + company.overlay_agents.len());
 
     for manifest_agent in &company.manifest.agents {
-        let mut agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily)
+        // Issue #343: the cap in force, not the one the manifest shipped with.
+        // `effective_budget` is an operator override when one is stored and the
+        // manifest value otherwise, so a console cap change reaches BOTH readers
+        // built below — the `ApprovalPolicy` arm and `CompanyAgent`'s copy that
+        // the L1 dispatch gate reads — from this one call.
+        let effective_budget = company.effective_budget(&manifest_agent.id);
+        let mut agent_policy = ApprovalPolicy::new(policy, effective_budget)
             .with_requests(deps.approval_requests.clone())
             // Issue #243: stamp who the parked effect belongs to, so approving it
             // can hand the grant back to this agent rather than to nobody.
@@ -1496,7 +1600,7 @@ pub(crate) fn build_roster(
         roster.push(Arc::new(CompanyAgent {
             agent_id: manifest_agent.id.clone(),
             role: manifest_agent.role.clone(),
-            budget_usd_daily: manifest_agent.budget_usd_daily,
+            budget_usd_daily: effective_budget,
             agent: Mutex::new(agent),
         }));
     }
@@ -1515,11 +1619,12 @@ pub(crate) fn build_roster(
             continue;
         }
         let manifest_agent = overlay_agent_to_manifest(overlay);
-        // No per-teammate budget cap or cognition-tier hint in v1 — see
-        // `overlay_agent_to_manifest`. The spend reader is still wired: the cap
-        // is `None`, so the arm is inert, but an overlay teammate that grows a
-        // cap later needs no second wiring site.
-        let mut agent_policy = ApprovalPolicy::new(policy, manifest_agent.budget_usd_daily)
+        // Issue #343: an overlay teammate has no manifest row to carry a cap, so
+        // before the override existed it was unconditionally uncapped — the "v1
+        // limitation" this lifts. `effective_budget` gives it a stored cap when
+        // an operator set one, and `None` (as before) when nobody has.
+        let effective_budget = company.effective_budget(&manifest_agent.id);
+        let mut agent_policy = ApprovalPolicy::new(policy, effective_budget)
             .with_requests(deps.approval_requests.clone())
             // An overlay teammate is a real roster agent and re-dispatches the
             // same way a manifest one does (issue #243).
@@ -1541,8 +1646,7 @@ pub(crate) fn build_roster(
         roster.push(Arc::new(CompanyAgent {
             agent_id: manifest_agent.id.clone(),
             role: manifest_agent.role.clone(),
-            // Overlay teammates are uncapped in v1 (`overlay_agent_to_manifest`).
-            budget_usd_daily: manifest_agent.budget_usd_daily,
+            budget_usd_daily: effective_budget,
             agent: Mutex::new(agent),
         }));
     }
@@ -1554,7 +1658,10 @@ pub(crate) fn build_roster(
 /// [`build::build_agent`] consumes: an empty `tools` list (so
 /// [`agent_effective_grants`] falls back to the full company `[tools].allow`
 /// — the "standard tool grant"), no cognition tier (→ the default `chat-v1`
-/// model), and no per-agent budget cap. The overlay's `name` is a display
+/// model), and no manifest budget cap — an overlay teammate has no manifest row
+/// at all, so its cap (if any) comes from the record's budget overrides via
+/// [`CompanyRecord::effective_budget`], resolved by the caller. The overlay's
+/// `name` is a display
 /// label only — already surfaced through
 /// [`crate::metering::roster_display_names`] — so the persona is framed from
 /// `role`/`description` alone, exactly like a manifest teammate
@@ -1750,6 +1857,7 @@ description = "Builds the product."
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -2714,6 +2822,7 @@ description = "Sets direction."
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -3167,6 +3276,269 @@ description = "Builds the product."
         assert!(
             ok.contains("hello-marker"),
             "one teammate's exhausted budget must not stop the company: {ok:?}"
+        );
+    }
+
+    // --- Console budget overrides, live (issue #343) -------------------------
+
+    /// **The no-restart proof.** A daily cap written through the company store —
+    /// the exact path `PUT …/team/{id}/budget` writes through — is enforced on
+    /// the company's **next dispatch**, in one process, with no restart and no
+    /// redeploy.
+    ///
+    /// This is the whole of #343 at the layer that decides whether a teammate
+    /// works. Before it, `budget_usd_daily` was readable only from the manifest,
+    /// which is a boot snapshot baked into the tenant image — so an operator
+    /// whose teammate had stopped had no remedy short of us shipping a new
+    /// image. The four phases walk exactly that operator's day:
+    ///
+    ///   A. the CEO has spent its manifest $5 and is refused (issue #304, and
+    ///      the state that motivates the issue);
+    ///   B. an admin **raises** the cap to $50 — the stopped teammate works
+    ///      again on its very next turn. This is the acceptance criterion;
+    ///   C. the admin sets the cap to **$0** — a real cap of nothing, refused
+    ///      from the first cent;
+    ///   D. the admin **clears** the cap — an explicitly-uncapped override that
+    ///      beats the manifest's $5 even with $5 already spent, so the teammate
+    ///      works again.
+    ///
+    /// C and D are the same route with different bodies and they must not
+    /// resolve alike: C refuses, D runs. That is "clearing is distinct from
+    /// zeroing" asserted on live behaviour rather than on a type.
+    ///
+    /// Throughout, the pool holds **one** resident company and is never
+    /// reconstructed — `resident_companies()` stays 1 and the same `pool` binding
+    /// serves every phase — so the only mechanism that can be carrying these
+    /// changes is the budget fingerprint flipping and `ensure` rebuilding the
+    /// roster in place. Each phase asserts that fingerprint actually moved.
+    #[tokio::test]
+    async fn a_budget_written_through_the_store_is_enforced_on_the_next_dispatch() {
+        use crate::ports::types::{Actor, ActorKind, BudgetOverride};
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = Arc::new(MockContext::default());
+        let meter = Arc::new(RecordingMeter::default());
+        let rec = capped_record();
+
+        // A live store, so `ensure` re-resolves the overrides the way it does in
+        // production. `deps_with_plan`'s default store is inert.
+        let live_store = Arc::new(LiveStore::default());
+        live_store.save(&rec).await.unwrap();
+
+        // The CEO has already spent its manifest $5 today.
+        meter
+            .record(
+                &rec.id,
+                &spend_sample("ceo", 5.00, crate::ports::now_millis()),
+            )
+            .await
+            .unwrap();
+
+        let mut deps = deps_with_plan(
+            dir.path(),
+            context.clone(),
+            Some(meter.clone() as Arc<dyn UsageMeter>),
+            None,
+        );
+        deps.store = live_store.clone();
+
+        // ONE pool for the whole test. Nothing below reconstructs it, so nothing
+        // below can be smuggling in a restart.
+        let pool = HarnessPool::new();
+
+        /// Writes an override through the store exactly as the console route
+        /// does, and returns the record for the next `ensure`.
+        fn with_override(base: &CompanyRecord, cap: Option<f64>) -> CompanyRecord {
+            let mut next = base.clone();
+            next.overlay_budgets = vec![BudgetOverride {
+                agent_id: "ceo".to_string(),
+                budget_usd_daily: cap,
+                set_by: Actor {
+                    kind: ActorKind::User,
+                    id: "user-admin".to_string(),
+                },
+                at_millis: crate::ports::now_millis(),
+            }];
+            next
+        }
+
+        // --- A. The manifest cap is spent: the teammate is stopped. ----------
+        pool.ensure(&rec, &deps).await.expect("ensure A");
+        let fp_manifest = pool
+            .budget_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        let refused = pool
+            .run(&rec.id, "ceo", "should-not-echo", &deps, None)
+            .await
+            .expect("a refusal is a benign outcome")
+            .reply;
+        assert_eq!(
+            refused,
+            agent_budget_exhausted_notice("ceo", 5.0),
+            "phase A: the manifest's $5 cap is spent, so dispatch is refused"
+        );
+
+        // --- B. An admin raises the cap. The teammate works again. -----------
+        live_store
+            .save(&with_override(&rec, Some(50.0)))
+            .await
+            .unwrap();
+        pool.ensure(&rec, &deps).await.expect("ensure B");
+        let fp_raised = pool
+            .budget_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert_ne!(
+            fp_manifest, fp_raised,
+            "phase B: setting a cap must move the budget fingerprint, or the \
+             cached roster is reused and the change never reaches the gate"
+        );
+        assert_eq!(
+            pool.resident_companies().await,
+            1,
+            "phase B: the same company, rebuilt in place — not a new process"
+        );
+        let unblocked = pool
+            .run(&rec.id, "ceo", "hello-marker", &deps, None)
+            .await
+            .expect("the raised cap unblocks the teammate")
+            .reply;
+        assert!(
+            unblocked.contains("hello-marker"),
+            "phase B: raising the cap from the console must unblock the stopped \
+             teammate on its very next dispatch, with no restart: {unblocked:?}"
+        );
+
+        // --- C. The admin sets the cap to zero. Zero is a real cap. ----------
+        live_store
+            .save(&with_override(&rec, Some(0.0)))
+            .await
+            .unwrap();
+        pool.ensure(&rec, &deps).await.expect("ensure C");
+        let fp_zero = pool
+            .budget_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert_ne!(fp_raised, fp_zero, "phase C: lowering a cap is a change");
+        let zeroed = pool
+            .run(&rec.id, "ceo", "should-not-echo", &deps, None)
+            .await
+            .expect("a refusal is a benign outcome")
+            .reply;
+        assert_eq!(
+            zeroed,
+            agent_budget_exhausted_notice("ceo", 0.0),
+            "phase C: a $0 cap refuses from the first cent"
+        );
+
+        // --- D. The admin clears the cap. Cleared is not zero. ---------------
+        live_store.save(&with_override(&rec, None)).await.unwrap();
+        pool.ensure(&rec, &deps).await.expect("ensure D");
+        let fp_cleared = pool
+            .budget_fingerprint_of(&rec.id)
+            .await
+            .expect("fingerprinted");
+        assert_ne!(
+            fp_zero, fp_cleared,
+            "phase D: 'no cap' and 'a cap of $0' must not hash alike — if they \
+             did, clearing a cap would silently leave the teammate at zero"
+        );
+        let cleared = pool
+            .run(&rec.id, "ceo", "hello-marker", &deps, None)
+            .await
+            .expect("an explicitly-uncapped teammate runs")
+            .reply;
+        assert!(
+            cleared.contains("hello-marker"),
+            "phase D: an explicitly-uncapped override beats the manifest's $5 \
+             even with $5 already spent today: {cleared:?}"
+        );
+
+        // Nothing above restarted anything.
+        assert_eq!(
+            pool.resident_companies().await,
+            1,
+            "one company, rebuilt in place across all four phases"
+        );
+
+        // A further `ensure` with no change is a no-op: the axis is not thrashing
+        // the roster (and dropping live agent sessions) on every turn.
+        pool.ensure(&rec, &deps).await.expect("ensure idempotent");
+        assert_eq!(pool.budget_fingerprint_of(&rec.id).await, Some(fp_cleared));
+    }
+
+    /// An **overlay** teammate — one added from the console, with no manifest
+    /// row — can be capped through the same override, and is refused when it has
+    /// spent it. Before #343 an overlay teammate was unconditionally uncapped
+    /// ("overlay teammates are uncapped in v1"), so this is a capability that did
+    /// not exist rather than a behaviour that changed.
+    #[tokio::test]
+    async fn an_overlay_teammate_can_be_capped_from_the_console() {
+        use crate::ports::types::{Actor, ActorKind, BudgetOverride};
+
+        let dir = tempfile::tempdir().unwrap();
+        let context = Arc::new(MockContext::default());
+        let meter = Arc::new(RecordingMeter::default());
+
+        let mut rec = record();
+        rec.overlay_agents.push(OverlayAgent {
+            id: "growth".into(),
+            name: "Jamie".into(),
+            role: "Growth Lead".into(),
+            description: None,
+        });
+        let live_store = Arc::new(LiveStore::default());
+        live_store.save(&rec).await.unwrap();
+
+        let mut deps = deps_with_plan(
+            dir.path(),
+            context.clone(),
+            Some(meter.clone() as Arc<dyn UsageMeter>),
+            None,
+        );
+        deps.store = live_store.clone();
+        let pool = HarnessPool::new();
+
+        // Uncapped to begin with: it answers.
+        pool.ensure(&rec, &deps).await.expect("ensure");
+        let reply = pool
+            .run(&rec.id, "growth", "hello-marker", &deps, None)
+            .await
+            .expect("an uncapped overlay teammate answers")
+            .reply;
+        assert!(reply.contains("hello-marker"), "got {reply:?}");
+
+        // The operator caps it at $1 and it has already spent $2.
+        meter
+            .record(
+                &rec.id,
+                &spend_sample("growth", 2.00, crate::ports::now_millis()),
+            )
+            .await
+            .unwrap();
+        let mut capped = rec.clone();
+        capped.overlay_budgets = vec![BudgetOverride {
+            agent_id: "growth".to_string(),
+            budget_usd_daily: Some(1.0),
+            set_by: Actor {
+                kind: ActorKind::User,
+                id: "user-admin".to_string(),
+            },
+            at_millis: crate::ports::now_millis(),
+        }];
+        live_store.save(&capped).await.unwrap();
+
+        pool.ensure(&rec, &deps).await.expect("ensure again");
+        let refused = pool
+            .run(&rec.id, "growth", "should-not-echo", &deps, None)
+            .await
+            .expect("a refusal is a benign outcome")
+            .reply;
+        assert_eq!(
+            refused,
+            agent_budget_exhausted_notice("growth", 1.0),
+            "a console-added teammate is capped by the same gate as a manifest one"
         );
     }
 

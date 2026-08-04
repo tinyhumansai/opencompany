@@ -147,11 +147,35 @@ struct Meta {
     /// through the store, so `#[serde(default)]` keeps those loading.
     #[serde(default)]
     overlay_workflows: Vec<crate::ports::types::OverlayWorkflow>,
+    /// The operator-set per-teammate daily spend caps (issue #343). Absent on
+    /// meta files written before the console could write a budget, so
+    /// `#[serde(default)]` keeps those loading with the manifest in charge.
+    #[serde(default)]
+    overlay_budgets: Vec<crate::ports::types::BudgetOverride>,
     /// The source-template provenance stamped at launch. `None` for companies
     /// provisioned from a raw manifest and for legacy meta files written before
     /// provenance existed (the `#[serde(default)]` keeps those loading).
     #[serde(default)]
     template_provenance: Option<crate::ports::types::TemplateProvenance>,
+}
+
+impl Default for Meta {
+    /// A bundle whose meta file has not been written yet: a running company
+    /// with no operator overlays and no recorded provenance. `lifecycle` is
+    /// `"running"` rather than `String::default()` — an empty lifecycle is not
+    /// a state this runtime has.
+    fn default() -> Self {
+        Self {
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
+            template_provenance: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,35 +218,14 @@ impl CompanyStore for FsCompanyStore {
             .map_err(|e| OpenCompanyError::Store(format!("invalid company.toml: {e}")))?;
 
         let meta_src = read_optional(&bundle.meta_json()).await?;
-        let (
-            lifecycle,
-            overlay_agents,
-            overlay_desk_members,
-            overlay_desk_order,
-            overlay_desks,
-            overlay_workflows,
-            template_provenance,
-        ) = if meta_src.trim().is_empty() {
-            (
-                "running".to_string(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            )
+        // A bundle with no meta file yet is a running company with no overlays —
+        // which is exactly `Meta::default()`. Carrying that through one value
+        // rather than a positional tuple keeps adding an overlay collection a
+        // one-line change here instead of a four-place one.
+        let meta: Meta = if meta_src.trim().is_empty() {
+            Meta::default()
         } else {
-            let meta: Meta = serde_json::from_str(&meta_src)?;
-            (
-                meta.lifecycle,
-                meta.overlay_agents,
-                meta.overlay_desk_members,
-                meta.overlay_desk_order,
-                meta.overlay_desks,
-                meta.overlay_workflows,
-                meta.template_provenance,
-            )
+            serde_json::from_str(&meta_src)?
         };
 
         let ledger = read_jsonl::<LedgerEntry>(&bundle.ledger_jsonl()).await?;
@@ -231,13 +234,14 @@ impl CompanyStore for FsCompanyStore {
             id: id.clone(),
             manifest,
             ledger,
-            lifecycle,
-            overlay_agents,
-            overlay_desk_members,
-            overlay_desk_order,
-            overlay_desks,
-            overlay_workflows,
-            template_provenance,
+            lifecycle: meta.lifecycle,
+            overlay_agents: meta.overlay_agents,
+            overlay_desk_members: meta.overlay_desk_members,
+            overlay_desk_order: meta.overlay_desk_order,
+            overlay_desks: meta.overlay_desks,
+            overlay_workflows: meta.overlay_workflows,
+            overlay_budgets: meta.overlay_budgets,
+            template_provenance: meta.template_provenance,
         }))
     }
 
@@ -256,6 +260,7 @@ impl CompanyStore for FsCompanyStore {
             overlay_desk_order: record.overlay_desk_order.clone(),
             overlay_desks: record.overlay_desks.clone(),
             overlay_workflows: record.overlay_workflows.clone(),
+            overlay_budgets: record.overlay_budgets.clone(),
             template_provenance: record.template_provenance.clone(),
         };
         write_atomic(&bundle.meta_json(), &serde_json::to_string(&meta)?).await?;
@@ -957,6 +962,7 @@ mod test {
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         };
         store.save(&record).await.unwrap();
@@ -996,6 +1002,7 @@ mod test {
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await

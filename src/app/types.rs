@@ -369,6 +369,22 @@ pub struct AppState {
             HashMap<String, (std::time::Instant, crate::company::mcp_oauth::PendingOAuth)>,
         >,
     >,
+    /// Issue #290: this host's ability to rebuild a registered company's runtime
+    /// in place, so a first-time inference config takes effect without a process
+    /// restart.
+    ///
+    /// Wired by the binary, which is where the builder inputs (harness pool,
+    /// OpenHuman RPC, managed backends, per-tenant mailbox) are assembled.
+    /// `None` — every test host, and any embedder that does not wire one — keeps
+    /// the pre-#290 behaviour: the inference status still reports
+    /// `restartRequired` and the console still says so, which is the honest
+    /// answer when a rebuild is genuinely unavailable.
+    rebuilder: Option<Arc<dyn crate::runtime::RuntimeRebuilder>>,
+    /// The boot-only builder inputs recorded per company at registration, so a
+    /// rebuild configures the successor exactly as boot configured its
+    /// predecessor. See [`BootInputs`](crate::runtime::BootInputs) for why
+    /// `--discoverable` in particular cannot be recovered any other way.
+    boot_inputs: Arc<RwLock<HashMap<CompanyId, crate::runtime::BootInputs>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -403,7 +419,43 @@ impl AppState {
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
             #[cfg(feature = "mcp")]
             oauth_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            rebuilder: None,
+            boot_inputs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Wires this host's in-place runtime rebuilder (issue #290).
+    pub fn with_rebuilder(mut self, rebuilder: Arc<dyn crate::runtime::RuntimeRebuilder>) -> Self {
+        self.rebuilder = Some(rebuilder);
+        self
+    }
+
+    /// This host's in-place runtime rebuilder, when one is wired.
+    pub fn rebuilder(&self) -> Option<Arc<dyn crate::runtime::RuntimeRebuilder>> {
+        self.rebuilder.clone()
+    }
+
+    /// Records the boot-only builder inputs for `id`, at registration.
+    ///
+    /// Cloned state shares this map (it is `Arc`-backed), so a company
+    /// registered after the router was built is still reachable by a rebuild.
+    pub fn set_boot_inputs(&self, id: CompanyId, inputs: crate::runtime::BootInputs) {
+        self.boot_inputs
+            .write()
+            .expect("boot inputs poisoned")
+            .insert(id, inputs);
+    }
+
+    /// The boot-only builder inputs recorded for `id`, or the defaults when the
+    /// company was registered without any (a platform-provisioned tenant has no
+    /// source directory and was never `--discoverable`).
+    pub fn boot_inputs(&self, id: &CompanyId) -> crate::runtime::BootInputs {
+        self.boot_inputs
+            .read()
+            .expect("boot inputs poisoned")
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Sets the OpenCompany home root used to resolve company identities.

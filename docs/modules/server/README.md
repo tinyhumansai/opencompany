@@ -36,7 +36,7 @@ address check for `{id}`, operator + `sole()` for the alias).
 
 | Surface (`ops::*`) | Routes |
 |---|---|
-| `tasks` | `POST …/tasks`, `PATCH`/`DELETE …/tasks/{id}` |
+| `tasks` | `POST …/tasks`, `GET …/tasks`, `GET …/tasks/{id}` (the Task Detail read, #185), `PATCH`/`DELETE …/tasks/{id}`, `GET …/tasks/inflight`, `POST …/tasks/{id}/steer` (#111), `POST …/tasks/{id}/discussion` (#335) |
 | `memory` | `POST …/memory`, `DELETE …/memory/{id}` (journals `MemoryFactDeleted`) |
 | `workspace` | `GET …/workspace`, `GET …/workspace/file/{id}`, `POST …/workspace`, `PUT …/workspace/file/{id}`, `PATCH`/`DELETE …/workspace/{id}` (the two `GET`s are REST twins of the GraphQL reads — the console has no GraphQL client, #177) |
 | `skills` | `POST …/skills`, `GET …/skills/registry`, `POST …/skills/{slug}/install\|uninstall`, `PUT …/skills/{slug}` |
@@ -47,6 +47,98 @@ address check for `{id}`, operator + `sole()` for the alias).
 | `smtp` | `PUT …/smtp`, `POST …/smtp/test` |
 | `connections` (feature `oauth`) | `POST …/connections/{provider}/start\|disconnect`, `GET /api/v1/oauth/callback` |
 | `workflows` | `POST …/workflows`, `GET …/workflows`, `GET …/workflows/runs`, `POST …/workflows/cron/preview`, `GET …/workflows/{wid}`, `PUT …/workflows/{wid}`, `DELETE …/workflows/{wid}`, `POST …/workflows/{wid}/run` |
+
+### The per-task discussion (issue #335)
+
+The Task Detail screen's Discussion tab shipped as an honest stub with no
+backend. This is what was decided when it got one, written down here rather
+than left to be inferred from the schema.
+
+**A task discussion is its own thread, not a filtered view of company chat.**
+The alternative — reuse the chat store and filter it to a card — is cheaper and
+was rejected: chat is addressed to a *desk* and is a conversation with the
+company, while a discussion is addressed to a *card* and is a note about one
+piece of work. Filtering one into the other would mean every card's thread is a
+slice of a stream whose messages were written for a different audience, and a
+card would stop being the record of its own work the moment somebody replied in
+the desk instead.
+
+**One store, two projections.** The thread is *not* a second message store: a
+post is journaled as `CompanyEvent::TaskDiscussionPosted`, in the same
+company `EventLog` the timeline is folded from, and `GET …/tasks/{task_id}`
+serves both out of **one** traversal (`fold_task_journal`). That is what keeps
+the two notions of "something happened on this task" from drifting — they are
+the same log read two ways.
+
+They stay two *arrays* rather than one merged list because they answer different
+questions: the timeline is the record of what the **company** did on the card
+(dispatch, replies, failed tool calls, approvals, completion), and the
+discussion is what **people** said about it. Merged, an operator's aside would
+sit between a dispatch and its completion and read as part of the run.
+
+**What the shared log costs, stated plainly.** The read rides a cost that was
+already there — the detail folded the whole journal per request before this
+existed. The *write* does not: it points a new, human-paced, unbounded writer at
+the log every other projection folds over, with no retention or compaction for
+it anywhere in the tree. That is not hypothetical — it is the conclusion the
+runtime already reached and acted on: `src/ports/runs.rs` (#342) says outright
+that "folding the whole journal per read is what makes the existing workflow-run
+list expensive", #242 answered it by giving runs a store of their own instead of
+more events, and #357 now writes a `RunRecord` per attempt on `main`. This goes
+the other way knowingly: one small event per post with no per-step fan-out, and
+a paged read so thread length no longer sets response size. But it is a shared
+log with an extra writer on it, and the moment a thread needs history, search or
+retention it wants the same treatment runs got.
+
+**The read is paged.** `GET …/tasks/{taskId}` answers with the newest
+`DISCUSSION_PAGE` (50) messages plus `discussionHasMore`, and
+`?discussionBefore=<seq>` walks backwards — the `first` + `before_seq` shape
+`chat_history::history_for_desk` already uses. Without it the whole thread is
+re-sent on every 4s poll, per browser, forever. The fold drops out-of-window
+posts as it reads them, so a long thread is traversed but never resident. The
+timeline is *not* paged: it is bounded by what the company did on one card.
+
+**Operator-only in v1; agents do not participate.** Posting journals a message
+and nothing else: no cycle runs, no turn is dispatched, and no agent reads the
+thread back. The projections enforce it rather than merely documenting it — the
+sidecar wire body (`wire_event`) and the orchestrator's insight line
+(`summarize_event`) both name the *card* and deliberately omit the *text*, so
+the tab cannot become an unannounced prompt surface. Nor does a post hold a slot
+in the orchestrator's ten-event activity tail: they fold there into one
+"N discussion posts" line, because a card's afternoon of back-and-forth would
+otherwise evict every dispatch, reply and approval from the only view the
+orchestrator has of the company — "agents do not participate" has to hold for
+the *slot* as well as the *text*.
+
+Agent participation is a product decision to take with first-class runs (#242):
+a discussion anchored to a task and one anchored to a run are different things.
+That deferral was cleaner when this branch was cut than it is now — #342 landed
+`RunStore` and #357 landed the write path, so an attempt *is* a first-class
+record on `main` and the question is answerable rather than blocked. Still
+deferred, but on scope, not on missing prior art.
+
+**Ordering, editing, deletion, references.** Oldest-first by journal sequence,
+which is also the console's render key. The journal is append-only, so v1 has no
+edit and no delete — what was said stays said; a retraction would need a
+tombstone event and is not one. That is a real gap: the log is what export/import
+ships, and a discussion is exactly where somebody pastes the API key they are
+blocked on. Tracked as **#358**, a redaction path for journaled human prose. A
+message is plain text: it cannot yet reference an artifact or an approval, left
+until there is a link target more durable than a row's position.
+
+**Attribution.** A post carries the signed-in user as `by`, resolved to a roster
+label on read (a display name, or an email's local part). A user no longer on
+the roster reads as `someone`; a post made with a machine credential reads as
+`operator`. A user id and an email address never reach the wire — a thread is
+read by every member of the company.
+
+The write is `POST …/tasks/{taskId}/discussion` with `{text}`. Empty or
+whitespace-only text is a `400` (there is no delete, so a blank row would be
+permanent noise), an unknown card is a `404`, and over-long text is truncated to
+`MAX_DISCUSSION_CHARS` rather than refused. The `201` echoes the journaled row —
+read back at its own `seq`, not re-stamped — so the console renders the post at
+once under the key the next poll returns it under. Reads ride the detail's 4s
+poll, which is what makes another operator's post appear without a reload.
 
 ### Reading a trigger's cron back (issue #262)
 

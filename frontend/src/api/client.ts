@@ -32,6 +32,7 @@ import {
   type FinancesDto,
   type InboxDto,
   type InboxMessageDto,
+  type SetBudgetInput,
   type TeamMemberDto,
   type UsageDto,
   type Verdict,
@@ -335,10 +336,51 @@ export class OpenCompanyClient {
    * callers fall back to a local-only add.
    */
   addTeamMember(
-    input: { name: string; role: string; description?: string },
+    input: { name: string; role: string; description?: string; budgetUsdDaily?: number },
     company?: string | null,
   ): Promise<TeamMemberDto> {
     return this.request<TeamMemberDto>("POST", `${this.scope(company)}/team`, input);
+  }
+
+  /**
+   * Set, change, or remove a teammate's daily spend cap (issue #343). Admin-only
+   * on the host — a member gets 403 — and the change is enforced on the
+   * company's next dispatch, with no restart.
+   *
+   * Pass `null` to remove the cap and a number to set one; `0` is a real cap of
+   * nothing, not the same thing as `null`. The argument is required precisely so
+   * an accidental `undefined` cannot be serialised away into `{}`, which the host
+   * rejects with a 422 rather than reading as "remove the cap".
+   *
+   * Returns the teammate's updated roster row, so the caller can refresh one
+   * card instead of refetching the team.
+   */
+  setTeamBudget(
+    agentId: string,
+    budgetUsdDaily: number | null,
+    company?: string | null,
+  ): Promise<TeamMemberDto> {
+    const body: SetBudgetInput = { budgetUsdDaily };
+    return this.request<TeamMemberDto>(
+      "PUT",
+      `${this.scope(company)}/team/${encodeURIComponent(agentId)}/budget`,
+      body,
+    );
+  }
+
+  /**
+   * Drop a teammate's cap override so the company's manifest default applies
+   * again (issue #343). Admin-only.
+   *
+   * Not the same as `setTeamBudget(id, null)`: that stores "uncapped, decided by
+   * an admin", while this restores whatever the company defines — which for a
+   * manifest-capped teammate brings the cap back.
+   */
+  clearTeamBudgetOverride(agentId: string, company?: string | null): Promise<TeamMemberDto> {
+    return this.request<TeamMemberDto>(
+      "DELETE",
+      `${this.scope(company)}/team/${encodeURIComponent(agentId)}/budget`,
+    );
   }
 
   /** Remove an operator-added teammate. 409s for a manifest teammate (can't be removed here). */

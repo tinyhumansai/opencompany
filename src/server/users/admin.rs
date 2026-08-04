@@ -79,7 +79,15 @@ fn unauthorized() -> Response {
 }
 
 /// Requires a live session whose user is an admin of this company.
-async fn require_admin(
+///
+/// Shared beyond this module (issue #343: the team budget writes) so "who may
+/// administer this company" is decided in exactly one place. Note what it
+/// resolves through: [`current_user`] yields a principal only for a **human**
+/// session, so a platform/tenant bearer — a machine credential — is not an
+/// admin here and is refused as unauthenticated. That is the same "no operator
+/// break-glass" doctrine this module's header states, and it is what makes the
+/// attribution recorded by callers a real person rather than a token.
+pub(crate) async fn require_admin(
     headers: &HeaderMap,
     state: &AppState,
     runtime: &CompanyRuntime,

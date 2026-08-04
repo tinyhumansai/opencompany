@@ -37,7 +37,9 @@ import {
   getTaskDetail,
   listInflight,
   patchTask,
+  postTaskDiscussion,
   steerTask,
+  type DiscussionMessage,
   type InflightRun,
   type StepStatus,
   type SteerAction,
@@ -82,6 +84,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
@@ -432,11 +435,16 @@ export function TaskDetailView({
               </TabsContent>
 
               <TabsContent value="discussion" className="mt-4">
-                {/* No backend for per-task discussion yet — honest empty state,
-                    no fake threads. */}
-                <EmptyState
-                  title="No discussion yet"
-                  body="A per-task discussion thread has no backend yet."
+                <DiscussionTab
+                  // Keyed by card: a different task is a different thread, and
+                  // the tab accumulates the one it is shown.
+                  key={detail.task.id}
+                  messages={detail.discussion}
+                  hasMore={detail.discussionHasMore}
+                  taskId={detail.task.id}
+                  client={client}
+                  company={company}
+                  onPosted={load}
                 />
               </TabsContent>
             </Tabs>
@@ -1450,6 +1458,206 @@ function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
           ))}
         </ol>
       )}
+    </div>
+  );
+}
+
+/**
+ * The Task Detail **Discussion** tab (#335): the card's own message thread.
+ *
+ * A task discussion is a thread of its own, not the company chat filtered to a
+ * card — so a message posted here is about *this* work and is read by whoever
+ * opens the card next. It is served on the parent's single `GET …/tasks/{id}`
+ * (#185) and therefore rides its 4s poll: a colleague's post lands here without
+ * a reload, which is the whole point of putting the conversation on the card.
+ *
+ * Operator-only in v1. Posting deliberately runs no agent turn — nothing here
+ * dispatches work or spends money, which stays behind the board's column drag.
+ * There is no edit and no delete either: the thread is journal-backed and
+ * append-only, so what was said stays said.
+ *
+ * The poll carries only the newest page of the thread (the host caps it so a
+ * long discussion is not re-sent every 4s). Older messages are pulled on demand
+ * and kept here, so walking back through a thread survives the next poll.
+ */
+function DiscussionTab({
+  messages,
+  hasMore,
+  taskId,
+  client,
+  company,
+  onPosted,
+}: {
+  messages: DiscussionMessage[];
+  hasMore: boolean;
+  taskId: string;
+  client: OpenCompanyClient;
+  company: string | null;
+  onPosted: () => Promise<void>;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  /**
+   * Every message this tab has been shown, oldest first, deduped by `seq` — the
+   * journal key, and the only identity a message has.
+   *
+   * The poll carries a *sliding* page, so a new post pushes the oldest message
+   * of that page out of it; rendering the page directly would make a message
+   * disappear from under someone mid-read. Accumulating means the thread on
+   * screen only ever grows: the poll adds new posts, "load earlier" adds old
+   * ones, and the `201` echo adds your own before the poll comes round.
+   *
+   * Mounted per card (the parent keys this component by task id), so this never
+   * holds another card's thread.
+   */
+  const [thread, setThread] = useState<DiscussionMessage[]>([]);
+  /**
+   * Whether anything remains before the oldest message held. `null` until an
+   * older page has been pulled, when that page's own flag is the answer.
+   */
+  const [earlierHasMore, setEarlierHasMore] = useState<boolean | null>(null);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  const absorb = useCallback((rows: DiscussionMessage[]) => {
+    setThread((prev) => {
+      const bySeq = new Map<number, DiscussionMessage>(
+        prev.map((m) => [m.seq, m] as const),
+      );
+      let added = false;
+      for (const m of rows) {
+        if (!bySeq.has(m.seq)) {
+          bySeq.set(m.seq, m);
+          added = true;
+        }
+      }
+      // Same list back when the poll brought nothing new — the common case, and
+      // the one that must not churn the render.
+      return added ? [...bySeq.values()].sort((a, b) => a.seq - b.seq) : prev;
+    });
+  }, []);
+
+  useEffect(() => {
+    absorb(messages);
+  }, [messages, absorb]);
+
+  const moreBefore = earlierHasMore ?? hasMore;
+
+  async function loadEarlier() {
+    const oldest = thread[0]?.seq;
+    if (oldest === undefined || loadingEarlier) return;
+    setLoadingEarlier(true);
+    try {
+      const page = await getTaskDetail(client, company, taskId, oldest);
+      absorb(page.discussion);
+      setEarlierHasMore(page.discussionHasMore);
+    } catch (e) {
+      toast.error(
+        e instanceof Error ? e.message : "could not load earlier messages",
+      );
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
+
+  async function post() {
+    const body = text.trim();
+    if (!body || busy) return;
+    setBusy(true);
+    try {
+      const posted = await postTaskDiscussion(client, company, taskId, body);
+      // Shown straight away rather than after the poll: the host journaled it
+      // and handed the stored row back, so waiting up to four seconds to show
+      // an operator their own message buys nothing. It carries the journaled
+      // `seq` and stamp, so the poll's copy collapses onto it.
+      absorb([posted]);
+      // Cleared only after the host accepted it, so a failed post leaves the
+      // operator's words in the box rather than losing them.
+      setText("");
+      await onPosted();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "could not post the message");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      {thread.length === 0 ? (
+        <EmptyState
+          title="No discussion yet"
+          body="Post the first message to start this card's thread."
+        />
+      ) : (
+        <ol className="space-y-1.5">
+          {moreBefore ? (
+            <li className="pb-1 text-center">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={loadingEarlier}
+                onClick={() => void loadEarlier()}
+              >
+                {loadingEarlier ? (
+                  <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                ) : null}
+                Load earlier messages
+              </Button>
+            </li>
+          ) : null}
+          {thread.map((m) => (
+            <li key={m.seq} className="rounded-lg border bg-card px-3 py-2">
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <MessagesSquare className="size-3.5 shrink-0" aria-hidden />
+                <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                  {m.author}
+                </span>
+                <span
+                  className="shrink-0 tabular-nums"
+                  title={new Date(m.atMillis).toLocaleString()}
+                >
+                  {timeOf(m.atMillis)}
+                </span>
+              </div>
+              <p className="mt-1 whitespace-pre-wrap break-words text-xs">{m.text}</p>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      <div className="flex items-start gap-2">
+        <Textarea
+          value={text}
+          placeholder="Write a message about this task…"
+          rows={2}
+          className="min-h-16 text-xs"
+          disabled={busy}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            // Enter posts; Shift+Enter is a newline. A note about a task is
+            // usually one line, and the mouse trip for every one of them is
+            // what stops people writing them down at all.
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void post();
+            }
+          }}
+        />
+        <Button
+          size="sm"
+          className="h-8 shrink-0"
+          disabled={busy || !text.trim()}
+          onClick={() => void post()}
+        >
+          {busy ? (
+            <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+          ) : (
+            <Send className="mr-1.5 size-3.5" />
+          )}
+          Post
+        </Button>
+      </div>
     </div>
   );
 }

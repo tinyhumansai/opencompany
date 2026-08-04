@@ -373,6 +373,7 @@ impl CompanyStore for SqliteStore {
             overlay_desk_order: overlay.desk_order,
             overlay_desks: overlay.desks,
             overlay_workflows: overlay.workflows,
+            overlay_budgets: overlay.budgets,
             template_provenance: overlay.provenance,
         }))
     }
@@ -2330,6 +2331,7 @@ mod test {
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await

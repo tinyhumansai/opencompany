@@ -94,7 +94,16 @@ construction, ≥1 response per cycle) are inherited, not re-verified.
 Durable company records: charter, roster, ledger, approval queue.
 
 The record also carries the **operator overlays** — teammates, desk members,
-desk order, operator-created desks, and (issue #168) `overlay_workflows`: the
+desk order, operator-created desks, (issue #343) `overlay_budgets`: the
+per-teammate daily spend caps an admin sets from the console, which win over the
+manifest's `budget_usd_daily` and are read through
+`CompanyRecord::effective_budget` — the single reconciliation point the harness
+gate, the approval policy, and both roster reads share, so a cap raised in the
+console cannot be honoured by one surface and ignored by another. At most one
+`overlay_budgets` entry may exist per teammate — the console write path upserts
+through `CompanyRecord::upsert_budget_override`, and a bundle import carrying two
+entries for the same teammate is rejected rather than resolved by guesswork.
+And (issue #168) `overlay_workflows`: the
 workflow graph bodies authored at runtime through the console's create dialog or
 the orchestrator's `create_workflow` tool. These are persisted here rather than
 written into `companies/<name>/workflows/<id>.toml` because the company source
@@ -119,8 +128,12 @@ Every other manifest field is **seed-authoritative**; for `[tools]` and
 `[policy]` that is a security property, not a convention — a record-wins merge
 would let a runtime grant or a relaxed approval mode outlive the operator
 revoking it in version control. Runtime additions that must persist get their own
-overlay field instead (`overlay_agents`, `overlay_desks`, the `SecretStore` for
-console MCP credentials).
+overlay field instead (`overlay_agents`, `overlay_desks`, `overlay_budgets`, the
+`SecretStore` for console MCP credentials). `overlay_budgets` is the clearest
+case for why: a manifest baked into a hosted tenant's image cannot be edited at
+all, so without a record-side override the shipped cap would be the only cap
+forever — while keeping it *seed-authoritative* for everything else is what stops
+a console write from silently outliving a revocation in version control.
 
 ```rust
 // src/ports/store.rs
@@ -155,7 +168,10 @@ orchestrator's `create_workflow` tool; journaled best-effort after persist),
 `TaskSteered` (an operator paused, cancelled, or redirected an in-flight task
 or delegation), `DeskTaskCompleted` (a dispatched board task finished its run —
 the terminal anchor a per-task timeline ends on; "completed" means the run
-stopped, not that it succeeded, and `column` carries where the card landed).
+stopped, not that it succeeded, and `column` carries where the card landed),
+`TaskDiscussionPosted` (a human posted to a card's discussion thread, issue
+#335 — the Discussion tab's whole store, folded back out by
+`GET …/tasks/{task_id}` beside that card's timeline).
 
 ### Per-task event correlation (issue #185)
 
@@ -656,6 +672,11 @@ serialise per company.
 at least one approval finishes `waiting_approval`, not `succeeded` — a person
 must act. A failed, cancelled or paused run keeps the reason it stopped;
 relabelling it "waiting on you" would hide that reason.
+
+**A runtime being replaced is a fifth writer.** Writer 1 mints the row before
+writer 2 can start it, so a runtime swapped in between refuses the cycle and
+settles the row itself — and the boot reaper is *not* a safe fallback mid-life.
+See [rebuild.md](rebuild.md#attempt-rows-242).
 
 #### Correlation fields elsewhere
 

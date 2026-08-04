@@ -192,6 +192,70 @@ async fn register_company(
             path: Some(slug.to_string()),
         }
     });
+    // Shared-single-DB mode: namespace the derived id with this tenant so the
+    // same boot template (`OPENCOMPANY_COMPANY`) does not collide across tenants
+    // in one logical database. A no-op when `tenant_namespace` is unset.
+    let derived = opencompany::runtime::company_id_from_name(&name);
+    let company_id = state.config().namespaced_company_id(derived);
+    let mut builder = company_builder(
+        state,
+        home,
+        manifest,
+        &company_id,
+        Some(source_dir.clone()),
+        discoverable,
+    )?;
+    if let Some(provenance) = provenance {
+        builder = builder.with_template_provenance(provenance);
+    }
+    let runtime = builder.build().await?;
+    let company_id = runtime.id().clone();
+    let id = company_id.as_ref().to_string();
+    // Record boot-company ownership so a shared-DB manager can later purge by
+    // tenant. Only meaningful in tenant-namespace mode; otherwise skipped so
+    // db-per-tenant / self-hosted deployments keep their in-memory-only stub.
+    if let Some(tenant) = state.config().tenant_namespace.clone() {
+        // Canonical (bare-slug) form so the persisted `owners` row matches what
+        // tenant-scoped auth compares a `tenant:acme` claim against.
+        let tenant = opencompany::app::canonical_tenant(&tenant).to_string();
+        state.set_owner(company_id.clone(), tenant.clone());
+        if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
+            && let Err(err) = ownership.set_owner(&company_id, &tenant).await
+        {
+            eprintln!("failed to persist ownership for `{id}`: {err}");
+        }
+    }
+    // Issue #290: stash what a later in-place rebuild cannot recover any other
+    // way. `--discoverable` is the case that forces this to exist: it lives only
+    // in the `serve` stack frame and mutates the manifest before the build.
+    state.set_boot_inputs(
+        company_id.clone(),
+        opencompany::runtime::BootInputs {
+            source_dir: Some(source_dir),
+            discoverable,
+        },
+    );
+    state.registry().insert(company_id, Arc::new(runtime));
+    Ok((id, name, schedules))
+}
+
+/// Assembles the `RuntimeBuilder` for one company with this host's full boot
+/// wiring: the OpenHuman RPC transport, the harness pool and its managed
+/// backends, feedback routing, the opened storage backend and memory overlay,
+/// the shared skill library, and the manager-injected per-tenant mailbox.
+///
+/// Extracted from [`register_company`] so an in-place rebuild (issue #290) runs
+/// the *same* wiring boot ran. A rebuild that assembled its own would drift from
+/// boot silently, and the first symptom would be a company that came back from a
+/// rebuild missing a capability nobody changed.
+fn company_builder(
+    state: &AppState,
+    home: &std::path::Path,
+    manifest: CompanyManifest,
+    company_id: &CompanyId,
+    source_dir: Option<PathBuf>,
+    discoverable: bool,
+) -> Result<RuntimeBuilder> {
     let mut builder = attach_tinyhumans_feedback(
         attach_harness(attach_openhuman(RuntimeBuilder::new(
             home.to_path_buf(),
@@ -199,19 +263,13 @@ async fn register_company(
         ))),
         state.config(),
     )
-    .with_seed_dir(source_dir.clone())
     .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
     .with_host_base_url(state.config().host_base_url())
-    .with_skills_registry(state.shared_skill_registry()?);
-    if let Some(provenance) = provenance {
-        builder = builder.with_template_provenance(provenance);
+    .with_skills_registry(state.shared_skill_registry()?)
+    .with_id(company_id.clone());
+    if let Some(source_dir) = source_dir {
+        builder = builder.with_seed_dir(source_dir);
     }
-    // Shared-single-DB mode: namespace the derived id with this tenant so the
-    // same boot template (`OPENCOMPANY_COMPANY`) does not collide across tenants
-    // in one logical database. A no-op when `tenant_namespace` is unset.
-    let derived = opencompany::runtime::company_id_from_name(&name);
-    let company_id = state.config().namespaced_company_id(derived);
-    builder = builder.with_id(company_id.clone());
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
@@ -235,25 +293,39 @@ async fn register_company(
     if discoverable {
         builder = builder.with_discoverable(true);
     }
-    let runtime = builder.build().await?;
-    let company_id = runtime.id().clone();
-    let id = company_id.as_ref().to_string();
-    // Record boot-company ownership so a shared-DB manager can later purge by
-    // tenant. Only meaningful in tenant-namespace mode; otherwise skipped so
-    // db-per-tenant / self-hosted deployments keep their in-memory-only stub.
-    if let Some(tenant) = state.config().tenant_namespace.clone() {
-        // Canonical (bare-slug) form so the persisted `owners` row matches what
-        // tenant-scoped auth compares a `tenant:acme` claim against.
-        let tenant = opencompany::app::canonical_tenant(&tenant).to_string();
-        state.set_owner(company_id.clone(), tenant.clone());
-        if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
-            && let Err(err) = ownership.set_owner(&company_id, &tenant).await
-        {
-            eprintln!("failed to persist ownership for `{id}`: {err}");
-        }
+    Ok(builder)
+}
+
+/// This host's in-place runtime rebuilder (issue #290).
+///
+/// Lives in the binary because [`company_builder`] does: the harness pool, the
+/// OpenHuman transport and the managed media/search backends are assembled here
+/// from the process environment and feature flags, and a rebuild that did not
+/// reuse that assembly would quietly produce a differently-wired company.
+struct BootRebuilder;
+
+#[async_trait::async_trait]
+impl opencompany::runtime::RuntimeRebuilder for BootRebuilder {
+    async fn rebuild(
+        &self,
+        state: &AppState,
+        request: opencompany::runtime::RebuildRequest,
+    ) -> Result<opencompany::CompanyRuntime> {
+        company_builder(
+            state,
+            state.home(),
+            request.manifest,
+            &request.id,
+            request.boot.source_dir,
+            request.boot.discoverable,
+        )?
+        // The whole point: the successor adopts the live journal, approval gate,
+        // grant set, stores, harness pool, MCP runtime and serialising mutexes
+        // rather than constructing a second copy of any of them.
+        .with_handover(request.handover)
+        .build()
+        .await
     }
-    state.registry().insert(company_id, Arc::new(runtime));
-    Ok((id, name, schedules))
 }
 
 /// Starts a company's cron scheduler as a background task, if it has schedules.
@@ -273,7 +345,15 @@ fn spawn_scheduler(
     }
     let runtime = state.registry().get(&CompanyId::new(id))?;
     match CompanyScheduler::new(runtime, schedules, Arc::new(SystemClock)) {
-        Ok(scheduler) => Some(scheduler.spawn(shutdown.clone())),
+        // Follow the registry so an in-place rebuild (issue #290) reaches cron.
+        // Without this the scheduler keeps driving the runtime it snapshotted —
+        // which after a rebuild is the replaced, quiesced one, i.e. exactly the
+        // "scheduled workflows never fire" surface #266 was reported against.
+        Ok(scheduler) => Some(
+            scheduler
+                .following(state.registry().clone())
+                .spawn(shutdown.clone()),
+        ),
         Err(err) => {
             eprintln!("skipping scheduler for `{id}`: {err}");
             None
@@ -345,7 +425,10 @@ fn spawn_mailbox_poller(
             cfg.imap.clone(),
             cfg.address.clone(),
             interval,
-        );
+        )
+        // See `spawn_scheduler`: follow the registry so a rebuild reaches
+        // inbound mail instead of stranding it on the replaced runtime.
+        .following(state.registry().clone());
         handles.push(poller.spawn(shutdown.clone()));
     }
     #[cfg(not(feature = "imap"))]
@@ -387,7 +470,10 @@ fn spawn_telegram_poller(
         api,
         poll_secs,
         webhook_capable,
-    );
+    )
+    // See `spawn_scheduler`: follow the registry so a rebuild reaches inbound
+    // Telegram instead of stranding it on the replaced runtime.
+    .following(state.registry().clone());
     handles.push(poller.spawn(shutdown.clone()));
 }
 
@@ -897,19 +983,24 @@ async fn main() -> Result<()> {
                 state = state.with_memory_overlay(overlay);
                 println!("memory backend: {:?}", storage_settings.memory_backend);
             }
-            // Platform (multi-tenant) auth: a shared platform token enables the
-            // provisioning/lifecycle surface. Without it the prosumer operator
-            // path stays in force. Real signed JWT is `platform-jwt`.
-            if let Some(token) = std::env::var("OPENCOMPANY_PLATFORM_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
+            // Platform (multi-tenant) auth: either credential enables the
+            // provisioning/lifecycle surface. Without both the prosumer operator
+            // path stays in force. A signing secret this build cannot verify
+            // aborts boot here rather than silently degrading — same precedent
+            // as a selected-but-unavailable storage backend above.
             {
                 use opencompany::server::platform_auth::{
-                    PlatformAuthConfig, StaticPlatformVerifier,
+                    PLATFORM_JWT_SECRET_ENV, PLATFORM_TOKEN_ENV, configure,
                 };
-                state = state.with_platform_auth(PlatformAuthConfig::new(Arc::new(
-                    StaticPlatformVerifier::new(token),
-                )));
+                if let Some((platform_auth, mode)) = configure(
+                    std::env::var(PLATFORM_TOKEN_ENV).ok(),
+                    std::env::var(PLATFORM_JWT_SECRET_ENV).ok(),
+                )? {
+                    state = state.with_platform_auth(platform_auth);
+                    // The mode only — never the secret, or anything derived
+                    // from it.
+                    println!("platform auth: {mode}");
+                }
             }
             // Outbound webhooks: a URL wires the HTTP sink under `webhooks`;
             // without the feature the request is warned and dropped.
@@ -936,6 +1027,11 @@ async fn main() -> Result<()> {
             }) {
                 state = state.with_skills_root(skills_root);
             }
+            // Issue #290: with every builder input above now resolved, this host
+            // can rebuild a company's runtime in place. Wired BEFORE the
+            // companies register, so the very first `PUT …/inference` on a
+            // freshly booted tenant already has a rebuilder to reach for.
+            state = state.with_rebuilder(Arc::new(BootRebuilder));
             // Schedulers stop cleanly when this is notified (Ctrl-C below).
             let shutdown = Arc::new(Notify::new());
             let mut scheduler_handles = Vec::new();
