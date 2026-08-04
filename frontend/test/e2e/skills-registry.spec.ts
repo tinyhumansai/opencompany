@@ -43,7 +43,9 @@ test("registry tab lists the live server registry, not a hardcoded array", async
   const served = (await (await request.get("/api/v1/company/skills/registry")).json()) as unknown[];
   expect(served.length).toBeGreaterThanOrEqual(14); // the deleted array had 6
 
-  await page.goto("/#/skills");
+  // Skills moved under Settings' sub-rail; the bare `#/skills` hash no longer
+  // names a view, so it would silently canonicalize to Overview.
+  await page.goto("/#/settings/skills");
   await dismissOnboarding(page);
   await page.getByRole("tab", { name: "Registry" }).click();
 
@@ -67,7 +69,7 @@ test("installing from the registry lands a skill the host can serve", async ({
   page,
   request,
 }) => {
-  await page.goto("/#/skills");
+  await page.goto("/#/settings/skills");
   await dismissOnboarding(page);
   await page.getByRole("tab", { name: "Registry" }).click();
 

@@ -83,7 +83,7 @@ layer set it, and what is missing for each optional capability.
 | `TINYHUMANS_API_KEY` | — (required for cycles when no token file) | Static TinyHumans credential (JWT or API key) |
 | `TINYHUMANS_API_URL` | `https://api.tinyhumans.ai` | Backend base URL |
 | `OPENCOMPANY_BIND` | `127.0.0.1:8080` | HTTP bind address |
-| `OPENCOMPANY_DATA_DIR` | `~/.opencompany` (workspace) / `~/.opencompany/companies` (bundle home) | The instance data root: both the workspace layout and the company-bundle home. `--home` outranks it for the bundle home **only** — the workspace (`memory/`, `store/`, `files/`, `logs/`, `tmp/`) still resolves under this variable, so `--home` alone does not move a whole instance. The only knob that isolates two hosts from each other — see [storage](storage.md#choosing-the-root-srcstorepathsrs) |
+| `OPENCOMPANY_DATA_DIR` | `~/.opencompany` (workspace and bundle home alike; bundles at `companies/<slug>`) | The instance data root: both the workspace layout and the company-bundle home. `--home` outranks it for the bundle home **only** — the workspace (`memory/`, `store/`, `files/`, `logs/`, `tmp/`) still resolves under this variable, so `--home` alone does not move a whole instance. The only knob that isolates two hosts from each other — see [storage](storage.md#choosing-the-root-srcstorepathsrs) |
 | `OPENCOMPANY_BRAIN_MODE` | `hosted` | `hosted` \| `sidecar` (overrides `[brain].mode`) |
 | `OPENCOMPANY_OPENHUMAN_URL` | — | Attach to a running `openhuman-core serve` instead of launching |
 | `OPENCOMPANY_INFERENCE_KEY` | `TINYHUMANS_API_KEY` | Harness-brain credential (`openhuman` feature). Per-tenant override of the platform key |
@@ -99,6 +99,8 @@ layer set it, and what is missing for each optional capability.
 | `OPENCOMPANY_MAIL_USERNAME` / `_PASSWORD` | — | SMTP auth. Redacted from `Debug` and never logged |
 | `OPENCOMPANY_MAIL_FROM_NAME` | — | Display name on the `From` header |
 | `OPENCOMPANY_CORS_ORIGINS` | — (CORS off) | Comma-separated exact origins allowed to send the session cookie cross-origin, e.g. `http://localhost:5173`. `*` is refused: a wildcard is illegal with credentials |
+| `OPENCOMPANY_PLATFORM_TOKEN` | — (no machine credential) | The shared platform secret. A bearer equal to it is the `tenant:platform` principal, with the `platform` scope |
+| `OPENCOMPANY_PLATFORM_JWT_SECRET` | — (signed tenant tokens not accepted) | HS256 secret that signs tenant-scoped machine tokens. No shipped literal and no fallback: unset means the path does not exist. Set on a build without `platform-jwt` (in the default feature set) and the host **refuses to boot** |
 
 ### Outbound mail
 
@@ -155,6 +157,33 @@ whole story, and HTTP provisioning is unavailable by construction (load
 companies with `serve --company <dir>`). A company with no admin in its
 manifest's `[users]` cannot be reached until one is listed — that is the
 bootstrap, and it is deliberate.
+
+#### How a platform bearer is authenticated
+
+Exactly two shapes, selected by the two environment variables above:
+
+- **Shared platform secret** (`OPENCOMPANY_PLATFORM_TOKEN`) — an exact match.
+  Authenticated by knowledge of the secret, the same pattern the control plane
+  uses for its own admin token. Grants the single `tenant:platform` principal.
+- **Signed tenant token** (`OPENCOMPANY_PLATFORM_JWT_SECRET`) — HS256 over the
+  `tenant` / `scopes` / `companies` claims, `exp` honored when present. This is
+  how a tenant-scoped machine token is issued.
+
+Both may be set; a bearer accepted by either is accepted. Boot prints the active
+mode (`platform auth: shared-secret | jwt | both`) and never the secret.
+
+No state fails open. No credential means every machine route answers `401`; an
+unauthenticated bearer of any shape is `401`; a wrong secret is `401`; and a
+signing secret on a build compiled without `platform-jwt` aborts boot with a
+message naming the variable and the missing feature rather than degrading to a
+weaker check.
+
+Two limits worth naming. The signing is **symmetric**, so a workload that can
+verify a token could also mint one — acceptable while the trust boundary is a
+single workload; asymmetric keys via the control plane's issuer are the
+follow-up. And a signed token carrying **no `exp` never expires**, because the
+verifier clears its required-claims set; tightening that is a separate policy
+decision.
 
 ### What changed, and why it mattered
 

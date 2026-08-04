@@ -10,7 +10,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useTheme } from "next-themes";
-import { History, Loader2, Play, Plus, RotateCw, Trash2 } from "lucide-react";
+import { History, Loader2, Pencil, Play, Plus, RotateCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -101,6 +101,10 @@ export function WorkflowsView({
   const [ranWith, setRanWith] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  // Issue #259: the same dialog, hydrated from the selected graph. Separate
+  // state from `createOpen` rather than a mode flag, so the create path keeps
+  // working exactly as it did and neither can be half-open.
+  const [editOpen, setEditOpen] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   // Issue #228: what past runs did, read back from the host's journal. This is
   // the half that survives a reload — before it, a manual run's delivery rows
@@ -300,6 +304,30 @@ export function WorkflowsView({
     }
   }, [client, company, selectedId, graph, workflows]);
 
+  // Issue #259: the edit dialog saved. The host answers with the stored graph
+  // AND a fresh version token, so holding onto it is what lets the operator
+  // save again without a re-read — dropping it and re-fetching would be a round
+  // trip that can only return the same thing.
+  const handleSaved = useCallback((saved: WorkflowGraph) => {
+    setGraph(saved);
+    // The name and description are editable, so the picker entry has to move
+    // with them. The id cannot change, which is what makes this a rewrite of
+    // one row rather than a re-list.
+    setWorkflows((prev) =>
+      prev
+        .map((w) =>
+          w.id === saved.id
+            ? { ...w, name: saved.name, description: saved.description }
+            : w,
+        )
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    );
+    // The write landed, so whatever we hold is current — the same reasoning as
+    // the graph-load effect's clear.
+    setConflict(null);
+    toast.success("Workflow saved.");
+  }, []);
+
   // The creator posts the full graph back, so the new entry can be spliced
   // straight into the list and selected — no extra round trip to re-list.
   const handleCreated = useCallback((created: WorkflowGraph) => {
@@ -340,8 +368,11 @@ export function WorkflowsView({
   // read as a refusal, so only an explicit `false` disables the affordance.
   const notEditable = graph?.editable === false;
   const canDelete = !!graph && !notEditable && !deleting;
+  // Same predicate as Delete, and deliberately the same explanation: the host
+  // refuses both writes for the same reason, with one message.
+  const canEdit = !!graph && !notEditable && !loadingGraph && !deleting;
   const notEditableReason = graph
-    ? `“${graph.name}” is defined by a file in the company source tree, so it can't be removed from the console. Edit workflows/${graph.id}.toml in the company repository instead.`
+    ? `“${graph.name}” is defined by a file in the company source tree, so it can't be changed or removed from the console. Edit workflows/${graph.id}.toml in the company repository instead.`
     : undefined;
 
   return (
@@ -427,6 +458,19 @@ export function WorkflowsView({
           {/* Issue #259. The wrapping span carries the explanation: a disabled
               button swallows pointer events in most browsers, so a `title` on
               the button itself would never show. */}
+          <span title={notEditable ? notEditableReason : undefined}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setEditOpen(true)}
+              disabled={!canEdit}
+              aria-label="Edit workflow"
+              data-testid="workflow-edit"
+            >
+              <Pencil className="mr-1.5 size-4" />
+              Edit
+            </Button>
+          </span>
           <span title={notEditable ? notEditableReason : undefined}>
             <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
               <AlertDialogTrigger
@@ -577,6 +621,25 @@ export function WorkflowsView({
         open={createOpen}
         onOpenChange={setCreateOpen}
         onCreated={handleCreated}
+      />
+
+      {/* Issue #259: the same dialog in edit mode. `graph` carries the version
+          token the save is conditional on, so it is passed as loaded rather
+          than copied — and a 409 lands in the banner above, which outlives the
+          dialog and holds the way out.
+
+          `open` is gated on `graph` too: without it, a selection that goes away
+          under an open dialog (a company switch, a failed re-read) would leave
+          `workflow` null, which IS create mode — the operator would be looking
+          at a blank New workflow form wearing the Edit title. */}
+      <WorkflowCreateDialog
+        client={client}
+        company={company}
+        open={editOpen && graph !== null}
+        onOpenChange={setEditOpen}
+        workflow={graph}
+        onSaved={handleSaved}
+        onConflict={setConflict}
       />
     </div>
   );

@@ -1,181 +1,165 @@
-import { Activity, ArrowRight, Flag, MessagesSquare, ShieldCheck } from "lucide-react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
+import { listPeople, type Person } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { StatusPill } from "@/components/status-pill";
-import type { CompanyFeed } from "@/hooks/use-company";
-import { approvalSummary, lifecycle, money, timeAgo } from "@/lib/language";
-import type { View } from "@/components/app-shell";
+import { listMemory, type MemoryEntry } from "@/api/memory";
+import { listSkills, type Skill } from "@/api/skills";
+import { listTasks, type Task } from "@/api/tasks";
+import type { McpServer, McpTool } from "@/lib/mcp";
+import { fromDto, starterTeam, type TeamMember } from "@/lib/team";
+import { adapt, buildMemoryGraph } from "./overview/kg/adapter";
+import { buildKnowledgeGraph } from "./overview/kg/model";
+import { ownedBy } from "./overview/pulse";
+
+// The graph carries the force simulation and every detail card with it. Its own
+// chunk means a cold load paints the frame before the physics arrives.
+const KnowledgeGraph = lazy(() =>
+  import("./overview/kg/KnowledgeGraph").then((m) => ({ default: m.KnowledgeGraph })),
+);
 
 interface Props {
-  feed: CompanyFeed;
   client: OpenCompanyClient;
   company: string | null;
-  onNavigate: (view: View) => void;
-  onFlag: () => void;
 }
 
-/** The landing surface: a calm summary of where the company stands. */
-export function Overview({ feed, onNavigate, onFlag }: Props) {
-  const { status, approvals, now } = feed;
-  const state = lifecycle(status.lifecycle);
-  const pending = status.pending_approvals;
+/** Everything the graph is drawn from, fetched once per company. */
+interface Sources {
+  tasks: Task[];
+  team: TeamMember[];
+  people: Person[];
+  skills: Skill[];
+  memories: MemoryEntry[];
+  servers: McpServer[];
+  toolsByServer: Record<string, McpTool[]>;
+}
 
-  return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6">
-        {/* Greeting */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="space-y-1">
-            <h2 className="text-2xl font-semibold tracking-tight">{status.name}</h2>
-            <p className="text-sm text-muted-foreground">
-              Here&apos;s where your company stands right now.
-            </p>
-          </div>
-          <StatusPill lifecycle={status.lifecycle} />
-        </div>
+const EMPTY: Sources = {
+  tasks: [],
+  team: starterTeam(),
+  people: [],
+  skills: [],
+  memories: [],
+  servers: [],
+  toolsByServer: {},
+};
 
-        {/* Stat cards */}
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <StatCard
-            icon={Activity}
-            label="Status"
-            value={state.label}
-            hint={
-              state.tone === "live"
-                ? "Running and handling work."
-                : state.tone === "stopped"
-                  ? "Not currently working."
-                  : "Getting things in order."
-            }
-          />
-          <StatCard
-            icon={ShieldCheck}
-            label="Needs approval"
-            value={String(pending)}
-            hint={pending === 0 ? "Nothing waiting on you." : "Waiting for your sign-off."}
-            action={pending > 0 ? { label: "Review", onClick: () => onNavigate("approvals") } : undefined}
-          />
-          <StatCard
-            icon={MessagesSquare}
-            label="Conversation"
-            value="Open"
-            hint="Ask for an update or hand off a task."
-            action={{ label: "Open", onClick: () => onNavigate("conversation") }}
-          />
-        </div>
+/**
+ * The command centre: the company's knowledge graph, and nothing else.
+ *
+ * The page is the graph — no header, no strip, no top bar (the shell hides its
+ * own for this view). The company sits at the core, its departments are the
+ * pillars, the jobs hang off each pillar, the teammate who does each job sits
+ * above it, and their tools are the outer ring.
+ *
+ * Two of those rings are **derived**, not declared: a company manifest carries
+ * no department field and no per-agent tool list, so `kg/adapter.ts` invents a
+ * plausible structure rather than leaving the graph three rings short. See
+ * `DERIVED_NOTICE` there — it is the standing caveat on this whole surface.
+ */
+export function Overview({ client, company }: Props) {
+  const [sources, setSources] = useState<Sources>(EMPTY);
 
-        {/* Pending approvals preview */}
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <div className="space-y-1">
-              <CardTitle className="text-base">Approvals</CardTitle>
-              <CardDescription>The few things parked for your decision.</CardDescription>
-            </div>
-            {pending > 0 && <Badge variant="secondary">{pending}</Badge>}
-          </CardHeader>
-          <CardContent>
-            {approvals.length === 0 ? (
-              <div className="flex items-center gap-3 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-                <ShieldCheck className="size-4 text-emerald-500" />
-                All clear — nothing needs your approval.
-              </div>
-            ) : (
-              <ul className="divide-y">
-                {approvals.slice(0, 4).map((a) => (
-                  <li key={a.id} className="flex items-center gap-3 py-2.5 first:pt-0 last:pb-0">
-                    <span className="min-w-0 flex-1 truncate text-sm">{approvalSummary(a)}</span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {a.amount_usd != null && (
-                        <span className="font-medium text-foreground">{money(a.amount_usd)} · </span>
-                      )}
-                      {timeAgo(a.at_millis, now)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </CardContent>
-          {approvals.length > 0 && (
-            <CardContent className="pt-0">
-              <Button variant="outline" size="sm" className="w-full" onClick={() => onNavigate("approvals")}>
-                Review all approvals <ArrowRight className="size-4" />
-              </Button>
-            </CardContent>
-          )}
-        </Card>
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const [tasks, roster, people, skills, memories, mcp] = await Promise.all([
+        listTasks(client, company).catch(() => [] as Task[]),
+        client.listTeam(company).catch(() => null),
+        // Only an admin may list people; a member just gets no humans on the
+        // graph, which is the right amount of information for them to have.
+        listPeople(client, company).catch(() => [] as Person[]),
+        listSkills(client, company).catch(() => [] as Skill[]),
+        // The company's real durable memory (issue #36). A host without the
+        // surface draws no constellation rather than a seeded one — the graph
+        // must never claim the company remembers something it doesn't.
+        listMemory(client, company).catch(() => [] as MemoryEntry[]),
+        client.listMcpServers(company).catch(() => ({ servers: [] as McpServer[] })),
+      ]);
+      if (!live) return;
 
-        {/* Quick actions */}
-        <div className="grid gap-3 sm:grid-cols-3" data-tour="overview-quickactions">
-          <QuickAction icon={MessagesSquare} label="Talk to your company" onClick={() => onNavigate("conversation")} />
-          <QuickAction icon={ShieldCheck} label="Review approvals" onClick={() => onNavigate("approvals")} />
-          <QuickAction icon={Flag} label="Flag something" onClick={onFlag} />
-        </div>
-      </div>
-    </div>
+      // Only a connected server advertises tools; asking a disconnected one
+      // just spends a request to be told nothing.
+      const connected = mcp.servers.filter((s) => s.status === "connected");
+      const toolLists = await Promise.all(
+        connected.map((s) =>
+          client
+            .listMcpTools(s.server_id, company)
+            .then((r) => [s.server_id, r.tools] as const)
+            .catch(() => [s.server_id, [] as McpTool[]] as const),
+        ),
+      );
+      if (!live) return;
+
+      setSources({
+        tasks,
+        team: roster?.length ? roster.map(fromDto) : starterTeam(),
+        people,
+        skills,
+        memories,
+        servers: mcp.servers,
+        toolsByServer: Object.fromEntries(toolLists),
+      });
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company]);
+
+  const adapted = useMemo(
+    () =>
+      adapt({
+        members: sources.team,
+        tasks: sources.tasks,
+        people: sources.people,
+        skills: sources.skills,
+        servers: sources.servers,
+        toolsByServer: sources.toolsByServer,
+        ownedBy,
+      }),
+    [sources],
   );
-}
 
-function StatCard({
-  icon: Icon,
-  label,
-  value,
-  hint,
-  action,
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value: string;
-  hint: string;
-  action?: { label: string; onClick: () => void };
-}) {
-  return (
-    <Card>
-      <CardContent className="space-y-3 py-5">
-        <div className="flex items-center justify-between">
-          <span className="text-sm font-medium text-muted-foreground">{label}</span>
-          <Icon className="size-4 text-muted-foreground" />
-        </div>
-        <div className="text-2xl font-semibold tracking-tight">{value}</div>
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-xs text-muted-foreground">{hint}</p>
-          {action && (
-            <Button variant="ghost" size="sm" className="-mr-2 h-7 shrink-0 px-2" onClick={action.onClick}>
-              {action.label} <ArrowRight className="size-3.5" />
-            </Button>
-          )}
-        </div>
-      </CardContent>
-    </Card>
+  const graph = useMemo(
+    () =>
+      buildKnowledgeGraph(
+        adapted.agents,
+        adapted.departments,
+        adapted.people,
+        adapted.tasks,
+        adapted.workflows,
+      ),
+    [adapted],
   );
-}
 
-function QuickAction({
-  icon: Icon,
-  label,
-  onClick,
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  onClick: () => void;
-}) {
+  const memoryGraph = useMemo(() => buildMemoryGraph(sources.memories), [sources.memories]);
+
   return (
-    <button
-      onClick={onClick}
-      className="flex items-center gap-3 rounded-xl border bg-card p-4 text-left text-sm font-medium shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground"
+    // The whole viewport: the shell hides its top bar for this view, so there
+    // is nothing above to subtract.
+    <div
+      className="oc-kg h-svh min-h-0 w-full min-w-0 overflow-hidden"
+      // The guided tour's Overview stop anchors here. It used to spotlight the
+      // quick-action row this page had before it became the graph; the graph is
+      // the page now, so the graph is what gets spotlighted.
+      data-tour="overview-graph"
     >
-      <span className="flex size-9 items-center justify-center rounded-lg bg-muted">
-        <Icon className="size-4" />
-      </span>
-      {label}
-    </button>
+      <Suspense
+        fallback={
+          <div className="grid h-full place-items-center text-sm text-muted-foreground">
+            Drawing the graph…
+          </div>
+        }
+      >
+        <KnowledgeGraph
+          graph={graph}
+          agents={adapted.agents}
+          departments={adapted.departments}
+          people={adapted.people}
+          tasks={adapted.tasks}
+          memory={memoryGraph}
+          toolLabels={adapted.toolLabels}
+        />
+      </Suspense>
+    </div>
   );
 }

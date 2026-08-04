@@ -94,7 +94,16 @@ construction, ≥1 response per cycle) are inherited, not re-verified.
 Durable company records: charter, roster, ledger, approval queue.
 
 The record also carries the **operator overlays** — teammates, desk members,
-desk order, operator-created desks, and (issue #168) `overlay_workflows`: the
+desk order, operator-created desks, (issue #343) `overlay_budgets`: the
+per-teammate daily spend caps an admin sets from the console, which win over the
+manifest's `budget_usd_daily` and are read through
+`CompanyRecord::effective_budget` — the single reconciliation point the harness
+gate, the approval policy, and both roster reads share, so a cap raised in the
+console cannot be honoured by one surface and ignored by another. At most one
+`overlay_budgets` entry may exist per teammate — the console write path upserts
+through `CompanyRecord::upsert_budget_override`, and a bundle import carrying two
+entries for the same teammate is rejected rather than resolved by guesswork.
+And (issue #168) `overlay_workflows`: the
 workflow graph bodies authored at runtime through the console's create dialog or
 the orchestrator's `create_workflow` tool. These are persisted here rather than
 written into `companies/<name>/workflows/<id>.toml` because the company source
@@ -119,8 +128,12 @@ Every other manifest field is **seed-authoritative**; for `[tools]` and
 `[policy]` that is a security property, not a convention — a record-wins merge
 would let a runtime grant or a relaxed approval mode outlive the operator
 revoking it in version control. Runtime additions that must persist get their own
-overlay field instead (`overlay_agents`, `overlay_desks`, the `SecretStore` for
-console MCP credentials).
+overlay field instead (`overlay_agents`, `overlay_desks`, `overlay_budgets`, the
+`SecretStore` for console MCP credentials). `overlay_budgets` is the clearest
+case for why: a manifest baked into a hosted tenant's image cannot be edited at
+all, so without a record-side override the shipped cap would be the only cap
+forever — while keeping it *seed-authoritative* for everything else is what stops
+a console write from silently outliving a revocation in version control.
 
 ```rust
 // src/ports/store.rs
@@ -155,7 +168,10 @@ orchestrator's `create_workflow` tool; journaled best-effort after persist),
 `TaskSteered` (an operator paused, cancelled, or redirected an in-flight task
 or delegation), `DeskTaskCompleted` (a dispatched board task finished its run —
 the terminal anchor a per-task timeline ends on; "completed" means the run
-stopped, not that it succeeded, and `column` carries where the card landed).
+stopped, not that it succeeded, and `column` carries where the card landed),
+`TaskDiscussionPosted` (a human posted to a card's discussion thread, issue
+#335 — the Discussion tab's whole store, folded back out by
+`GET …/tasks/{task_id}` beside that card's timeline).
 
 ### Per-task event correlation (issue #185)
 
@@ -723,6 +739,11 @@ at least one approval finishes `waiting_approval`, not `succeeded` — a person
 must act. A failed, cancelled or paused run keeps the reason it stopped;
 relabelling it "waiting on you" would hide that reason.
 
+**A runtime being replaced is a fifth writer.** Writer 1 mints the row before
+writer 2 can start it, so a runtime swapped in between refuses the cycle and
+settles the row itself — and the boot reaper is *not* a safe fallback mid-life.
+See [rebuild.md](rebuild.md#attempt-rows-242).
+
 #### Correlation fields elsewhere
 
 Four additive `Option<String>` fields point back at a run. All are
@@ -740,6 +761,50 @@ untagged one serializes byte-identically to how it did before.
 Old `RunRecord`s are never synthesised from historical `AgentReply` events:
 fabricating identity for attempts nobody recorded would be worse than a
 pre-existing card honestly showing zero of them.
+
+#### Reading runs back
+
+Three surfaces, all in `src/server/ops/runs.rs`, under both scope forms:
+
+| Route | Answers |
+|---|---|
+| `GET …/runs?task=&status=&limit=` | the company's attempts, newest first |
+| `GET …/runs/{run_id}` | one attempt plus its full persisted step trace |
+| `GET …/tasks/{task_id}` → `runs[]` | the card's attempts, additive on the task detail read |
+
+Each hands its predicates to `RunStore::list_runs` as a `RunFilter`. **No route
+here folds the journal** — that is the whole reason a run is state rather than
+an event, and the sibling `GET …/workflows/runs` (which does fold, and says so)
+is the cost being avoided. `?status=` takes a comma-separated list and refuses
+an unknown word with a `400`, because a typo'd filter answering `[]` is
+indistinguishable from "nothing matched".
+
+Three things the wire shape refuses to imply, each a state the write path really
+produces:
+
+- **`phase`** (`active` · `parked` · `terminal`), projected from
+  `RunStatus::phase`, is how a reader decides liveness. `finishedAtMillis` is
+  absent for a *parked* run exactly as for a running one — a parked run can
+  resume — so inferring liveness from the timestamp renders an attempt waiting
+  on a person as running forever.
+- **`stepCount` / `stepCountCapped`.** The count is the high-water ordinal
+  persisted, capped at `run_trace::MAX_RUN_STEPS`, and written on the settle —
+  so it reads `0` throughout a live run and stops meaning "steps the agent
+  took" once capped. `usage` settles alongside it and is provisional until then.
+- **A step's `status`** (`ok` · `error` · `running`) rides beside its `kind`. A
+  host killed mid-tool-call leaves that call recorded `running` — the point of
+  an incremental trace — meaning in-flight-when-the-trace-stopped, never failed.
+
+Steps project into the console's existing `TimelineEntry` contract (`seq` /
+`atMillis` / `kind` / `label` / `detail`, plus `status` and `elapsedMs`), so
+`kind` widens additively to include `tool_call` · `thinking` · `note` and the
+grouped-timeline renderer is reused rather than reinvented. `usage` is re-cased
+to camelCase by a local DTO — `TokenUsage` carries no `rename_all` because its
+field names are the decode contract for already-journaled events.
+
+Run detail is **refresh-on-read**: steps persist incrementally, so re-reading a
+live attempt shows the progress since. Streaming would widen the harness turn
+stream for something a re-read already answers.
 
 ## Assembly
 

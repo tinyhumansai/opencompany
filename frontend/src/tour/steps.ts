@@ -10,11 +10,13 @@ import type { View } from "@/components/app-shell";
  * element (`[data-tour="nav-<view>"]`), which sidesteps the lazy/Suspense race
  * entirely — navigating still swaps the main pane so the operator sees the
  * view, but the spotlight never waits on a code-split chunk. Only the two
- * richest moments (Overview quick-actions, the chat composer) anchor to
- * content on non-lazy views.
+ * richest moments (the Overview graph, the chat composer) anchor to content on
+ * non-lazy views.
  */
 export interface TourStop {
   view: View;
+  /** A section's sub-page, when the stop lives inside one (`#/settings/…`). */
+  sub?: string;
   target: string;
   title: string;
   body: string;
@@ -31,24 +33,24 @@ export const TOUR: TourStop[] = [
   },
   {
     view: "overview",
-    target: '[data-tour="overview-quickactions"]',
+    target: '[data-tour="overview-graph"]',
     placement: "top",
     title: "Start here each day",
-    body: "Talk to your company, review what's waiting on you, or flag anything that looks off.",
+    body: "Your company at a glance: its departments, the work in flight, who's doing it, and what it remembers. Pull the graph around to explore it.",
   },
   {
-    view: "conversation",
+    view: "chat",
     target: '[data-tour="chat-composer"]',
     placement: "top",
     title: "Talk to your company",
     body: "Ask for an update or hand off a task in plain language — like messaging a teammate.",
   },
   {
-    view: "team",
-    target: '[data-tour="nav-team"]',
+    view: "chat",
+    target: '[data-tour="nav-chat"]',
     placement: "right",
     title: "Your AI staff",
-    body: "The agents that actually do the work. Each has a role and the tools to match.",
+    body: "The agents that actually do the work each have a channel and a direct message here. Open the members pane to see the whole roster.",
   },
   {
     view: "workflows",
@@ -65,14 +67,17 @@ export const TOUR: TourStop[] = [
     body: "Anything that needs your sign-off before it happens waits here. Nothing risky runs without you.",
   },
   {
-    view: "connections",
-    target: '[data-tour="nav-connections"]',
+    // Connections is a page of the Settings section now, so the stop navigates
+    // to `#/settings/connections` and spotlights the nav row that leads there.
+    view: "settings",
+    sub: "connections",
+    target: '[data-tour="nav-settings"]',
     placement: "right",
     title: "Connect your tools",
     body: "Plug in the tools your company already uses — Gmail, Slack, GitHub — so your agents can act for real.",
   },
   {
-    view: "conversation",
+    view: "chat",
     target: '[data-tour="chat-composer"]',
     placement: "top",
     title: "You're all set",

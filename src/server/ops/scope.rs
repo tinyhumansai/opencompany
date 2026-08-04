@@ -21,8 +21,9 @@ use axum::routing::MethodRouter;
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
-use crate::ports::types::CompanyId;
+use crate::ports::types::{Actor, ActorKind, CompanyId};
 use crate::server::error::ApiError;
+use crate::server::graphql::auth::GqlAuth;
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
 
 /// Registers `mr` under both the `{id}` platform form and the single-company
@@ -39,6 +40,16 @@ pub(crate) fn scoped(suffix: &str, mr: MethodRouter<AppState>) -> Router<AppStat
 pub(crate) struct ScopedCompany {
     /// The resolved runtime for the addressed company.
     pub(crate) runtime: Arc<CompanyRuntime>,
+    /// The signed-in human behind the request, when there is one (issue #335).
+    ///
+    /// The extractor already resolves the principal to authorize the call; this
+    /// carries the person half of it forward so a route that journals an
+    /// operator action can attribute it, instead of every write landing as an
+    /// anonymous `by: None`. A machine credential (the platform scope) is
+    /// `None` — there is no person behind it to name, which is exactly the
+    /// distinction [`CompanyEvent::OperatorMessage`](crate::ports::types::CompanyEvent::OperatorMessage)'s
+    /// `by` already draws.
+    pub(crate) actor: Option<Actor>,
 }
 
 impl ScopedCompany {
@@ -91,6 +102,15 @@ impl FromRequestParts<AppState> for ScopedCompany {
         if let Some(resp) = refuse_until_password_changed(&auth) {
             return Err(resp);
         }
-        Ok(ScopedCompany { runtime })
+        // Keep the person, drop the credential: only a human principal names an
+        // actor, and only the user id travels — never the email or the role.
+        let actor = match auth {
+            GqlAuth::User(user) => Some(Actor {
+                kind: ActorKind::User,
+                id: user.user_id,
+            }),
+            GqlAuth::Platform(_) => None,
+        };
+        Ok(ScopedCompany { runtime, actor })
     }
 }

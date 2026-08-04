@@ -515,6 +515,42 @@ pub enum CompanyEvent {
         /// without re-deriving it from `output`.
         column: String,
     },
+    /// A human posted to a task's discussion thread (issue #335).
+    ///
+    /// The per-task Discussion tab's whole backing store. A task discussion is
+    /// its *own* thread — not a filtered view of the company chat — but it is
+    /// not a second message store either: it lives in this journal, beside the
+    /// events the same task's timeline is folded from, so the two notions of
+    /// "something happened on this task" cannot drift apart. `GET
+    /// …/tasks/{task_id}` projects both out of one traversal.
+    ///
+    /// Operator-authored only in v1. Nothing dispatches an agent turn off the
+    /// back of it and no agent reads it: posting is a durable note on the card,
+    /// not a delegation surface. That is a product decision rather than a
+    /// technical limit — see `docs/modules/server/README.md` — and the wire
+    /// projections here reflect it: the text is deliberately never forwarded to
+    /// the inference sidecar or the SSE stream.
+    ///
+    /// Append-only, like every other variant: there is no edit and no delete in
+    /// v1, so a posted message is a fact about what was said and when.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes.
+    TaskDiscussionPosted {
+        /// The board card the message belongs to.
+        task_id: String,
+        /// The message text, codepoint-capped at the route boundary
+        /// ([`MAX_DISCUSSION_CHARS`](crate::ports::tasks::MAX_DISCUSSION_CHARS)).
+        text: String,
+        /// Who posted, when a signed-in human is behind the request.
+        ///
+        /// `None` for a machine credential, which has no person to name and
+        /// reads back as "operator" — the same fallback
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by` takes, and the same
+        /// additive `skip_serializing_if` contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
     /// A workflow run finished (issue #228) — the durable record of what a run
     /// actually did, journaled from **both** entry points: the console's Run
     /// button and the cron [`WorkflowScheduler`](crate::runtime::WorkflowScheduler).
@@ -1275,6 +1311,66 @@ pub struct OverlayWorkflow {
     pub toml: String,
 }
 
+/// An operator-set daily spend cap for one teammate, persisted on the
+/// [`CompanyRecord`] so it wins over the manifest's `budget_usd_daily` without
+/// rewriting `company.toml` and without a redeploy (issue #343).
+///
+/// The manifest is a **boot snapshot** baked into the tenant image, so before
+/// this the shipped number was the only number. An entry here is the durable
+/// override the console writes; [`CompanyRecord::effective_budget`] is the one
+/// place the two are reconciled.
+///
+/// Three states, and keeping them apart is the point:
+///
+/// - **no entry** — the manifest value applies (the pre-#343 behaviour exactly);
+/// - **entry with `Some(x)`** — capped at `x`, including a legitimate `0.0`
+///   ("this teammate may not spend");
+/// - **entry with `None`** — explicitly **uncapped**, which beats a manifest cap.
+///   Without this state, clearing a cap on a manifest-capped teammate would be
+///   impossible: dropping the row would fall back to the very cap being cleared.
+///
+/// "Cleared" and "zero" are therefore different rows, never the same one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BudgetOverride {
+    /// The teammate this caps — a manifest `[[agent]]` id or an
+    /// [`OverlayAgent`] id.
+    pub agent_id: String,
+    /// The cap in USD per UTC day, or `None` for "explicitly uncapped".
+    #[serde(default)]
+    pub budget_usd_daily: Option<f64>,
+    /// Who set it. Attribution is part of the acceptance: a cap that can be
+    /// raised anonymously is not much of a cap.
+    pub set_by: Actor,
+    /// When it was set (epoch millis).
+    pub at_millis: u64,
+}
+
+impl BudgetOverride {
+    /// The first `agent_id` appearing more than once in `entries`, if any.
+    ///
+    /// For validating a set of overrides this process did not write — an
+    /// imported bundle, principally. [`CompanyRecord::budget_override`] reads the
+    /// *first* match, so a second row for one teammate is not a harmless
+    /// duplicate: it makes the applied cap a function of serialization order.
+    /// The two rows can differ in cap *and* in attribution, so there is no
+    /// answer to pick — one choice over-restricts a teammate, the other hands
+    /// back an allowance an admin revoked, and both name someone in the console
+    /// who may not have set it. Callers reject rather than guess.
+    ///
+    /// Linear scan: an override set is one row per capped teammate, so it is
+    /// bounded by roster size.
+    pub fn duplicate_agent_id(entries: &[BudgetOverride]) -> Option<&str> {
+        let mut seen: Vec<&str> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if seen.contains(&entry.agent_id.as_str()) {
+                return Some(&entry.agent_id);
+            }
+            seen.push(&entry.agent_id);
+        }
+        None
+    }
+}
+
 /// The operator overlays persisted as a single JSON blob by the string-column
 /// stores (sqlite + mongodb `overlay_json`). The filesystem store keeps the two
 /// collections as typed fields on its own `Meta` instead.
@@ -1302,6 +1398,11 @@ pub struct OverlayBlob {
     /// `#[serde(default)]` loads them as empty.
     #[serde(default)]
     pub workflows: Vec<OverlayWorkflow>,
+    /// The operator-set per-teammate daily spend caps (issue #343). Absent on
+    /// rows written before console budget writes existed, so `#[serde(default)]`
+    /// loads them as empty — which is exactly "the manifest still decides".
+    #[serde(default)]
+    pub budgets: Vec<BudgetOverride>,
     /// The source-template provenance recorded at launch. `None` for companies
     /// provisioned from a raw manifest and for legacy rows written before
     /// provenance existed (the `#[serde(default)]` keeps those rows loading).
@@ -1318,6 +1419,7 @@ impl OverlayBlob {
             desk_order: record.overlay_desk_order.clone(),
             desks: record.overlay_desks.clone(),
             workflows: record.overlay_workflows.clone(),
+            budgets: record.overlay_budgets.clone(),
             provenance: record.template_provenance.clone(),
         }
     }
@@ -1340,6 +1442,7 @@ impl OverlayBlob {
                     desk_order: Vec::new(),
                     desks: Vec::new(),
                     workflows: Vec::new(),
+                    budgets: Vec::new(),
                     provenance: None,
                 })
                 .map_err(|_| original),
@@ -1383,6 +1486,22 @@ pub struct CompanyRecord {
     /// authoring persisted through the store loading without a migration.
     #[serde(default)]
     pub overlay_workflows: Vec<OverlayWorkflow>,
+    /// Operator-set per-teammate daily spend caps that win over the manifest's
+    /// `budget_usd_daily` (issue #343). Read through
+    /// [`Self::effective_budget`] — never directly — so the console write path,
+    /// the roster build and both read surfaces cannot drift. Empty means the
+    /// manifest decides, which is byte-for-byte the pre-#343 behaviour; the
+    /// `#[serde(default)]` keeps records written before console budget writes
+    /// existed loading without a migration.
+    ///
+    /// **At most one entry per `agent_id`.** [`Self::effective_budget`] reads the
+    /// first match, so a second entry for the same teammate is not a harmless
+    /// duplicate — it is a silently unreachable cap, and which of the two wins
+    /// depends on insertion order rather than on what an admin last decided.
+    /// Mutate through [`Self::upsert_budget_override`] rather than pushing, and
+    /// check untrusted input with [`Self::duplicate_budget_agent_id`].
+    #[serde(default)]
+    pub overlay_budgets: Vec<BudgetOverride>,
     /// Where this company's manifest was seeded from — the source template's
     /// stable identity, stamped once at launch and carried across rebuilds.
     /// `None` for companies provisioned from a raw manifest body. The
@@ -1538,6 +1657,67 @@ impl CompanyRecord {
             .filter(|a| a.name.eq_ignore_ascii_case(name_key))
             .map(|a| a.id.clone())
             .collect()
+    }
+
+    /// This teammate's operator-set budget override, if one exists.
+    ///
+    /// The presence of a row is itself information — it is what the console
+    /// renders the "set by … " attribution line from, and what tells "reset to
+    /// the manifest default" (drop the row) apart from "remove the cap" (a row
+    /// whose `budget_usd_daily` is `None`). Callers that only want the number
+    /// should use [`Self::effective_budget`].
+    pub fn budget_override(&self, agent_id: &str) -> Option<&BudgetOverride> {
+        self.overlay_budgets
+            .iter()
+            .find(|entry| entry.agent_id == agent_id)
+    }
+
+    /// The daily USD cap actually in force for `agent_id`: the operator's
+    /// override when one is stored, else the manifest's `budget_usd_daily`,
+    /// else `None` (uncapped).
+    ///
+    /// **The single source of truth for "what may this teammate spend today"**,
+    /// in the shape of [`Self::effective_desk_members`]. The harness gate, the
+    /// per-agent [`ApprovalPolicy`](crate::harness::policy::ApprovalPolicy) arm,
+    /// the REST roster and the GraphQL roster all read through here, so a cap
+    /// raised in the console cannot be honoured by one and ignored by another.
+    ///
+    /// An **overlay** teammate has no manifest row at all, so before #343 it was
+    /// unconditionally uncapped; now a stored override caps it like any other.
+    /// A stored `Some(0.0)` really does mean zero, and a stored `None` really
+    /// does mean uncapped even when the manifest names a cap — that asymmetry is
+    /// the whole reason the override is `Option<f64>` rather than `f64`.
+    pub fn effective_budget(&self, agent_id: &str) -> Option<f64> {
+        match self.budget_override(agent_id) {
+            Some(entry) => entry.budget_usd_daily,
+            None => self
+                .manifest
+                .agents
+                .iter()
+                .find(|a| a.id == agent_id)
+                .and_then(|a| a.budget_usd_daily),
+        }
+    }
+
+    /// Stores `entry` as **the** override for its teammate, replacing any entry
+    /// already held for that `agent_id`.
+    ///
+    /// The one way a write path should add to [`Self::overlay_budgets`]. Pushing
+    /// directly is what lets a record accumulate two rows for one teammate, and
+    /// [`Self::budget_override`] reads the *first* — so the stale row would keep
+    /// winning and every surface would agree on a cap no admin last set. Making
+    /// the replacement part of the type rather than a convention each caller
+    /// remembers is the point: there is no correct way to append.
+    pub fn upsert_budget_override(&mut self, entry: BudgetOverride) {
+        self.overlay_budgets
+            .retain(|held| held.agent_id != entry.agent_id);
+        self.overlay_budgets.push(entry);
+    }
+
+    /// The first `agent_id` on this record carrying more than one override, if
+    /// any. See [`BudgetOverride::duplicate_agent_id`].
+    pub fn duplicate_budget_agent_id(&self) -> Option<&str> {
+        BudgetOverride::duplicate_agent_id(&self.overlay_budgets)
     }
 }
 
@@ -2169,6 +2349,34 @@ mod test {
         );
     }
 
+    /// Issue #335: an unattributed post must serialize with **no** `by` key, so
+    /// the variant's wire shape is the same one a machine-credentialled post
+    /// wrote before attribution could ever be present — and an attributed one
+    /// round-trips its actor.
+    #[test]
+    fn task_discussion_posted_round_trips_and_omits_an_absent_actor() {
+        let anonymous = CompanyEvent::TaskDiscussionPosted {
+            task_id: "t1".into(),
+            text: "blocked on the API key".into(),
+            by: None,
+        };
+        assert_eq!(round_trip(&anonymous), anonymous);
+        assert_eq!(
+            serde_json::to_string(&anonymous).unwrap(),
+            r#"{"kind":"TaskDiscussionPosted","task_id":"t1","text":"blocked on the API key"}"#
+        );
+
+        let attributed = CompanyEvent::TaskDiscussionPosted {
+            task_id: "t1".into(),
+            text: "unblocked".into(),
+            by: Some(Actor {
+                kind: ActorKind::User,
+                id: "u-7".into(),
+            }),
+        };
+        assert_eq!(round_trip(&attributed), attributed);
+    }
+
     #[test]
     fn verdict_serializes_lowercase() {
         assert_eq!(
@@ -2266,6 +2474,7 @@ mod test {
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -2539,6 +2748,182 @@ mod test {
             OverlayBlob::parse("[]")
                 .expect("legacy array")
                 .workflows
+                .is_empty()
+        );
+    }
+
+    /// A manifest with two teammates, one capped at $5/day and one uncapped —
+    /// the two starting positions every budget-override case builds on.
+    const BUDGET_ROSTER: &str = "[company]\nname = \"Acme\"\n\
+         [[agent]]\nid = \"analyst\"\nrole = \"Analyst\"\nbudget_usd_daily = 5.0\n\
+         [[agent]]\nid = \"writer\"\nrole = \"Writer\"\n";
+
+    fn budget_entry(agent_id: &str, cap: Option<f64>) -> BudgetOverride {
+        BudgetOverride {
+            agent_id: agent_id.to_string(),
+            budget_usd_daily: cap,
+            set_by: Actor {
+                kind: ActorKind::User,
+                id: "user-1".to_string(),
+            },
+            at_millis: 1_700_000_000_000,
+        }
+    }
+
+    /// Issue #343: with no override stored, `effective_budget` is the manifest
+    /// value verbatim — the pre-#343 behaviour, and the regression net that says
+    /// adding this field changed nothing for a company that never uses it.
+    #[test]
+    fn effective_budget_falls_back_to_the_manifest() {
+        let record = desk_record(BUDGET_ROSTER, Vec::new());
+        assert_eq!(record.effective_budget("analyst"), Some(5.0));
+        assert_eq!(record.effective_budget("writer"), None);
+        // An id on no roster at all is uncapped rather than an error: the gate
+        // reads this per dispatched agent and must not invent a cap.
+        assert_eq!(record.effective_budget("nobody"), None);
+    }
+
+    /// A stored override wins over the manifest in both directions — raising a
+    /// cap and lowering one. This is the "no redeploy" property at its source:
+    /// nothing here consults `company.toml` once a row exists.
+    #[test]
+    fn a_stored_override_beats_the_manifest() {
+        let mut record = desk_record(BUDGET_ROSTER, Vec::new());
+        record
+            .overlay_budgets
+            .push(budget_entry("analyst", Some(50.0)));
+        assert_eq!(record.effective_budget("analyst"), Some(50.0));
+
+        record.overlay_budgets = vec![budget_entry("analyst", Some(1.0))];
+        assert_eq!(record.effective_budget("analyst"), Some(1.0));
+    }
+
+    /// The distinction the issue calls out by name: clearing a cap and setting
+    /// it to zero are different states and must not collapse into each other.
+    ///
+    /// `Some(0.0)` caps the teammate at nothing (it will refuse to dispatch);
+    /// `None` means explicitly uncapped and beats the manifest's $5. If these
+    /// two ever resolved the same way, an operator lifting a cap would instead
+    /// have silenced the teammate completely — the opposite of what they asked
+    /// for, and unrecoverable from the console.
+    #[test]
+    fn clearing_a_cap_is_not_the_same_as_zeroing_it() {
+        let mut record = desk_record(BUDGET_ROSTER, Vec::new());
+
+        record.overlay_budgets = vec![budget_entry("analyst", Some(0.0))];
+        assert_eq!(record.effective_budget("analyst"), Some(0.0));
+
+        record.overlay_budgets = vec![budget_entry("analyst", None)];
+        assert_eq!(
+            record.effective_budget("analyst"),
+            None,
+            "an explicitly-uncapped override must beat the manifest's cap"
+        );
+    }
+
+    /// An **overlay** teammate has no manifest row, so before #343 it could not
+    /// be capped at all. A stored override caps it like anyone else — and
+    /// dropping that override returns it to uncapped, since there is no manifest
+    /// value underneath to fall back to.
+    #[test]
+    fn an_overlay_teammate_can_be_capped() {
+        let mut record = desk_record(BUDGET_ROSTER, Vec::new());
+        record.overlay_agents.push(OverlayAgent {
+            id: "shane".to_string(),
+            name: "Shane".to_string(),
+            role: "Growth".to_string(),
+            description: None,
+        });
+        assert_eq!(record.effective_budget("shane"), None);
+
+        record.overlay_budgets = vec![budget_entry("shane", Some(2.5))];
+        assert_eq!(record.effective_budget("shane"), Some(2.5));
+
+        record.overlay_budgets.clear();
+        assert_eq!(record.effective_budget("shane"), None);
+    }
+
+    /// Issue #343: one override per teammate. `upsert_budget_override` replaces
+    /// the held row instead of appending a second, so the cap an admin last set
+    /// is the cap every surface reads.
+    ///
+    /// Appending would leave the *first* row winning `budget_override`'s
+    /// find-first read — meaning a raise or a revocation would persist happily
+    /// and change nothing, the failure mode hardest to notice from the console.
+    #[test]
+    fn upserting_an_override_replaces_rather_than_appends() {
+        let mut record = desk_record(BUDGET_ROSTER, Vec::new());
+        record.upsert_budget_override(budget_entry("analyst", Some(50.0)));
+        record.upsert_budget_override(budget_entry("writer", Some(3.0)));
+        record.upsert_budget_override(budget_entry("analyst", None));
+
+        assert_eq!(
+            record.overlay_budgets.len(),
+            2,
+            "a second write for one teammate must replace, not accumulate: {:?}",
+            record.overlay_budgets
+        );
+        assert_eq!(
+            record.effective_budget("analyst"),
+            None,
+            "the latest write must win over the manifest's $5"
+        );
+        assert_eq!(record.effective_budget("writer"), Some(3.0));
+    }
+
+    /// Issue #343: duplicates are detectable, so a caller holding overrides it
+    /// did not write (a bundle import) can refuse them instead of silently
+    /// applying whichever row happens to sort first.
+    #[test]
+    fn duplicate_overrides_are_detected() {
+        let mut record = desk_record(BUDGET_ROSTER, Vec::new());
+        assert_eq!(record.duplicate_budget_agent_id(), None);
+
+        record.overlay_budgets = vec![
+            budget_entry("analyst", Some(9.0)),
+            budget_entry("writer", None),
+        ];
+        assert_eq!(
+            record.duplicate_budget_agent_id(),
+            None,
+            "distinct teammates are not a duplicate"
+        );
+
+        // Two rows for one teammate that disagree about the cap — the case where
+        // guessing would either over-restrict or hand back a revoked allowance.
+        record.overlay_budgets = vec![
+            budget_entry("analyst", Some(9.0)),
+            budget_entry("writer", None),
+            budget_entry("analyst", Some(0.0)),
+        ];
+        assert_eq!(record.duplicate_budget_agent_id(), Some("analyst"));
+    }
+
+    /// Issue #343: the budget overrides round-trip through the `OverlayBlob` the
+    /// sqlite/mongodb stores persist, and pre-#343 rows load as "no overrides"
+    /// (the manifest still decides) rather than failing to parse.
+    #[test]
+    fn overlay_blob_round_trips_budgets() {
+        let mut record = desk_record(BUDGET_ROSTER, Vec::new());
+        record.overlay_budgets = vec![
+            budget_entry("analyst", Some(9.0)),
+            budget_entry("writer", None),
+        ];
+        let json = serde_json::to_string(&OverlayBlob::from_record(&record)).expect("serialize");
+        let blob = OverlayBlob::parse(&json).expect("reparse");
+        assert_eq!(blob.budgets, record.overlay_budgets);
+
+        let legacy = r#"{"agents":[],"desk_members":[]}"#;
+        assert!(
+            OverlayBlob::parse(legacy)
+                .expect("pre-budget object")
+                .budgets
+                .is_empty()
+        );
+        assert!(
+            OverlayBlob::parse("[]")
+                .expect("legacy array")
+                .budgets
                 .is_empty()
         );
     }

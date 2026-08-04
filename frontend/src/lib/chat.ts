@@ -13,6 +13,13 @@ export interface ChatMessage {
    */
   channel?: string;
   /**
+   * The message this one replies to. A line with a parent is a thread reply:
+   * it stays out of the channel timeline and renders inside the thread panel.
+   */
+  parentId?: string;
+  /** Emoji → count. Absent until someone reacts. */
+  reactions?: Record<string, number>;
+  /**
    * The scrubbed processing steps behind a company reply (tool calls, thinking,
    * surfaced failures), rendered as a timeline above the bubble. Absent/empty
    * on your own messages and on tool-less replies.
@@ -64,7 +71,13 @@ const nextId = () => `m${seq++}`;
 export function makeMessage(
   from: ChatMessage["from"],
   text: string,
-  opts: { channel?: string; at?: number; steps?: TurnStep[]; taskId?: string } = {},
+  opts: {
+    channel?: string;
+    at?: number;
+    parentId?: string;
+    steps?: TurnStep[];
+    taskId?: string;
+  } = {},
 ): ChatMessage {
   return {
     id: nextId(),
@@ -72,6 +85,7 @@ export function makeMessage(
     text,
     at: opts.at ?? Date.now(),
     channel: opts.channel,
+    parentId: opts.parentId,
     steps: opts.steps,
     taskId: opts.taskId,
   };

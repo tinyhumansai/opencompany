@@ -1444,6 +1444,7 @@ description = "Runs Acme."
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -1591,6 +1592,7 @@ description = "Builds it."
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -2478,6 +2480,7 @@ members = ["engineer"]
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -2623,6 +2626,7 @@ name = "Design"
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         };
         let (brain, _tasks) = brain_over(dir.path(), record);
@@ -2681,6 +2685,7 @@ members = ["eng1", "eng2"]
             }],
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         };
         let (brain, _tasks) = brain_over(dir.path(), record);
@@ -2735,6 +2740,7 @@ members = ["eng1", "eng2"]
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await

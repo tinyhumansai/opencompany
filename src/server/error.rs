@@ -45,6 +45,9 @@ impl ApiError {
             OpenCompanyError::LifecycleConflict(_) | OpenCompanyError::Conflict(_) => {
                 StatusCode::CONFLICT
             }
+            // A runtime swap is in progress and clears itself within a turn, so
+            // this is a retry-me, not a refusal (issue #290).
+            OpenCompanyError::Quiescing(_) => StatusCode::SERVICE_UNAVAILABLE,
             OpenCompanyError::ToolNotGranted(_) => StatusCode::FORBIDDEN,
             OpenCompanyError::BudgetExceeded(_) => StatusCode::PAYMENT_REQUIRED,
             // tiny.place transport: an unreachable backend degrades to 503 so

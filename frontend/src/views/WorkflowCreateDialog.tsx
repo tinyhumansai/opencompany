@@ -3,6 +3,12 @@
 // are restricted to the ones the engine actually executes today
 // (`CREATABLE_NODE_KINDS`); `tool_call`/`http_request` stay off the palette
 // until they're wired (see `src/workflows/caps.rs`).
+//
+// It is also the EDITOR (issue #259): pass a `workflow` and the same form
+// hydrates from that saved graph and saves through `updateWorkflow`, carrying
+// the graph's `version` as the optimistic-concurrency token. One component
+// rather than two because an edit is the same form with the same rules — a
+// second one would drift the moment either side grew a field.
 
 import { useEffect, useId, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
@@ -11,12 +17,14 @@ import {
   CREATABLE_NODE_KINDS,
   DESTINATION_KINDS,
   createWorkflow,
+  updateWorkflow,
   type WorkflowDestination,
   type WorkflowEdge,
   type WorkflowGraph,
   type WorkflowNode,
 } from "@/api/workflows";
 import type { OpenCompanyClient } from "@/api/client";
+import { ApiError } from "@/api/types";
 import { CronPreviewLine } from "@/views/CronPreviewLine";
 import type { TeamMemberDto } from "@/api/types";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -57,6 +65,24 @@ interface DraftNode {
   destinationKind: "" | WorkflowDestination["kind"];
   /** The address (`email`) or channel id (`channel`). Unused for `owner`. */
   destinationTarget: string;
+  /**
+   * Fields the form has no control for, carried through an edit **verbatim**
+   * (issue #259).
+   *
+   * An overlay graph can carry them — `POST`/`PUT` accept them and the
+   * orchestrator's own `create_workflow` tool writes them — so a graph authored
+   * outside this dialog can reach it. Rebuilding the node from the visible
+   * controls alone would then quietly delete a retry policy or an approval gate
+   * on the first save, which is a worse bug than the write-once one this fixes.
+   *
+   * They ride on the ROW, not on the node id, so they follow the row when its
+   * id is edited. `config` is the exception: it is kind-specific, so
+   * {@link changeKind} drops it along with every other kind-conditional field.
+   */
+  config?: unknown;
+  onError?: string;
+  retry?: WorkflowNode["retry"];
+  requiresApproval?: boolean;
 }
 
 /** "No schedule" — the workflow runs only when something starts it. A sentinel
@@ -194,7 +220,18 @@ function nextKey(): string {
  * this reset.
  */
 function changeKind(kind: string): Partial<DraftNode> {
-  return { kind, agent: "", schedule: "", destinationKind: "", destinationTarget: "" };
+  return {
+    kind,
+    agent: "",
+    schedule: "",
+    destinationKind: "",
+    destinationTarget: "",
+    // Kind-specific by definition (a `switch`'s cases, a `sub_workflow`'s
+    // target), so it means nothing on the new kind — and unlike the fields
+    // above there is no control that could ever show what was dropped. The
+    // kind-agnostic policies (`onError`, `retry`, `requiresApproval`) are kept.
+    config: undefined,
+  };
 }
 
 /** A blank node row, so every construction site stays in step as the shape grows. */
@@ -217,6 +254,43 @@ function starterNodes(): DraftNode[] {
   return [blankNode({ id: "start", kind: "trigger", name: "Start" })];
 }
 
+/** The saved graph's nodes as draft rows (issue #259).
+ *
+ * Every row goes through {@link blankNode}, so each gets a **fresh** `key` from
+ * `nextKey()`. Reusing the saved node ids as keys would be the obvious shortcut
+ * and a real bug: `fieldErrors` is keyed on `key`, so two graphs that share a
+ * node id (`start` is the starter row's id, so most of them do) would share an
+ * error map, and a complaint raised on one graph would render on the next.
+ */
+function draftNodes(graph: WorkflowGraph): DraftNode[] {
+  return graph.nodes.map((n) =>
+    blankNode({
+      id: n.id,
+      kind: n.kind,
+      name: n.name,
+      summary: n.summary ?? "",
+      agent: n.agent ?? "",
+      schedule: n.schedule ?? "",
+      destinationKind: n.destination?.kind ?? "",
+      destinationTarget: n.destination?.target ?? "",
+      config: n.config,
+      onError: n.onError,
+      retry: n.retry,
+      requiresApproval: n.requiresApproval,
+    }),
+  );
+}
+
+/** The saved graph's edges as draft rows, on the same fresh-key rule. */
+function draftEdges(graph: WorkflowGraph): DraftEdge[] {
+  return graph.edges.map((e) => ({
+    key: nextKey(),
+    from: e.from,
+    to: e.to,
+    label: e.label ?? "",
+  }));
+}
+
 /** A safe on-disk id: only letters, digits, `_`, and `-` — a subset of what the
  * host's `safe_wid` accepts (any single path component), chosen to keep ids
  * simple and unambiguous without a round-trip to the server first. */
@@ -230,13 +304,33 @@ export function WorkflowCreateDialog({
   open,
   onOpenChange,
   onCreated,
+  workflow = null,
+  onSaved,
+  onConflict,
 }: {
   client: OpenCompanyClient;
   company: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreated: (graph: WorkflowGraph) => void;
+  /** Called with the stored graph after a create. Create mode only. */
+  onCreated?: (graph: WorkflowGraph) => void;
+  /**
+   * The saved graph to edit (issue #259). `null` is create mode. Pass the graph
+   * straight from `getWorkflow` — its `version` is what makes the save
+   * conditional, so a copy without one silently loses the guard.
+   */
+  workflow?: WorkflowGraph | null;
+  /** Called with the stored graph, and its FRESH version, after an edit. */
+  onSaved?: (graph: WorkflowGraph) => void;
+  /**
+   * The host's message when it refused the save with a `409` — the graph moved
+   * under this edit, or the new display name is taken. The dialog stays open
+   * with the same message inline (so the author keeps what they typed); this
+   * hands it to the view, whose persistent banner carries the way out (Reload).
+   */
+  onConflict?: (message: string) => void;
 }) {
+  const editing = workflow !== null;
   const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -254,13 +348,23 @@ export function WorkflowCreateDialog({
 
   // Reload the roster (for the agent-node picker) and reset the draft each
   // time the dialog opens, so a prior attempt never leaks into the next one.
+  //
+  // Edit mode hydrates HERE rather than anywhere else on purpose (issue #259):
+  // this is the one place `fieldErrors` is cleared, so a draft populated by any
+  // other path would carry the previous graph's errors — attached to rows that
+  // no longer exist and pointing at fields nobody can see.
+  //
+  // `workflow` is a dependency, so the conflict banner's Reload re-hydrates an
+  // open dialog with the fresh graph and its fresh token. That discards what
+  // was typed, which is the honest outcome: Reload means "show me the latest",
+  // and keeping the edit would keep the stale token with it.
   useEffect(() => {
     if (!open) return;
-    setId("");
-    setName("");
-    setDescription("");
-    setNodes(starterNodes());
-    setEdges([]);
+    setId(workflow?.id ?? "");
+    setName(workflow?.name ?? "");
+    setDescription(workflow?.description ?? "");
+    setNodes(workflow ? draftNodes(workflow) : starterNodes());
+    setEdges(workflow ? draftEdges(workflow) : []);
     setError(null);
     setFieldErrors({});
     let live = true;
@@ -277,7 +381,7 @@ export function WorkflowCreateDialog({
     return () => {
       live = false;
     };
-  }, [open, client, company]);
+  }, [open, client, company, workflow]);
 
   function addNode() {
     setNodes((rows) => [...rows, blankNode()]);
@@ -445,6 +549,13 @@ export function WorkflowCreateDialog({
                       : n.destinationTarget.trim() || undefined,
                 }
               : undefined,
+          // Whatever the form has no control for, straight back out again — an
+          // edit must not delete what it cannot show. Always `undefined` on a
+          // create, and `undefined` is omitted from the JSON body.
+          config: n.config,
+          onError: n.onError,
+          retry: n.retry,
+          requiresApproval: n.requiresApproval,
         }),
       ),
       edges: edges.map(
@@ -456,11 +567,42 @@ export function WorkflowCreateDialog({
       ),
     };
     try {
-      const created = await createWorkflow(client, company, graph);
-      onCreated(created);
+      if (workflow) {
+        // The id keys the saved graph, the schedule and the run history, so it
+        // is the graph's own id that is sent, not the (read-only) field —
+        // there is no path here that renames anything, and the host answers
+        // 400 if one ever appeared. `version` makes the write conditional: it
+        // means "save over the graph I was looking at", not "over whatever is
+        // there now". The response carries a fresh token, so a second save
+        // needs no intervening read.
+        const saved = await updateWorkflow(
+          client,
+          company,
+          workflow.id,
+          graph,
+          workflow.version,
+        );
+        onSaved?.(saved);
+      } else {
+        const created = await createWorkflow(client, company, graph);
+        onCreated?.(created);
+      }
       onOpenChange(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "could not create the workflow");
+      setError(
+        e instanceof Error
+          ? e.message
+          : workflow
+            ? "could not save the workflow"
+            : "could not create the workflow",
+      );
+      // A refused write is the one failure the operator can act on, and the
+      // action (reload, or pick another name) happens out in the view — so it
+      // is raised there too, where the banner persists past this dialog. The
+      // dialog stays open with the same message so the edit is not thrown away.
+      if (workflow && e instanceof ApiError && e.status === 409) {
+        onConflict?.(e.message);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -470,21 +612,36 @@ export function WorkflowCreateDialog({
     <Dialog open={open} onOpenChange={(o) => !submitting && onOpenChange(o)}>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>New workflow</DialogTitle>
+          <DialogTitle>{editing ? "Edit workflow" : "New workflow"}</DialogTitle>
           <DialogDescription>
-            Define the graph by hand — nodes, then how they connect.
+            {editing
+              ? "Change the nodes, how they connect, or when it runs. Saving replaces the whole graph."
+              : "Define the graph by hand — nodes, then how they connect."}
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="grid gap-2">
             <Label htmlFor={`${formId}-id`}>Id</Label>
+            {/* Read-only in edit mode, not merely rejected on save: the id keys
+                the saved graph, the scheduler and every past run, so the host
+                answers 400 to a rename. Letting an author type a new one and
+                then refusing it would be a trap. */}
             <Input
               id={`${formId}-id`}
               value={id}
               onChange={(e) => setId(e.target.value)}
+              readOnly={editing}
+              aria-readonly={editing || undefined}
+              className={editing ? "text-muted-foreground" : undefined}
               placeholder="e.g. campaign_pipeline"
             />
+            {editing && (
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                A workflow&apos;s id can&apos;t change. It keys the saved graph, its
+                schedule and its run history.
+              </p>
+            )}
           </div>
           <div className="grid gap-2">
             <Label htmlFor={`${formId}-name`}>Name</Label>
@@ -580,8 +737,18 @@ export function WorkflowCreateDialog({
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={submitting}>
             Cancel
           </Button>
-          <Button onClick={() => void submit()} disabled={submitting}>
-            {submitting ? "Creating…" : "Create workflow"}
+          <Button
+            onClick={() => void submit()}
+            disabled={submitting}
+            data-testid="workflow-dialog-submit"
+          >
+            {editing
+              ? submitting
+                ? "Saving…"
+                : "Save changes"
+              : submitting
+                ? "Creating…"
+                : "Create workflow"}
           </Button>
         </DialogFooter>
       </DialogContent>

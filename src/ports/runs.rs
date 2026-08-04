@@ -51,6 +51,16 @@ use crate::ports::types::{CompanyId, EventSeq, TokenUsage, TurnStep};
 pub const ORPHAN_ERROR: &str =
     "the host restarted while this attempt was running, so its outcome was lost";
 
+/// The `error` stamped on an attempt whose dispatch was refused because the
+/// company's runtime was being replaced (issue #290).
+///
+/// Deliberately distinct from [`ORPHAN_ERROR`]. That one means the host process
+/// died and nothing is left to say what happened; this one means the process is
+/// perfectly healthy and the company's runtime was swapped underneath a card an
+/// operator had just dispatched, which is a retry-me rather than an incident.
+pub const RUNTIME_REPLACED_ERROR: &str =
+    "the company runtime was being replaced when this card was dispatched, so it never started";
+
 // ---------------------------------------------------------------------------
 // RunStatus
 // ---------------------------------------------------------------------------
@@ -97,11 +107,58 @@ impl RunStatus {
         }
     }
 
+    /// Parses a wire/column literal back into a status, or `None`.
+    ///
+    /// The inverse of [`Self::as_str`], and deliberately in the same `impl`
+    /// rather than left to each reader: a REST `?status=` filter that grew its
+    /// own literal table would be free to drift from the column the backend
+    /// indexes. [`from_wire_round_trips`](self::test::from_wire_round_trips)
+    /// pins the two together.
+    pub fn from_wire(word: &str) -> Option<Self> {
+        Some(match word {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "waiting_approval" => Self::WaitingApproval,
+            "paused" => Self::Paused,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+
     /// Whether the attempt is over for good. Nothing moves out of a terminal
     /// status — a re-run is a *new* attempt with its own ordinal, never a
     /// resurrection of this one.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
+    /// Which of the three coarse phases this status sits in: `active`,
+    /// `parked`, or `terminal`.
+    ///
+    /// A projection of [`Self::is_active`] / [`Self::is_parked`] /
+    /// [`Self::is_terminal`], which partition the enum
+    /// ([`phases_partition_every_status`](self::test::phases_partition_every_status)
+    /// pins that).
+    ///
+    /// It exists for readers — chiefly the console — that need to know whether
+    /// an attempt is live, waiting, or over, and must not answer that from a
+    /// timestamp. `finished_at_millis` is `None` for a **parked** run as well as
+    /// a live one, so "no finish time" does not mean "still running"; a reader
+    /// that guessed from the timestamp would render a run waiting on a human as
+    /// though it were burning tokens. Projecting the phase here means the
+    /// terminal set is enumerated once, in the module that owns the state
+    /// machine, instead of being re-derived by every surface and drifting the
+    /// next time a status is added.
+    pub fn phase(self) -> &'static str {
+        if self.is_terminal() {
+            "terminal"
+        } else if self.is_parked() {
+            "parked"
+        } else {
+            "active"
+        }
     }
 
     /// Whether the attempt claims to be live in *this* process — the states a
@@ -537,6 +594,19 @@ fn check_transition(run: &RunRecord, next: RunStatus) -> Result<()> {
 /// that no longer exists. This is a proof, not a timeout heuristic — nothing
 /// here guesses at staleness from a clock.
 ///
+/// ## The proof is about *boot*, and only boot (issue #290)
+///
+/// Invariant 3 is the load-bearing one and it is the one a
+/// [runtime rebuild](crate::runtime::rebuild_company) breaks: a rebuild calls
+/// [`RuntimeBuilder::build`](crate::runtime::RuntimeBuilder::build) a second
+/// time in a live process, where cycles *have* run and may hold rows that are
+/// genuinely in flight. Calling this from there would settle live attempts as
+/// dead, which is the precise corruption the sweep exists to clean up — so
+/// `build()` suppresses it whenever a
+/// [`RuntimeHandover`](crate::runtime::RuntimeHandover) is present. Any future
+/// caller owes the same argument: this function reclaims rows it can *prove* are
+/// abandoned, and outside boot that proof does not exist.
+///
 /// **Parked runs are never touched.** `WaitingApproval` and `Paused` are
 /// waiting on a person or an external condition, not on a process; reaping them
 /// would delete real pending work every time the host restarted.
@@ -616,6 +686,62 @@ mod test {
                 format!("\"{}\"", status.as_str()),
                 "the indexed column literal and the wire form must not drift"
             );
+        }
+    }
+
+    /// The `?status=` filter parses the exact literal the backend indexes —
+    /// pinned in both directions so neither table can drift alone.
+    #[test]
+    fn from_wire_round_trips() {
+        for status in ALL {
+            assert_eq!(
+                RunStatus::from_wire(status.as_str()),
+                Some(status),
+                "{status} does not parse back from its own literal"
+            );
+        }
+        assert_eq!(RunStatus::from_wire("Succeeded"), None, "case is exact");
+        assert_eq!(RunStatus::from_wire("waitingApproval"), None);
+        assert_eq!(RunStatus::from_wire(""), None);
+    }
+
+    /// `phase()` is only sound if the three predicates partition the enum:
+    /// exactly one must hold for every status, or a run would report a phase
+    /// that contradicts one of them.
+    #[test]
+    fn phases_partition_every_status() {
+        for status in ALL {
+            let held = [status.is_active(), status.is_parked(), status.is_terminal()]
+                .into_iter()
+                .filter(|b| *b)
+                .count();
+            assert_eq!(held, 1, "{status} is in {held} phases, not exactly one");
+        }
+        assert_eq!(RunStatus::Pending.phase(), "active");
+        assert_eq!(RunStatus::Running.phase(), "active");
+        assert_eq!(RunStatus::WaitingApproval.phase(), "parked");
+        assert_eq!(RunStatus::Paused.phase(), "parked");
+        assert_eq!(RunStatus::Succeeded.phase(), "terminal");
+        assert_eq!(RunStatus::Failed.phase(), "terminal");
+        assert_eq!(RunStatus::Cancelled.phase(), "terminal");
+    }
+
+    /// The trap this whole projection exists for: a parked run has **no**
+    /// finish time, exactly like a live one, so a reader that inferred
+    /// liveness from the timestamp would call a run waiting on a person "still
+    /// running" forever.
+    #[test]
+    fn a_parked_run_has_no_finish_time_and_is_not_active() {
+        for parked in [RunStatus::WaitingApproval, RunStatus::Paused] {
+            let mut record = run("r1", 10, 1);
+            record.status = RunStatus::Running;
+            record.started_at_millis = Some(11);
+            // What `finish_run` would stamp: only a terminal settle is a finish.
+            record.status = parked;
+            record.finished_at_millis = parked.is_terminal().then_some(12);
+            assert_eq!(record.finished_at_millis, None);
+            assert!(!record.is_active(), "{parked} must not read as live");
+            assert_eq!(record.status.phase(), "parked");
         }
     }
 

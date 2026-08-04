@@ -56,7 +56,8 @@ export function TourController({
   setView,
 }: {
   company: string | null;
-  setView: (view: View) => void;
+  /** `sub` names a section's sub-page, e.g. `#/settings/connections`. */
+  setView: (view: View, sub?: string) => void;
 }) {
   const [welcomeOpen, setWelcomeOpen] = useState(false);
   const [session, setSession] = useState(false); // mounts Joyride for the run
@@ -151,7 +152,7 @@ export function TourController({
       // Publish the live position so `armTourResume` can persist it if this
       // stop hands the browser off to a third party (the OAuth connect flow).
       setActiveTourStop(stop.view);
-      setView(stop.view);
+      setView(stop.view, stop.sub);
       await waitForTarget(stop.target);
     },
     [setView],
