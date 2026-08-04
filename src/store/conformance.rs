@@ -1318,6 +1318,7 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
         cached_input_tokens: 10,
         cost_usd: cost,
         kind: SampleKind::Inference,
+        run_id: None,
     };
 
     usage.record(&alpha, &sample(100, 0.1)).await.unwrap();
@@ -1355,6 +1356,7 @@ pub async fn assert_usage_retention(usage: Arc<dyn UsageMeter>) {
         cached_input_tokens: 10,
         cost_usd: 0.1,
         kind: SampleKind::Inference,
+        run_id: None,
     };
 
     // A fixed base far from epoch 0 so the cutoff math stays positive.

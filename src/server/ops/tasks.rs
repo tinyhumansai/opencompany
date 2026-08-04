@@ -721,7 +721,7 @@ fn fold_page(
 
     for ev in page {
         let entry = match &ev.event {
-            CompanyEvent::TaskDispatched { task_id: id } if id == task_id => {
+            CompanyEvent::TaskDispatched { task_id: id, .. } if id == task_id => {
                 *window_opened_at = Some(ev.at_millis);
                 Some(("dispatched", "Dispatched".to_string(), None, None))
             }

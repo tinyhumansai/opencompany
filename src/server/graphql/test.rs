@@ -584,6 +584,7 @@ async fn usage_reflects_recorded_samples() {
                 cached_input_tokens: 0,
                 cost_usd: 0.5,
                 kind: SampleKind::Inference,
+                run_id: None,
             },
         )
         .await

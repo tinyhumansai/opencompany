@@ -367,7 +367,7 @@ impl CompanyRuntime {
         let dispatch = task_enters_in_progress(prev_column.as_deref(), &task.column);
         self.ops.tasks.upsert(&self.id, task).await?;
         if dispatch {
-            self.dispatch_task(task.id.clone());
+            self.dispatch_task(task).await;
         }
         Ok(())
     }
@@ -377,15 +377,23 @@ impl CompanyRuntime {
     /// the cycle writes its outcome back onto the card. In the default build (no
     /// harness) this is a no-op, keeping the board inert.
     ///
+    /// The one **choke point** every dispatch passes through, which is why issue
+    /// #242 mints the attempt's [`RunRecord`](crate::ports::runs::RunRecord)
+    /// here — see [`open_run`](Self::open_run) for why it is minted *before* the
+    /// spawn rather than inside the cycle.
+    ///
     /// [`TaskDispatched`]: crate::ports::types::CompanyEvent::TaskDispatched
-    fn dispatch_task(self: &Arc<Self>, task_id: String) {
+    async fn dispatch_task(self: &Arc<Self>, task: &TaskRecord) {
         #[cfg(feature = "openhuman")]
         if self.harness.is_some() {
+            let task_id = task.id.clone();
+            let run_id = self.open_run(task).await;
             let runtime = Arc::clone(self);
             tokio::spawn(async move {
                 if let Err(err) = runtime
                     .run_cycle(vec![CompanyEvent::TaskDispatched {
                         task_id: task_id.clone(),
+                        run_id,
                     }])
                     .await
                 {
@@ -400,8 +408,60 @@ impl CompanyRuntime {
             return;
         }
         // Default build / no harness: the board stays inert. The card rests in
-        // `in_progress` until a harness cycle (or a human) advances it.
-        let _ = task_id;
+        // `in_progress` until a harness cycle (or a human) advances it. No run is
+        // minted either — nothing is attempting the card, so an attempt row would
+        // be a fiction.
+        let _ = task;
+    }
+
+    /// Mints this dispatch's [`RunStatus::Pending`] attempt row and returns its
+    /// id, or `None` when the row could not be written (issue #242).
+    ///
+    /// **Before the spawn, deliberately.** The cycle is a detached
+    /// `tokio::spawn`, so a host that dies in the gap between this write and the
+    /// cycle's first turn used to leave *nothing at all* behind: the card sat in
+    /// `in_progress` with no record that anything had ever tried it. Writing the
+    /// row first turns that silent loss into a visible orphan the boot reaper
+    /// ([`reap_orphaned_runs`](crate::ports::runs::reap_orphaned_runs)) fails on
+    /// the next start.
+    ///
+    /// **A failed write never blocks the dispatch.** Record-keeping does not get
+    /// to fail the work it records — the same invariant the workflow-outcome
+    /// journal, the inference meter and the grant-consumption record already
+    /// hold. The dispatch proceeds with `run_id: None`, which every downstream
+    /// reader treats as "this attempt is untracked", and the failure is logged at
+    /// `warn` rather than swallowed.
+    ///
+    /// [`RunStatus::Pending`]: crate::ports::runs::RunStatus::Pending
+    #[cfg(feature = "openhuman")]
+    async fn open_run(&self, task: &TaskRecord) -> Option<String> {
+        let spec = crate::ports::runs::NewRun {
+            id: crate::ports::generate_id(),
+            task_id: task.id.clone(),
+            agent_id: task.assignee.clone(),
+        };
+        match self.ops.runs.create_run(&self.id, spec).await {
+            Ok(run) => {
+                tracing::debug!(
+                    company = %self.id,
+                    task = %task.id,
+                    run = %run.id,
+                    attempt = run.attempt,
+                    "[runs] opened an attempt for a dispatched card"
+                );
+                Some(run.id)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    company = %self.id,
+                    task = %task.id,
+                    error = %err,
+                    "[runs] could not open an attempt row; dispatching anyway — the work runs \
+                     untracked rather than not at all"
+                );
+                None
+            }
+        }
     }
 
     /// This company's workspace file tree.
@@ -829,6 +889,84 @@ mod tests {
         assert!(
             task_enters_in_progress(None, COLUMN_IN_PROGRESS),
             "positive control: the trigger this test relies on is still live"
+        );
+    }
+
+    /// Issue #242: the attempt row exists **before** the cycle is spawned, in
+    /// [`RunStatus::Pending`], carrying the assignee it was dispatched to and a
+    /// 1-based ordinal that climbs per re-dispatch. This is the whole point of
+    /// minting at the choke point rather than inside the cycle — a host that
+    /// dies in the gap leaves a visible orphan instead of nothing.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_dispatch_opens_a_pending_attempt_before_the_cycle_spawns() {
+        use crate::ports::TaskRecord;
+        use crate::ports::runs::{RunFilter, RunStatus};
+        use crate::ports::tasks::COLUMN_IN_PROGRESS;
+
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-run-open-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest: crate::company::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .expect("manifest");
+        let id = crate::ports::types::CompanyId::new("acme");
+        let runtime = crate::runtime::RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .expect("runtime");
+
+        let card = TaskRecord {
+            id: "t-1".to_string(),
+            title: "Ship it".to_string(),
+            note: None,
+            column: COLUMN_IN_PROGRESS.to_string(),
+            priority: "medium".to_string(),
+            assignee: "ceo".to_string(),
+            updated_at_millis: 0,
+            origin_chat_id: None,
+            parent_task_id: None,
+        };
+
+        let first = runtime.open_run(&card).await.expect("an attempt is minted");
+        let runs = runtime
+            .runs()
+            .list_runs(&id, &RunFilter::for_task("t-1"))
+            .await
+            .expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, first);
+        assert_eq!(
+            runs[0].status,
+            RunStatus::Pending,
+            "the row is written before anything runs, so it starts Pending"
+        );
+        assert_eq!(runs[0].attempt, 1, "the first attempt at a card is 1");
+        assert_eq!(runs[0].agent_id, "ceo");
+        assert!(
+            runs[0].trigger_event_seq.is_none(),
+            "the driving event has not been appended yet"
+        );
+        assert!(runs[0].started_at_millis.is_none());
+
+        // A re-dispatch is a NEW attempt, never a resurrection of the first.
+        let second = runtime.open_run(&card).await.expect("a second attempt");
+        assert_ne!(second, first);
+        let runs = runtime
+            .runs()
+            .list_runs(&id, &RunFilter::for_task("t-1"))
+            .await
+            .expect("list");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter()
+                .find(|r| r.id == second)
+                .expect("second")
+                .attempt,
+            2
         );
     }
 }

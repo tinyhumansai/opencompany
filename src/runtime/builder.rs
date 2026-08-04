@@ -1290,7 +1290,13 @@ impl RuntimeBuilder {
                             // `set_workflow_runner`, so this is not a strong cycle.
                             deps.workflow_runner.set(&runner);
                             wf_runner = Some(runner);
-                            Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
+                            Some(Arc::new(
+                                // Issue #242: the same run store the dispatch
+                                // choke point mints into and the boot reaper
+                                // sweeps, so an attempt's trace, cost and
+                                // status all land on the row it opened.
+                                HarnessBrain::new(pool, deps, record).with_runs(ops.runs.clone()),
+                            ) as Arc<dyn Brain>)
                         } else {
                             // Do not degrade silently (issue #174): an openhuman
                             // build with no resolvable inference source disables
@@ -1740,6 +1746,113 @@ mod test {
             .prefix(prefix)
             .tempdir()
             .expect("tempdir")
+    }
+
+    /// Issue #242, the property this whole PR exists to create, proven across a
+    /// real restart: a host killed mid-run leaves the attempt's **partial trace
+    /// intact**, and the next boot settles the row it stranded.
+    ///
+    /// The kill is simulated by simply not settling — which is exactly what a
+    /// `SIGKILL` looks like from the store's side, and the reason the boot
+    /// reaper's claim is a proof rather than a timeout heuristic: a cycle is a
+    /// process-local spawn, so an active row at boot cannot belong to anything
+    /// still alive.
+    #[tokio::test]
+    async fn a_killed_run_keeps_its_partial_trace_and_is_settled_on_the_next_boot() {
+        use crate::ports::runs::{NewRun, RunStatus, RunStepRecord};
+        use crate::ports::types::{EventSeq, TurnStep, TurnStepKind, TurnStepStatus};
+
+        let home = tmp_home("opencompany-run-restart-");
+        let manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .expect("manifest");
+        let id = CompanyId::new("acme");
+
+        // --- boot 1: a card is dispatched, starts, writes two steps… and dies.
+        {
+            let rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest.clone())
+                .with_id(id.clone())
+                .build()
+                .await
+                .expect("first boot");
+            let runs = rt.runs();
+            runs.create_run(
+                &id,
+                NewRun {
+                    id: "run-1".to_string(),
+                    task_id: "t-1".to_string(),
+                    agent_id: "ceo".to_string(),
+                },
+            )
+            .await
+            .expect("mint");
+            runs.begin_run(&id, "run-1", EventSeq::new(3))
+                .await
+                .expect("begin");
+            for (step_seq, label, status) in [
+                (0u32, "Reading the brief", TurnStepStatus::Ok),
+                (1, "Searching the web", TurnStepStatus::Running),
+            ] {
+                runs.append_run_step(
+                    &id,
+                    &RunStepRecord {
+                        run_id: "run-1".to_string(),
+                        step_seq,
+                        at_millis: 100 + step_seq as u64,
+                        step: TurnStep {
+                            kind: TurnStepKind::ToolCall,
+                            status,
+                            label: label.to_string(),
+                            detail: None,
+                            elapsed_ms: None,
+                        },
+                    },
+                )
+                .await
+                .expect("append step");
+            }
+            // …and the process is gone. Nothing settles the row.
+        }
+
+        // --- boot 2: the builder's reaper runs before anything is dispatched.
+        let rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .expect("second boot");
+
+        let reaped = rt
+            .runs()
+            .get_run(&id, "run-1")
+            .await
+            .expect("read")
+            .expect("the row survives the restart");
+        assert_eq!(
+            reaped.status,
+            RunStatus::Failed,
+            "an attempt whose process died must not still claim to be running"
+        );
+        assert_eq!(
+            reaped.error.as_deref(),
+            Some(crate::ports::runs::ORPHAN_ERROR)
+        );
+
+        // The whole point: the steps written before the kill are still there,
+        // including the tool call that never got to finish.
+        let steps = rt
+            .runs()
+            .list_run_steps(&id, "run-1")
+            .await
+            .expect("list steps");
+        assert_eq!(steps.len(), 2, "the partial trace must survive the restart");
+        assert_eq!(steps[0].step.label, "Reading the brief");
+        assert_eq!(steps[0].step.status, TurnStepStatus::Ok);
+        assert_eq!(
+            steps[1].step.status,
+            TurnStepStatus::Running,
+            "the call that was in flight when the host died reads as in flight"
+        );
     }
 
     #[test]

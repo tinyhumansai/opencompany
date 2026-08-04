@@ -9,10 +9,13 @@
 //!
 //! Compiled only under `feature = "openhuman"`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::Result;
 use crate::company::steer::SteerControl;
+use crate::harness::run_trace::RunTraceSink;
 use crate::harness::{HarnessDeps, HarnessPool, TurnOutcome};
 use crate::ports::types::CompanyId;
 use crate::runtime::delegation::RunTurn;
@@ -51,9 +54,12 @@ impl RunTurn for HarnessRunTurn<'_> {
         message: &str,
         control: &SteerControl,
         chat_id: Option<&str>,
+        run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome> {
         self.pool
-            .run_steered(company, agent_id, message, self.deps, control, chat_id)
+            .run_steered(
+                company, agent_id, message, self.deps, control, chat_id, run_sink,
+            )
             .await
     }
 
@@ -63,9 +69,10 @@ impl RunTurn for HarnessRunTurn<'_> {
         agent_id: &str,
         message: &str,
         control: &SteerControl,
+        run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome> {
         self.pool
-            .run_steered_background(company, agent_id, message, self.deps, control)
+            .run_steered_background(company, agent_id, message, self.deps, control, run_sink)
             .await
     }
 }

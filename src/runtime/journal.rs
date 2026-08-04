@@ -758,6 +758,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         }
     }
 

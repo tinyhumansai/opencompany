@@ -3082,6 +3082,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
     for event in [
         CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
+            run_id: None,
         },
         // Tagged to this task — admitted.
         CompanyEvent::AgentReply {
@@ -3285,6 +3286,7 @@ async fn task_timeline_scopes_approvals_to_the_run_window() {
         approval("before"),
         CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
+            run_id: None,
         },
         // Inside the window — admitted.
         approval("during"),
@@ -3372,6 +3374,7 @@ async fn dispatched_task(
             company,
             CompanyEvent::TaskDispatched {
                 task_id: "t-1".into(),
+                run_id: None,
             },
         )
         .await
@@ -3399,6 +3402,7 @@ fn parked_effect() -> crate::ports::types::Effect {
         first_time_counterparty: false,
         payload: serde_json::Value::Null,
         agent: None,
+        run_id: None,
     }
 }
 
