@@ -3,7 +3,6 @@ import {
   Brain,
   ChartColumnBig,
   FolderClosed,
-  Flag,
   Inbox,
   LayoutDashboard,
   type LucideIcon,
@@ -29,7 +28,6 @@ import {
   SidebarFooter,
   SidebarGroup,
   SidebarGroupLabel,
-  SidebarHeader,
   SidebarInset,
   SidebarMenu,
   SidebarMenuBadge,
@@ -37,19 +35,12 @@ import {
   SidebarMenuItem,
   SidebarProvider,
   SidebarRail,
-  SidebarTrigger,
 } from "@/components/ui/sidebar";
-import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
-import { CompanySwitcher } from "@/components/company-switcher";
 import { FeedbackDialog } from "@/components/feedback-dialog";
-import { StatusPill } from "@/components/status-pill";
-import { ThemeToggle } from "@/components/theme-toggle";
-import { DiscordIcon } from "@/components/discord-icon";
+import { SidebarControls } from "@/components/sidebar-controls";
 import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
-import { DISCORD_INVITE_URL } from "@/lib/links";
 import { defaultThreads } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { Conversation } from "@/views/Conversation";
@@ -143,26 +134,6 @@ const NAV: NavGroup[] = [
   },
 ];
 
-const TITLES: Record<View, string> = {
-  overview: "Overview",
-  conversation: "Conversation",
-  inbox: "Inbox",
-  tasks: "Tasks",
-  team: "Team",
-  skills: "Skills",
-  workspace: "Workspace",
-  memory: "Memory",
-  approvals: "Approvals",
-  workflows: "Workflows",
-  usage: "Usage",
-  finances: "Finances",
-  connections: "Connections",
-  mcp: "MCP Servers",
-  people: "People",
-  settings: "Settings",
-  feedback: "Feedback",
-};
-
 const VIEWS = NAV.flatMap((g) => g.items.map((i) => i.view));
 
 interface Props {
@@ -206,15 +177,9 @@ export function AppShell({
   return (
     <SidebarProvider>
       <Sidebar collapsible="icon">
-        <SidebarHeader>
-          <CompanySwitcher
-            active={feed.status}
-            companies={companies}
-            onSwitch={onSwitchCompany}
-            onBackToPicker={onBackToPicker}
-          />
-        </SidebarHeader>
-        <SidebarContent>
+        {/* The company header that used to sit above the nav is gone, so the
+            first group needs its own breathing room off the top edge. */}
+        <SidebarContent className="pt-2">
           {NAV.map((group) => (
             <SidebarGroup key={group.label}>
               <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
@@ -239,45 +204,19 @@ export function AppShell({
           ))}
         </SidebarContent>
         <SidebarFooter>
-          <SidebarMenu>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                tooltip="Join our Discord"
-                render={<a href={DISCORD_INVITE_URL} target="_blank" rel="noreferrer" />}
-              >
-                <DiscordIcon className="size-4" />
-                <span>Join our Discord</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
+          <SidebarControls
+            lifecycleState={feed.status.lifecycle}
+            companies={companies}
+            activeCompany={company}
+            onSwitchCompany={onSwitchCompany}
+            onBackToPicker={onBackToPicker}
+            onFlag={() => setFeedbackOpen(true)}
+          />
         </SidebarFooter>
         <SidebarRail />
       </Sidebar>
 
       <SidebarInset>
-        {/* The Overview is the graph and nothing else — it takes the whole
-            frame, top bar included. Every other view keeps its chrome. */}
-        {view !== "overview" && (
-          <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-            <SidebarTrigger className="-ml-1" />
-            <Separator orientation="vertical" className="mr-1 h-4" />
-            <h1 className="text-sm font-semibold">{TITLES[view]}</h1>
-            <div className="ml-auto flex items-center gap-2">
-              <StatusPill lifecycle={feed.status.lifecycle} className="hidden sm:inline-flex" />
-              <Button
-                variant="outline"
-                size="sm"
-                className="hidden sm:inline-flex"
-                onClick={() => setFeedbackOpen(true)}
-              >
-                <Flag className="size-4" />
-                Flag something
-              </Button>
-              <ThemeToggle />
-            </div>
-          </header>
-        )}
-
         <main className="flex flex-1 flex-col overflow-hidden">
           {view === "overview" && (
             <Overview client={client} company={company} />
