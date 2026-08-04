@@ -9,7 +9,6 @@ use tower::ServiceExt;
 
 use crate::company::CompanyManifest;
 use crate::company::steer::{InflightEntry, InflightKind};
-use crate::ports::RunStore;
 use crate::ports::facts::{FactKind, FactRecord};
 use crate::ports::tasks::TaskRecord;
 use crate::ports::types::{CompanyId, CompanyRecord, ContextChunk};
@@ -4126,7 +4125,6 @@ async fn the_attempt_id_outranks_the_card_link_when_both_are_present() {
 /// id", opposite outcome, because one is unrecorded and the other is recorded.
 #[tokio::test]
 async fn a_pre_333_approval_falls_back_to_the_run_window() {
-    use crate::ports::types::ApprovalId;
     use crate::store::paths::Bundle;
 
     let home_dir = home();

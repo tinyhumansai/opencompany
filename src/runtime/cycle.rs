@@ -845,12 +845,10 @@ fn cycle_task_id(
                 match approval_task(approval_id) {
                     // Resolved an approval that belongs to a card: this cycle
                     // continues that card's work.
-                    Some(Some(link)) => match link.task_id() {
-                        Some(id) => Some(id.to_string()),
-                        // Known to belong to no card — a rival turn, not a
-                        // neutral event.
-                        None => return None,
-                    },
+                    Some(Some(TaskLink::Task { id })) => Some(id),
+                    // Known to belong to no card — a rival turn, not a neutral
+                    // event, so the batch is ambiguous.
+                    Some(Some(TaskLink::Unlinked)) => return None,
                     // A pre-#333 park, or an id with no origin at all: nothing
                     // is claimed either way, so it neither stamps nor blocks.
                     Some(None) | None => continue,
