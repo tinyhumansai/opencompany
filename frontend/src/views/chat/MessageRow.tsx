@@ -10,6 +10,7 @@ import {
   type Sender,
   type TimelineEntry,
 } from "./model";
+import { CardChip, StepTimeline } from "./StepTimeline";
 
 interface Props {
   entry: TimelineEntry;
@@ -63,6 +64,9 @@ export function MessageRow({ entry, threadOpen, onOpenThread, onReact }: Props) 
       <div className="flex min-w-0 flex-1 flex-col">
         {!continuation && <AuthorLine sender={sender} at={message.at} />}
         <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.text}</p>
+
+        {message.steps && message.steps.length > 0 && <StepTimeline steps={message.steps} />}
+        {message.taskId && <CardChip taskId={message.taskId} />}
 
         {message.reactions && (
           <Reactions reactions={message.reactions} onReact={(e) => onReact(message.id, e)} />

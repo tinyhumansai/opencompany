@@ -44,7 +44,7 @@ import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { ChatView } from "@/views/ChatView";
-import type { Transcripts } from "@/views/chat/model";
+import { DEFAULT_CHANNEL, type Transcripts } from "@/views/chat/model";
 import { Conversation } from "@/views/Conversation";
 import { TeamView } from "@/views/TeamView";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -178,9 +178,6 @@ export function AppShell({
   // Most call sites only ever change the top-level view.
   const setView = useCallback((next: View, nextSub?: string) => navigate(next, nextSub), [navigate]);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
-  // System lines raised outside chat (an approval decision, say). Chat owns
-  // the transcripts now, so the shell hands it an append-only log to fold in.
-  const [notices, setNotices] = useState<string[]>([]);
   // The shell owns every channel's transcript, not `ChatView` — the shell
   // mounts and unmounts `ChatView` per route, so component-local state there
   // would be discarded on every trip away from Chat and back.
@@ -344,10 +341,15 @@ export function AppShell({
     );
 
   // Approval decisions and other events land in a transcript rather than
-  // vanishing. Both chat surfaces get the line: Chat drains the append-only
-  // `notices` log, the parked Conversation appends to its active thread.
+  // vanishing. Both chat surfaces get the line: Chat's `main` channel gets it
+  // appended directly (the shell owns `transcripts`, not `ChatView`, so this
+  // survives `ChatView` unmounting), and the parked Conversation appends to
+  // its active thread.
   const noteSystem = (line: string) => {
-    setNotices((n) => [...n, line]);
+    setTranscripts((t) => ({
+      ...t,
+      [DEFAULT_CHANNEL]: [...(t[DEFAULT_CHANNEL] ?? []), makeMessage("system", line)],
+    }));
     setThreadMessages(activeThreadId, (m) => [...m, makeMessage("system", line)]);
   };
 
@@ -538,7 +540,6 @@ export function AppShell({
               sub={sub}
               onNavigate={(channelId) => navigate("chat", channelId)}
               onReply={() => void feed.refresh()}
-              notices={notices}
               transcripts={transcripts}
               setTranscripts={setTranscripts}
             />

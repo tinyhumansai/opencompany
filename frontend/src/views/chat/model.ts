@@ -1,9 +1,22 @@
 // The chat workspace's data model: channels, direct messages, and the grouping
 // rules the timeline reads. Everything here is pure — the view owns the state.
 
+import type { DeskDto } from "@/api/types";
 import type { ChatMessage } from "@/lib/chat";
-import { defaultDesks } from "@/lib/desks";
+import { defaultDesks, type Desk } from "@/lib/desks";
 import { initials as nameInitials, type TeamMember } from "@/lib/team";
+
+/**
+ * A host desk (`GET .../desks`), shaped into the console's `Desk`. The host
+ * has no separate channel-slug or blurb field, so the slug is derived from
+ * the desk's name and the blurb falls back to its description — the id is
+ * the one field that must survive untouched, since it doubles as the chat
+ * thread id `send` addresses.
+ */
+export function deskFromDto(d: DeskDto): Desk {
+  const slug = d.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return { id: d.id, channel: slug || d.id, name: d.name, blurb: d.description ?? "" };
+}
 
 /**
  * Every channel's transcript, keyed by channel id. Owned by `AppShell`, not
@@ -11,6 +24,9 @@ import { initials as nameInitials, type TeamMember } from "@/lib/team";
  * steps into Tasks, Settings, or any other view and comes back.
  */
 export type Transcripts = Record<string, ChatMessage[]>;
+
+/** The channel a fresh session lands on, and where an unaddressed system line goes. */
+export const DEFAULT_CHANNEL = "main";
 
 export type ChannelKind = "channel" | "dm";
 
@@ -43,16 +59,19 @@ export interface ChannelSection {
 /**
  * The channel list.
  *
- * The company's desks (`lib/desks.ts`) become the `#channels` — they are the
- * standing lines you can address, and each already carries a name, a blurb, and
- * a tone. Every roster teammate additionally gets a DM, so a one-to-one line
- * exists for anyone the company employs.
+ * `desks` become the `#channels` — they are the standing lines you can
+ * address, and each already carries a name, a blurb, and a tone. Defaults to
+ * `lib/desks.ts`'s static set for a host that doesn't expose `.../desks` yet
+ * (issue #53); the caller fetches the real ones and passes them in once they
+ * land, so a company's own desks show up instead of the generic
+ * strategy/creative/front-desk trio. Every roster teammate additionally gets
+ * a DM, so a one-to-one line exists for anyone the company employs.
  *
  * Both kinds post to the same company endpoint. A channel scopes a transcript
  * and gives the company side a stable identity; it is not a separate backend.
  */
-export function buildChannels(members: TeamMember[]): ChannelSection[] {
-  const channels: Channel[] = defaultDesks().map((d) => ({
+export function buildChannels(members: TeamMember[], desks: Desk[] = defaultDesks()): ChannelSection[] {
+  const channels: Channel[] = desks.map((d) => ({
     id: d.id,
     name: d.channel,
     voice: d.name,
@@ -83,9 +102,24 @@ export function buildChannels(members: TeamMember[]): ChannelSection[] {
  * mints ids from a module counter (`lib/team.ts`), so they differ between two
  * calls in the same session and a `#/chat/dm:member-3` link would point at a
  * different person — or nobody — on the next mount.
+ *
+ * The slug alone is not enough: it keeps only `[a-z0-9]`, so a name written
+ * entirely in a non-Latin script slugifies to nothing, and two names that
+ * slugify alike (or both empty) would collide onto the same id — the second
+ * teammate's DM becomes unreachable and their messages merge with the
+ * first's. A short hash of the full name, appended after the slug, keeps the
+ * id both name-derived and unique.
  */
 export function dmChannelId(member: TeamMember): string {
-  return `dm:${member.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`;
+  const name = member.name.trim();
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return `dm:${slug ? `${slug}-` : ""}${nameHash(name)}`;
+}
+
+function nameHash(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  return (hash >>> 0).toString(36);
 }
 
 export function findChannel(sections: ChannelSection[], id: string | null): Channel | null {

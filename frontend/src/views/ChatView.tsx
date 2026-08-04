@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
 import { setInboxEnabled } from "@/api/inbox";
 import { ApiError } from "@/api/types";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
+import { defaultDesks, type Desk } from "@/lib/desks";
 import { fromDto, newMember, starterTeam, type TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { AddMemberDialog, type NewMemberFields } from "./chat/AddMemberDialog";
@@ -18,6 +19,8 @@ import {
   buildChannels,
   buildTimeline,
   channelTitle,
+  DEFAULT_CHANNEL,
+  deskFromDto,
   dmChannelId,
   findChannel,
   toggleReaction,
@@ -33,12 +36,6 @@ interface Props {
   /** Called after a reply lands, so the shell can refresh approvals/status. */
   onReply?: () => void;
   /**
-   * Append-only system lines raised elsewhere in the console (an approval
-   * decision, say). They land in the main channel so the transcript still
-   * records what happened outside it.
-   */
-  notices: string[];
-  /**
    * Every channel's transcript, keyed by channel id, and its setter — owned by
    * `AppShell` rather than here so a transcript survives this component
    * unmounting when the operator navigates to another view and back (the shell
@@ -48,8 +45,6 @@ interface Props {
   transcripts: Transcripts;
   setTranscripts: Dispatch<SetStateAction<Transcripts>>;
 }
-
-const DEFAULT_CHANNEL = "main";
 
 /**
  * The chat workspace.
@@ -70,13 +65,13 @@ export function ChatView({
   sub,
   onNavigate,
   onReply,
-  notices,
   transcripts,
   setTranscripts,
 }: Props) {
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [loadingTeam, setLoadingTeam] = useState(true);
   const [fromHost, setFromHost] = useState(false);
+  const [desks, setDesks] = useState<Desk[]>(defaultDesks());
   const [sending, setSending] = useState(false);
   const [openThreadId, setOpenThreadId] = useState<string | null>(null);
   const [membersOpen, setMembersOpen] = useState(false);
@@ -107,23 +102,26 @@ export function ChatView({
     void boot();
   }, [boot]);
 
-  // Drain by index rather than by identity: `notices` only ever grows, so the
-  // count of what has already been folded in is the whole bookmark.
-  const drained = useRef(0);
+  // The company's real desks, when the host exposes them — a company with its
+  // own desks gets its own channels instead of the generic strategy/creative/
+  // front-desk trio. Hosts without `.../desks` yet 404; the static defaults
+  // still work then (the existing Conversation path has the same fallback).
   useEffect(() => {
-    if (notices.length <= drained.current) return;
-    const fresh = notices.slice(drained.current);
-    drained.current = notices.length;
-    setTranscripts((t) => ({
-      ...t,
-      [DEFAULT_CHANNEL]: [
-        ...(t[DEFAULT_CHANNEL] ?? []),
-        ...fresh.map((line) => makeMessage("system", line)),
-      ],
-    }));
-  }, [notices]);
+    let live = true;
+    void (async () => {
+      try {
+        const dtos = await client.listDesks(company);
+        if (live) setDesks(dtos.length ? dtos.map(deskFromDto) : defaultDesks());
+      } catch {
+        if (live) setDesks(defaultDesks());
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company]);
 
-  const sections = useMemo(() => buildChannels(members), [members]);
+  const sections = useMemo(() => buildChannels(members, desks), [members, desks]);
   const channel = findChannel(sections, sub) ?? findChannel(sections, DEFAULT_CHANNEL);
 
   const messages = channel ? (transcripts[channel.id] ?? []) : [];
@@ -156,9 +154,18 @@ export function ChatView({
     append(target, makeMessage("you", text, { parentId }));
     setSending(true);
     try {
-      const reply = await client.chat(text, company);
+      // A real desk channel's id doubles as its thread id (`deskFromDto`), so
+      // addressing by it routes to that desk's lead instead of the
+      // orchestrator. A DM's id is console-local (`dmChannelId`), not a host
+      // thread — passing it would be an unknown id, which the host already
+      // falls back on, but omitting it here says plainly that a DM has no
+      // addressed thread of its own.
+      const chatId = active.kind === "channel" ? active.id : undefined;
+      const reply = await client.chat(text, company, chatId);
       const replies = reply.responses.length
-        ? reply.responses.map((r) => makeMessage("company", r.text, { channel: r.channel, parentId }))
+        ? reply.responses.map((r) =>
+            makeMessage("company", r.text, { channel: r.channel, parentId, steps: r.steps, taskId: r.taskId }),
+          )
         : [makeMessage("system", "(no reply)", { parentId })];
       append(target, ...replies);
       onReply?.();
