@@ -21,6 +21,10 @@ pub mod fs_ops;
 /// (`companies/`, `memory/`, `store/`, `files/`, `logs/`, `tmp/`) and the
 /// startup lifecycle that creates them and, by default, clears `tmp/`.
 pub mod layout;
+/// The one-shot boot migration off the legacy doubled home layout
+/// (`companies/companies/<slug>`), run by `serve`, `export`, and `import`
+/// against the resolved home before anything reads it.
+pub mod migrate;
 pub mod paths;
 
 /// Config-driven backend selection: maps `OPENCOMPANY_STORAGE` (fs | sqlite |
@@ -75,6 +79,9 @@ pub use fs::{
 };
 pub use fs_ops::FsOps;
 pub use layout::DataLayout;
+pub use migrate::{
+    Collision, NestMigration, Relocated, migrate_legacy_nest, migrate_legacy_nest_announced,
+};
 pub use paths::{Bundle, DATA_DIR_ENV, home_divergence_warning, resolve_home};
 pub use select::{
     MemoryBackend, MemoryOverlay, StorageHandles, StorageKind, StorageSettings,

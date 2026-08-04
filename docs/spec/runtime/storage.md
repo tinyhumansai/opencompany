@@ -75,21 +75,17 @@ bundle hangs off through `store::resolve_home`, in this order:
 | --- | --- | --- |
 | 1 | `--home <DIR>` | `<DIR>` verbatim — an explicit flag is never overridden by the environment |
 | 2 | `OPENCOMPANY_DATA_DIR` | its value verbatim, so bundles land at `<root>/companies/<slug>` — exactly the layout above |
-| 3 | neither | `$HOME/.opencompany/companies` (the legacy default; see below) |
+| 3 | neither | `$HOME/.opencompany` (a relative `.opencompany` when `$HOME` is unset) |
 
 An empty `OPENCOMPANY_DATA_DIR` counts as unset — it would otherwise root the
 instance at the process working directory.
 
-Two consequences worth knowing:
+All three branches resolve the home to the **workspace root**, so `Bundle`'s own
+`companies/` segment puts bundles at `<root>/companies/<slug>` in every case —
+exactly the layout above, and exactly `DataLayout::companies_dir()`.
 
-- **The legacy default is one level deeper than the layout above.** With neither
-  the flag nor the variable set, the home is `$HOME/.opencompany/companies` and
-  `Bundle` appends a `companies/` of its own, so bundles sit at
-  `~/.opencompany/companies/companies/<slug>` while `DataLayout` materializes
-  `~/.opencompany/{memory,store,files,logs,tmp}`. That extra level is a wart kept
-  for compatibility with existing local installs rather than silently relocating
-  their data. Setting `OPENCOMPANY_DATA_DIR` gives the canonical single-root
-  layout.
+One consequence worth knowing:
+
 - **`--home` moves the bundles but not the workspace.** It places company
   bundles only; `memory/`, `store/`, `files/`, `logs/` and `tmp/` always follow
   `OPENCOMPANY_DATA_DIR`. So two hosts isolated by `--home` alone still share one
@@ -97,7 +93,38 @@ Two consequences worth knowing:
   whenever they are not aligned. Prefer `OPENCOMPANY_DATA_DIR`, which moves the
   whole instance. A hosted tenant sets both to the same value
   (`docker/entrypoint.sh` passes `--home "$OPENCOMPANY_DATA_DIR"`), so it never
-  warns — nor does the untouched local default.
+  warns — nor does the local default, whose home and data root are now the same
+  path. Passing `--home ~/.opencompany/companies` by hand recreates the legacy
+  doubled shape below and does warn, correctly.
+
+#### Migrating a legacy doubled install (`src/store/migrate.rs`)
+
+The default home used to append a `companies` leaf of its own, so a default local
+install's bundles were nested one level too deep at
+`~/.opencompany/companies/companies/<slug>` while `DataLayout` materialized
+`~/.opencompany/{memory,store,files,logs,tmp}` beside the *first* `companies/`. A
+local sqlite database was orphaned the same way, at
+`~/.opencompany/companies/opencompany.db`, because `serve` hands the resolved
+home to `open_storage`.
+
+Dropping the leaf without moving that data would leave every existing local
+company invisible, so `serve`, `export`, and `import` all run
+`store::migrate_legacy_nest` against the resolved home before reading anything:
+
+- No `<home>/companies/companies` directory is a no-op. A hosted tenant takes
+  this branch on every boot: two `stat`s that find nothing.
+- A nest holding a `company.toml` or `meta.json` at its top level is a real
+  bundle slugged `companies` and is left exactly as it is.
+- Every other entry is renamed up one level, and any `opencompany.db` (with its
+  `-wal`/`-shm` siblings, as a set) moves from `<home>/companies/` to `<home>/`.
+- An occupied destination is **skipped**, never merged: two copies of one company
+  hold two event logs and two signing keys, which cannot be interleaved. Both
+  copies stay put and a warning names both paths.
+- The nest directory is removed only once emptied, so a crash mid-migration
+  resumes on the next boot. Re-running a migrated install is silent.
+
+Moves are printed on stderr rather than logged through `warn!`, which the default
+`EnvFilter` drops unless `RUST_LOG` is set.
 
 `OPENCOMPANY_HOME` is **not** a synonym and is **not supported**. It was never
 wired to anything, so setting it used to be ignored silently. The resolver now

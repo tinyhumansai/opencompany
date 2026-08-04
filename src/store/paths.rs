@@ -19,7 +19,10 @@
 //! signing key or per-company secrets.
 //!
 //! [`resolve_home`] resolves the `<home>` root every bundle hangs off, and is
-//! the only place that decision is made.
+//! the only place that decision is made. It resolves to the instance workspace
+//! root in every branch, so the single `companies/` segment above is the only
+//! one; installs predating that carry an extra level and are moved up on boot by
+//! [`migrate_legacy_nest`](crate::store::migrate_legacy_nest).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -38,14 +41,6 @@ pub const DATA_DIR_ENV: &str = "OPENCOMPANY_DATA_DIR";
 /// [`resolve_home`] now rejects it by name instead of ignoring it.
 const REMOVED_HOME_ENV: &str = "OPENCOMPANY_HOME";
 
-/// The legacy leaf appended to `$HOME/.opencompany` when neither `--home` nor
-/// [`DATA_DIR_ENV`] is set. [`Bundle::new`] appends `companies/` of its own, so
-/// the untouched default resolves bundles to
-/// `~/.opencompany/companies/companies/<slug>`. That extra level is a wart, but
-/// it is where every existing local install's data already sits, so the default
-/// is preserved verbatim rather than silently relocating it.
-const LEGACY_DEFAULT_LEAF: &str = "companies";
-
 /// Resolves the OpenCompany home — the root every [`Bundle`] hangs off — from
 /// the `--home` flag and the process environment.
 ///
@@ -61,9 +56,18 @@ const LEGACY_DEFAULT_LEAF: &str = "companies";
 ///    identically and the workspace layout and the company bundles share one
 ///    root (`<root>/companies/<slug>`, matching
 ///    [`DataLayout::companies_dir`](crate::store::DataLayout::companies_dir)).
-/// 3. **`$HOME/.opencompany/companies`**, the legacy local default — see
-///    [`LEGACY_DEFAULT_LEAF`]. Falls back to a relative `.opencompany/companies`
-///    when `$HOME` is unset.
+/// 3. **`$HOME/.opencompany`**, the local default. Falls back to a relative
+///    `.opencompany` when `$HOME` is unset.
+///
+/// All three branches resolve the home to the *workspace root*, so bundles land
+/// at `<root>/companies/<slug>` in every case — the layout
+/// [`DataLayout::companies_dir`](crate::store::DataLayout::companies_dir) and
+/// `docs/spec/runtime/storage.md` document. The default used to append a
+/// `companies` leaf of its own on top of the one [`Bundle::new`] adds, nesting a
+/// default local install's bundles at `~/.opencompany/companies/companies/<slug>`.
+/// That leaf is gone; existing installs are moved up on first launch by
+/// [`migrate_legacy_nest`](crate::store::migrate_legacy_nest), which `serve`,
+/// `export`, and `import` all run before touching the home.
 ///
 /// An empty variable counts as unset: an empty `OPENCOMPANY_DATA_DIR` would
 /// otherwise root the instance at the process working directory.
@@ -111,10 +115,8 @@ fn resolve_home_from(
         return Ok(PathBuf::from(dir));
     }
     Ok(match set(unix_home) {
-        Some(home) => PathBuf::from(home)
-            .join(".opencompany")
-            .join(LEGACY_DEFAULT_LEAF),
-        None => PathBuf::from(".opencompany").join(LEGACY_DEFAULT_LEAF),
+        Some(home) => PathBuf::from(home).join(".opencompany"),
+        None => PathBuf::from(".opencompany"),
     })
 }
 
@@ -125,15 +127,17 @@ fn resolve_home_from(
 /// — the bundles separate, the workspace does not.
 ///
 /// `data_root` is [`data_dir_from_env`](crate::app::config::data_dir_from_env).
-/// Silent in the two aligned shapes:
+/// Silent in the one aligned shape, `home == data_root`, which now covers every
+/// branch of [`resolve_home`]: a hosted tenant
+/// (`--home "$OPENCOMPANY_DATA_DIR"`), `OPENCOMPANY_DATA_DIR` alone, and the
+/// untouched local default.
 ///
-/// - `home == data_root` — a hosted tenant (`--home "$OPENCOMPANY_DATA_DIR"`)
-///   or `OPENCOMPANY_DATA_DIR` alone.
-/// - `home == data_root/companies` — the untouched legacy default, which
-///   diverges by design (see [`LEGACY_DEFAULT_LEAF`]) and must not warn on
-///   every ordinary run.
+/// One deliberate consequence: an explicit `--home ~/.opencompany/companies`
+/// recreates the old doubled shape and now warns where the legacy default was
+/// silent. That is correct — the bundles really are one level away from the
+/// workspace there.
 pub fn home_divergence_warning(home: &Path, data_root: &Path) -> Option<String> {
-    if home == data_root || home == data_root.join(LEGACY_DEFAULT_LEAF) {
+    if home == data_root {
         return None;
     }
     Some(format!(
@@ -500,12 +504,14 @@ mod test {
     }
 
     #[test]
-    fn the_default_is_unchanged_when_nothing_is_set() {
-        // Existing local installs must not silently relocate: the legacy
-        // default keeps its extra `companies` level (see LEGACY_DEFAULT_LEAF).
+    fn the_default_resolves_to_the_workspace_root() {
+        // The default no longer appends a `companies` leaf on top of the one
+        // `Bundle::new` adds, so a default local install has the same
+        // single-root shape as a hosted tenant. Existing doubled installs are
+        // moved up by `store::migrate_legacy_nest` rather than orphaned.
         assert_eq!(
             resolve(None, None, Some("/home/u")).unwrap(),
-            PathBuf::from("/home/u/.opencompany/companies")
+            PathBuf::from("/home/u/.opencompany")
         );
         let bundle = Bundle::new(
             resolve(None, None, Some("/home/u")).unwrap(),
@@ -513,13 +519,30 @@ mod test {
         );
         assert_eq!(
             bundle.dir(),
-            Path::new("/home/u/.opencompany/companies/companies/acme")
+            Path::new("/home/u/.opencompany/companies/acme")
         );
         // No $HOME keeps the relative fallback.
         assert_eq!(
             resolve(None, None, None).unwrap(),
-            PathBuf::from(".opencompany/companies")
+            PathBuf::from(".opencompany")
         );
+    }
+
+    #[test]
+    fn every_branch_resolves_to_the_same_shape() {
+        // Flag, variable, and default now agree: the home is the workspace root
+        // and bundles hang off `<root>/companies/<slug>` in all three.
+        let roots = [
+            resolve(Some("/root"), None, None).unwrap(),
+            resolve(None, Some("/root"), None).unwrap(),
+            resolve(None, None, Some("/root")).unwrap(),
+        ];
+        assert_eq!(roots[0], roots[1]);
+        assert_eq!(roots[2], PathBuf::from("/root/.opencompany"));
+        for root in roots {
+            let bundle = Bundle::new(root.clone(), &CompanyId::new("acme"));
+            assert_eq!(bundle.dir(), root.join("companies").join("acme"));
+        }
     }
 
     #[test]
@@ -527,11 +550,11 @@ mod test {
         // Empty would otherwise root the instance at the working directory.
         assert_eq!(
             resolve(None, Some(""), Some("/home/u")).unwrap(),
-            PathBuf::from("/home/u/.opencompany/companies")
+            PathBuf::from("/home/u/.opencompany")
         );
         assert_eq!(
             resolve(None, Some(""), Some("")).unwrap(),
-            PathBuf::from(".opencompany/companies")
+            PathBuf::from(".opencompany")
         );
     }
 
@@ -575,14 +598,32 @@ mod test {
             home_divergence_warning(Path::new("/data"), Path::new("/data")).is_none(),
             "one root for the whole instance is the intended shape"
         );
-        // The untouched legacy default diverges by design and must stay silent
-        // on every ordinary local run.
+        // The default local run: both the home and the data root resolve to
+        // $HOME/.opencompany now, so an ordinary run is silent without needing a
+        // special case for a doubled shape.
         assert!(
             home_divergence_warning(
-                Path::new("/home/u/.opencompany/companies"),
+                Path::new("/home/u/.opencompany"),
                 Path::new("/home/u/.opencompany"),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn recreating_the_old_doubled_shape_by_hand_now_warns() {
+        // A deliberate consequence of dropping the default's `companies` leaf:
+        // an explicit --home at the old path really does put the bundles one
+        // level away from the workspace, which is exactly what this warning is
+        // for. It used to be special-cased silent.
+        let warning = home_divergence_warning(
+            Path::new("/home/u/.opencompany/companies"),
+            Path::new("/home/u/.opencompany"),
+        )
+        .expect("an explicit --home at the legacy path is a real divergence");
+        assert!(
+            warning.contains("/home/u/.opencompany/companies"),
+            "{warning}"
         );
     }
 

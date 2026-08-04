@@ -83,7 +83,7 @@ layer set it, and what is missing for each optional capability.
 | `TINYHUMANS_API_KEY` | — (required for cycles when no token file) | Static TinyHumans credential (JWT or API key) |
 | `TINYHUMANS_API_URL` | `https://api.tinyhumans.ai` | Backend base URL |
 | `OPENCOMPANY_BIND` | `127.0.0.1:8080` | HTTP bind address |
-| `OPENCOMPANY_DATA_DIR` | `~/.opencompany` (workspace) / `~/.opencompany/companies` (bundle home) | The instance data root: both the workspace layout and the company-bundle home. `--home` outranks it for the bundle home **only** — the workspace (`memory/`, `store/`, `files/`, `logs/`, `tmp/`) still resolves under this variable, so `--home` alone does not move a whole instance. The only knob that isolates two hosts from each other — see [storage](storage.md#choosing-the-root-srcstorepathsrs) |
+| `OPENCOMPANY_DATA_DIR` | `~/.opencompany` (workspace and bundle home alike; bundles at `companies/<slug>`) | The instance data root: both the workspace layout and the company-bundle home. `--home` outranks it for the bundle home **only** — the workspace (`memory/`, `store/`, `files/`, `logs/`, `tmp/`) still resolves under this variable, so `--home` alone does not move a whole instance. The only knob that isolates two hosts from each other — see [storage](storage.md#choosing-the-root-srcstorepathsrs) |
 | `OPENCOMPANY_BRAIN_MODE` | `hosted` | `hosted` \| `sidecar` (overrides `[brain].mode`) |
 | `OPENCOMPANY_OPENHUMAN_URL` | — | Attach to a running `openhuman-core serve` instead of launching |
 | `OPENCOMPANY_INFERENCE_KEY` | `TINYHUMANS_API_KEY` | Harness-brain credential (`openhuman` feature). Per-tenant override of the platform key |
