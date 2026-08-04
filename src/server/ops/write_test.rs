@@ -4564,6 +4564,7 @@ async fn the_attempt_id_outranks_the_card_link_when_both_are_present() {
 #[tokio::test]
 async fn a_pre_333_approval_falls_back_to_the_run_window() {
     use crate::store::paths::Bundle;
+    use crate::ports::types::{Actor, ActorKind, ApprovalId, CompanyEvent, Verdict};
 
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
@@ -4592,6 +4593,36 @@ async fn a_pre_333_approval_falls_back_to_the_run_window() {
         body["waitingSince"].as_u64().unwrap(),
         dispatched_at + 5,
         "the legacy live-wait behaviour is unchanged",
+    );
+
+    let id = ApprovalId::new("appr-legacy");
+    runtime.journal.record_resolved(&id).await.unwrap();
+    runtime
+        .events()
+        .append(
+            &company,
+            CompanyEvent::ApprovalResolved {
+                approval_id: id,
+                verdict: Verdict::Approve,
+                by: Actor {
+                    kind: ActorKind::User,
+                    id: "u-1".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    let approvals = body["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(approvals[0]["id"], "appr-legacy");
+    assert_eq!(approvals[0]["status"], "approved");
+    let resolved_at = approvals[0]["resolvedAtMillis"].as_u64().unwrap();
+    assert_eq!(
+        approvals[0]["waitedMillis"].as_u64().unwrap(),
+        resolved_at.saturating_sub(dispatched_at + 5),
+        "the resolved legacy row keeps the original park-to-resolve wait",
     );
 }
 

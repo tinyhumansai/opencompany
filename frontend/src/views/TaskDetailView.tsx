@@ -1499,6 +1499,7 @@ function ApprovalsTab({ approvals, now }: { approvals: TaskApproval[]; now: numb
                       "shrink-0 text-[11px] underline-offset-2 hover:underline",
                       status.className,
                     )}
+                    aria-label={`${status.label} — review ${a.kind} on the Approvals page`}
                     title="Review this on the Approvals page"
                   >
                     {status.label}

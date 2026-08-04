@@ -28,6 +28,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::types::{ApprovalId, Effect};
 use crate::runtime::grants::GrantedCall;
+pub use crate::runtime::types::TaskLink;
 
 /// One durable journal record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,49 +123,6 @@ enum JournalRecord {
     },
 }
 
-/// Which board task an approval was parked for (issue #333).
-///
-/// Two arms rather than an `Option<String>` because "no card is behind this
-/// one" is a *recorded* fact, not a missing one. A host from #333 onward always
-/// writes one of these; an absent link (`Option<TaskLink>::None`) means only
-/// that the line predates the field.
-///
-/// The distinction is the whole correctness of the tab. Every unlinked park —
-/// a workflow delivery ([`crate::workflows`]), an operator-chat turn, a
-/// scheduler tick — is a deliberate `Unlinked`, and must *not* be re-attributed
-/// to whatever card happened to be running when it parked. Only a genuinely
-/// pre-#333 line keeps the old run-window correlation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "link", rename_all = "snake_case")]
-pub enum TaskLink {
-    /// Parked inside a board task's dispatch cycle — that card owns it.
-    Task {
-        /// The owning board task's id.
-        id: String,
-    },
-    /// Parked with no board task behind it, recorded as such.
-    Unlinked,
-}
-
-impl TaskLink {
-    /// The owning task's id, or `None` for [`Unlinked`](Self::Unlinked).
-    pub fn task_id(&self) -> Option<&str> {
-        match self {
-            Self::Task { id } => Some(id.as_str()),
-            Self::Unlinked => None,
-        }
-    }
-
-    /// Builds a link from an optional task id — `None` becoming an explicit
-    /// [`Unlinked`](Self::Unlinked) rather than a missing link.
-    pub fn from_task_id(task_id: Option<&str>) -> Self {
-        match task_id {
-            Some(id) => Self::Task { id: id.to_string() },
-            None => Self::Unlinked,
-        }
-    }
-}
-
 /// A parked approval awaiting resolution.
 #[derive(Clone, Debug)]
 pub struct PendingApproval {
@@ -225,11 +183,20 @@ pub struct ApprovalOrigin {
     pub run_id: Option<String>,
 }
 
+/// One approval currently waiting in the in-memory queue.
+#[derive(Clone, Debug)]
+struct ParkedApproval {
+    effect: Effect,
+    at_millis: u64,
+    /// `None` only for a journal line written before #333.
+    task: Option<TaskLink>,
+}
+
 /// In-memory state rebuilt from (and kept in sync with) `journal.jsonl`.
 #[derive(Default)]
 struct State {
     executed: HashSet<String>,
-    parked: HashMap<ApprovalId, (Effect, u64, Option<TaskLink>)>,
+    parked: HashMap<ApprovalId, ParkedApproval>,
     /// What each approval was when it parked, retained after it leaves `parked`.
     ///
     /// This is what makes waiting time readable (issue #305) and what links a
@@ -307,7 +274,14 @@ impl RuntimeJournal {
                             run_id: effect.run_id.clone(),
                         },
                     );
-                    state.parked.insert(id, (effect, at_millis, task));
+                    state.parked.insert(
+                        id,
+                        ParkedApproval {
+                            effect,
+                            at_millis,
+                            task,
+                        },
+                    );
                 }
                 JournalRecord::ApprovalResolved { id } => {
                     state.parked.remove(&id);
@@ -382,9 +356,14 @@ impl RuntimeJournal {
                     run_id: effect.run_id.clone(),
                 },
             );
-            state
-                .parked
-                .insert(id.clone(), (effect.clone(), at_millis, Some(task.clone())));
+            state.parked.insert(
+                id.clone(),
+                ParkedApproval {
+                    effect: effect.clone(),
+                    at_millis,
+                    task: Some(task.clone()),
+                },
+            );
         }
         self.append(&JournalRecord::ApprovalParked {
             id: id.clone(),
@@ -558,11 +537,11 @@ impl RuntimeJournal {
         let mut out: Vec<PendingApproval> = state
             .parked
             .iter()
-            .map(|(id, (effect, at_millis, task))| PendingApproval {
+            .map(|(id, parked)| PendingApproval {
                 id: id.clone(),
-                effect: effect.clone(),
-                at_millis: *at_millis,
-                task: task.clone(),
+                effect: parked.effect.clone(),
+                at_millis: parked.at_millis,
+                task: parked.task.clone(),
             })
             .collect();
         out.sort_by(|a, b| {

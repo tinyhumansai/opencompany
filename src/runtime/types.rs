@@ -6,7 +6,43 @@ use serde::{Deserialize, Serialize};
 use crate::ports::types::{
     ApprovalId, CompanyId, Effect, EventSeq, OutboundMessage, TemplateProvenance,
 };
-use crate::runtime::journal::TaskLink;
+
+/// Which board task an approval was parked for (issue #333).
+///
+/// Two arms rather than an `Option<String>` because "no card is behind this
+/// one" is a recorded fact, not a missing one. A host from #333 onward always
+/// writes one of these; an absent link (`Option<TaskLink>::None`) means only
+/// that the journal line predates the field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "link", rename_all = "snake_case")]
+pub enum TaskLink {
+    /// Parked inside a board task's dispatch cycle — that card owns it.
+    Task {
+        /// The owning board task's id.
+        id: String,
+    },
+    /// Parked with no board task behind it, recorded as such.
+    Unlinked,
+}
+
+impl TaskLink {
+    /// The owning task's id, or `None` for [`Unlinked`](Self::Unlinked).
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Task { id } => Some(id.as_str()),
+            Self::Unlinked => None,
+        }
+    }
+
+    /// Builds a link from an optional task id — `None` becoming an explicit
+    /// [`Unlinked`](Self::Unlinked) rather than a missing link.
+    pub fn from_task_id(task_id: Option<&str>) -> Self {
+        match task_id {
+            Some(id) => Self::Task { id: id.to_string() },
+            None => Self::Unlinked,
+        }
+    }
+}
 
 /// The outcome of one cycle: what the brain said, what effects ran or parked,
 /// and where the event log now stands.

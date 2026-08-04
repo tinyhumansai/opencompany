@@ -966,7 +966,9 @@ enum ApprovalOwner {
 ///    resolves to a task; a task id can never resolve to a run. #183 settled
 ///    that repeat trips through review are normal, so two attempts on one card
 ///    is the expected case, and only this key separates them. Checked against
-///    `task_runs`, this card's own attempt ids.
+///    `task_runs`, this card's own attempt ids. Any present id takes precedence:
+///    an id missing from this card's run set returns `NotMine` without consulting
+///    the card-level link, including when the run record is unavailable.
 /// 2. **the parked [`TaskLink`](crate::runtime::journal::TaskLink) —
 ///    card-level, the fallback.** `run_id` is
 ///    `None` by design wherever no attempt is behind the park — a chat turn, a
