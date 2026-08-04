@@ -882,19 +882,24 @@ async fn main() -> Result<()> {
                 state = state.with_memory_overlay(overlay);
                 println!("memory backend: {:?}", storage_settings.memory_backend);
             }
-            // Platform (multi-tenant) auth: a shared platform token enables the
-            // provisioning/lifecycle surface. Without it the prosumer operator
-            // path stays in force. Real signed JWT is `platform-jwt`.
-            if let Some(token) = std::env::var("OPENCOMPANY_PLATFORM_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
+            // Platform (multi-tenant) auth: either credential enables the
+            // provisioning/lifecycle surface. Without both the prosumer operator
+            // path stays in force. A signing secret this build cannot verify
+            // aborts boot here rather than silently degrading — same precedent
+            // as a selected-but-unavailable storage backend above.
             {
                 use opencompany::server::platform_auth::{
-                    PlatformAuthConfig, StaticPlatformVerifier,
+                    PLATFORM_JWT_SECRET_ENV, PLATFORM_TOKEN_ENV, configure,
                 };
-                state = state.with_platform_auth(PlatformAuthConfig::new(Arc::new(
-                    StaticPlatformVerifier::new(token),
-                )));
+                if let Some((platform_auth, mode)) = configure(
+                    std::env::var(PLATFORM_TOKEN_ENV).ok(),
+                    std::env::var(PLATFORM_JWT_SECRET_ENV).ok(),
+                )? {
+                    state = state.with_platform_auth(platform_auth);
+                    // The mode only — never the secret, or anything derived
+                    // from it.
+                    println!("platform auth: {mode}");
+                }
             }
             // Outbound webhooks: a URL wires the HTTP sink under `webhooks`;
             // without the feature the request is warned and dropped.

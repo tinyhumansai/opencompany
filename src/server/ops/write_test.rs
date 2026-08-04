@@ -887,13 +887,13 @@ async fn memory_operator_fact_is_injected_into_the_agent_turn() {
 #[tokio::test]
 async fn memory_is_isolated_between_companies() {
     use crate::server::platform_auth::{
-        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+        PlatformAuthConfig, PlatformClaims, UnsignedTenantVerifier,
     };
     use std::collections::HashSet;
 
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
-    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let verifier = std::sync::Arc::new(UnsignedTenantVerifier::new("plat-secret"));
     let state = AppState::new(AppConfig::default())
         .with_home(home.clone())
         .with_platform_auth(PlatformAuthConfig::new(verifier));
@@ -912,7 +912,7 @@ async fn memory_is_isolated_between_companies() {
     }
 
     let token = |tenant: &str| {
-        StaticPlatformVerifier::tenant_token(&PlatformClaims {
+        UnsignedTenantVerifier::tenant_token(&PlatformClaims {
             tenant: tenant.to_string(),
             scopes: HashSet::from(["operator".to_string()]),
             companies: None,
@@ -1198,13 +1198,13 @@ async fn workspace_tree_and_file_reads_reflect_writes() {
 #[tokio::test]
 async fn workspace_reads_are_isolated_between_companies() {
     use crate::server::platform_auth::{
-        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+        PlatformAuthConfig, PlatformClaims, UnsignedTenantVerifier,
     };
     use std::collections::HashSet;
 
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
-    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let verifier = std::sync::Arc::new(UnsignedTenantVerifier::new("plat-secret"));
     let state = AppState::new(AppConfig::default())
         .with_home(home.clone())
         .with_platform_auth(PlatformAuthConfig::new(verifier));
@@ -1223,7 +1223,7 @@ async fn workspace_reads_are_isolated_between_companies() {
     }
 
     let token = |tenant: &str| {
-        StaticPlatformVerifier::tenant_token(&PlatformClaims {
+        UnsignedTenantVerifier::tenant_token(&PlatformClaims {
             tenant: tenant.to_string(),
             scopes: HashSet::from(["operator".to_string()]),
             companies: None,
@@ -1998,14 +1998,14 @@ async fn chat_accepts_desk_id_and_replies() {
 #[tokio::test]
 async fn credential_route_rejects_foreign_tenant() {
     use crate::server::platform_auth::{
-        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+        PlatformAuthConfig, PlatformClaims, UnsignedTenantVerifier,
     };
     use std::collections::HashSet;
 
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     // Platform mode: `acme` is owned by `tenant:acme`.
-    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let verifier = std::sync::Arc::new(UnsignedTenantVerifier::new("plat-secret"));
     let state = AppState::new(AppConfig::default())
         .with_home(home.clone())
         .with_platform_auth(PlatformAuthConfig::new(verifier));
@@ -2021,7 +2021,7 @@ async fn credential_route_rejects_foreign_tenant() {
     state.set_owner(id.clone(), "tenant:acme");
 
     let token = |tenant: &str| {
-        StaticPlatformVerifier::tenant_token(&PlatformClaims {
+        UnsignedTenantVerifier::tenant_token(&PlatformClaims {
             tenant: tenant.to_string(),
             scopes: HashSet::from(["operator".to_string()]),
             companies: None,
