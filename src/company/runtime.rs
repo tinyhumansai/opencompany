@@ -339,18 +339,6 @@ impl CompanyRuntime {
         &self.journal
     }
 
-    /// The per-company cycle lock, so a rebuild can assert the successor
-    /// inherited it rather than minting a second one.
-    pub(crate) fn serial_lock(&self) -> &Arc<TokioMutex<()>> {
-        &self.serial
-    }
-
-    /// The board read-modify-write lock, exposed for the same reason as
-    /// [`serial_lock`](Self::serial_lock).
-    pub(crate) fn task_writes_lock(&self) -> &Arc<TokioMutex<()>> {
-        &self.task_writes
-    }
-
     /// This company's durable record store.
     pub fn store(&self) -> &Arc<dyn CompanyStore> {
         &self.store

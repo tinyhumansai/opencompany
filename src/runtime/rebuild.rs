@@ -305,12 +305,12 @@ mod test {
         assert!(Arc::ptr_eq(before.events(), after.events()));
         assert!(Arc::ptr_eq(before.store(), after.store()));
         // Same serial lock, so the cycle invariant spans the swap rather than
-        // lapsing at it.
-        assert!(Arc::ptr_eq(before.serial_lock(), after.serial_lock()));
-        assert!(Arc::ptr_eq(
-            before.task_writes_lock(),
-            after.task_writes_lock()
-        ));
+        // lapsing at it. Read off the fields, like the gate above: every
+        // production holder (`CycleRunner::run`, the desk routes, `quiesce`'s
+        // drain) takes them the same way, so an accessor here would be a public
+        // surface that exists only for this assertion.
+        assert!(Arc::ptr_eq(&before.serial, &after.serial));
+        assert!(Arc::ptr_eq(&before.task_writes, &after.task_writes));
     }
 
     #[tokio::test]
