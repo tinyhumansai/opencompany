@@ -130,7 +130,12 @@ impl<'a> CycleRunner<'a> {
         };
 
         // 4. Think + 5. Gate — the host services callbacks and gates effects.
-        let host = CycleHostImpl::new(company.clone(), cycle_id.clone(), self.rt);
+        let host = CycleHostImpl::new(
+            company.clone(),
+            cycle_id.clone(),
+            self.rt,
+            cycle_task_id(&request.events, &self.rt.journal.approval_origins()),
+        );
         let result = self.rt.brain.run_cycle(request, &host).await?;
 
         // 6. Persist output.
@@ -679,6 +684,46 @@ async fn recipient_is_established(rt: &CompanyRuntime, to: &str) -> bool {
         .unwrap_or(false) // fail closed → parks for approval
 }
 
+/// The board task a cycle is working, read off its own trigger events
+/// (issue #333) — the correlation key every approval this cycle parks carries.
+///
+/// Two ways a cycle belongs to a card, and both are a real id:
+///
+/// * a [`TaskDispatched`](CompanyEvent::TaskDispatched) event — the card was
+///   dragged into `in_progress` and this cycle is its run;
+/// * an [`ApprovalResolved`](CompanyEvent::ApprovalResolved) event whose
+///   approval was itself parked for a card. Approving a gated tool call
+///   re-dispatches the agent (issue #243), and that follow-up cycle is still
+///   the same card's work — so a run that needs two sign-offs keeps both,
+///   instead of losing the link the moment the first one is granted.
+///
+/// **An ambiguous batch yields `None`.** Two dispatched cards in one cycle
+/// cannot both own an effect parked by it, and guessing one would hand a task
+/// approvals that are not its own — the precise failure this issue exists to
+/// end. Unlinked is honest; the read side falls back to the run window there.
+fn cycle_task_id(
+    events: &[CompanyEvent],
+    origins: &std::collections::HashMap<ApprovalId, crate::runtime::journal::ApprovalOrigin>,
+) -> Option<String> {
+    let mut found: Option<String> = None;
+    for event in events {
+        let candidate = match event {
+            CompanyEvent::TaskDispatched { task_id } => Some(task_id.clone()),
+            CompanyEvent::ApprovalResolved { approval_id, .. } => {
+                origins.get(approval_id).and_then(|o| o.task_id.clone())
+            }
+            _ => continue,
+        };
+        let Some(candidate) = candidate else { continue };
+        match &found {
+            Some(existing) if existing != &candidate => return None,
+            Some(_) => {}
+            None => found = Some(candidate),
+        }
+    }
+    found
+}
+
 /// The host the brain calls back into mid-cycle. Bridges tool, context, and
 /// effect callbacks to the runtime's ports and gates every effect.
 struct CycleHostImpl<'a> {
@@ -688,10 +733,24 @@ struct CycleHostImpl<'a> {
     counter: AtomicU64,
     executed: StdMutex<Vec<Effect>>,
     parked: StdMutex<Vec<ApprovalId>>,
+    /// The board task this cycle is working, when it is working one
+    /// (issue #333) — stamped onto every approval the cycle parks.
+    ///
+    /// Computed once, from the cycle's own trigger events, by
+    /// [`cycle_task_id`]. It is a real id rather than a time window: whatever
+    /// turn parks the effect — the dispatched card's own turn, a desk it
+    /// delegated to, an email it tried to send — the approval belongs to the
+    /// task whose dispatch opened this cycle, and to no other.
+    task_id: Option<String>,
 }
 
 impl<'a> CycleHostImpl<'a> {
-    fn new(company: CompanyId, cycle_id: String, rt: &'a CompanyRuntime) -> Self {
+    fn new(
+        company: CompanyId,
+        cycle_id: String,
+        rt: &'a CompanyRuntime,
+        task_id: Option<String>,
+    ) -> Self {
         Self {
             company,
             cycle_id,
@@ -699,6 +758,7 @@ impl<'a> CycleHostImpl<'a> {
             counter: AtomicU64::new(0),
             executed: StdMutex::new(Vec::new()),
             parked: StdMutex::new(Vec::new()),
+            task_id,
         }
     }
 
@@ -749,7 +809,7 @@ impl<'a> CycleHostImpl<'a> {
             .await?;
         self.rt
             .journal
-            .record_parked(&approval_id, &effect, now_millis())
+            .record_parked(&approval_id, &effect, now_millis(), self.task_id.as_deref())
             .await?;
         self.parked
             .lock()
@@ -760,6 +820,7 @@ impl<'a> CycleHostImpl<'a> {
             group = ?effect.group,
             approval_id = %approval_id,
             cycle = %self.cycle_id,
+            task = self.task_id.as_deref().unwrap_or("-"),
             "[cycle] parked effect for operator approval"
         );
         Ok(approval_id)
@@ -2325,7 +2386,7 @@ mod test {
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
-            .record_parked(&approval_id, &effect, now_millis())
+            .record_parked(&approval_id, &effect, now_millis(), None)
             .await
             .unwrap();
 
@@ -2389,7 +2450,7 @@ mod test {
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
-            .record_parked(&approval_id, &effect, now_millis())
+            .record_parked(&approval_id, &effect, now_millis(), None)
             .await
             .unwrap();
 
@@ -2438,7 +2499,7 @@ mod test {
                 .unwrap();
             let id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
             rt.journal
-                .record_parked(&id, &effect, now_millis())
+                .record_parked(&id, &effect, now_millis(), None)
                 .await
                 .unwrap();
             id
@@ -2553,7 +2614,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-nomail".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-nomail".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "to": "x@ext.com", "subject": "s", "body": "b" }))
@@ -2576,7 +2637,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-bad".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-bad".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "subject": "s", "body": "b" }))
@@ -2599,7 +2660,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-park".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-park".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "to": "new@ext.com", "subject": "s", "body": "b" }))
@@ -2607,6 +2668,114 @@ mod test {
             .unwrap();
         assert_eq!(res.output["status"], "pending_approval");
         assert_eq!(sender.sent().len(), 0);
+    }
+
+    /// Issue #333: an effect parked by a card's dispatch cycle is journaled
+    /// against that card, so the card's Approvals tab can find it.
+    #[tokio::test]
+    async fn a_dispatch_cycle_stamps_its_task_onto_every_approval_it_parks() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .with_mail(CompanyMail {
+                sender: sender.clone(),
+                smtp: test_smtp("ceo@acme.test"),
+            })
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(
+            rt.id().clone(),
+            "cyc-task".into(),
+            &rt,
+            Some("t-42".to_string()),
+        );
+
+        // A cold recipient parks — the same path a card's turn takes.
+        host.send_email(serde_json::json!({ "to": "new@ext.com", "subject": "s", "body": "b" }))
+            .await
+            .unwrap();
+
+        let pending = rt.pending_approvals();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].task_id.as_deref(),
+            Some("t-42"),
+            "the parked approval must name the card that asked for it",
+        );
+        assert_eq!(
+            rt.approval_origins()
+                .get(&pending[0].id)
+                .and_then(|o| o.task_id.clone()),
+            Some("t-42".into()),
+            "and the link must outlive the queue entry",
+        );
+    }
+
+    /// The correlation key itself (#333): which card a cycle is working, read
+    /// off its own trigger events.
+    #[test]
+    fn cycle_task_id_reads_a_dispatch_inherits_a_resolution_and_refuses_to_guess() {
+        use crate::ports::types::{Actor, ActorKind, ApprovalId, Verdict};
+        use crate::runtime::journal::ApprovalOrigin;
+
+        let origins = std::collections::HashMap::from([(
+            ApprovalId::new("appr-1"),
+            ApprovalOrigin {
+                at_millis: 1,
+                kind: "filing.submit".into(),
+                task_id: Some("t-1".into()),
+            },
+        )]);
+        let dispatched = |id: &str| CompanyEvent::TaskDispatched {
+            task_id: id.to_string(),
+        };
+        let resolved = |id: &str| CompanyEvent::ApprovalResolved {
+            approval_id: ApprovalId::new(id),
+            verdict: Verdict::Approve,
+            by: Actor {
+                kind: ActorKind::Operator,
+                id: "owner".into(),
+            },
+        };
+
+        // A dispatch names the card outright.
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1")], &origins),
+            Some("t-1".into())
+        );
+        // A follow-up cycle inherits it from the approval it is resolving, so a
+        // run needing two sign-offs keeps the link through the first.
+        assert_eq!(
+            cycle_task_id(&[resolved("appr-1")], &origins),
+            Some("t-1".into())
+        );
+        // An approval that belonged to no card leaves the cycle unlinked.
+        assert_eq!(cycle_task_id(&[resolved("appr-unknown")], &origins), None);
+        // Nothing task-shaped at all.
+        assert_eq!(
+            cycle_task_id(
+                &[CompanyEvent::OperatorMessage {
+                    text: "hi".into(),
+                    by: None,
+                    chat: None,
+                }],
+                &origins
+            ),
+            None
+        );
+        // Two different cards in one batch: refuse to guess rather than hand one
+        // of them the other's approvals.
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1"), dispatched("t-2")], &origins),
+            None
+        );
+        // The same card twice is not ambiguous.
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1"), resolved("appr-1")], &origins),
+            Some("t-1".into())
+        );
     }
 
     #[tokio::test]
@@ -2639,7 +2808,7 @@ mod test {
             )
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-send".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-send".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "to": "known@ext.com", "subject": "s", "body": "b" }))
@@ -2703,7 +2872,7 @@ mod test {
         }
         file(501, "known@ext.com").await;
 
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-deep".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-deep".into(), &rt, None);
         let res = host
             .send_email(serde_json::json!({ "to": "known@ext.com", "subject": "s", "body": "b" }))
             .await
@@ -2789,7 +2958,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt, None);
 
         let res = host
             .spawn_task(serde_json::json!({ "title": "  Ship it ", "assignee": " eng " }))
@@ -2823,7 +2992,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt, None);
 
         // Known desk (by name) → card assigned to the resolved desk id, lead noted.
         let ok = host
@@ -2859,7 +3028,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt, None);
 
         // Reached through the CycleHost trait exactly as the hosted brain does.
         let res = host

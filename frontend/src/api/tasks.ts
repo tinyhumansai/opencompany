@@ -94,6 +94,36 @@ export interface TimelineEntry {
   waitedMillis?: number;
 }
 
+/** What became of an approval (#333). `pending` is still waiting on a human. */
+export type TaskApprovalStatus = "pending" | "approved" | "denied" | "expired";
+
+/**
+ * One approval that belongs to this task (#333).
+ *
+ * Distinct from an `approval` {@link TimelineEntry}, which can only describe a
+ * *resolution*: an approval still parked has no resolution event, so it cannot
+ * reach the timeline at all, and it is the row that matters most — the card is
+ * stopped behind it. Carries no payload; the Approvals page is where a sign-off
+ * is read in full and decided.
+ */
+export interface TaskApproval {
+  /** The approval's id, the same one the Approvals page resolves against. */
+  id: string;
+  /** The parked effect's dotted kind, e.g. `payment.send`. */
+  kind: string;
+  /** Epoch-millis the effect parked. Rows are ordered by this, oldest first. */
+  atMillis: number;
+  status: TaskApprovalStatus;
+  /** Epoch-millis the resolution landed; absent while pending. */
+  resolvedAtMillis?: number;
+  /**
+   * The park to resolve span. Absent while pending, where the console runs that
+   * clock itself from `atMillis`, and for an approval whose park instant the
+   * host cannot recover.
+   */
+  waitedMillis?: number;
+}
+
 /** A neighbouring card in the lineage, trimmed to what a link needs (#185). */
 export interface LineageRef {
   id: string;
@@ -115,6 +145,14 @@ export interface TaskDetail {
   task: Task;
   /** The per-task event stream, oldest first. */
   timeline: TimelineEntry[];
+  /**
+   * This task's own approvals, oldest first, still-parked ones included (#333).
+   *
+   * The Approvals tab reads this rather than filtering the timeline: the old
+   * filter could only surface resolutions that happened to fall inside the run
+   * window, so a card with an approval waiting on a human read as having none.
+   */
+  approvals: TaskApproval[];
   /** Parent and children. */
   lineage: TaskLineage;
   /**
@@ -130,8 +168,8 @@ export interface TaskDetail {
 
 /**
  * The Task Detail screen's single read (#185): assembles the card header, the
- * per-task timeline, the approvals trail (as `approval` timeline rows), and the
- * lineage into one response. 404s when the id names no card.
+ * per-task timeline, this task's approvals (#333) and the lineage into one
+ * response. 404s when the id names no card.
  */
 export function getTaskDetail(
   client: OpenCompanyClient,

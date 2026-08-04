@@ -53,4 +53,11 @@ pub struct ApprovalSummary {
     pub amount_usd: Option<f64>,
     /// Epoch-millis the effect was parked.
     pub at_millis: u64,
+    /// The board task this approval was parked for (issue #333).
+    ///
+    /// `None` when no card is behind it — a workflow delivery, an operator-chat
+    /// turn, or an approval parked by a build older than #333. Omitted when
+    /// absent, so the Approvals page's existing wire shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }

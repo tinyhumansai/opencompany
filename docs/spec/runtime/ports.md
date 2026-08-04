@@ -188,6 +188,32 @@ break the byte-identical round-trip, so the claim is incomplete but never wrong.
 Both `chat/history` surfaces (REST and GraphQL) project it from the shared
 `MessageView`, so the chip survives a transcript reload on either.
 
+### Per-task approval correlation (issue #333)
+
+`ApprovalResolved` carries an id, a verdict and an actor — never a task — so
+the same problem reaches the approval queue, and worse: a *parked* approval has
+no event at all. A task's Approvals tab could therefore only filter the
+timeline for resolutions that happened to fall inside the card's run window,
+which showed nothing while an approval was actually waiting and let a second
+card worked in that window absorb the first's sign-offs.
+
+The link is recorded where the approval is: the runtime journal's
+`ApprovalParked` record gains an optional `task_id`, stamped by the cycle that
+parked the effect. A cycle knows which card it is working from its own trigger
+events — a `TaskDispatched`, or an `ApprovalResolved` whose approval was itself
+parked for a card, which is how a run needing two sign-offs keeps the link
+through the first. A batch naming two different cards stamps nothing rather
+than guessing.
+
+The journal keeps a per-approval origin index (park instant, effect kind,
+task) for the life of the file, because the parked effect is dropped from the
+queue on resolution and nothing else can answer what a resolved approval was.
+`GET …/tasks/{task_id}` returns `approvals[]` from it, joined by id.
+
+The field is additive on the same contract as the rest: a journal line written
+before #333 replays with no task, and those — and only those — keep the old
+run-window correlation, so existing history still renders.
+
 ## MemoryStore
 
 The equivalent of Medulla's `CyclePersistence`; TinyCortex is the target

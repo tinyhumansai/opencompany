@@ -172,6 +172,12 @@ export interface ApprovalSummary {
   kind: string;
   amount_usd: number | null;
   at_millis: number;
+  /**
+   * The board task this approval was parked for (#333). Absent when no card is
+   * behind it (a workflow delivery, an operator-chat turn) or when it was
+   * parked by a host older than #333.
+   */
+  task_id?: string;
 }
 
 export type Verdict = "approve" | "deny";

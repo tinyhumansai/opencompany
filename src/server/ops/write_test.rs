@@ -3440,7 +3440,7 @@ async fn task_timeline_reports_the_wait_an_approval_actually_caused() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at)
+        .record_parked(&id, &parked_effect(), parked_at, Some("t-1"))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -3516,7 +3516,7 @@ async fn expired_approval_is_labelled_as_an_expiry_and_carries_its_wait() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at)
+        .record_parked(&id, &parked_effect(), parked_at, Some("t-1"))
         .await
         .unwrap();
     // Re-park into the gate at epoch 0 so it is unambiguously past any TTL.
@@ -3565,7 +3565,12 @@ async fn a_wait_that_began_before_dispatch_is_clamped_to_the_run_window() {
     let id = ApprovalId::new("appr-old");
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), dispatched_at - 3_600_000)
+        .record_parked(
+            &id,
+            &parked_effect(),
+            dispatched_at - 3_600_000,
+            Some("t-1"),
+        )
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3620,7 +3625,12 @@ async fn a_currently_parked_approval_surfaces_as_a_live_wait() {
     let parked_at = dispatched_at + 10;
     runtime
         .journal
-        .record_parked(&ApprovalId::new("appr-live"), &parked_effect(), parked_at)
+        .record_parked(
+            &ApprovalId::new("appr-live"),
+            &parked_effect(),
+            parked_at,
+            Some("t-1"),
+        )
         .await
         .unwrap();
 
@@ -3684,6 +3694,304 @@ async fn a_task_that_never_waited_reports_no_waiting_fields() {
             "a non-approval row must never carry a wait: {entry:?}",
         );
     }
+}
+
+// ── Issue #333: a task's Approvals tab shows that task's approvals ──────────
+//
+// The tab used to filter the *timeline* for `kind == "approval"`, which meant
+// it could only ever show a resolution that fell inside the run window — and
+// showed nothing at all for the state that matters most, an approval parked
+// right now with the card stopped behind it. These pin the real query: the
+// task id the runtime journal records with every parked effect.
+
+/// **The acceptance test**: an approval raised while working a task appears on
+/// that task's Approvals tab while it is still parked.
+///
+/// This is the QA repro — a request sitting on the main Approvals page while
+/// the originating card's own tab read "No approvals in this run" — and it is
+/// unreachable through the timeline by construction: nothing is appended to the
+/// event log until somebody decides.
+#[tokio::test]
+async fn a_parked_approval_appears_on_its_own_task() {
+    use crate::ports::types::ApprovalId;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    let parked_at = dispatched_at + 10;
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-mine"),
+            &parked_effect(),
+            parked_at,
+            Some("t-1"),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let approvals = body["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(approvals[0]["id"], "appr-mine");
+    assert_eq!(approvals[0]["status"], "pending");
+    assert_eq!(approvals[0]["kind"], "filing.submit");
+    assert_eq!(approvals[0]["atMillis"].as_u64().unwrap(), parked_at);
+    assert!(
+        approvals[0].get("resolvedAtMillis").is_none(),
+        "a pending approval has not resolved",
+    );
+    // The timeline is untouched — a parked approval still has no event.
+    assert!(
+        body["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] != "approval"),
+    );
+}
+
+/// **The acceptance test that the old window could not pass**: two cards worked
+/// in the same window keep their own approvals.
+///
+/// Under the window correlation both rows landed on both tabs, because the only
+/// question asked was "did this resolve while that card was running". The join
+/// is an id now, so a card's tab shows its own sign-off and nothing else.
+#[tokio::test]
+async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals() {
+    use crate::ports::types::{Actor, ActorKind, ApprovalId, CompanyEvent, Verdict};
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    // A second card, dispatched into the same open window as `t-1`.
+    runtime
+        .tasks()
+        .upsert(
+            &company,
+            &TaskRecord {
+                id: "t-2".into(),
+                title: "Also ship it".into(),
+                note: None,
+                column: "in_progress".into(),
+                priority: "medium".into(),
+                assignee: "ceo".into(),
+                updated_at_millis: 1,
+                origin_chat_id: None,
+                parent_task_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .events()
+        .append(
+            &company,
+            CompanyEvent::TaskDispatched {
+                task_id: "t-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // One approval each, both parked and resolved inside both windows.
+    for (id, owner) in [("appr-one", "t-1"), ("appr-two", "t-2")] {
+        let id = ApprovalId::new(id);
+        runtime
+            .journal
+            .record_parked(&id, &parked_effect(), dispatched_at + 5, Some(owner))
+            .await
+            .unwrap();
+        runtime.journal.record_resolved(&id).await.unwrap();
+        runtime
+            .events()
+            .append(
+                &company,
+                CompanyEvent::ApprovalResolved {
+                    approval_id: id,
+                    verdict: Verdict::Approve,
+                    by: Actor {
+                        kind: ActorKind::User,
+                        id: "u-1".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    for (task, own, other) in [
+        ("t-1", "appr-one", "appr-two"),
+        ("t-2", "appr-two", "appr-one"),
+    ] {
+        let (status, body) = send(
+            &state,
+            "GET",
+            &format!("/api/v1/company/tasks/{task}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<&str> = body["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![own], "{task} must own exactly its own approval");
+        assert!(!ids.contains(&other));
+        // And the timeline agrees — one surface, one correlation.
+        let rows: Vec<&Value> = body["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "approval")
+            .collect();
+        assert_eq!(rows.len(), 1, "{task}: {rows:?}");
+    }
+}
+
+/// A resolved approval keeps its row on the tab, carrying the verdict and the
+/// wait it caused. The same resolution the main Approvals page performed, seen
+/// from the card: approving on either surface reflects on both.
+#[tokio::test]
+async fn a_resolved_approval_reports_its_verdict_and_wait_on_the_tab() {
+    use crate::ports::types::{Actor, ActorKind, ApprovalId, CompanyEvent, Verdict};
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    let id = ApprovalId::new("appr-done");
+    let parked_at = dispatched_at + 20;
+    runtime
+        .journal
+        .record_parked(&id, &parked_effect(), parked_at, Some("t-1"))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    runtime.journal.record_resolved(&id).await.unwrap();
+    runtime
+        .events()
+        .append(
+            &company,
+            CompanyEvent::ApprovalResolved {
+                approval_id: id,
+                verdict: Verdict::Deny,
+                by: Actor {
+                    kind: ActorKind::Operator,
+                    id: "owner".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    let approvals = body["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    let row = &approvals[0];
+    assert_eq!(row["status"], "denied");
+    // The row is anchored at the *park*, so the tab reads in the order things
+    // were asked rather than the order they were answered.
+    assert_eq!(row["atMillis"].as_u64().unwrap(), parked_at);
+    let resolved_at = row["resolvedAtMillis"].as_u64().unwrap();
+    assert!(resolved_at > parked_at);
+    assert_eq!(
+        row["waitedMillis"].as_u64().unwrap(),
+        resolved_at - parked_at,
+    );
+    // Nothing is parked any more, so the card is not still waiting.
+    assert!(body.get("waitingSince").is_none());
+    // The join must not become a new identity leak.
+    let raw = serde_json::to_string(&body["approvals"]).unwrap();
+    assert!(!raw.contains("owner"), "operator identity leaked: {raw}");
+}
+
+/// A task with no approvals reports an empty list, not a fabricated one — the
+/// honest empty state the console renders.
+///
+/// Includes the case that made the old window wrong in the other direction: an
+/// approval belonging to *nothing* (a workflow delivery) parked mid-window used
+/// to be absorbed by whatever card happened to be running.
+#[tokio::test]
+async fn a_task_with_no_approvals_of_its_own_reports_an_empty_list() {
+    use crate::ports::types::ApprovalId;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    // Parked for a different card entirely, while this one is mid-run.
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-elsewhere"),
+            &parked_effect(),
+            dispatched_at + 5,
+            Some("t-other"),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["approvals"].as_array().unwrap().is_empty(),
+        "{:?}",
+        body["approvals"],
+    );
+    assert!(
+        body.get("waitingSince").is_none(),
+        "another card's approval must not make this one read as waiting",
+    );
+}
+
+/// An approval parked by a build older than #333 carries no task id at all. It
+/// keeps the pre-#333 run-window correlation rather than vanishing, so existing
+/// history still renders.
+#[tokio::test]
+async fn a_pre_333_approval_falls_back_to_the_run_window() {
+    use crate::ports::types::ApprovalId;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-legacy"),
+            &parked_effect(),
+            dispatched_at + 5,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    let approvals = body["approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(approvals[0]["id"], "appr-legacy");
+    assert_eq!(
+        body["waitingSince"].as_u64().unwrap(),
+        dispatched_at + 5,
+        "the legacy live-wait behaviour is unchanged",
+    );
 }
 
 /// #185 review follow-up: the lineage forest is enforced at the write boundary.
