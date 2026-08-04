@@ -616,7 +616,7 @@ fn waiting_span(timeline: &[TimelineEntry], waiting_since: Option<u64>, now: u64
 /// One message in a task's discussion thread (issue #335).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DiscussionMessage {
+pub(crate) struct DiscussionMessage {
     /// The journal sequence the post came from — the console's stable key, and
     /// what makes the thread strictly ordered. Shares its numbering with
     /// [`TimelineEntry::seq`]: both project out of the same journal.

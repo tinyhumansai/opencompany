@@ -85,6 +85,8 @@ fn detail_at(waiting_since: Option<u64>) -> TaskDetail {
         task: card("Launch post"),
         durations: TaskDurations::compute(&timeline, waiting_since, T0 + 900_000),
         timeline,
+        discussion: Vec::new(),
+        discussion_has_more: false,
         lineage: Lineage {
             parent: Some(LineageRef {
                 id: "t-parent".to_string(),
@@ -97,6 +99,7 @@ fn detail_at(waiting_since: Option<u64>) -> TaskDetail {
                 column: "todo".to_string(),
             }],
         },
+        runs: Vec::new(),
         waiting_since,
     }
 }
