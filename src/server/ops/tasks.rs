@@ -13,7 +13,7 @@
 //! [`task_detail`] for the assembly and its scrub discipline, and
 //! [`post_discussion`] for the thread's one write.
 
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -510,7 +510,16 @@ struct TaskDetail {
     /// does — which is what makes another operator's post appear in this
     /// browser without a refresh. Empty for a card nobody has posted on, which
     /// is what the tab's honest empty state renders.
+    ///
+    /// Capped at the newest [`DISCUSSION_PAGE`] posts; older ones are fetched
+    /// on demand with `?discussionBefore=`.
     discussion: Vec<DiscussionMessage>,
+    /// Whether the thread has posts older than the ones in `discussion`.
+    ///
+    /// The console's "load earlier" affordance, and the honest half of the cap:
+    /// a truncated thread that did not say it was truncated would read as the
+    /// whole conversation.
+    discussion_has_more: bool,
     /// Parent and children.
     lineage: Lineage,
     /// Epoch-millis the company started waiting on an operator *right now*
@@ -556,10 +565,16 @@ struct TaskDetail {
 /// into one list would put an operator's aside between a dispatch and its
 /// completion and call it part of the run.
 ///
+/// The thread is **paged** (`?discussionBefore=<seq>`, newest
+/// [`DISCUSSION_PAGE`] by default) for the reason the timeline is not: this
+/// screen polls every 4s, and a discussion is the one part of the response a
+/// human grows without bound. See [`DISCUSSION_PAGE`].
+///
 /// 404s when the id names no card, matching `PATCH` / `DELETE`.
 async fn task_detail(
     company: ScopedCompany,
     Path(TaskPath { task_id }): Path<TaskPath>,
+    Query(query): Query<TaskDetailQuery>,
 ) -> Result<Json<TaskDetail>, ApiError> {
     let rows = company.runtime.tasks().list(company.id()).await?;
     let card = rows
@@ -584,8 +599,17 @@ async fn task_detail(
     let TaskFold {
         timeline,
         discussion,
+        discussion_has_more,
         window_opened_at: open_window_at,
-    } = fold_task_journal(&company, &task_id).await?;
+    } = fold_task_journal(
+        &company,
+        &task_id,
+        DiscussionWindow {
+            before_seq: query.discussion_before,
+            first: DISCUSSION_PAGE,
+        },
+    )
+    .await?;
 
     // Resolve the posters' labels — one roster read per detail, and only when
     // the card actually has a thread, so the 4s poll on a card nobody has
@@ -619,6 +643,7 @@ async fn task_detail(
         task: card.into(),
         timeline,
         discussion,
+        discussion_has_more,
         lineage: Lineage { parent, children },
         waiting_since,
     }))
@@ -630,6 +655,47 @@ async fn task_detail(
 /// anywhere in a company's history, so the whole log must still be *traversed* —
 /// but it is never all *resident* at once.
 const TIMELINE_PAGE: usize = 512;
+
+/// How many discussion posts one detail read answers with.
+///
+/// The timeline is bounded by what the *company* did on one card; a discussion
+/// is bounded by nothing — people keep typing. Without a cap the whole thread
+/// comes back on every 4s poll of an open detail screen, per browser, forever:
+/// a card with a few hundred posts at
+/// [`MAX_DISCUSSION_CHARS`](crate::ports::tasks::MAX_DISCUSSION_CHARS) each is hundreds
+/// of kilobytes re-serialized fifteen times a minute, and it only grows.
+///
+/// So the read answers with the tail — what somebody opening the card actually
+/// reads first — and everything older is fetched on demand behind
+/// `?discussionBefore=<seq>`. That is the `first` + `before_seq` shape
+/// [`chat_history::history_for_desk`](crate::server::chat_history::history_for_desk)
+/// already uses for a desk transcript, which has the same unbounded-writer
+/// problem and answered it the same way.
+const DISCUSSION_PAGE: usize = 50;
+
+/// The detail read's query string.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskDetailQuery {
+    /// An opaque journal cursor: only posts *before* this `seq` are considered,
+    /// so the console walks backwards through the thread by passing the `seq` of
+    /// the oldest message it holds. Absent means the newest page.
+    ///
+    /// Only the discussion is paged — the timeline and the lineage are bounded
+    /// by the card's own run history and come back whole.
+    #[serde(default)]
+    discussion_before: Option<u64>,
+}
+
+/// Which slice of a thread one fold should keep.
+#[derive(Debug, Clone, Copy)]
+struct DiscussionWindow {
+    /// Exclusive upper cursor: keep posts with `seq <` this. `None` is "up to
+    /// the newest".
+    before_seq: Option<u64>,
+    /// How many of the most recent remaining posts to keep.
+    first: usize,
+}
 
 /// A discussion post as the fold reads it, before its author is resolved.
 ///
@@ -678,8 +744,12 @@ impl DiscussionRow {
 struct TaskFold {
     /// The run record, oldest first.
     timeline: Vec<TimelineEntry>,
-    /// The discussion thread, oldest first (issue #335).
+    /// The discussion thread, oldest first (issue #335) — at most
+    /// [`DiscussionWindow::first`] posts, the newest inside the window.
     discussion: Vec<DiscussionRow>,
+    /// Whether the window dropped an older post, i.e. the thread continues
+    /// behind the page.
+    discussion_has_more: bool,
     /// The instant a *still-open* dispatch window opened, or `None` when the
     /// task is not mid-run — the anchor the live wait (#305) is scoped to.
     window_opened_at: Option<u64>,
@@ -694,7 +764,9 @@ struct TaskFold {
 ///
 /// The discussion rides this same traversal rather than a second one: both
 /// projections read the same log, and the journal is long enough that scanning
-/// it twice per detail poll would be the whole cost of the tab.
+/// it twice per detail poll would be the whole cost of the tab. `discussion`
+/// says which slice of the thread to keep; posts outside it are dropped as they
+/// are read, so a ten-thousand-post thread is traversed but never resident.
 ///
 /// **Why the scan does not stop at the first completion anchor.** A card can be
 /// re-dispatched — moved back to `in_progress` after review — which opens a
@@ -707,7 +779,11 @@ struct TaskFold {
 /// Returns both projections alongside the instant the *still-open* window
 /// opened, or `None` when the task is not mid-run — the caller needs that anchor
 /// to scope the live wait (issue #305).
-async fn fold_task_journal(company: &ScopedCompany, task_id: &str) -> Result<TaskFold, ApiError> {
+async fn fold_task_journal(
+    company: &ScopedCompany,
+    task_id: &str,
+    discussion: DiscussionWindow,
+) -> Result<TaskFold, ApiError> {
     use crate::ports::types::EventSeq;
 
     // One snapshot for the whole fold, not a lookup per event: the fold is a
@@ -733,7 +809,7 @@ async fn fold_task_journal(company: &ScopedCompany, task_id: &str) -> Result<Tas
             .map(|ev| ev.seq.value() + 1)
             .unwrap_or(next_seq + 1);
         let exhausted = page.len() < TIMELINE_PAGE;
-        fold_page(&page, task_id, &park_instants, &mut fold);
+        fold_page(&page, task_id, discussion, &park_instants, &mut fold);
         if exhausted {
             break;
         }
@@ -751,6 +827,7 @@ async fn fold_task_journal(company: &ScopedCompany, task_id: &str) -> Result<Tas
 fn fold_page(
     page: &[crate::ports::types::StoredEvent],
     task_id: &str,
+    discussion: DiscussionWindow,
     park_instants: &std::collections::HashMap<crate::ports::types::ApprovalId, u64>,
     fold: &mut TaskFold,
 ) {
@@ -771,12 +848,29 @@ fn fold_page(
         } = &ev.event
             && id == task_id
         {
+            // Outside the cursor: the caller is walking backwards through the
+            // thread and already holds this post. Skipped before the cap so the
+            // page ends where the caller asked it to, not one post short.
+            if discussion
+                .before_seq
+                .is_some_and(|before| ev.seq.value() >= before)
+            {
+                continue;
+            }
             fold.discussion.push(DiscussionRow {
                 seq: ev.seq.value(),
                 at_millis: ev.at_millis,
                 text: text.clone(),
                 by: by.clone(),
             });
+            // Keep the newest `first`, dropping from the front as the traversal
+            // moves forward. The thread is still read oldest-first (the window
+            // state and the timeline demand one pass), but only a page of it is
+            // ever held — an unbounded thread costs the fold a constant.
+            if fold.discussion.len() > discussion.first {
+                fold.discussion.remove(0);
+                fold.discussion_has_more = true;
+            }
             continue;
         }
         let entry = match &ev.event {
@@ -886,8 +980,10 @@ fn fold_page(
 /// not a way to ask an agent for something. Dispatching work is the board's job
 /// and spending money stays behind the column drag.
 ///
-/// Answers `201` with the stored message, so the console can render the post
-/// immediately instead of waiting for the next detail poll.
+/// Answers `201` with the stored message — the journaled row, read back at its
+/// own `seq` rather than re-stamped — so the console renders the post at once
+/// instead of waiting out the 4s poll, and the row it renders is byte-for-byte
+/// the one the next poll returns under the same key.
 async fn post_discussion(
     company: ScopedCompany,
     Path(TaskPath { task_id }): Path<TaskPath>,
@@ -933,14 +1029,27 @@ async fn post_discussion(
         )
         .await?;
 
-    // The echoed row is stamped from the same clock the store stamps the
-    // journal line with, a moment earlier. The next detail poll replaces it
-    // with the journaled row under the same `seq` — the console's render key —
-    // so the two can never appear as two messages.
+    // The echo is *the journaled row*, not a re-stamp of it: reading the event
+    // back at its own `seq` is one bounded read, and it means the message the
+    // console renders now carries the same `atMillis` the next poll returns
+    // under the same key — a locally re-stamped copy would silently shift the
+    // time by however long the append took. The local clock is the fallback if
+    // that read comes back empty; the append itself already succeeded, so the
+    // message is not lost either way.
+    let at_millis = company
+        .runtime
+        .events()
+        .read_from(company.id(), seq, 1)
+        .await
+        .ok()
+        .and_then(|page| page.into_iter().next())
+        .filter(|stored| stored.seq == seq)
+        .map(|stored| stored.at_millis)
+        .unwrap_or_else(now_millis);
     let authors = crate::server::chat_history::author_labels(&company.runtime).await?;
     let message = DiscussionRow {
         seq: seq.value(),
-        at_millis: now_millis(),
+        at_millis,
         text,
         by,
     }

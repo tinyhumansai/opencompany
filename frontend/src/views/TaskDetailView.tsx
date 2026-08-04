@@ -393,7 +393,11 @@ export function TaskDetailView({
 
               <TabsContent value="discussion" className="mt-4">
                 <DiscussionTab
+                  // Keyed by card: a different task is a different thread, and
+                  // the tab accumulates the one it is shown.
+                  key={detail.task.id}
                   messages={detail.discussion}
+                  hasMore={detail.discussionHasMore}
                   taskId={detail.task.id}
                   client={client}
                   company={company}
@@ -1091,15 +1095,21 @@ function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
  * dispatches work or spends money, which stays behind the board's column drag.
  * There is no edit and no delete either: the thread is journal-backed and
  * append-only, so what was said stays said.
+ *
+ * The poll carries only the newest page of the thread (the host caps it so a
+ * long discussion is not re-sent every 4s). Older messages are pulled on demand
+ * and kept here, so walking back through a thread survives the next poll.
  */
 function DiscussionTab({
   messages,
+  hasMore,
   taskId,
   client,
   company,
   onPosted,
 }: {
   messages: DiscussionMessage[];
+  hasMore: boolean;
   taskId: string;
   client: OpenCompanyClient;
   company: string | null;
@@ -1107,13 +1117,79 @@ function DiscussionTab({
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  /**
+   * Every message this tab has been shown, oldest first, deduped by `seq` — the
+   * journal key, and the only identity a message has.
+   *
+   * The poll carries a *sliding* page, so a new post pushes the oldest message
+   * of that page out of it; rendering the page directly would make a message
+   * disappear from under someone mid-read. Accumulating means the thread on
+   * screen only ever grows: the poll adds new posts, "load earlier" adds old
+   * ones, and the `201` echo adds your own before the poll comes round.
+   *
+   * Mounted per card (the parent keys this component by task id), so this never
+   * holds another card's thread.
+   */
+  const [thread, setThread] = useState<DiscussionMessage[]>([]);
+  /**
+   * Whether anything remains before the oldest message held. `null` until an
+   * older page has been pulled, when that page's own flag is the answer.
+   */
+  const [earlierHasMore, setEarlierHasMore] = useState<boolean | null>(null);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  const absorb = useCallback((rows: DiscussionMessage[]) => {
+    setThread((prev) => {
+      const bySeq = new Map<number, DiscussionMessage>(
+        prev.map((m) => [m.seq, m] as const),
+      );
+      let added = false;
+      for (const m of rows) {
+        if (!bySeq.has(m.seq)) {
+          bySeq.set(m.seq, m);
+          added = true;
+        }
+      }
+      // Same list back when the poll brought nothing new — the common case, and
+      // the one that must not churn the render.
+      return added ? [...bySeq.values()].sort((a, b) => a.seq - b.seq) : prev;
+    });
+  }, []);
+
+  useEffect(() => {
+    absorb(messages);
+  }, [messages, absorb]);
+
+  const moreBefore = earlierHasMore ?? hasMore;
+
+  async function loadEarlier() {
+    const oldest = thread[0]?.seq;
+    if (oldest === undefined || loadingEarlier) return;
+    setLoadingEarlier(true);
+    try {
+      const page = await getTaskDetail(client, company, taskId, oldest);
+      absorb(page.discussion);
+      setEarlierHasMore(page.discussionHasMore);
+    } catch (e) {
+      toast.error(
+        e instanceof Error ? e.message : "could not load earlier messages",
+      );
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
 
   async function post() {
     const body = text.trim();
     if (!body || busy) return;
     setBusy(true);
     try {
-      await postTaskDiscussion(client, company, taskId, body);
+      const posted = await postTaskDiscussion(client, company, taskId, body);
+      // Shown straight away rather than after the poll: the host journaled it
+      // and handed the stored row back, so waiting up to four seconds to show
+      // an operator their own message buys nothing. It carries the journaled
+      // `seq` and stamp, so the poll's copy collapses onto it.
+      absorb([posted]);
       // Cleared only after the host accepted it, so a failed post leaves the
       // operator's words in the box rather than losing them.
       setText("");
@@ -1127,14 +1203,30 @@ function DiscussionTab({
 
   return (
     <div className="space-y-3">
-      {messages.length === 0 ? (
+      {thread.length === 0 ? (
         <EmptyState
           title="No discussion yet"
           body="Post the first message to start this card's thread."
         />
       ) : (
         <ol className="space-y-1.5">
-          {messages.map((m) => (
+          {moreBefore ? (
+            <li className="pb-1 text-center">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={loadingEarlier}
+                onClick={() => void loadEarlier()}
+              >
+                {loadingEarlier ? (
+                  <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                ) : null}
+                Load earlier messages
+              </Button>
+            </li>
+          ) : null}
+          {thread.map((m) => (
             <li key={m.seq} className="rounded-lg border bg-card px-3 py-2">
               <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
                 <MessagesSquare className="size-3.5 shrink-0" aria-hidden />

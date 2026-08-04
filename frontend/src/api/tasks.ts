@@ -143,8 +143,17 @@ export interface TaskDetail {
    * Carried on this read rather than fetched by the tab, so it refreshes on the
    * screen's existing 4s poll: a message another operator posts appears here
    * without a reload. Empty for a card nobody has posted on.
+   *
+   * Only the newest page of the thread — the host caps it so a long discussion
+   * is not re-serialized on every poll. Older messages come from the same read
+   * with `discussionBefore`.
    */
   discussion: DiscussionMessage[];
+  /**
+   * Whether the thread continues before {@link discussion}'s oldest message —
+   * i.e. whether "load earlier" has anything to load.
+   */
+  discussionHasMore: boolean;
   /** Parent and children. */
   lineage: TaskLineage;
   /**
@@ -162,14 +171,24 @@ export interface TaskDetail {
  * The Task Detail screen's single read (#185): assembles the card header, the
  * per-task timeline, the approvals trail (as `approval` timeline rows), and the
  * lineage into one response. 404s when the id names no card.
+ *
+ * `discussionBefore` walks *backwards* through the discussion: pass the `seq` of
+ * the oldest message held and the response carries the page before it. Omitted
+ * (the poll's shape) it returns the newest page — the thread is capped host-side
+ * so a long one is not re-sent whole every 4s.
  */
 export function getTaskDetail(
   client: OpenCompanyClient,
   company: string | null,
   id: string,
+  discussionBefore?: number,
 ): Promise<TaskDetail> {
+  const query =
+    discussionBefore === undefined
+      ? ""
+      : `?discussionBefore=${encodeURIComponent(discussionBefore)}`;
   return client.get<TaskDetail>(
-    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`,
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}${query}`,
   );
 }
 

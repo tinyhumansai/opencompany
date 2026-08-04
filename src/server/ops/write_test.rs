@@ -3409,6 +3409,212 @@ async fn task_discussion_rejects_an_empty_message_and_an_unknown_card() {
     assert_eq!(body["discussion"].as_array().unwrap().len(), 1);
 }
 
+/// #348 review: the thread is served on a screen that polls every 4s, so it
+/// comes back as a **page** — the newest slice — with the rest reachable behind
+/// a cursor. Without the cap, one busy card re-sends its whole history fifteen
+/// times a minute per open browser, forever.
+///
+/// Asserted as a reader experiences it: the newest messages are the ones on the
+/// first read, the response admits there are older ones, and passing the oldest
+/// held `seq` back walks to the page before it without dropping or repeating a
+/// message. The cursor's page is the *end* of the thread, which is what makes
+/// `discussionHasMore` false there.
+#[tokio::test]
+async fn task_discussion_is_paged_newest_first_and_walks_back_with_a_cursor() {
+    use crate::ports::types::CompanyEvent;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+    runtime
+        .tasks()
+        .upsert(&company, &discussion_card("t-1", "Ship it"))
+        .await
+        .unwrap();
+
+    // A thread longer than one page. Journaled directly: this test is about the
+    // read's shape, and the write path is pinned by the tests above.
+    const POSTS: usize = 62;
+    for n in 0..POSTS {
+        runtime
+            .events()
+            .append(
+                &company,
+                CompanyEvent::TaskDiscussionPosted {
+                    task_id: "t-1".into(),
+                    text: format!("message {n}"),
+                    by: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = body["discussion"].as_array().unwrap();
+    assert!(
+        page.len() < POSTS,
+        "an unbounded thread came back whole: {} posts",
+        page.len()
+    );
+    assert_eq!(
+        body["discussionHasMore"], true,
+        "a truncated thread that does not say so reads as the whole conversation"
+    );
+    // The tail, not the head: what somebody opening the card needs first.
+    assert_eq!(
+        page.last().unwrap()["text"],
+        format!("message {}", POSTS - 1)
+    );
+    let first_seq = page[0]["seq"].as_u64().unwrap();
+    let oldest_on_page = page[0]["text"].as_str().unwrap().to_string();
+
+    // Walk back: the page *before* the oldest message held.
+    let (status, older) = send(
+        &state,
+        "GET",
+        &format!("/api/v1/company/tasks/t-1?discussionBefore={first_seq}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let older_page = older["discussion"].as_array().unwrap();
+    assert_eq!(
+        older_page.len(),
+        POSTS - page.len(),
+        "the cursor page plus the first page must be the whole thread"
+    );
+    assert_eq!(
+        older["discussionHasMore"], false,
+        "nothing precedes the start of the thread"
+    );
+    assert_eq!(older_page[0]["text"], "message 0");
+    assert!(
+        older_page
+            .iter()
+            .all(|m| m["seq"].as_u64().unwrap() < first_seq),
+        "the cursor is exclusive — a message must not be served twice: {older_page:?}"
+    );
+    assert!(
+        !older_page
+            .iter()
+            .any(|m| m["text"].as_str() == Some(oldest_on_page.as_str())),
+        "the cursor message repeated on its own older page"
+    );
+
+    // A short thread is not paged at all — the flag stays honest downward.
+    runtime
+        .tasks()
+        .upsert(&company, &discussion_card("t-2", "Quiet"))
+        .await
+        .unwrap();
+    runtime
+        .events()
+        .append(
+            &company,
+            CompanyEvent::TaskDiscussionPosted {
+                task_id: "t-2".into(),
+                text: "just the one".into(),
+                by: None,
+            },
+        )
+        .await
+        .unwrap();
+    let (_, quiet) = send(&state, "GET", "/api/v1/company/tasks/t-2", None).await;
+    assert_eq!(quiet["discussion"].as_array().unwrap().len(), 1);
+    assert_eq!(quiet["discussionHasMore"], false);
+}
+
+/// #348 review: every post in the tests above is the harness admin, which
+/// exercises one of `into_message`'s three branches. The other two are the ones
+/// that matter for what reaches a reader's screen:
+///
+/// * a **departed** user — off the roster, so there is no name to resolve —
+///   must read as `someone`, never as the raw user id the journal holds;
+/// * a **machine credential** — the platform scope, which names no person —
+///   must read as `operator`, and must journal no actor at all.
+///
+/// The machine half goes through the real write path with a tenant token, so it
+/// pins `ScopedCompany`'s "keep the person, drop the credential" rule too: a
+/// platform post that started attributing itself to *something* would show up
+/// here as a label that is not `operator`.
+#[tokio::test]
+async fn task_discussion_names_a_departed_user_someone_and_a_machine_credential_operator() {
+    use crate::ports::types::{Actor, ActorKind, CompanyEvent};
+    use crate::server::platform_auth::{
+        PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier,
+    };
+    use std::collections::HashSet;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let verifier = std::sync::Arc::new(StaticPlatformVerifier::new("plat-secret"));
+    let state = state_with_company(&home)
+        .await
+        .with_platform_auth(PlatformAuthConfig::new(verifier));
+    let company = CompanyId::new("acme");
+    state.set_owner(company.clone(), "tenant:acme".to_string());
+    let runtime = state.registry().get(&company).unwrap();
+    runtime
+        .tasks()
+        .upsert(&company, &discussion_card("t-1", "Ship it"))
+        .await
+        .unwrap();
+
+    // A user who has since left: journaled with an id the roster can no longer
+    // resolve. Only the journal can hold this state, so the fixture is written
+    // there rather than posted.
+    runtime
+        .events()
+        .append(
+            &company,
+            CompanyEvent::TaskDiscussionPosted {
+                task_id: "t-1".into(),
+                text: "I looked at this before I left".into(),
+                by: Some(Actor {
+                    kind: ActorKind::User,
+                    id: "u-departed".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    let token = StaticPlatformVerifier::tenant_token(&PlatformClaims {
+        tenant: "tenant:acme".to_string(),
+        scopes: HashSet::from(["operator".to_string()]),
+        companies: None,
+    });
+    let (status, posted) = send_auth(
+        &state,
+        "POST",
+        "/api/v1/companies/acme/tasks/t-1/discussion",
+        Some(json!({ "text": "posted by the platform" })),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(posted["author"], "operator");
+
+    let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    let thread = body["discussion"].as_array().unwrap();
+    let authors: Vec<&str> = thread
+        .iter()
+        .map(|m| m["author"].as_str().unwrap())
+        .collect();
+    assert_eq!(authors, vec!["someone", "operator"]);
+    // The id the journal holds must not reach a reader — a thread is read by
+    // every member of the company.
+    let wire = serde_json::to_string(&body["discussion"]).unwrap();
+    assert!(
+        !wire.contains("u-departed"),
+        "a user id reached the wire: {wire}"
+    );
+}
+
 /// #185 review follow-up: pin the two timeline branches the first test skipped —
 /// `tool_failed`, and the window-correlated `approval` arm.
 ///

@@ -76,22 +76,56 @@ questions: the timeline is the record of what the **company** did on the card
 discussion is what **people** said about it. Merged, an operator's aside would
 sit between a dispatch and its completion and read as part of the run.
 
+**What the shared log costs, stated plainly.** The read rides a cost that was
+already there — the detail folded the whole journal per request before this
+existed. The *write* does not: it points a new, human-paced, unbounded writer at
+the log every other projection folds over, with no retention or compaction for
+it anywhere in the tree. `src/ports/runs.rs` (#342, landed on `main` after this
+branch was cut) says outright that "folding the whole journal per read is what
+makes the existing workflow-run list expensive", and #242 answered that by
+giving runs their own store rather than more events; the same argument will
+eventually be made about a busy discussion. A post is at least one small event
+with no per-step fan-out, and the read is paged — but this is a shared log with
+an extra writer on it, not free sharing.
+
+**The read is paged.** `GET …/tasks/{taskId}` answers with the newest
+`DISCUSSION_PAGE` (50) messages plus `discussionHasMore`, and
+`?discussionBefore=<seq>` walks backwards — the `first` + `before_seq` shape
+`chat_history::history_for_desk` already uses for a desk transcript. Without it
+the whole thread is re-sent on every 4s poll, per browser, forever. The fold
+drops out-of-window posts as it reads them, so a long thread is traversed but
+never resident. The timeline is *not* paged: it is bounded by what the company
+did on one card, which is not a surface a person can inflate.
+
 **Operator-only in v1; agents do not participate.** Posting journals a message
 and nothing else: no cycle runs, no turn is dispatched, and no agent reads the
 thread back. The projections enforce it rather than merely documenting it — the
 sidecar wire body (`wire_event`) and the orchestrator's insight line
 (`summarize_event`) both name the *card* and deliberately omit the *text*, so
-the tab cannot become an unannounced prompt surface. Agent participation is a
-product decision to take with first-class runs (#242): a discussion anchored to
-a task and one anchored to a run are different things, and it is worth knowing
-which one an agent would be answering in.
+the tab cannot become an unannounced prompt surface. Neither is a slot in the
+orchestrator's ten-event activity tail: posts fold there into a single
+"N discussion posts" line, because a card's afternoon of back-and-forth would
+otherwise evict every dispatch, reply and approval from the only view the
+orchestrator has of what the company did. "Agents do not participate" has to
+hold for the *slot* as well as for the *text*.
+
+Agent participation is a product decision to take with first-class runs (#242):
+a discussion anchored to a task and one anchored to a run are different things.
+That deferral was cleaner when this branch was cut than it is now — #342 has
+since landed `RunStore` on `main`, so a run *is* a first-class record and the
+question is answerable rather than blocked. Still deferred, but on scope, not on
+missing prior art.
 
 **Ordering, editing, deletion, references.** Oldest-first by journal sequence,
 which is also the console's render key. The journal is append-only, so v1 has no
 edit and no delete — what was said stays said; a retraction would need a
-tombstone event and is not one. A message is plain text: it cannot yet reference
-an artifact or an approval, which is deliberately left until there is a link
-target more durable than a row's position.
+tombstone event and is not one. That is a real gap, not just an omission: the
+log is what export/import ships, and a discussion is exactly where somebody
+pastes the API key they are blocked on. Tracked as **#358** — a redaction path
+for journaled human prose — rather than left as a paragraph here. A message is
+plain text: it cannot yet reference an artifact or an approval, which is
+deliberately left until there is a link target more durable than a row's
+position.
 
 **Attribution.** A post carries the signed-in user as `by`, resolved to a roster
 label on read (a display name, or an email's local part). A user no longer on
@@ -102,9 +136,11 @@ read by every member of the company.
 The write is `POST …/tasks/{taskId}/discussion` with `{text}`. Empty or
 whitespace-only text is a `400` (there is no delete, so a blank row would be
 permanent noise), an unknown card is a `404`, and over-long text is truncated to
-`MAX_DISCUSSION_CHARS` rather than refused. Reads come back on the detail's
-existing 4s poll, which is what makes another operator's post appear without a
-reload.
+`MAX_DISCUSSION_CHARS` rather than refused. The `201` echoes the journaled row —
+read back at its own `seq`, not re-stamped — so the console renders the post at
+once and the row it renders is the one the next poll returns under the same key.
+Reads come back on the detail's existing 4s poll, which is what makes another
+operator's post appear without a reload.
 
 ### Reading a trigger's cron back (issue #262)
 
