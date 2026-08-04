@@ -82,61 +82,6 @@ export function toolSlugOf(nodeId: string): string {
   return nodeId.replace(/^tool:/, '').split('@')[0];
 }
 
-export type DirectoryRow = { id: string; label: string; sub: string };
-export type DirectoryGroup = { kind: 'employee' | 'person' | 'task' | 'tool'; title: string; rows: DirectoryRow[] };
-
-/**
- * The scrollable everything-index for the graph: four labeled groups (AI
- * agents, humans, SOPs, tools), each alphabetized. Rows carry the graph node
- * id to jump to — tools carry their SLUG (the click resolves to the copy in
- * the focused pillar, since shared tools are duplicated per department).
- */
-export function graphDirectory(
-  agents: Agent[],
-  departments: Department[],
-  people: Person[],
-  tasks: SopTask[],
-  graph: KnowledgeGraph,
-): DirectoryGroup[] {
-  const deptName = new Map(departments.map((d) => [d.id, d.name]));
-  const byLabel = (a: DirectoryRow, b: DirectoryRow) => a.label.localeCompare(b.label);
-
-  const toolRows = new Map<string, DirectoryRow>();
-  for (const n of graph.nodes) {
-    if (n.kind !== 'tool') continue;
-    const slug = toolSlugOf(n.id);
-    if (!toolRows.has(slug)) {
-      const users = new Set(
-        graph.edges.filter((e) => e.kind === 'uses' && toolSlugOf(e.target) === slug).map((e) => e.source),
-      );
-      toolRows.set(slug, { id: slug, label: n.label, sub: `${users.size} user${users.size === 1 ? '' : 's'}` });
-    }
-  }
-
-  return [
-    {
-      kind: 'employee',
-      title: 'AI agents',
-      rows: agents.map((a) => ({ id: `emp:${a.id}`, label: a.name, sub: deptName.get(a.departmentId) ?? a.departmentId })).sort(byLabel),
-    },
-    {
-      kind: 'person',
-      title: 'Humans',
-      rows: people.map((p) => ({ id: `person:${p.id}`, label: p.name, sub: deptName.get(p.departmentId) ?? p.departmentId })).sort(byLabel),
-    },
-    {
-      kind: 'task',
-      title: 'SOPs',
-      rows: tasks.map((t) => ({ id: `task:${t.id}`, label: t.title, sub: deptName.get(t.departmentId) ?? t.departmentId })).sort(byLabel),
-    },
-    {
-      kind: 'tool',
-      title: 'Tools',
-      rows: [...toolRows.values()].sort(byLabel),
-    },
-  ];
-}
-
 export function buildKnowledgeGraph(
   agents: Agent[],
   departments: Department[],

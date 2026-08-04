@@ -12,9 +12,7 @@ import {
   type Simulation,
 } from 'd3-force';
 import { ClipboardList, Sparkles, User, UserRound, Users, Wrench, type LucideIcon } from 'lucide-react';
-import { graphDirectory, orderGraphDepartments, SELF_ID, toolSlugOf, type DirectoryGroup, type KGNode, type KGNodeKind, type KnowledgeGraph as KGData } from './model';
-import { ACTION_LENSES, ENTITY_LENSES, FUNCTION_LENSES, lensNodeSet, type Lens } from './lens';
-import { GraphDirectory } from './GraphDirectory';
+import { orderGraphDepartments, SELF_ID, toolSlugOf, type KGNode, type KGNodeKind, type KnowledgeGraph as KGData } from './model';
 import { branchPath, branchWidth, cyclicDeltaF, edgeArc, focusWheel, radialRestLayout, responsiveRingR, rotateAbout, shortestAngleDelta, treeLayout, wheelPoint, wheelStageGeom, wheelStageSpot, type RestLayoutResult, type TreeLayoutResult, type TreeNodePos } from './tree-layout';
 import { rafThrottle } from './raf-throttle';
 import { buildToolWiki, prettifySlug } from './agent-wiki';
@@ -212,7 +210,7 @@ export function KnowledgeGraph({
   /** physics tuning (the in-UI editor is retired; these still configure the sim) */
   repelDefault?: number; linkDistDefault?: number; centerDefault?: number;
 }) {
-  // fixed physics — the slider editor gave way to the always-on directory
+  // fixed physics — the in-UI slider editor is retired
   const centerForce = centerDefault;
   const repel = repelDefault;
   const linkDist = linkDistDefault;
@@ -231,10 +229,6 @@ export function KnowledgeGraph({
   // The graph is the page. There is no inline mode to return to, so the
   // shell below is always the fullscreen one and the toggle is retired.
   const fullscreen = true;
-  // the everything-index can be tucked away (inline + fullscreen) so the wheel
-  // is viewable unobstructed; one toggle drives both mounts
-  const [directoryCollapsed, setDirectoryCollapsed] = useState(false);
-
   const memoryOn = !!memory && memory.nodes.length > 0;
 
   const simRef = useRef<Simulation<SimNode, undefined> | null>(null);
@@ -243,6 +237,16 @@ export function KnowledgeGraph({
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragRef = useRef<{ id: string; moved: boolean; startX: number; startY: number } | null>(null);
   const suppressClickRef = useRef(false);
+  // Drag-to-pan. `panRef` is an offset in viewBox units added to whatever the
+  // camera is framing, so panning composes with the cinematic camera instead
+  // of fighting it: the shot still tracks its subject, just off-centre by the
+  // amount you dragged. `camRectRef` mirrors the live viewBox so a pointer
+  // delta in CSS pixels can be converted at the current zoom.
+  const panRef = useRef({ x: 0, y: 0 });
+  const panDragRef = useRef<{
+    startX: number; startY: number; originX: number; originY: number; moved: boolean;
+  } | null>(null);
+  const camRectRef = useRef<Rect>({ x: 0, y: 0, w: W, h: H });
   const [, setTick] = useState(0);
 
   const agentById = useMemo(() => new Map(agents.map((a) => [`emp:${a.id}`, a])), [agents]);
@@ -871,9 +875,16 @@ export function KnowledgeGraph({
         },
       );
       const goingHome = !c.focusTree && !c.coreExpanded && !c.selectedOrgId && !c.selectedMemoryId;
-      const next = lerpRect(cur, target, reduced ? 1 : goingHome ? CAM_EASE_HOME : CAM_EASE);
+      // the drag offset rides on top of the framing the camera chose
+      const pan = panRef.current;
+      const aimed =
+        pan.x || pan.y ? { x: target.x + pan.x, y: target.y + pan.y, w: target.w, h: target.h } : target;
+      // a drag must track the pointer exactly — easing it would feel like lag
+      const panning = !!panDragRef.current?.moved;
+      const next = lerpRect(cur, aimed, reduced || panning ? 1 : goingHome ? CAM_EASE_HOME : CAM_EASE);
       if (next !== cur) {
         cur = next;
+        camRectRef.current = cur;
         const svg = svgRef.current;
         if (svg) {
           svg.setAttribute('viewBox', `${cur.x} ${cur.y} ${cur.w} ${cur.h}`);
@@ -927,16 +938,9 @@ export function KnowledgeGraph({
 
   const nodes = nodesRef.current;
   const links = linksRef.current;
-  // lenses (Alex taxonomy): slice the graph by entity type, business
-  // function, or action — the matching nodes stay lit, everything else dims.
-  // Focus and hover both outrank an armed lens.
-  const [lensId, setLensId] = useState<string | null>(null);
-  const lensLit = useMemo(
-    () => (lensId ? lensNodeSet(lensId, { nodes: graph.nodes, teamOf: (id) => teamForFocus(id) ?? null }) : null),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [lensId, graph],
-  );
-  const lit = focusSet ?? (hoverId ? litFor(hoverId) : null) ?? lensLit;
+  // What stays lit while everything else dims: a focused pillar outranks a
+  // hover, and nothing lights when neither is engaged.
+  const lit = focusSet ?? (hoverId ? litFor(hoverId) : null);
   const posById = new Map(nodes.map((n) => [n.id, n]));
   const focusedTeam = focusTeamId ? byId.get(focusTeamId) : null;
 
@@ -1399,66 +1403,6 @@ export function KnowledgeGraph({
     if (target) selectTool(target);
   };
 
-  // the everything-index: every agent, human, SOP and tool, grouped and
-  // alphabetized. Click = jump the graph to that node; hover = pre-light it.
-  const directory = useMemo(
-    () => graphDirectory(agents, departments, people, tasks, graph),
-    [agents, departments, people, tasks, graph],
-  );
-  const pickFromDirectory = (kind: DirectoryGroup['kind'], id: string) => {
-    if (kind === 'tool') selectToolSlug(id);
-    else if (kind === 'task') selectTask(id);
-    else selectWorker(id);
-  };
-  const hoverFromDirectory = (kind: DirectoryGroup['kind'], id: string | null) => {
-    if (!id) {
-      setHoverId(null);
-      return;
-    }
-    const nodeId = kind === 'tool' ? graph.nodes.find((n) => n.kind === 'tool' && toolSlugOf(n.id) === id)?.id ?? null : id;
-    setHoverId(nodeId);
-  };
-  const directoryPanel = (
-    <GraphDirectory groups={directory} onPick={pickFromDirectory} onHover={hoverFromDirectory} collapsed={directoryCollapsed} onToggleCollapse={() => setDirectoryCollapsed((v) => !v)} className="h-full" />
-  );
-
-  // The three lenses, lifted out of the retired inline layout so the shell
-  // that survives still carries them.
-  const lensPanel = (
-    <div className="flex w-44 flex-col gap-1 rounded-sm-t border border-os-border-strong bg-os-bg/85 p-2 backdrop-blur">
-      <div className="flex items-baseline justify-between font-mono text-[9px] uppercase tracking-[0.16em] text-os-dim">
-        <span>Lens</span>
-        {lensId && (
-          <button onClick={() => setLensId(null)} className="transition-colors hover:text-os-err">
-            clear · {lensLit?.size ?? 0} lit
-          </button>
-        )}
-      </div>
-      {(
-        [
-          ['Entity', ENTITY_LENSES],
-          ['Function', FUNCTION_LENSES],
-          ['Action', ACTION_LENSES],
-        ] as [string, Lens[]][]
-      ).map(([groupLabel, lenses]) => (
-        <select
-          key={groupLabel}
-          value={lenses.some((l) => l.id === lensId) ? lensId! : ''}
-          onChange={(e) => setLensId(e.target.value || null)}
-          aria-label={`${groupLabel} lens`}
-          className="w-full rounded-sm-t border border-os-border bg-os-bg px-1.5 py-1 font-mono text-[10px] text-os-muted focus:border-os-border-strong focus:outline-none"
-        >
-          <option value="">{groupLabel} · all</option>
-          {lenses.map((l) => (
-            <option key={l.id} value={l.id}>
-              {l.label}
-            </option>
-          ))}
-        </select>
-      ))}
-    </div>
-  );
-
   // compact legend for the fullscreen wheel: color + icon per kind, with the
   // Notes core in its vault orange
   const compactLegend = (
@@ -1668,6 +1612,53 @@ export function KnowledgeGraph({
     dragRef.current = null;
   };
 
+  // ── drag the canvas to pan ──────────────────────────────────────────────────
+  // Only fires on the background: every node stops propagation on pointerdown,
+  // so dragging a node still moves the node.
+  const onCanvasPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    const p = panRef.current;
+    panDragRef.current = {
+      startX: e.clientX, startY: e.clientY, originX: p.x, originY: p.y, moved: false,
+    };
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      /* capture is best-effort */
+    }
+  };
+  const onCanvasPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const d = panDragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    const dy = e.clientY - d.startY;
+    // a few pixels of slop, so a click that wobbles is still a click
+    if (!d.moved && Math.hypot(dx, dy) > 3) d.moved = true;
+    if (!d.moved) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    // one CSS pixel is this many viewBox units at the current zoom
+    const k = camRectRef.current.w / (box.width || 1);
+    panRef.current = { x: d.originX - dx * k, y: d.originY - dy * k };
+  };
+  const onCanvasPointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    const d = panDragRef.current;
+    if (!d) return;
+    try {
+      e.currentTarget.releasePointerCapture?.(e.pointerId);
+    } catch {
+      /* release is best-effort */
+    }
+    // a drag that ended on the background must not also clear the selection
+    if (d.moved) suppressClickRef.current = true;
+    panDragRef.current = null;
+  };
+
+  // Re-framing resets the pan: the camera is about to fly somewhere specific,
+  // and carrying an old offset there would land it off-screen.
+  useEffect(() => {
+    panRef.current = { x: 0, y: 0 };
+  }, [focusId, selectedAgentId, selectedToolId, selectedTaskId, selectedHumanId, selectedMemoryId, coreExpanded]);
+
   // ── the graph itself (reused inline + fullscreen) ───────────────────────────
   const graphInner = (
     <>
@@ -1675,10 +1666,20 @@ export function KnowledgeGraph({
       <svg
         ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}
-        className="h-full w-full"
+        className="h-full w-full cursor-grab touch-none active:cursor-grabbing"
         role="img"
         aria-label="Operating knowledge graph"
-        onClick={clearAll}
+        onPointerDown={onCanvasPointerDown}
+        onPointerMove={onCanvasPointerMove}
+        onPointerUp={onCanvasPointerUp}
+        onPointerCancel={onCanvasPointerUp}
+        onClick={() => {
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false;
+            return;
+          }
+          clearAll();
+        }}
       >
         {/* orbital rings — faint, slowly-rotating backdrop (memoized; static) */}
         {orbitalRings}
@@ -2207,9 +2208,6 @@ export function KnowledgeGraph({
         onCollapseCore={clearAll}
         searchSlot={vaultSearchInput}
         legendSlot={compactLegend}
-        lensSlot={lensPanel}
-        directorySlot={directoryPanel}
-        directoryCollapsed={directoryCollapsed}
         onNavDept={navDept}
         onBack={clearDetail}
       >

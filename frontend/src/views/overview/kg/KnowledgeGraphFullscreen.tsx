@@ -7,8 +7,8 @@ import { ToolDetailCard, type DeptLite } from './KnowledgeDetail';
 
 export function KnowledgeGraphFullscreen({
   deptList, currentTeamId, currentDept,
-  toolWiki, extraDetail, coreOpen = false, onCollapseCore, searchSlot, legendSlot, directorySlot, directoryCollapsed = false,
-  lensSlot, onNavDept, onBack, children,
+  toolWiki, extraDetail, coreOpen = false, onCollapseCore, searchSlot, legendSlot,
+  onNavDept, onBack, children,
 }: {
   deptList: DeptLite[];
   currentTeamId: string | null;
@@ -25,11 +25,6 @@ export function KnowledgeGraphFullscreen({
   searchSlot?: React.ReactNode;
   /** compact kind legend, rendered bottom-left */
   legendSlot?: React.ReactNode;
-  /** the entity / function / action lenses, rendered under the legend */
-  lensSlot?: React.ReactNode;
-  /** the everything-index, docked right; collapsible so it can step aside */
-  directorySlot?: React.ReactNode;
-  directoryCollapsed?: boolean;
   onNavDept: (teamId: string) => void;
   onBack: () => void;
   children: React.ReactNode;
@@ -121,14 +116,6 @@ export function KnowledgeGraphFullscreen({
 
         {/* compact legend — bottom-left, always on */}
         {legendSlot && <div className="absolute bottom-5 left-5 z-10">{legendSlot}</div>}
-
-        {/* the everything-index — always expanded in fullscreen (the detail
-            aside overlays it while a card is open) */}
-        {directorySlot && (
-          <div className={`absolute bottom-5 right-5 top-36 z-[5] flex ${directoryCollapsed ? 'w-9' : 'w-72'}`}>{directorySlot}</div>
-        )}
-
-        {lensSlot && <div className="absolute right-5 top-5 z-20">{lensSlot}</div>}
 
         {/* side paddles: slim, hugging the canvas edges at mid-height — you
             turn the wheel from where you're already looking, never the top.

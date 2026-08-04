@@ -19,7 +19,12 @@ Five concentric rings, read outward from the centre:
 Hover any node to trace its whole pillar chain. Click a pillar to grow it into
 a bottom-up tree; click a job for its steps, a teammate or tool for its card.
 Click the core to bloom the memory constellation, with type-to-find over it.
-`←` / `→` turn the pillar wheel; `Escape` steps back out.
+Drag the background to pan. `←` / `→` turn the pillar wheel; `Escape` steps
+back out.
+
+Panning is an offset on top of whatever the camera is framing, not a separate
+mode: the shot still tracks its subject, just off-centre by the amount you
+dragged, and re-framing (selecting a node, opening the core) resets it.
 
 ## The derived rings — read this before trusting the org chart
 
@@ -43,7 +48,12 @@ connected MCP server advertises.
 
 `kg/` holds the graph itself — `model.ts` (the five-ring node/edge model),
 `adapter.ts` (our host's data, shaped into it), `tree-layout.ts` and
-`memory-core.ts` (pure layout and camera maths), `lens.ts`, and the
-`KnowledgeGraph` / `KnowledgeGraphFullscreen` / `GraphDirectory` /
-`KnowledgeDetail` components. `pulse.ts` holds the two board predicates the
-adapter needs. Theme tokens live under `.oc-kg` in `src/index.css`.
+`memory-core.ts` (pure layout and camera maths), and the `KnowledgeGraph` /
+`KnowledgeGraphFullscreen` / `KnowledgeDetail` components. `pulse.ts` holds
+the two board predicates the adapter needs. Theme tokens live under `.oc-kg`
+in `src/index.css`.
+
+The graph is the whole page, so its chrome stays minimal: a pillar selector, a
+kind legend, the side paddles, and the detail card. The docked directory index
+and the entity/function/action lenses were removed — with nothing else on the
+page competing for attention, they covered more of the graph than they earned.
