@@ -6,6 +6,14 @@ import { ArrowLeft, ChevronLeft, ChevronRight } from 'lucide-react';
 import type { ToolWiki } from './agent-wiki';
 import { ToolDetailCard, type DeptLite } from './KnowledgeDetail';
 
+/**
+ * The chrome around the graph in its fullscreen (only) mode: the pillar
+ * selector and side paddles for stepping through departments, the vault
+ * search/legend slots, and a detail panel that overlays rather than resizes
+ * the canvas — so opening or closing a card never reflows the graph. Owns
+ * ←/→ and Escape; typing in the vault search suppresses them so the query
+ * can use those keys.
+ */
 export function KnowledgeGraphFullscreen({
   deptList, currentTeamId, currentDept,
   toolWiki, extraDetail, coreOpen = false, onCollapseCore, searchSlot, legendSlot,

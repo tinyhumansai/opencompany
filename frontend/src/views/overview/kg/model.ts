@@ -89,6 +89,13 @@ export function toolSlugOf(nodeId: string): string {
   return nodeId.replace(/^tool:/, '').split('@')[0];
 }
 
+/**
+ * Build the five-ring graph from the adapted org model: the company at the
+ * core, each department that actually has somebody in it, their SOP tasks and
+ * workflows, the workers who run them, and the tools those workers reach for.
+ * Deterministic given the same inputs — nothing here depends on render order
+ * or wall-clock time.
+ */
 export function buildKnowledgeGraph(
   agents: Agent[],
   departments: Department[],
