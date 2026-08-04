@@ -40,6 +40,19 @@ const TONE_TEXT: Record<string, string> = {
 // sidebar's surface instead of sinking into it.
 const DISCORD_BLURPLE = "text-[#5865f2] dark:text-[#7f8ffa]";
 
+/**
+ * A sidebar row at rest: dimmed until you reach for it.
+ *
+ * The sidebar is standing furniture, on screen behind every view — holding the
+ * whole list at full strength makes ten equal-weight rows compete with the
+ * content beside them. Hover, keyboard focus, and the active row all come back
+ * to full, so nothing is ever dimmed at the moment you are using it.
+ */
+// `data-active` is a bare boolean attribute on these buttons, not
+// `data-active="true"` — match it the same way the sidebar's own styles do.
+export const RESTING_ROW =
+  "opacity-60 transition-opacity hover:opacity-100 focus-visible:opacity-100 data-active:opacity-100";
+
 interface Props {
   /** The company's lifecycle, shown as a dot + label. */
   lifecycleState: string;
@@ -103,6 +116,7 @@ export function SidebarControls({
           tooltip="Feedback"
           isActive={view === "feedback"}
           onClick={() => onNavigate("feedback")}
+          className={RESTING_ROW}
         >
           <MessageSquareWarning />
           <span>Feedback</span>
@@ -115,7 +129,9 @@ export function SidebarControls({
       {(companies.length > 1 || onBackToPicker) && (
         <SidebarMenuItem>
           <DropdownMenu>
-            <DropdownMenuTrigger render={<SidebarMenuButton tooltip="Switch company" />}>
+            <DropdownMenuTrigger
+              render={<SidebarMenuButton tooltip="Switch company" className={RESTING_ROW} />}
+            >
               <Building2 />
               <span>Switch company</span>
             </DropdownMenuTrigger>
@@ -140,7 +156,11 @@ export function SidebarControls({
       <SidebarMenuItem>
         <SidebarMenuButton
           tooltip="Join our Discord"
-          className={cn(DISCORD_BLURPLE, "hover:text-[#5865f2] dark:hover:text-[#7f8ffa]")}
+          className={cn(
+            DISCORD_BLURPLE,
+            "hover:text-[#5865f2] dark:hover:text-[#7f8ffa]",
+            RESTING_ROW,
+          )}
           render={<a href={DISCORD_INVITE_URL} target="_blank" rel="noreferrer" />}
         >
           <DiscordIcon className="size-4" />
@@ -172,8 +192,9 @@ export function SidebarCollapseToggle() {
           tooltip={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           onClick={toggleSidebar}
           className={cn(
-            collapsed &&
-              "bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/90 active:text-primary-foreground",
+            collapsed
+              ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/90 active:text-primary-foreground"
+              : RESTING_ROW,
           )}
         >
           <PanelLeft className={cn("transition-transform", collapsed && "rotate-180")} />

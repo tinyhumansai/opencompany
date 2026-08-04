@@ -32,6 +32,7 @@ import {
 import { FeedbackDialog } from "@/components/feedback-dialog";
 import {
   AutoCollapse,
+  RESTING_ROW,
   SidebarCollapseToggle,
   SidebarControls,
 } from "@/components/sidebar-controls";
@@ -148,6 +149,7 @@ export function AppShell({
                     isActive={view === item.view}
                     tooltip={item.label}
                     onClick={() => setView(item.view)}
+                    className={RESTING_ROW}
                   >
                     <item.icon />
                     <span>{item.label}</span>
