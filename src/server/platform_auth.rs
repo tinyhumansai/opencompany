@@ -454,6 +454,71 @@ mod test {
         assert!(!claims.has_platform_scope());
     }
 
+    /// The shipped default build must not turn a caller-supplied payload into
+    /// platform claims. The bearer is assembled literally, from nothing but the
+    /// wire shape, so this stays a black-box statement about what an
+    /// unauthenticated request can obtain — no helper, no shared constant.
+    #[test]
+    fn hand_constructed_tenant_bearer_is_refused() {
+        let verifier = StaticPlatformVerifier::new("top-secret");
+        let forged = format!(
+            "oc_tenant.{}",
+            b64url_encode(br#"{"tenant":"tenant:victim","scopes":["platform","operator"]}"#)
+        );
+        assert!(
+            verifier.verify(&forged).is_err(),
+            "an unsigned, caller-supplied payload must not resolve to platform claims"
+        );
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    fn sign(secret: &str, claims: &serde_json::Value) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("sign")
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn jwt_verifier_refuses_an_expired_token() {
+        let secret = "signing-secret";
+        // 2001-09-09, comfortably in the past whenever this runs.
+        let token = sign(
+            secret,
+            &json!({"tenant": "tenant:acme", "scopes": ["operator"], "exp": 1_000_000_000u64}),
+        );
+        assert!(JwtPlatformVerifier::new(secret).verify(&token).is_err());
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn jwt_verifier_refuses_a_tampered_payload() {
+        let secret = "signing-secret";
+        let token = sign(
+            secret,
+            &json!({"tenant": "tenant:acme", "scopes": ["operator"]}),
+        );
+
+        // Rewrite the claims to grant the platform scope, keeping the original
+        // signature: it no longer covers the body it is attached to.
+        let parts: Vec<&str> = token.split('.').collect();
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(parts[1]).expect("payload")).expect("claims");
+        claims["scopes"] = json!(["platform", "operator"]);
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            b64url_encode(&serde_json::to_vec(&claims).expect("re-encode")),
+            parts[2]
+        );
+
+        assert!(JwtPlatformVerifier::new(secret).verify(&tampered).is_err());
+    }
+
     #[test]
     fn unrecognized_token_is_rejected() {
         let verifier = StaticPlatformVerifier::new("top-secret");

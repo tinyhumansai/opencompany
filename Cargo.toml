@@ -218,7 +218,17 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 # (`github`, `telegram`, `medulla`, …) also depend on, so the default build
 # gains no new heavy native dependency. The read-only status route
 # (`ops::connections_read`) is un-gated and available regardless.
-default = ["oauth"]
+#
+# `platform-jwt` ships in the standard build because it is the *only* way a
+# shipped build can accept a tenant-scoped machine credential: the platform
+# verifier authenticates a bearer either by knowledge of the shared secret or by
+# an HS256 signature, and nothing else. Leaving it optional made the signed path
+# a build-time opt-in, and — because cargo features are additive and no CI lane
+# enabled it — its tests were compiled by the check-only `--all-features` step
+# and *run* by nothing. Moving it into the default set makes both `cargo test`
+# lanes execute them, which is why this needs no new CI lane. It costs one pure
+# dependency (`jsonwebtoken`), already in `Cargo.lock`.
+default = ["oauth", "platform-jwt"]
 tiny = ["tinyagents"]
 # WS4: embed `vendor/openhuman` (`openhuman_core`) directly as the tenant agent
 # harness via `AgentBuilder`. `src/harness/` compiles only under this feature;
