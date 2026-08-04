@@ -157,6 +157,7 @@ export function Overview({ client, company }: Props) {
           people={adapted.people}
           tasks={adapted.tasks}
           memory={memoryGraph}
+          toolLabels={adapted.toolLabels}
         />
       </Suspense>
     </div>
