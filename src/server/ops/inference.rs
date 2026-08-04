@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 
 use axum::Router;
+use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, response::Response};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,13 @@ const RESTART_NOTE: &str = "Saved — but this company started with no inference
      running the offline echo brain and its workflow runner is unwired. The brain is chosen at \
      startup: restart the company for agents to think with this provider and for scheduled \
      workflows to fire.";
+
+/// The reminder attached when [`restart_pending`] held and the runtime was
+/// rebuilt in place to clear it (issue #290). The restart the operator was
+/// previously told to perform has already happened, for this company only.
+const REBUILT_NOTE: &str = "Saved, and this company's runtime was rebuilt so the new provider is \
+     live now. Agents think with it from their next turn and scheduled workflows fire again — no \
+     restart needed.";
 
 /// Builds the inference management route fragment.
 pub fn router() -> Router<AppState> {
@@ -246,6 +254,7 @@ async fn get_status(company: ScopedCompany) -> Result<Json<InferenceStatusDto>, 
 /// `PUT …/inference` — set (or replace) the runtime provider override, and
 /// optionally rotate the write-only outbound credential.
 async fn set_config(
+    State(state): State<AppState>,
     company: ScopedCompany,
     Json(body): Json<SetInference>,
 ) -> Result<Json<MutationResponse>, ApiError> {
@@ -279,6 +288,40 @@ async fn set_config(
     }
 
     let status = effective_status(runtime).await?;
+    // Issue #290: the not-configured → configured transition is the one a save
+    // alone cannot deliver, because the brain was chosen at build time. Rather
+    // than telling the operator to restart a container they may have no access
+    // to, rebuild this company's runtime in place and re-read the status from
+    // the successor.
+    if status.restart_required {
+        match crate::runtime::rebuild_company(&state, runtime.id()).await {
+            Ok(successor) => {
+                let status = effective_status(successor.as_ref()).await?;
+                return Ok(Json(MutationResponse {
+                    // Read off the *successor*, so a rebuild that somehow landed
+                    // on the same brain still reports honestly rather than
+                    // claiming a success the runtime cannot back up.
+                    note: if status.restart_required {
+                        RESTART_NOTE
+                    } else {
+                        REBUILT_NOTE
+                    }
+                    .to_string(),
+                    status,
+                }));
+            }
+            Err(err) => {
+                // The save landed and the company is still running its old
+                // brain, which is exactly what RESTART_NOTE describes. Falling
+                // through is therefore the honest answer, not a swallowed error.
+                tracing::warn!(
+                    company = %runtime.id(),
+                    error = %err,
+                    "inference saved but the runtime could not be rebuilt; a restart is still required",
+                );
+            }
+        }
+    }
     Ok(Json(MutationResponse {
         // The note follows the *resulting* status, so the response can never
         // promise "next turn" to a company whose brain cannot honour it.
@@ -732,5 +775,131 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(err["code"], "not_wired");
+    }
+
+    /// A brain standing in for the one a rebuild puts a configured company on,
+    /// so the route's behaviour is pinned without constructing a real harness
+    /// brain (which would resolve MCP servers, Composio and an agent roster
+    /// inside a unit test).
+    ///
+    /// Only its [`Cognition`](crate::ports::Cognition) matters here: reporting
+    /// the harness path is exactly what makes `restart_pending` false, which is
+    /// the observable the console reads.
+    #[cfg(feature = "openhuman")]
+    struct RebuiltBrain;
+
+    #[cfg(feature = "openhuman")]
+    #[async_trait::async_trait]
+    impl crate::ports::brain::Brain for RebuiltBrain {
+        async fn run_cycle(
+            &self,
+            _req: crate::ports::types::CycleRequest,
+            _host: &dyn crate::ports::brain::CycleHost,
+        ) -> crate::Result<crate::ports::types::CycleResult> {
+            Ok(crate::ports::types::CycleResult {
+                channel_responses: Vec::new(),
+                new_traces: Vec::new(),
+                ledger_deltas: Vec::new(),
+                token_usage: crate::ports::types::TokenUsage::default(),
+            })
+        }
+
+        fn cognition(&self) -> crate::ports::Cognition {
+            crate::ports::Cognition {
+                path: crate::ports::brain::HARNESS_PATH,
+                // A stub brain meters per turn and reports zero usage, so
+                // nothing is double-counted (see `Brain::cognition`).
+                provider: "stub",
+                metering: crate::ports::UsageMetering::PerTurn,
+            }
+        }
+    }
+
+    /// A rebuilder that runs the real builder over the real handover, and puts
+    /// the successor on a brain that reports the harness path — the shape a live
+    /// rebuild produces once inference resolves.
+    #[cfg(feature = "openhuman")]
+    struct StubRebuilder {
+        home: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "openhuman")]
+    #[async_trait::async_trait]
+    impl crate::runtime::RuntimeRebuilder for StubRebuilder {
+        async fn rebuild(
+            &self,
+            _state: &AppState,
+            request: crate::runtime::RebuildRequest,
+        ) -> crate::Result<crate::company::runtime::CompanyRuntime> {
+            RuntimeBuilder::new(self.home.clone(), request.manifest)
+                .with_id(request.id)
+                .with_harness(std::sync::Arc::new(crate::harness::HarnessPool::new()))
+                .with_brain(std::sync::Arc::new(RebuiltBrain))
+                .with_handover(request.handover)
+                .build()
+                .await
+        }
+    }
+
+    /// Issue #290, the half #266 did not ship: with a rebuilder wired, the save
+    /// that *would* have set `restartRequired` rebuilds the company instead, and
+    /// the response reports the successor rather than the runtime that is being
+    /// replaced.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn configuring_inference_after_boot_rebuilds_instead_of_asking_for_a_restart() {
+        use crate::harness::HarnessPool;
+
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let id = CompanyId::new("acme");
+        let runtime = RuntimeBuilder::new(home.clone(), manifest())
+            .with_id(id.clone())
+            .with_harness(std::sync::Arc::new(HarnessPool::new()))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(runtime.cognition().path, "echo");
+
+        let outgoing = std::sync::Arc::new(runtime);
+        let state = AppState::new(AppConfig::default())
+            .with_rebuilder(std::sync::Arc::new(StubRebuilder { home: home.clone() }));
+        state.registry().insert(id.clone(), outgoing.clone());
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+
+        let (status, resp, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({
+                "provider": "openai_compatible",
+                "baseUrl": "https://stub.invalid/v1",
+                "key": TOKEN,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        // The save landed, and the company is no longer stranded behind a boot
+        // decision: it reports the live cognition path, not "restart me".
+        assert_eq!(resp["status"]["source"], "runtime");
+        assert_eq!(resp["status"]["keyConfigured"], true);
+        assert_eq!(resp["status"]["cognition"], "harness", "{raw}");
+        assert_eq!(resp["status"]["restartRequired"], false, "{raw}");
+        let note = resp["note"].as_str().unwrap_or_default();
+        assert!(!note.contains("restart the company"), "{note}");
+        assert!(!raw.contains(TOKEN), "PUT response leaked the token: {raw}");
+
+        // The registry really was swapped, and the replaced runtime is left
+        // quiesced so nothing still holding it keeps driving a dead company.
+        let registered = state.registry().get(&id).expect("still registered");
+        assert!(!std::sync::Arc::ptr_eq(&registered, &outgoing));
+        assert!(outgoing.is_quiesced());
+        assert!(!registered.is_quiesced());
+
+        // A plain read agrees: the banner clears itself rather than needing the
+        // console to remember what the mutation said.
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(dto["restartRequired"], false);
+        assert_eq!(dto["cognition"], "harness");
     }
 }

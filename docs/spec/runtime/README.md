@@ -11,6 +11,8 @@ Supporting docs:
 - [ports.md](ports.md) — the port trait contracts (normative)
 - [manifest.md](manifest.md) — `company.toml` schema
 - [lifecycle.md](lifecycle.md) — company state machine and durability
+- [rebuild.md](rebuild.md) — replacing a registered runtime in place (quiesce →
+  hand over → swap), so a first-time inference config needs no restart
 - [api.md](api.md) — HTTP routes and auth
 - [config.md](config.md) — configuration and the one-key story
 - [users.md](users.md) — human collaborators: magic-link/password sign-in,

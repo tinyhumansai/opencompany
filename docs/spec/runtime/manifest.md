@@ -156,6 +156,14 @@ prompt = "Weekly review and operator digest"
   neither. The status route reports that state as `restartRequired` — a resolved
   config next to a non-harness `cognition` — and the console says "restart"
   instead of "next turn" for it (issue #266).
+  Since issue #290 that save **rebuilds the company's runtime in place** rather
+  than asking for a restart the operator may have no way to perform: a hosted
+  tenant's unit of restart is its container, and the control plane has no button
+  for it. `PUT …/inference` quiesces the running runtime, hands its live state to
+  a successor, and swaps the registry — see
+  [runtime rebuild](rebuild.md). `restartRequired` remains on the read shape and
+  stays honest: it is still `true` on a host that wired no rebuilder, which is
+  when a restart genuinely is the only route.
   Saving `managed` from the console is a *revert* (`DELETE …/inference`) and
   carries no credential, so the console refuses that save while a key is still
   typed in the form rather than dropping it and reporting success (issue #265).

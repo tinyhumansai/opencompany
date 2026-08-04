@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex as TokioMutex;
 
@@ -149,7 +150,14 @@ pub struct CompanyRuntime {
     /// pre-#243 native-execute behaviour.
     pub(crate) grants: GrantSet,
     /// Held for the duration of a cycle so cycles never interleave per company.
-    pub(crate) serial: TokioMutex<()>,
+    ///
+    /// `Arc`-shared rather than owned so a rebuilt runtime can inherit the *same*
+    /// lock (issue #290). Two runtimes for one company each holding their own
+    /// mutex would mean two cycles running at once against a store whose `save`
+    /// writes the whole record, which is exactly the invariant this exists to
+    /// hold. Handing the lock over is also what makes
+    /// [`quiesce`](Self::quiesce)'s drain meaningful across the swap.
+    pub(crate) serial: Arc<TokioMutex<()>>,
     /// Held across a REST board write's read → validate → write, so two
     /// concurrent edits cannot each validate against a snapshot that predates
     /// the other's edge (issue #185 review).
@@ -158,7 +166,17 @@ pub struct CompanyRuntime {
     /// whole cycle, which is a live agent turn, so reusing it would park every
     /// board edit behind an LLM call. This one is only ever held across a
     /// couple of store round-trips.
-    pub(crate) task_writes: TokioMutex<()>,
+    ///
+    /// `Arc`-shared for the same reason as [`serial`](Self::serial): a rebuild
+    /// inherits it rather than minting a second one.
+    pub(crate) task_writes: Arc<TokioMutex<()>>,
+    /// Set while this runtime is being replaced (issue #290). Once set, every
+    /// cycle entry point refuses with [`OpenCompanyError::Quiescing`] so the
+    /// in-flight turn can drain and the successor takes over at a point with no
+    /// live cycle. Never cleared by the runtime itself: either the successor
+    /// replaces it in the registry, or the rebuild failed and
+    /// [`resume`](Self::resume) puts this one back to work.
+    pub(crate) quiesced: Arc<AtomicBool>,
     /// WS4: the embedded openhuman harness pool, when wired via
     /// [`RuntimeBuilder::with_harness`](crate::runtime::RuntimeBuilder::with_harness).
     /// Feature-gated so the default build is unaffected.
@@ -219,8 +237,9 @@ impl CompanyRuntime {
             workflow_runner: None,
             steer: crate::company::steer::InflightRegistry::new(),
             grants,
-            serial: TokioMutex::new(()),
-            task_writes: TokioMutex::new(()),
+            serial: Arc::new(TokioMutex::new(())),
+            task_writes: Arc::new(TokioMutex::new(())),
+            quiesced: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "openhuman")]
             harness: None,
             #[cfg(feature = "mcp")]
@@ -307,6 +326,29 @@ impl CompanyRuntime {
     /// This company's event log (append-only audit trail).
     pub fn events(&self) -> &Arc<dyn EventLog> {
         &self.events
+    }
+
+    /// This company's runtime journal — the at-most-once effect log and the
+    /// durable approval queue.
+    ///
+    /// Exposed so a rebuild can prove it handed the *same* journal to the
+    /// successor: a second `RuntimeJournal` over one path is the corruption
+    /// hazard [`RuntimeHandover`](crate::runtime::RuntimeHandover) exists to
+    /// prevent, and "we passed it along" is only checkable if it is readable.
+    pub fn journal(&self) -> &Arc<RuntimeJournal> {
+        &self.journal
+    }
+
+    /// The per-company cycle lock, so a rebuild can assert the successor
+    /// inherited it rather than minting a second one.
+    pub(crate) fn serial_lock(&self) -> &Arc<TokioMutex<()>> {
+        &self.serial
+    }
+
+    /// The board read-modify-write lock, exposed for the same reason as
+    /// [`serial_lock`](Self::serial_lock).
+    pub(crate) fn task_writes_lock(&self) -> &Arc<TokioMutex<()>> {
+        &self.task_writes
     }
 
     /// This company's durable record store.
@@ -526,8 +568,76 @@ impl CompanyRuntime {
         self.economy.is_some()
     }
 
+    /// Stops this runtime accepting new cycles, then waits for the one in flight
+    /// to finish (issue #290).
+    ///
+    /// The two halves are both necessary and neither is sufficient. Setting the
+    /// flag alone leaves a turn mid-cycle, and a successor that started writing
+    /// the same journal underneath it would interleave two records onto one line
+    /// — a parse failure that bricks the *next* boot, not just this one. Waiting
+    /// on [`serial`](Self::serial) alone would race: a cycle queued behind the
+    /// one in flight would acquire the lock the moment it dropped and the drain
+    /// would return to a runtime that is busy again.
+    ///
+    /// The `serial` guard is deliberately released before returning. It is
+    /// handed to the successor by [`RuntimeHandover`](crate::runtime::RuntimeHandover),
+    /// so holding it here would park the successor's first cycle behind a guard
+    /// this runtime no longer has any reason to own.
+    ///
+    /// What this does **not** drain: work that never takes `serial`. Detached
+    /// task dispatches and scheduled workflow runs each clone an
+    /// `Arc<CompanyRuntime>` and run a cycle, so they *are* covered — they either
+    /// completed before the flag was set or they are the turn being waited on.
+    /// A harness tool call already in flight inside that turn finishes on the old
+    /// pool, which the successor then inherits.
+    pub async fn quiesce(&self) {
+        self.quiesced.store(true, Ordering::SeqCst);
+        // Acquiring proves the in-flight cycle (if any) has finished.
+        let _drained = self.serial.lock().await;
+    }
+
+    /// Puts a quiesced runtime back to work.
+    ///
+    /// Called when a rebuild fails: a company left quiesced would refuse every
+    /// cycle forever, which is a far worse outcome than the stale brain the
+    /// rebuild was trying to replace.
+    pub fn resume(&self) {
+        self.quiesced.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this runtime has stopped accepting cycles pending a swap.
+    pub fn is_quiesced(&self) -> bool {
+        self.quiesced.load(Ordering::SeqCst)
+    }
+
+    /// Adopts the serialising mutexes of the runtime this one replaces
+    /// (issue #290), so the cycle and board-write invariants span the swap
+    /// instead of lapsing at it.
+    ///
+    /// Called by the [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) on a
+    /// rebuild, before the successor is registered and therefore before anything
+    /// can be holding either lock through *this* runtime.
+    pub fn adopt_locks(&mut self, serial: Arc<TokioMutex<()>>, task_writes: Arc<TokioMutex<()>>) {
+        self.serial = serial;
+        self.task_writes = task_writes;
+    }
+
+    /// Rejects a cycle on a runtime that is being replaced.
+    ///
+    /// Separate from [`ensure_running`](Self::ensure_running): that one reads a
+    /// durable lifecycle an operator chose (paused, archived) and renders `409`;
+    /// this one is a process-local window that clears itself within a turn and
+    /// renders `503`.
+    fn ensure_accepting(&self) -> Result<()> {
+        if self.is_quiesced() {
+            return Err(OpenCompanyError::Quiescing(self.id.as_ref().to_string()));
+        }
+        Ok(())
+    }
+
     /// Runs one cycle over a batch of events, returning what happened.
     pub async fn run_cycle(&self, events: Vec<CompanyEvent>) -> Result<CycleReport> {
+        self.ensure_accepting()?;
         CycleRunner::new(self).run(events).await
     }
 
@@ -539,6 +649,11 @@ impl CompanyRuntime {
         verdict: Verdict,
         by: Actor,
     ) -> Result<CycleReport> {
+        // Checked before the gate is touched, not inside the follow-up cycle: a
+        // resolution that journaled the verdict and then failed to run its
+        // follow-up would leave the brain permanently unaware of an approval the
+        // operator had already granted.
+        self.ensure_accepting()?;
         CycleRunner::new(self)
             .resolve_approval(id, verdict, by)
             .await
@@ -555,6 +670,7 @@ impl CompanyRuntime {
         amended_payload: serde_json::Value,
         by: Actor,
     ) -> Result<CycleReport> {
+        self.ensure_accepting()?;
         CycleRunner::new(self)
             .resolve_approval_amended(id, amended_payload, by)
             .await

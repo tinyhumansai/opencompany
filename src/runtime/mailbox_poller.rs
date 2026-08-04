@@ -22,6 +22,10 @@ use crate::server::ops::smtp::local_part;
 /// it into the addressed inbox via [`file_and_notify`].
 pub struct MailboxPoller {
     runtime: Arc<CompanyRuntime>,
+    /// When set, the runtime to file into is looked up here every tick so a
+    /// runtime swap (issue #290) reaches inbound mail. `None` keeps the boot
+    /// snapshot.
+    registry: Option<crate::runtime::CompanyRegistry>,
     receiver: Arc<dyn MailReceiver>,
     creds: ImapCredentials,
     address: String,
@@ -40,11 +44,32 @@ impl MailboxPoller {
     ) -> Self {
         Self {
             runtime,
+            registry: None,
             receiver,
             creds,
             address,
             interval: Duration::from_secs(interval_secs.max(1)),
         }
+    }
+
+    /// Issue #290: re-read `registry` for this company on every tick, instead of
+    /// driving the `Arc<CompanyRuntime>` snapshotted at boot.
+    ///
+    /// Without this, a runtime swap never reaches this loop: it keeps driving a
+    /// runtime that has been replaced and quiesced, so every tick fails. Opted
+    /// into by the boot path, so existing callers keep the snapshot behaviour.
+    pub fn following(mut self, registry: crate::runtime::CompanyRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// The runtime to drive this tick: whatever is registered now, else the
+    /// snapshot taken at construction.
+    fn runtime(&self) -> Arc<CompanyRuntime> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(self.runtime.id()))
+            .unwrap_or_else(|| self.runtime.clone())
     }
 
     /// Fetches new mail and files each message. Returns the count filed. Skips
@@ -59,7 +84,8 @@ impl MailboxPoller {
     /// choices mean one bad message can never mark itself (or any message
     /// after it) seen without having been filed, so nothing is silently lost.
     pub async fn tick(&self) -> crate::Result<usize> {
-        if self.runtime.ensure_running().await.is_err() {
+        let runtime = self.runtime();
+        if runtime.ensure_running().await.is_err() {
             return Ok(0);
         }
         let messages = self.receiver.fetch_new(&self.creds).await?;
@@ -76,7 +102,7 @@ impl MailboxPoller {
                 read: false,
                 outbound: false,
             };
-            match file_and_notify(&self.runtime, &self.address, record).await {
+            match file_and_notify(&runtime, &self.address, record).await {
                 Ok(()) => filed_uids.push(m.uid),
                 Err(err) => {
                     tracing::warn!(
