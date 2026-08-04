@@ -17,7 +17,7 @@ use crate::ports::types::{
 };
 use crate::ports::{CycleHost, EventLog};
 use crate::runtime::RuntimeBuilder;
-use crate::server::platform_auth::{PlatformAuthConfig, PlatformClaims, StaticPlatformVerifier};
+use crate::server::platform_auth::{PlatformAuthConfig, PlatformClaims, UnsignedTenantVerifier};
 use crate::server::router;
 use crate::server::webhook::{WebhookConfig, WebhookKind};
 use crate::store::FsEventLog;
@@ -35,7 +35,7 @@ fn home() -> tempfile::TempDir {
 }
 
 fn platform_state(home: &std::path::Path, max_per_tenant: Option<usize>) -> AppState {
-    let verifier = Arc::new(StaticPlatformVerifier::new(PLATFORM_SECRET));
+    let verifier = Arc::new(UnsignedTenantVerifier::new(PLATFORM_SECRET));
     AppState::new(AppConfig::default())
         .with_home(home.to_path_buf())
         .with_platform_auth(PlatformAuthConfig::new(verifier))
@@ -48,7 +48,7 @@ fn platform_state(home: &std::path::Path, max_per_tenant: Option<usize>) -> AppS
 /// ownership record, so ids and owners stay workload-local and survive boot
 /// hydration, which filters the `owners` rows by this same value.
 fn namespaced_state(home: &std::path::Path, namespace: &str) -> AppState {
-    let verifier = Arc::new(StaticPlatformVerifier::new(PLATFORM_SECRET));
+    let verifier = Arc::new(UnsignedTenantVerifier::new(PLATFORM_SECRET));
     AppState::new(AppConfig {
         tenant_namespace: Some(namespace.to_string()),
         ..AppConfig::default()
@@ -57,8 +57,14 @@ fn namespaced_state(home: &std::path::Path, namespace: &str) -> AppState {
     .with_platform_auth(PlatformAuthConfig::new(verifier))
 }
 
+/// Mints a tenant principal through the `cfg(test)` unsigned codec.
+///
+/// What these tests are about is what a *verified* tenant token may reach —
+/// scopes, the allow-list, cross-tenant ownership — which is independent of how
+/// the bearer was authenticated. The codec keeps them running with no signing
+/// machinery; a shipped build accepts this shape from nobody.
 fn tenant_token(tenant: &str, scopes: &[&str]) -> String {
-    StaticPlatformVerifier::tenant_token(&PlatformClaims {
+    UnsignedTenantVerifier::tenant_token(&PlatformClaims {
         tenant: tenant.to_string(),
         scopes: scopes.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
         companies: None,
@@ -714,6 +720,7 @@ async fn webhook_emitted_on_approval_requested() {
         first_time_counterparty: false,
         payload: serde_json::Value::Null,
         agent: None,
+        run_id: None,
     };
     let runtime = RuntimeBuilder::new(home.clone(), manifest)
         .with_id(CompanyId::new("acme"))

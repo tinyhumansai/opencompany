@@ -61,6 +61,7 @@ pub fn oauth_call_sample(agent: &str, provider: &str, at_millis: u64) -> UsageSa
         cached_input_tokens: 0,
         cost_usd: 0.0,
         kind: SampleKind::OauthCall,
+        run_id: None,
     }
 }
 

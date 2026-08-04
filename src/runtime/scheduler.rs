@@ -87,6 +87,10 @@ struct ParsedSchedule {
 /// Drives the cron schedules of a single [`CompanyRuntime`].
 pub struct CompanyScheduler {
     runtime: Arc<CompanyRuntime>,
+    /// When set, the runtime to drive is looked up here every tick so a runtime
+    /// swap (issue #290) reaches cron instead of leaving it on the replaced
+    /// instance. `None` keeps the boot snapshot.
+    registry: Option<crate::runtime::CompanyRegistry>,
     schedules: Vec<ParsedSchedule>,
     clock: Arc<dyn Clock>,
     /// Per-schedule last-fired epoch minute, so a schedule fires at most once per
@@ -115,10 +119,39 @@ impl CompanyScheduler {
         }
         Ok(Self {
             runtime,
+            registry: None,
             schedules: parsed,
             clock,
             last_fired: HashMap::new(),
         })
+    }
+
+    /// Issue #290: re-read `registry` for this company on every tick, instead of
+    /// driving the `Arc<CompanyRuntime>` snapshotted at boot.
+    ///
+    /// Without this, a runtime swap never reaches this loop: it keeps driving the
+    /// replaced runtime — which, after a rebuild, is the offline echo brain the
+    /// rebuild existed to get rid of, and is quiesced besides, so every tick
+    /// fails. [`WorkflowScheduler`](crate::runtime::WorkflowScheduler) already
+    /// reads the registry per tick; this is that pattern, opted into by the boot
+    /// path so existing callers and tests keep the snapshot behaviour.
+    ///
+    /// The boot snapshot stays as the fallback: a company removed from the
+    /// registry (archive) is not a reason to start driving nothing at all
+    /// silently — `ensure_running` already rejects an archived company, and that
+    /// is the check with the right error.
+    pub fn following(mut self, registry: crate::runtime::CompanyRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// The runtime to drive this tick: whatever is registered now, else the
+    /// snapshot taken at construction.
+    fn runtime(&self) -> Arc<CompanyRuntime> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(self.runtime.id()))
+            .unwrap_or_else(|| self.runtime.clone())
     }
 
     /// Whether this scheduler has any schedules to drive.
@@ -136,8 +169,9 @@ impl CompanyScheduler {
         if self.schedules.is_empty() {
             return Ok(0);
         }
+        let runtime = self.runtime();
         // Skip firing for a company that is not accepting work.
-        if self.runtime.ensure_running().await.is_err() {
+        if runtime.ensure_running().await.is_err() {
             return Ok(0);
         }
 
@@ -154,7 +188,7 @@ impl CompanyScheduler {
                 continue; // already fired this minute
             }
             self.last_fired.insert(idx, minute);
-            self.runtime
+            runtime
                 .run_cycle(vec![CompanyEvent::ScheduleFired {
                     cron: schedule.cron.clone(),
                     prompt: schedule.prompt.clone(),
@@ -175,8 +209,9 @@ impl CompanyScheduler {
     /// agent simply never acted). It announces itself on the operator channel
     /// instead.
     pub async fn tick_maintenance(&self) -> Result<Vec<crate::ports::types::ApprovalId>> {
-        let expired = self.runtime.sweep_expired_approvals().await?;
-        self.runtime.sweep_expired_grants().await?;
+        let runtime = self.runtime();
+        let expired = runtime.sweep_expired_approvals().await?;
+        runtime.sweep_expired_grants().await?;
         Ok(expired)
     }
 
@@ -384,6 +419,98 @@ mod test {
     }
 
     #[tokio::test]
+    async fn following_the_registry_reaches_a_rebuilt_runtime() {
+        // Issue #290. The cron scheduler snapshots an `Arc<CompanyRuntime>` at
+        // boot, so before this it kept driving a runtime that had been replaced
+        // — and a replaced runtime is quiesced, so every fire failed. "Scheduled
+        // workflows never fire" is one of the two surfaces #266 was reported
+        // against, which makes this the half of a rebuild that is easiest to
+        // ship broken.
+        use crate::runtime::CompanyRegistry;
+
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let manifest = scheduled_manifest();
+        let schedules = manifest.schedules.clone();
+        let outgoing = Arc::new(
+            RuntimeBuilder::new(home.clone(), manifest)
+                .with_brain(Arc::new(ScheduleBrain))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let id = outgoing.id().clone();
+        let registry = CompanyRegistry::new();
+        registry.insert(id.clone(), outgoing.clone());
+
+        let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 13, 9, 0)));
+        let mut scheduler = CompanyScheduler::new(outgoing.clone(), &schedules, clock.clone())
+            .unwrap()
+            .following(registry.clone());
+
+        // Stand in for a rebuild: quiesce the snapshotted runtime and register a
+        // successor over the same home.
+        outgoing.quiesce().await;
+        let successor = Arc::new(
+            RuntimeBuilder::new(home.clone(), scheduled_manifest())
+                .with_id(id.clone())
+                .with_brain(Arc::new(ScheduleBrain))
+                .with_handover(outgoing.handover())
+                .build()
+                .await
+                .unwrap(),
+        );
+        registry.insert(id.clone(), successor.clone());
+
+        // The fire lands, which it could not have done against the quiesced
+        // runtime the scheduler was built with.
+        assert_eq!(scheduler.tick().await.unwrap(), 1);
+        let events = successor
+            .events()
+            .read_from(&id, EventSeq::new(0), 10)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, CompanyEvent::ScheduleFired { .. })),
+            "the successor ran the scheduled cycle",
+        );
+    }
+
+    #[tokio::test]
+    async fn without_following_a_scheduler_drives_its_snapshot() {
+        // The opt-in is real: an un-followed scheduler still drives the runtime
+        // it was handed, which is what every existing caller and test relies on.
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let manifest = scheduled_manifest();
+        let schedules = manifest.schedules.clone();
+        let rt = Arc::new(
+            RuntimeBuilder::new(home.clone(), manifest)
+                .with_brain(Arc::new(ScheduleBrain))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 13, 9, 0)));
+        let mut scheduler = CompanyScheduler::new(rt.clone(), &schedules, clock).unwrap();
+
+        rt.quiesce().await;
+
+        // No registry to consult, so the quiesced snapshot is what it tries, and
+        // the refusal surfaces rather than being silently swallowed.
+        let err = scheduler
+            .tick()
+            .await
+            .expect_err("a quiesced snapshot refuses the cycle");
+        assert!(
+            matches!(err, crate::error::OpenCompanyError::Quiescing(_)),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn non_matching_minute_never_fires() {
         let home_dir = tmp_home();
         let home = home_dir.path().to_path_buf();
@@ -440,6 +567,7 @@ mod test {
                             first_time_counterparty: false,
                             payload: serde_json::Value::Null,
                             agent: None,
+                            run_id: None,
                         })
                         .await?;
                     }

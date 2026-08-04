@@ -92,6 +92,7 @@ pub fn inference_sample(usage: &TokenUsage, agent: &str, provider: &str) -> Opti
         cached_input_tokens: usage.cached_input,
         cost_usd: usage.cost_usd,
         kind: SampleKind::Inference,
+        run_id: None,
     })
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type DragEvent, useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Play, Plus } from "lucide-react";
 
 import { createTask, listTasks, patchTask, type Task } from "@/api/tasks";
@@ -42,8 +42,44 @@ function readTaskDetailId(): string | null {
 /** How often to re-poll the board, so a dispatched card's result appears. */
 const POLL_MS = 4000;
 
+/**
+ * The MIME type a dragged card stamps its id onto (issue #334).
+ *
+ * The drop used to read the dragged id out of React state alone. That is a
+ * silent single point of failure: a drag that began on anything other than a
+ * card leaves the state null, and the drop handler then returned without a
+ * word. Putting the id on the drag itself makes a drop self-describing.
+ *
+ * Filling the data store at all matters for a second reason: a drag whose store
+ * is empty is aborted outright by Firefox and Safari, so the board's one
+ * documented gesture never even started there.
+ *
+ * Every read and write of it is optional-chained. A real drag always carries a
+ * `dataTransfer`; a synthesized `DragEvent` — which is how the e2e suite drives
+ * these handlers — does not, and the `dragId` fallback covers that case.
+ */
+const CARD_MIME = "application/x-opencompany-task";
+
+/**
+ * How near the board's left or right edge a drag has to come before the board
+ * starts scrolling itself, and how fast it goes once hard against that edge.
+ *
+ * The board is a horizontal scroller and, at six columns, wider than an
+ * ordinary window: the last column sits off the right edge. HTML5
+ * drag-and-drop does not scroll a nested scroll container on its own — a drag
+ * parked on the edge moves it zero pixels — so without this the far column
+ * cannot be reached by the very gesture the board's own hint recommends.
+ */
+const EDGE_BAND_PX = 72;
+const EDGE_SPEED_PX = 16;
+
 function priorityStyle(priority: string): string {
   return PRIORITY_STYLES[priority as keyof typeof PRIORITY_STYLES] ?? PRIORITY_STYLES.low;
+}
+
+/** A column's board label, for messages the operator reads. */
+function columnLabel(id: string): string {
+  return TASK_COLUMNS.find((c) => c.id === id)?.label ?? id;
 }
 
 /**
@@ -80,6 +116,14 @@ export function TasksView({
   // A real HTML5 drag fires a trailing click; suppress it so a drag never also
   // opens the detail dialog.
   const dragged = useRef(false);
+  // The horizontal scroller holding the columns, so a drag near its edge can
+  // scroll it (issue #334).
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  // Pixels per frame the board is currently scrolling itself by, and the frame
+  // that is doing it. Both refs rather than state: this is driven by dragover
+  // at pointer rate and must not re-render the board on every move.
+  const edgeSpeed = useRef(0);
+  const edgeFrame = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -112,6 +156,52 @@ export function TasksView({
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  const stopEdgeScroll = useCallback(() => {
+    edgeSpeed.current = 0;
+    if (edgeFrame.current !== null) {
+      cancelAnimationFrame(edgeFrame.current);
+      edgeFrame.current = null;
+    }
+  }, []);
+
+  /**
+   * Aims the board's self-scroll at wherever the drag currently is: full speed
+   * hard against an edge, easing to nothing at the band's inner lip, and off
+   * entirely across the middle of the board.
+   */
+  const edgeScrollTo = useCallback(
+    (clientX: number) => {
+      const board = boardRef.current;
+      if (!board) return;
+      const { left, right } = board.getBoundingClientRect();
+      const ramp = (depth: number) => Math.min(1, Math.max(0, 1 - depth / EDGE_BAND_PX));
+      let speed = 0;
+      if (clientX < left + EDGE_BAND_PX) speed = -EDGE_SPEED_PX * ramp(clientX - left);
+      else if (clientX > right - EDGE_BAND_PX) speed = EDGE_SPEED_PX * ramp(right - clientX);
+      if (speed === 0) {
+        stopEdgeScroll();
+        return;
+      }
+      edgeSpeed.current = speed;
+      if (edgeFrame.current !== null) return;
+      const step = () => {
+        const el = boardRef.current;
+        if (!el || edgeSpeed.current === 0) {
+          edgeFrame.current = null;
+          return;
+        }
+        el.scrollLeft += edgeSpeed.current;
+        edgeFrame.current = requestAnimationFrame(step);
+      };
+      edgeFrame.current = requestAnimationFrame(step);
+    },
+    [stopEdgeScroll],
+  );
+
+  // A drag interrupted by a view change (the detail screen replaces the board
+  // in place) must not leave a frame running against a detached node.
+  useEffect(() => stopEdgeScroll, [stopEdgeScroll]);
+
   const openDetail = useCallback((id: string) => {
     window.location.hash = `/tasks/${encodeURIComponent(id)}`;
     setDetailId(id);
@@ -121,13 +211,32 @@ export function TasksView({
     setDetailId(null);
   }, []);
 
-  async function moveTo(column: string) {
-    const id = dragId;
+  /**
+   * Lands a dropped card in `column`. `dropped` is the id the drag carried on
+   * its dataTransfer, which is authoritative; `dragId` is the fallback for a
+   * drop that arrives without one.
+   *
+   * Every exit from here now says something (issue #334). A drop that goes
+   * nowhere and reports nothing is indistinguishable from a frozen app, and
+   * that is what made one failed gesture read as "there is no way to do this".
+   * The one deliberate silence is a card landing back in its own column: that
+   * is a no-op, not a refusal.
+   */
+  async function moveTo(column: string, dropped: string | null) {
+    const id = dropped || dragId;
     setDragId(null);
     setOverCol(null);
-    if (!id) return;
+    if (!id) {
+      toast.error("That drop did not carry a card, so nothing moved.");
+      return;
+    }
     const current = tasks.find((t) => t.id === id);
-    if (!current || current.column === column) return;
+    if (!current) {
+      toast.error("That card is no longer on the board. Reloading it now.");
+      void refresh();
+      return;
+    }
+    if (current.column === column) return;
     // Optimistic move; reconcile with the server's echo (and revert on error).
     setTasks((ts) => ts.map((t) => (t.id === id ? { ...t, column } : t)));
     try {
@@ -140,7 +249,14 @@ export function TasksView({
       }
     } catch (e) {
       setTasks((ts) => ts.map((t) => (t.id === id ? { ...t, column: current.column } : t)));
-      toast.error(e instanceof Error ? e.message : "could not move the card");
+      // The card has already snapped back by the time this is read, so the
+      // message carries the whole story: which card, where it was going, and
+      // the host's own words for why it would not go. The board validates
+      // nothing itself — `BOARD_COLUMNS` is the host's list — so the reason for
+      // a refusal only ever exists in the response.
+      toast.error(`Could not move "${current.title}" to ${columnLabel(column)}.`, {
+        description: e instanceof Error ? e.message : "the host refused the move",
+      });
     }
   }
 
@@ -215,7 +331,34 @@ export function TasksView({
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 gap-4 overflow-x-auto py-4 pl-4">
+      <div
+        ref={boardRef}
+        onDragOver={(e) => {
+          // The columns preventDefault as well; this handler also covers the
+          // pixels between and around them, so the board keeps scrolling while
+          // a drag crosses a gap on its way to a far column.
+          e.preventDefault();
+          edgeScrollTo(e.clientX);
+        }}
+        onDragLeave={(e) => {
+          // Only when the pointer has genuinely left the board, not while it
+          // moves between two of the board's own children.
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) stopEdgeScroll();
+        }}
+        onDrop={(e) => {
+          // Columns claim their own drops and stop them here, so anything that
+          // reaches this handler landed on dead board pixels: the gap between
+          // two columns, the leading padding, the trailing gutter. Those used
+          // to swallow the whole gesture without a word (issue #334).
+          e.preventDefault();
+          stopEdgeScroll();
+          const id = e.dataTransfer?.getData(CARD_MIME) || dragId;
+          setDragId(null);
+          setOverCol(null);
+          if (id) toast.error("Drop the card on a column to move it.");
+        }}
+        className="flex min-h-0 flex-1 gap-4 overflow-x-auto py-4 pl-4"
+      >
         {TASK_COLUMNS.map((col) => {
           const items = tasks.filter((t) => t.column === col.id);
           return (
@@ -223,10 +366,21 @@ export function TasksView({
               key={col.id}
               onDragOver={(e) => {
                 e.preventDefault();
+                // Runs before the board's own dragover (this is the inner
+                // handler), and the board leaves it alone — so the cursor says
+                // "move" over a column and nothing over the dead pixels.
+                if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
                 setOverCol(col.id);
               }}
               onDragLeave={() => setOverCol((c) => (c === col.id ? null : c))}
-              onDrop={() => void moveTo(col.id)}
+              onDrop={(e) => {
+                e.preventDefault();
+                // Claim the drop, so anything still reaching the board's own
+                // handler is known to have missed every column.
+                e.stopPropagation();
+                stopEdgeScroll();
+                void moveTo(col.id, e.dataTransfer?.getData(CARD_MIME) ?? null);
+              }}
               className={cn(
                 "flex min-h-0 w-72 shrink-0 flex-col rounded-xl border bg-card/40 transition-colors",
                 overCol === col.id && "border-primary/40 bg-accent/40",
@@ -250,13 +404,23 @@ export function TasksView({
                       dragging={dragId === t.id}
                       onOpen={() => openCard(t)}
                       onResume={() => void resume(t)}
-                      onDragStart={() => {
+                      onDragStart={(e) => {
                         dragged.current = true;
                         setDragId(t.id);
+                        if (e.dataTransfer) {
+                          e.dataTransfer.effectAllowed = "move";
+                          // The id is what the drop reads back. The
+                          // `text/plain` copy is what makes the drag
+                          // well-formed for the browsers that abort one
+                          // carrying no data at all.
+                          e.dataTransfer.setData(CARD_MIME, t.id);
+                          e.dataTransfer.setData("text/plain", t.title);
+                        }
                       }}
                       onDragEnd={() => {
                         setDragId(null);
                         setOverCol(null);
+                        stopEdgeScroll();
                         // Clear the drag-suppression shortly after, so a genuine
                         // click that follows is honored.
                         setTimeout(() => (dragged.current = false), 0);
@@ -304,7 +468,8 @@ function TaskItem({
   dragging: boolean;
   onOpen: () => void;
   onResume: () => void;
-  onDragStart: () => void;
+  /** Takes the event so the card can stamp its id onto the drag (issue #334). */
+  onDragStart: (e: DragEvent<HTMLDivElement>) => void;
   onDragEnd: () => void;
 }) {
   return (

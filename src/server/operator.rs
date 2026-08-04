@@ -651,7 +651,7 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             }
             o
         }
-        CompanyEvent::TaskDispatched { task_id } => {
+        CompanyEvent::TaskDispatched { task_id, .. } => {
             let mut o = envelope("task_dispatched");
             o["taskId"] = json!(task_id);
             o
@@ -1382,6 +1382,7 @@ mod test {
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await
@@ -1503,6 +1504,7 @@ mod test {
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         };
         FsCompanyStore::new(home.to_path_buf())
@@ -1613,6 +1615,7 @@ mod test {
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await
@@ -2774,6 +2777,7 @@ mod test {
     fn projects_task_dispatched() {
         let v = super::project_event(&stored(CompanyEvent::TaskDispatched {
             task_id: "t-42".into(),
+            run_id: None,
         }))
         .expect("task_dispatched is an attention signal");
         assert_eq!(v["type"], "task_dispatched");

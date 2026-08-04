@@ -84,6 +84,7 @@ async fn state_from(
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         })
         .await
@@ -648,6 +649,7 @@ async fn a_https_deployment_marks_the_cookie_secure() {
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         })
         .await

@@ -11,11 +11,34 @@
 //! configured there is no machine credential at all, and a session is the only
 //! way in.
 //!
-//! The verification seam is [`PlatformVerifier`]. The default build ships an
-//! offline [`StaticPlatformVerifier`] (a shared platform secret plus unsigned,
-//! structured tenant tokens) so the scope-gate and cross-tenant logic are fully
-//! covered by `cargo test`. Real signed-JWT verification is added under the
-//! `platform-jwt` feature; the gate logic here is verifier-agnostic.
+//! The verification seam is [`PlatformVerifier`]. A shipped build authenticates
+//! a bearer exactly two ways, and [`configure`] selects between them from the
+//! environment:
+//!
+//! - [`StaticPlatformVerifier`] — an exact match against a shared platform
+//!   secret. Authenticated by *knowledge of the secret*, the same pattern the
+//!   control plane uses for its own admin token.
+//! - [`JwtPlatformVerifier`] — HS256-signed, tenant-scoped claims. This is how a
+//!   tenant token is issued in production.
+//!
+//! A host may set either or both; with both, a bearer is accepted if either
+//! accepts it. Neither set means there is no machine credential at all.
+//!
+//! No shipped build parses caller-supplied claims that carry no authentication.
+//! The offline `oc_tenant.<base64url(json)>` codec survives only as
+//! `UnsignedTenantVerifier`, a `cfg(test)` type, so the scope-gate,
+//! allow-list and ownership suites keep running without signing machinery. It is
+//! a separate type rather than a branch inside `StaticPlatformVerifier::verify`
+//! on purpose: a `cfg(test)` branch there would make the production rejection
+//! unobservable, because the test build would still accept the unsigned shape.
+//!
+//! Known limits, stated rather than fixed here:
+//!
+//! - The signing is **symmetric** — a workload that can verify can also mint.
+//!   Acceptable while the trust boundary is a single workload; asymmetric keys
+//!   via the control plane's issuer are the follow-up.
+//! - A signed token carrying **no `exp` never expires**, because the verifier
+//!   clears its required-claims set. Changing that is a separate policy call.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -75,10 +98,14 @@ pub trait PlatformVerifier: Send + Sync {
     fn verify(&self, bearer: &str) -> crate::Result<PlatformClaims>;
 }
 
-/// An offline/dev verifier. A bearer equal to `platform_secret` is a
-/// platform-scope token; a `oc_tenant.<base64url(json)>` bearer carries
-/// structured (UNSIGNED) tenant claims. Clearly insecure — for local use and
-/// tests. Real signed verification is `platform-jwt`.
+/// The shared-secret verifier: a bearer *equal to* `platform_secret` is a
+/// full platform-scope token, and nothing else is accepted.
+///
+/// Exact match is the whole mechanism, and it is a real one — the credential is
+/// authenticated by knowledge of the secret, so a caller who does not hold it
+/// cannot produce an accepted bearer. Tenant-scoped machine tokens are signed
+/// JWTs ([`JwtPlatformVerifier`]); this verifier issues only the one
+/// `tenant:platform` identity.
 #[derive(Clone)]
 pub struct StaticPlatformVerifier {
     /// The shared secret that grants a full platform-scope token.
@@ -86,20 +113,11 @@ pub struct StaticPlatformVerifier {
 }
 
 impl StaticPlatformVerifier {
-    /// The prefix marking an unsigned structured tenant token.
-    pub const TENANT_PREFIX: &'static str = "oc_tenant.";
-
     /// Builds a verifier around a shared platform secret.
     pub fn new(platform_secret: impl Into<String>) -> Self {
         Self {
             platform_secret: platform_secret.into(),
         }
-    }
-
-    /// Encodes structured claims into a dev tenant token (test helper).
-    pub fn tenant_token(claims: &PlatformClaims) -> String {
-        let json = serde_json::to_vec(claims).expect("claims serialize");
-        format!("{}{}", Self::TENANT_PREFIX, b64url_encode(&json))
     }
 }
 
@@ -112,23 +130,19 @@ impl PlatformVerifier for StaticPlatformVerifier {
                 companies: None,
             });
         }
-        if let Some(encoded) = bearer.strip_prefix(Self::TENANT_PREFIX) {
-            let bytes = b64url_decode(encoded).ok_or_else(|| {
-                OpenCompanyError::InvalidRequest("malformed platform token".to_string())
-            })?;
-            let claims: PlatformClaims = serde_json::from_slice(&bytes)?;
-            return Ok(claims);
-        }
         Err(OpenCompanyError::InvalidRequest(
             "unrecognized token".to_string(),
         ))
     }
 }
 
-/// A real signed-JWT verifier (HS256), gated behind `platform-jwt`. The claim
+/// The signed-JWT verifier (HS256) for tenant-scoped machine tokens. The claim
 /// shape mirrors [`PlatformClaims`] (`tenant`, `scopes`, `companies`); `exp` is
-/// honored when present. The offline [`StaticPlatformVerifier`] covers the
-/// scope-gate logic without this feature.
+/// honored when present.
+///
+/// Gated on `platform-jwt`, which is in the default feature set — a build
+/// without it can verify nothing but the shared secret, and [`configure`]
+/// refuses to boot rather than silently ignoring a signing secret it cannot use.
 #[cfg(feature = "platform-jwt")]
 pub struct JwtPlatformVerifier {
     secret: String,
@@ -184,6 +198,149 @@ impl std::fmt::Debug for PlatformAuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlatformAuthConfig").finish_non_exhaustive()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Boot-time selection
+// ---------------------------------------------------------------------------
+
+/// Environment variable holding the shared platform secret. Unset means the
+/// shared-secret credential does not exist; there is no shipped default.
+pub const PLATFORM_TOKEN_ENV: &str = "OPENCOMPANY_PLATFORM_TOKEN";
+
+/// Environment variable holding the HS256 secret that signs tenant tokens.
+/// Unset means signed tenant tokens are not accepted; there is no shipped
+/// default and no fallback — an absent value is an absent capability, never a
+/// weaker one.
+pub const PLATFORM_JWT_SECRET_ENV: &str = "OPENCOMPANY_PLATFORM_JWT_SECRET";
+
+/// Which credential shapes a running host accepts. Printed at boot so an
+/// operator can read the active mode off the logs; carries no secret material
+/// and is not derived from any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformAuthMode {
+    /// Only the exact-match shared platform secret.
+    SharedSecret,
+    /// Only signed tenant tokens.
+    Jwt,
+    /// Both; a bearer accepted by either is accepted.
+    Both,
+}
+
+impl PlatformAuthMode {
+    /// The mode's log name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedSecret => "shared-secret",
+            Self::Jwt => "jwt",
+            Self::Both => "both",
+        }
+    }
+}
+
+impl std::fmt::Display for PlatformAuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Accepts a bearer that any constituent verifier accepts, in order.
+///
+/// Only used when a host configures more than one credential shape. The last
+/// error is surfaced when every verifier refuses — callers turn any error into
+/// a flat `401`, so which one it is never reaches the wire.
+struct AnyPlatformVerifier {
+    verifiers: Vec<Arc<dyn PlatformVerifier>>,
+}
+
+impl PlatformVerifier for AnyPlatformVerifier {
+    fn verify(&self, bearer: &str) -> crate::Result<PlatformClaims> {
+        let mut last = None;
+        for verifier in &self.verifiers {
+            match verifier.verify(bearer) {
+                Ok(claims) => return Ok(claims),
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| OpenCompanyError::InvalidRequest("unrecognized token".to_string())))
+    }
+}
+
+/// Whether this build can verify a signed tenant token at all.
+const JWT_AVAILABLE: bool = cfg!(feature = "platform-jwt");
+
+/// The boot refusal for a signing secret this build cannot use. Names the
+/// variable and the missing feature; never the value.
+fn jwt_unavailable() -> OpenCompanyError {
+    OpenCompanyError::Config(format!(
+        "{PLATFORM_JWT_SECRET_ENV} is set but this build has no `platform-jwt` feature, \
+         so a signed tenant token cannot be verified. Rebuild with \
+         `--features platform-jwt` (it is in the default set) or unset the variable."
+    ))
+}
+
+#[cfg(feature = "platform-jwt")]
+fn jwt_verifier(secret: String) -> crate::Result<Arc<dyn PlatformVerifier>> {
+    Ok(Arc::new(JwtPlatformVerifier::new(secret)))
+}
+
+#[cfg(not(feature = "platform-jwt"))]
+fn jwt_verifier(_secret: String) -> crate::Result<Arc<dyn PlatformVerifier>> {
+    Err(jwt_unavailable())
+}
+
+/// Builds the platform auth config from the two credential secrets, or `None`
+/// when neither is set (no machine credential — humans and `serve --company`
+/// are the whole story).
+///
+/// Every configuration state either authenticates or refuses; none of them
+/// fails open. No credential is `None` and every machine route 401s; a signing
+/// secret on a build that cannot verify signatures aborts boot with
+/// `jwt_unavailable` rather than degrading to the shared secret. A blank or
+/// whitespace-only value is treated as unset, so an empty injected variable
+/// cannot become an empty accepted bearer.
+pub fn configure(
+    platform_secret: Option<String>,
+    jwt_secret: Option<String>,
+) -> crate::Result<Option<(PlatformAuthConfig, PlatformAuthMode)>> {
+    configure_with(platform_secret, jwt_secret, JWT_AVAILABLE)
+}
+
+/// [`configure`] with the build's JWT support passed in, so the refusal path is
+/// reachable from a test on a build that *does* have the feature.
+fn configure_with(
+    platform_secret: Option<String>,
+    jwt_secret: Option<String>,
+    jwt_available: bool,
+) -> crate::Result<Option<(PlatformAuthConfig, PlatformAuthMode)>> {
+    let platform_secret = platform_secret.filter(|value| !value.trim().is_empty());
+    let jwt_secret = jwt_secret.filter(|value| !value.trim().is_empty());
+
+    let mode = match (platform_secret.is_some(), jwt_secret.is_some()) {
+        (false, false) => return Ok(None),
+        (true, false) => PlatformAuthMode::SharedSecret,
+        (false, true) => PlatformAuthMode::Jwt,
+        (true, true) => PlatformAuthMode::Both,
+    };
+
+    let mut verifiers: Vec<Arc<dyn PlatformVerifier>> = Vec::new();
+    if let Some(secret) = platform_secret {
+        verifiers.push(Arc::new(StaticPlatformVerifier::new(secret)));
+    }
+    if let Some(secret) = jwt_secret {
+        if !jwt_available {
+            return Err(jwt_unavailable());
+        }
+        verifiers.push(jwt_verifier(secret)?);
+    }
+
+    let verifier: Arc<dyn PlatformVerifier> = if verifiers.len() == 1 {
+        verifiers.pop().expect("one verifier")
+    } else {
+        Arc::new(AnyPlatformVerifier { verifiers })
+    };
+    Ok(Some((PlatformAuthConfig::new(verifier), mode)))
 }
 
 /// Extracts the bearer token from the `Authorization` header.
@@ -384,6 +541,11 @@ pub(crate) fn b64url_encode(input: &[u8]) -> String {
 }
 
 /// Decodes unpadded base64url, returning `None` on any invalid input.
+///
+/// `cfg(test)` — the only decoder in this module belonged to the unsigned token
+/// arm, which no longer exists in a shipped build. It stays for
+/// `UnsignedTenantVerifier` and the round-trip test.
+#[cfg(test)]
 fn b64url_decode(input: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -416,6 +578,57 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A test-only verifier that additionally accepts an **unsigned**
+/// `oc_tenant.<base64url(json)>` bearer as literal claims.
+///
+/// This is how the scope-gate, allow-list and ownership suites mint a
+/// tenant-scoped principal without standing up signing machinery: those suites
+/// exercise what a *verified* tenant token may reach, which is orthogonal to how
+/// it was authenticated. It is `cfg(test)`, so no shipped build contains it, and
+/// it is a distinct type from [`StaticPlatformVerifier`] precisely so that the
+/// production refusal of this shape stays observable to
+/// `hand_constructed_tenant_bearer_is_refused`.
+#[cfg(test)]
+pub struct UnsignedTenantVerifier {
+    inner: StaticPlatformVerifier,
+}
+
+#[cfg(test)]
+impl UnsignedTenantVerifier {
+    /// The prefix marking an unsigned structured tenant token.
+    pub const TENANT_PREFIX: &'static str = "oc_tenant.";
+
+    /// Builds a verifier that also honors the shared platform secret, so a
+    /// suite can hold both principals at once.
+    pub fn new(platform_secret: impl Into<String>) -> Self {
+        Self {
+            inner: StaticPlatformVerifier::new(platform_secret),
+        }
+    }
+
+    /// Encodes claims into an unsigned tenant token.
+    pub fn tenant_token(claims: &PlatformClaims) -> String {
+        let json = serde_json::to_vec(claims).expect("claims serialize");
+        format!("{}{}", Self::TENANT_PREFIX, b64url_encode(&json))
+    }
+}
+
+#[cfg(test)]
+impl PlatformVerifier for UnsignedTenantVerifier {
+    fn verify(&self, bearer: &str) -> crate::Result<PlatformClaims> {
+        match bearer.strip_prefix(Self::TENANT_PREFIX) {
+            Some(encoded) => {
+                let bytes = b64url_decode(encoded).ok_or_else(|| {
+                    OpenCompanyError::InvalidRequest("malformed platform token".to_string())
+                })?;
+                Ok(serde_json::from_slice(&bytes)?)
+            }
+            // Delegate so the suites keep exercising the real secret arm.
+            None => self.inner.verify(bearer),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -444,14 +657,115 @@ mod test {
         assert_eq!(claims.tenant, "tenant:platform");
     }
 
+    /// The offline codec the gate suites mint tenant principals with. It lives
+    /// on the test-only type; the assertion below is about the codec, not about
+    /// anything a shipped build accepts.
     #[test]
-    fn tenant_token_carries_structured_claims_without_platform_scope() {
-        let verifier = StaticPlatformVerifier::new("top-secret");
+    fn unsigned_codec_round_trips_for_the_gate_suites() {
+        let verifier = UnsignedTenantVerifier::new("top-secret");
         let token =
-            StaticPlatformVerifier::tenant_token(&tenant_claims("tenant:acme", &["operator"]));
+            UnsignedTenantVerifier::tenant_token(&tenant_claims("tenant:acme", &["operator"]));
         let claims = verifier.verify(&token).unwrap();
         assert_eq!(claims.tenant, "tenant:acme");
         assert!(!claims.has_platform_scope());
+
+        // It still delegates the shared-secret arm, so a suite can hold both.
+        assert!(verifier.verify("top-secret").unwrap().has_platform_scope());
+    }
+
+    /// The shipped default build must not turn a caller-supplied payload into
+    /// platform claims. The bearer is assembled literally, from nothing but the
+    /// wire shape, so this stays a black-box statement about what an
+    /// unauthenticated request can obtain — no helper, no shared constant.
+    #[test]
+    fn hand_constructed_tenant_bearer_is_refused() {
+        let verifier = StaticPlatformVerifier::new("top-secret");
+        let forged = format!(
+            "oc_tenant.{}",
+            b64url_encode(br#"{"tenant":"tenant:victim","scopes":["platform","operator"]}"#)
+        );
+        assert!(
+            verifier.verify(&forged).is_err(),
+            "an unsigned, caller-supplied payload must not resolve to platform claims"
+        );
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    fn sign(secret: &str, claims: &serde_json::Value) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("sign")
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn jwt_verifier_refuses_an_expired_token() {
+        let secret = "signing-secret";
+        // 2001-09-09, comfortably in the past whenever this runs.
+        let token = sign(
+            secret,
+            &json!({"tenant": "tenant:acme", "scopes": ["operator"], "exp": 1_000_000_000u64}),
+        );
+        assert!(JwtPlatformVerifier::new(secret).verify(&token).is_err());
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn jwt_verifier_refuses_a_tampered_payload() {
+        let secret = "signing-secret";
+        let token = sign(
+            secret,
+            &json!({"tenant": "tenant:acme", "scopes": ["operator"]}),
+        );
+
+        // Rewrite the claims to grant the platform scope, keeping the original
+        // signature: it no longer covers the body it is attached to.
+        let parts: Vec<&str> = token.split('.').collect();
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(parts[1]).expect("payload")).expect("claims");
+        claims["scopes"] = json!(["platform", "operator"]);
+        let tampered = format!(
+            "{}.{}.{}",
+            parts[0],
+            b64url_encode(&serde_json::to_vec(&claims).expect("re-encode")),
+            parts[2]
+        );
+
+        assert!(JwtPlatformVerifier::new(secret).verify(&tampered).is_err());
+    }
+
+    /// `alg: "none"` is the oldest JWT forgery there is: drop the signature,
+    /// keep whatever payload you like, and hope the verifier honors the header's
+    /// choice of algorithm. `Validation::new(Algorithm::HS256)` pins the
+    /// algorithm so it does not, and clearing `required_spec_claims` does not
+    /// loosen that — but only a test says so out loud. The same claims, signed,
+    /// are accepted, which leaves the header as the only thing the rejection can
+    /// be about.
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn jwt_verifier_refuses_an_unsigned_token() {
+        let secret = "signing-secret";
+        let claims = json!({"tenant": "tenant:victim", "scopes": ["platform", "operator"]});
+
+        // Assembled literally, from nothing but the wire shape: header, payload,
+        // and the empty signature an `alg: none` token carries.
+        let unsigned = format!(
+            "{}.{}.",
+            b64url_encode(br#"{"alg":"none","typ":"JWT"}"#),
+            b64url_encode(&serde_json::to_vec(&claims).expect("claims"))
+        );
+
+        assert!(
+            JwtPlatformVerifier::new(secret).verify(&unsigned).is_err(),
+            "an unsigned `alg: none` token must not resolve to platform claims"
+        );
+
+        let signed = sign(secret, &claims);
+        assert!(JwtPlatformVerifier::new(secret).verify(&signed).is_ok());
     }
 
     #[test]
@@ -459,6 +773,117 @@ mod test {
         let verifier = StaticPlatformVerifier::new("top-secret");
         assert!(verifier.verify("nope").is_err());
         assert!(verifier.verify("oc_tenant.@@@not-base64@@@").is_err());
+    }
+
+    #[test]
+    fn no_credential_configures_no_platform_auth() {
+        assert!(configure(None, None).unwrap().is_none());
+        // A blank injected variable is unset, not an empty accepted bearer.
+        assert!(
+            configure(Some("  ".to_string()), Some(String::new()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_secret_alone_configures_shared_secret_mode() {
+        let (config, mode) = configure(Some("plat-secret".to_string()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode, PlatformAuthMode::SharedSecret);
+        assert!(
+            config
+                .verifier
+                .verify("plat-secret")
+                .unwrap()
+                .has_platform_scope()
+        );
+        assert!(config.verifier.verify("wrong").is_err());
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn signing_secret_alone_configures_jwt_mode() {
+        let (config, mode) = configure(None, Some("signing-secret".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode, PlatformAuthMode::Jwt);
+
+        let token = sign(
+            "signing-secret",
+            &json!({"tenant": "tenant:acme", "scopes": ["operator"]}),
+        );
+        assert_eq!(
+            config.verifier.verify(&token).unwrap().tenant,
+            "tenant:acme"
+        );
+        // The shared-secret arm is not wired, so nothing else gets in.
+        assert!(config.verifier.verify("signing-secret").is_err());
+    }
+
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn both_secrets_accept_either_credential() {
+        let (config, mode) = configure(
+            Some("plat-secret".to_string()),
+            Some("signing-secret".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mode, PlatformAuthMode::Both);
+
+        assert!(
+            config
+                .verifier
+                .verify("plat-secret")
+                .unwrap()
+                .has_platform_scope()
+        );
+        let token = sign(
+            "signing-secret",
+            &json!({"tenant": "tenant:acme", "scopes": ["operator"]}),
+        );
+        assert_eq!(
+            config.verifier.verify(&token).unwrap().tenant,
+            "tenant:acme"
+        );
+
+        // And a bearer neither arm authenticates is still refused.
+        assert!(config.verifier.verify("oc_tenant.e30").is_err());
+        assert!(config.verifier.verify("nope").is_err());
+    }
+
+    /// A build that cannot verify signatures must abort boot when a signing
+    /// secret is set, not fall back to the shared secret. `configure_with` takes
+    /// the availability flag so this stays observable on a build that *has* the
+    /// feature; a featureless build reaches the same error through
+    /// `jwt_verifier`.
+    #[test]
+    fn signing_secret_without_the_feature_refuses_to_boot() {
+        let err = configure_with(
+            Some("plat-secret".to_string()),
+            Some("signing-secret".to_string()),
+            false,
+        )
+        .expect_err("a signing secret this build cannot use must abort boot");
+
+        let message = err.to_string();
+        assert!(
+            message.contains(PLATFORM_JWT_SECRET_ENV) && message.contains("platform-jwt"),
+            "the refusal must name the variable and the missing feature: {message}"
+        );
+        assert!(
+            !message.contains("signing-secret"),
+            "the refusal must never carry secret material: {message}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_names_are_stable() {
+        assert_eq!(PlatformAuthMode::SharedSecret.to_string(), "shared-secret");
+        assert_eq!(PlatformAuthMode::Jwt.to_string(), "jwt");
+        assert_eq!(PlatformAuthMode::Both.to_string(), "both");
     }
 
     #[test]

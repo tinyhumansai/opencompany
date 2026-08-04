@@ -41,8 +41,17 @@ pub mod delegation_tools;
 /// are feature-independent, so a company that ran under the harness stays
 /// replayable by a build without it.
 pub mod grants;
+/// Issue #290: [`RuntimeHandover`] — the live, per-instance state a rebuilt
+/// company runtime must inherit rather than construct a second copy of (the
+/// journal, the approval gate, the grant set, the event log, the stores, the
+/// harness pool, the MCP runtime, and the two serialising mutexes). See
+/// [`handover`].
+pub mod handover;
 pub mod journal;
 pub mod mailbox_poller;
+/// Issue #290: replacing a registered company's runtime in place, so first-time
+/// BYOK setup takes effect without a process restart. See [`rebuild`].
+pub mod rebuild;
 pub mod registry;
 pub mod scheduler;
 /// Issue #203: the Telegram `getUpdates` long-polling listener — the inbound
@@ -60,6 +69,8 @@ pub use builder::{RuntimeBuilder, company_id_from_name};
 pub use channel::{OPERATOR_CHANNEL, OperatorChannel};
 pub use cron::{CivilTime, CronExpr};
 pub use cycle::CycleRunner;
+pub use handover::RuntimeHandover;
+pub use rebuild::{BootInputs, RebuildRequest, RuntimeRebuilder, rebuild_company};
 pub use registry::CompanyRegistry;
 pub use scheduler::{Clock, CompanyScheduler, FakeClock, SystemClock};
 pub use tools::StubToolProvider;

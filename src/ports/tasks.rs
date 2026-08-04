@@ -126,6 +126,31 @@ pub(crate) fn column_label(column: &str) -> &str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The per-task discussion (issue #335)
+// ---------------------------------------------------------------------------
+
+/// The longest discussion message the write boundary accepts, in **codepoints**
+/// (issue #335).
+///
+/// A discussion post is a note on a card, not a document: the cap keeps one
+/// paste from dominating a thread that is read back in full on every detail
+/// poll, and it bounds what a single journal line can grow to. Text past it is
+/// truncated rather than rejected, so a long paste still posts — the same
+/// forgiving shape a steer's `instruction` takes
+/// ([`MAX_REDIRECT_CHARS`](crate::company::steer::MAX_REDIRECT_CHARS)), and for
+/// the same reason: losing the tail of an over-long note is a smaller failure
+/// than losing the whole note to a `400`.
+pub const MAX_DISCUSSION_CHARS: usize = 4000;
+
+/// Truncates a discussion message to [`MAX_DISCUSSION_CHARS`] codepoints.
+///
+/// Counts characters, never bytes, so a message of multi-byte text is cut on a
+/// character boundary instead of panicking on a split codepoint.
+pub fn cap_discussion(text: &str) -> String {
+    text.chars().take(MAX_DISCUSSION_CHARS).collect()
+}
+
 /// Rewrites a stored column literal that no longer names a board column.
 ///
 /// Today that is exactly one mapping: [`LEGACY_COLUMN_BACKLOG`] →
@@ -298,6 +323,22 @@ mod test {
             );
         }
         assert_eq!(column_label("something_new"), "something_new");
+    }
+
+    /// Issue #335: a long paste is truncated on a character boundary, never on
+    /// a byte one — a message of multi-byte text must not panic the write path
+    /// or persist a split codepoint. Anything within the cap passes through
+    /// untouched.
+    #[test]
+    fn cap_discussion_is_codepoint_safe() {
+        let long: String = "é".repeat(MAX_DISCUSSION_CHARS + 50);
+        let capped = cap_discussion(&long);
+        assert_eq!(capped.chars().count(), MAX_DISCUSSION_CHARS);
+        // A clean multiple of 2 (é is 2 bytes) — no half-written character.
+        assert_eq!(capped.len(), MAX_DISCUSSION_CHARS * 2);
+
+        assert_eq!(cap_discussion("looks good to me"), "looks good to me");
+        assert_eq!(cap_discussion(""), "");
     }
 
     /// Issue #301's whole migration, at the seam every persistence backend

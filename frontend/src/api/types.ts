@@ -257,7 +257,10 @@ export interface TeamMemberDto {
    */
   inboxEnabled?: boolean;
   /**
-   * This teammate's daily spend cap in USD (manifest `budget_usd_daily`).
+   * This teammate's daily spend cap in USD, as the host will actually enforce
+   * it: an operator override set from this console when one exists, otherwise
+   * the manifest's `budget_usd_daily`.
+   *
    * Absent when the teammate is uncapped — absence IS the uncapped signal, so
    * never default it to `0`, which would render a permanently exhausted
    * teammate.
@@ -269,6 +272,30 @@ export interface TeamMemberDto {
    * the field.
    */
   spentTodayUsd?: number;
+  /**
+   * The user id of the admin who last set this teammate's cap from the console.
+   * Absent when no override is stored — i.e. when the cap (if any) is just the
+   * company's manifest default.
+   *
+   * Deliberately NOT paired with `budgetUsdDaily`: it is present even for an
+   * override that *removed* a cap, which is the only way to tell "nobody has
+   * touched this" from "an admin deliberately uncapped this".
+   */
+  budgetSetBy?: string;
+  /** When that cap was set (epoch millis). Paired with `budgetSetBy`. */
+  budgetSetAtMillis?: number;
+}
+
+/**
+ * The body of `PUT .../team/{id}/budget`.
+ *
+ * `budgetUsdDaily` must always be present — `null` to remove the cap, a number
+ * to set one (including `0`, which caps at nothing). The host rejects a body
+ * that omits the key with a 422 rather than reading it as "remove the cap", so
+ * never build this object conditionally.
+ */
+export interface SetBudgetInput {
+  budgetUsdDaily: number | null;
 }
 
 /**

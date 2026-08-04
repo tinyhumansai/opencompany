@@ -42,8 +42,18 @@ use crate::runtime::delegation::{self, DelegationRunner, RunTurn};
 /// forever.
 const MAX_REDIRECTS_PER_DISPATCH: u32 = 3;
 
+/// The `error` a dispatched attempt settles with when the company has no task
+/// board wired at all — the card cannot even be read, so nothing was tried.
+const NO_TASK_STORE: &str = "this company has no task board wired, so the card could not be run";
+
+/// The `error` a dispatched attempt settles with when its card is gone by the
+/// time the cycle reaches it (deleted, or never persisted).
+const CARD_VANISHED: &str = "the card was gone by the time its dispatch ran";
+
+use crate::harness::run_trace::RunTraceSink;
 use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord};
 use crate::ports::brain::{Brain, CycleHost};
+use crate::ports::runs::{RunOutcome, RunStatus};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
     TokenUsage, TurnStep, TurnStepKind, TurnStepStatus, Verdict,
@@ -56,6 +66,18 @@ pub struct HarnessBrain {
     deps: HarnessDeps,
     record: CompanyRecord,
     responder: String,
+    /// The attempt records a dispatched card writes into (issue #242).
+    ///
+    /// Held here rather than on [`HarnessDeps`] on purpose: every one of the
+    /// ~28 `HarnessDeps` literals in this crate would otherwise have to be
+    /// widened for a handle only the dispatch path reads — the same argument
+    /// that put the grant set on `ApprovalRequestQueue` instead.
+    ///
+    /// `None` **fails silent, not closed**: the card still runs, its outcome
+    /// still lands on the board and in the journal, and only the run record is
+    /// missing. That is the right direction for a purely observational store —
+    /// and it is why every test construction can leave it unset.
+    runs: Option<Arc<dyn crate::ports::RunStore>>,
 }
 
 impl HarnessBrain {
@@ -70,12 +92,19 @@ impl HarnessBrain {
             deps,
             record,
             responder,
+            runs: None,
         }
     }
 
     /// Overrides which roster agent answers operator messages.
     pub fn with_responder(mut self, agent_id: impl Into<String>) -> Self {
         self.responder = agent_id.into();
+        self
+    }
+
+    /// Wires the run store a dispatched card records its attempt into (#242).
+    pub fn with_runs(mut self, runs: Arc<dyn crate::ports::RunStore>) -> Self {
+        self.runs = Some(runs);
         self
     }
 
@@ -152,7 +181,7 @@ impl HarnessBrain {
         // bubble returned below, and its transient frames would otherwise
         // misattribute onto whichever chat thread the console is watching.
         let outcome = run_turn
-            .run_steered_background(&self.record.id, &grant.agent, &instruction, &control)
+            .run_steered_background(&self.record.id, &grant.agent, &instruction, &control, None)
             .await;
         drop(guard);
 
@@ -214,8 +243,19 @@ impl HarnessBrain {
         }))
     }
 
-    async fn run_task(&self, task_id: &str) -> Result<Option<OutboundMessage>> {
+    async fn run_task(
+        &self,
+        task_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<Option<OutboundMessage>> {
+        // Issue #242: the attempt this dispatch is recorded under. `None`
+        // whenever the run store is unwired or the choke point could not mint a
+        // row — the card runs either way, untracked.
+        let sink = self.open_trace(run_id);
+
         let Some(tasks) = self.deps.tasks.as_ref() else {
+            self.settle_run(sink.as_deref(), RunStatus::Failed, Some(NO_TASK_STORE))
+                .await;
             return Ok(None);
         };
         let Some(mut card) = tasks
@@ -224,6 +264,8 @@ impl HarnessBrain {
             .into_iter()
             .find(|t| t.id == task_id)
         else {
+            self.settle_run(sink.as_deref(), RunStatus::Failed, Some(CARD_VANISHED))
+                .await;
             return Ok(None);
         };
 
@@ -244,7 +286,9 @@ impl HarnessBrain {
                 assignee = %card.assignee,
                 "[task] refusing dispatch: {reason}"
             );
-            return self.refuse_dispatch(tasks, card, &reason).await;
+            return self
+                .refuse_dispatch(tasks, card, &reason, sink.as_deref())
+                .await;
         }
         // A blank assignee is the one legitimate miss: nobody was named, so the
         // orchestrator picks it up.
@@ -305,12 +349,20 @@ impl HarnessBrain {
         // Route the background turn through the brain-agnostic `RunTurn` seam
         // (issue #176), re-attaching `HarnessDeps` behind `HarnessRunTurn`.
         let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+        // Issue #242: where this attempt's own approval requests begin. The
+        // queue is shared with any chat turn earlier in the same cycle and is
+        // append-only until the cycle-end drain, so a position taken here stays
+        // the boundary between "somebody else parked that" and "this run did".
+        let approvals_before = self.deps.approval_requests.queued();
 
-        // The loop yields the run's operator-facing result on whichever path
-        // ends it, so the artifact (#187) and the completion event (#185) both
-        // record exactly the text the note does rather than a second, divergent
-        // rendering of the same run.
-        let result_text = loop {
+        // The loop yields how the run ended plus its operator-facing result on
+        // whichever path ends it, so the artifact (#187), the completion event
+        // (#185) and the attempt row (#242) all record exactly what the note
+        // does rather than three divergent renderings of one run. The ending
+        // rides along because the run's status cannot be re-derived from the
+        // card's landing column — `Failed` and `Cancelled` share one column and
+        // are not the same outcome (see [`lifecycle::run_status_for`]).
+        let (run_end, result_text) = loop {
             // Start each turn from an empty queue so nothing a prior turn (this
             // cycle's operator message, or an earlier redirect rerun) left
             // behind can hijack this card — the same guard
@@ -320,7 +372,17 @@ impl HarnessBrain {
                 // A dispatched task card carries no chat bubble (its steps are
                 // discarded into the note), so its live turn frames must not leak
                 // onto the console timeline — run it un-streamed (#125 review).
-                .run_steered_background(&self.record.id, &responder, &instruction, &control)
+                .run_steered_background(
+                    &self.record.id,
+                    &responder,
+                    &instruction,
+                    &control,
+                    // Issue #242: un-streamed does not mean unrecorded. The
+                    // trace this turn produces is written to the attempt row as
+                    // it happens, which is what a redirect re-run appends to
+                    // rather than restarting.
+                    sink.clone(),
+                )
                 .await;
             // One-shot read of what (if anything) the operator asked for. `None`
             // is the ordinary, unsteered path.
@@ -360,6 +422,10 @@ impl HarnessBrain {
                             let handoff = match self
                                 .delegation_runner(&run_turn)
                                 .for_task(&card.id)
+                                // The delegate's turn is part of THIS attempt —
+                                // its steps and its spend belong to the card's
+                                // run, not to nothing (#242).
+                                .for_run(sink.clone())
                                 .handle_task_delegations(&mut card, &responder)
                                 .await
                             {
@@ -367,7 +433,7 @@ impl HarnessBrain {
                                 Err(err) => {
                                     let result = format!("hand-off failed: {err}");
                                     settle(&mut card, TaskRunEnd::Failed, &responder, &result);
-                                    break result;
+                                    break (TaskRunEnd::Failed, result);
                                 }
                             };
                             // `settle` writes the note (attributed to whoever
@@ -375,7 +441,7 @@ impl HarnessBrain {
                             // via the #186 lifecycle seam; the loop still yields
                             // the reply so the #185/#190 completion events
                             // report the same text that landed in the note.
-                            let result = match handoff {
+                            let (end, result) = match handoff {
                                 // The delegate answered: they own the card, and
                                 // every downstream write credits them.
                                 Some(handoff) => {
@@ -388,7 +454,7 @@ impl HarnessBrain {
                                                 &responder,
                                                 &reply,
                                             );
-                                            reply
+                                            (TaskRunEnd::Completed, reply)
                                         }
                                         // The hand-off ran and an operator
                                         // CANCELLED it in flight, so it produced
@@ -417,7 +483,7 @@ impl HarnessBrain {
                                                 &responder,
                                                 &reply,
                                             );
-                                            reply
+                                            (TaskRunEnd::Cancelled, reply)
                                         }
                                     }
                                 }
@@ -426,15 +492,15 @@ impl HarnessBrain {
                                 None => {
                                     let result = outcome.reply;
                                     settle(&mut card, TaskRunEnd::Completed, &responder, &result);
-                                    result
+                                    (TaskRunEnd::Completed, result)
                                 }
                             };
-                            break result;
+                            break (end, result);
                         }
                         Err(err) => {
                             let result = format!("dispatch failed: {err}");
                             settle(&mut card, TaskRunEnd::Failed, &responder, &result);
-                            break result;
+                            break (TaskRunEnd::Failed, result);
                         }
                     }
                 }
@@ -445,7 +511,7 @@ impl HarnessBrain {
                     // that). The loop still yields the text for #185/#190.
                     let result = "cancelled while in flight".to_string();
                     settle(&mut card, TaskRunEnd::Cancelled, &responder, &result);
-                    break result;
+                    break (TaskRunEnd::Cancelled, result);
                 }
                 Some(SteerAction::Pause) => {
                     // Partial work is PRESERVED in the note; the card parks in the
@@ -457,7 +523,7 @@ impl HarnessBrain {
                         Err(err) => format!("[paused] dispatch failed: {err}"),
                     };
                     settle(&mut card, TaskRunEnd::Paused, &responder, &partial);
-                    break partial;
+                    break (TaskRunEnd::Paused, partial);
                 }
                 Some(SteerAction::Redirect { instruction: fresh }) => {
                     redirects += 1;
@@ -475,7 +541,7 @@ impl HarnessBrain {
                             Err(err) => format!("dispatch failed: {err}"),
                         };
                         settle(&mut card, TaskRunEnd::RedirectsExhausted, &responder, &last);
-                        break last;
+                        break (TaskRunEnd::RedirectsExhausted, last);
                     }
                     // Re-run from the original brief plus the (codepoint-capped)
                     // operator instruction.
@@ -492,6 +558,29 @@ impl HarnessBrain {
         tasks.upsert(&self.record.id, &card).await?;
         // `guard` drops here → the run leaves the in-flight strip.
         drop(guard);
+
+        // Issue #242: settle the attempt row from how the run actually ended.
+        //
+        // Here, right after the card is persisted and before any of the
+        // best-effort journal writes below, so the run record and the board
+        // agree the moment either is readable. It also means the cycle's
+        // terminality backstop finds this row already settled and no-ops — the
+        // rich settle always wins the race, because `run_task` returns before
+        // `run_locked` reaches the backstop.
+        //
+        // First (#333's unblocking move): tag every approval this attempt's own
+        // turns parked with the run that produced it, and count them. A run that
+        // finished its work but left a person something to act on has not
+        // succeeded — it is in review.
+        let parked = match sink.as_ref() {
+            Some(sink) => self
+                .deps
+                .approval_requests
+                .stamp_run(approvals_before, sink.run_id()),
+            None => 0,
+        };
+        self.settle_run_end(sink.as_deref(), run_end, &result_text, parked)
+            .await;
 
         // Issue #187: record the run's output as a versioned artifact so the
         // Task Detail Artifacts tab has something behind it, and so a later
@@ -515,8 +604,13 @@ impl HarnessBrain {
         // Recorded before the #185 journal writes below because those move
         // `result_text` into the completion event; the artifact only borrows it.
         if card.column == lifecycle::success_terminal_column(&card) {
-            self.record_task_artifact(&card, &responder, &result_text)
-                .await?;
+            self.record_task_artifact(
+                &card,
+                &responder,
+                &result_text,
+                sink.as_ref().map(|s| s.run_id()),
+            )
+            .await?;
         }
 
         // Issue #185: correlate this dispatch's journal trail to its card.
@@ -600,12 +694,18 @@ impl HarnessBrain {
         tasks: &Arc<dyn crate::ports::TaskStore>,
         mut card: TaskRecord,
         reason: &str,
+        sink: Option<&RunTraceSink>,
     ) -> Result<Option<OutboundMessage>> {
         let orchestrator = self.orchestrator();
         let text = format!("dispatch refused: {reason}");
         settle(&mut card, TaskRunEnd::Failed, &orchestrator, &text);
         card.updated_at_millis = now_millis();
         tasks.upsert(&self.record.id, &card).await?;
+        // A refusal is a real, terminal attempt — one that spent nothing. It
+        // settles like any other ending (#242), so the card's run history shows
+        // "this was tried and refused, and why" rather than a gap.
+        self.settle_run_end(sink, TaskRunEnd::Failed, &text, 0)
+            .await;
 
         self.journal_task_outcome(&card, &orchestrator, text).await;
 
@@ -618,6 +718,91 @@ impl HarnessBrain {
             &orchestrator,
             origin,
         )))
+    }
+
+    /// Opens the trace sink for this dispatch's attempt row (issue #242), or
+    /// `None` when there is nothing to record into.
+    ///
+    /// Two independent reasons for `None`, and both are ordinary: the run store
+    /// is unwired (every test construction, and any embedder that never called
+    /// [`with_runs`](Self::with_runs)), or the dispatch choke point could not
+    /// mint a row and sent `run_id: None`. In both cases the card runs exactly
+    /// as it did before this issue.
+    fn open_trace(&self, run_id: Option<&str>) -> Option<Arc<RunTraceSink>> {
+        let run_id = run_id?;
+        let runs = self.runs.as_ref()?;
+        Some(Arc::new(RunTraceSink::new(
+            self.record.id.clone(),
+            run_id,
+            Arc::clone(runs),
+        )))
+    }
+
+    /// Settles the attempt row from how its run ended, folding in the trace's
+    /// step count and cost (issue #242).
+    ///
+    /// `parked_approvals` is how many approval requests **this attempt's own
+    /// turns** left for a person to act on. A run that otherwise succeeded while
+    /// parking at least one finishes [`RunStatus::WaitingApproval`] rather than
+    /// [`RunStatus::Succeeded`] — epic #183 decision 2: a person must act, so
+    /// the attempt is in review, not done. A run that failed, was cancelled or
+    /// was paused keeps its own status; the operator has a bigger problem than a
+    /// pending approval, and overwriting the reason it stopped would hide it.
+    ///
+    /// `WaitingApproval` is terminal-in-v1 (resuming an approved attempt is its
+    /// own issue) and deliberately **re-enterable across attempts**: the
+    /// re-dispatch after an approval is a new run that can wait again, which is
+    /// what keeps #243's single-use, argument-exact grants coherent instead of
+    /// forcing an operator to batch several approvals into one.
+    async fn settle_run_end(
+        &self,
+        sink: Option<&RunTraceSink>,
+        end: TaskRunEnd,
+        result: &str,
+        parked_approvals: usize,
+    ) {
+        let status = lifecycle::settled_run_status(end, parked_approvals);
+        // Only a failure carries a reason: `error` is "why this went wrong", not
+        // "what the agent said". Stamping a success's reply here would put the
+        // deliverable in a field every reader renders as a fault.
+        let error = matches!(status, RunStatus::Failed).then_some(result);
+        self.settle_run(sink, status, error).await;
+    }
+
+    /// Writes one settle through to the run store, best-effort.
+    ///
+    /// Never propagates: the card is already persisted and the operator can
+    /// already see the outcome by the time this runs, so a store fault must not
+    /// fail the cycle — the same journal-after-persist rule
+    /// [`journal_task_outcome`](Self::journal_task_outcome) follows. A run left
+    /// unsettled by a failure here is still caught by the cycle's terminality
+    /// backstop, and failing that by the boot reaper.
+    async fn settle_run(
+        &self,
+        sink: Option<&RunTraceSink>,
+        status: RunStatus,
+        error: Option<&str>,
+    ) {
+        let (Some(sink), Some(runs)) = (sink, self.runs.as_ref()) else {
+            return;
+        };
+        let outcome = RunOutcome {
+            status,
+            error: error.map(str::to_string),
+            usage: sink.usage(),
+            step_count: sink.step_count(),
+        };
+        if let Err(err) = runs
+            .finish_run(&self.record.id, sink.run_id(), outcome)
+            .await
+        {
+            tracing::warn!(
+                company = %self.record.id,
+                run = %sink.run_id(),
+                error = %err,
+                "[runs] could not settle an attempt row; the dispatch itself landed"
+            );
+        }
     }
 
     /// Journals a finished dispatch onto its card's timeline (issue #185): the
@@ -714,11 +899,15 @@ impl HarnessBrain {
     /// A missing artifact store is a silent no-op, exactly like a missing task
     /// store: the note is still written, so the board behaves as it did before
     /// this issue.
+    /// `run_id` is the attempt that produced `body`, stamped onto the revision
+    /// this call writes (issue #242) so a run row can point at what it actually
+    /// wrote. `None` for an untracked dispatch, which behaves exactly as before.
     async fn record_task_artifact(
         &self,
         card: &TaskRecord,
         responder: &str,
         body: &str,
+        run_id: Option<&str>,
     ) -> Result<()> {
         let Some(artifacts) = self.deps.artifacts.as_ref() else {
             return Ok(());
@@ -729,7 +918,7 @@ impl HarnessBrain {
             .into_iter()
             .max_by_key(|a| a.updated_at_millis);
         let at = now_millis();
-        let record = match existing {
+        let mut record = match existing {
             Some(mut found) => {
                 found.push_version(body, ArtifactAuthor::Agent, responder, at, None);
                 found
@@ -744,6 +933,12 @@ impl HarnessBrain {
                 at,
             ),
         };
+        // Only the revision this run wrote. An earlier attempt's version keeps
+        // the attempt that wrote *it*, which is the point of stamping per
+        // version instead of per record.
+        if let Some(run_id) = run_id {
+            record.stamp_run(run_id);
+        }
         artifacts.upsert(&self.record.id, &record).await?;
         Ok(())
     }
@@ -1069,8 +1264,8 @@ impl Brain for HarnessBrain {
                     });
                     channel_responses.extend(turn.bubbles);
                 }
-                CompanyEvent::TaskDispatched { task_id } => {
-                    if let Some(message) = self.run_task(task_id).await? {
+                CompanyEvent::TaskDispatched { task_id, run_id } => {
+                    if let Some(message) = self.run_task(task_id, run_id.as_deref()).await? {
                         channel_responses.push(message);
                     }
                 }
@@ -1249,6 +1444,7 @@ description = "Runs Acme."
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -1396,6 +1592,7 @@ description = "Builds it."
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -1550,7 +1747,7 @@ members = ["engineer"]
             .await
             .expect("seed");
 
-        let posted = brain.run_task("t-no-origin").await.expect("run");
+        let posted = brain.run_task("t-no-origin", None).await.expect("run");
         assert!(
             posted.is_none(),
             "a card with no originating thread must not post back"
@@ -1578,7 +1775,7 @@ members = ["engineer"]
             .expect("seed");
 
         let posted = brain
-            .run_task("t-origin")
+            .run_task("t-origin", None)
             .await
             .expect("run")
             .expect("a card with an origin must post back");
@@ -1634,6 +1831,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1678,7 +1876,7 @@ members = ["engineer"]
             .expect("roster");
 
         let posted = brain
-            .run_task("t-origin")
+            .run_task("t-origin", None)
             .await
             .expect("run")
             .expect("a card with an origin posts back");
@@ -1716,6 +1914,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t-origin".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1758,6 +1957,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t-cancel".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1815,6 +2015,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1851,6 +2052,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1859,6 +2061,169 @@ members = ["engineer"]
 
         let note = only_card(&tasks).await.note.expect("note");
         assert!(note.contains("[engineer]"), "{note:?}");
+    }
+
+    // ── Issue #242: the attempt row records what the dispatch actually did ──
+
+    /// Wires a run store onto a task-capable brain, mints the `Pending` row the
+    /// dispatch choke point would have minted, and returns both.
+    async fn brain_with_a_pending_run(
+        dir: &std::path::Path,
+        assignee: &str,
+    ) -> (HarnessBrain, Arc<FsOps>, Arc<dyn crate::ports::RunStore>) {
+        use crate::ports::runs::NewRun;
+
+        let (brain, tasks) = brain_with_tasks(dir);
+        let runs: Arc<dyn crate::ports::RunStore> = Arc::new(FsOps::new(dir));
+        let company = CompanyId::new("acme");
+        tasks
+            .upsert(&company, &card("t-1", assignee))
+            .await
+            .expect("seed");
+        runs.create_run(
+            &company,
+            NewRun {
+                id: "run-1".to_string(),
+                task_id: "t-1".to_string(),
+                agent_id: assignee.to_string(),
+            },
+        )
+        .await
+        .expect("mint");
+        (brain.with_runs(Arc::clone(&runs)), tasks, runs)
+    }
+
+    /// The settle. This fixture's pool holds no roster, so the turn errors —
+    /// which is exactly the `TaskRunEnd::Failed` path — and the row must end
+    /// **terminal**, carrying the reason the card's note carries, rather than
+    /// sitting `Pending` for the boot reaper to find.
+    #[tokio::test]
+    async fn a_dispatch_settles_its_attempt_row_from_how_the_run_ended() {
+        use crate::ports::runs::RunStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks, runs) = brain_with_a_pending_run(dir.path(), "engineer").await;
+        let company = CompanyId::new("acme");
+
+        brain.run_task("t-1", Some("run-1")).await.expect("run");
+
+        let settled = runs
+            .get_run(&company, "run-1")
+            .await
+            .expect("read")
+            .expect("the row survives");
+        assert_eq!(settled.status, RunStatus::Failed);
+        assert!(
+            settled.finished_at_millis.is_some(),
+            "a terminal settle stamps when the attempt ended"
+        );
+        let reason = settled.error.expect("a failure carries its reason");
+        assert!(reason.contains("dispatch failed"), "{reason}");
+        // …and the row agrees with the card, rather than telling a second story.
+        let note = only_card(&tasks).await.note.expect("note");
+        assert!(note.contains("dispatch failed"), "{note}");
+        // No turn ran on this offline fixture, so there is nothing to charge.
+        assert_eq!(settled.step_count, 0);
+        assert_eq!(settled.usage, TokenUsage::default());
+    }
+
+    /// A refusal is an attempt too. It spends nothing and runs no turn, but it
+    /// is a real, terminal outcome — the card's history must show "this was
+    /// tried and refused, and why" rather than a gap where an attempt was.
+    #[tokio::test]
+    async fn a_refused_dispatch_settles_its_attempt_rather_than_leaving_a_gap() {
+        use crate::ports::runs::RunStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks, runs) = brain_with_a_pending_run(dir.path(), "Shane").await;
+        let company = CompanyId::new("acme");
+
+        brain.run_task("t-1", Some("run-1")).await.expect("run");
+
+        let settled = runs
+            .get_run(&company, "run-1")
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(settled.status, RunStatus::Failed);
+        let reason = settled.error.expect("reason");
+        assert!(reason.contains("dispatch refused"), "{reason}");
+        assert!(
+            reason.contains("Shane"),
+            "the row must name what was wrong, like the note does: {reason}"
+        );
+    }
+
+    /// The degraded path stays degraded, not broken: a dispatch carrying no run
+    /// id runs the card exactly as before and invents no row for it.
+    #[tokio::test]
+    async fn an_untracked_dispatch_runs_the_card_and_records_no_attempt() {
+        use crate::ports::runs::RunFilter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, tasks) = brain_with_tasks(dir.path());
+        let runs: Arc<dyn crate::ports::RunStore> = Arc::new(FsOps::new(dir.path()));
+        let brain = brain.with_runs(Arc::clone(&runs));
+        let company = CompanyId::new("acme");
+        tasks
+            .upsert(&company, &card("t-1", "engineer"))
+            .await
+            .expect("seed");
+
+        brain.run_task("t-1", None).await.expect("run");
+
+        assert!(
+            only_card(&tasks).await.note.is_some(),
+            "the card still ran and still recorded its outcome"
+        );
+        assert!(
+            runs.list_runs(&company, &RunFilter::default())
+                .await
+                .expect("list")
+                .is_empty(),
+            "no row was minted for this dispatch, so none may be invented"
+        );
+    }
+
+    /// A card that vanished between the dispatch write and the cycle still
+    /// closes its attempt. Otherwise the row would sit `Pending` until a
+    /// restart reaped it with a misleading "the host restarted" reason.
+    #[tokio::test]
+    async fn a_dispatch_whose_card_is_gone_still_closes_its_attempt() {
+        use crate::ports::runs::{NewRun, RunStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, _tasks) = brain_with_tasks(dir.path());
+        let runs: Arc<dyn crate::ports::RunStore> = Arc::new(FsOps::new(dir.path()));
+        let brain = brain.with_runs(Arc::clone(&runs));
+        let company = CompanyId::new("acme");
+        runs.create_run(
+            &company,
+            NewRun {
+                id: "run-1".to_string(),
+                task_id: "t-gone".to_string(),
+                agent_id: "engineer".to_string(),
+            },
+        )
+        .await
+        .expect("mint");
+
+        assert!(
+            brain
+                .run_task("t-gone", Some("run-1"))
+                .await
+                .expect("run")
+                .is_none(),
+            "a missing card posts nothing back"
+        );
+
+        let settled = runs
+            .get_run(&company, "run-1")
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(settled.status, RunStatus::Failed);
+        assert_eq!(settled.error.as_deref(), Some(CARD_VANISHED));
     }
 
     // ── Issue #205: the working agent is linked, and a bad assignee is refused ──
@@ -1881,6 +2246,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1927,6 +2293,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1959,6 +2326,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -1998,6 +2366,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -2025,7 +2394,7 @@ members = ["engineer"]
             .expect("seed");
 
         let posted = brain
-            .run_task("t-origin")
+            .run_task("t-origin", None)
             .await
             .expect("run")
             .expect("a refused card with an origin must still post back");
@@ -2051,6 +2420,7 @@ members = ["engineer"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "nope".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -2110,6 +2480,7 @@ members = ["engineer"]
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -2255,6 +2626,7 @@ name = "Design"
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         };
         let (brain, _tasks) = brain_over(dir.path(), record);
@@ -2313,6 +2685,7 @@ members = ["eng1", "eng2"]
             }],
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         };
         let (brain, _tasks) = brain_over(dir.path(), record);
@@ -2367,6 +2740,7 @@ members = ["eng1", "eng2"]
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await
@@ -3176,6 +3550,7 @@ members = ["eng1", "eng2"]
                 first_time_counterparty: false,
                 payload: serde_json::json!({ "prompt": "a logo" }),
                 agent: None,
+                run_id: None,
             },
         });
 
@@ -3253,6 +3628,7 @@ members = ["eng1", "eng2"]
                     first_time_counterparty: false,
                     payload: serde_json::json!({ "tool": tool }),
                     agent: None,
+                    run_id: None,
                 },
             });
         }
@@ -3629,6 +4005,7 @@ members = ["eng1", "eng2"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -3662,6 +4039,7 @@ members = ["eng1", "eng2"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -3702,6 +4080,7 @@ members = ["eng1", "eng2"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: "t1".into(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )
@@ -4087,6 +4466,7 @@ members = ["eng1", "eng2"]
             .run_cycle(
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: id.to_string(),
+                    run_id: None,
                 }]),
                 &NoopHost,
             )

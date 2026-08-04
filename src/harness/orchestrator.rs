@@ -354,19 +354,49 @@ impl Tool for QueryCompanyTool {
 
         // Recent events: read the log and keep the tail. Mirrors the GraphQL
         // history resolver's read-then-tail pattern (`read_from(0, MAX)`).
-        let mut recent: Vec<String> = match &self.events {
+        //
+        // Discussion posts (#335) do not take a slot each. The tail is ten
+        // events wide and a card's discussion is an operator-driven,
+        // high-frequency writer into this same log, so a row per post would let
+        // one afternoon's thread evict every dispatch, reply and approval from
+        // the orchestrator's whole view of the company — replacing rows it can
+        // act on with ten it cannot ("agents do not participate" holds for the
+        // text, and must hold for the slot too). They fold into a single count
+        // line instead: the orchestrator learns that people are talking on the
+        // cards without losing what the company *did*.
+        let stored = match &self.events {
             Some(log) => log
                 .read_from(&self.company, EventSeq::new(0), usize::MAX)
                 .await
-                .unwrap_or_default()
-                .iter()
-                .rev()
-                .take(RECENT_EVENTS)
-                .map(|stored| format!("- #{} {}", stored.seq, summarize_event(&stored.event)))
-                .collect(),
+                .unwrap_or_default(),
             None => Vec::new(),
         };
+        let mut recent: Vec<String> = Vec::new();
+        let mut discussion_posts = 0usize;
+        for event in stored.iter().rev() {
+            if recent.len() == RECENT_EVENTS {
+                break;
+            }
+            if matches!(event.event, CompanyEvent::TaskDiscussionPosted { .. }) {
+                // Counted over the same span the tail covers, not over all of
+                // history: this line reads as "recent activity" like the rows
+                // beside it.
+                discussion_posts += 1;
+                continue;
+            }
+            recent.push(format!(
+                "- #{} {}",
+                event.seq,
+                summarize_event(&event.event)
+            ));
+        }
         recent.reverse(); // back to chronological order
+        if discussion_posts > 0 {
+            let plural = if discussion_posts == 1 { "" } else { "s" };
+            recent.push(format!(
+                "- {discussion_posts} discussion post{plural} on task cards (text not shown)"
+            ));
+        }
 
         let mut md = String::from("# Company insight\n");
         md.push_str("\n## Facts\n");
@@ -509,7 +539,7 @@ fn summarize_event(event: &CompanyEvent) -> String {
     match event {
         CompanyEvent::OperatorMessage { .. } => "operator message".to_string(),
         CompanyEvent::AgentReply { agent_id, .. } => format!("reply from {agent_id}"),
-        CompanyEvent::TaskDispatched { task_id } => format!("task dispatched: {task_id}"),
+        CompanyEvent::TaskDispatched { task_id, .. } => format!("task dispatched: {task_id}"),
         CompanyEvent::ScheduleFired { cron, .. } => format!("schedule fired: {cron}"),
         CompanyEvent::WebhookReceived { channel, .. } => format!("webhook on {channel}"),
         CompanyEvent::A2aTaskReceived { from, .. } => format!("A2A task from {from}"),
@@ -546,6 +576,16 @@ fn summarize_event(event: &CompanyEvent) -> String {
         CompanyEvent::DeskTaskCompleted {
             task_id, column, ..
         } => format!("task completed ({column}): {task_id}"),
+        // A human posted on a card (#335). The card is named; the message text
+        // is not — a discussion post is operator free text that no agent
+        // consumes in v1, and quoting it here would route it into a turn through
+        // the back door. The insight tail folds these into a single count line
+        // rather than calling this arm (they must not each hold one of ten
+        // slots); the arm stays because the match is exhaustive and because a
+        // future caller must inherit the no-quoting rule, not re-decide it.
+        CompanyEvent::TaskDiscussionPosted { task_id, .. } => {
+            format!("discussion post on task {task_id}")
+        }
         // A finished workflow run (#228). Counts only — never a delivery row's
         // `target` (a recipient's email address) or its `detail`, which can
         // quote one. This string is a non-sensitive one-liner for the insight
@@ -2076,6 +2116,110 @@ members = ["nobody"]
         assert_eq!(queue.queued(), 1);
     }
 
+    /// **Issue #348 review.** The recent-activity tail is ten slots wide, and a
+    /// discussion (#335) is an operator-driven writer into the same journal the
+    /// tail reads. A row per post would let one afternoon's thread on one card
+    /// push every dispatch, reply and approval out of the orchestrator's only
+    /// view of what the company has been doing — and replace them with rows it
+    /// cannot act on, since no agent participates in a discussion.
+    ///
+    /// So: posts never hold a slot, the run events survive a thread that
+    /// outnumbers them, and the fact that people are talking is still reported —
+    /// as one folded count, with no message text (the same no-quoting rule
+    /// `summarize_event`'s arm carries).
+    #[tokio::test]
+    async fn discussion_posts_fold_to_one_line_instead_of_evicting_the_activity_tail() {
+        use crate::ports::types::StoredEvent;
+        use futures::stream::{self, BoxStream};
+
+        /// A log that replays a fixed history.
+        struct FixedLog(Vec<StoredEvent>);
+
+        #[async_trait]
+        impl EventLog for FixedLog {
+            async fn append(
+                &self,
+                _id: &CompanyId,
+                _event: CompanyEvent,
+            ) -> crate::Result<EventSeq> {
+                unreachable!("the insight surface only reads")
+            }
+            async fn read_from(
+                &self,
+                _id: &CompanyId,
+                seq: EventSeq,
+                limit: usize,
+            ) -> crate::Result<Vec<StoredEvent>> {
+                Ok(self
+                    .0
+                    .iter()
+                    .filter(|e| e.seq.value() >= seq.value())
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            }
+            fn subscribe(&self, _id: &CompanyId) -> BoxStream<'static, StoredEvent> {
+                Box::pin(stream::empty())
+            }
+        }
+
+        let company = CompanyId::new("acme");
+        let mut history = vec![StoredEvent {
+            seq: EventSeq::new(0),
+            company: company.clone(),
+            event: CompanyEvent::TaskDispatched {
+                task_id: "t-1".to_string(),
+                run_id: None,
+            },
+            at_millis: 1,
+        }];
+        // Twenty posts — twice the tail — on the one card, as an afternoon of
+        // back-and-forth actually looks.
+        for n in 0..20u64 {
+            history.push(StoredEvent {
+                seq: EventSeq::new(n + 1),
+                company: company.clone(),
+                event: CompanyEvent::TaskDiscussionPosted {
+                    task_id: "t-1".to_string(),
+                    text: format!("ping the vendor again ({n})"),
+                    by: None,
+                },
+                at_millis: 2 + n,
+            });
+        }
+        history.push(StoredEvent {
+            seq: EventSeq::new(21),
+            company: company.clone(),
+            event: CompanyEvent::DeskTaskCompleted {
+                task_id: "t-1".to_string(),
+                desk: "eng".to_string(),
+                output: "shipped".to_string(),
+                column: "done".to_string(),
+            },
+            at_millis: 30,
+        });
+
+        let log: Arc<dyn EventLog> = Arc::new(FixedLog(history));
+        let tool = QueryCompanyTool::new(company, None, Some(log), None, None);
+        let out = tool
+            .execute(json!({}))
+            .await
+            .expect("execute")
+            .output_for_llm(true);
+
+        // Both run events survive the thread that buried them.
+        assert!(out.contains("task dispatched"), "dispatch evicted: {out}");
+        assert!(out.contains("task completed"), "completion evicted: {out}");
+        // One folded line, not twenty rows — and no message text anywhere.
+        assert!(out.contains("20 discussion posts"), "{out}");
+        assert!(!out.contains("ping the vendor"), "post text quoted: {out}");
+        assert_eq!(
+            out.matches("discussion post").count(),
+            1,
+            "a post must not hold a slot of its own: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn query_company_tool_reports_no_data_when_unwired() {
         let tool = QueryCompanyTool::new(CompanyId::new("acme"), None, None, None, None);
@@ -2218,6 +2362,7 @@ name = "Morning"
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }
@@ -2575,6 +2720,7 @@ name = "Morning"
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }

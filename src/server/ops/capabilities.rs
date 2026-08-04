@@ -340,6 +340,7 @@ mod tests {
                 overlay_desk_order: Vec::new(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await
@@ -529,6 +530,7 @@ mod tests {
                     cached_input_tokens: 0,
                     cost_usd: 0.0,
                     kind: SampleKind::Inference,
+                    run_id: None,
                 },
             )
             .await
@@ -585,6 +587,7 @@ mod tests {
                     cached_input_tokens: 0,
                     cost_usd: 0.0,
                     kind: SampleKind::Inference,
+                    run_id: None,
                 },
             )
             .await

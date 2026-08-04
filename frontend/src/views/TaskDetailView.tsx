@@ -6,11 +6,18 @@
 // honest stub pending its own backend. Export (#352) is a host-rendered
 // document the controls bar downloads — the console lays out none of it.
 
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactElement,
+} from "react";
 import {
   AlertCircle,
   ArrowLeft,
   Ban,
+  Brain,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -20,6 +27,7 @@ import {
   CornerUpRight,
   Download,
   Hourglass,
+  Layers,
   Loader2,
   MessageSquare,
   MessagesSquare,
@@ -28,7 +36,9 @@ import {
   Send,
   ShieldCheck,
   Square,
+  StickyNote,
   UserCog,
+  Wrench,
 } from "lucide-react";
 
 import {
@@ -36,14 +46,26 @@ import {
   getTaskDetail,
   listInflight,
   patchTask,
+  postTaskDiscussion,
   steerTask,
+  type DiscussionMessage,
   type InflightRun,
+  type StepStatus,
   type SteerAction,
   type Task,
   type TaskDetail,
   type TimelineEntry,
   type TimelineKind,
 } from "@/api/tasks";
+import {
+  getRun,
+  isRunOpen,
+  runElapsedMillis,
+  RUN_STATUS_LABEL,
+  type RunDetail,
+  type RunStatus,
+  type RunSummary,
+} from "@/api/runs";
 import { ApiError } from "@/api/types";
 import type { OpenCompanyClient } from "@/api/client";
 import {
@@ -63,7 +85,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
@@ -75,7 +105,10 @@ import { TaskEditDialog } from "./TaskEditDialog";
 const POLL_MS = 4000;
 
 function priorityStyle(priority: string): string {
-  return PRIORITY_STYLES[priority as keyof typeof PRIORITY_STYLES] ?? PRIORITY_STYLES.low;
+  return (
+    PRIORITY_STYLES[priority as keyof typeof PRIORITY_STYLES] ??
+    PRIORITY_STYLES.low
+  );
 }
 
 /** The column id → human label ("in_progress" → "In progress"), tolerating unknowns. */
@@ -129,7 +162,8 @@ function formatDuration(millis: number): string {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
+  if (h > 0)
+    return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
   if (m > 0) return `${m}m ${String(sec).padStart(2, "0")}s`;
   return `${sec}s`;
 }
@@ -221,7 +255,8 @@ export function TaskDetailView({
       }
     };
     const start = () => {
-      if (timer === undefined) timer = window.setInterval(() => void load(isActive), POLL_MS);
+      if (timer === undefined)
+        timer = window.setInterval(() => void load(isActive), POLL_MS);
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") {
@@ -266,8 +301,13 @@ export function TaskDetailView({
   );
 
   // Only tick the 1s clock while something is actually running: a dispatch
-  // window is open, or the task is parked on an operator right now.
-  const ticking = Boolean(worked?.live) || Boolean(waiting?.live);
+  // window is open, the task is parked on an operator right now, or an attempt
+  // has not settled (#242 — a parked attempt's clock is still running, which is
+  // why this asks the run's phase and not its finish time).
+  const ticking =
+    Boolean(worked?.live) ||
+    Boolean(waiting?.live) ||
+    Boolean(detail?.runs.some(isRunOpen));
   useEffect(() => {
     if (!ticking) return;
     const timer = window.setInterval(() => {
@@ -294,7 +334,12 @@ export function TaskDetailView({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex items-center gap-2 border-b px-4 py-3">
-        <Button variant="ghost" size="sm" className="-ml-2 h-8 px-2" onClick={onBack}>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="-ml-2 h-8 px-2"
+          onClick={onBack}
+        >
           <ArrowLeft className="mr-1.5 size-4" />
           Board
         </Button>
@@ -318,7 +363,11 @@ export function TaskDetailView({
       ) : detail ? (
         <ScrollArea className="min-h-0 flex-1">
           <div className="mx-auto w-full max-w-3xl space-y-5 p-4">
-            <DetailHeader task={detail.task} worked={worked} waiting={waiting} />
+            <DetailHeader
+              task={detail.task}
+              worked={worked}
+              waiting={waiting}
+            />
 
             <ControlBar
               task={detail.task}
@@ -340,6 +389,14 @@ export function TaskDetailView({
             <Tabs defaultValue="timeline">
               <TabsList>
                 <TabsTrigger value="timeline">Timeline</TabsTrigger>
+                <TabsTrigger value="attempts">
+                  Attempts
+                  {detail.runs.length > 0 && (
+                    <span className="ml-1.5 tabular-nums text-muted-foreground">
+                      {detail.runs.length}
+                    </span>
+                  )}
+                </TabsTrigger>
                 <TabsTrigger value="approvals">Approvals</TabsTrigger>
                 <TabsTrigger value="artifacts">Artifacts</TabsTrigger>
                 <TabsTrigger value="discussion">Discussion</TabsTrigger>
@@ -353,20 +410,38 @@ export function TaskDetailView({
                 />
               </TabsContent>
 
+              <TabsContent value="attempts" className="mt-4">
+                <AttemptsTab
+                  client={client}
+                  company={company}
+                  runs={detail.runs}
+                  now={now}
+                />
+              </TabsContent>
+
               <TabsContent value="approvals" className="mt-4">
                 <ApprovalsTab entries={detail.timeline} />
               </TabsContent>
 
               <TabsContent value="artifacts" className="mt-4">
-                <ArtifactsTab client={client} company={company} taskId={detail.task.id} />
+                <ArtifactsTab
+                  client={client}
+                  company={company}
+                  taskId={detail.task.id}
+                />
               </TabsContent>
 
               <TabsContent value="discussion" className="mt-4">
-                {/* No backend for per-task discussion yet — honest empty state,
-                    no fake threads. */}
-                <EmptyState
-                  title="No discussion yet"
-                  body="A per-task discussion thread has no backend yet."
+                <DiscussionTab
+                  // Keyed by card: a different task is a different thread, and
+                  // the tab accumulates the one it is shown.
+                  key={detail.task.id}
+                  messages={detail.discussion}
+                  hasMore={detail.discussionHasMore}
+                  taskId={detail.task.id}
+                  client={client}
+                  company={company}
+                  onPosted={load}
                 />
               </TabsContent>
             </Tabs>
@@ -451,7 +526,10 @@ function DetailHeader({
               </span>
               {worked!.live && (
                 <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
-                  <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+                  <span
+                    className="size-1.5 animate-pulse rounded-full bg-current"
+                    aria-hidden
+                  />
                   live
                 </span>
               )}
@@ -468,7 +546,10 @@ function DetailHeader({
             </span>
             {waiting!.live && (
               <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
-                <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+                <span
+                  className="size-1.5 animate-pulse rounded-full bg-current"
+                  aria-hidden
+                />
                 on you
               </span>
             )}
@@ -488,8 +569,8 @@ function DetailHeader({
           window. Said plainly rather than left for a reader to discover. */}
       {showWaiting && (
         <p className="mt-2 text-[11px] text-muted-foreground/70">
-          Waiting is correlated to this task&rsquo;s run window — approvals are not linked
-          per-task.
+          Waiting is correlated to this task&rsquo;s run window — approvals are
+          not linked per-task.
         </p>
       )}
     </div>
@@ -522,7 +603,10 @@ function ControlBar({
   const pending = inflight?.pendingAction ?? null;
   const steerDisabled = busy || pending !== null;
 
-  async function steer(action: SteerAction, opts?: { instruction?: string; confirm?: boolean }) {
+  async function steer(
+    action: SteerAction,
+    opts?: { instruction?: string; confirm?: boolean },
+  ) {
     if (!inflight) return;
     setBusy(true);
     try {
@@ -540,12 +624,16 @@ function ControlBar({
   async function patchColumn() {
     setBusy(true);
     try {
-      const saved = await patchTask(client, company, task.id, { column: "in_progress" });
+      const saved = await patchTask(client, company, task.id, {
+        column: "in_progress",
+      });
       onSaved(saved);
       await onChanged();
       toast.success("Dispatched — the assignee is working on it.");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not dispatch the task");
+      toast.error(
+        e instanceof Error ? e.message : "could not dispatch the task",
+      );
     } finally {
       setBusy(false);
     }
@@ -563,13 +651,17 @@ function ControlBar({
     }
     setBusy(true);
     try {
-      const saved = await patchTask(client, company, task.id, { assignee: next });
+      const saved = await patchTask(client, company, task.id, {
+        assignee: next,
+      });
       onSaved(saved);
       await onChanged();
       setReassigning(false);
       toast.success("Reassigned.");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not reassign the task");
+      toast.error(
+        e instanceof Error ? e.message : "could not reassign the task",
+      );
     } finally {
       setBusy(false);
     }
@@ -583,7 +675,10 @@ function ControlBar({
         {inflight ? (
           <>
             <span className="mr-1 inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-              <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+              <span
+                className="size-1.5 animate-pulse rounded-full bg-current"
+                aria-hidden
+              />
               In flight
             </span>
             {pending !== null ? (
@@ -615,7 +710,12 @@ function ControlBar({
                 </Button>
                 <ConfirmButton
                   trigger={
-                    <Button variant="outline" size="sm" className="h-8" disabled={steerDisabled}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      disabled={steerDisabled}
+                    >
                       <Ban className="mr-1.5 size-3.5" />
                       Cancel
                     </Button>
@@ -630,14 +730,22 @@ function ControlBar({
             )}
           </>
         ) : (
-          <Button variant="outline" size="sm" className="h-8" disabled={busy} onClick={() => void patchColumn()}>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8"
+            disabled={busy}
+            onClick={() => void patchColumn()}
+          >
             <Play className="mr-1.5 size-3.5" />
             {resumeLabel}
           </Button>
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          {busy && <Loader2 className="size-4 animate-spin text-muted-foreground" />}
+          {busy && (
+            <Loader2 className="size-4 animate-spin text-muted-foreground" />
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -652,7 +760,13 @@ function ControlBar({
             <UserCog className="mr-1.5 size-3.5" />
             Reassign
           </Button>
-          <Button variant="ghost" size="sm" className="h-8" disabled={busy} onClick={onEdit}>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8"
+            disabled={busy}
+            onClick={onEdit}
+          >
             <Pencil className="mr-1.5 size-3.5" />
             Edit
           </Button>
@@ -670,14 +784,17 @@ function ControlBar({
             disabled={steerDisabled}
             onChange={(e) => setInstruction(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && instruction.trim()) void steer("redirect", { instruction: instruction.trim() });
+              if (e.key === "Enter" && instruction.trim())
+                void steer("redirect", { instruction: instruction.trim() });
             }}
           />
           <Button
             size="sm"
             className="h-8"
             disabled={steerDisabled || !instruction.trim()}
-            onClick={() => void steer("redirect", { instruction: instruction.trim() })}
+            onClick={() =>
+              void steer("redirect", { instruction: instruction.trim() })
+            }
           >
             <Send className="mr-1.5 size-3.5" />
             Send
@@ -701,7 +818,12 @@ function ControlBar({
             disabled={busy}
             className="h-8 min-w-0 flex-1"
           />
-          <Button size="sm" className="h-8" disabled={busy} onClick={() => void saveAssignee()}>
+          <Button
+            size="sm"
+            className="h-8"
+            disabled={busy}
+            onClick={() => void saveAssignee()}
+          >
             Save
           </Button>
         </div>
@@ -746,7 +868,9 @@ function OriginThreadRow({
     >
       <MessagesSquare className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate">{label}</span>
-      <span className="shrink-0 text-muted-foreground">Open the conversation</span>
+      <span className="shrink-0 text-muted-foreground">
+        Open the conversation
+      </span>
     </button>
   );
 }
@@ -771,13 +895,17 @@ function LineageRail({
             onClick={() => onNavigate(lineage.parent!.id)}
           >
             <CornerUpLeft className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="min-w-0 flex-1 truncate">{lineage.parent.title}</span>
+            <span className="min-w-0 flex-1 truncate">
+              {lineage.parent.title}
+            </span>
             <Badge variant="secondary" className="shrink-0 font-normal">
               {columnLabel(lineage.parent.column)}
             </Badge>
           </button>
         )}
-        <div className="px-2.5 py-1 text-[11px] font-medium text-muted-foreground">This task</div>
+        <div className="px-2.5 py-1 text-[11px] font-medium text-muted-foreground">
+          This task
+        </div>
         {lineage.children.map((child) => (
           <button
             key={child.id}
@@ -800,6 +928,8 @@ function LineageRail({
 interface TimelineGroup {
   key: string;
   kind: TimelineKind;
+  /** A run step's outcome (#242); absent for journal-derived entries. */
+  status?: StepStatus;
   label: string;
   count: number;
   entries: TimelineEntry[];
@@ -834,21 +964,40 @@ function groupTimeline(
   const groups: TimelineGroup[] = [];
   for (const e of entries) {
     const last = groups[groups.length - 1];
-    if (e.kind === "tool_failed" && last && last.kind === "tool_failed" && last.label === e.label) {
+    if (
+      isFailureRow(e) &&
+      last &&
+      last.kind === e.kind &&
+      last.label === e.label &&
+      isFailureRow(last.entries[last.entries.length - 1])
+    ) {
       last.count += 1;
       last.entries.push(e);
     } else {
-      groups.push({ key: String(e.seq), kind: e.kind, label: e.label, count: 1, entries: [e] });
+      groups.push({
+        key: String(e.seq),
+        kind: e.kind,
+        status: e.status,
+        label: e.label,
+        count: 1,
+        entries: [e],
+      });
     }
   }
 
   const items: TimelineItem[] = [];
   for (const g of groups) {
-    const waited = g.kind === "approval" ? g.entries[0].waitedMillis : undefined;
+    const waited =
+      g.kind === "approval" ? g.entries[0].waitedMillis : undefined;
     if (waited !== undefined && waited > 0) {
       // `wait-` prefixed so a band can never collide with a row key, which is
       // the bare sequence number.
-      items.push({ row: "wait", key: `wait-${g.entries[0].seq}`, millis: waited, live: false });
+      items.push({
+        row: "wait",
+        key: `wait-${g.entries[0].seq}`,
+        millis: waited,
+        live: false,
+      });
     }
     items.push({ row: "group", key: g.key, group: g });
   }
@@ -869,9 +1018,32 @@ const KIND_ICON: Record<TimelineKind, ReactElement> = {
   tool_failed: <AlertCircle className="size-3.5" />,
   approval: <ShieldCheck className="size-3.5" />,
   completed: <CheckCircle2 className="size-3.5" />,
+  // The run-trace kinds (#242). Same renderer, three more icon rows.
+  tool_call: <Wrench className="size-3.5" />,
+  thinking: <Brain className="size-3.5" />,
+  note: <StickyNote className="size-3.5" />,
 };
 
-function kindTone(kind: TimelineKind): string {
+/**
+ * The icon for a row. A run step's **outcome** outranks its kind (#242): a
+ * failed tool call reads as a failure, and one still in flight reads as a
+ * spinner — which is the honest render of a step the trace recorded as
+ * `running` because the host died mid-call, not an error.
+ *
+ * Task-timeline entries carry no `status`, so they fall through to the kind
+ * icon exactly as before.
+ */
+function rowIcon(kind: TimelineKind, status?: StepStatus): ReactElement {
+  if (status === "running")
+    return <Loader2 className="size-3.5 animate-spin" />;
+  if (status === "error") return <AlertCircle className="size-3.5" />;
+  return KIND_ICON[kind];
+}
+
+function kindTone(kind: TimelineKind, status?: StepStatus): string {
+  // Outcome first, for the same reason `rowIcon` reads it first.
+  if (status === "running") return "text-sky-600 dark:text-sky-400";
+  if (status === "error") return "text-rose-600 dark:text-rose-400";
   switch (kind) {
     case "completed":
       return "text-emerald-600 dark:text-emerald-400";
@@ -882,6 +1054,16 @@ function kindTone(kind: TimelineKind): string {
     default:
       return "text-muted-foreground";
   }
+}
+
+/**
+ * Whether a row is a failure, from either surface: the journal's `tool_failed`
+ * kind, or a run step whose recorded outcome was an error (#242). This is what
+ * the `×N` coalescing keys on, so a tool that failed six times in a row reads
+ * the same in a run's trace as it does on the task timeline.
+ */
+function isFailureRow(entry: TimelineEntry): boolean {
+  return entry.kind === "tool_failed" || entry.status === "error";
 }
 
 function TimelineList({
@@ -929,7 +1111,9 @@ function TimelineList({
 function WaitingBand({ millis, live }: { millis: number; live: boolean }) {
   // Height is quantised to the 4s poll while the band is live, so a 1s text tick
   // does not relayout the list underneath the reader's cursor every second.
-  const height = waitingBandHeight(live ? Math.round(millis / 4000) * 4000 : millis);
+  const height = waitingBandHeight(
+    live ? Math.round(millis / 4000) * 4000 : millis,
+  );
   return (
     <li
       className={cn(
@@ -943,7 +1127,9 @@ function WaitingBand({ millis, live }: { millis: number; live: boolean }) {
     >
       <Hourglass className="size-3.5 shrink-0" aria-hidden />
       <span className="font-medium tabular-nums">
-        {live ? `Waiting on you · ${formatDuration(millis)}` : `Waited ${formatDuration(millis)}`}
+        {live
+          ? `Waiting on you · ${formatDuration(millis)}`
+          : `Waited ${formatDuration(millis)}`}
       </span>
     </li>
   );
@@ -965,12 +1151,24 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
         disabled={!expandable}
         onClick={() => expandable && setOpen((o) => !o)}
       >
-        <span className={cn("shrink-0", kindTone(group.kind))}>{KIND_ICON[group.kind]}</span>
-        <span className="min-w-0 flex-1 truncate font-medium">{group.label}</span>
+        <span className={cn("shrink-0", kindTone(group.kind, group.status))}>
+          {rowIcon(group.kind, group.status)}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-medium">
+          {group.label}
+        </span>
         {group.count > 1 && (
           <Badge variant="outline" className="shrink-0 font-normal">
             ×{group.count}
           </Badge>
+        )}
+        {/* A run step's own duration (#242); journal entries carry none. */}
+        {group.count === 1 && first.elapsedMs !== undefined && (
+          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {first.elapsedMs < 1000
+              ? `${first.elapsedMs}ms`
+              : formatDuration(first.elapsedMs)}
+          </span>
         )}
         <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
           {timeOf(first.atMillis)}
@@ -987,7 +1185,9 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
           {group.count > 1
             ? group.entries.map((e) => (
                 <div key={e.seq} className="text-[11px]">
-                  <div className="mb-0.5 text-muted-foreground">{timeOf(e.atMillis)}</div>
+                  <div className="mb-0.5 text-muted-foreground">
+                    {timeOf(e.atMillis)}
+                  </div>
                   {e.detail && (
                     <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">
                       {e.detail}
@@ -1009,14 +1209,323 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
   );
 }
 
-function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
-  const approvals = useMemo(() => entries.filter((e) => e.kind === "approval"), [entries]);
+// ---------------------------------------------------------------------------
+// Attempts (#242)
+// ---------------------------------------------------------------------------
+
+/**
+ * The tone of a run's status chip. `waiting_approval` and `paused` share the
+ * amber "parked" tone the waiting band already uses — they differ in *who*
+ * unblocks them, not in whether the company is stuck.
+ */
+function runStatusTone(status: RunStatus): string {
+  switch (status) {
+    case "succeeded":
+      return "border-emerald-500/40 text-emerald-700 dark:text-emerald-400";
+    case "failed":
+      return "border-rose-500/40 text-rose-700 dark:text-rose-400";
+    case "cancelled":
+      return "border-muted-foreground/30 text-muted-foreground";
+    case "waiting_approval":
+    case "paused":
+      return "border-amber-500/40 text-amber-700 dark:text-amber-400";
+    default:
+      return "border-sky-500/40 text-sky-700 dark:text-sky-400";
+  }
+}
+
+/**
+ * The card's recorded attempts (#242) — the thing that makes a task which
+ * failed twice and succeeded on the third try look different from one that
+ * succeeded immediately.
+ *
+ * Cost is deliberately absent: epic #184 scopes this screen with the
+ * cost/currency dimension removed (no per-line cost, no total-cost header), and
+ * a per-attempt USD figure is exactly a per-line cost. The usage totals are on
+ * the wire for the surfaces that own them.
+ */
+function AttemptsTab({
+  client,
+  company,
+  runs,
+  now,
+}: {
+  client: OpenCompanyClient;
+  company: string | null;
+  runs: RunSummary[];
+  now: number;
+}) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  const open = useMemo(
+    () => runs.find((r) => r.id === openId) ?? null,
+    [runs, openId],
+  );
+
+  if (runs.length === 0) {
+    return (
+      <EmptyState
+        title="No recorded attempts"
+        body="Dispatch this card to record one. Cards dispatched before attempts were recorded show none — they were never backfilled, because inventing them would fabricate a record."
+      />
+    );
+  }
+
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Approvals resolved <span className="font-medium text-foreground">during this run</span> —
-        correlated to the dispatch window, not linked per-task. Each wait is measured from the
-        moment the effect actually parked.
+        Every dispatch of this card, newest first. A card can enter review more
+        than once, so several waits on one attempt is the expected record, not a
+        fault.
+      </p>
+      <ol className="space-y-1.5">
+        {runs.map((run) => (
+          <AttemptRow
+            key={run.id}
+            run={run}
+            now={now}
+            onOpen={() => setOpenId(run.id)}
+          />
+        ))}
+      </ol>
+      <RunDrawer
+        client={client}
+        company={company}
+        run={open}
+        now={now}
+        onClose={() => setOpenId(null)}
+      />
+    </div>
+  );
+}
+
+/**
+ * What to say about an attempt's step count, which is **written on the settle**
+ * and so reads `0` for the whole of a live run.
+ *
+ * Three honest cases rather than one misleading number:
+ * - never started (`pending`) — nothing has been traced, and nothing is being
+ *   traced either, so it does not claim to be recording;
+ * - open but unsettled — steps *are* landing incrementally (the drawer shows
+ *   them), the count just has not been written yet;
+ * - settled — the real figure, marked `+` when it is a capped high-water
+ *   ordinal rather than a total.
+ */
+function stepSummary(run: RunSummary): string {
+  if (run.startedAtMillis === undefined) return "not started";
+  if (isRunOpen(run) && run.stepCount === 0) return "recording…";
+  const n = run.stepCount;
+  return `${n}${run.stepCountCapped ? "+" : ""} step${n === 1 ? "" : "s"}`;
+}
+
+function AttemptRow({
+  run,
+  now,
+  onOpen,
+}: {
+  run: RunSummary;
+  now: number;
+  onOpen: () => void;
+}) {
+  const elapsed = runElapsedMillis(run, now);
+  return (
+    <li className="rounded-lg border bg-card">
+      <button
+        className="flex w-full cursor-pointer flex-col gap-1 px-3 py-2 text-left"
+        onClick={onOpen}
+      >
+        <div className="flex w-full items-center gap-2 text-xs">
+          <Layers className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="shrink-0 font-medium">Attempt {run.attempt}</span>
+          <Badge
+            variant="outline"
+            className={cn("shrink-0 font-normal", runStatusTone(run.status))}
+          >
+            {RUN_STATUS_LABEL[run.status]}
+          </Badge>
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
+            {run.agentId}
+          </span>
+          {elapsed !== null && (
+            <span
+              className={cn(
+                "shrink-0 tabular-nums text-[11px] text-muted-foreground",
+                isRunOpen(run) && "text-foreground",
+              )}
+            >
+              {formatDuration(elapsed)}
+              {isRunOpen(run) && " …"}
+            </span>
+          )}
+          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+        </div>
+        <div className="flex w-full items-center gap-2 pl-5 text-[11px] text-muted-foreground">
+          <span className="tabular-nums">{timeOf(run.createdAtMillis)}</span>
+          <span aria-hidden>·</span>
+          <span>{stepSummary(run)}</span>
+          {run.stepCountCapped && <span>(trace capped)</span>}
+        </div>
+        {run.error && (
+          <p className="w-full truncate pl-5 text-[11px] text-rose-600 dark:text-rose-400">
+            {run.error}
+          </p>
+        )}
+      </button>
+    </li>
+  );
+}
+
+/**
+ * One attempt's persisted step trace, in a side drawer (#242).
+ *
+ * **Refresh-on-read.** Steps land in the store *as the turn executes*, so
+ * re-reading an open attempt shows the progress made since — which is why this
+ * re-fetches on the same cadence as the screen while the run has not settled,
+ * and stops once it has. A live stream would mean widening the harness turn
+ * stream for something a re-read already answers.
+ */
+function RunDrawer({
+  client,
+  company,
+  run,
+  now,
+  onClose,
+}: {
+  client: OpenCompanyClient;
+  company: string | null;
+  run: RunSummary | null;
+  now: number;
+  onClose: () => void;
+}) {
+  const [detail, setDetail] = useState<RunDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const runId = run?.id ?? null;
+  // Re-fetch while the attempt is unsettled. Read from the *summary* the parent
+  // poll refreshes, so the drawer stops polling as soon as the run settles even
+  // if its own last read still showed it open.
+  const live = run !== null && isRunOpen(run);
+
+  useEffect(() => {
+    if (runId === null) {
+      setDetail(null);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    const read = async () => {
+      try {
+        const next = await getRun(client, company, runId);
+        if (!cancelled) {
+          setDetail(next);
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled)
+          setError(
+            e instanceof Error ? e.message : "could not load the attempt",
+          );
+      }
+    };
+    void read();
+    if (!live) return () => void (cancelled = true);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") void read();
+    }, POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [client, company, runId, live]);
+
+  const elapsed = run ? runElapsedMillis(run, now) : null;
+
+  return (
+    <Sheet open={run !== null} onOpenChange={(next) => !next && onClose()}>
+      <SheetContent side="right" className="w-full sm:max-w-md">
+        {run && (
+          <>
+            <SheetHeader className="border-b">
+              <SheetTitle>Attempt {run.attempt}</SheetTitle>
+              <SheetDescription className="flex flex-wrap items-center gap-1.5 text-xs">
+                <Badge
+                  variant="outline"
+                  className={cn("font-normal", runStatusTone(run.status))}
+                >
+                  {RUN_STATUS_LABEL[run.status]}
+                </Badge>
+                <span>{run.agentId}</span>
+                {elapsed !== null && (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span className="tabular-nums">
+                      {formatDuration(elapsed)}
+                    </span>
+                  </>
+                )}
+              </SheetDescription>
+            </SheetHeader>
+            <ScrollArea className="min-h-0 flex-1">
+              <div className="space-y-3 px-4 pb-4">
+                {run.error && (
+                  <Alert variant="destructive">
+                    <AlertDescription className="text-xs">
+                      {run.error}
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {error && (
+                  <Alert variant="destructive">
+                    <AlertDescription className="text-xs">
+                      {error}
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {run.stepCountCapped && (
+                  <p className="text-[11px] text-muted-foreground">
+                    This attempt hit the per-run trace ceiling, so what follows
+                    is the start of the run, not all of it.
+                  </p>
+                )}
+                {detail === null && error === null ? (
+                  <div className="space-y-1.5 pt-1">
+                    <Skeleton className="h-9 rounded-lg" />
+                    <Skeleton className="h-9 rounded-lg" />
+                    <Skeleton className="h-9 rounded-lg" />
+                  </div>
+                ) : detail && detail.steps.length === 0 ? (
+                  <EmptyState
+                    title="No steps recorded"
+                    body={
+                      isRunOpen(run)
+                        ? "Steps appear here as the attempt runs."
+                        : "This attempt settled without producing a traceable step."
+                    }
+                  />
+                ) : detail ? (
+                  /* The same grouped-timeline renderer the task timeline uses —
+                     `kind` simply widens to the three step words. */
+                  <TimelineList entries={detail.steps} now={now} />
+                ) : null}
+              </div>
+            </ScrollArea>
+          </>
+        )}
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
+  const approvals = useMemo(
+    () => entries.filter((e) => e.kind === "approval"),
+    [entries],
+  );
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Approvals resolved{" "}
+        <span className="font-medium text-foreground">during this run</span> —
+        correlated to the dispatch window, not linked per-task. Each wait is
+        measured from the moment the effect actually parked.
       </p>
       {approvals.length === 0 ? (
         <EmptyState
@@ -1031,7 +1540,9 @@ function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
               className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2 text-xs"
             >
               <ShieldCheck className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-              <span className="min-w-0 flex-1 truncate font-medium">{e.label}</span>
+              <span className="min-w-0 flex-1 truncate font-medium">
+                {e.label}
+              </span>
               {e.waitedMillis !== undefined && (
                 <span className="shrink-0 text-[11px] tabular-nums text-amber-700 dark:text-amber-400">
                   waited {formatDuration(e.waitedMillis)}
@@ -1075,7 +1586,11 @@ function ExportButton({
   async function download() {
     setBusy(true);
     try {
-      const { text, filename } = await exportTaskRecord(client, company, task.id);
+      const { text, filename } = await exportTaskRecord(
+        client,
+        company,
+        task.id,
+      );
       const url = URL.createObjectURL(new Blob([text], { type: "text/html" }));
       const link = document.createElement("a");
       link.href = url;
@@ -1090,7 +1605,9 @@ function ExportButton({
       // Freed on the next tick: revoking synchronously can beat the click in
       // some browsers and save an empty file.
       setTimeout(() => URL.revokeObjectURL(url), 0);
-      toast.success("Record downloaded. Open it in any browser, or print it to PDF.");
+      toast.success(
+        "Record downloaded. Open it in any browser, or print it to PDF.",
+      );
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "could not export the task");
     } finally {
@@ -1117,11 +1634,217 @@ function ExportButton({
   );
 }
 
+/**
+ * The Task Detail **Discussion** tab (#335): the card's own message thread.
+ *
+ * A task discussion is a thread of its own, not the company chat filtered to a
+ * card — so a message posted here is about *this* work and is read by whoever
+ * opens the card next. It is served on the parent's single `GET …/tasks/{id}`
+ * (#185) and therefore rides its 4s poll: a colleague's post lands here without
+ * a reload, which is the whole point of putting the conversation on the card.
+ *
+ * Operator-only in v1. Posting deliberately runs no agent turn — nothing here
+ * dispatches work or spends money, which stays behind the board's column drag.
+ * There is no edit and no delete either: the thread is journal-backed and
+ * append-only, so what was said stays said.
+ *
+ * The poll carries only the newest page of the thread (the host caps it so a
+ * long discussion is not re-sent every 4s). Older messages are pulled on demand
+ * and kept here, so walking back through a thread survives the next poll.
+ */
+function DiscussionTab({
+  messages,
+  hasMore,
+  taskId,
+  client,
+  company,
+  onPosted,
+}: {
+  messages: DiscussionMessage[];
+  hasMore: boolean;
+  taskId: string;
+  client: OpenCompanyClient;
+  company: string | null;
+  onPosted: () => Promise<void>;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  /**
+   * Every message this tab has been shown, oldest first, deduped by `seq` — the
+   * journal key, and the only identity a message has.
+   *
+   * The poll carries a *sliding* page, so a new post pushes the oldest message
+   * of that page out of it; rendering the page directly would make a message
+   * disappear from under someone mid-read. Accumulating means the thread on
+   * screen only ever grows: the poll adds new posts, "load earlier" adds old
+   * ones, and the `201` echo adds your own before the poll comes round.
+   *
+   * Mounted per card (the parent keys this component by task id), so this never
+   * holds another card's thread.
+   */
+  const [thread, setThread] = useState<DiscussionMessage[]>([]);
+  /**
+   * Whether anything remains before the oldest message held. `null` until an
+   * older page has been pulled, when that page's own flag is the answer.
+   */
+  const [earlierHasMore, setEarlierHasMore] = useState<boolean | null>(null);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+
+  const absorb = useCallback((rows: DiscussionMessage[]) => {
+    setThread((prev) => {
+      const bySeq = new Map<number, DiscussionMessage>(
+        prev.map((m) => [m.seq, m] as const),
+      );
+      let added = false;
+      for (const m of rows) {
+        if (!bySeq.has(m.seq)) {
+          bySeq.set(m.seq, m);
+          added = true;
+        }
+      }
+      // Same list back when the poll brought nothing new — the common case, and
+      // the one that must not churn the render.
+      return added ? [...bySeq.values()].sort((a, b) => a.seq - b.seq) : prev;
+    });
+  }, []);
+
+  useEffect(() => {
+    absorb(messages);
+  }, [messages, absorb]);
+
+  const moreBefore = earlierHasMore ?? hasMore;
+
+  async function loadEarlier() {
+    const oldest = thread[0]?.seq;
+    if (oldest === undefined || loadingEarlier) return;
+    setLoadingEarlier(true);
+    try {
+      const page = await getTaskDetail(client, company, taskId, oldest);
+      absorb(page.discussion);
+      setEarlierHasMore(page.discussionHasMore);
+    } catch (e) {
+      toast.error(
+        e instanceof Error ? e.message : "could not load earlier messages",
+      );
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
+
+  async function post() {
+    const body = text.trim();
+    if (!body || busy) return;
+    setBusy(true);
+    try {
+      const posted = await postTaskDiscussion(client, company, taskId, body);
+      // Shown straight away rather than after the poll: the host journaled it
+      // and handed the stored row back, so waiting up to four seconds to show
+      // an operator their own message buys nothing. It carries the journaled
+      // `seq` and stamp, so the poll's copy collapses onto it.
+      absorb([posted]);
+      // Cleared only after the host accepted it, so a failed post leaves the
+      // operator's words in the box rather than losing them.
+      setText("");
+      await onPosted();
+    } catch (e) {
+      toast.error(
+        e instanceof Error ? e.message : "could not post the message",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      {thread.length === 0 ? (
+        <EmptyState
+          title="No discussion yet"
+          body="Post the first message to start this card's thread."
+        />
+      ) : (
+        <ol className="space-y-1.5">
+          {moreBefore ? (
+            <li className="pb-1 text-center">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={loadingEarlier}
+                onClick={() => void loadEarlier()}
+              >
+                {loadingEarlier ? (
+                  <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+                ) : null}
+                Load earlier messages
+              </Button>
+            </li>
+          ) : null}
+          {thread.map((m) => (
+            <li key={m.seq} className="rounded-lg border bg-card px-3 py-2">
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <MessagesSquare className="size-3.5 shrink-0" aria-hidden />
+                <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                  {m.author}
+                </span>
+                <span
+                  className="shrink-0 tabular-nums"
+                  title={new Date(m.atMillis).toLocaleString()}
+                >
+                  {timeOf(m.atMillis)}
+                </span>
+              </div>
+              <p className="mt-1 whitespace-pre-wrap break-words text-xs">
+                {m.text}
+              </p>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      <div className="flex items-start gap-2">
+        <Textarea
+          value={text}
+          placeholder="Write a message about this task…"
+          rows={2}
+          className="min-h-16 text-xs"
+          disabled={busy}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            // Enter posts; Shift+Enter is a newline. A note about a task is
+            // usually one line, and the mouse trip for every one of them is
+            // what stops people writing them down at all.
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void post();
+            }
+          }}
+        />
+        <Button
+          size="sm"
+          className="h-8 shrink-0"
+          disabled={busy || !text.trim()}
+          onClick={() => void post()}
+        >
+          {busy ? (
+            <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+          ) : (
+            <Send className="mr-1.5 size-3.5" />
+          )}
+          Post
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function EmptyState({ title, body }: { title: string; body: string }) {
   return (
     <div className="rounded-xl border border-dashed py-10 text-center">
       <p className="text-sm font-medium">{title}</p>
-      <p className="mx-auto mt-1 max-w-xs text-xs text-muted-foreground">{body}</p>
+      <p className="mx-auto mt-1 max-w-xs text-xs text-muted-foreground">
+        {body}
+      </p>
     </div>
   );
 }
@@ -1154,7 +1877,11 @@ function ConfirmButton({
           <AlertDialogCancel>Keep running</AlertDialogCancel>
           <AlertDialogAction
             onClick={onConfirm}
-            className={destructive ? "bg-destructive text-white hover:bg-destructive/90" : undefined}
+            className={
+              destructive
+                ? "bg-destructive text-white hover:bg-destructive/90"
+                : undefined
+            }
           >
             {confirmLabel}
           </AlertDialogAction>

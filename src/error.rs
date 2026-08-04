@@ -135,6 +135,15 @@ pub enum OpenCompanyError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// The company's runtime is quiescing for a swap (issue #290): it has
+    /// stopped accepting new cycles while the one in flight drains, and a
+    /// successor is being built. Distinct from
+    /// [`LifecycleConflict`](Self::LifecycleConflict), which is a *durable*
+    /// state an operator chose; this one clears itself within a turn, so it
+    /// renders as `503 Service Unavailable` and the caller should retry.
+    #[error("company {0} is being rebuilt; retry shortly")]
+    Quiescing(String),
+
     /// A request was malformed or internally inconsistent (e.g. an approval
     /// resolution that pairs a `deny` verdict with an amended payload).
     #[error("invalid request: {0}")]
@@ -237,6 +246,7 @@ impl OpenCompanyError {
             Self::BudgetExceeded(_) => "budget_exceeded".to_string(),
             Self::LifecycleConflict(_) => "lifecycle_conflict".to_string(),
             Self::Conflict(_) => "conflict".to_string(),
+            Self::Quiescing(_) => "quiescing".to_string(),
             Self::InvalidRequest(_) => "invalid_request".to_string(),
             Self::Config(_) => "config_error".to_string(),
             Self::Orchestration { code, .. } => code.clone(),

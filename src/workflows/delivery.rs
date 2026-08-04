@@ -564,6 +564,7 @@ async fn park_cold_recipient(
             "body": text,
         }),
         agent: None,
+        run_id: None,
     };
 
     match park_effect(parking, &record.id, effect).await {
@@ -1013,6 +1014,7 @@ allow = [{allow}]
             overlay_desk_order: Vec::new(),
             overlay_desks: Vec::new(),
             overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
             template_provenance: None,
         }
     }

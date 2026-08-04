@@ -45,6 +45,7 @@ use crate::ports::{
     SkillStateStore, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
+use crate::runtime::handover::RuntimeHandover;
 use crate::runtime::journal::RuntimeJournal;
 use crate::runtime::tools::{StubToolProvider, grant_matches};
 use crate::store::paths::Bundle;
@@ -260,6 +261,14 @@ pub struct RuntimeBuilder {
     /// consumed when a company **explicitly** grants the `search` namespace.
     #[cfg(feature = "openhuman")]
     search_backend: Option<crate::harness::search::SearchBackend>,
+    /// Issue #290: the live state of the runtime this build is *replacing*.
+    ///
+    /// Present only on a rebuild. It supplies the per-instance pieces a second
+    /// runtime must never duplicate (see [`RuntimeHandover`]), and its presence
+    /// is also the "this is a rebuild" signal that suppresses the boot-only side
+    /// effects below: journal replay, orphan-run reaping, workspace seeding,
+    /// going-public, and the MCP re-boot.
+    handover: Option<RuntimeHandover>,
 }
 
 impl RuntimeBuilder {
@@ -318,6 +327,7 @@ impl RuntimeBuilder {
             media_backend: None,
             #[cfg(feature = "openhuman")]
             search_backend: None,
+            handover: None,
         }
     }
 
@@ -558,6 +568,18 @@ impl RuntimeBuilder {
     }
 
     /// Swaps the approval gate (default: manifest `[policy]` gate).
+    /// Issue #290: adopt the live state of the runtime this build replaces,
+    /// instead of constructing a second copy of it.
+    ///
+    /// Setting this makes the build a **rebuild**: see [`RuntimeHandover`] for
+    /// what is inherited and why each piece is a correctness matter, and
+    /// [`rebuild_company`](crate::runtime::rebuild_company) for the quiesce →
+    /// hand over → build → swap sequence a caller must follow around it.
+    pub fn with_handover(mut self, handover: RuntimeHandover) -> Self {
+        self.handover = Some(handover);
+        self
+    }
+
     pub fn with_approvals(mut self, approvals: Arc<ManifestApprovalGate>) -> Self {
         self.approvals = Some(approvals);
         self
@@ -698,18 +720,45 @@ impl RuntimeBuilder {
     pub async fn build(mut self) -> Result<CompanyRuntime> {
         let home = self.home;
         let id = self.id;
+        // Issue #290. Present ⇒ this is a rebuild of a live company, so every
+        // per-instance piece below is inherited rather than constructed, and the
+        // boot-only side effects are skipped. Absent ⇒ an ordinary boot, byte for
+        // byte as before.
+        let handover = self.handover.take();
+        // On a rebuild the *brain* must be built over the inherited harness pool,
+        // not a freshly minted one. The boot path mints a pool per build, so
+        // without this the successor's brain would talk to a new pool while the
+        // runtime reported the old one — two pools for one company, and every
+        // agent's conversation history silently dropped. Done here, before any
+        // field is moved out of `self`, so the brain arm below and the
+        // `set_harness` wiring further down agree by construction.
+        #[cfg(feature = "openhuman")]
+        if let Some(pool) = handover.as_ref().and_then(|h| h.harness.clone()) {
+            self.harness = Some(pool);
+        }
 
-        let store: Arc<dyn CompanyStore> = self
-            .store
+        // Inherit-or-construct. The handover's handles outrank an explicitly
+        // injected one: on a rebuild, a second store over the same data is the
+        // bug, not the configuration.
+        let store: Arc<dyn CompanyStore> = handover
+            .as_ref()
+            .map(|h| h.store.clone())
+            .or(self.store)
             .unwrap_or_else(|| Arc::new(FsCompanyStore::new(home.clone())));
-        let events: Arc<dyn EventLog> = self
-            .events
+        let events: Arc<dyn EventLog> = handover
+            .as_ref()
+            .map(|h| h.events.clone())
+            .or(self.events)
             .unwrap_or_else(|| Arc::new(FsEventLog::new(home.clone())));
-        let memory: Arc<dyn MemoryStore> = self
-            .memory
+        let memory: Arc<dyn MemoryStore> = handover
+            .as_ref()
+            .map(|h| h.memory.clone())
+            .or(self.memory)
             .unwrap_or_else(|| Arc::new(FsMemoryStore::new(home.clone())));
-        let context: Arc<dyn ContextStore> = self
-            .context
+        let context: Arc<dyn ContextStore> = handover
+            .as_ref()
+            .map(|h| h.context.clone())
+            .or(self.context)
             .unwrap_or_else(|| Arc::new(FsContextStore::new(home.clone())));
         // Effective grants narrow the company allow-list by per-agent tools.
         let grants = effective_grants(&self.manifest);
@@ -719,49 +768,68 @@ impl RuntimeBuilder {
         // filing configuration. The consent mode is also the built-in feedback
         // tool's capture mode.
         let bundle = Bundle::new(home.clone(), &id);
-        let feedback = self
-            .feedback
+        let feedback = handover
+            .as_ref()
+            .map(|h| h.feedback.clone())
+            .or(self.feedback)
             .unwrap_or_else(|| Arc::new(FeedbackStore::new(&bundle)));
-        let secrets: Arc<dyn SecretStore> = self
-            .secrets
+        let secrets: Arc<dyn SecretStore> = handover
+            .as_ref()
+            .map(|h| h.secrets.clone())
+            .or(self.secrets)
             .unwrap_or_else(|| Arc::new(FsSecretStore::new(home.clone())));
-        let inbox: Arc<dyn InboxStore> = self
-            .inbox
+        let inbox: Arc<dyn InboxStore> = handover
+            .as_ref()
+            .map(|h| h.inbox.clone())
+            .or(self.inbox)
             .unwrap_or_else(|| Arc::new(FsInboxStore::new(home.clone())));
         // The WS3 console ports default to a single shared fs backend.
         let fs_ops = Arc::new(FsOps::new(home.clone()));
-        let ops = OpsStores {
-            tasks: self.tasks.unwrap_or_else(|| fs_ops.clone()),
-            workspace: self.workspace.unwrap_or_else(|| fs_ops.clone()),
-            facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
-            artifacts: self.artifacts.unwrap_or_else(|| fs_ops.clone()),
-            runs: self.runs.unwrap_or_else(|| fs_ops.clone()),
-            usage: self.usage.unwrap_or_else(|| fs_ops.clone()),
-            skills: self.skills.unwrap_or_else(|| fs_ops.clone()),
-            users: self.users.unwrap_or_else(|| fs_ops.clone()),
-            sessions: self.sessions.unwrap_or_else(|| fs_ops.clone()),
-            login_codes: self.login_codes.unwrap_or_else(|| fs_ops.clone()),
+        let ops = match handover.as_ref() {
+            Some(h) => h.ops.clone(),
+            None => OpsStores {
+                tasks: self.tasks.unwrap_or_else(|| fs_ops.clone()),
+                workspace: self.workspace.unwrap_or_else(|| fs_ops.clone()),
+                facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
+                artifacts: self.artifacts.unwrap_or_else(|| fs_ops.clone()),
+                runs: self.runs.unwrap_or_else(|| fs_ops.clone()),
+                usage: self.usage.unwrap_or_else(|| fs_ops.clone()),
+                skills: self.skills.unwrap_or_else(|| fs_ops.clone()),
+                users: self.users.unwrap_or_else(|| fs_ops.clone()),
+                sessions: self.sessions.unwrap_or_else(|| fs_ops.clone()),
+                login_codes: self.login_codes.unwrap_or_else(|| fs_ops.clone()),
+            },
         };
 
         // Idempotent workspace seeding: only when the workspace is empty (an
         // operator's deletions must stick, so a seeded-then-emptied workspace is
         // never re-seeded). Skills need no seeding — the store holds deltas only
         // and the effective set unions company-dir skills at read time.
-        if let Some(seed_dir) = &self.seed_dir
+        //
+        // Skipped entirely on a rebuild: the workspace belongs to a company that
+        // is already running, so there is nothing to seed and the `is_empty`
+        // probe would only race the live runtime's own writes.
+        if handover.is_none()
+            && let Some(seed_dir) = &self.seed_dir
             && ops.workspace.is_empty(&id).await?
         {
             seed_workspace(ops.workspace.as_ref(), &id, seed_dir).await?;
         }
 
         let consent = self.consent;
-        let filer = Arc::new(FeedbackFiler {
-            client: self.github,
-            tinyhumans: self.tinyhumans_feedback,
-            repo: crate::feedback::DEFAULT_REPO.to_string(),
-            consent,
-            limiter: RateLimiter::default(),
-            quality: crate::feedback::QualityLedger::default(),
-        });
+        // Inherited on a rebuild so the in-memory filing rate limiter survives.
+        // A fresh limiter would make a rebuild loop a rate-limit bypass.
+        let filer = match handover.as_ref() {
+            Some(h) => h.filer.clone(),
+            None => Arc::new(FeedbackFiler {
+                client: self.github,
+                tinyhumans: self.tinyhumans_feedback,
+                repo: crate::feedback::DEFAULT_REPO.to_string(),
+                consent,
+                limiter: RateLimiter::default(),
+                quality: crate::feedback::QualityLedger::default(),
+            }),
+        };
 
         // Probe OpenHuman once; an unreachable daemon degrades, never fails.
         let openhuman_healthy = match &openhuman {
@@ -854,10 +922,25 @@ impl RuntimeBuilder {
         // produces or mutates, so hoisting it is a pure move. The same two
         // `Arc`s go to the delivery deps and to the runtime — one gate, one
         // journal, one approvals queue.
-        let journal = Arc::new(RuntimeJournal::new(
-            Bundle::new(home.clone(), &id).journal_jsonl(),
-        ));
-        journal.load().await?;
+        //
+        // On a rebuild the journal is **inherited, never reopened**. It is the
+        // one piece where a second instance is not merely wasteful: `append`
+        // writes a record and its newline as two writes under a per-instance
+        // lock, so two journals on one path interleave onto a single line and
+        // fail to parse on replay — bricking the next boot, not just this
+        // process. `load()` is skipped for the same reason it is not repeated at
+        // boot: the inherited journal is already replayed, and re-reading it
+        // would re-apply records the live instance has since resolved.
+        let journal = match handover.as_ref() {
+            Some(h) => h.journal.clone(),
+            None => {
+                let journal = Arc::new(RuntimeJournal::new(
+                    Bundle::new(home.clone(), &id).journal_jsonl(),
+                ));
+                journal.load().await?;
+                journal
+            }
+        };
 
         // Issue #242, the other half of boot replay: reclaim run records left
         // active by a previous host process.
@@ -877,7 +960,32 @@ impl RuntimeBuilder {
         // and scheduler spawns further down, so no fresh run can be reaped by
         // mistake. A store failure is logged, never fatal: record-keeping must
         // not stop a company from booting.
-        if let Err(err) = crate::ports::runs::reap_orphaned_runs(ops.runs.as_ref(), &id).await {
+        //
+        // Issue #290: suppressed on a rebuild. The whole argument above rests on
+        // "nothing from this process can be in flight yet" — true at boot, false
+        // the moment a company has been serving. Mid-life this sweep would be
+        // reclaiming rows it cannot prove are abandoned, which is the one thing
+        // it promises never to do.
+        //
+        // Precisely which rows are at risk, since the answer is narrower than it
+        // looks: `rebuild_company` quiesces and drains before reaching here, and
+        // both `begin_run` and the terminality backstop sit inside the serial
+        // lock, so no `Running` row survives the drain. `Pending` does — the
+        // dispatch choke point mints a row *outside* that lock, so a board write
+        // landing in the window leaves one behind. Reaping it would stamp the
+        // wrong reason on it ("the host restarted"), and if the rebuild then
+        // fails and `resume()` puts the company back to work, the row is already
+        // terminal: its cycle's `begin_run` is rejected and a genuinely live
+        // attempt runs with no record at all.
+        //
+        // Suppressing rather than leaning on the drain also keeps this resting
+        // on the invariant the reaper states instead of on the current call
+        // order. It costs nothing: a refused dispatch settles its own row
+        // (`CompanyRuntime::abandon_run`), and the next real boot sweeps
+        // anything that escapes.
+        if handover.is_none()
+            && let Err(err) = crate::ports::runs::reap_orphaned_runs(ops.runs.as_ref(), &id).await
+        {
             tracing::warn!(
                 company = %id,
                 error = %err,
@@ -885,12 +993,25 @@ impl RuntimeBuilder {
             );
         }
 
-        let gate = self
-            .approvals
-            .unwrap_or_else(|| Arc::new(ManifestApprovalGate::new(self.manifest.policy.clone())));
-        for pending in journal.pending() {
-            gate.rehydrate(pending.id, pending.effect, pending.at_millis);
-        }
+        // The policy gate, rehydrated from the journal replay above so approvals
+        // survive a restart with their original ids.
+        //
+        // Inherited on a rebuild, along with its parked approvals: an approval
+        // waiting on a person keeps its id, its parked effect and its TTL across
+        // the swap, and rehydrating a fresh gate from the journal would resurrect
+        // approvals the live gate has already resolved.
+        let gate = match handover.as_ref() {
+            Some(h) => h.approval_gate.clone(),
+            None => {
+                let gate = self.approvals.unwrap_or_else(|| {
+                    Arc::new(ManifestApprovalGate::new(self.manifest.policy.clone()))
+                });
+                for pending in journal.pending() {
+                    gate.rehydrate(pending.id, pending.effect, pending.at_millis);
+                }
+                gate
+            }
+        };
 
         // Issue #243: the single-use grant set, seeded from the same replay.
         //
@@ -908,8 +1029,19 @@ impl RuntimeBuilder {
         // asking for a permission it had just been given. Consumed and expired
         // grants are folded out during replay, so this can only re-arm one that
         // never fired.
-        let grants = crate::runtime::grants::GrantSet::default();
-        grants.rehydrate(journal.replayed_grants());
+        //
+        // Inherited on a rebuild for the same reason as the gate: the operator
+        // who approved a blocked tool call moments before the swap must not be
+        // asked to approve it again, and a set rebuilt from the journal replay
+        // would re-arm grants the live set has already consumed.
+        let grants = match handover.as_ref() {
+            Some(h) => h.grants.clone(),
+            None => {
+                let grants = crate::runtime::grants::GrantSet::default();
+                grants.rehydrate(journal.replayed_grants());
+                grants
+            }
+        };
 
         // Brain selection, in precedence order:
         //   1. an explicit brain (test injection) always wins;
@@ -968,6 +1100,16 @@ impl RuntimeBuilder {
         let overlay_workflows = existing
             .as_ref()
             .map(|r| r.overlay_workflows.clone())
+            .unwrap_or_default();
+        // Issue #343: the operator-set daily spend caps. Carried across the
+        // rebuild for the same reason as the workflow bodies — the manifest is a
+        // read-only boot snapshot on a hosted tenant, so dropping these would
+        // silently revert every console-set cap to the number baked into the
+        // image on the next restart, which is the exact failure #343 exists to
+        // end.
+        let overlay_budgets = existing
+            .as_ref()
+            .map(|r| r.overlay_budgets.clone())
             .unwrap_or_default();
         // Issue #208: `[workflows].enabled` is the one manifest field a runtime
         // write mutates (`create_company_workflow` pushes the new id alongside
@@ -1272,6 +1414,7 @@ impl RuntimeBuilder {
                                 overlay_desk_order: overlay_desk_order.clone(),
                                 overlay_desks: overlay_desks.clone(),
                                 overlay_workflows: overlay_workflows.clone(),
+                                overlay_budgets: overlay_budgets.clone(),
                                 template_provenance: template_provenance.clone(),
                             };
                             // Workflow agent nodes execute on the same pool as the
@@ -1290,7 +1433,13 @@ impl RuntimeBuilder {
                             // `set_workflow_runner`, so this is not a strong cycle.
                             deps.workflow_runner.set(&runner);
                             wf_runner = Some(runner);
-                            Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
+                            Some(Arc::new(
+                                // Issue #242: the same run store the dispatch
+                                // choke point mints into and the boot reaper
+                                // sweeps, so an attempt's trace, cost and
+                                // status all land on the row it opened.
+                                HarnessBrain::new(pool, deps, record).with_runs(ops.runs.clone()),
+                            ) as Arc<dyn Brain>)
                         } else {
                             // Do not degrade silently (issue #174): an openhuman
                             // build with no resolvable inference source disables
@@ -1381,6 +1530,7 @@ impl RuntimeBuilder {
                 overlay_desk_order,
                 overlay_desks,
                 overlay_workflows,
+                overlay_budgets,
                 template_provenance,
             })
             .await?;
@@ -1432,20 +1582,47 @@ impl RuntimeBuilder {
         // skills/workflows content on the serve path.
         runtime.set_source_dir(self.seed_dir.clone());
 
+        // Issue #290: adopt the outgoing runtime's serialising mutexes. Two
+        // runtimes for one company each holding their own `serial` would let two
+        // cycles run at once against a store whose `save` writes the whole
+        // record; two `task_writes` would let two board edits each validate
+        // against a snapshot predating the other. Adopting them is also what
+        // makes the quiesce drain mean something after the swap.
+        if let Some(h) = handover.as_ref() {
+            runtime.adopt_locks(h.serial.clone(), h.task_writes.clone());
+        }
+
         // MCP uses OpenHuman's process-global live connection registry. Keep a
         // runtime-owned config for this OpenCompany home so REST and agents see
         // the same installed servers, and reconnect persisted installs without
         // delaying company boot.
+        //
+        // A rebuild adopts the live one and does **not** re-boot it: the connect
+        // map is keyed by server id and shared process-wide, so re-dialling would
+        // replace connections the outgoing runtime's agents may still be
+        // mid-call on.
         #[cfg(feature = "mcp")]
         {
-            let mcp = Arc::new(crate::harness::mcp::McpRuntime::new(home.join("mcp")));
-            runtime.set_mcp(mcp.clone());
-            tokio::spawn(async move { mcp.boot().await });
+            match handover.as_ref().and_then(|h| h.mcp.clone()) {
+                Some(mcp) => runtime.set_mcp(mcp),
+                None => {
+                    let mcp = Arc::new(crate::harness::mcp::McpRuntime::new(home.join("mcp")));
+                    runtime.set_mcp(mcp.clone());
+                    tokio::spawn(async move { mcp.boot().await });
+                }
+            }
         }
 
-        // WS4: attach the embedded harness pool when one was provided.
+        // WS4: attach the embedded harness pool when one was provided. On a
+        // rebuild the outgoing pool wins over any freshly minted one, so each
+        // agent's conversation history survives the swap instead of being
+        // silently dropped.
         #[cfg(feature = "openhuman")]
-        if let Some(harness) = self.harness.clone() {
+        if let Some(harness) = handover
+            .as_ref()
+            .and_then(|h| h.harness.clone())
+            .or_else(|| self.harness.clone())
+        {
             runtime.set_harness(harness);
         }
 
@@ -1467,14 +1644,21 @@ impl RuntimeBuilder {
 
         // Boot lifecycle step 3: going-public. Best-effort and non-blocking —
         // any failure degrades to "private" with a warning and never fails boot.
-        maybe_go_public(
-            &economy,
-            &self.manifest,
-            &id,
-            going_public,
-            self.host_base_url.as_deref(),
-        )
-        .await;
+        //
+        // Skipped on a rebuild (issue #290): the handle claim is a paid,
+        // networked, once-per-boot action, and a company that is already public
+        // does not become more public by claiming again. Firing it on every
+        // inference save would spend money for nothing.
+        if handover.is_none() {
+            maybe_go_public(
+                &economy,
+                &self.manifest,
+                &id,
+                going_public,
+                self.host_base_url.as_deref(),
+            )
+            .await;
+        }
 
         Ok(runtime)
     }
@@ -1740,6 +1924,113 @@ mod test {
             .prefix(prefix)
             .tempdir()
             .expect("tempdir")
+    }
+
+    /// Issue #242, the property this whole PR exists to create, proven across a
+    /// real restart: a host killed mid-run leaves the attempt's **partial trace
+    /// intact**, and the next boot settles the row it stranded.
+    ///
+    /// The kill is simulated by simply not settling — which is exactly what a
+    /// `SIGKILL` looks like from the store's side, and the reason the boot
+    /// reaper's claim is a proof rather than a timeout heuristic: a cycle is a
+    /// process-local spawn, so an active row at boot cannot belong to anything
+    /// still alive.
+    #[tokio::test]
+    async fn a_killed_run_keeps_its_partial_trace_and_is_settled_on_the_next_boot() {
+        use crate::ports::runs::{NewRun, RunStatus, RunStepRecord};
+        use crate::ports::types::{EventSeq, TurnStep, TurnStepKind, TurnStepStatus};
+
+        let home = tmp_home("opencompany-run-restart-");
+        let manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .expect("manifest");
+        let id = CompanyId::new("acme");
+
+        // --- boot 1: a card is dispatched, starts, writes two steps… and dies.
+        {
+            let rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest.clone())
+                .with_id(id.clone())
+                .build()
+                .await
+                .expect("first boot");
+            let runs = rt.runs();
+            runs.create_run(
+                &id,
+                NewRun {
+                    id: "run-1".to_string(),
+                    task_id: "t-1".to_string(),
+                    agent_id: "ceo".to_string(),
+                },
+            )
+            .await
+            .expect("mint");
+            runs.begin_run(&id, "run-1", EventSeq::new(3))
+                .await
+                .expect("begin");
+            for (step_seq, label, status) in [
+                (0u32, "Reading the brief", TurnStepStatus::Ok),
+                (1, "Searching the web", TurnStepStatus::Running),
+            ] {
+                runs.append_run_step(
+                    &id,
+                    &RunStepRecord {
+                        run_id: "run-1".to_string(),
+                        step_seq,
+                        at_millis: 100 + step_seq as u64,
+                        step: TurnStep {
+                            kind: TurnStepKind::ToolCall,
+                            status,
+                            label: label.to_string(),
+                            detail: None,
+                            elapsed_ms: None,
+                        },
+                    },
+                )
+                .await
+                .expect("append step");
+            }
+            // …and the process is gone. Nothing settles the row.
+        }
+
+        // --- boot 2: the builder's reaper runs before anything is dispatched.
+        let rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .expect("second boot");
+
+        let reaped = rt
+            .runs()
+            .get_run(&id, "run-1")
+            .await
+            .expect("read")
+            .expect("the row survives the restart");
+        assert_eq!(
+            reaped.status,
+            RunStatus::Failed,
+            "an attempt whose process died must not still claim to be running"
+        );
+        assert_eq!(
+            reaped.error.as_deref(),
+            Some(crate::ports::runs::ORPHAN_ERROR)
+        );
+
+        // The whole point: the steps written before the kill are still there,
+        // including the tool call that never got to finish.
+        let steps = rt
+            .runs()
+            .list_run_steps(&id, "run-1")
+            .await
+            .expect("list steps");
+        assert_eq!(steps.len(), 2, "the partial trace must survive the restart");
+        assert_eq!(steps[0].step.label, "Reading the brief");
+        assert_eq!(steps[0].step.status, TurnStepStatus::Ok);
+        assert_eq!(
+            steps[1].step.status,
+            TurnStepStatus::Running,
+            "the call that was in flight when the host died reads as in flight"
+        );
     }
 
     #[test]
@@ -2653,6 +2944,7 @@ mod test {
                 }],
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
                 template_provenance: None,
             })
             .await

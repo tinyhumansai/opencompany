@@ -211,10 +211,34 @@ impl ApprovalRequestQueue {
         self.grants.clone()
     }
 
-    /// The number of queued requests (test/observability).
-    #[cfg(test)]
+    /// The number of queued requests.
+    ///
+    /// Read by a dispatched card **before** its turns run, so it can tell which
+    /// of the queue's entries are its own (issue #242) — the queue is shared
+    /// with the cycle's chat turns, and [`push`](Self::push) only ever appends,
+    /// so a position taken now stays a valid boundary until the cycle-end drain.
     pub fn queued(&self) -> usize {
         self.inner.lock().expect("approval request queue").len()
+    }
+
+    /// Stamps `run_id` onto every request queued at or after `from`, returning
+    /// how many were stamped (issue #242).
+    ///
+    /// This is where an approval learns which task attempt is waiting on it. It
+    /// happens at the **dispatch** boundary rather than in
+    /// [`ApprovalPolicy::effect_for`] because that is the only place the run is
+    /// unambiguous: the policy is per-agent and outlives every run, whereas a
+    /// dispatched card knows exactly which of the queue's entries its own turns
+    /// added. Requests below `from` belong to a chat turn earlier in the same
+    /// cycle and are deliberately left `None`.
+    pub fn stamp_run(&self, from: usize, run_id: &str) -> usize {
+        let mut guard = self.inner.lock().expect("approval request queue");
+        let mut stamped = 0;
+        for request in guard.iter_mut().skip(from) {
+            request.effect.run_id = Some(run_id.to_string());
+            stamped += 1;
+        }
+        stamped
     }
 }
 
@@ -376,6 +400,7 @@ impl ApprovalPolicy {
             first_time_counterparty: false,
             payload: args.clone(),
             agent: self.agent.clone(),
+            run_id: None,
         }
     }
 
@@ -1672,6 +1697,57 @@ mod tests {
         );
     }
 
+    /// Issue #242: a dispatched card claims only the requests **its own** turns
+    /// added. The queue is shared with any chat turn earlier in the same cycle,
+    /// so stamping from position zero would tag somebody else's approval with
+    /// this run and make the card read as waiting on an approval it never
+    /// triggered.
+    #[test]
+    fn stamping_a_run_claims_only_the_requests_that_came_after_the_boundary() {
+        let queue = ApprovalRequestQueue::default();
+        let queued = |kind: &str| ApprovalRequest {
+            tool: kind.to_string(),
+            reason: "gated".to_string(),
+            effect: Effect {
+                kind: kind.to_string(),
+                group: EffectGroup::Other,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "kind": kind }),
+                agent: Some("ceo".to_string()),
+                run_id: None,
+            },
+        };
+
+        // A chat turn earlier in this cycle parked one…
+        queue.push(queued("chat.thing"));
+        // …and the dispatch takes its boundary here.
+        let boundary = queue.queued();
+        assert_eq!(boundary, 1);
+        queue.push(queued("dispatch.thing"));
+        queue.push(queued("dispatch.other"));
+
+        assert_eq!(queue.stamp_run(boundary, "run-1"), 2);
+
+        let drained = queue.drain(10);
+        assert_eq!(drained.len(), 3);
+        assert_eq!(
+            drained[0].effect.run_id, None,
+            "the chat turn's approval belongs to no attempt"
+        );
+        assert_eq!(drained[1].effect.run_id.as_deref(), Some("run-1"));
+        assert_eq!(drained[2].effect.run_id.as_deref(), Some("run-1"));
+    }
+
+    /// A dispatch that parked nothing stamps nothing — which is what keeps a
+    /// clean run reading as `Succeeded` rather than as waiting on a person.
+    #[test]
+    fn a_dispatch_that_parked_nothing_claims_nothing() {
+        let queue = ApprovalRequestQueue::default();
+        assert_eq!(queue.stamp_run(queue.queued(), "run-1"), 0);
+    }
+
     /// A queue nobody installed stays inert — the default policy behaves exactly
     /// as it did before #172 for every non-harness construction site.
     #[tokio::test]
@@ -1761,6 +1837,7 @@ mod tests {
             cached_input_tokens: 0,
             cost_usd: usd,
             kind: SampleKind::Inference,
+            run_id: None,
         }
     }
 

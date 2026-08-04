@@ -91,6 +91,7 @@ pub fn search_call_sample(
         cached_input_tokens: 0,
         cost_usd: attributed_cost_usd(reported_cost_usd),
         kind: SampleKind::SearchCall,
+        run_id: None,
     }
 }
 

@@ -1,19 +1,12 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
-  ChartColumnBig,
   FolderClosed,
-  Flag,
   LayoutDashboard,
   type LucideIcon,
-  MessageSquareWarning,
   MessagesSquare,
-  Plug,
   Settings2,
   ShieldCheck,
-  Sparkles,
   SquareKanban,
-  UserCog,
-  Users,
   Workflow,
 } from "lucide-react";
 
@@ -24,7 +17,6 @@ import {
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
@@ -33,15 +25,15 @@ import {
   SidebarMenuItem,
   SidebarProvider,
   SidebarRail,
-  SidebarTrigger,
 } from "@/components/ui/sidebar";
-import { Button } from "@/components/ui/button";
-import { CompanySwitcher } from "@/components/company-switcher";
 import { FeedbackDialog } from "@/components/feedback-dialog";
+import {
+  AutoCollapse,
+  RESTING_ROW,
+  SidebarCollapseToggle,
+  SidebarControls,
+} from "@/components/sidebar-controls";
 import { TourController } from "@/tour/TourController";
-import { StatusPill } from "@/components/status-pill";
-import { ThemeToggle } from "@/components/theme-toggle";
-import { DiscordIcon } from "@/components/discord-icon";
 import { useCompany } from "@/hooks/use-company";
 import { type AgentReplyEvent, type CompanyStreamEvent, useEvents } from "@/hooks/use-events";
 import { useHashView } from "@/hooks/use-hash-view";
@@ -49,18 +41,20 @@ import { toast } from "sonner";
 
 import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
 import { CONNECTION_PROVIDERS } from "@/lib/connections";
-import { DISCORD_INVITE_URL } from "@/lib/links";
+import { defaultDesks } from "@/lib/desks";
+import { fromDto } from "@/lib/team";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
+import { ChatView } from "@/views/ChatView";
+import { DEFAULT_CHANNEL, deskFromDto, dmChannelId, type Transcripts } from "@/views/chat/model";
 import { Conversation } from "@/views/Conversation";
+import { TeamView } from "@/views/TeamView";
 import { ApprovalsView } from "@/views/ApprovalsView";
 import { TasksView } from "@/views/TasksView";
-import { TeamView } from "@/views/TeamView";
-import { PeopleView } from "@/views/PeopleView";
-import { SkillsView } from "@/views/SkillsView";
-import { ConnectionsView } from "@/views/ConnectionsView";
-import { SettingsView } from "@/views/SettingsView";
+import { InboxView } from "@/views/InboxView";
+import { MemoryView } from "@/views/MemoryView";
 import { FeedbackView } from "@/views/FeedbackView";
+import { SettingsSection } from "@/views/SettingsSection";
 
 // React Flow is heavy and only used here — load it on demand.
 const WorkflowsView = lazy(() =>
@@ -70,25 +64,23 @@ const WorkflowsView = lazy(() =>
 const WorkspaceView = lazy(() =>
   import("@/views/WorkspaceView").then((m) => ({ default: m.WorkspaceView })),
 );
-// Recharts is heavy — load the usage dashboard on demand.
-const UsageView = lazy(() => import("@/views/UsageView").then((m) => ({ default: m.UsageView })));
+// Recharts-backed — load on demand.
+const FinancesView = lazy(() =>
+  import("@/views/FinancesView").then((m) => ({ default: m.FinancesView })),
+);
 
-// Issue #302: Inbox, Desks, Brain and Finances are hidden from the console, not
-// retired. Their host routes, stores and tests are untouched — only the
-// operator-facing entry points are gone, so re-listing a view here is all it
-// takes to bring one back. The view components stay in `src/views/`.
 export type View =
   | "overview"
-  | "people"
+  | "chat"
   | "conversation"
+  | "inbox"
   | "tasks"
   | "team"
-  | "skills"
   | "workspace"
+  | "memory"
   | "approvals"
   | "workflows"
-  | "usage"
-  | "connections"
+  | "finances"
   | "settings"
   | "feedback";
 
@@ -98,57 +90,42 @@ interface NavItem {
   icon: LucideIcon;
 }
 
-interface NavGroup {
-  label: string;
-  items: NavItem[];
-}
-
-const NAV: NavGroup[] = [
-  {
-    label: "Operate",
-    items: [
-      { view: "overview", label: "Overview", icon: LayoutDashboard },
-      { view: "conversation", label: "Conversation", icon: MessagesSquare },
-      { view: "tasks", label: "Tasks", icon: SquareKanban },
-      { view: "team", label: "Team", icon: Users },
-      { view: "skills", label: "Skills", icon: Sparkles },
-      { view: "workspace", label: "Workspace", icon: FolderClosed },
-      { view: "approvals", label: "Approvals", icon: ShieldCheck },
-      { view: "workflows", label: "Workflows", icon: Workflow },
-    ],
-  },
-  {
-    label: "Configure",
-    items: [
-      { view: "usage", label: "Usage", icon: ChartColumnBig },
-      { view: "connections", label: "Connections", icon: Plug },
-      { view: "people", label: "People", icon: UserCog },
-      { view: "settings", label: "Settings", icon: Settings2 },
-    ],
-  },
-  {
-    label: "Support",
-    items: [{ view: "feedback", label: "Feedback", icon: MessageSquareWarning }],
-  },
+// One flat list. The nav was grouped under "Operate" and "Configure" when the
+// second group held five entries; now that configuration is a section of its
+// own, a heading over two rows labelled more than it sorted.
+const NAV: NavItem[] = [
+  { view: "overview", label: "Overview", icon: LayoutDashboard },
+  { view: "chat", label: "Chat", icon: MessagesSquare },
+  { view: "tasks", label: "Tasks", icon: SquareKanban },
+  { view: "workspace", label: "Workspace", icon: FolderClosed },
+  { view: "approvals", label: "Approvals", icon: ShieldCheck },
+  { view: "workflows", label: "Workflows", icon: Workflow },
+  { view: "settings", label: "Settings", icon: Settings2 },
 ];
 
-const TITLES: Record<View, string> = {
-  overview: "Overview",
-  conversation: "Conversation",
-  tasks: "Tasks",
-  team: "Team",
-  skills: "Skills",
-  workspace: "Workspace",
-  approvals: "Approvals",
-  workflows: "Workflows",
-  usage: "Usage",
-  connections: "Connections",
-  people: "People",
-  settings: "Settings",
-  feedback: "Feedback",
-};
+/**
+ * Routable without a nav entry — reachable by URL, absent from the sidebar.
+ *
+ * Feedback is linked from the sidebar footer instead. The rest are parked
+ * rather than retired (issue #302 for Inbox, Brain and Finances; the chat
+ * rebuild for Conversation and Team): their host routes, stores and e2e specs
+ * are untouched, and re-listing one in `NAV` above is all it takes to bring it
+ * back. Conversation and Team are the surfaces the Chat workspace replaces —
+ * everything they can do it can do in one screen, including the teammate
+ * budget controls `MembersPane` ported from Team (issue #360) — but they
+ * keep answering `#/conversation` and `#/team` until the chat covers the
+ * last of what they still do better (a desk's persisted transcript).
+ */
+const HIDDEN_VIEWS: View[] = [
+  "feedback",
+  "inbox",
+  "memory",
+  "finances",
+  "conversation",
+  "team",
+];
 
-const VIEWS = NAV.flatMap((g) => g.items.map((i) => i.view));
+const VIEWS: View[] = [...NAV.map((i) => i.view), ...HIDDEN_VIEWS];
 
 /**
  * Operator-facing copy for a `connect_error` code from the host's OAuth
@@ -200,10 +177,16 @@ export function AppShell({
   onSwitchCompany,
   onBackToPicker,
 }: Props) {
-  const [view, setView] = useHashView<View>(VIEWS, "overview");
+  const [view, sub, navigate] = useHashView<View>(VIEWS, "overview");
+  // Most call sites only ever change the top-level view.
+  const setView = useCallback((next: View, nextSub?: string) => navigate(next, nextSub), [navigate]);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  // The shell owns every channel's transcript, not `ChatView` — the shell
+  // mounts and unmounts `ChatView` per route, so component-local state there
+  // would be discarded on every trip away from Chat and back.
+  const [transcripts, setTranscripts] = useState<Transcripts>({});
   const [threads, setThreads] = useState(defaultThreads);
   const [activeThreadId, setActiveThreadId] = useState("main");
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
   // A monotonic nonce bumped on every task-lifecycle SSE event, so the
   // company-chat in-flight steer strip (issue #111) refetches live.
   const [taskEventTick, setTaskEventTick] = useState(0);
@@ -240,10 +223,13 @@ export function AppShell({
   // OAuth connect bounce-back: the host's callback redirects the browser to
   // `…/connections?connected={provider}` after storing the token, or to
   // `…/connections?connect_error={code}[&provider={id}]` when the handshake
-  // failed. Land the operator on the Connections view either way, say what
+  // failed. Land the operator on the Connections page either way, say what
   // happened, then strip the params so a refresh doesn't re-fire them. Runs
   // once; StrictMode's double invoke is harmless because the first run clears
   // the params the second reads.
+  //
+  // Connections is a page of the Settings section now (`#/settings/connections`),
+  // so the bounce-back lands there rather than on a top-level view.
   //
   // The failure half matters as much as the success half: before issue #300 the
   // host answered a cancelled or expired handshake with a JSON body, which the
@@ -267,7 +253,7 @@ export function AppShell({
       "",
       window.location.pathname + (query ? `?${query}` : "") + window.location.hash,
     );
-    setView("connections");
+    setView("settings", "connections");
     // The callback param carries the raw provider id (e.g. "slack"); show the
     // catalog display name ("Slack") when we know it, falling back to the id.
     const providerName = providerId
@@ -311,6 +297,29 @@ export function AppShell({
         });
     };
 
+    // Same rehydration, into `transcripts` instead of `threads` — the Chat
+    // workspace's own transcript store. Chat's channel id and the host's
+    // thread id agree for a desk (`deskFromDto` keeps `DeskDto.id`
+    // untouched), but not for a DM: the channel id is the console-local
+    // `dmChannelId`, while the thread id `getChatHistory`/`chat` read is the
+    // roster agent id (see `ChatView`'s `send`) — so this takes both.
+    const hydrateChannel = (channelId: string, threadId: string) => {
+      client
+        .getChatHistory(threadId, company)
+        .then((entries) => {
+          if (cancelled || entries.length === 0) return;
+          const hydrated = fromHistory(entries);
+          setTranscripts((t) => {
+            const known = new Set((t[channelId] ?? []).map((m) => m.id));
+            const fresh = hydrated.filter((m) => !known.has(m.id));
+            return fresh.length === 0 ? t : { ...t, [channelId]: [...fresh, ...(t[channelId] ?? [])] };
+          });
+        })
+        .catch(() => {
+          /* host without `/chat/history`, or offline — channel stays empty */
+        });
+    };
+
     client
       .listDesks(company)
       .then(async (desks) => {
@@ -336,12 +345,17 @@ export function AppShell({
           });
         });
         resolved.forEach((t) => hydrate(t.id));
+
+        const chatDesks = desks.length ? desks.map(deskFromDto) : defaultDesks();
+        chatDesks.forEach((d) => hydrateChannel(d.id, d.id));
+        team.map(fromDto).forEach((m) => hydrateChannel(dmChannelId(m), m.id));
       })
       .catch(() => {
         // Host without `/desks`, or offline — keep the static default
         // threads, but the operator/General line still deserves a
         // rehydration attempt (it's the one every deployment has).
         defaultThreads().forEach((t) => hydrate(t.id));
+        defaultDesks().forEach((d) => hydrateChannel(d.id, d.id));
       });
 
     return () => {
@@ -357,9 +371,18 @@ export function AppShell({
       ts.map((t) => (t.id === threadId ? { ...t, messages: updater(t.messages) } : t)),
     );
 
-  // Approval decisions and other events land in the active thread's transcript.
-  const noteSystem = (line: string) =>
+  // Approval decisions and other events land in a transcript rather than
+  // vanishing. Both chat surfaces get the line: Chat's `main` channel gets it
+  // appended directly (the shell owns `transcripts`, not `ChatView`, so this
+  // survives `ChatView` unmounting), and the parked Conversation appends to
+  // its active thread.
+  const noteSystem = (line: string) => {
+    setTranscripts((t) => ({
+      ...t,
+      [DEFAULT_CHANNEL]: [...(t[DEFAULT_CHANNEL] ?? []), makeMessage("system", line)],
+    }));
     setThreadMessages(activeThreadId, (m) => [...m, makeMessage("system", line)]);
+  };
 
   // Inject an `AgentReply` pushed over the SSE feed (issue #66) into its desk
   // thread's transcript. Dedupe against our own optimistic echo: the backend
@@ -487,82 +510,69 @@ export function AppShell({
 
   return (
     <SidebarProvider className="h-svh overflow-hidden">
+      <AutoCollapse view={view} />
       <Sidebar collapsible="icon">
         <SidebarHeader>
-          <CompanySwitcher
-            active={feed.status}
-            companies={companies}
-            onSwitch={onSwitchCompany}
-            onBackToPicker={onBackToPicker}
-          />
+          <SidebarCollapseToggle />
         </SidebarHeader>
         <SidebarContent data-tour="sidebar">
-          {NAV.map((group) => (
-            <SidebarGroup key={group.label}>
-              <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
-              <SidebarMenu>
-                {group.items.map((item) => (
-                  <SidebarMenuItem key={item.view} data-tour={`nav-${item.view}`}>
-                    <SidebarMenuButton
-                      isActive={view === item.view}
-                      tooltip={item.label}
-                      onClick={() => setView(item.view)}
-                    >
-                      <item.icon />
-                      <span>{item.label}</span>
-                    </SidebarMenuButton>
-                    {item.view === "approvals" && pending > 0 && (
-                      <SidebarMenuBadge>{pending}</SidebarMenuBadge>
-                    )}
-                  </SidebarMenuItem>
-                ))}
-              </SidebarMenu>
-            </SidebarGroup>
-          ))}
+          <SidebarGroup>
+            <SidebarMenu>
+              {NAV.map((item) => (
+                <SidebarMenuItem key={item.view} data-tour={`nav-${item.view}`}>
+                  <SidebarMenuButton
+                    isActive={view === item.view}
+                    tooltip={item.label}
+                    onClick={() => setView(item.view)}
+                    className={RESTING_ROW}
+                  >
+                    <item.icon />
+                    <span>{item.label}</span>
+                  </SidebarMenuButton>
+                  {item.view === "approvals" && pending > 0 && (
+                    <SidebarMenuBadge>{pending}</SidebarMenuBadge>
+                  )}
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroup>
         </SidebarContent>
         <SidebarFooter>
-          <SidebarMenu>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                tooltip="Join our Discord"
-                render={<a href={DISCORD_INVITE_URL} target="_blank" rel="noreferrer" />}
-              >
-                <DiscordIcon className="size-4" />
-                <span>Join our Discord</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
+          <SidebarControls
+            lifecycleState={feed.status.lifecycle}
+            companies={companies}
+            activeCompany={company}
+            onSwitchCompany={onSwitchCompany}
+            onBackToPicker={onBackToPicker}
+            view={view}
+            onNavigate={setView}
+          />
         </SidebarFooter>
         <SidebarRail />
       </Sidebar>
 
-      <SidebarInset className="min-h-0">
-        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
-          <h1 className="text-sm font-semibold">{TITLES[view]}</h1>
-          <div className="ml-auto flex items-center gap-2">
-            <StatusPill lifecycle={feed.status.lifecycle} className="hidden sm:inline-flex" />
-            <Button
-              variant="outline"
-              size="sm"
-              className="hidden sm:inline-flex"
-              onClick={() => setFeedbackOpen(true)}
-            >
-              <Flag className="size-4" />
-              Flag something
-            </Button>
-            <ThemeToggle />
-          </div>
-        </header>
-
+      {/* `min-w-0`: the inset is a flex item beside the sidebar, and a flex
+          item's default `min-width: auto` floors it at its content's
+          min-content width. That floor won — the inset measured a full window
+          wide while sitting a sidebar's width to the right of the origin, so
+          its last ~256px hung past the right edge of the window inside a
+          wrapper that clips and cannot scroll. On the task board that clipped
+          strip held the "Done" column, which is why a card could not be dragged
+          into it (issue #334); every view was losing the same strip. */}
+      <SidebarInset className="min-h-0 min-w-0">
         <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {view === "overview" && (
-            <Overview
-              feed={feed}
+            <Overview client={client} company={company} />
+          )}
+          {view === "chat" && (
+            <ChatView
               client={client}
               company={company}
-              onNavigate={setView}
-              onFlag={() => setFeedbackOpen(true)}
+              sub={sub}
+              onNavigate={(channelId) => navigate("chat", channelId)}
+              onReply={() => void feed.refresh()}
+              transcripts={transcripts}
+              setTranscripts={setTranscripts}
             />
           )}
           {view === "conversation" && (
@@ -580,6 +590,7 @@ export function AppShell({
               onSendEnd={onSendEnd}
             />
           )}
+          {view === "inbox" && <InboxView client={client} company={company} />}
           {view === "tasks" && (
             <TasksView
               client={client}
@@ -594,8 +605,7 @@ export function AppShell({
             />
           )}
           {view === "team" && <TeamView client={client} company={company} />}
-          {view === "people" && <PeopleView client={client} company={company} />}
-          {view === "skills" && <SkillsView client={client} company={company} />}
+          {view === "memory" && <MemoryView client={client} company={company} />}
           {view === "workspace" && (
             <Suspense
               fallback={
@@ -613,7 +623,7 @@ export function AppShell({
               company={company}
               feed={feed}
               onResolved={noteSystem}
-              onGoToConversation={() => setView("conversation")}
+              onGoToConversation={() => setView("chat")}
             />
           )}
           {view === "workflows" && (
@@ -631,20 +641,26 @@ export function AppShell({
               />
             </Suspense>
           )}
-          {view === "usage" && (
+          {view === "finances" && (
             <Suspense
               fallback={
                 <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-                  Loading usage…
+                  Loading finances…
                 </div>
               }
             >
-              <UsageView client={client} company={company} />
+              <FinancesView client={client} company={company} />
             </Suspense>
           )}
-          {view === "connections" && <ConnectionsView client={client} company={company} />}
           {view === "settings" && (
-            <SettingsView client={client} company={company} feed={feed} onFlag={() => setFeedbackOpen(true)} />
+            <SettingsSection
+              client={client}
+              company={company}
+              feed={feed}
+              sub={sub}
+              onNavigate={(page) => navigate("settings", page)}
+              onFlag={() => setFeedbackOpen(true)}
+            />
           )}
           {view === "feedback" && <FeedbackView client={client} company={company} />}
         </main>

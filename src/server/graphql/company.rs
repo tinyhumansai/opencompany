@@ -232,11 +232,17 @@ impl CompanyGql {
         // reads of the same roster must not drift, so the cap columns are
         // resolved here by the same rule (one meter read, only when somebody is
         // capped; spend paired with the cap).
+        // Issue #343: the scan is over EFFECTIVE caps across the whole roster
+        // (manifest agents plus overlay teammates), because a console override
+        // can cap somebody the manifest never did — including a teammate the
+        // manifest does not contain at all.
         let any_capped = record
             .manifest
             .agents
             .iter()
-            .any(|agent| agent.budget_usd_daily.is_some());
+            .map(|agent| &agent.id)
+            .chain(record.overlay_agents.iter().map(|agent| &agent.id))
+            .any(|id| record.effective_budget(id).is_some());
         let spend_today = if any_capped {
             let since = crate::metering::utc_day_start_millis(crate::ports::now_millis());
             Some(self.runtime.usage().query(&self.id, since).await?)
@@ -249,29 +255,44 @@ impl CompanyGql {
                 .map(|samples| crate::metering::usd_spent_by_agent(samples, id))
         };
 
+        // Issue #343: caps and their attribution resolve through the record for
+        // BOTH arms, exactly as the REST handler does — an overlay teammate is
+        // no longer hardcoded uncapped.
+        let row = |id: &str, name: Option<String>, role: String, description: Option<String>| {
+            let cap = record.effective_budget(id);
+            let attribution = record.budget_override(id);
+            TeamMemberGql {
+                id: ID(id.to_string()),
+                name,
+                role,
+                description,
+                inbox_enabled: enabled(id),
+                budget_usd_daily: cap,
+                spent_today_usd: cap.and_then(|_| spent(id)),
+                budget_set_by: attribution.map(|entry| entry.set_by.id.clone()),
+                budget_set_at_millis: attribution.map(|entry| entry.at_millis as f64),
+            }
+        };
         let mut out: Vec<TeamMemberGql> = record
             .manifest
             .agents
             .iter()
-            .map(|agent| TeamMemberGql {
-                id: ID(agent.id.clone()),
-                name: None,
-                role: agent.role.clone(),
-                description: agent.description.clone(),
-                inbox_enabled: enabled(&agent.id),
-                budget_usd_daily: agent.budget_usd_daily,
-                spent_today_usd: agent.budget_usd_daily.and_then(|_| spent(&agent.id)),
+            .map(|agent| {
+                row(
+                    &agent.id,
+                    None,
+                    agent.role.clone(),
+                    agent.description.clone(),
+                )
             })
             .collect();
-        out.extend(record.overlay_agents.iter().map(|agent| TeamMemberGql {
-            id: ID(agent.id.clone()),
-            name: Some(agent.name.clone()),
-            role: agent.role.clone(),
-            description: agent.description.clone(),
-            inbox_enabled: enabled(&agent.id),
-            // Overlay teammates are uncapped in v1.
-            budget_usd_daily: None,
-            spent_today_usd: None,
+        out.extend(record.overlay_agents.iter().map(|agent| {
+            row(
+                &agent.id,
+                Some(agent.name.clone()),
+                agent.role.clone(),
+                agent.description.clone(),
+            )
         }));
         Ok(out)
     }
@@ -336,13 +357,24 @@ pub struct TeamMemberGql {
     pub description: Option<String>,
     /// Whether this teammate has an enabled inbox.
     pub inbox_enabled: bool,
-    /// This teammate's manifest `budget_usd_daily` cap (issue #304), or null
-    /// when it has none. Null-vs-set is the capped/uncapped distinction — `0`
-    /// would mean "capped at nothing".
+    /// This teammate's daily spend cap in force (issue #304), or null when it
+    /// has none. Null-vs-set is the capped/uncapped distinction — `0` would
+    /// mean "capped at nothing".
+    ///
+    /// Since #343 this is the **effective** cap: an operator override set from
+    /// the console when one is stored, the manifest value otherwise.
     pub budget_usd_daily: Option<f64>,
     /// What this teammate has spent since 00:00 UTC; non-null only alongside a
     /// cap.
     pub spent_today_usd: Option<f64>,
+    /// The user id of the admin who last set this teammate's cap from the
+    /// console (issue #343); null when no override is stored. Non-null even
+    /// when the override *removed* the cap, which is how "nobody capped this"
+    /// is told from "an admin uncapped this".
+    pub budget_set_by: Option<String>,
+    /// When that cap was set (epoch millis). `Float` round-trips the full u64
+    /// range that would overflow GraphQL's `Int`, matching `Approval.atMillis`.
+    pub budget_set_at_millis: Option<f64>,
 }
 
 /// Internal desk projection shared between `chats` and `chat`.

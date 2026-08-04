@@ -75,21 +75,17 @@ bundle hangs off through `store::resolve_home`, in this order:
 | --- | --- | --- |
 | 1 | `--home <DIR>` | `<DIR>` verbatim — an explicit flag is never overridden by the environment |
 | 2 | `OPENCOMPANY_DATA_DIR` | its value verbatim, so bundles land at `<root>/companies/<slug>` — exactly the layout above |
-| 3 | neither | `$HOME/.opencompany/companies` (the legacy default; see below) |
+| 3 | neither | `$HOME/.opencompany` (a relative `.opencompany` when `$HOME` is unset) |
 
 An empty `OPENCOMPANY_DATA_DIR` counts as unset — it would otherwise root the
 instance at the process working directory.
 
-Two consequences worth knowing:
+All three branches resolve the home to the **workspace root**, so `Bundle`'s own
+`companies/` segment puts bundles at `<root>/companies/<slug>` in every case —
+exactly the layout above, and exactly `DataLayout::companies_dir()`.
 
-- **The legacy default is one level deeper than the layout above.** With neither
-  the flag nor the variable set, the home is `$HOME/.opencompany/companies` and
-  `Bundle` appends a `companies/` of its own, so bundles sit at
-  `~/.opencompany/companies/companies/<slug>` while `DataLayout` materializes
-  `~/.opencompany/{memory,store,files,logs,tmp}`. That extra level is a wart kept
-  for compatibility with existing local installs rather than silently relocating
-  their data. Setting `OPENCOMPANY_DATA_DIR` gives the canonical single-root
-  layout.
+One consequence worth knowing:
+
 - **`--home` moves the bundles but not the workspace.** It places company
   bundles only; `memory/`, `store/`, `files/`, `logs/` and `tmp/` always follow
   `OPENCOMPANY_DATA_DIR`. So two hosts isolated by `--home` alone still share one
@@ -97,7 +93,88 @@ Two consequences worth knowing:
   whenever they are not aligned. Prefer `OPENCOMPANY_DATA_DIR`, which moves the
   whole instance. A hosted tenant sets both to the same value
   (`docker/entrypoint.sh` passes `--home "$OPENCOMPANY_DATA_DIR"`), so it never
-  warns — nor does the untouched local default.
+  warns — nor does the local default, whose home and data root are now the same
+  path. Passing `--home ~/.opencompany/companies` by hand recreates the legacy
+  doubled shape below and does warn, correctly.
+
+#### Migrating a legacy doubled install (`src/store/migrate.rs`)
+
+The default home used to append a `companies` leaf of its own, so a default local
+install's bundles were nested one level too deep at
+`~/.opencompany/companies/companies/<slug>` while `DataLayout` materialized
+`~/.opencompany/{memory,store,files,logs,tmp}` beside the *first* `companies/`. A
+local sqlite database was orphaned the same way, at
+`~/.opencompany/companies/opencompany.db`, because `serve` hands the resolved
+home to `open_storage`. So were the two runtime trees that hang off the home
+rather than off a bundle: the harness agent workspaces (`<home>/harness`) and the
+MCP runtime registry (`<home>/mcp`, whose persisted installs and stored
+environment values are reconnected on boot).
+
+Dropping the leaf without moving that data would leave every existing local
+company invisible, so `serve`, `export`, and `import` all run
+`store::migrate::migrate_legacy_nest` against the resolved home before reading
+anything:
+
+- No `<home>/companies/companies` directory is a no-op. A hosted tenant takes
+  this branch on every boot: two `stat`s that find nothing.
+- A nest that is **bundle-shaped** — holding any of the top-level files
+  (`company.toml`, `meta.json`, `events.jsonl`, `ledger.jsonl`, `tasks.json`, …)
+  or subdirectories (`keys/`, `secrets/`, `memory/`, `context/`, …) that only a
+  company owns — is a real bundle slugged `companies` and is left exactly as it
+  is. A manifest is deliberately *not* the test: `Bundle::ensure_dirs` creates a
+  bundle with neither marker at ~20 call sites, and under
+  `OPENCOMPANY_STORAGE=sqlite|mongodb` the manifest never reaches the filesystem
+  at all while the keys, secrets and task board still do — so a marker test would
+  have dissolved exactly the installs that have no manifest to find.
+- Only entries that are **themselves bundle-shaped directories** are relocated,
+  the same test one level down. Anything else stays where it is, silently: the
+  legacy nest holds nothing but bundles, so an entry that does not look like one
+  is not something the migration knows where to put.
+- Any `opencompany.db` (with its `-wal`/`-shm` siblings, as a set) moves from
+  `<home>/companies/` to `<home>/`. Only **regular files** count as the database:
+  a company slugged `opencompany.db` owns the directory at that exact path, and
+  relocating it would delete the company.
+- `<home>/companies/{harness,mcp}` move up to `<home>/{harness,mcp}` under the
+  same shape guard — a company really can be slugged `harness`, and its canonical
+  bundle sits at exactly the path the legacy tree occupied.
+- An occupied destination is **skipped**, never merged: two copies of one company
+  hold two event logs and two signing keys, which cannot be interleaved. Both
+  copies stay put and a warning names both paths.
+- Files move by `link`+`unlink`, never by `rename`. A rename replaces a regular
+  file silently, and a "is the destination free?" check taken beforehand is stale
+  the instant it is read — a `serve` that has already migrated is writing a live
+  `-wal` at that path, and a rename over it drops every committed transaction the
+  log still holds. A hard link fails when the destination exists, so the check and
+  the move are one indivisible step. A crash between the link and the unlink
+  leaves one file reachable under both names, which the next run recognises by
+  device and inode and finishes rather than reporting as two databases.
+  Directories keep `rename`, which cannot replace a populated directory
+  (`ENOTEMPTY`) or a regular file (`ENOTDIR`) at all.
+- The nest directory is removed only once emptied, so a crash mid-migration
+  resumes on the next boot. Re-running a migrated install is silent.
+- The database set resumes the same way. It is detected from **any** surviving
+  member, not from `opencompany.db` alone, so a run that moved the database and
+  then died is finished by the next boot rather than being read as complete —
+  which would have paired a relocated database with a stranded write-ahead log
+  and lost whatever that log still held.
+- A source another process moved first is a success, not a failure. Running
+  `opencompany export` against a home a `serve` process is booting is ordinary
+  and both migrate; the loser of that race must not abort on a `NotFound` that
+  means "already done". Note that this is race *tolerance*, not a concurrency
+  guarantee: two processes sharing one home is unsupported for the same reason
+  the runtime journal is single-writer, and this migration does not change that.
+  What the no-replace moves above do guarantee is that losing such a race can
+  never cost data, whatever the interleaving.
+
+An install whose migration genuinely cannot complete — `EXDEV` because
+`companies/` is a mount point, a root-owned or read-only nest — still boots:
+`--home ~/.opencompany/companies` resolves every bundle exactly where it already
+sits and finds no nest beneath it to migrate. That shape warns about the split
+workspace, correctly, and is the supported way to run an install this migration
+cannot move.
+
+Moves are printed on stderr rather than logged through `warn!`, which the default
+`EnvFilter` drops unless `RUST_LOG` is set.
 
 `OPENCOMPANY_HOME` is **not** a synonym and is **not supported**. It was never
 wired to anything, so setting it used to be ignored silently. The resolver now

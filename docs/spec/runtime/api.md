@@ -47,6 +47,7 @@ POST   …/tasks                              create a task card (`originChatId`
 PATCH  …/tasks/{taskId}                      edit / move a task
 DELETE …/tasks/{taskId}                      delete a task
 GET    …/tasks/{taskId}/export               the task's record as a readable HTML document (#352)
+POST   …/tasks/{taskId}/discussion           post a message to the card's thread (#335)
 POST   …/memory                             add a memory fact
 DELETE …/memory/{factId}                     delete a memory fact
 GET    …/workspace                          the whole tree (metadata; no bodies)
@@ -63,6 +64,8 @@ PUT    …/skills/{slug}                       enable / disable a skill
 POST   …/team                               add an operator-overlay teammate
 DELETE …/team/{agentId}                      remove an overlay teammate
 PUT    …/team/{agentId}/inbox                toggle a teammate's inbox
+PUT    …/team/{agentId}/budget               set / change / remove a daily cap
+DELETE …/team/{agentId}/budget               reset the cap to the manifest default
 POST   …/inboxes/{key}/read                  mark inbox messages read
 POST   …/inboxes/ingest                     HMAC-signed inbound email → inbox
 GET    …/inboxes                            list inboxes + unread counts
@@ -96,6 +99,31 @@ Team writes are an **operator overlay** persisted through the store, merged
 into the manifest roster at read time — the version-controlled `company.toml`
 is never rewritten. In v1 overlay teammates are **roster-only**: they appear in
 the roster and get an inbox, but no harness `Agent` is built for them yet.
+
+The two **budget** routes (issue #343) are how a teammate's `budget_usd_daily`
+becomes changeable without a redeploy. Both are **admin-only** — a member gets
+`403` and an unauthenticated caller `401` — and both stamp who set the cap and
+when, surfaced as `budgetSetBy` / `budgetSetAtMillis` on the roster row. A
+stored cap wins over the manifest, and the change is enforced on the teammate's
+**next dispatch**: the harness fingerprints the override set alongside its other
+freshness axes, so the roster is rebuilt before the next turn rather than at the
+next process start.
+
+`PUT` takes `{"budgetUsdDaily": <number|null>}` and the three cases stay apart
+on the wire, which is the point of the route:
+
+| body | effect |
+|---|---|
+| `{"budgetUsdDaily": 5}` | cap at $5/day |
+| `{"budgetUsdDaily": 0}` | cap at nothing — a real cap, not "uncapped" |
+| `{"budgetUsdDaily": null}` | remove the cap, beating a manifest cap |
+| `{}` | **`422`** — an omitted key is never read as "remove the cap" |
+
+A negative or non-finite amount is `400`; an unknown teammate is `404`.
+`DELETE` drops the override so the manifest default applies again — distinct
+from `PUT null`, and not expressible by it. `POST …/team` also accepts an
+optional `budgetUsdDaily`, so a console-created teammate can be given a cap at
+creation; only that form of the add requires an admin.
 
 ### Credential-bearing surfaces (feature-gated)
 

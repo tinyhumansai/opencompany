@@ -3,6 +3,7 @@
 // the client-side `tasks-sample` illustrative data.
 
 import type { OpenCompanyClient } from "./client";
+import type { RunSummary } from "./runs";
 
 /** A board card as the host returns it. */
 export interface Task {
@@ -56,15 +57,43 @@ export interface PatchTask {
   assignee?: string;
 }
 
-export function listTasks(client: OpenCompanyClient, company: string | null): Promise<Task[]> {
+export function listTasks(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<Task[]> {
   return client.get<Task[]>(`${client.scopeFor(company)}/tasks`);
 }
 
 /**
  * A stable wire word for what a {@link TimelineEntry} records (#185). The host
  * emits exactly this set today; re-transcribed here so `tsc` pins the contract.
+ *
+ * Widened **additively** by #242 with the three step kinds a run's trace
+ * produces (`tool_call` | `thinking` | `note`). A task timeline never emits
+ * those and a run trace never emits the journal's five, but both arrive in this
+ * one shape on purpose: the grouped-timeline renderer is then reused for the
+ * run-detail drawer rather than reinvented beside it.
  */
-export type TimelineKind = "dispatched" | "reply" | "tool_failed" | "approval" | "completed";
+export type TimelineKind =
+  | "dispatched"
+  | "reply"
+  | "tool_failed"
+  | "approval"
+  | "completed"
+  | "tool_call"
+  | "thinking"
+  | "note";
+
+/**
+ * How a run-trace step ended (#242). Present only on entries that came from a
+ * run's step trace; a journal-derived task-timeline entry has no such notion.
+ *
+ * `running` is a **real and expected** resting state of a persisted row, not a
+ * glitch: the trace is written *as the turn executes*, so a host killed
+ * mid-tool-call leaves that call recorded exactly as it stood. It means
+ * in-flight-when-the-trace-stopped — render it as such, never as a failure.
+ */
+export type StepStatus = "ok" | "error" | "running";
 
 /**
  * One entry on a task's timeline (#185) — the same scrubbed vocabulary the host
@@ -73,16 +102,34 @@ export type TimelineKind = "dispatched" | "reply" | "tool_failed" | "approval" |
  * arguments, output, or call ids.
  */
 export interface TimelineEntry {
-  /** The journal sequence — the stable render key, and the strict order. */
+  /**
+   * The stable render key, and the strict order.
+   *
+   * On a task timeline this is the company-wide journal sequence. On a run's
+   * step trace (#242) it is the **run-scoped** step ordinal, 0-based and dense
+   * — so two different runs both have a step `0`. Never compare a `seq` across
+   * the two surfaces.
+   */
   seq: number;
-  /** Epoch-millis the event was journaled. */
+  /** Epoch-millis the event was journaled, or the step recorded. */
   atMillis: number;
-  /** What happened: `dispatched` | `reply` | `tool_failed` | `approval` | `completed`. */
+  /** What happened. See {@link TimelineKind} for which surface emits which words. */
   kind: TimelineKind;
   /** A short, past-tense human label rendered verbatim. */
   label: string;
   /** Optional scrubbed detail; expands under the row when present. */
   detail?: string;
+  /**
+   * How a run-trace step ended (#242). Absent on task-timeline entries, which
+   * have no such notion — so `undefined` means "not a step", never "unknown
+   * outcome".
+   */
+  status?: StepStatus;
+  /**
+   * How long a run-trace step took (#242), when known. Tool calls report it;
+   * thinking and note steps do not.
+   */
+  elapsedMs?: number;
   /**
    * On an `approval` entry: how long the company sat waiting on the operator
    * before this resolution landed (#305), clamped to the run window.
@@ -92,6 +139,28 @@ export interface TimelineEntry {
    * claiming an instant sign-off that never happened.
    */
   waitedMillis?: number;
+}
+
+/**
+ * One message in a task's discussion thread (#335).
+ *
+ * The thread is the card's own, not a filtered view of company chat: it is
+ * journaled per task and served by the task-detail read, so a message posted
+ * here belongs to this card and nowhere else.
+ */
+export interface DiscussionMessage {
+  /** The journal sequence — the stable render key, and the thread's order. */
+  seq: number;
+  /** Epoch-millis the message was journaled. */
+  atMillis: number;
+  /**
+   * Who posted, as a label: a roster display name (or an email's local part),
+   * `someone` for a poster no longer on the roster, `operator` for a post made
+   * with a machine credential. The host never sends a user id or an email here.
+   */
+  author: string;
+  /** The message text, exactly as posted. */
+  text: string;
 }
 
 /** A neighbouring card in the lineage, trimmed to what a link needs (#185). */
@@ -143,8 +212,33 @@ export interface TaskDetail {
   timeline: TimelineEntry[];
   /** The worked/waiting split, so the screen and an export cannot disagree. */
   durations: TaskDurations;
+  /**
+   * The card's discussion thread, oldest first (#335).
+   *
+   * Carried on this read rather than fetched by the tab, so it refreshes on the
+   * screen's existing 4s poll: a message another operator posts appears here
+   * without a reload. Empty for a card nobody has posted on.
+   *
+   * Only the newest page of the thread — the host caps it so a long discussion
+   * is not re-serialized on every poll. Older messages come from the same read
+   * with `discussionBefore`.
+   */
+  discussion: DiscussionMessage[];
+  /**
+   * Whether the thread continues before {@link discussion}'s oldest message —
+   * i.e. whether "load earlier" has anything to load.
+   */
+  discussionHasMore: boolean;
   /** Parent and children. */
   lineage: TaskLineage;
+  /**
+   * The card's recorded attempts, newest first (#242).
+   *
+   * Empty is a legitimate answer, not an error: run records were not
+   * backfilled, so a card dispatched before they existed genuinely has none —
+   * synthesising attempts from old reply events would fabricate identity.
+   */
+  runs: RunSummary[];
   /**
    * Epoch-millis this task started waiting on an operator *right now* (#305),
    * or absent when nothing is currently parked for its run.
@@ -160,14 +254,47 @@ export interface TaskDetail {
  * The Task Detail screen's single read (#185): assembles the card header, the
  * per-task timeline, the approvals trail (as `approval` timeline rows), and the
  * lineage into one response. 404s when the id names no card.
+ *
+ * `discussionBefore` walks *backwards* through the discussion: pass the `seq` of
+ * the oldest message held and the response carries the page before it. Omitted
+ * (the poll's shape) it returns the newest page — the thread is capped host-side
+ * so a long one is not re-sent whole every 4s.
  */
 export function getTaskDetail(
   client: OpenCompanyClient,
   company: string | null,
   id: string,
+  discussionBefore?: number,
 ): Promise<TaskDetail> {
+  const query =
+    discussionBefore === undefined
+      ? ""
+      : `?discussionBefore=${encodeURIComponent(discussionBefore)}`;
   return client.get<TaskDetail>(
-    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`,
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}${query}`,
+  );
+}
+
+/**
+ * Post a message to a task's discussion thread (#335).
+ *
+ * Answers `201` with the stored message, so the caller can render it at once;
+ * the next {@link getTaskDetail} poll returns the same message under the same
+ * `seq`. Rejects an empty message with a `400` and an unknown card with a `404`;
+ * a very long message is truncated by the host rather than refused.
+ *
+ * Posting runs no agent turn: this is a note on the card, not a way to ask for
+ * work. Dispatching stays the board's column drag.
+ */
+export function postTaskDiscussion(
+  client: OpenCompanyClient,
+  company: string | null,
+  id: string,
+  text: string,
+): Promise<DiscussionMessage> {
+  return client.post<DiscussionMessage>(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/discussion`,
+    { text },
   );
 }
 
@@ -183,7 +310,9 @@ export function exportTaskRecord(
   company: string | null,
   id: string,
 ): Promise<{ text: string; filename?: string }> {
-  return client.getDocument(`${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/export`);
+  return client.getDocument(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/export`,
+  );
 }
 
 export function createTask(
@@ -200,7 +329,10 @@ export function patchTask(
   id: string,
   body: PatchTask,
 ): Promise<Task> {
-  return client.patch<Task>(`${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`, body);
+  return client.patch<Task>(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`,
+    body,
+  );
 }
 
 export function deleteTask(
@@ -208,7 +340,9 @@ export function deleteTask(
   company: string | null,
   id: string,
 ): Promise<void> {
-  return client.del<void>(`${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`);
+  return client.del<void>(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`,
+  );
 }
 
 /** A steer verb the operator can apply to an in-flight run (issue #111). */
@@ -243,7 +377,9 @@ export function listInflight(
   client: OpenCompanyClient,
   company: string | null,
 ): Promise<InflightRun[]> {
-  return client.get<InflightRun[]>(`${client.scopeFor(company)}/tasks/inflight`);
+  return client.get<InflightRun[]>(
+    `${client.scopeFor(company)}/tasks/inflight`,
+  );
 }
 
 /**

@@ -728,9 +728,12 @@ type TeamMember {
 	"""
 	inboxEnabled: Boolean!
 	"""
-	This teammate's manifest `budget_usd_daily` cap (issue #304), or null
-	when it has none. Null-vs-set is the capped/uncapped distinction — `0`
-	would mean "capped at nothing".
+	This teammate's daily spend cap in force (issue #304), or null when it
+	has none. Null-vs-set is the capped/uncapped distinction — `0` would
+	mean "capped at nothing".
+	
+	Since #343 this is the **effective** cap: an operator override set from
+	the console when one is stored, the manifest value otherwise.
 	"""
 	budgetUsdDaily: Float
 	"""
@@ -738,6 +741,18 @@ type TeamMember {
 	cap.
 	"""
 	spentTodayUsd: Float
+	"""
+	The user id of the admin who last set this teammate's cap from the
+	console (issue #343); null when no override is stored. Non-null even
+	when the override *removed* the cap, which is how "nobody capped this"
+	is told from "an admin uncapped this".
+	"""
+	budgetSetBy: String
+	"""
+	When that cap was set (epoch millis). `Float` round-trips the full u64
+	range that would overflow GraphQL's `Int`, matching `Approval.atMillis`.
+	"""
+	budgetSetAtMillis: Float
 }
 
 """

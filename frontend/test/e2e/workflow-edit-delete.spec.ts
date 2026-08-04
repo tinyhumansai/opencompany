@@ -19,6 +19,20 @@ import { expect, test, type Page, type APIRequestContext } from "@playwright/tes
  *   out-of-band over HTTP while the console holds a stale copy — rather than
  *   trusting that the token is wired through.
  *
+ * Edit mode landed after the rest of #259 (the backend, the client and Delete
+ * shipped in #279), and its specs are here rather than in their own file
+ * because they are the same feature and share this file's fixtures — a graph
+ * created over HTTP, the tour dismissal, the picker helper. They cover:
+ *
+ * * an edit round trip that the host actually stored;
+ * * the id being **read-only**, not merely rejected on save (the host answers
+ *   400 to a rename, so offering the field would be a trap);
+ * * a stale save landing in the same conflict banner Delete uses, having
+ *   written nothing;
+ * * field errors **not** carrying from one graph to the next, which is what
+ *   the fresh-row-key hydration exists to prevent and is invisible anywhere
+ *   but a browser.
+ *
  * Runs against the live host the harness brings up (see `playwright.config.ts`).
  * Not run by CI, which has no host.
  */
@@ -41,15 +55,29 @@ async function dismissTour(page: Page) {
   await expect(skip).toBeHidden();
 }
 
+/**
+ * Node fields the dialog has no control for. `outputExtras` puts them on the
+ * report node so a spec can check they survive an edit — the dialog cannot show
+ * them, and a save that rebuilds nodes from the visible controls alone would
+ * delete them.
+ */
+type NodeExtras = Record<string, unknown>;
+
 /** A minimal valid graph body: one trigger, one output, one edge. */
-function graphBody(id: string, name: string, schedule: string, description: string) {
+function graphBody(
+  id: string,
+  name: string,
+  schedule: string,
+  description: string,
+  outputExtras: NodeExtras = {},
+) {
   return {
     id,
     name,
     description,
     nodes: [
       { id: "start", kind: "trigger", name: "Start", schedule },
-      { id: "done", kind: "output", name: "Report" },
+      { id: "done", kind: "output", name: "Report", ...outputExtras },
     ],
     edges: [{ from: "start", to: "done" }],
   };
@@ -60,9 +88,10 @@ async function createWorkflow(
   request: APIRequestContext,
   id: string,
   name: string,
+  outputExtras: NodeExtras = {},
 ): Promise<string> {
   const res = await request.post(`${COMPANY_SCOPE}/workflows`, {
-    data: graphBody(id, name, "0 9 * * *", "Created by the #259 e2e spec."),
+    data: graphBody(id, name, "0 9 * * *", "Created by the #259 e2e spec.", outputExtras),
   });
   expect(res.ok(), `create ${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
   const body = await res.json();
@@ -92,6 +121,25 @@ async function selectWorkflow(page: Page, name: string) {
 }
 
 const DELETE = "workflow-delete";
+const EDIT = "workflow-edit";
+const SUBMIT = "workflow-dialog-submit";
+
+/** Opens the edit dialog for the currently selected workflow. */
+async function openEditDialog(page: Page) {
+  const button = page.getByTestId(EDIT);
+  await expect(button, "an overlay-backed workflow must be editable").toBeEnabled();
+  await button.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText("Edit workflow", { exact: true })).toBeVisible();
+  return dialog;
+}
+
+/** Reads a workflow's stored graph back from the host. */
+async function readWorkflow(request: APIRequestContext, id: string) {
+  const res = await request.get(`${COMPANY_SCOPE}/workflows/${id}`);
+  expect(res.ok(), `read ${id}: ${res.status()}`).toBeTruthy();
+  return res.json();
+}
 
 test("a source-defined workflow cannot be deleted, and the console says why", async ({
   page,
@@ -241,5 +289,193 @@ test("a version conflict surfaces distinctly with a way out, and deletes nothing
       .toBe(404);
   } finally {
     await removeWorkflow(request, id);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Edit mode (issue #259, the remainder after #279)
+// ---------------------------------------------------------------------------
+
+test("a source-defined workflow offers no Edit, with the same explanation Delete gives", async ({
+  page,
+}) => {
+  await page.goto("/#/workflows");
+  await dismissTour(page);
+
+  await selectWorkflow(page, "Committed flow");
+
+  const button = page.getByTestId(EDIT);
+  await expect(button).toBeVisible();
+  await expect(button, "a seed-backed workflow must not be editable").toBeDisabled();
+
+  // One refusal, one explanation: the host answers 409 to a PUT and a DELETE
+  // for the same reason, so the console must not tell two stories about it.
+  const explanation = page.locator(`span:has([data-testid="${EDIT}"])`);
+  await expect(explanation).toHaveAttribute("title", /company source tree/);
+  await expect(explanation).toHaveAttribute("title", /can't be changed or removed/);
+  await expect(explanation).toHaveAttribute("title", /workflows\/committed\.toml/);
+});
+
+test("an author can change a saved workflow's schedule, and the id is read-only", async ({
+  page,
+  request,
+}) => {
+  const id = `e2e-edit-${Date.now()}`;
+  const name = `Edit probe ${Date.now()}`;
+  // Policies the dialog cannot show. A graph carrying them is not exotic: the
+  // API accepts them and the orchestrator's own `create_workflow` tool writes
+  // them, so an author can easily be editing one.
+  const hidden = {
+    config: { note: "kept across an edit" },
+    onError: "continue",
+    retry: { maxAttempts: 2, backoff: "fixed" },
+    requiresApproval: true,
+  };
+  await createWorkflow(request, id, name, hidden);
+
+  try {
+    await page.goto("/#/workflows");
+    await dismissTour(page);
+    await selectWorkflow(page, name);
+
+    const dialog = await openEditDialog(page);
+
+    // Hydrated from the saved graph, not blank — the whole point of edit mode.
+    await expect(dialog.getByLabel("Id", { exact: true })).toHaveValue(id);
+    await expect(dialog.getByLabel("Name", { exact: true })).toHaveValue(name);
+    await expect(dialog.getByRole("textbox", { name: "Node id" }).first()).toHaveValue("start");
+
+    // The id may not change through a PUT — the host answers 400 — so the field
+    // states that by being unwritable rather than by refusing after the click.
+    await expect(
+      dialog.getByLabel("Id", { exact: true }),
+      "an id field that accepts a rename can only ever 400",
+    ).toHaveJSProperty("readOnly", true);
+
+    // Correct the trigger's schedule: the very mistake #259 is about.
+    await dialog.getByRole("combobox", { name: "Schedule" }).click();
+    await page.getByRole("option", { name: /Weekly/ }).click();
+
+    await dialog.getByTestId(SUBMIT).click();
+    await expect(dialog).toBeHidden({ timeout: 15_000 });
+
+    // The host stored it — the console did not merely redraw its own copy.
+    await expect
+      .poll(async () => (await readWorkflow(request, id)).nodes[0].schedule, {
+        timeout: 15_000,
+      })
+      .toBe("0 9 * * MON");
+
+    // …and the save did not quietly delete the policies it had no control for.
+    // A node rebuilt from the visible fields alone would have dropped every one
+    // of these, silently, on the first edit of any field at all.
+    const report = (await readWorkflow(request, id)).nodes[1];
+    expect(report.config, "an edit must not drop node config").toEqual(hidden.config);
+    expect(report.onError, "an edit must not drop the error policy").toBe("continue");
+    expect(report.retry, "an edit must not drop the retry policy").toEqual(hidden.retry);
+    expect(report.requiresApproval, "an edit must not drop an approval gate").toBe(true);
+  } finally {
+    await removeWorkflow(request, id);
+  }
+});
+
+test("a stale save surfaces the conflict banner and writes nothing", async ({
+  page,
+  request,
+}) => {
+  const id = `e2e-edit-conflict-${Date.now()}`;
+  const name = `Edit conflict probe ${Date.now()}`;
+  await createWorkflow(request, id, name);
+
+  try {
+    await page.goto("/#/workflows");
+    await dismissTour(page);
+    await selectWorkflow(page, name);
+
+    const dialog = await openEditDialog(page);
+
+    // Someone else saves while this dialog holds the token it loaded a moment
+    // ago. Forced for real, as with the delete conflict above.
+    const edited = await request.put(`${COMPANY_SCOPE}/workflows/${id}`, {
+      data: graphBody(id, name, "0 11 * * *", "Edited out-of-band, mid-edit."),
+    });
+    expect(edited.ok(), `out-of-band edit: ${edited.status()}`).toBeTruthy();
+
+    await dialog.getByRole("combobox", { name: "Schedule" }).click();
+    await page.getByRole("option", { name: /Weekly/ }).click();
+    await dialog.getByTestId(SUBMIT).click();
+
+    // Refused, and said so where the author is looking. The dialog stays open:
+    // throwing away what they typed would be a second loss on top of the race.
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText(/changed since you loaded it/, { timeout: 15_000 });
+
+    // Nothing was written — the out-of-band value still stands.
+    expect((await readWorkflow(request, id)).nodes[0].schedule).toBe("0 11 * * *");
+
+    // And the way out is the banner Delete already had, waiting behind the
+    // dialog rather than vanishing with it.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    const banner = page.getByTestId("workflow-conflict");
+    await expect(banner).toBeVisible();
+    await banner.getByTestId("workflow-conflict-reload").click();
+    await expect(banner).toBeHidden({ timeout: 15_000 });
+
+    // Reloaded, the same edit goes through — so the loop terminates.
+    const reopened = await openEditDialog(page);
+    await reopened.getByRole("combobox", { name: "Schedule" }).click();
+    await page.getByRole("option", { name: /Weekly/ }).click();
+    await reopened.getByTestId(SUBMIT).click();
+    await expect(reopened).toBeHidden({ timeout: 15_000 });
+    await expect
+      .poll(async () => (await readWorkflow(request, id)).nodes[0].schedule, {
+        timeout: 15_000,
+      })
+      .toBe("0 9 * * MON");
+  } finally {
+    await removeWorkflow(request, id);
+  }
+});
+
+test("a field error raised on one graph never appears on another", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now();
+  const first = { id: `e2e-errors-a-${stamp}`, name: `Errors probe A ${stamp}` };
+  const second = { id: `e2e-errors-b-${stamp}`, name: `Errors probe B ${stamp}` };
+  await createWorkflow(request, first.id, first.name);
+  await createWorkflow(request, second.id, second.name);
+
+  try {
+    await page.goto("/#/workflows");
+    await dismissTour(page);
+    await selectWorkflow(page, first.name);
+
+    // Raise a real blur-time error on the first graph's trigger row.
+    const dialog = await openEditDialog(page);
+    await dialog.getByRole("combobox", { name: "Schedule" }).click();
+    await page.getByRole("option", { name: /Custom cron/ }).click();
+    const cron = dialog.getByRole("textbox", { name: "Custom cron schedule" });
+    await cron.fill("hourly");
+    await cron.blur();
+    // The rule, not the standing hint under the field (which also says
+    // "5-field cron") — those are different strings for a reason.
+    await expect(dialog).toContainText(/A schedule is a 5-field cron/);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+
+    // Both graphs have a trigger node whose id is `start`, so an error map keyed
+    // on the node id (rather than on the freshly minted row key) would carry
+    // this complaint straight over to the second graph, attached to a field the
+    // author never touched.
+    await selectWorkflow(page, second.name);
+    const other = await openEditDialog(page);
+    await expect(
+      other,
+      "a stale field error must not follow the author to another graph",
+    ).not.toContainText("5-field cron, e.g.");
+  } finally {
+    await removeWorkflow(request, first.id);
+    await removeWorkflow(request, second.id);
   }
 });
