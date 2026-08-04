@@ -44,6 +44,7 @@ import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
 import { ChatView } from "@/views/ChatView";
+import type { Transcripts } from "@/views/chat/model";
 import { Conversation } from "@/views/Conversation";
 import { TeamView } from "@/views/TeamView";
 import { ApprovalsView } from "@/views/ApprovalsView";
@@ -180,6 +181,10 @@ export function AppShell({
   // System lines raised outside chat (an approval decision, say). Chat owns
   // the transcripts now, so the shell hands it an append-only log to fold in.
   const [notices, setNotices] = useState<string[]>([]);
+  // The shell owns every channel's transcript, not `ChatView` — the shell
+  // mounts and unmounts `ChatView` per route, so component-local state there
+  // would be discarded on every trip away from Chat and back.
+  const [transcripts, setTranscripts] = useState<Transcripts>({});
   const [threads, setThreads] = useState(defaultThreads);
   const [activeThreadId, setActiveThreadId] = useState("main");
   // A monotonic nonce bumped on every task-lifecycle SSE event, so the
@@ -526,6 +531,8 @@ export function AppShell({
               onNavigate={(channelId) => navigate("chat", channelId)}
               onReply={() => void feed.refresh()}
               notices={notices}
+              transcripts={transcripts}
+              setTranscripts={setTranscripts}
             />
           )}
           {view === "conversation" && (

@@ -5,6 +5,13 @@ import type { ChatMessage } from "@/lib/chat";
 import { defaultDesks } from "@/lib/desks";
 import { initials as nameInitials, type TeamMember } from "@/lib/team";
 
+/**
+ * Every channel's transcript, keyed by channel id. Owned by `AppShell`, not
+ * `ChatView`, so a transcript survives `ChatView` unmounting when the operator
+ * steps into Tasks, Settings, or any other view and comes back.
+ */
+export type Transcripts = Record<string, ChatMessage[]>;
+
 export type ChannelKind = "channel" | "dm";
 
 export interface Channel {

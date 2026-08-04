@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
@@ -21,6 +21,7 @@ import {
   dmChannelId,
   findChannel,
   toggleReaction,
+  type Transcripts,
 } from "./chat/model";
 
 interface Props {
@@ -37,10 +38,16 @@ interface Props {
    * records what happened outside it.
    */
   notices: string[];
+  /**
+   * Every channel's transcript, keyed by channel id, and its setter — owned by
+   * `AppShell` rather than here so a transcript survives this component
+   * unmounting when the operator navigates to another view and back (the shell
+   * mounts and unmounts `ChatView` per route; component-local state would be
+   * discarded on every trip away from Chat).
+   */
+  transcripts: Transcripts;
+  setTranscripts: Dispatch<SetStateAction<Transcripts>>;
 }
-
-/** Every channel's transcript, keyed by channel id. */
-type Transcripts = Record<string, ChatMessage[]>;
 
 const DEFAULT_CHANNEL = "main";
 
@@ -57,11 +64,19 @@ const DEFAULT_CHANNEL = "main";
  * backend. Threads and reactions are console-local for the same reason: the
  * host has no surface for either yet.
  */
-export function ChatView({ client, company, sub, onNavigate, onReply, notices }: Props) {
+export function ChatView({
+  client,
+  company,
+  sub,
+  onNavigate,
+  onReply,
+  notices,
+  transcripts,
+  setTranscripts,
+}: Props) {
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [loadingTeam, setLoadingTeam] = useState(true);
   const [fromHost, setFromHost] = useState(false);
-  const [transcripts, setTranscripts] = useState<Transcripts>({});
   const [sending, setSending] = useState(false);
   const [openThreadId, setOpenThreadId] = useState<string | null>(null);
   const [membersOpen, setMembersOpen] = useState(false);
