@@ -749,7 +749,8 @@ enum ApprovalOwner {
 ///    that repeat trips through review are normal, so two attempts on one card
 ///    is the expected case, and only this key separates them. Checked against
 ///    `task_runs`, this card's own attempt ids.
-/// 2. **the parked [`TaskLink`] — card-level, the fallback.** `run_id` is
+/// 2. **the parked [`TaskLink`](crate::runtime::journal::TaskLink) —
+///    card-level, the fallback.** `run_id` is
 ///    `None` by design wherever no attempt is behind the park — a chat turn, a
 ///    workflow delivery, a scheduler tick, the hosted brain's gate — and those
 ///    parks are stamped here instead, in `CycleHostImpl::park`, which every
