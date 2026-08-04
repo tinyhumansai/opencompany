@@ -155,7 +155,10 @@ orchestrator's `create_workflow` tool; journaled best-effort after persist),
 `TaskSteered` (an operator paused, cancelled, or redirected an in-flight task
 or delegation), `DeskTaskCompleted` (a dispatched board task finished its run —
 the terminal anchor a per-task timeline ends on; "completed" means the run
-stopped, not that it succeeded, and `column` carries where the card landed).
+stopped, not that it succeeded, and `column` carries where the card landed),
+`TaskDiscussionPosted` (a human posted to a card's discussion thread, issue
+#335 — the Discussion tab's whole store, folded back out by
+`GET …/tasks/{task_id}` beside that card's timeline).
 
 ### Per-task event correlation (issue #185)
 

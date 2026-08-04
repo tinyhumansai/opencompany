@@ -3234,10 +3234,185 @@ async fn inflight_read_is_not_shadowed_by_task_detail() {
     );
 }
 
+/// Seeds a board card for the discussion tests (#335).
+fn discussion_card(id: &str, title: &str) -> TaskRecord {
+    TaskRecord {
+        id: id.into(),
+        title: title.into(),
+        note: None,
+        column: "todo".into(),
+        priority: "medium".into(),
+        assignee: "ceo".into(),
+        updated_at_millis: 1,
+        origin_chat_id: None,
+        parent_task_id: None,
+    }
+}
+
+/// #335: the per-task Discussion tab's whole contract — a post persists, reads
+/// back on the card's own detail, and belongs to exactly one card.
+///
+/// The acceptance criterion is "posts survive a reload and are visible from
+/// another browser", which is the same thing as: the message lives in the
+/// company journal, not in the posting session. So the assertions are made
+/// through a *second, independent request* rather than off the POST's echo.
+///
+/// The scoping half matters as much: the journal is company-scoped, so a fold
+/// that forgot to compare `task_id` would show every card the same thread.
+#[tokio::test]
+async fn task_discussion_posts_persist_and_are_scoped_to_their_card() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+
+    for card in [
+        discussion_card("t-1", "Ship it"),
+        discussion_card("t-other", "Unrelated"),
+        discussion_card("t-quiet", "Nobody has said anything"),
+    ] {
+        runtime.tasks().upsert(&company, &card).await.unwrap();
+    }
+
+    // Surrounding whitespace is trimmed, and the poster is named from the
+    // roster — never by user id, and never by email address.
+    let (status, posted) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks/t-1/discussion",
+        Some(json!({ "text": "  blocked on the API key  " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(posted["text"], "blocked on the API key");
+    assert_eq!(posted["author"], "harness-admin");
+
+    for (task, text) in [
+        ("t-1", "unblocked, the key was rotated"),
+        ("t-other", "someone else's thread"),
+    ] {
+        let (status, _) = send(
+            &state,
+            "POST",
+            &format!("/api/v1/company/tasks/{task}/discussion"),
+            Some(json!({ "text": text })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // The reload: a fresh read of the card, which reaches the journal rather
+    // than anything the posting request kept.
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let thread = body["discussion"].as_array().expect("discussion array");
+    let texts: Vec<&str> = thread.iter().map(|m| m["text"].as_str().unwrap()).collect();
+    assert_eq!(
+        texts,
+        vec!["blocked on the API key", "unblocked, the key was rotated"],
+        "the thread reads back oldest-first"
+    );
+    assert!(
+        thread[0]["seq"].as_u64().unwrap() < thread[1]["seq"].as_u64().unwrap(),
+        "seq is the thread's strict order: {thread:?}"
+    );
+    assert!(
+        !serde_json::to_string(&body["discussion"])
+            .unwrap()
+            .contains("someone else's thread"),
+        "another card's message leaked onto this thread"
+    );
+
+    // The two projections stay apart: a discussion post is not a run event, so
+    // it must not appear on the timeline the Timeline tab renders.
+    assert!(
+        body["timeline"].as_array().unwrap().is_empty(),
+        "a discussion post must not land on the run timeline: {body}"
+    );
+
+    // The other card sees only its own message, and a card nobody has posted on
+    // reads back an empty thread — what keeps the tab's empty state honest.
+    let (_, other) = send(&state, "GET", "/api/v1/company/tasks/t-other", None).await;
+    let other_thread = other["discussion"].as_array().unwrap();
+    assert_eq!(other_thread.len(), 1);
+    assert_eq!(other_thread[0]["text"], "someone else's thread");
+
+    let (_, quiet) = send(&state, "GET", "/api/v1/company/tasks/t-quiet", None).await;
+    assert_eq!(quiet["discussion"].as_array().unwrap().len(), 0);
+
+    // Both scope forms serve the same thread.
+    let (status, scoped) = send(&state, "GET", "/api/v1/companies/acme/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(scoped["discussion"].as_array().unwrap().len(), 2);
+}
+
+/// #335: what the write boundary refuses, and what it forgives.
+///
+/// An empty message is refused because there is no delete in v1 — a blank row
+/// would be permanent noise. An unknown card is refused because the post would
+/// otherwise be journaled somewhere no read surface can reach. An over-long
+/// message is *not* refused: it is truncated, so a long paste still posts.
+#[tokio::test]
+async fn task_discussion_rejects_an_empty_message_and_an_unknown_card() {
+    use crate::ports::tasks::MAX_DISCUSSION_CHARS;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+    runtime
+        .tasks()
+        .upsert(&company, &discussion_card("t-1", "Ship it"))
+        .await
+        .unwrap();
+
+    for text in ["", "   \n\t "] {
+        let (status, _) = send(
+            &state,
+            "POST",
+            "/api/v1/company/tasks/t-1/discussion",
+            Some(json!({ "text": text })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "empty text: {text:?}");
+    }
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks/nope/discussion",
+        Some(json!({ "text": "into the void" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A long paste posts, capped on a character boundary.
+    let long = "é".repeat(MAX_DISCUSSION_CHARS + 500);
+    let (status, posted) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks/t-1/discussion",
+        Some(json!({ "text": long })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        posted["text"].as_str().unwrap().chars().count(),
+        MAX_DISCUSSION_CHARS
+    );
+
+    // Only the accepted post is on the thread: the three refusals journaled
+    // nothing.
+    let (_, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(body["discussion"].as_array().unwrap().len(), 1);
+}
+
 /// #185 review follow-up: pin the two timeline branches the first test skipped —
 /// `tool_failed`, and the window-correlated `approval` arm.
 ///
-/// The approval arm is the only branch in `task_timeline` whose correlation is
+/// The approval arm is the only branch in `fold_task_journal` whose correlation is
 /// heuristic (parked effects carry no task id, so it is scoped by the run
 /// window). That makes it the one most likely to regress into leaking another
 /// run's resolution, so it is asserted from both sides: a resolution *before*

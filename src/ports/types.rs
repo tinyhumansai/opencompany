@@ -494,6 +494,42 @@ pub enum CompanyEvent {
         /// without re-deriving it from `output`.
         column: String,
     },
+    /// A human posted to a task's discussion thread (issue #335).
+    ///
+    /// The per-task Discussion tab's whole backing store. A task discussion is
+    /// its *own* thread — not a filtered view of the company chat — but it is
+    /// not a second message store either: it lives in this journal, beside the
+    /// events the same task's timeline is folded from, so the two notions of
+    /// "something happened on this task" cannot drift apart. `GET
+    /// …/tasks/{task_id}` projects both out of one traversal.
+    ///
+    /// Operator-authored only in v1. Nothing dispatches an agent turn off the
+    /// back of it and no agent reads it: posting is a durable note on the card,
+    /// not a delegation surface. That is a product decision rather than a
+    /// technical limit — see `docs/modules/server/README.md` — and the wire
+    /// projections here reflect it: the text is deliberately never forwarded to
+    /// the inference sidecar or the SSE stream.
+    ///
+    /// Append-only, like every other variant: there is no edit and no delete in
+    /// v1, so a posted message is a fact about what was said and when.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes.
+    TaskDiscussionPosted {
+        /// The board card the message belongs to.
+        task_id: String,
+        /// The message text, codepoint-capped at the route boundary
+        /// ([`MAX_DISCUSSION_CHARS`](crate::ports::tasks::MAX_DISCUSSION_CHARS)).
+        text: String,
+        /// Who posted, when a signed-in human is behind the request.
+        ///
+        /// `None` for a machine credential, which has no person to name and
+        /// reads back as "operator" — the same fallback
+        /// [`OperatorMessage`](Self::OperatorMessage)'s `by` takes, and the same
+        /// additive `skip_serializing_if` contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
     /// A workflow run finished (issue #228) — the durable record of what a run
     /// actually did, journaled from **both** entry points: the console's Run
     /// button and the cron [`WorkflowScheduler`](crate::runtime::WorkflowScheduler).
@@ -2126,6 +2162,34 @@ mod test {
             serde_json::to_string(&redirect).unwrap(),
             r#"{"kind":"TaskSteered","task_id":"t1","action":"redirect","instruction":"focus on the API"}"#
         );
+    }
+
+    /// Issue #335: an unattributed post must serialize with **no** `by` key, so
+    /// the variant's wire shape is the same one a machine-credentialled post
+    /// wrote before attribution could ever be present — and an attributed one
+    /// round-trips its actor.
+    #[test]
+    fn task_discussion_posted_round_trips_and_omits_an_absent_actor() {
+        let anonymous = CompanyEvent::TaskDiscussionPosted {
+            task_id: "t1".into(),
+            text: "blocked on the API key".into(),
+            by: None,
+        };
+        assert_eq!(round_trip(&anonymous), anonymous);
+        assert_eq!(
+            serde_json::to_string(&anonymous).unwrap(),
+            r#"{"kind":"TaskDiscussionPosted","task_id":"t1","text":"blocked on the API key"}"#
+        );
+
+        let attributed = CompanyEvent::TaskDiscussionPosted {
+            task_id: "t1".into(),
+            text: "unblocked".into(),
+            by: Some(Actor {
+                kind: ActorKind::User,
+                id: "u-7".into(),
+            }),
+        };
+        assert_eq!(round_trip(&attributed), attributed);
     }
 
     #[test]

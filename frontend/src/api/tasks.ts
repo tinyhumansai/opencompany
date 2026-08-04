@@ -94,6 +94,28 @@ export interface TimelineEntry {
   waitedMillis?: number;
 }
 
+/**
+ * One message in a task's discussion thread (#335).
+ *
+ * The thread is the card's own, not a filtered view of company chat: it is
+ * journaled per task and served by the task-detail read, so a message posted
+ * here belongs to this card and nowhere else.
+ */
+export interface DiscussionMessage {
+  /** The journal sequence — the stable render key, and the thread's order. */
+  seq: number;
+  /** Epoch-millis the message was journaled. */
+  atMillis: number;
+  /**
+   * Who posted, as a label: a roster display name (or an email's local part),
+   * `someone` for a poster no longer on the roster, `operator` for a post made
+   * with a machine credential. The host never sends a user id or an email here.
+   */
+  author: string;
+  /** The message text, exactly as posted. */
+  text: string;
+}
+
 /** A neighbouring card in the lineage, trimmed to what a link needs (#185). */
 export interface LineageRef {
   id: string;
@@ -115,6 +137,14 @@ export interface TaskDetail {
   task: Task;
   /** The per-task event stream, oldest first. */
   timeline: TimelineEntry[];
+  /**
+   * The card's discussion thread, oldest first (#335).
+   *
+   * Carried on this read rather than fetched by the tab, so it refreshes on the
+   * screen's existing 4s poll: a message another operator posts appears here
+   * without a reload. Empty for a card nobody has posted on.
+   */
+  discussion: DiscussionMessage[];
   /** Parent and children. */
   lineage: TaskLineage;
   /**
@@ -140,6 +170,29 @@ export function getTaskDetail(
 ): Promise<TaskDetail> {
   return client.get<TaskDetail>(
     `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}`,
+  );
+}
+
+/**
+ * Post a message to a task's discussion thread (#335).
+ *
+ * Answers `201` with the stored message, so the caller can render it at once;
+ * the next {@link getTaskDetail} poll returns the same message under the same
+ * `seq`. Rejects an empty message with a `400` and an unknown card with a `404`;
+ * a very long message is truncated by the host rather than refused.
+ *
+ * Posting runs no agent turn: this is a note on the card, not a way to ask for
+ * work. Dispatching stays the board's column drag.
+ */
+export function postTaskDiscussion(
+  client: OpenCompanyClient,
+  company: string | null,
+  id: string,
+  text: string,
+): Promise<DiscussionMessage> {
+  return client.post<DiscussionMessage>(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/discussion`,
+    { text },
   );
 }
 

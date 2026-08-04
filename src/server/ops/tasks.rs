@@ -8,8 +8,10 @@
 //!
 //! `GET /tasks/{task_id}` (issue #185) is the Task Detail screen's read
 //! foundation: it assembles the card header, the per-task timeline, the
-//! lineage, and the approvals trail into one response so the console makes a
-//! single call. See [`task_detail`] for the assembly and its scrub discipline.
+//! lineage, the approvals trail, and — since issue #335 — the card's discussion
+//! thread into one response so the console makes a single call. See
+//! [`task_detail`] for the assembly and its scrub discipline, and
+//! [`post_discussion`] for the thread's one write.
 
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -20,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::steer::{InflightEntry, SteerAction, SteerError, cap_redirect};
 use crate::error::OpenCompanyError;
-use crate::ports::tasks::{BOARD_COLUMNS, COLUMN_TODO, TaskRecord, is_board_column};
+use crate::ports::tasks::{
+    BOARD_COLUMNS, COLUMN_TODO, TaskRecord, cap_discussion, is_board_column,
+};
 use crate::ports::types::CompanyEvent;
 use crate::ports::{generate_id, now_millis};
 use crate::runtime::assignee;
@@ -48,6 +52,7 @@ pub fn router() -> Router<AppState> {
             get(task_detail).patch(patch_task).delete(delete_task),
         ))
         .merge(scoped("/tasks/{task_id}/steer", post(steer_task)))
+        .merge(scoped("/tasks/{task_id}/discussion", post(post_discussion)))
 }
 
 /// A task card as the console renders it.
@@ -460,6 +465,36 @@ struct Lineage {
     children: Vec<LineageRef>,
 }
 
+/// One message in a task's discussion thread (issue #335).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscussionMessage {
+    /// The journal sequence the post came from — the console's stable key, and
+    /// what makes the thread strictly ordered. Shares its numbering with
+    /// [`TimelineEntry::seq`]: both project out of the same journal.
+    seq: u64,
+    /// Epoch-millis the message was journaled.
+    at_millis: u64,
+    /// Who posted, as a label a reader can recognize: a roster display name (or
+    /// the local part of their email), `someone` for a user id no longer on the
+    /// roster, and `operator` for a post made with a machine credential. Never
+    /// an email address and never a user id — a thread is read by every member
+    /// of the company.
+    author: String,
+    /// The message text, exactly as posted (codepoint-capped on write).
+    text: String,
+}
+
+/// The post-a-message body (`{text}`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PostDiscussion {
+    /// The message. Must be non-empty after trimming; truncated to
+    /// [`MAX_DISCUSSION_CHARS`](crate::ports::tasks::MAX_DISCUSSION_CHARS)
+    /// codepoints.
+    text: String,
+}
+
 /// The assembled Task Detail response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -468,6 +503,14 @@ struct TaskDetail {
     task: TaskCard,
     /// The per-task event stream, oldest first.
     timeline: Vec<TimelineEntry>,
+    /// The card's discussion thread, oldest first (issue #335).
+    ///
+    /// Served here rather than from a route of its own so the Discussion tab
+    /// costs the screen no extra read and rides the same 4s poll the timeline
+    /// does — which is what makes another operator's post appear in this
+    /// browser without a refresh. Empty for a card nobody has posted on, which
+    /// is what the tab's honest empty state renders.
+    discussion: Vec<DiscussionMessage>,
     /// Parent and children.
     lineage: Lineage,
     /// Epoch-millis the company started waiting on an operator *right now*
@@ -504,6 +547,15 @@ struct TaskDetail {
 ///   labelled as such so a reader is not misled;
 /// * **lineage** — parent and children, from `parent_task_id`.
 ///
+/// Issue #335 added a fifth, **discussion** — the card's own message thread,
+/// folded out of the same journal traversal from
+/// [`TaskDiscussionPosted`](CompanyEvent::TaskDiscussionPosted). It is a
+/// separate array rather than another timeline `kind` because the two answer
+/// different questions: the timeline is the record of what the *company* did on
+/// this card, and the discussion is what *people* said about it. Folding them
+/// into one list would put an operator's aside between a dispatch and its
+/// completion and call it part of the run.
+///
 /// 404s when the id names no card, matching `PATCH` / `DELETE`.
 async fn task_detail(
     company: ScopedCompany,
@@ -529,7 +581,24 @@ async fn task_detail(
     children.sort_by_key(|t| t.updated_at_millis);
     let children = children.into_iter().map(LineageRef::from).collect();
 
-    let (timeline, open_window_at) = task_timeline(&company, &task_id).await?;
+    let TaskFold {
+        timeline,
+        discussion,
+        window_opened_at: open_window_at,
+    } = fold_task_journal(&company, &task_id).await?;
+
+    // Resolve the posters' labels — one roster read per detail, and only when
+    // the card actually has a thread, so the 4s poll on a card nobody has
+    // posted on costs exactly what it did before #335.
+    let discussion = if discussion.is_empty() {
+        Vec::new()
+    } else {
+        let authors = crate::server::chat_history::author_labels(&company.runtime).await?;
+        discussion
+            .into_iter()
+            .map(|row| row.into_message(&authors))
+            .collect()
+    };
 
     // The live wait (issue #305). Only meaningful while a run window is open —
     // a parked approval on a finished task belongs to whatever runs next, not to
@@ -549,6 +618,7 @@ async fn task_detail(
     Ok(Json(TaskDetail {
         task: card.into(),
         timeline,
+        discussion,
         lineage: Lineage { parent, children },
         waiting_since,
     }))
@@ -561,12 +631,70 @@ async fn task_detail(
 /// but it is never all *resident* at once.
 const TIMELINE_PAGE: usize = 512;
 
-/// Folds the company journal down to one task's timeline.
+/// A discussion post as the fold reads it, before its author is resolved.
+///
+/// The journal carries an [`Actor`](crate::ports::types::Actor); the wire
+/// carries a label. Keeping the two apart means the roster is read once per
+/// request rather than once per message.
+#[derive(Debug)]
+struct DiscussionRow {
+    seq: u64,
+    at_millis: u64,
+    text: String,
+    by: Option<crate::ports::types::Actor>,
+}
+
+impl DiscussionRow {
+    /// Resolves the poster against a `user id → label` map (see
+    /// [`crate::server::chat_history::author_labels`]).
+    fn into_message(
+        self,
+        authors: &std::collections::HashMap<String, String>,
+    ) -> DiscussionMessage {
+        use crate::ports::types::ActorKind;
+        let author = match &self.by {
+            // A signed-in human: name them from the roster. A user who has
+            // since been removed reads as "someone" rather than as a raw id.
+            Some(actor) if actor.kind == ActorKind::User => authors
+                .get(&actor.id)
+                .cloned()
+                .unwrap_or_else(|| "someone".to_string()),
+            // A machine credential, or a post journaled before attribution
+            // existed: there is nobody to name. Same fallback the desk
+            // transcript takes for an unattributed operator message.
+            _ => "operator".to_string(),
+        };
+        DiscussionMessage {
+            seq: self.seq,
+            at_millis: self.at_millis,
+            author,
+            text: self.text,
+        }
+    }
+}
+
+/// What one traversal of the company journal yields for a single task.
+#[derive(Debug, Default)]
+struct TaskFold {
+    /// The run record, oldest first.
+    timeline: Vec<TimelineEntry>,
+    /// The discussion thread, oldest first (issue #335).
+    discussion: Vec<DiscussionRow>,
+    /// The instant a *still-open* dispatch window opened, or `None` when the
+    /// task is not mid-run — the anchor the live wait (#305) is scoped to.
+    window_opened_at: Option<u64>,
+}
+
+/// Folds the company journal down to one task's timeline and discussion.
 ///
 /// Oldest-first, paged. `window` opens on this task's dispatch anchor and closes
 /// on its completion anchor; untagged-but-windowed events (approvals) are only
 /// admitted while it is open, so a resolution belonging to a different task's
 /// run never leaks in.
+///
+/// The discussion rides this same traversal rather than a second one: both
+/// projections read the same log, and the journal is long enough that scanning
+/// it twice per detail poll would be the whole cost of the tab.
 ///
 /// **Why the scan does not stop at the first completion anchor.** A card can be
 /// re-dispatched — moved back to `in_progress` after review — which opens a
@@ -576,21 +704,17 @@ const TIMELINE_PAGE: usize = 512;
 /// memory win without that correctness loss; a stored per-task dispatch offset
 /// is the durable fix for the traversal cost and is left to the epic.
 ///
-/// Returns the timeline alongside the instant the *still-open* window opened,
-/// or `None` when the task is not mid-run — the caller needs that anchor to
-/// scope the live wait (issue #305).
-async fn task_timeline(
-    company: &ScopedCompany,
-    task_id: &str,
-) -> Result<(Vec<TimelineEntry>, Option<u64>), ApiError> {
+/// Returns both projections alongside the instant the *still-open* window
+/// opened, or `None` when the task is not mid-run — the caller needs that anchor
+/// to scope the live wait (issue #305).
+async fn fold_task_journal(company: &ScopedCompany, task_id: &str) -> Result<TaskFold, ApiError> {
     use crate::ports::types::EventSeq;
 
     // One snapshot for the whole fold, not a lookup per event: the fold is a
     // pure function over it, and the journal lock is never held while paging.
     let park_instants = company.runtime.approval_park_instants();
 
-    let mut timeline = Vec::new();
-    let mut window_opened_at: Option<u64> = None;
+    let mut fold = TaskFold::default();
     let mut next_seq = 0u64;
     loop {
         let page = company
@@ -609,40 +733,55 @@ async fn task_timeline(
             .map(|ev| ev.seq.value() + 1)
             .unwrap_or(next_seq + 1);
         let exhausted = page.len() < TIMELINE_PAGE;
-        fold_page(
-            &page,
-            task_id,
-            &park_instants,
-            &mut window_opened_at,
-            &mut timeline,
-        );
+        fold_page(&page, task_id, &park_instants, &mut fold);
         if exhausted {
             break;
         }
     }
-    Ok((timeline, window_opened_at))
+    Ok(fold)
 }
 
-/// Folds one page of journal events onto `timeline`, carrying the window state
+/// Folds one page of journal events onto `fold`, carrying the window state
 /// across pages.
 ///
-/// `window_opened_at` is both the window flag and its anchor: `Some(at)` while
-/// a dispatch is open, `None` once it closes. `park_instants` is the journal
-/// snapshot the approval arm joins against to recover waiting time (#305);
-/// keeping it a parameter leaves this a pure function of its inputs.
+/// `fold.window_opened_at` is both the window flag and its anchor: `Some(at)`
+/// while a dispatch is open, `None` once it closes. `park_instants` is the
+/// journal snapshot the approval arm joins against to recover waiting time
+/// (#305); keeping it a parameter leaves this a pure function of its inputs.
 fn fold_page(
     page: &[crate::ports::types::StoredEvent],
     task_id: &str,
     park_instants: &std::collections::HashMap<crate::ports::types::ApprovalId, u64>,
-    window_opened_at: &mut Option<u64>,
-    timeline: &mut Vec<TimelineEntry>,
+    fold: &mut TaskFold,
 ) {
     use crate::ports::types::ActorKind;
 
+    // Carried by value across the page and written back at the end, so the
+    // window state and the two output lists are never borrowed from `fold` at
+    // the same time.
+    let mut window_opened_at = fold.window_opened_at;
     for ev in page {
+        // The discussion arm short-circuits before the timeline match: a post is
+        // the other projection of this task, never a run event, so it must not
+        // reach `timeline` even as an unlabelled row.
+        if let CompanyEvent::TaskDiscussionPosted {
+            task_id: id,
+            text,
+            by,
+        } = &ev.event
+            && id == task_id
+        {
+            fold.discussion.push(DiscussionRow {
+                seq: ev.seq.value(),
+                at_millis: ev.at_millis,
+                text: text.clone(),
+                by: by.clone(),
+            });
+            continue;
+        }
         let entry = match &ev.event {
             CompanyEvent::TaskDispatched { task_id: id } if id == task_id => {
-                *window_opened_at = Some(ev.at_millis);
+                window_opened_at = Some(ev.at_millis);
                 Some(("dispatched", "Dispatched".to_string(), None, None))
             }
             CompanyEvent::AgentReply {
@@ -674,7 +813,7 @@ fn fold_page(
                 output,
                 column,
             } if id == task_id => {
-                *window_opened_at = None;
+                window_opened_at = None;
                 Some((
                     "completed",
                     format!("Finished on {desk} → {column}"),
@@ -716,7 +855,7 @@ fn fold_page(
             _ => None,
         };
         if let Some((kind, label, detail, waited_millis)) = entry {
-            timeline.push(TimelineEntry {
+            fold.timeline.push(TimelineEntry {
                 seq: ev.seq.value(),
                 at_millis: ev.at_millis,
                 kind: kind.to_string(),
@@ -726,6 +865,87 @@ fn fold_page(
             });
         }
     }
+    fold.window_opened_at = window_opened_at;
+}
+
+/// `POST …/tasks/{task_id}/discussion` — post a message to a card's thread
+/// (issue #335).
+///
+/// The write half of the Discussion tab. A post is journaled as
+/// [`CompanyEvent::TaskDiscussionPosted`] and read back by
+/// [`task_detail`], so it survives a reload and is visible to every operator of
+/// the company on their next poll — one store, no per-browser state.
+///
+/// Validation: a `text` that is empty or whitespace-only is a `400` (an empty
+/// row in a thread is noise nobody can remove — there is no delete in v1), and
+/// an unknown card is a `404`, matching `PATCH` / `DELETE`. Over-long text is
+/// truncated rather than rejected (see
+/// [`MAX_DISCUSSION_CHARS`](crate::ports::tasks::MAX_DISCUSSION_CHARS)).
+///
+/// Unlike a chat message this runs **no cycle**: posting is a note on the card,
+/// not a way to ask an agent for something. Dispatching work is the board's job
+/// and spending money stays behind the column drag.
+///
+/// Answers `201` with the stored message, so the console can render the post
+/// immediately instead of waiting for the next detail poll.
+async fn post_discussion(
+    company: ScopedCompany,
+    Path(TaskPath { task_id }): Path<TaskPath>,
+    Json(body): Json<PostDiscussion>,
+) -> Result<(StatusCode, Json<DiscussionMessage>), ApiError> {
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "a discussion message cannot be empty".to_string(),
+        )));
+    }
+    let text = cap_discussion(text);
+
+    // The card must exist: a thread on a deleted (or mistyped) id would be
+    // written into the journal and then be unreachable from every read surface.
+    let exists = company
+        .runtime
+        .tasks()
+        .list(company.id())
+        .await?
+        .into_iter()
+        .any(|t| t.id == task_id);
+    if !exists {
+        return Err(ApiError(OpenCompanyError::NotFound(format!(
+            "task {task_id}"
+        ))));
+    }
+
+    let by = company.actor.clone();
+    // Not best-effort, unlike the steer audit: here the journal append IS the
+    // write. A swallowed failure would show the operator a posted message that
+    // vanishes on the next poll.
+    let seq = company
+        .runtime
+        .events()
+        .append(
+            company.id(),
+            CompanyEvent::TaskDiscussionPosted {
+                task_id,
+                text: text.clone(),
+                by: by.clone(),
+            },
+        )
+        .await?;
+
+    // The echoed row is stamped from the same clock the store stamps the
+    // journal line with, a moment earlier. The next detail poll replaces it
+    // with the journaled row under the same `seq` — the console's render key —
+    // so the two can never appear as two messages.
+    let authors = crate::server::chat_history::author_labels(&company.runtime).await?;
+    let message = DiscussionRow {
+        seq: seq.value(),
+        at_millis: now_millis(),
+        text,
+        by,
+    }
+    .into_message(&authors);
+    Ok((StatusCode::CREATED, Json(message)))
 }
 
 // ---------------------------------------------------------------------------

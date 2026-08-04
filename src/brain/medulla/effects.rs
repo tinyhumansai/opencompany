@@ -163,6 +163,17 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Deleted workflow {name} ({workflow_id})"),
             "workflow.deleted",
         ),
+        // Card-only body, for the same reason the steer arm below is action-only:
+        // the message text is human free text that no agent consumes in v1
+        // (#335), and this body is wired out to the inference sidecar. Naming
+        // the card records that a human said something on it; quoting them would
+        // make the Discussion tab an unannounced prompt surface.
+        CompanyEvent::TaskDiscussionPosted { task_id, .. } => (
+            Role::System,
+            "operator".to_string(),
+            format!("Posted to the discussion on task {task_id}"),
+            "task.discussion_posted",
+        ),
         // Action-only body: the operator's redirect instruction is never wired.
         CompanyEvent::TaskSteered {
             task_id, action, ..

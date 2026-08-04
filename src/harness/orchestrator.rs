@@ -546,6 +546,13 @@ fn summarize_event(event: &CompanyEvent) -> String {
         CompanyEvent::DeskTaskCompleted {
             task_id, column, ..
         } => format!("task completed ({column}): {task_id}"),
+        // A human posted on a card (#335). The card is named; the message text
+        // is not. This string feeds the orchestrator's recent-activity insight,
+        // and a discussion post is operator free text that no agent consumes in
+        // v1 — quoting it here would route it into a turn through the back door.
+        CompanyEvent::TaskDiscussionPosted { task_id, .. } => {
+            format!("discussion post on task {task_id}")
+        }
         // A finished workflow run (#228). Counts only — never a delivery row's
         // `target` (a recipient's email address) or its `detail`, which can
         // quote one. This string is a non-sensitive one-liner for the insight
