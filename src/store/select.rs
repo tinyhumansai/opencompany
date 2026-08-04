@@ -24,6 +24,7 @@ use crate::ports::facts::FactStore;
 use crate::ports::inbox::InboxStore;
 use crate::ports::login_codes::LoginCodeStore;
 use crate::ports::memory::MemoryStore;
+use crate::ports::runs::RunStore;
 use crate::ports::secrets::SecretStore;
 use crate::ports::sessions::SessionStore;
 use crate::ports::skills_state::SkillStateStore;
@@ -133,6 +134,8 @@ pub struct StorageHandles {
     pub workspace: Arc<dyn WorkspaceStore>,
     pub facts: Arc<dyn FactStore>,
     pub artifacts: Arc<dyn ArtifactStore>,
+    /// First-class task-run records and their step traces (#242).
+    pub runs: Arc<dyn RunStore>,
     pub usage: Arc<dyn UsageMeter>,
     pub skills: Arc<dyn SkillStateStore>,
     pub users: Arc<dyn UserStore>,
@@ -386,6 +389,7 @@ fn open_sqlite(data_dir: &Path) -> Result<Option<StorageHandles>> {
         workspace: store.clone(),
         facts: store.clone(),
         artifacts: store.clone(),
+        runs: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
         users: store.clone(),
@@ -422,6 +426,7 @@ async fn open_mongodb(settings: &StorageSettings) -> Result<Option<StorageHandle
         workspace: store.clone(),
         facts: store.clone(),
         artifacts: store.clone(),
+        runs: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
         users: store.clone(),

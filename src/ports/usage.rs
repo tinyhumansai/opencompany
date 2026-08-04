@@ -71,6 +71,21 @@ pub struct UsageSample {
     pub cost_usd: f64,
     /// What produced the sample.
     pub kind: SampleKind,
+    /// The task **attempt** ([`RunRecord`](crate::ports::runs::RunRecord)) whose
+    /// turn produced this usage, when it ran under one (issue #242).
+    ///
+    /// Purely an attribution key: it lets "what did this attempt cost?" be
+    /// answered from the meter as well as from the run row, and "which attempts
+    /// burned this teammate's budget?" be answered at all. It changes **no**
+    /// ledger semantics — money still moves through the same `inference.spend`
+    /// entry, and [`UNATTRIBUTED_AGENT`](crate::metering::UNATTRIBUTED_AGENT)
+    /// still owns whole-company cycle usage.
+    ///
+    /// `None` for every chat turn, every workflow node, every OAuth/search call,
+    /// and every sample written before this field existed — so a backend's
+    /// stored rows need no migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Durable per-company usage samples. Company A's usage MUST be invisible to

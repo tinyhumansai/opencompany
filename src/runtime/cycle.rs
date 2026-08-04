@@ -31,6 +31,7 @@ use crate::error::OpenCompanyError;
 use crate::feedback::tool::SEND_EMAIL_TOOL;
 use crate::policy::gate::ResolveOutcome;
 use crate::ports::brain::{CycleHost, UsageMetering};
+use crate::ports::runs::{RunOutcome, RunStatus};
 use crate::ports::tasks::{COLUMN_TODO, TaskRecord};
 use crate::ports::types::{
     Actor, ApprovalId, CompanyEvent, CompanyId, CompanyRecord, ContextOp, ContextOpResult,
@@ -61,6 +62,16 @@ const HISTORY_LIMIT: usize = 32;
 /// park cards that silently do nothing when approved.
 pub(crate) const EMAIL_SEND_KIND: &str = "email.send";
 
+/// The `error` the terminality backstop stamps on an attempt row whose cycle
+/// ended without settling it (issue #242) — a brain that ignored the dispatch,
+/// not a brain that failed at it.
+pub(crate) const RUN_UNSETTLED_ERROR: &str =
+    "the dispatch cycle ended without settling this attempt";
+
+/// The `error` prefix the backstop stamps when the cycle itself errored, so the
+/// row carries the same reason the caller saw rather than a generic one.
+pub(crate) const RUN_CYCLE_FAILED_ERROR: &str = "the dispatch cycle failed";
+
 /// Drives cycles for one [`CompanyRuntime`].
 pub struct CycleRunner<'a> {
     rt: &'a CompanyRuntime,
@@ -84,10 +95,39 @@ impl<'a> CycleRunner<'a> {
         // 2. Persist input — durable before any thinking.
         let mut persisted_seq = None;
         let mut event_seqs = Vec::with_capacity(events.len());
+        // Issue #242: the attempt rows this cycle is about to run, moved
+        // `Pending` → `Running` below and backstopped after the brain returns.
+        let mut dispatched_runs: Vec<String> = Vec::new();
         for event in &events {
             let seq = self.rt.events.append(&company, event.clone()).await?;
             event_seqs.push(seq);
             persisted_seq = Some(seq);
+            // Start the run here, not inside the brain: the serial lock is held,
+            // the driving event's seq now exists, and every brain — harness,
+            // hosted, echo — passes through this one place. A brain that ignores
+            // `TaskDispatched` entirely still leaves a correctly-started row for
+            // the backstop below to settle.
+            if let CompanyEvent::TaskDispatched {
+                run_id: Some(run_id),
+                ..
+            } = event
+            {
+                match self.rt.runs().begin_run(&company, run_id, seq).await {
+                    Ok(_) => dispatched_runs.push(run_id.clone()),
+                    // Not fatal, and not silent. The row may be missing (its
+                    // `create_run` failed at the choke point and the dispatch
+                    // proceeded anyway) or already past `Pending` (a replayed
+                    // event). Either way the work still runs — record-keeping
+                    // does not fail the work it records — but the run is not
+                    // tracked as this cycle's, so the backstop leaves it alone.
+                    Err(err) => tracing::warn!(
+                        company = %company,
+                        run = %run_id,
+                        error = %err,
+                        "[runs] could not start an attempt row; the cycle runs untracked"
+                    ),
+                }
+            }
         }
 
         // 3. Load — history, context index, roster.
@@ -140,7 +180,16 @@ impl<'a> CycleRunner<'a> {
             // `ApprovalResolved` ids in its own batch.
             cycle_task_id(&request.events, |id| self.rt.journal.approval_task(id)),
         );
-        let result = self.rt.brain.run_cycle(request, &host).await?;
+        let result = self.rt.brain.run_cycle(request, &host).await;
+        // Issue #242: the terminality backstop. Whatever the brain did — settled
+        // the run richly (the harness path), ignored `TaskDispatched` entirely
+        // (the echo brain), or errored out — no attempt row may be left claiming
+        // to be live once the cycle that owned it is over. Runs deliberately
+        // BEFORE the `?` so a brain error settles its rows too; the only path
+        // that escapes it is a panic, which is the boot reaper's job.
+        self.backstop_dispatched_runs(&company, &dispatched_runs, result.as_ref().err())
+            .await;
+        let result = result?;
 
         // 6. Persist output.
         for trace in &result.new_traces {
@@ -188,6 +237,70 @@ impl<'a> CycleRunner<'a> {
             parked,
             persisted_seq,
         })
+    }
+
+    /// Settles any attempt row this cycle started that is *still* claiming to be
+    /// live (issue #242) — the terminality backstop.
+    ///
+    /// On the ordinary harness path this is a no-op: `run_task` settles the run
+    /// richly (status, cost, step count, failure reason) and returns before
+    /// `run_locked` gets here, so every row is already terminal or parked and
+    /// [`RunStatus::is_active`] is false. The backstop exists for the paths that
+    /// produce no rich settle at all:
+    ///
+    /// * a brain that ignores `TaskDispatched` (the default build's `EchoBrain`,
+    ///   an injected test brain) — the row would otherwise sit `Running` until
+    ///   the next boot reaped it;
+    /// * a brain that **errored**, which is why this runs before the `?`.
+    ///
+    /// Best-effort per row, never propagated: the cycle either produced output
+    /// the operator can already see or failed for a reason worth surfacing, and
+    /// neither should be replaced by a bookkeeping error.
+    ///
+    /// A panic still escapes it — that is deliberately the boot reaper's job
+    /// ([`reap_orphaned_runs`](crate::ports::runs::reap_orphaned_runs)), since a
+    /// panicking cycle cannot run its own cleanup by definition.
+    async fn backstop_dispatched_runs(
+        &self,
+        company: &CompanyId,
+        run_ids: &[String],
+        cycle_error: Option<&OpenCompanyError>,
+    ) {
+        for id in run_ids {
+            let run = match self.rt.runs().get_run(company, id).await {
+                Ok(Some(run)) => run,
+                // Vanished between `begin_run` and here — nothing to settle.
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        company = %company,
+                        run = %id,
+                        error = %err,
+                        "[runs] could not read an attempt row for the terminality backstop"
+                    );
+                    continue;
+                }
+            };
+            if !run.is_active() {
+                // The rich settle already happened (or the run parked). Leaving
+                // a parked run alone is the point: `Paused` / `WaitingApproval`
+                // are waiting on something outside the cycle, not stranded by it.
+                continue;
+            }
+            let reason = match cycle_error {
+                Some(err) => format!("{RUN_CYCLE_FAILED_ERROR}: {err}"),
+                None => RUN_UNSETTLED_ERROR.to_string(),
+            };
+            let outcome = RunOutcome::new(RunStatus::Failed).with_error(reason);
+            if let Err(err) = self.rt.runs().finish_run(company, id, outcome).await {
+                tracing::warn!(
+                    company = %company,
+                    run = %id,
+                    error = %err,
+                    "[runs] the terminality backstop could not settle an attempt row"
+                );
+            }
+        }
     }
 
     /// Meters a finished cycle's inference usage onto the Usage + Finances
@@ -727,7 +840,7 @@ fn cycle_task_id(
     let mut found: Option<String> = None;
     for event in events {
         let candidate = match event {
-            CompanyEvent::TaskDispatched { task_id } => Some(task_id.clone()),
+            CompanyEvent::TaskDispatched { task_id, .. } => Some(task_id.clone()),
             CompanyEvent::ApprovalResolved { approval_id, .. } => {
                 match approval_task(approval_id) {
                     // Resolved an approval that belongs to a card: this cycle
@@ -900,6 +1013,7 @@ impl<'a> CycleHostImpl<'a> {
             first_time_counterparty: !established,
             payload: serde_json::json!({ "to": to, "subject": subject, "body": body }),
             agent: None,
+            run_id: None,
         };
         match self.gate_effect(effect).await? {
             EffectDisposition::Executed => Ok(ToolResult {
@@ -1320,6 +1434,259 @@ mod test {
         );
     }
 
+    /// A brain that fails every cycle — the shape the terminality backstop has
+    /// to cover, because a `?` on `run_cycle` would otherwise skip every settle
+    /// and strand the attempt row `Running` until the next boot.
+    struct FailingBrain;
+
+    #[async_trait]
+    impl Brain for FailingBrain {
+        async fn run_cycle(
+            &self,
+            _req: CycleRequest,
+            _host: &dyn CycleHost,
+        ) -> Result<CycleResult> {
+            Err(OpenCompanyError::Store("the brain fell over".into()))
+        }
+    }
+
+    /// A brain that settles the dispatched run itself, the way `run_task` does
+    /// on the harness path — so the backstop can be shown to leave a rich settle
+    /// alone rather than racing it.
+    struct SettlingBrain {
+        runs: Arc<dyn crate::ports::RunStore>,
+        status: RunStatus,
+    }
+
+    #[async_trait]
+    impl Brain for SettlingBrain {
+        async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
+            for event in &req.events {
+                if let CompanyEvent::TaskDispatched {
+                    run_id: Some(run_id),
+                    ..
+                } = event
+                {
+                    let mut outcome = RunOutcome::new(self.status);
+                    if self.status == RunStatus::Failed {
+                        outcome = outcome.with_error("the brain said so");
+                    }
+                    self.runs
+                        .finish_run(&req.company_id, run_id, outcome)
+                        .await?;
+                }
+            }
+            Ok(CycleResult {
+                channel_responses: vec![OutboundMessage {
+                    task_id: None,
+                    channel: "operator".into(),
+                    text: "settled".into(),
+                    steps: Vec::new(),
+                    reply_to: None,
+                }],
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "settling cycle")],
+                ledger_deltas: Vec::new(),
+                token_usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    /// The rich settle always wins: `run_task` finishes the row *inside*
+    /// `brain.run_cycle`, which is awaited before the backstop, so there is no
+    /// race for the backstop to lose. Pinned rather than argued, because a
+    /// backstop that overwrote a real outcome with a generic failure would be
+    /// worse than no backstop at all.
+    ///
+    /// Both cases matter. A **terminal** settle must survive; so must a
+    /// **parked** one — `Paused` and `WaitingApproval` are waiting on something
+    /// outside the cycle, and reclaiming them would delete real pending work
+    /// every time a cycle ended.
+    #[tokio::test]
+    async fn the_backstop_never_overwrites_a_settle_the_brain_already_made() {
+        for (status, error) in [
+            (RunStatus::Succeeded, None),
+            (RunStatus::Paused, None),
+            (RunStatus::WaitingApproval, None),
+            (RunStatus::Failed, Some("the brain said so")),
+        ] {
+            let home_dir = tmp_home();
+            let runs: Arc<dyn crate::ports::RunStore> =
+                Arc::new(crate::store::FsOps::new(home_dir.path().to_path_buf()));
+            let rt = RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("full"))
+                .with_runs(Arc::clone(&runs))
+                .with_brain(Arc::new(SettlingBrain {
+                    runs: Arc::clone(&runs),
+                    status,
+                }))
+                .build()
+                .await
+                .unwrap();
+            let run_id = pending_run(&rt, "t-1").await;
+
+            rt.run_cycle(vec![CompanyEvent::TaskDispatched {
+                task_id: "t-1".into(),
+                run_id: Some(run_id.clone()),
+            }])
+            .await
+            .expect("cycle");
+
+            let settled = rt
+                .runs()
+                .get_run(rt.id(), &run_id)
+                .await
+                .expect("read")
+                .expect("row");
+            assert_eq!(
+                settled.status, status,
+                "the backstop must not overwrite a {status} settle"
+            );
+            assert_eq!(settled.error.as_deref(), error);
+        }
+    }
+
+    /// Mints a `Pending` run for `task`, so a test can drive a dispatch cycle
+    /// the way `CompanyRuntime::dispatch_task` does.
+    async fn pending_run(rt: &crate::company::runtime::CompanyRuntime, task: &str) -> String {
+        rt.runs()
+            .create_run(
+                rt.id(),
+                crate::ports::runs::NewRun {
+                    id: crate::ports::generate_id(),
+                    task_id: task.to_string(),
+                    agent_id: "ceo".to_string(),
+                },
+            )
+            .await
+            .expect("mint a run")
+            .id
+    }
+
+    /// Issue #242, the `begin_run` half: the run moves `Pending` → `Running`
+    /// stamped with the **seq of the very `TaskDispatched` event that drove
+    /// it**, and by the end of the cycle it is terminal rather than stranded —
+    /// even though the default build's brain ignores `TaskDispatched` entirely
+    /// and settles nothing.
+    #[tokio::test]
+    async fn a_dispatch_cycle_starts_its_run_and_never_leaves_it_claiming_to_be_live() {
+        let home_dir = tmp_home();
+        let rt = RuntimeBuilder::fs_defaults(home_dir.path().to_path_buf(), manifest("full"))
+            .await
+            .unwrap();
+        let run_id = pending_run(&rt, "t-1").await;
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::TaskDispatched {
+                task_id: "t-1".into(),
+                run_id: Some(run_id.clone()),
+            }])
+            .await
+            .expect("the cycle itself succeeds");
+
+        let run = rt
+            .runs()
+            .get_run(rt.id(), &run_id)
+            .await
+            .expect("read")
+            .expect("the run survives its cycle");
+        assert_eq!(
+            run.trigger_event_seq, report.persisted_seq,
+            "the run must name the exact log line that drove it"
+        );
+        assert!(
+            run.started_at_millis.is_some(),
+            "begin_run stamps when the attempt actually began"
+        );
+        assert_eq!(
+            run.status,
+            RunStatus::Failed,
+            "an echo-brain dispatch produces no rich settle, so the backstop closes it"
+        );
+        assert_eq!(run.error.as_deref(), Some(RUN_UNSETTLED_ERROR));
+        assert!(run.finished_at_millis.is_some());
+    }
+
+    /// The other backstop arm: the brain **errored**. The cycle error still
+    /// propagates to the caller (nothing is swallowed), and the row settles
+    /// carrying that same reason instead of sitting `Running` forever.
+    #[tokio::test]
+    async fn a_failed_cycle_settles_its_run_and_still_reports_the_failure() {
+        let home_dir = tmp_home();
+        let rt = RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("full"))
+            .with_brain(Arc::new(FailingBrain))
+            .build()
+            .await
+            .unwrap();
+        let run_id = pending_run(&rt, "t-1").await;
+
+        let err = rt
+            .run_cycle(vec![CompanyEvent::TaskDispatched {
+                task_id: "t-1".into(),
+                run_id: Some(run_id.clone()),
+            }])
+            .await
+            .expect_err("a failing brain still fails the cycle");
+        assert!(err.to_string().contains("the brain fell over"), "{err}");
+
+        let run = rt
+            .runs()
+            .get_run(rt.id(), &run_id)
+            .await
+            .expect("read")
+            .expect("run");
+        assert_eq!(run.status, RunStatus::Failed);
+        let reason = run.error.unwrap_or_default();
+        assert!(reason.starts_with(RUN_CYCLE_FAILED_ERROR), "{reason}");
+        assert!(
+            reason.contains("the brain fell over"),
+            "the row must carry the reason the caller saw: {reason}"
+        );
+    }
+
+    /// A dispatch whose run row could not be minted (`run_id: None`) — the
+    /// documented degraded path — must still run the cycle normally. The
+    /// dispatch is the work; the row is only the record of it.
+    #[tokio::test]
+    async fn an_untracked_dispatch_still_runs_its_cycle() {
+        let home_dir = tmp_home();
+        let rt = RuntimeBuilder::fs_defaults(home_dir.path().to_path_buf(), manifest("full"))
+            .await
+            .unwrap();
+
+        rt.run_cycle(vec![CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+            run_id: None,
+        }])
+        .await
+        .expect("an untracked dispatch is still a dispatch");
+
+        assert!(
+            rt.runs()
+                .list_runs(rt.id(), &crate::ports::runs::RunFilter::default())
+                .await
+                .expect("list")
+                .is_empty(),
+            "no row was minted, so none may be invented"
+        );
+    }
+
+    /// A `run_id` naming a row that does not exist (a replayed journal line, a
+    /// row lost with its store) must not fail the cycle either — and must not
+    /// be tracked, so the backstop has nothing to settle.
+    #[tokio::test]
+    async fn a_dispatch_naming_an_unknown_run_does_not_fail_the_cycle() {
+        let home_dir = tmp_home();
+        let rt = RuntimeBuilder::fs_defaults(home_dir.path().to_path_buf(), manifest("full"))
+            .await
+            .unwrap();
+
+        rt.run_cycle(vec![CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+            run_id: Some("run-that-never-was".into()),
+        }])
+        .await
+        .expect("an unknown run id is a bookkeeping miss, not a cycle failure");
+    }
+
     #[tokio::test]
     async fn end_to_end_operator_message_echoes_and_persists() {
         let home_dir = tmp_home();
@@ -1379,6 +1746,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         };
 
         execute_effect_once(&rt, "k1", &effect).await.unwrap();
@@ -1411,6 +1779,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         };
         let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
             .with_brain(Arc::new(EffectBrain {
@@ -1460,6 +1829,7 @@ mod test {
             first_time_counterparty: false,
             payload: args,
             agent: Some(agent.to_string()),
+            run_id: None,
         }
     }
 
@@ -1748,6 +2118,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         };
         let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
             .with_brain(Arc::new(EffectBrain {
@@ -1825,6 +2196,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" }),
             agent: None,
+            run_id: None,
         };
         let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
             .with_brain(Arc::new(ParkingBrain {
@@ -1879,6 +2251,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         };
         let approval_id = {
             let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
@@ -1929,6 +2302,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::json!({ "channel": "operator", "text": "ORIGINAL" }),
             agent: None,
+            run_id: None,
         };
         // A recording operator channel we keep a handle to (Arc-shared buffer).
         let operator_channel = OperatorChannel::new();
@@ -1994,6 +2368,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         };
         // A zero-TTL gate: anything parked is immediately past its deadline.
         let gate = Arc::new(
@@ -2355,6 +2730,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::json!({ "to": "x@ext.com", "subject": "Hi", "body": "yo" }),
             agent: None,
+            run_id: None,
         };
         let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
             .with_brain(Arc::new(EffectBrain {
@@ -2424,6 +2800,7 @@ mod test {
                 "body": "Q3 is up 12%.",
             }),
             agent: None,
+            run_id: None,
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
@@ -2488,6 +2865,7 @@ mod test {
                 "body": "Q3 is up 12%.",
             }),
             agent: None,
+            run_id: None,
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
@@ -2532,6 +2910,7 @@ mod test {
                 "body": "Q3 is up 12%.",
             }),
             agent: None,
+            run_id: None,
         };
         let approval_id = {
             let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
@@ -2584,6 +2963,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::json!({ "to": "x@ext.com", "subject": "Hi", "body": "yo" }),
             agent: None,
+            run_id: None,
         };
         let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
             .with_brain(Arc::new(EffectBrain {
@@ -2603,6 +2983,7 @@ mod test {
                 first_time_counterparty: false,
                 payload: serde_json::json!({ "to": "x@ext.com", "subject": "Hi", "body": "yo" }),
                 agent: None,
+                run_id: None,
             },
         )
         .await
@@ -2810,6 +3191,7 @@ mod test {
         };
         let dispatched = |id: &str| CompanyEvent::TaskDispatched {
             task_id: id.to_string(),
+            run_id: None,
         };
         let resolved = |id: &str| CompanyEvent::ApprovalResolved {
             approval_id: ApprovalId::new(id),

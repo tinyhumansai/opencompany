@@ -42,6 +42,13 @@ jobs:
             | sed -E 's#(mongodb(\+srv)?://[^:]+:)[^@]+@#\1***@#g; s#(Bearer )[A-Za-z0-9._-]{6,}#\1***#g; s#sntryu_[A-Za-z0-9]+#sntryu_***#g; s#((password|passwd|secret|token|apikey|api_key)[\"'"'"'=: ]+)[A-Za-z0-9._/+-]{8,}#\1***#gI'
           set -uo pipefail
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          echo "===== CLUSTER OIDC issuer (for OPENCOMPANY_CLUSTER_ISSUER) ====="
+          kubectl get --raw /.well-known/openid-configuration 2>&1 \
+            | (jq -r '"issuer=\(.issuer)\njwks_uri=\(.jwks_uri)"' 2>/dev/null || cat) || true
+          echo "===== attestation env ON LIVE DEPLOYMENTS (audience/issuer set?) ====="
+          kubectl get deploy -A -o json 2>/dev/null \
+            | jq -r '.items[] | .metadata.namespace as $ns | .metadata.name as $n | (.spec.template.spec.containers[]?.env[]? | select(.name|test("ATTESTATION|CLUSTER_ISSUER|TENANT_SA_NAME|TENANT_NS")) | "\($ns)/\($n)  \(.name)=\(.value // "(fromSecret/ref)")")' \
+            2>/dev/null | sort -u || echo "(none set on any deployment)"
           echo "===== statefulset status ====="
           kubectl -n "$NS" get sts opencompany -o custom-columns=REPLICAS:.spec.replicas,READY:.status.readyReplicas,CURRENT:.status.currentReplicas,IMG:.spec.template.spec.containers[0].image 2>&1 || true
           echo "===== describe statefulset (events tail) ====="

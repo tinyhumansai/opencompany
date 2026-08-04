@@ -413,6 +413,7 @@ mod tests {
                         cached_input_tokens: 0,
                         cost_usd: cost,
                         kind: SampleKind::Inference,
+                        run_id: None,
                     },
                 )
                 .await
@@ -432,6 +433,7 @@ mod tests {
                     cached_input_tokens: 0,
                     cost_usd: 9.00,
                     kind: SampleKind::Inference,
+                    run_id: None,
                 },
             )
             .await
@@ -479,6 +481,7 @@ mod tests {
                     cached_input_tokens: 0,
                     cost_usd: 9.00,
                     kind: SampleKind::Inference,
+                    run_id: None,
                 },
             )
             .await

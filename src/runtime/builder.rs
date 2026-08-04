@@ -41,8 +41,8 @@ use crate::ports::types::{
 };
 use crate::ports::{
     AgentEconomy, ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    FactStore, InboxStore, LoginCodeStore, MemoryStore, SecretStore, SessionStore, SkillStateStore,
-    TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
+    FactStore, InboxStore, LoginCodeStore, MemoryStore, RunStore, SecretStore, SessionStore,
+    SkillStateStore, TaskStore, ToolProvider, UsageMeter, UserStore, WorkspaceStore,
 };
 use crate::runtime::channel::{OPERATOR_CHANNEL, OperatorChannel};
 use crate::runtime::journal::RuntimeJournal;
@@ -215,6 +215,7 @@ pub struct RuntimeBuilder {
     workspace: Option<Arc<dyn WorkspaceStore>>,
     facts: Option<Arc<dyn FactStore>>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
+    runs: Option<Arc<dyn RunStore>>,
     usage: Option<Arc<dyn UsageMeter>>,
     skills: Option<Arc<dyn SkillStateStore>>,
     users: Option<Arc<dyn UserStore>>,
@@ -296,6 +297,7 @@ impl RuntimeBuilder {
             workspace: None,
             facts: None,
             artifacts: None,
+            runs: None,
             usage: None,
             skills: None,
             users: None,
@@ -401,6 +403,7 @@ impl RuntimeBuilder {
         self.workspace = Some(handles.workspace.clone());
         self.facts = Some(handles.facts.clone());
         self.artifacts = Some(handles.artifacts.clone());
+        self.runs = Some(handles.runs.clone());
         self.usage = Some(handles.usage.clone());
         self.skills = Some(handles.skills.clone());
         self.users = Some(handles.users.clone());
@@ -464,6 +467,12 @@ impl RuntimeBuilder {
     /// Swaps the artifact store (default: fs-backed).
     pub fn with_artifacts(mut self, artifacts: Arc<dyn ArtifactStore>) -> Self {
         self.artifacts = Some(artifacts);
+        self
+    }
+
+    /// Swaps the task-run store (default: fs-backed).
+    pub fn with_runs(mut self, runs: Arc<dyn RunStore>) -> Self {
+        self.runs = Some(runs);
         self
     }
 
@@ -726,6 +735,7 @@ impl RuntimeBuilder {
             workspace: self.workspace.unwrap_or_else(|| fs_ops.clone()),
             facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
             artifacts: self.artifacts.unwrap_or_else(|| fs_ops.clone()),
+            runs: self.runs.unwrap_or_else(|| fs_ops.clone()),
             usage: self.usage.unwrap_or_else(|| fs_ops.clone()),
             skills: self.skills.unwrap_or_else(|| fs_ops.clone()),
             users: self.users.unwrap_or_else(|| fs_ops.clone()),
@@ -848,6 +858,32 @@ impl RuntimeBuilder {
             Bundle::new(home.clone(), &id).journal_jsonl(),
         ));
         journal.load().await?;
+
+        // Issue #242, the other half of boot replay: reclaim run records left
+        // active by a previous host process.
+        //
+        // A run row is written *before* its cycle spawns, so a crash in that
+        // gap — or anywhere inside the cycle — leaves a row claiming to be
+        // Pending or Running that nothing will ever settle. Three invariants
+        // make every such row provably dead rather than merely suspicious:
+        // cycles are process-local `tokio::spawn`s, exactly one process owns a
+        // company (the journal above is single-writer), and cycles serialise on
+        // the per-company mutex — so nothing from this process can be in flight
+        // yet. `reap_orphaned_runs` therefore needs no timeout heuristic, and it
+        // never touches a parked run: WaitingApproval and Paused are waiting on
+        // a person or an external condition, not on a process.
+        //
+        // It runs here, beside `journal.load()`, and well before the dispatch
+        // and scheduler spawns further down, so no fresh run can be reaped by
+        // mistake. A store failure is logged, never fatal: record-keeping must
+        // not stop a company from booting.
+        if let Err(err) = crate::ports::runs::reap_orphaned_runs(ops.runs.as_ref(), &id).await {
+            tracing::warn!(
+                company = %id,
+                error = %err,
+                "could not sweep orphaned run records at boot"
+            );
+        }
 
         let gate = self
             .approvals
@@ -1254,7 +1290,13 @@ impl RuntimeBuilder {
                             // `set_workflow_runner`, so this is not a strong cycle.
                             deps.workflow_runner.set(&runner);
                             wf_runner = Some(runner);
-                            Some(Arc::new(HarnessBrain::new(pool, deps, record)) as Arc<dyn Brain>)
+                            Some(Arc::new(
+                                // Issue #242: the same run store the dispatch
+                                // choke point mints into and the boot reaper
+                                // sweeps, so an attempt's trace, cost and
+                                // status all land on the row it opened.
+                                HarnessBrain::new(pool, deps, record).with_runs(ops.runs.clone()),
+                            ) as Arc<dyn Brain>)
                         } else {
                             // Do not degrade silently (issue #174): an openhuman
                             // build with no resolvable inference source disables
@@ -1706,6 +1748,113 @@ mod test {
             .expect("tempdir")
     }
 
+    /// Issue #242, the property this whole PR exists to create, proven across a
+    /// real restart: a host killed mid-run leaves the attempt's **partial trace
+    /// intact**, and the next boot settles the row it stranded.
+    ///
+    /// The kill is simulated by simply not settling — which is exactly what a
+    /// `SIGKILL` looks like from the store's side, and the reason the boot
+    /// reaper's claim is a proof rather than a timeout heuristic: a cycle is a
+    /// process-local spawn, so an active row at boot cannot belong to anything
+    /// still alive.
+    #[tokio::test]
+    async fn a_killed_run_keeps_its_partial_trace_and_is_settled_on_the_next_boot() {
+        use crate::ports::runs::{NewRun, RunStatus, RunStepRecord};
+        use crate::ports::types::{EventSeq, TurnStep, TurnStepKind, TurnStepStatus};
+
+        let home = tmp_home("opencompany-run-restart-");
+        let manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .expect("manifest");
+        let id = CompanyId::new("acme");
+
+        // --- boot 1: a card is dispatched, starts, writes two steps… and dies.
+        {
+            let rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest.clone())
+                .with_id(id.clone())
+                .build()
+                .await
+                .expect("first boot");
+            let runs = rt.runs();
+            runs.create_run(
+                &id,
+                NewRun {
+                    id: "run-1".to_string(),
+                    task_id: "t-1".to_string(),
+                    agent_id: "ceo".to_string(),
+                },
+            )
+            .await
+            .expect("mint");
+            runs.begin_run(&id, "run-1", EventSeq::new(3))
+                .await
+                .expect("begin");
+            for (step_seq, label, status) in [
+                (0u32, "Reading the brief", TurnStepStatus::Ok),
+                (1, "Searching the web", TurnStepStatus::Running),
+            ] {
+                runs.append_run_step(
+                    &id,
+                    &RunStepRecord {
+                        run_id: "run-1".to_string(),
+                        step_seq,
+                        at_millis: 100 + step_seq as u64,
+                        step: TurnStep {
+                            kind: TurnStepKind::ToolCall,
+                            status,
+                            label: label.to_string(),
+                            detail: None,
+                            elapsed_ms: None,
+                        },
+                    },
+                )
+                .await
+                .expect("append step");
+            }
+            // …and the process is gone. Nothing settles the row.
+        }
+
+        // --- boot 2: the builder's reaper runs before anything is dispatched.
+        let rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .expect("second boot");
+
+        let reaped = rt
+            .runs()
+            .get_run(&id, "run-1")
+            .await
+            .expect("read")
+            .expect("the row survives the restart");
+        assert_eq!(
+            reaped.status,
+            RunStatus::Failed,
+            "an attempt whose process died must not still claim to be running"
+        );
+        assert_eq!(
+            reaped.error.as_deref(),
+            Some(crate::ports::runs::ORPHAN_ERROR)
+        );
+
+        // The whole point: the steps written before the kill are still there,
+        // including the tool call that never got to finish.
+        let steps = rt
+            .runs()
+            .list_run_steps(&id, "run-1")
+            .await
+            .expect("list steps");
+        assert_eq!(steps.len(), 2, "the partial trace must survive the restart");
+        assert_eq!(steps[0].step.label, "Reading the brief");
+        assert_eq!(steps[0].step.status, TurnStepStatus::Ok);
+        assert_eq!(
+            steps[1].step.status,
+            TurnStepStatus::Running,
+            "the call that was in flight when the host died reads as in flight"
+        );
+    }
+
     #[test]
     fn slugifies_display_names() {
         assert_eq!(company_id_from_name("Acme Co!").as_ref(), "acme-co");
@@ -1894,6 +2043,84 @@ mod test {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Issue #242: a run row left active by a dead host is reclaimed at the next
+    /// boot, and a parked one is not.
+    ///
+    /// The store is the default fs backend over the same home, so the second
+    /// `build()` is a genuine restart of the same company — this asserts the
+    /// reaper is *wired into boot*, not merely that the port function works
+    /// (which the conformance suite covers for all three backends).
+    #[tokio::test]
+    async fn boot_reaps_runs_stranded_by_a_previous_host() {
+        use crate::ports::runs::{NewRun, ORPHAN_ERROR, RunOutcome, RunStatus};
+
+        let home_dir = tmp_home("oc-run-reap-");
+        let home = home_dir.path().to_path_buf();
+        let manifest = parse("[company]\nname=\"Acme\"\n[policy]\nmode=\"full\"\n");
+        let id = CompanyId::new("acme");
+        let spec = |run: &str, task: &str| NewRun {
+            id: run.to_string(),
+            task_id: task.to_string(),
+            agent_id: "ceo".to_string(),
+        };
+
+        let first_boot = RuntimeBuilder::new(home.clone(), manifest.clone())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let runs = first_boot.runs().clone();
+
+        // Two attempts the host is "running", and one parked for a person.
+        runs.create_run(&id, spec("pending", "card-a"))
+            .await
+            .unwrap();
+        runs.create_run(&id, spec("running", "card-b"))
+            .await
+            .unwrap();
+        runs.begin_run(&id, "running", crate::ports::types::EventSeq::new(1))
+            .await
+            .unwrap();
+        runs.create_run(&id, spec("review", "card-c"))
+            .await
+            .unwrap();
+        runs.begin_run(&id, "review", crate::ports::types::EventSeq::new(2))
+            .await
+            .unwrap();
+        runs.finish_run(&id, "review", RunOutcome::new(RunStatus::WaitingApproval))
+            .await
+            .unwrap();
+
+        // The host dies here — no settle, no journal entry, nothing.
+        drop(first_boot);
+
+        let second_boot = RuntimeBuilder::new(home.clone(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let runs = second_boot.runs();
+
+        for stranded in ["pending", "running"] {
+            let run = runs.get_run(&id, stranded).await.unwrap().unwrap();
+            assert_eq!(
+                run.status,
+                RunStatus::Failed,
+                "{stranded} outlived its process and must be reclaimed"
+            );
+            assert_eq!(run.error.as_deref(), Some(ORPHAN_ERROR));
+            assert!(run.finished_at_millis.is_some());
+        }
+
+        // Parked is not orphaned: this one is waiting on a person, and a restart
+        // must not throw that work away.
+        let review = runs.get_run(&id, "review").await.unwrap().unwrap();
+        assert_eq!(review.status, RunStatus::WaitingApproval);
+        assert_eq!(review.error, None);
+
+        assert!(runs.list_stale_active(&id).await.unwrap().is_empty());
     }
 
     #[tokio::test]

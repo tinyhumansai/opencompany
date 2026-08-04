@@ -714,6 +714,7 @@ async fn webhook_emitted_on_approval_requested() {
         first_time_counterparty: false,
         payload: serde_json::Value::Null,
         agent: None,
+        run_id: None,
     };
     let runtime = RuntimeBuilder::new(home.clone(), manifest)
         .with_id(CompanyId::new("acme"))

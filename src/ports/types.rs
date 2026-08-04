@@ -343,6 +343,27 @@ pub enum CompanyEvent {
     TaskDispatched {
         /// The id of the dispatched task card.
         task_id: String,
+        /// The [`RunRecord`](crate::ports::runs::RunRecord) this dispatch is an
+        /// attempt under (issue #242), minted at the dispatch choke point
+        /// *before* the cycle is spawned.
+        ///
+        /// Carrying it on the event is what makes the journal self-describing:
+        /// the run row and the durable log line name each other, so a reader
+        /// holding either one can find the other without re-deriving identity
+        /// from timestamps. It also keeps
+        /// [`Brain::run_cycle`](crate::ports::brain::Brain::run_cycle)'s
+        /// signature stable — the id rides the event the brain already reads
+        /// rather than a new argument every brain would have to thread.
+        ///
+        /// `None` for a dispatch whose run row could not be minted (record-keeping
+        /// never fails the work it records) and for every event journaled before
+        /// this field existed. Additive in exactly the way
+        /// [`AgentReply`](Self::AgentReply)'s `task_id` is: `#[serde(default)]`
+        /// lets an already-persisted log load, and `skip_serializing_if` keeps an
+        /// untagged dispatch serializing byte-for-byte as it did before, so no
+        /// stored record needs migrating.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     /// An agent's MCP tool call failed during a turn, journaled by the harness
     /// so the operator has an audit trail of which server/tool broke and why.
@@ -634,6 +655,26 @@ pub struct Effect {
     /// to parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The task **attempt** ([`RunRecord`](crate::ports::runs::RunRecord)) whose
+    /// turn produced this effect, when it was produced inside one at all (issue
+    /// #242).
+    ///
+    /// This is the correlation an approval needs to be answerable *about a
+    /// run*: the approvals queue is company-wide, so without it "which attempt
+    /// is waiting on me?" cannot be asked, and an attempt cannot tell whether it
+    /// parked anything of its own.
+    ///
+    /// Stamped at the **dispatch** boundary, not in
+    /// [`ApprovalPolicy::effect_for`](crate::harness::policy::ApprovalPolicy::effect_for):
+    /// the policy is per-agent and outlives any one run, so it has no run
+    /// context to stamp. An effect a *chat* turn parked therefore stays `None`,
+    /// correctly — no attempt is waiting on it.
+    ///
+    /// Skipped when serializing and defaulted when absent, exactly like
+    /// [`agent`](Self::agent), so journal lines written before this field
+    /// existed replay as `None` rather than failing to parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl Effect {
@@ -2151,6 +2192,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::json!({"to": "@vendor"}),
             agent: None,
+            run_id: None,
         };
         let back = round_trip(&effect);
         assert_eq!(back, effect);
@@ -2706,6 +2748,79 @@ mod test {
             let again = serde_json::to_string(&event).expect("serialize");
             assert_eq!(again, line, "pre-#228 line must re-serialize unchanged");
         }
+    }
+
+    /// Issue #242: an effect remembers which task attempt produced it, and the
+    /// field is additive in the same way `Effect::agent` was — a journal line
+    /// written before it existed replays as `None` (no run correlation, the
+    /// pre-#242 behaviour) rather than failing to parse and taking the whole
+    /// approval queue down with it on replay.
+    #[test]
+    fn effect_run_id_round_trips_and_a_legacy_line_replays_as_none() {
+        let mut effect = Effect {
+            kind: "composio.execute".to_string(),
+            group: EffectGroup::Other,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "tool": "GMAIL_SEND_EMAIL" }),
+            agent: Some("finance".to_string()),
+            run_id: None,
+        };
+        let untagged = serde_json::to_string(&effect).expect("serialize");
+        assert!(
+            !untagged.contains("run_id"),
+            "an untagged effect's wire form must be unchanged: {untagged}"
+        );
+
+        effect.run_id = Some("run-7".to_string());
+        let tagged = serde_json::to_string(&effect).expect("serialize");
+        assert!(tagged.contains(r#""run_id":"run-7""#), "{tagged}");
+        assert_eq!(
+            effect,
+            serde_json::from_str::<Effect>(&tagged).expect("round trip")
+        );
+
+        // The pre-#242 line: same bytes, no field.
+        let legacy: Effect = serde_json::from_str(&untagged).expect("legacy effect must load");
+        assert_eq!(legacy.run_id, None);
+        assert_eq!(
+            legacy.agent.as_deref(),
+            Some("finance"),
+            "the earlier additive field must still be read alongside the new one"
+        );
+    }
+
+    /// Issue #242: the run id rides the dispatch event, and it is additive in
+    /// both directions — a tagged dispatch round-trips it, and an untagged one
+    /// serializes exactly the shape a pre-#242 journal holds (asserted verbatim
+    /// above too, but here against the *writer* rather than the reader).
+    #[test]
+    fn task_dispatched_carries_its_run_id_without_changing_the_untagged_shape() {
+        let untagged = CompanyEvent::TaskDispatched {
+            task_id: "t-1".to_string(),
+            run_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).expect("serialize"),
+            r#"{"kind":"TaskDispatched","task_id":"t-1"}"#
+        );
+
+        let tagged = CompanyEvent::TaskDispatched {
+            task_id: "t-1".to_string(),
+            run_id: Some("run-7".to_string()),
+        };
+        let line = serde_json::to_string(&tagged).expect("serialize");
+        assert!(line.contains(r#""run_id":"run-7""#), "{line}");
+        assert_eq!(
+            tagged,
+            serde_json::from_str::<CompanyEvent>(&line).expect("round trip")
+        );
+
+        // A legacy line loads as an untagged dispatch rather than failing.
+        let legacy: CompanyEvent =
+            serde_json::from_str(r#"{"kind":"TaskDispatched","task_id":"t-1"}"#).expect("legacy");
+        assert_eq!(legacy, untagged);
     }
 
     #[test]

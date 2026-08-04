@@ -28,6 +28,7 @@ use crate::company::steer::{
 use crate::harness::TurnOutcome;
 use crate::harness::lifecycle::{self, TaskRunEnd};
 use crate::harness::orchestrator::{self, Delegation, DelegationQueue};
+use crate::harness::run_trace::RunTraceSink;
 use crate::ports::tasks::COLUMN_TODO;
 use crate::ports::types::{CompanyId, CompanyRecord, OutboundMessage, TurnStep};
 use crate::ports::{TaskRecord, TaskStore, generate_id, now_millis};
@@ -55,6 +56,11 @@ pub trait RunTurn: Send + Sync {
     ) -> Result<TurnOutcome>;
 
     /// A streamed, operator-steerable turn (pause / cancel / redirect).
+    ///
+    /// `run_sink` is the dispatched attempt this turn belongs to, when it
+    /// belongs to one (issue #242): a desk turn a *dispatched card* handed its
+    /// work to traces into that card's run, while the same delegation reached
+    /// from operator chat passes `None` and behaves exactly as before.
     async fn run_steered(
         &self,
         company: &CompanyId,
@@ -62,17 +68,24 @@ pub trait RunTurn: Send + Sync {
         message: &str,
         control: &SteerControl,
         chat_id: Option<&str>,
+        run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome>;
 
     /// A steerable turn WITHOUT live streaming — for a dispatched card whose
     /// steps are discarded into its note and must not leak onto the console
     /// timeline.
+    ///
+    /// `run_sink` carries the same meaning as on
+    /// [`run_steered`](Self::run_steered). It is *this* method the dispatched
+    /// card's own turns pass a sink to, which is what makes the card's trace
+    /// durable while the turn runs even though nothing is streamed.
     async fn run_steered_background(
         &self,
         company: &CompanyId,
         agent_id: &str,
         message: &str,
         control: &SteerControl,
+        run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome>;
 }
 
@@ -215,6 +228,11 @@ pub(crate) struct DelegationRunner<'a> {
     /// #204). Owned rather than borrowed so a caller can hold the card mutably
     /// while the runner runs. `None` for an operator chat turn.
     task: Option<String>,
+    /// The attempt row that card is running under (issue #242), so a delegate's
+    /// turn traces and meters into the *same* run rather than disappearing from
+    /// the record the moment the work changes hands. `None` for an operator chat
+    /// turn, and for a dispatch whose run row could not be minted.
+    run_sink: Option<Arc<RunTraceSink>>,
 }
 
 impl<'a> DelegationRunner<'a> {
@@ -238,6 +256,7 @@ impl<'a> DelegationRunner<'a> {
             queue,
             max_delegations,
             task: None,
+            run_sink: None,
         }
     }
 
@@ -245,6 +264,13 @@ impl<'a> DelegationRunner<'a> {
     /// records that card as its parent (issue #185's `parent_task_id`).
     pub(crate) fn for_task(mut self, task_id: &str) -> Self {
         self.task = Some(task_id.to_string());
+        self
+    }
+
+    /// Scopes this runner to the card's **attempt** (issue #242), so a delegated
+    /// turn's steps and spend land on the same run the dispatch opened.
+    pub(crate) fn for_run(mut self, run_sink: Option<Arc<RunTraceSink>>) -> Self {
+        self.run_sink = run_sink;
         self
     }
 
@@ -614,7 +640,18 @@ impl<'a> DelegationRunner<'a> {
                 let control = guard.control().clone();
                 let outcome = self
                     .run_turn
-                    .run_steered(self.company, &member, &instruction, &control, chat_id)
+                    .run_steered(
+                        self.company,
+                        &member,
+                        &instruction,
+                        &control,
+                        chat_id,
+                        // Issue #242: when this drain is running inside a
+                        // dispatched card, the delegate's turn is part of that
+                        // card's attempt — its steps and its spend belong to the
+                        // same run. `None` for a chat-path delegation.
+                        self.run_sink.clone(),
+                    )
                     .await?;
                 // A cancel issued mid-flight discards the delegated reply —
                 // nothing is relayed. Flagged as a cancellation so a caller that

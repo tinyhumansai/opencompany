@@ -17,5 +17,9 @@ lcov.info
 # agent worktrees (isolation)
 .claude/worktrees/
 
+# Local worktree files
+worktree/*
+!worktree/.gitkeep
+
 # Local dev cargo path-override (points at a sibling openhuman checkout)
 .cargo/config.toml

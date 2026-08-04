@@ -8,6 +8,8 @@
 //! - sessions → `user-sessions.json`, login codes → `login-codes.json`
 //!   (credential material: token/code *hashes* only, never plaintext)
 //! - facts → `facts.jsonl` (last-write-wins per id, rewritten on mutate)
+//! - runs → `runs.jsonl` (last-write-wins per id) + `run-steps.jsonl`
+//!   (append-only trace, last-write-wins per `(run_id, step_seq)`)
 //! - usage → `usage.jsonl` (append-only samples)
 //! - skills → `skills.json` (operator deltas)
 //! - workspace → real folders + Markdown files under `workspace/`, indexed by
@@ -25,6 +27,9 @@ use crate::ports::artifacts::{ArtifactRecord, ArtifactStore};
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
 use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
 use crate::ports::now_millis;
+use crate::ports::runs::{
+    NewRun, RunFilter, RunRecord, RunStatus, RunStepRecord, RunStore, sort_newest_first,
+};
 use crate::ports::sessions::{SessionRecord, SessionStore};
 use crate::ports::skills_state::{SkillState, SkillStateStore};
 use crate::ports::tasks::{TaskRecord, TaskStore};
@@ -509,6 +514,109 @@ impl ArtifactStore for FsOps {
 }
 
 // ---------------------------------------------------------------------------
+// RunStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl RunStore for FsOps {
+    async fn create_run(&self, company: &CompanyId, spec: NewRun) -> Result<RunRecord> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.runs_jsonl();
+        // The per-path lock is what makes read-max-then-write atomic. It is
+        // process-local — the documented fs-backend assumption everywhere in
+        // this file — which is why the port's `create_run` contract calls the
+        // filesystem ordinal best-effort rather than transactional.
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut runs = dedup_latest(read_jsonl::<RunRecord>(&path).await?);
+        if runs.iter().any(|r| r.id == spec.id) {
+            return Err(OpenCompanyError::Conflict(format!(
+                "run '{}' already exists",
+                spec.id
+            )));
+        }
+        let attempt = runs
+            .iter()
+            .filter(|r| r.task_id == spec.task_id)
+            .map(|r| r.attempt)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let run = RunRecord {
+            id: spec.id,
+            company: company.clone(),
+            task_id: spec.task_id,
+            agent_id: spec.agent_id,
+            attempt,
+            status: RunStatus::Pending,
+            trigger_event_seq: None,
+            created_at_millis: now_millis(),
+            started_at_millis: None,
+            finished_at_millis: None,
+            error: None,
+            usage: Default::default(),
+            step_count: 0,
+        };
+        runs.push(run.clone());
+        rewrite_jsonl(&path, &runs).await?;
+        Ok(run)
+    }
+
+    async fn get_run(&self, company: &CompanyId, id: &str) -> Result<Option<RunRecord>> {
+        let runs = dedup_latest(read_jsonl::<RunRecord>(&self.bundle(company).runs_jsonl()).await?);
+        Ok(runs.into_iter().find(|r| r.id == id))
+    }
+
+    async fn put_run(&self, company: &CompanyId, run: &RunRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.runs_jsonl();
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        let mut runs = dedup_latest(read_jsonl::<RunRecord>(&path).await?);
+        match runs.iter_mut().find(|r| r.id == run.id) {
+            Some(existing) => *existing = run.clone(),
+            None => runs.push(run.clone()),
+        }
+        rewrite_jsonl(&path, &runs).await
+    }
+
+    async fn list_runs(&self, company: &CompanyId, filter: &RunFilter) -> Result<Vec<RunRecord>> {
+        let mut runs =
+            dedup_latest(read_jsonl::<RunRecord>(&self.bundle(company).runs_jsonl()).await?);
+        runs.retain(|r| filter.matches(r));
+        sort_newest_first(&mut runs);
+        if let Some(limit) = filter.limit {
+            runs.truncate(limit);
+        }
+        Ok(runs)
+    }
+
+    async fn append_run_step(&self, company: &CompanyId, step: &RunStepRecord) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.run_steps_jsonl();
+        let line = serde_json::to_string(step)?;
+        let lock = self.locks.get(&path);
+        let _guard = lock.lock().await;
+        // A genuine append: the trace only ever grows, and a replayed
+        // `(run_id, step_seq)` is folded out at read time rather than by
+        // rewriting the whole file per step.
+        append_line(&path, &line).await
+    }
+
+    async fn list_run_steps(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<RunStepRecord>> {
+        let steps = read_jsonl::<RunStepRecord>(&self.bundle(company).run_steps_jsonl()).await?;
+        Ok(dedup_steps(steps, run_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageMeter
 // ---------------------------------------------------------------------------
 
@@ -912,6 +1020,32 @@ impl HasId for ArtifactRecord {
     }
 }
 
+impl HasId for RunRecord {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Folds a raw `run-steps.jsonl` read down to one run's trace: the last record
+/// per `step_seq`, oldest first.
+///
+/// Steps are appended, never rewritten, so a replayed append leaves two lines
+/// with the same `(run_id, step_seq)`. Keeping the later one makes an append
+/// idempotent — the same guarantee the sqlite and MongoDB backends get from
+/// their composite primary key.
+fn dedup_steps(steps: Vec<RunStepRecord>, run_id: &str) -> Vec<RunStepRecord> {
+    let mut by_seq: HashMap<u32, RunStepRecord> = HashMap::new();
+    for step in steps {
+        if step.run_id != run_id {
+            continue;
+        }
+        by_seq.insert(step.step_seq, step);
+    }
+    let mut out: Vec<RunStepRecord> = by_seq.into_values().collect();
+    out.sort_by_key(|s| s.step_seq);
+    out
+}
+
 /// Keeps the last record per id (last-write-wins), preserving first-seen order.
 fn dedup_latest<T: HasId>(records: Vec<T>) -> Vec<T> {
     let mut order: Vec<String> = Vec::new();
@@ -992,6 +1126,20 @@ mod test {
         let root = root_dir.path().to_path_buf();
         conformance::assert_fact_store(Arc::new(FsOps::new(&root))).await;
         conformance::assert_artifact_store(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_run_store(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_reaper() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_run_reaper(Arc::new(FsOps::new(&root))).await;
     }
 
     #[tokio::test]
