@@ -34,6 +34,7 @@ import type { TeamMember } from "@/lib/team";
 import { TASK_COLUMNS } from "@/lib/tasks-sample";
 import type { BrainGraphEdge, BrainGraphNode, MemoryGraph } from "./memory-core";
 import { distillMemoryGraph } from "./memory-core";
+import { isOpen } from "../pulse";
 import type { Agent, Department, Person, SopTask, Workflow } from "./schemas";
 
 /** Shown wherever the derived structure is on screen. */
@@ -231,9 +232,12 @@ export function adapt(input: AdaptInput): Adapted {
 
   // A board card becomes an SOP task owned by the teammate it is assigned to —
   // the one edge here that the host actually records. Cards nobody owns are
-  // dropped rather than parked under an invented owner.
+  // dropped rather than parked under an invented owner, and a closed one
+  // (`pulse.ts`'s `isOpen`) is dropped too: the graph reads as work owed, not
+  // an archive, so a card already in Done should not still show as active.
   const tasks: SopTask[] = [];
   for (const task of input.tasks) {
+    if (!isOpen(task)) continue;
     const member = input.members.find((m) => input.ownedBy(task, m));
     if (!member) continue;
     tasks.push({

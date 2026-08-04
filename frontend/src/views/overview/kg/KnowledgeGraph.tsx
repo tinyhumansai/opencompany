@@ -12,7 +12,8 @@ import {
   forceY,
   type Simulation,
 } from 'd3-force';
-import { ClipboardList, Milestone, Sparkles, User, UserRound, Users, Workflow as WorkflowIcon, Wrench, type LucideIcon } from 'lucide-react';
+import { ClipboardList, Info, Milestone, Sparkles, User, UserRound, Users, Workflow as WorkflowIcon, Wrench, type LucideIcon } from 'lucide-react';
+import { DERIVED_NOTICE } from './adapter';
 import { orderGraphDepartments, SELF_ID, toolSlugOf, type KGNode, type KGNodeKind, type KnowledgeGraph as KGData } from './model';
 import { branchPath, branchWidth, cyclicDeltaF, edgeArc, focusWheel, radialRestLayout, responsiveRingR, rotateAbout, shortestAngleDelta, treeLayout, wheelPoint, wheelStageGeom, wheelStageSpot, type RestLayoutResult, type TreeLayoutResult, type TreeNodePos } from './tree-layout';
 import { rafThrottle } from './raf-throttle';
@@ -1488,6 +1489,15 @@ export function KnowledgeGraph({
           {label}
         </span>
       ))}
+      {/* The standing caveat (adapter.ts's DERIVED_NOTICE): this legend is the
+          graph's persistent, low-weight chrome, so it is where an operator
+          reading the wheel is already looking to learn how to read it. The
+          full sentence lives in the title — the strip is crowded enough
+          without seven kind-labels wrapping around a whole caveat. */}
+      <span className="flex items-center gap-1 border-l border-os-border pl-3 font-mono text-[9.5px] text-os-dim" title={DERIVED_NOTICE}>
+        <Info className="h-3 w-3 shrink-0" strokeWidth={2} />
+        derived data
+      </span>
     </div>
   );
 
