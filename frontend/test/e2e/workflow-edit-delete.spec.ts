@@ -55,15 +55,29 @@ async function dismissTour(page: Page) {
   await expect(skip).toBeHidden();
 }
 
+/**
+ * Node fields the dialog has no control for. `outputExtras` puts them on the
+ * report node so a spec can check they survive an edit — the dialog cannot show
+ * them, and a save that rebuilds nodes from the visible controls alone would
+ * delete them.
+ */
+type NodeExtras = Record<string, unknown>;
+
 /** A minimal valid graph body: one trigger, one output, one edge. */
-function graphBody(id: string, name: string, schedule: string, description: string) {
+function graphBody(
+  id: string,
+  name: string,
+  schedule: string,
+  description: string,
+  outputExtras: NodeExtras = {},
+) {
   return {
     id,
     name,
     description,
     nodes: [
       { id: "start", kind: "trigger", name: "Start", schedule },
-      { id: "done", kind: "output", name: "Report" },
+      { id: "done", kind: "output", name: "Report", ...outputExtras },
     ],
     edges: [{ from: "start", to: "done" }],
   };
@@ -74,9 +88,10 @@ async function createWorkflow(
   request: APIRequestContext,
   id: string,
   name: string,
+  outputExtras: NodeExtras = {},
 ): Promise<string> {
   const res = await request.post(`${COMPANY_SCOPE}/workflows`, {
-    data: graphBody(id, name, "0 9 * * *", "Created by the #259 e2e spec."),
+    data: graphBody(id, name, "0 9 * * *", "Created by the #259 e2e spec.", outputExtras),
   });
   expect(res.ok(), `create ${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
   const body = await res.json();
@@ -307,7 +322,16 @@ test("an author can change a saved workflow's schedule, and the id is read-only"
 }) => {
   const id = `e2e-edit-${Date.now()}`;
   const name = `Edit probe ${Date.now()}`;
-  await createWorkflow(request, id, name);
+  // Policies the dialog cannot show. A graph carrying them is not exotic: the
+  // API accepts them and the orchestrator's own `create_workflow` tool writes
+  // them, so an author can easily be editing one.
+  const hidden = {
+    config: { note: "kept across an edit" },
+    onError: "continue",
+    retry: { maxAttempts: 2, backoff: "fixed" },
+    requiresApproval: true,
+  };
+  await createWorkflow(request, id, name, hidden);
 
   try {
     await page.goto("/#/workflows");
@@ -341,6 +365,15 @@ test("an author can change a saved workflow's schedule, and the id is read-only"
         timeout: 15_000,
       })
       .toBe("0 9 * * MON");
+
+    // …and the save did not quietly delete the policies it had no control for.
+    // A node rebuilt from the visible fields alone would have dropped every one
+    // of these, silently, on the first edit of any field at all.
+    const report = (await readWorkflow(request, id)).nodes[1];
+    expect(report.config, "an edit must not drop node config").toEqual(hidden.config);
+    expect(report.onError, "an edit must not drop the error policy").toBe("continue");
+    expect(report.retry, "an edit must not drop the retry policy").toEqual(hidden.retry);
+    expect(report.requiresApproval, "an edit must not drop an approval gate").toBe(true);
   } finally {
     await removeWorkflow(request, id);
   }
