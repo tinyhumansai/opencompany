@@ -52,6 +52,42 @@ export function effectAction(kind: string): string {
   return EFFECT_LABELS[kind] ?? titleCase(kind.replace(/[._]/g, " "));
 }
 
+/**
+ * The same effects in the past tense (#351) — what a task ALREADY did.
+ *
+ * A separate table rather than a suffix rule on {@link EFFECT_LABELS}: every
+ * entry there is phrased as a request the company is making ("Send a payment"),
+ * and a retry warning has to state a fact ("Sent a payment"). Bending one into
+ * the other mechanically produces sentences no editor would sign off on.
+ */
+const EFFECT_DONE_LABELS: Record<string, string> = {
+  "payment.send": "Sent a payment",
+  "subscription.start": "Started a subscription",
+  "email.send": "Sent an email",
+  "dm.external": "Messaged someone new",
+  "filing.submit": "Submitted a filing",
+  "contract.accept": "Accepted a contract",
+  "external.publish": "Published something publicly",
+  "website.deploy": "Deployed a website change",
+  "handle.register": "Claimed a public handle",
+  "handle.renew": "Renewed a public handle",
+  "key.rotate": "Rotated its security key",
+  composio_authorize: "Connected one of its accounts",
+  composio_execute: "Acted in one of its connected accounts",
+  mcp_registry_tool_call: "Used a connected tool",
+  media_generate_image: "Generated an image",
+  media_generate_video: "Generated a video",
+};
+
+/**
+ * What a company already did, in plain language, with the amount when there is
+ * one: "Sent a payment of $2,400" (#351).
+ */
+export function effectDone(kind: string, amountUsd?: number | null): string {
+  const action = EFFECT_DONE_LABELS[kind] ?? titleCase(kind.replace(/[._]/g, " "));
+  return amountUsd != null ? `${action} of ${money(amountUsd)}` : action;
+}
+
 /** A one-line, human summary of what needs approval. */
 export function approvalSummary(a: ApprovalSummary): string {
   const action = effectAction(a.kind);

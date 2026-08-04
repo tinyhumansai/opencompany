@@ -660,7 +660,9 @@ async fn park_effect(
     let approval_id = parking.approvals.park(company, effect.clone()).await?;
     if let Err(err) = parking
         .journal
-        .record_parked(&approval_id, &effect, now_millis())
+        // No board task is behind a workflow delivery, so the approval is
+        // parked unlinked (issue #351).
+        .record_parked(&approval_id, &effect, now_millis(), None)
         .await
     {
         // Roll back to "never parked". Both steps deliberately swallow their own

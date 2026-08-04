@@ -35,6 +35,7 @@ import {
   patchTask,
   steerTask,
   type InflightRun,
+  type IrreversibleEffect,
   type SteerAction,
   type Task,
   type TaskDetail,
@@ -62,6 +63,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { effectDone } from "@/lib/language";
 import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
 import { ArtifactsTab } from "./ArtifactsTab";
@@ -350,6 +352,7 @@ export function TaskDetailView({
             <ControlBar
               task={detail.task}
               inflight={inflight}
+              irreversible={detail.irreversibleEffects}
               client={client}
               company={company}
               onChanged={load}
@@ -526,6 +529,7 @@ function DetailHeader({
 function ControlBar({
   task,
   inflight,
+  irreversible,
   client,
   company,
   onChanged,
@@ -534,6 +538,8 @@ function ControlBar({
 }: {
   task: Task;
   inflight: InflightRun | null;
+  /** What a retry would do again (#351). Empty means Retry stays one click. */
+  irreversible: IrreversibleEffect[];
   client: OpenCompanyClient;
   company: string | null;
   onChanged: () => Promise<void> | void;
@@ -657,10 +663,13 @@ function ControlBar({
             )}
           </>
         ) : (
-          <Button variant="outline" size="sm" className="h-8" disabled={busy} onClick={() => void patchColumn()}>
-            <Play className="mr-1.5 size-3.5" />
-            {resumeLabel}
-          </Button>
+          <RetryButton
+            label={resumeLabel}
+            title={task.title}
+            irreversible={irreversible}
+            disabled={busy}
+            onConfirm={() => void patchColumn()}
+          />
         )}
 
         <div className="ml-auto flex items-center gap-2">
@@ -1083,19 +1092,106 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+/**
+ * Retry / Resume (#351): one click when the previous attempt did nothing that
+ * cannot be taken back, and a confirmation naming what it did when it did.
+ *
+ * Re-entering a run re-runs its effects. Cancel on this same bar has always
+ * been gated, while Retry — the control that can send a second payment or
+ * submit a second filing — was a bare `patchColumn()`. The gate is conditional
+ * on purpose: a dialog that appears every time is a dialog that gets clicked
+ * through, and most retries are of a task that only read and replied.
+ *
+ * Nothing here re-derives risk from the timeline. The host answers with the
+ * effects its journal recorded as executed, and an empty list means the journal
+ * has nothing irreversible against this card, not that the console failed to
+ * classify something.
+ */
+function RetryButton({
+  label,
+  title,
+  irreversible,
+  disabled,
+  onConfirm,
+}: {
+  label: string;
+  title: string;
+  irreversible: IrreversibleEffect[];
+  disabled: boolean;
+  onConfirm: () => void;
+}) {
+  // Nothing to warn about: the plain button, wired straight through, exactly as
+  // it behaved before this existed.
+  if (irreversible.length === 0) {
+    return (
+      <Button variant="outline" size="sm" className="h-8" disabled={disabled} onClick={onConfirm}>
+        <Play className="mr-1.5 size-3.5" />
+        {label}
+      </Button>
+    );
+  }
+
+  return (
+    <ConfirmButton
+      trigger={
+        <Button variant="outline" size="sm" className="h-8" disabled={disabled}>
+          <Play className="mr-1.5 size-3.5" />
+          {label}
+        </Button>
+      }
+      title={`${label} “${title}”?`}
+      description={
+        irreversible.length === 1
+          ? "This task already did something that cannot be undone. Running it again may do it a second time."
+          : `This task already did ${irreversible.length} things that cannot be undone. Running it again may do them a second time.`
+      }
+      details={
+        <ul className="space-y-1.5 rounded-lg border bg-muted/40 p-3 text-left text-xs">
+          {irreversible.map((e, i) => (
+            // Two effects of the same kind can land in the same millisecond, so
+            // the index carries the uniqueness the pair cannot.
+            <li key={`${e.kind}-${e.atMillis}-${i}`} className="flex items-start gap-2">
+              <AlertCircle
+                className="mt-px size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+                aria-hidden
+              />
+              <span className="min-w-0 flex-1">{effectDone(e.kind, e.amountUsd)}</span>
+              <span className="shrink-0 tabular-nums text-muted-foreground">
+                {timeOf(e.atMillis)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      }
+      confirmLabel={`${label} anyway`}
+      cancelLabel="Leave it alone"
+      onConfirm={onConfirm}
+    />
+  );
+}
+
 /** An AlertDialog-gated button, mirroring the confirm pattern used elsewhere. */
 function ConfirmButton({
   trigger,
   title,
   description,
+  details,
   confirmLabel,
+  cancelLabel = "Keep running",
   destructive,
   onConfirm,
 }: {
   trigger: ReactElement;
   title: string;
   description: string;
+  /**
+   * Block content rendered under the description (#351) — a list of what
+   * already happened. A sibling of the description rather than a child of it:
+   * the description renders a `<p>`, and a `<ul>` inside one is invalid HTML.
+   */
+  details?: ReactElement;
   confirmLabel: string;
+  cancelLabel?: string;
   destructive?: boolean;
   onConfirm: () => void;
 }) {
@@ -1107,8 +1203,9 @@ function ConfirmButton({
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>{description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {details}
         <AlertDialogFooter>
-          <AlertDialogCancel>Keep running</AlertDialogCancel>
+          <AlertDialogCancel>{cancelLabel}</AlertDialogCancel>
           <AlertDialogAction
             onClick={onConfirm}
             className={destructive ? "bg-destructive text-white hover:bg-destructive/90" : undefined}

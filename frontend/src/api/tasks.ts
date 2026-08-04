@@ -94,6 +94,25 @@ export interface TimelineEntry {
   waitedMillis?: number;
 }
 
+/**
+ * One irreversible effect a task already executed (#351).
+ *
+ * Read by the host from the runtime journal's executed record — what actually
+ * fired — not from the timeline, which reports what an agent said it did.
+ * `kind` is the dotted effect kind, the same vocabulary the Approvals page
+ * receives; `effectDone` in `@/lib/language` turns it into the sentence a
+ * person reads. There is deliberately no payload here, so a recipient or a
+ * message body cannot reach the screen.
+ */
+export interface IrreversibleEffect {
+  /** The dotted effect kind, e.g. `payment.send`. Never rendered raw. */
+  kind: string;
+  /** Epoch-millis the effect was committed. */
+  atMillis: number;
+  /** The USD amount involved, if any. */
+  amountUsd?: number;
+}
+
 /** A neighbouring card in the lineage, trimmed to what a link needs (#185). */
 export interface LineageRef {
   id: string;
@@ -115,6 +134,14 @@ export interface TaskDetail {
   task: Task;
   /** The per-task event stream, oldest first. */
   timeline: TimelineEntry[];
+  /**
+   * What this task already did that cannot be undone (#351), oldest first.
+   * Empty for a task that only read, thought and replied.
+   *
+   * Retrying re-runs the work, so this list is the difference between a
+   * one-click Retry and one that stops to say what already happened.
+   */
+  irreversibleEffects: IrreversibleEffect[];
   /** Parent and children. */
   lineage: TaskLineage;
   /**

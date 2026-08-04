@@ -44,6 +44,7 @@ use crate::runtime::delegation_tools::{
     unknown_desk_message,
 };
 use crate::runtime::grants::GrantedCall;
+use crate::runtime::journal::ExecutedEffect;
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
@@ -130,7 +131,12 @@ impl<'a> CycleRunner<'a> {
         };
 
         // 4. Think + 5. Gate — the host services callbacks and gates effects.
-        let host = CycleHostImpl::new(company.clone(), cycle_id.clone(), self.rt);
+        let host = CycleHostImpl::new(
+            company.clone(),
+            cycle_id.clone(),
+            self.rt,
+            cycle_task_id(&request.events, self.rt),
+        );
         let result = self.rt.brain.run_cycle(request, &host).await?;
 
         // 6. Persist output.
@@ -366,7 +372,12 @@ working on):\n{}\n]",
     async fn settle_approved_effect(&self, id: &ApprovalId, effect: Effect) -> Result<()> {
         let Some(agent) = effect.agent.clone() else {
             let key = format!("approval:{id}");
-            return execute_effect_once(self.rt, &key, &effect).await;
+            // The card that asked for this sign-off (issue #351). It is not
+            // this call's caller — an approval is resolved from the Approvals
+            // page, which knows only an id — so it comes off the parked record,
+            // which `record_resolved` deliberately does not erase.
+            let task_id = self.rt.journal.approval_task(id);
+            return execute_effect_once(self.rt, &key, &effect, task_id.as_deref()).await;
         };
         self.mint_grant(id, agent, effect).await
     }
@@ -556,11 +567,28 @@ pub(crate) async fn execute_effect_once(
     rt: &CompanyRuntime,
     key: &str,
     effect: &Effect,
+    task_id: Option<&str>,
 ) -> Result<()> {
     if rt.journal.is_executed(key) {
         return Ok(());
     }
-    rt.journal.record_executed(key).await?;
+    // The commit now describes what it is committing (issue #351). Classified
+    // here, against the gate in force at execution time, because this is the one
+    // place that has both the effect and the policy — and because "was this
+    // irreversible?" is a question about the moment it ran, not about whatever
+    // the cap happens to be when somebody later opens the retry dialog.
+    rt.journal
+        .record_executed(
+            key,
+            ExecutedEffect {
+                kind: effect.kind.clone(),
+                amount_usd: effect.amount_usd,
+                task_id: task_id.map(str::to_string),
+                at_millis: now_millis(),
+                irreversible: rt.approval_gate.is_irreversible(effect),
+            },
+        )
+        .await?;
     perform_effect(rt, effect).await
 }
 
@@ -679,6 +707,47 @@ async fn recipient_is_established(rt: &CompanyRuntime, to: &str) -> bool {
         .unwrap_or(false) // fail closed → parks for approval
 }
 
+/// The board task a cycle is working, read off its own trigger events
+/// (issue #351) — the id every effect this cycle executes or parks is stamped
+/// with.
+///
+/// Two ways a cycle belongs to a card, and both are a real id rather than a
+/// guess from a time window:
+///
+/// * a [`TaskDispatched`](CompanyEvent::TaskDispatched) event — the card was
+///   dragged into `in_progress` and this cycle is its run;
+/// * an [`ApprovalResolved`](CompanyEvent::ApprovalResolved) event whose
+///   approval was itself parked for a card. **This arm is load-bearing, not a
+///   nicety.** Under `supervised` an irreversible effect never executes in the
+///   cycle that emitted it — it parks, and the operator's approval opens a
+///   fresh cycle carrying only that event. Without the inheritance, every
+///   effect that went through the approval gate the way the policy intends
+///   would be attributed to no task and named on no retry dialog.
+///
+/// **An ambiguous batch yields `None`.** Two dispatched cards in one cycle
+/// cannot both own an effect it executes, and guessing one would warn an
+/// operator about work another card did — a false alarm on a safety dialog is
+/// how a safety dialog stops being read.
+fn cycle_task_id(events: &[CompanyEvent], rt: &CompanyRuntime) -> Option<String> {
+    let mut found: Option<String> = None;
+    for event in events {
+        let candidate = match event {
+            CompanyEvent::TaskDispatched { task_id } => Some(task_id.clone()),
+            CompanyEvent::ApprovalResolved { approval_id, .. } => {
+                rt.journal.approval_task(approval_id)
+            }
+            _ => continue,
+        };
+        let Some(candidate) = candidate else { continue };
+        match &found {
+            Some(existing) if existing != &candidate => return None,
+            Some(_) => {}
+            None => found = Some(candidate),
+        }
+    }
+    found
+}
+
 /// The host the brain calls back into mid-cycle. Bridges tool, context, and
 /// effect callbacks to the runtime's ports and gates every effect.
 struct CycleHostImpl<'a> {
@@ -688,10 +757,23 @@ struct CycleHostImpl<'a> {
     counter: AtomicU64,
     executed: StdMutex<Vec<Effect>>,
     parked: StdMutex<Vec<ApprovalId>>,
+    /// The board task this cycle is working, when it is working one
+    /// (issue #351) — stamped onto every effect the cycle executes or parks.
+    ///
+    /// Computed once, from the cycle's own trigger events, by
+    /// [`cycle_task_id`]. Whatever turn produces the effect — the dispatched
+    /// card's own turn, a desk it delegated to, an email it tried to send — it
+    /// belongs to the task whose dispatch opened this cycle, and to no other.
+    task_id: Option<String>,
 }
 
 impl<'a> CycleHostImpl<'a> {
-    fn new(company: CompanyId, cycle_id: String, rt: &'a CompanyRuntime) -> Self {
+    fn new(
+        company: CompanyId,
+        cycle_id: String,
+        rt: &'a CompanyRuntime,
+        task_id: Option<String>,
+    ) -> Self {
         Self {
             company,
             cycle_id,
@@ -699,6 +781,7 @@ impl<'a> CycleHostImpl<'a> {
             counter: AtomicU64::new(0),
             executed: StdMutex::new(Vec::new()),
             parked: StdMutex::new(Vec::new()),
+            task_id,
         }
     }
 
@@ -717,7 +800,7 @@ impl<'a> CycleHostImpl<'a> {
             PolicyDecision::Allow => {
                 let idx = self.counter.fetch_add(1, Ordering::Relaxed);
                 let key = format!("{}:{idx}", self.cycle_id);
-                execute_effect_once(self.rt, &key, &effect).await?;
+                execute_effect_once(self.rt, &key, &effect, self.task_id.as_deref()).await?;
                 self.executed
                     .lock()
                     .expect("executed poisoned")
@@ -749,7 +832,7 @@ impl<'a> CycleHostImpl<'a> {
             .await?;
         self.rt
             .journal
-            .record_parked(&approval_id, &effect, now_millis())
+            .record_parked(&approval_id, &effect, now_millis(), self.task_id.as_deref())
             .await?;
         self.parked
             .lock()
@@ -1279,9 +1362,9 @@ mod test {
             agent: None,
         };
 
-        execute_effect_once(&rt, "k1", &effect).await.unwrap();
+        execute_effect_once(&rt, "k1", &effect, None).await.unwrap();
         // Same key again: skipped, no second ledger entry.
-        execute_effect_once(&rt, "k1", &effect).await.unwrap();
+        execute_effect_once(&rt, "k1", &effect, None).await.unwrap();
 
         let record = rt.store().load(rt.id()).await.unwrap().unwrap();
         assert_eq!(record.ledger.len(), 1);
@@ -1292,7 +1375,9 @@ mod test {
             .await
             .unwrap();
         assert!(rt2.journal.is_executed("k1"));
-        execute_effect_once(&rt2, "k1", &effect).await.unwrap();
+        execute_effect_once(&rt2, "k1", &effect, None)
+            .await
+            .unwrap();
         let record = rt2.store.load(rt2.id()).await.unwrap().unwrap();
         assert_eq!(record.ledger.len(), 1);
     }
@@ -2325,7 +2410,7 @@ mod test {
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
-            .record_parked(&approval_id, &effect, now_millis())
+            .record_parked(&approval_id, &effect, now_millis(), None)
             .await
             .unwrap();
 
@@ -2389,7 +2474,7 @@ mod test {
         };
         let approval_id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
         rt.journal
-            .record_parked(&approval_id, &effect, now_millis())
+            .record_parked(&approval_id, &effect, now_millis(), None)
             .await
             .unwrap();
 
@@ -2438,7 +2523,7 @@ mod test {
                 .unwrap();
             let id = rt.approvals.park(rt.id(), effect.clone()).await.unwrap();
             rt.journal
-                .record_parked(&id, &effect, now_millis())
+                .record_parked(&id, &effect, now_millis(), None)
                 .await
                 .unwrap();
             id
@@ -2553,7 +2638,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-nomail".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-nomail".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "to": "x@ext.com", "subject": "s", "body": "b" }))
@@ -2576,7 +2661,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-bad".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-bad".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "subject": "s", "body": "b" }))
@@ -2599,7 +2684,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-park".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-park".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "to": "new@ext.com", "subject": "s", "body": "b" }))
@@ -2607,6 +2692,174 @@ mod test {
             .unwrap();
         assert_eq!(res.output["status"], "pending_approval");
         assert_eq!(sender.sent().len(), 0);
+    }
+
+    /// **Issue #351**: an effect a card's run executes is recorded against that
+    /// card, classified, and readable back as what a retry would repeat.
+    ///
+    /// Runs in `full` mode deliberately. That is the configuration where an
+    /// irreversible effect fires with nobody ever being asked, so it is the one
+    /// where the retry dialog is the operator's only warning.
+    #[tokio::test]
+    async fn an_executed_effect_is_recorded_against_the_card_that_ran_it() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .build()
+            .await
+            .unwrap();
+        let host = CycleHostImpl::new(
+            rt.id().clone(),
+            "cyc-exec".into(),
+            &rt,
+            Some("t-42".to_string()),
+        );
+
+        // Irreversible: a filing, which the taxonomy never waves through.
+        host.gate_effect(Effect {
+            kind: "filing.submit".into(),
+            group: EffectGroup::Sign,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "form": "annual-return" }),
+            agent: None,
+        })
+        .await
+        .unwrap();
+        // Reversible: a read. Same card, same cycle, and it must not warn.
+        host.gate_effect(Effect {
+            kind: "web.search".into(),
+            group: EffectGroup::Other,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::Value::Null,
+            agent: None,
+        })
+        .await
+        .unwrap();
+
+        let named = rt.irreversible_effects("t-42");
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(named[0].kind, "filing.submit");
+        assert!(named[0].irreversible);
+        assert!(
+            rt.irreversible_effects("t-other").is_empty(),
+            "another card must not inherit this one's history",
+        );
+
+        // The payload never reaches the executed record — the retry dialog is
+        // an operator surface, and `form: annual-return` is tool content.
+        let journal_path = Bundle::new(&home, rt.id()).journal_jsonl();
+        let raw = tokio::fs::read_to_string(&journal_path).await.unwrap();
+        assert!(raw.contains("EffectExecuted"), "{raw}");
+        assert!(!raw.contains("annual-return"), "{raw}");
+    }
+
+    /// The approval path (#351): under `supervised` an irreversible effect
+    /// parks, and it is the operator's approval — a *separate* cycle carrying
+    /// only `ApprovalResolved` — that executes it.
+    ///
+    /// Without the parked record naming the card, that cycle knows no task and
+    /// the effect lands attributed to nothing. This is the default mode, so it
+    /// is the ordinary path, not an edge case.
+    #[tokio::test]
+    async fn an_approved_effect_is_attributed_to_the_card_that_parked_it() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .build()
+            .await
+            .unwrap();
+
+        // The card's run emits a filing; supervised parks it rather than
+        // executing it.
+        let host = CycleHostImpl::new(
+            rt.id().clone(),
+            "cyc-park".into(),
+            &rt,
+            Some("t-7".to_string()),
+        );
+        let disposition = host
+            .gate_effect(Effect {
+                kind: "filing.submit".into(),
+                group: EffectGroup::Sign,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::Value::Null,
+                agent: None,
+            })
+            .await
+            .unwrap();
+        let EffectDisposition::PendingApproval(approval_id) = disposition else {
+            panic!("supervised must park a filing: {disposition:?}");
+        };
+        assert!(
+            rt.irreversible_effects("t-7").is_empty(),
+            "parked is not executed — nothing has fired yet",
+        );
+
+        // The operator approves. The follow-up cycle carries one event and no
+        // task id of its own; the card comes from the parked record.
+        let events = vec![CompanyEvent::ApprovalResolved {
+            approval_id: approval_id.clone(),
+            verdict: Verdict::Approve,
+            by: operator(),
+        }];
+        assert_eq!(
+            cycle_task_id(&events, &rt),
+            Some("t-7".into()),
+            "the follow-up cycle must inherit the card from the approval",
+        );
+
+        rt.resolve_approval(&approval_id, Verdict::Approve, operator())
+            .await
+            .unwrap();
+
+        let named = rt.irreversible_effects("t-7");
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(named[0].kind, "filing.submit");
+    }
+
+    /// Two cards dispatched in one batch: the cycle refuses to guess which owns
+    /// the effects it runs, because a retry warning naming another card's work
+    /// is how a safety dialog stops being read.
+    #[tokio::test]
+    async fn an_ambiguous_batch_attributes_effects_to_no_card() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("full"))
+            .build()
+            .await
+            .unwrap();
+
+        let dispatched = |id: &str| CompanyEvent::TaskDispatched {
+            task_id: id.to_string(),
+        };
+        assert_eq!(cycle_task_id(&[dispatched("t-1")], &rt), Some("t-1".into()));
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1"), dispatched("t-1")], &rt),
+            Some("t-1".into()),
+            "the same card twice is not ambiguous",
+        );
+        assert_eq!(
+            cycle_task_id(&[dispatched("t-1"), dispatched("t-2")], &rt),
+            None
+        );
+        assert_eq!(
+            cycle_task_id(
+                &[CompanyEvent::OperatorMessage {
+                    text: "hi".into(),
+                    by: None,
+                    chat: None,
+                }],
+                &rt
+            ),
+            None,
+            "a chat turn is nobody's card",
+        );
     }
 
     #[tokio::test]
@@ -2639,7 +2892,7 @@ mod test {
             )
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-send".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-send".into(), &rt, None);
 
         let res = host
             .send_email(serde_json::json!({ "to": "known@ext.com", "subject": "s", "body": "b" }))
@@ -2703,7 +2956,7 @@ mod test {
         }
         file(501, "known@ext.com").await;
 
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc-deep".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc-deep".into(), &rt, None);
         let res = host
             .send_email(serde_json::json!({ "to": "known@ext.com", "subject": "s", "body": "b" }))
             .await
@@ -2789,7 +3042,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt, None);
 
         let res = host
             .spawn_task(serde_json::json!({ "title": "  Ship it ", "assignee": " eng " }))
@@ -2823,7 +3076,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt, None);
 
         // Known desk (by name) → card assigned to the resolved desk id, lead noted.
         let ok = host
@@ -2859,7 +3112,7 @@ mod test {
             .build()
             .await
             .unwrap();
-        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt);
+        let host = CycleHostImpl::new(rt.id().clone(), "cyc".into(), &rt, None);
 
         // Reached through the CycleHost trait exactly as the hosted brain does.
         let res = host

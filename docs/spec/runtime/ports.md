@@ -188,6 +188,39 @@ break the byte-identical round-trip, so the claim is incomplete but never wrong.
 Both `chat/history` surfaces (REST and GraphQL) project it from the shared
 `MessageView`, so the chip survives a transcript reload on either.
 
+### What a retry would repeat (issue #351)
+
+Re-entering a run re-runs its effects, and the two facts needed to warn about
+that already existed separately: the gate classifies `Sign` / `Publish` /
+`Identity` / capped `Spend` / first-contact `Send` as the effects it refuses to
+wave through, and the journal's executed-key set records what actually fired.
+Neither reached the operator, because the key is opaque — it answers "has this
+run?" and nothing else.
+
+`EffectExecuted` therefore carries an optional `ExecutedEffect` alongside the
+key: the effect kind, its amount, the board task it ran for, and whether the
+gate called it irreversible. The classification is made **at execution time**,
+by `ManifestApprovalGate::is_irreversible` (which delegates to the supervised
+taxonomy, so there is one copy of the rules), and it is deliberately
+mode-independent: a `full`-mode company executes a filing without ever parking
+it, which is precisely when a retry dialog is the only warning anyone gets.
+
+There is **no payload**. The record is read back onto an operator's screen
+through `GET …/tasks/{task_id}`, which scrubs by construction, so recipients and
+message bodies are never retained in the first place.
+
+The task attribution comes from the cycle that ran the effect. Under
+`supervised` an irreversible effect never executes in the cycle that emitted it
+— it parks, and the operator's approval opens a fresh cycle carrying only
+`ApprovalResolved` — so `ApprovalParked` also gains an optional `task_id`, and
+the approved execution reads the card back off it. Without that, every effect
+that went through the approval gate the way the policy intends would be
+attributed to nothing.
+
+Both fields are additive: a journal line written before #351 replays as a
+committed key with no description, which keeps the at-most-once guarantee exact
+and simply contributes no warning.
+
 ## MemoryStore
 
 The equivalent of Medulla's `CyclePersistence`; TinyCortex is the target

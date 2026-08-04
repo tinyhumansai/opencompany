@@ -37,6 +37,15 @@ enum JournalRecord {
     EffectExecuted {
         /// The effect's idempotency key.
         key: String,
+        /// What the key committed (issue #351).
+        ///
+        /// The key alone answers "has this run?" and nothing else, which is all
+        /// the at-most-once guarantee needs and not nearly enough to tell an
+        /// operator what a previous attempt already did. Absent on records
+        /// written before #351 — those replay as an executed key with no
+        /// description, exactly as they behaved before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<ExecutedEffect>,
     },
     /// An effect parked for operator approval.
     ApprovalParked {
@@ -46,6 +55,23 @@ enum JournalRecord {
         effect: Effect,
         /// Epoch-millis the effect was parked.
         at_millis: u64,
+        /// The board task whose dispatch cycle parked this effect, when it was
+        /// parked inside one.
+        ///
+        /// Not read for the queue itself — it is what lets the **approval
+        /// follow-up cycle** know which card it is finishing (issue #351).
+        /// Under `supervised`, an irreversible effect never executes in the
+        /// cycle that emitted it: it parks, and the operator's approval starts
+        /// a fresh cycle whose only event is `ApprovalResolved`. Without this
+        /// field that cycle knows no task, so every effect executed the way the
+        /// policy intends would be attributed to nothing and named on no retry
+        /// dialog.
+        ///
+        /// Skipped when serializing and defaulted when absent, so journal lines
+        /// written before this field existed replay as `None` rather than
+        /// failing to parse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
     },
     /// A parked approval that has since been resolved (approved or denied).
     ApprovalResolved {
@@ -112,11 +138,58 @@ pub struct PendingApproval {
     pub at_millis: u64,
 }
 
+/// A side effect that **actually ran** (issue #351): what it was, which board
+/// task it was run for, and whether it is one that cannot be taken back.
+///
+/// Recorded alongside the idempotency key so a retry can say what the previous
+/// attempt already did. Deliberately **not** the whole [`Effect`]: `payload`
+/// carries recipients, message bodies and arguments, and this record is read
+/// back out onto an operator's screen through the task-detail route, which
+/// scrubs by construction. The classification facts are kept; the contents are
+/// not.
+///
+/// `irreversible` is decided **at execution time**, by the gate that was in
+/// force then (`ManifestApprovalGate::is_irreversible`), rather than re-derived
+/// on read. A company that later raises its auto-approve cap does not get to
+/// retroactively decide that the payment it made last week was routine.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExecutedEffect {
+    /// The dotted effect kind, e.g. `payment.send`. The console maps it to
+    /// plain language; it is never shown raw.
+    pub kind: String,
+    /// The USD amount involved, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_usd: Option<f64>,
+    /// The board task this effect was executed for, when a card was behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Epoch-millis the effect was committed.
+    pub at_millis: u64,
+    /// Whether the supervised taxonomy calls this one irreversible.
+    pub irreversible: bool,
+}
+
 /// In-memory state rebuilt from (and kept in sync with) `journal.jsonl`.
 #[derive(Default)]
 struct State {
     executed: HashSet<String>,
+    /// Every effect that ran and said what it was, oldest first (issue #351).
+    ///
+    /// Append-only for the same reason [`executed`](Self::executed) is: an
+    /// effect that fired stays fired, and a retry warning that forgot half the
+    /// history would be worse than none. One small record per executed effect,
+    /// with no payload — see [`ExecutedEffect`].
+    executed_effects: Vec<ExecutedEffect>,
     parked: HashMap<ApprovalId, (Effect, u64)>,
+    /// The board task each approval was parked for, retained after it leaves
+    /// `parked` (issue #351).
+    ///
+    /// Read by the approval **follow-up** cycle, which knows only an
+    /// [`ApprovalId`]: it is what lets the effect an operator just approved be
+    /// attributed to the card that asked for it. Never removed, for the same
+    /// reason [`park_instants`](Self::park_instants) is not — the join happens
+    /// after the queue entry is gone, and holds only entries that have a task.
+    approval_tasks: HashMap<ApprovalId, String>,
     /// When each approval was *parked*, retained after it leaves `parked`.
     ///
     /// This is what makes waiting time readable (issue #305). The park instant
@@ -177,15 +250,24 @@ impl RuntimeJournal {
                 continue;
             }
             match serde_json::from_str::<JournalRecord>(line)? {
-                JournalRecord::EffectExecuted { key } => {
+                JournalRecord::EffectExecuted { key, effect } => {
                     state.executed.insert(key);
+                    // Absent on a pre-#351 line: the key still replays, the
+                    // description simply does not exist to replay.
+                    if let Some(effect) = effect {
+                        state.executed_effects.push(effect);
+                    }
                 }
                 JournalRecord::ApprovalParked {
                     id,
                     effect,
                     at_millis,
+                    task_id,
                 } => {
                     state.park_instants.insert(id.clone(), at_millis);
+                    if let Some(task_id) = task_id {
+                        state.approval_tasks.insert(id.clone(), task_id);
+                    }
                     state.parked.insert(id, (effect, at_millis));
                 }
                 JournalRecord::ApprovalResolved { id } => {
@@ -220,40 +302,82 @@ impl RuntimeJournal {
             .contains(key)
     }
 
-    /// Commits an effect key to the journal before its side effect runs.
+    /// Commits an effect key to the journal before its side effect runs,
+    /// alongside a description of what the key is about to do (issue #351).
     ///
-    /// A no-op (returns `Ok`) if the key is already committed.
-    pub async fn record_executed(&self, key: &str) -> Result<()> {
+    /// A no-op (returns `Ok`) if the key is already committed — which is also
+    /// what keeps the executed-effect list free of duplicates: the second
+    /// commit under a key never reaches the append.
+    pub async fn record_executed(&self, key: &str, effect: ExecutedEffect) -> Result<()> {
         {
             let mut state = self.state.lock().expect("journal state poisoned");
             if !state.executed.insert(key.to_string()) {
                 return Ok(());
             }
+            state.executed_effects.push(effect.clone());
         }
         self.append(&JournalRecord::EffectExecuted {
             key: key.to_string(),
+            effect: Some(effect),
         })
         .await
     }
 
-    /// Records a newly parked approval.
+    /// Records a newly parked approval, tagged with the board task whose cycle
+    /// parked it (issue #351) — `None` when no card is behind it.
     pub async fn record_parked(
         &self,
         id: &ApprovalId,
         effect: &Effect,
         at_millis: u64,
+        task_id: Option<&str>,
     ) -> Result<()> {
+        let task_id = task_id.map(str::to_string);
         {
             let mut state = self.state.lock().expect("journal state poisoned");
             state.park_instants.insert(id.clone(), at_millis);
+            if let Some(task_id) = task_id.clone() {
+                state.approval_tasks.insert(id.clone(), task_id);
+            }
             state.parked.insert(id.clone(), (effect.clone(), at_millis));
         }
         self.append(&JournalRecord::ApprovalParked {
             id: id.clone(),
             effect: effect.clone(),
             at_millis,
+            task_id,
         })
         .await
+    }
+
+    /// The board task an approval was parked for, if any (issue #351).
+    ///
+    /// Answers the approval follow-up cycle's only question: the operator
+    /// approved *this* id — whose card was that?
+    pub fn approval_task(&self, id: &ApprovalId) -> Option<String> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .approval_tasks
+            .get(id)
+            .cloned()
+    }
+
+    /// The irreversible effects this task has already executed, oldest first
+    /// (issue #351).
+    ///
+    /// Drawn from the journal's own executed record — the same append-only set
+    /// that makes effects at-most-once — rather than re-derived from timeline
+    /// labels, which describe what an agent *said* and not what actually fired.
+    pub fn irreversible_effects(&self, task_id: &str) -> Vec<ExecutedEffect> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .executed_effects
+            .iter()
+            .filter(|e| e.irreversible && e.task_id.as_deref() == Some(task_id))
+            .cloned()
+            .collect()
     }
 
     /// Records that a parked approval was resolved (removing it from the queue).
@@ -466,6 +590,18 @@ mod test {
             .expect("tempdir")
     }
 
+    /// An executed effect as journaled (issue #351): irreversible, against
+    /// `t-1`, unless a test says otherwise.
+    fn executed(at_millis: u64) -> ExecutedEffect {
+        ExecutedEffect {
+            kind: "filing.submit".into(),
+            amount_usd: None,
+            task_id: Some("t-1".into()),
+            at_millis,
+            irreversible: true,
+        }
+    }
+
     #[tokio::test]
     async fn effect_key_commits_once_and_survives_reload() {
         let dir = tmp_dir();
@@ -473,10 +609,10 @@ mod test {
         let journal = RuntimeJournal::new(&path);
 
         assert!(!journal.is_executed("cyc:0"));
-        journal.record_executed("cyc:0").await.unwrap();
+        journal.record_executed("cyc:0", executed(0)).await.unwrap();
         assert!(journal.is_executed("cyc:0"));
         // Re-committing the same key does not append a second record.
-        journal.record_executed("cyc:0").await.unwrap();
+        journal.record_executed("cyc:0", executed(0)).await.unwrap();
 
         // A fresh journal over the same file (a restart) replays the commit.
         let reloaded = RuntimeJournal::new(&path);
@@ -485,6 +621,100 @@ mod test {
 
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(raw.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+
+        // The re-commit is also what keeps the description list free of
+        // duplicates: one key, one entry, however many times it is committed.
+        assert_eq!(reloaded.irreversible_effects("t-1").len(), 1);
+    }
+
+    /// **Issue #351**: the executed record says what ran, for which card, and
+    /// whether it can be taken back — and survives a restart.
+    #[tokio::test]
+    async fn executed_effects_are_filtered_by_task_and_by_irreversibility() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        let journal = RuntimeJournal::new(&path);
+
+        // This card's irreversible effect — the one a retry must name.
+        journal
+            .record_executed("cyc:0", executed(1_000))
+            .await
+            .unwrap();
+        // The same card, but a read: it changed nothing, so it warns about
+        // nothing.
+        journal
+            .record_executed(
+                "cyc:1",
+                ExecutedEffect {
+                    kind: "web.search".into(),
+                    irreversible: false,
+                    ..executed(1_100)
+                },
+            )
+            .await
+            .unwrap();
+        // Another card's payment. Irreversible, and none of this card's
+        // business.
+        journal
+            .record_executed(
+                "cyc:2",
+                ExecutedEffect {
+                    kind: "payment.send".into(),
+                    amount_usd: Some(2_400.0),
+                    task_id: Some("t-2".into()),
+                    ..executed(1_200)
+                },
+            )
+            .await
+            .unwrap();
+        // A workflow delivery: no card behind it at all.
+        journal
+            .record_executed(
+                "cyc:3",
+                ExecutedEffect {
+                    task_id: None,
+                    ..executed(1_300)
+                },
+            )
+            .await
+            .unwrap();
+
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+
+        let mine = reloaded.irreversible_effects("t-1");
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert_eq!(mine[0].kind, "filing.submit");
+        assert_eq!(mine[0].at_millis, 1_000);
+
+        let theirs = reloaded.irreversible_effects("t-2");
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].amount_usd, Some(2_400.0));
+
+        assert!(reloaded.irreversible_effects("t-never-ran").is_empty());
+    }
+
+    /// A journal line written before #351 carries a key and nothing else. It
+    /// must still replay as an executed key — the at-most-once guarantee is not
+    /// negotiable — and simply contribute no description.
+    #[tokio::test]
+    async fn a_pre_351_executed_line_still_replays_as_a_committed_key() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        tokio::fs::write(
+            &path,
+            "{\"record\":\"EffectExecuted\",\"key\":\"cyc-old:0\"}\n",
+        )
+        .await
+        .unwrap();
+
+        let journal = RuntimeJournal::new(&path);
+        journal.load().await.expect("a pre-#351 line still replays");
+        assert!(
+            journal.is_executed("cyc-old:0"),
+            "dropping the key would re-run an effect that already fired",
+        );
+        assert!(journal.irreversible_effects("t-1").is_empty());
     }
 
     #[tokio::test]
@@ -494,7 +724,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-1");
         journal
-            .record_parked(&id, &effect(), now_millis())
+            .record_parked(&id, &effect(), now_millis(), None)
             .await
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
@@ -514,6 +744,37 @@ mod test {
         assert!(after.pending().is_empty());
     }
 
+    /// Issue #351: the card an approval was parked for outlives the queue
+    /// entry, because the cycle that needs it runs *after* the resolution.
+    #[tokio::test]
+    async fn an_approvals_task_survives_its_resolution_and_a_restart() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        let journal = RuntimeJournal::new(&path);
+
+        let linked = ApprovalId::new("appr-linked");
+        let orphan = ApprovalId::new("appr-orphan");
+        journal
+            .record_parked(&linked, &effect(), 1_000, Some("t-1"))
+            .await
+            .unwrap();
+        journal
+            .record_parked(&orphan, &effect(), 1_100, None)
+            .await
+            .unwrap();
+        journal.record_resolved(&linked).await.unwrap();
+
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        assert_eq!(
+            reloaded.approval_task(&linked),
+            Some("t-1".into()),
+            "the follow-up cycle looks this up after the queue entry is gone",
+        );
+        assert_eq!(reloaded.approval_task(&orphan), None);
+        assert_eq!(reloaded.approval_task(&ApprovalId::new("never")), None);
+    }
+
     #[tokio::test]
     async fn expired_record_removes_parked_and_survives_reload() {
         let dir = tmp_dir();
@@ -521,7 +782,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-exp");
         journal
-            .record_parked(&id, &effect(), now_millis())
+            .record_parked(&id, &effect(), now_millis(), None)
             .await
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
@@ -545,7 +806,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-amend");
         journal
-            .record_parked(&id, &effect(), now_millis())
+            .record_parked(&id, &effect(), now_millis(), None)
             .await
             .unwrap();
 
@@ -586,11 +847,11 @@ mod test {
         let resolved = ApprovalId::new("appr-resolved");
         let expired = ApprovalId::new("appr-expired");
         journal
-            .record_parked(&resolved, &effect(), 1_000)
+            .record_parked(&resolved, &effect(), 1_000, None)
             .await
             .unwrap();
         journal
-            .record_parked(&expired, &effect(), 2_000)
+            .record_parked(&expired, &effect(), 2_000, None)
             .await
             .unwrap();
 
@@ -717,7 +978,7 @@ mod test {
 
         let parked_id = ApprovalId::new("appr-parked");
         journal
-            .record_parked(&parked_id, &effect(), 500)
+            .record_parked(&parked_id, &effect(), 500, None)
             .await
             .unwrap();
         journal

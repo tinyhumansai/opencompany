@@ -42,7 +42,7 @@ fn task_enters_in_progress(prev_column: Option<&str>, next_column: &str) -> bool
 }
 use crate::runtime::CycleRunner;
 use crate::runtime::grants::{GRANT_TTL_MILLIS, GrantSet};
-use crate::runtime::journal::RuntimeJournal;
+use crate::runtime::journal::{ExecutedEffect, RuntimeJournal};
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::ops::mailer::MailSender;
 use crate::server::ops::smtp::SmtpCredentials;
@@ -615,6 +615,17 @@ impl CompanyRuntime {
     /// [`pending_approvals`](Self::pending_approvals).
     pub fn approval_park_instants(&self) -> std::collections::HashMap<ApprovalId, u64> {
         self.journal.park_instants()
+    }
+
+    /// The irreversible effects a task has already executed, oldest first
+    /// (issue #351).
+    ///
+    /// What the retry dialog names. Read from the journal's executed record —
+    /// the same append-only set that makes effects at-most-once — so it reports
+    /// what actually fired rather than what a timeline label says an agent
+    /// intended.
+    pub fn irreversible_effects(&self, task_id: &str) -> Vec<ExecutedEffect> {
+        self.journal.irreversible_effects(task_id)
     }
 
     /// The approvals currently awaiting the operator.

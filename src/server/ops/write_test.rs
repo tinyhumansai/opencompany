@@ -3440,7 +3440,7 @@ async fn task_timeline_reports_the_wait_an_approval_actually_caused() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at)
+        .record_parked(&id, &parked_effect(), parked_at, None)
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -3516,7 +3516,7 @@ async fn expired_approval_is_labelled_as_an_expiry_and_carries_its_wait() {
     let parked_at = dispatched_at + 40;
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), parked_at)
+        .record_parked(&id, &parked_effect(), parked_at, None)
         .await
         .unwrap();
     // Re-park into the gate at epoch 0 so it is unambiguously past any TTL.
@@ -3565,7 +3565,7 @@ async fn a_wait_that_began_before_dispatch_is_clamped_to_the_run_window() {
     let id = ApprovalId::new("appr-old");
     runtime
         .journal
-        .record_parked(&id, &parked_effect(), dispatched_at - 3_600_000)
+        .record_parked(&id, &parked_effect(), dispatched_at - 3_600_000, None)
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3620,7 +3620,12 @@ async fn a_currently_parked_approval_surfaces_as_a_live_wait() {
     let parked_at = dispatched_at + 10;
     runtime
         .journal
-        .record_parked(&ApprovalId::new("appr-live"), &parked_effect(), parked_at)
+        .record_parked(
+            &ApprovalId::new("appr-live"),
+            &parked_effect(),
+            parked_at,
+            None,
+        )
         .await
         .unwrap();
 
@@ -3684,6 +3689,110 @@ async fn a_task_that_never_waited_reports_no_waiting_fields() {
             "a non-approval row must never carry a wait: {entry:?}",
         );
     }
+}
+
+// ── Issue #351: Retry names what the previous attempt already did ────────────
+//
+// The console gates Retry on this array being non-empty, so the read is the
+// whole feature: an effect missing from it is a warning that never appears, and
+// an effect wrongly in it is a dialog that cries wolf. Both are read failures,
+// not UI ones, which is why they are pinned here.
+
+/// Journals an executed effect against a task, the way `execute_effect_once`
+/// does. `irreversible` is the classification the gate made at execution time.
+async fn record_executed(
+    runtime: &crate::CompanyRuntime,
+    key: &str,
+    kind: &str,
+    task_id: Option<&str>,
+    irreversible: bool,
+    amount_usd: Option<f64>,
+) {
+    runtime
+        .journal
+        .record_executed(
+            key,
+            crate::runtime::journal::ExecutedEffect {
+                kind: kind.to_string(),
+                amount_usd,
+                task_id: task_id.map(str::to_string),
+                at_millis: 1_000,
+                irreversible,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// **The acceptance test**: the read names every irreversible effect this task
+/// executed, and nothing else.
+///
+/// Three negatives ride along, and each is a way the warning could go wrong:
+/// a reversible effect on the same card (cries wolf), another card's payment
+/// (names work this operator is not about to repeat), and an effect with no
+/// card behind it at all (a workflow delivery, which no retry re-runs).
+#[tokio::test]
+async fn task_detail_names_only_this_task_s_irreversible_effects() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, _) = dispatched_task(&state, &company).await;
+
+    record_executed(&runtime, "c:0", "filing.submit", Some("t-1"), true, None).await;
+    record_executed(
+        &runtime,
+        "c:1",
+        "payment.send",
+        Some("t-1"),
+        true,
+        Some(2_400.0),
+    )
+    .await;
+    record_executed(&runtime, "c:2", "web.search", Some("t-1"), false, None).await;
+    record_executed(&runtime, "c:3", "external.publish", Some("t-2"), true, None).await;
+    record_executed(&runtime, "c:4", "email.send", None, true, None).await;
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let named = body["irreversibleEffects"].as_array().unwrap();
+    let kinds: Vec<&str> = named.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec!["filing.submit", "payment.send"],
+        "only this card's irreversible effects, oldest first: {named:?}",
+    );
+    assert_eq!(named[1]["amountUsd"].as_f64(), Some(2_400.0));
+    assert!(
+        named[0].get("amountUsd").is_none(),
+        "an effect with no amount must omit it rather than claim $0",
+    );
+
+    // The response carries no payload for any of them — there is none to carry.
+    let raw = serde_json::to_string(&body["irreversibleEffects"]).unwrap();
+    assert!(!raw.contains("payload"), "{raw}");
+}
+
+/// A task that only read, thought and replied reports an empty list — which is
+/// what keeps its Retry a single click.
+#[tokio::test]
+async fn a_task_with_no_irreversible_history_reports_an_empty_list() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, _) = dispatched_task(&state, &company).await;
+
+    record_executed(&runtime, "c:0", "web.search", Some("t-1"), false, None).await;
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["irreversibleEffects"].as_array().unwrap().is_empty(),
+        "{:?}",
+        body["irreversibleEffects"],
+    );
 }
 
 /// #185 review follow-up: the lineage forest is enforced at the write boundary.

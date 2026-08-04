@@ -430,6 +430,45 @@ struct TimelineEntry {
     waited_millis: Option<u64>,
 }
 
+/// One irreversible effect this task already executed (issue #351).
+///
+/// Drawn from the runtime journal's executed record — the same append-only set
+/// that makes an effect at-most-once — and **not** from the timeline. A
+/// timeline row says what an agent reported; this says what actually fired, and
+/// only the two together make a retry warning trustworthy.
+///
+/// `kind` is the dotted effect kind, the same vocabulary the Approvals page
+/// already receives and maps to plain language client-side (`effectAction` in
+/// `frontend/src/lib/language.ts`). Sending the key and rendering the sentence
+/// keeps operator-facing wording in the one layer the glossary rule puts it in,
+/// rather than growing a second copy on the host.
+///
+/// Deliberately no payload. The journal does not retain one for an executed
+/// effect, so a recipient or a message body cannot reach this response even by
+/// accident — the same scrub discipline [`TimelineEntry`] documents.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IrreversibleEffect {
+    /// The dotted effect kind, e.g. `payment.send`.
+    kind: String,
+    /// Epoch-millis the effect was committed.
+    at_millis: u64,
+    /// The USD amount involved, if any — what makes "sent a payment" into
+    /// "sent a payment of $2,400".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_usd: Option<f64>,
+}
+
+impl From<crate::runtime::journal::ExecutedEffect> for IrreversibleEffect {
+    fn from(e: crate::runtime::journal::ExecutedEffect) -> Self {
+        Self {
+            kind: e.kind,
+            at_millis: e.at_millis,
+            amount_usd: e.amount_usd,
+        }
+    }
+}
+
 /// A neighbouring card in the lineage, trimmed to what a link needs.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -468,6 +507,14 @@ struct TaskDetail {
     task: TaskCard,
     /// The per-task event stream, oldest first.
     timeline: Vec<TimelineEntry>,
+    /// What this task has already done that cannot be undone (issue #351),
+    /// oldest first. Empty for a task that only read, thought, and replied.
+    ///
+    /// Re-running a task re-runs its effects. The console gates Retry behind a
+    /// confirmation that names these, and shows no confirmation at all when the
+    /// list is empty — so this array is the whole difference between one click
+    /// and a stop-and-read.
+    irreversible_effects: Vec<IrreversibleEffect>,
     /// Parent and children.
     lineage: Lineage,
     /// Epoch-millis the company started waiting on an operator *right now*
@@ -502,7 +549,9 @@ struct TaskDetail {
 ///   running). Parked effects carry no task id, so a window is the honest
 ///   correlation here rather than a false-precision per-task link; entries are
 ///   labelled as such so a reader is not misled;
-/// * **lineage** — parent and children, from `parent_task_id`.
+/// * **lineage** — parent and children, from `parent_task_id`;
+/// * **irreversible effects** — what the task already did that a retry would
+///   do again (issue #351), read straight off the journal's executed record.
 ///
 /// 404s when the id names no card, matching `PATCH` / `DELETE`.
 async fn task_detail(
@@ -546,9 +595,19 @@ async fn task_detail(
             .min()
     });
 
+    // What a retry would re-do (issue #351). A pure journal read — no event
+    // scan — so a task that did nothing irreversible costs nothing extra.
+    let irreversible_effects = company
+        .runtime
+        .irreversible_effects(&task_id)
+        .into_iter()
+        .map(IrreversibleEffect::from)
+        .collect();
+
     Ok(Json(TaskDetail {
         task: card.into(),
         timeline,
+        irreversible_effects,
         lineage: Lineage { parent, children },
         waiting_since,
     }))
