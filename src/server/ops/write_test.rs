@@ -307,6 +307,59 @@ async fn task_writes_reject_a_column_the_board_cannot_render() {
     assert_eq!(board.as_array().expect("board")[0]["column"], "paused");
 }
 
+/// #334: `in_review → done` is a move the write boundary accepts, and the one
+/// the board's drag actually sends.
+///
+/// QA reported that a card "cannot be moved out of In review" — the drop did
+/// nothing and said nothing, which cannot distinguish a host refusing the write
+/// from a console that never sent it. It was the console (the drop was missing
+/// the mostly off-window last column, and every miss was silent), but nothing
+/// pinned the host's half of that answer. This does: both columns are in
+/// `BOARD_COLUMNS`, the transition is special-cased nowhere, and `done` is
+/// terminal — the card lands there and no dispatch fires behind it.
+#[tokio::test]
+async fn a_card_moves_from_in_review_to_done() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let (status, seeded) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Invoice March retainer", "column": "in_review"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let id = seeded["id"].as_str().unwrap().to_string();
+
+    // Exactly the body a drag onto Done sends.
+    let (status, moved) = send(
+        &state,
+        "PATCH",
+        &format!("/api/v1/company/tasks/{id}"),
+        Some(json!({"column": "done"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the board's drag PATCH must be accepted: {moved}"
+    );
+    assert_eq!(moved["column"], crate::ports::tasks::COLUMN_DONE);
+
+    // What the board reads back on its next poll, not just what the echo said —
+    // a card that snaps back is the shape of the original report.
+    let (_, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    let card = board
+        .as_array()
+        .expect("board")
+        .iter()
+        .find(|c| c["id"] == json!(id))
+        .expect("the card is still on the board");
+    assert_eq!(card["column"], crate::ports::tasks::COLUMN_DONE);
+}
+
 /// Issue #206: `POST …/tasks` defaults a new card to To-do — the board's one
 /// manual-entry column — while an explicit `column` still wins, so the
 /// lifecycle paths that place a card themselves are untouched.
