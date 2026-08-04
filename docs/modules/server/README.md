@@ -165,6 +165,26 @@ curl -X DELETE "$HOST/api/v1/company/workflows/weekly_digest?expectedVersion=a60
      -H "Authorization: Bearer $TOKEN"
 ```
 
+**In the console.** The Workflows view offers Edit and Delete side by side, both
+greyed out with the host's own explanation when `editable` is `false` — an
+explicit `false` only, since a host predating this sends no such field and
+`undefined` must not read as a refusal. Edit reopens the create dialog hydrated
+from the saved graph, with the **id read-only** (a rename is a `400`, so
+offering the field would be a trap) and `version` sent as `expectedVersion`. A
+`409` leaves the dialog open with the host's message and raises the same
+persistent conflict banner Delete uses, whose Reload re-reads the graph and its
+token; nothing is retried without one.
+
+**An edit does not disarm a schedule.** OpenHuman's `flows_update` forces
+`enabled = false` when an edit turns a manual trigger into an automatic one, so
+a new schedule cannot go live unreviewed. This host has no equivalent and
+deliberately gains none here: `WorkflowScheduler::tick` does not gate on
+`[workflows].enabled` at all, so writing `false` would stop nothing, and
+`adding_a_schedule_by_edit_arms_the_workflow_on_the_next_tick` pins that. An
+edit is therefore exactly as live as a create, which already persists a running
+schedule the same way. Reversing this means first making the scheduler honour
+`enabled`, which is the enable/disable follow-up below.
+
 **Deliberately not in #259**, each its own follow-up: revision history and
 rollback (OpenHuman keeps a bounded snapshot ring in a dedicated table; our
 overlay bodies live inside `CompanyRecord`, which is saved whole on every write,
