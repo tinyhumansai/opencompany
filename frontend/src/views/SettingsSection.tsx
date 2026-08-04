@@ -1,4 +1,5 @@
-import { Blocks, Plug, type LucideIcon, Settings2, UserCog } from "lucide-react";
+import { lazy, Suspense } from "react";
+import { Blocks, ChartColumnBig, Plug, type LucideIcon, Settings2, UserCog } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import type { CompanyFeed } from "@/hooks/use-company";
@@ -8,12 +9,16 @@ import { McpServersView } from "@/views/McpServersView";
 import { PeopleView } from "@/views/PeopleView";
 import { SettingsView } from "@/views/SettingsView";
 
+// Recharts is heavy and only used here — load the usage dashboard on demand.
+const UsageView = lazy(() => import("@/views/UsageView").then((m) => ({ default: m.UsageView })));
+
 /** The sub-pages that live under Settings. The id is the hash's second segment. */
 export const SETTINGS_PAGES = [
   { id: "general", label: "General", icon: Settings2, hint: "Connection, lifecycle, domain, mail" },
   { id: "people", label: "People", icon: UserCog, hint: "Who can sign in, and as what" },
   { id: "connections", label: "Connections", icon: Plug, hint: "Third-party accounts" },
   { id: "mcp", label: "MCP Servers", icon: Blocks, hint: "Tool servers and their tools" },
+  { id: "usage", label: "Usage", icon: ChartColumnBig, hint: "What this company is spending" },
 ] as const satisfies readonly { id: string; label: string; icon: LucideIcon; hint: string }[];
 
 export type SettingsPage = (typeof SETTINGS_PAGES)[number]["id"];
@@ -100,6 +105,17 @@ export function SettingsSection({ client, company, feed, sub, onNavigate, onFlag
         {page === "people" && <PeopleView client={client} company={company} />}
         {page === "connections" && <ConnectionsView client={client} company={company} />}
         {page === "mcp" && <McpServersView client={client} company={company} />}
+        {page === "usage" && (
+          <Suspense
+            fallback={
+              <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                Loading usage…
+              </div>
+            }
+          >
+            <UsageView />
+          </Suspense>
+        )}
       </div>
     </div>
   );

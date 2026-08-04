@@ -1,9 +1,7 @@
 import { lazy, Suspense, useState } from "react";
 import {
   Brain,
-  ChartColumnBig,
   FolderClosed,
-  Inbox,
   LayoutDashboard,
   type LucideIcon,
   MessagesSquare,
@@ -54,9 +52,7 @@ const WorkflowsView = lazy(() =>
 const WorkspaceView = lazy(() =>
   import("@/views/WorkspaceView").then((m) => ({ default: m.WorkspaceView })),
 );
-// Recharts is heavy — load the usage dashboard on demand.
-const UsageView = lazy(() => import("@/views/UsageView").then((m) => ({ default: m.UsageView })));
-// Also Recharts-backed — load on demand.
+// Recharts-backed — load on demand.
 const FinancesView = lazy(() =>
   import("@/views/FinancesView").then((m) => ({ default: m.FinancesView })),
 );
@@ -71,7 +67,6 @@ export type View =
   | "memory"
   | "approvals"
   | "workflows"
-  | "usage"
   | "finances"
   | "settings"
   | "feedback";
@@ -93,7 +88,6 @@ const NAV: NavGroup[] = [
     items: [
       { view: "overview", label: "Overview", icon: LayoutDashboard },
       { view: "chat", label: "Chat", icon: MessagesSquare },
-      { view: "inbox", label: "Inbox", icon: Inbox },
       { view: "tasks", label: "Tasks", icon: SquareKanban },
       { view: "skills", label: "Skills", icon: Sparkles },
       { view: "workspace", label: "Workspace", icon: FolderClosed },
@@ -105,16 +99,16 @@ const NAV: NavGroup[] = [
   {
     label: "Configure",
     items: [
-      { view: "usage", label: "Usage", icon: ChartColumnBig },
       { view: "finances", label: "Finances", icon: Wallet },
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
   },
 ];
 
-// Feedback is reachable from the sidebar footer rather than the nav, but it
-// is still a real view — keep it routable so `#/feedback` resolves.
-const VIEWS: View[] = [...NAV.flatMap((g) => g.items.map((i) => i.view)), "feedback"];
+// Two views are routable without a nav entry: Feedback, which the sidebar
+// footer links to, and Inbox, which is unfinished and hidden until it is worth
+// showing — `#/inbox` still resolves so the work stays reachable.
+const VIEWS: View[] = [...NAV.flatMap((g) => g.items.map((i) => i.view)), "feedback", "inbox"];
 
 interface Props {
   client: OpenCompanyClient;
@@ -239,17 +233,6 @@ export function AppShell({
               }
             >
               <WorkflowsView />
-            </Suspense>
-          )}
-          {view === "usage" && (
-            <Suspense
-              fallback={
-                <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-                  Loading usage…
-                </div>
-              }
-            >
-              <UsageView />
             </Suspense>
           )}
           {view === "finances" && (
