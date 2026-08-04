@@ -792,7 +792,7 @@ async fn assemble_detail_with_cursor(
         discussion_has_more,
         window_opened_at: open_window_at,
     } = fold_task_journal(
-        &company,
+        company,
         &task_id,
         DiscussionWindow {
             before_seq: discussion_before,
@@ -834,7 +834,7 @@ async fn assemble_detail_with_cursor(
     let durations = TaskDurations::compute(&timeline, waiting_since, now_millis());
 
     // An indexed store read, not another journal pass (issue #242).
-    let runs = runs_for_task(&company, &task_id).await?;
+    let runs = runs_for_task(company, &task_id).await?;
 
     Ok(TaskDetail {
         task: card.into(),
