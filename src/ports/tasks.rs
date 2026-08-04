@@ -111,7 +111,10 @@ pub fn is_board_column(column: &str) -> bool {
 /// test cannot see the TS one, so a renamed label is a deliberate two-place
 /// edit. An unknown id falls back to itself rather than to a guess, so a column
 /// added on one side still prints something truthful.
-pub fn column_label(column: &str) -> &str {
+///
+/// `pub(crate)`: presentation is not part of the port's contract, and the only
+/// consumer is the exported record. Widen it if a second surface needs it.
+pub(crate) fn column_label(column: &str) -> &str {
     match column {
         COLUMN_TODO => "To-do",
         COLUMN_PLANNING => "Planning",

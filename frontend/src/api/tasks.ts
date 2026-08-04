@@ -110,11 +110,39 @@ export interface TaskLineage {
 }
 
 /** The assembled Task Detail response (#185): one read for the whole screen. */
+/**
+ * The worked/waiting split (#305), computed by the host.
+ *
+ * Both totals used to be derived twice — here in the console and again in the
+ * exported record — so the screen and an exported copy of the same task could
+ * disagree about how long a person was waited on, with nothing failing when
+ * they drifted. The host does the arithmetic once and both read it.
+ *
+ * A still-open span cannot be carried by a snapshot: `workedLive` / `waitingLive`
+ * mark those, and a caller that wants a ticking figure adds `now - asOfMillis`
+ * to the live half. That is exact — every closed span ends in the past, so past
+ * `asOfMillis` only the open one grows.
+ */
+export interface TaskDurations {
+  /** Milliseconds actively worked, as of `asOfMillis`. */
+  workedMillis: number;
+  /** A dispatch window is still open. */
+  workedLive: boolean;
+  /** Milliseconds spent waiting on a person, interval-merged. */
+  waitingMillis: number;
+  /** An approval is still parked. */
+  waitingLive: boolean;
+  /** The instant both totals were taken. */
+  asOfMillis: number;
+}
+
 export interface TaskDetail {
   /** The card header — the same shape a board card carries. */
   task: Task;
   /** The per-task event stream, oldest first. */
   timeline: TimelineEntry[];
+  /** The worked/waiting split, so the screen and an export cannot disagree. */
+  durations: TaskDurations;
   /** Parent and children. */
   lineage: TaskLineage;
   /**
@@ -146,16 +174,16 @@ export function getTaskDetail(
 /**
  * The task's record as a self-contained HTML document (#352).
  *
- * The host renders it, so the console's job is delivery, not layout: the same
- * document reaches a `curl` or a scheduled job. Returns the file's text; the
- * caller saves it.
+ * The host renders it *and names it*, so the console's job is delivery only:
+ * the text and the `Content-Disposition` filename come back together, and the
+ * same document — under the same name — reaches a `curl -OJ` or a scheduled job.
  */
 export function exportTaskRecord(
   client: OpenCompanyClient,
   company: string | null,
   id: string,
-): Promise<string> {
-  return client.getText(`${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/export`);
+): Promise<{ text: string; filename?: string }> {
+  return client.getDocument(`${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/export`);
 }
 
 export function createTask(

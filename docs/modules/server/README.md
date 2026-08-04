@@ -53,7 +53,7 @@ address check for `{id}`, operator + `sole()` for the alias).
 
 `GET …/tasks/{taskId}/export` answers **one self-contained HTML file** carrying
 what the Task Detail screen shows: the header and the worked/waiting split, the
-whole ordered timeline with its details expanded, the sign-offs, every artifact
+whole ordered timeline with its details expanded, the text of every artifact
 revision and the human-edit diff, and the neighbouring cards. `Content-Type:
 text/html`, `Content-Disposition: attachment`, so `curl -OJ` lands a named file
 and the console's Export button downloads one.
@@ -89,13 +89,32 @@ renders as text in a file that will be opened in a browser and forwarded on.
 the task. A test compares the board rows and the journal length across the call,
 because an audit export that modifies what it audits is worse than none.
 
-**Approvals, until #333 lands.** An approval carries no task id yet, so the
-sign-offs section renders the `approval` timeline entries — resolutions that
-fell inside the card's run window — and says so in the document rather than
-implying a per-task link it cannot make. When #333 (PR #349) merges,
-`TaskDetail` gains an `approvals[]` keyed by a real id: the section should read
-that instead, pending sign-offs start appearing, and the correlation caveat
-comes out with the same edit.
+**One figure, computed once.** The worked/waiting split (#305) is computed
+host-side in `TaskDurations` and carried on `TaskDetail`, so the console and the
+exported record read the same numbers instead of deriving them separately. It
+used to be a hand-maintained mirror between `task_export.rs` and
+`frontend/src/views/TaskDetailView.tsx`: they agreed, but nothing failed if they
+stopped, and the failure mode is an exported record disagreeing with the screen
+about how long a person was waited on. `TaskDurations` carries the totals plus
+`workedLive` / `waitingLive` and `asOfMillis`; a caller wanting a ticking figure
+adds `now - asOfMillis` to the live half, which is exact because every closed
+span already ended before `asOfMillis`. The waiting *band height* stays mirrored
+— it is presentation, and a drifted pixel curve misleads nobody about a fact.
+
+**No sign-offs section, until #333 lands.** #352 deferred it explicitly: until an
+approval carries a task id, the only sign-offs attributable to a card are the
+resolutions that fell inside its run window, which is a correlation rather than a
+link. An imprecise attribution is least acceptable in the one artifact that goes
+to a client or an auditor, so the document omits the section rather than printing
+it with a caveat. When #333 (PR #349) merges, `TaskDetail` gains an `approvals[]`
+keyed by a real id and the section lands reading that — including the pending
+sign-offs that have no resolution event and so cannot appear at all today.
+
+**Bounded output.** The document is one `String` in one response, and it prints
+every revision of every artifact, so a long editing history scales it. Each
+revision body is capped (`MAX_BODY_CHARS`) and each human-edit diff is capped
+(`MAX_DIFF_LINES`); both cuts are announced in the document, because a reader
+must never be left believing they hold the whole text when they do not.
 
 ### Reading a trigger's cron back (issue #262)
 

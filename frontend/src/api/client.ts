@@ -116,8 +116,13 @@ export class OpenCompanyClient {
    * body into an `{error, code:"unparseable"}` object rather than throwing — so
    * a route that answers HTML needs its own reader. Same auth, same
    * `credentials: "include"`, same 401 handling; only the parsing differs.
+   *
+   * Returns the host's own `Content-Disposition` filename alongside the body.
+   * The host already names the file; without this the caller has to invent a
+   * name, which is a second naming rule that can disagree with the one a `curl
+   * -OJ` of the same route gets.
    */
-  async getText(path: string): Promise<string> {
+  async getDocument(path: string): Promise<{ text: string; filename?: string }> {
     const headers: Record<string, string> = {};
     if (this.token) headers["authorization"] = `Bearer ${this.token}`;
 
@@ -133,7 +138,7 @@ export class OpenCompanyClient {
       if (res.status === 401) this.onUnauthorized?.();
       throw new ApiError(res.status, envelope?.code ?? `http_${res.status}`, envelope?.error ?? res.statusText);
     }
-    return text;
+    return { text, filename: attachmentFilename(res.headers.get("content-disposition")) };
   }
 
   /** A typed POST, for surfaces that live outside this class (e.g. auth). */
@@ -502,6 +507,22 @@ export class OpenCompanyClient {
       `/api/v1/companies/${encodeURIComponent(id)}/${action}`,
     );
   }
+}
+
+/**
+ * The `filename` out of a `Content-Disposition` header, when the host sent one.
+ *
+ * Deliberately narrow: it accepts the quoted `attachment; filename="…"` form
+ * this codebase emits and nothing else, and it drops any path separator, so a
+ * header cannot steer a download out of the browser's download directory.
+ * Returns `undefined` when there is nothing usable, leaving the caller to fall
+ * back rather than saving a file named after a malformed header.
+ */
+function attachmentFilename(header: string | null): string | undefined {
+  if (!header) return undefined;
+  const match = /filename="([^"]+)"/i.exec(header);
+  const name = match?.[1]?.split(/[\\/]/).pop()?.trim();
+  return name && name !== "." && name !== ".." ? name : undefined;
 }
 
 function safeJson(text: string): unknown {

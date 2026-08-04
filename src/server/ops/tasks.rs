@@ -460,6 +460,153 @@ pub(crate) struct Lineage {
     pub(crate) children: Vec<LineageRef>,
 }
 
+/// The worked/waiting split (issue #305), computed once by the host.
+///
+/// Both halves are derived from the same timeline the screen and the exported
+/// record are handed, and they used to be derived *twice* — once in
+/// `frontend/src/views/TaskDetailView.tsx`, once in the exporter — so the two
+/// could disagree about how long a person was waited on with nothing failing.
+/// The host does the arithmetic and both callers read the result, which is the
+/// same reason [`assemble_detail`] is shared rather than re-read.
+///
+/// **Live runs are the one thing a snapshot cannot carry.** A dispatch window
+/// that is still open, or an approval still parked, keeps growing after these
+/// totals are taken. `worked_live` / `waiting_live` mark those, and
+/// `as_of_millis` is the instant they were taken: a caller that wants a ticking
+/// figure adds `now - as_of_millis` to the live half and does nothing else.
+///
+/// That extension is *exact*, not an approximation, and it is why the merge
+/// does not have to be repeated client-side: every closed span ends in the past,
+/// so past `as_of_millis` the only interval still growing is the open one, and
+/// it grows second for second.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskDurations {
+    /// Milliseconds this task was actively worked, as of `as_of_millis`.
+    pub(crate) worked_millis: u64,
+    /// A dispatch window is still open — extend `worked_millis` from `as_of_millis`.
+    pub(crate) worked_live: bool,
+    /// Milliseconds the company spent waiting on a person, interval-merged.
+    pub(crate) waiting_millis: u64,
+    /// An approval is still parked — extend `waiting_millis` from `as_of_millis`.
+    pub(crate) waiting_live: bool,
+    /// The instant both totals were taken.
+    pub(crate) as_of_millis: u64,
+}
+
+impl TaskDurations {
+    /// Both totals, over one timeline, as of `as_of_millis`.
+    ///
+    /// The single construction site, so a caller cannot assemble a `TaskDetail`
+    /// whose durations disagree with its timeline.
+    pub(crate) fn compute(
+        timeline: &[TimelineEntry],
+        waiting_since: Option<u64>,
+        as_of_millis: u64,
+    ) -> Self {
+        let (worked_millis, worked_live) = worked_span(timeline, as_of_millis);
+        let (waiting_millis, waiting_live) = waiting_span(timeline, waiting_since, as_of_millis);
+        Self {
+            worked_millis,
+            worked_live,
+            waiting_millis,
+            waiting_live,
+            as_of_millis,
+        }
+    }
+
+    /// The worked total extended to `now` when a window is still open.
+    pub(crate) fn worked_at(&self, now: u64) -> u64 {
+        self.extend(self.worked_millis, self.worked_live, now)
+    }
+
+    /// The waiting total extended to `now` when an approval is still parked.
+    pub(crate) fn waiting_at(&self, now: u64) -> u64 {
+        self.extend(self.waiting_millis, self.waiting_live, now)
+    }
+
+    fn extend(&self, total: u64, live: bool, now: u64) -> u64 {
+        if live {
+            total + now.saturating_sub(self.as_of_millis)
+        } else {
+            total
+        }
+    }
+}
+
+/// The task's worked time: each `dispatched` opens a window its `completed`
+/// closes, re-dispatch opens another, and an open window runs to `now`.
+///
+/// A `completed` with no open window is a card journaled before dispatch
+/// anchors existed: skipped, never counted from zero.
+fn worked_span(timeline: &[TimelineEntry], now: u64) -> (u64, bool) {
+    let mut total = 0u64;
+    let mut open_at: Option<u64> = None;
+    for e in timeline {
+        match e.kind.as_str() {
+            "dispatched" => open_at = Some(e.at_millis),
+            "completed" => {
+                if let Some(opened) = open_at.take() {
+                    total += e.at_millis.saturating_sub(opened);
+                }
+            }
+            _ => {}
+        }
+    }
+    let live = open_at.is_some();
+    if let Some(opened) = open_at {
+        total += now.saturating_sub(opened);
+    }
+    (total, live)
+}
+
+/// The task's waiting-on-a-person time, interval-merged then summed.
+///
+/// Each resolved approval carries `waited_millis` — the exact park→resolve span,
+/// already clamped to the run window — so a span is reconstructed as
+/// `[at_millis - waited_millis, at_millis]` rather than inferred from gaps. A
+/// still-parked approval has no resolution event yet and arrives as
+/// `waiting_since`, running to `now`.
+///
+/// The merge matters: two approvals parked at once mean the company waited
+/// *once* over the overlap, and double-counting could make waiting exceed the
+/// elapsed time it is compared against.
+fn waiting_span(timeline: &[TimelineEntry], waiting_since: Option<u64>, now: u64) -> (u64, bool) {
+    let mut spans: Vec<(u64, u64)> = timeline
+        .iter()
+        .filter(|e| e.kind == "approval")
+        // `None` means the host could not recover the park instant and `0` is a
+        // real instant sign-off. Neither is a span.
+        .filter_map(|e| {
+            e.waited_millis
+                .filter(|w| *w > 0)
+                .map(|w| (e.at_millis.saturating_sub(w), e.at_millis))
+        })
+        .collect();
+    let live = waiting_since.is_some();
+    if let Some(since) = waiting_since {
+        spans.push((since, now.max(since)));
+    }
+    spans.sort_unstable();
+
+    let mut total = 0u64;
+    let mut cursor: Option<(u64, u64)> = None;
+    for span in spans {
+        match cursor {
+            Some((start, end)) if span.0 <= end => cursor = Some((start, end.max(span.1))),
+            Some((start, end)) => {
+                total += end - start;
+                cursor = Some(span);
+            }
+            None => cursor = Some(span),
+        }
+    }
+    if let Some((start, end)) = cursor {
+        total += end - start;
+    }
+    (total, live)
+}
+
 /// The assembled Task Detail response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -468,6 +615,9 @@ pub(crate) struct TaskDetail {
     pub(crate) task: TaskCard,
     /// The per-task event stream, oldest first.
     pub(crate) timeline: Vec<TimelineEntry>,
+    /// The worked/waiting split, so the screen and the exported record cannot
+    /// disagree about it.
+    pub(crate) durations: TaskDurations,
     /// Parent and children.
     pub(crate) lineage: Lineage,
     /// Epoch-millis the company started waiting on an operator *right now*
@@ -563,9 +713,14 @@ pub(crate) async fn assemble_detail(
             .min()
     });
 
+    // The split is computed here, once, so the console and the exported record
+    // read the same numbers rather than deriving them separately (#352 review).
+    let durations = TaskDurations::compute(&timeline, waiting_since, now_millis());
+
     Ok(TaskDetail {
         task: card.into(),
         timeline,
+        durations,
         lineage: Lineage { parent, children },
         waiting_since,
     })
@@ -900,5 +1055,119 @@ async fn steer_task(
                 ))))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod durations_test {
+    use super::*;
+
+    /// 2026-08-05 09:00:00 UTC.
+    const T0: u64 = 1_785_920_400_000;
+
+    fn entry(at: u64, kind: &str, waited: Option<u64>) -> TimelineEntry {
+        TimelineEntry {
+            seq: at,
+            at_millis: at,
+            kind: kind.to_string(),
+            label: kind.to_string(),
+            detail: None,
+            waited_millis: waited,
+        }
+    }
+
+    /// A re-dispatched card accumulates every worked window, not just the first.
+    #[test]
+    fn worked_accumulates_every_dispatch_window() {
+        let d = TaskDurations::compute(
+            &[
+                entry(T0, "dispatched", None),
+                entry(T0 + 60_000, "completed", None),
+                entry(T0 + 600_000, "dispatched", None),
+                entry(T0 + 720_000, "completed", None),
+            ],
+            None,
+            T0,
+        );
+        assert_eq!(d.worked_millis, 180_000);
+        assert!(!d.worked_live);
+    }
+
+    /// A `completed` with no open window is legacy data: skipped, not counted
+    /// from zero, which would report the whole epoch as worked time.
+    #[test]
+    fn a_completion_without_a_dispatch_is_not_counted_from_zero() {
+        let d = TaskDurations::compute(&[entry(T0 + 60_000, "completed", None)], None, T0);
+        assert_eq!(d.worked_millis, 0);
+    }
+
+    /// Overlapping waits are merged, not summed twice — the company waited once.
+    #[test]
+    fn overlapping_waits_are_merged() {
+        let d = TaskDurations::compute(
+            &[
+                entry(T0 + 300_000, "approval", Some(300_000)), // [T0,     T0+5m]
+                entry(T0 + 420_000, "approval", Some(300_000)), // [T0+2m,  T0+7m]
+            ],
+            None,
+            T0,
+        );
+        assert_eq!(d.waiting_millis, 420_000, "the overlap was counted twice");
+        assert!(!d.waiting_live);
+    }
+
+    /// A sign-off resolved instantly (`0`) or with no recoverable park instant
+    /// (`None`) is not a span. Counting either would invent waiting time.
+    #[test]
+    fn an_instant_or_unknown_sign_off_is_not_a_wait() {
+        let d = TaskDurations::compute(
+            &[
+                entry(T0 + 60_000, "approval", Some(0)),
+                entry(T0 + 120_000, "approval", None),
+            ],
+            None,
+            T0,
+        );
+        assert_eq!(d.waiting_millis, 0);
+    }
+
+    /// The live halves run to `as_of`, and `*_at` extends them past it.
+    ///
+    /// This is the property the console's 1s tick and the exporter both rely on:
+    /// a reader adds elapsed time to the live half and nothing else, because
+    /// every closed span already ended before `as_of_millis`.
+    #[test]
+    fn live_spans_extend_exactly_and_sealed_ones_do_not() {
+        let live = TaskDurations::compute(
+            &[entry(T0, "dispatched", None)],
+            Some(T0 + 60_000),
+            T0 + 300_000,
+        );
+        assert!(live.worked_live && live.waiting_live);
+        assert_eq!(live.worked_millis, 300_000);
+        assert_eq!(live.waiting_millis, 240_000);
+        // One more minute of wall clock adds one minute to each live half.
+        assert_eq!(live.worked_at(T0 + 360_000), 360_000);
+        assert_eq!(live.waiting_at(T0 + 360_000), 300_000);
+
+        let sealed = TaskDurations::compute(
+            &[
+                entry(T0, "dispatched", None),
+                entry(T0 + 600_000, "completed", None),
+            ],
+            None,
+            T0 + 600_000,
+        );
+        assert!(!sealed.worked_live && !sealed.waiting_live);
+        // A finished task's totals do not move, however late it is read.
+        assert_eq!(sealed.worked_at(T0 + 99_000_000), 600_000);
+        assert_eq!(sealed.waiting_at(T0 + 99_000_000), 0);
+    }
+
+    /// A client clock behind the host's cannot subtract from a total.
+    #[test]
+    fn a_reader_clock_behind_the_host_does_not_go_backwards() {
+        let d = TaskDurations::compute(&[entry(T0, "dispatched", None)], None, T0 + 300_000);
+        assert_eq!(d.worked_at(T0), 300_000);
     }
 }

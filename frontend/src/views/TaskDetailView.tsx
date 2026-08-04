@@ -84,73 +84,27 @@ function columnLabel(column: string): string {
 }
 
 /**
- * Sums the task's "worked" spans from its timeline: each `dispatched` opens a
- * window that its matching `completed` closes. Re-dispatch reopens a fresh
- * window, so multiple spans accumulate. A `completed` with no open window
- * (legacy cards journaled before dispatch anchors existed) is skipped rather
- * than counted from zero. When a window is still open, its running time to
- * `now` is included and `live` is true — the caller ticks it every second.
- */
-function workedMillis(timeline: TimelineEntry[], now: number): { millis: number; live: boolean } {
-  let total = 0;
-  let openAt: number | null = null;
-  for (const e of timeline) {
-    if (e.kind === "dispatched") {
-      openAt = e.atMillis;
-    } else if (e.kind === "completed" && openAt !== null) {
-      total += Math.max(0, e.atMillis - openAt);
-      openAt = null;
-    }
-  }
-  const live = openAt !== null;
-  if (openAt !== null) total += Math.max(0, now - openAt);
-  return { millis: total, live };
-}
-
-/**
- * The task's waiting-on-a-human spans, merged and summed (#305).
+ * Extends a host-computed duration to `now` while its span is still open.
  *
- * Each resolved approval carries `waitedMillis` — the host's exact park→resolve
- * span, already clamped to the run window — so a span is reconstructed as
- * `[atMillis - waitedMillis, atMillis]` rather than inferred from gaps between
- * rows. A still-parked approval has no resolution event yet, so the live wait
- * arrives separately as `waitingSince` and runs to `now`.
+ * The worked/waiting arithmetic — the dispatch-window pairing and the approval
+ * interval merge — used to live here *and* in the exporter
+ * (`src/server/ops/task_export.rs`), so the screen and the exported record of
+ * the same task could disagree about how long a person was waited on with
+ * nothing failing. The host now computes both totals once in `TaskDurations`
+ * and hands them to whoever reads the task; this is all that is left client-side.
  *
- * Spans are interval-merged before summing. Two approvals can be parked at once
- * — the company is waiting *once* over that overlap, not twice — and without
- * the merge the waiting figure could exceed the elapsed time it is subtracted
- * from, which would read as a bug to anyone doing the arithmetic.
+ * The extension is exact rather than an approximation, which is why the merge
+ * does not have to be repeated here: every closed span ends in the past, so past
+ * `asOf` the only interval still growing is the open one, and it grows second
+ * for second. `Math.max(0, …)` guards a client clock behind the host's.
  */
-function waitingMillis(
-  timeline: TimelineEntry[],
-  waitingSince: number | undefined,
+function extend(
+  total: number,
+  live: boolean,
+  asOf: number,
   now: number,
 ): { millis: number; live: boolean } {
-  const spans: Array<[number, number]> = [];
-  for (const e of timeline) {
-    if (e.kind !== "approval") continue;
-    const waited = e.waitedMillis;
-    // `undefined` means the host could not recover the park instant; `0` is a
-    // real (instant) sign-off. Neither contributes a span.
-    if (waited === undefined || waited <= 0) continue;
-    spans.push([e.atMillis - waited, e.atMillis]);
-  }
-  const live = waitingSince !== undefined;
-  if (waitingSince !== undefined) spans.push([waitingSince, Math.max(waitingSince, now)]);
-
-  spans.sort((a, b) => a[0] - b[0]);
-  let total = 0;
-  let cursor: [number, number] | null = null;
-  for (const span of spans) {
-    if (cursor && span[0] <= cursor[1]) {
-      cursor[1] = Math.max(cursor[1], span[1]);
-    } else {
-      if (cursor) total += cursor[1] - cursor[0];
-      cursor = [span[0], span[1]];
-    }
-  }
-  if (cursor) total += cursor[1] - cursor[0];
-  return { millis: Math.max(0, total), live };
+  return { millis: live ? total + Math.max(0, now - asOf) : total, live };
 }
 
 /**
@@ -287,11 +241,27 @@ export function TaskDetailView({
   }, [load]);
 
   const worked = useMemo(
-    () => (detail ? workedMillis(detail.timeline, now) : null),
+    () =>
+      detail
+        ? extend(
+            detail.durations.workedMillis,
+            detail.durations.workedLive,
+            detail.durations.asOfMillis,
+            now,
+          )
+        : null,
     [detail, now],
   );
   const waiting = useMemo(
-    () => (detail ? waitingMillis(detail.timeline, detail.waitingSince, now) : null),
+    () =>
+      detail
+        ? extend(
+            detail.durations.waitingMillis,
+            detail.durations.waitingLive,
+            detail.durations.asOfMillis,
+            now,
+          )
+        : null,
     [detail, now],
   );
 
@@ -1085,8 +1055,8 @@ function ApprovalsTab({ entries }: { entries: TimelineEntry[] }) {
  * file — and this is delivery only: fetch the document through the authenticated
  * client, then hand it to the browser as a download. A plain `<a href>` would be
  * simpler but would drop the `Authorization` header the platform-token
- * deployment needs, so the bytes come back through `getText` and go out through
- * an object URL.
+ * deployment needs, so the bytes come back through `getDocument` — with the
+ * host's own filename — and go out through an object URL.
  *
  * Read-only by construction: the button triggers a GET, and the screen does not
  * reload after it, because nothing about the task changed.
@@ -1105,11 +1075,15 @@ function ExportButton({
   async function download() {
     setBusy(true);
     try {
-      const html = await exportTaskRecord(client, company, task.id);
-      const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+      const { text, filename } = await exportTaskRecord(client, company, task.id);
+      const url = URL.createObjectURL(new Blob([text], { type: "text/html" }));
       const link = document.createElement("a");
       link.href = url;
-      link.download = `task-${fileSlug(task.title) || task.id}.html`;
+      // The host already named the file, and a blob download does not honour
+      // `Content-Disposition` on its own — so carry the host's name across
+      // rather than deriving a second one here, which could disagree with what
+      // a `curl -OJ` of the same route saves.
+      link.download = filename ?? `task-${task.id}.html`;
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -1141,15 +1115,6 @@ function ExportButton({
       Export
     </Button>
   );
-}
-
-/** `Launch post` → `launch-post`, for the downloaded file's name. */
-function fileSlug(title: string): string {
-  return title
-    .slice(0, 60)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
 }
 
 function EmptyState({ title, body }: { title: string; body: string }) {

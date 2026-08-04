@@ -2,9 +2,8 @@
 //!
 //! `GET …/tasks/{task_id}/export` renders everything the Task Detail screen
 //! shows — the header and the worked/waiting split, the ordered timeline with
-//! its details expanded, the sign-offs, the artifact versions and their
-//! human-edit diffs, and the neighbouring cards — as **one self-contained HTML
-//! file**.
+//! its details expanded, every artifact revision and its human-edit diff, and
+//! the neighbouring cards — as **one self-contained HTML file**.
 //!
 //! ## Why HTML
 //!
@@ -56,7 +55,7 @@ use crate::ports::now_millis;
 use crate::ports::tasks::column_label;
 use crate::server::error::ApiError;
 use crate::server::ops::artifacts::{ArtifactView, artifacts_for_task};
-use crate::server::ops::tasks::{TaskDetail, TimelineEntry, assemble_detail};
+use crate::server::ops::tasks::{TaskDetail, assemble_detail};
 use crate::server::ops::{ScopedCompany, scoped};
 
 /// Builds the export route fragment.
@@ -149,11 +148,10 @@ ol.entries > li { margin-bottom: .5rem; }
 .tone-failed .what { color: #a11b2b; }
 .tone-done .what { color: #1a6c3c; }
 .muted { color: #5b6570; font-size: .88rem; }
-table.versions { width: 100%; border-collapse: collapse; font-size: .85rem; }
-table.versions th, table.versions td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #e6e9ed; }
-table.versions th { font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: #5b6570; }
 .body { margin: .6rem 0 0; padding: .6rem .75rem; background: #f2f4f7; border-radius: .35rem;
   white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; }
+.revision { margin: .8rem 0 0; padding-top: .6rem; border-top: 1px solid #e6e9ed; }
+.revision:first-of-type { border-top: 0; }
 .diff { margin: .6rem 0 0; border: 1px solid #dfe3e8; border-radius: .35rem; overflow: hidden; font-size: .8rem; }
 .diff div { padding: .12rem .6rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .diff .ins { background: #e7f6ec; }
@@ -181,8 +179,13 @@ fn render_document(
     now: u64,
 ) -> String {
     let task = &detail.task;
-    let worked = worked_millis(&detail.timeline, now);
-    let waiting = waiting_millis(&detail.timeline, detail.waiting_since, now);
+    // Both totals come from the host read, not from a second derivation here:
+    // the screen and this document must not be able to disagree about how long
+    // a person was waited on. `TaskDurations` carries them as of the instant the
+    // detail was assembled; extending a still-running window to this render's
+    // `now` is the only arithmetic left.
+    let worked = detail.durations.worked_at(now);
+    let waiting = detail.durations.waiting_at(now);
 
     let mut out = String::with_capacity(8 * 1024);
     out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
@@ -219,14 +222,22 @@ fn render_document(
         },
     );
     fact(&mut out, "Last updated", &format_utc(task.updated_at));
-    fact(&mut out, "Time worked", &format_duration(worked.millis));
-    fact(
-        &mut out,
-        "Waiting on a person",
-        &format_duration(waiting.millis),
-    );
+    fact(&mut out, "Time worked", &format_duration(worked));
+    fact(&mut out, "Waiting on a person", &format_duration(waiting));
+    // Where the card came from (#352 names the origin link in the header). The
+    // card carries a chat id, not a URL, and this document is read far from any
+    // console — so it names the conversation rather than pretending to link to
+    // it. Omitted on a board-created card, which has no origin at all.
+    if let Some(chat) = task
+        .origin_chat_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        fact(&mut out, "Opened from", &format!("the {chat} conversation"));
+    }
     out.push_str("</dl>\n");
-    if waiting.live {
+    if detail.durations.waiting_live {
         out.push_str(
             "<p class=\"lede\">This task is waiting on a person right now, so the two \
              durations above are still counting.</p>\n",
@@ -247,7 +258,6 @@ fn render_document(
     }
 
     render_timeline(&mut out, detail, now);
-    render_approvals(&mut out, &detail.timeline);
     render_artifacts(&mut out, artifacts);
     render_lineage(&mut out, detail);
 
@@ -346,52 +356,7 @@ fn wait_band(out: &mut String, label: &str, millis: u64) {
     ));
 }
 
-/// The sign-offs section.
-///
-/// **Until #333 lands** (PR #349) an approval carries no task id, so the only
-/// approvals that can be attributed to a card are the resolutions that fell
-/// inside its run window — which is what the timeline's `approval` entries
-/// already are, and what this section prints, with the correlation stated
-/// plainly rather than implied. When #333 merges, `TaskDetail` gains an
-/// `approvals[]` array keyed by a real id, and this section should read that
-/// instead: the honesty note goes away with it, and pending sign-offs (which
-/// have no resolution event and therefore cannot appear here at all today)
-/// start showing up.
-fn render_approvals(out: &mut String, timeline: &[TimelineEntry]) {
-    let approvals: Vec<&TimelineEntry> = timeline.iter().filter(|e| e.kind == "approval").collect();
-    out.push_str("<h2>Sign-offs</h2>\n");
-    if approvals.is_empty() {
-        out.push_str(
-            "<p class=\"card muted\">No decision needed a person's approval while this \
-             task ran.</p>\n",
-        );
-        return;
-    }
-    out.push_str(
-        "<p class=\"lede\">Decisions a person was asked to approve while this task was \
-         being worked on. These are matched to the period the task ran in, so a sign-off \
-         given for other work in the same period can appear here too.</p>\n",
-    );
-    out.push_str("<ol class=\"entries\">\n");
-    for entry in approvals {
-        out.push_str("<li class=\"card\">\n<div class=\"entry\">");
-        out.push_str(&format!(
-            "<span class=\"when\">{}</span><span class=\"what\">{}</span>",
-            escape(&clock_utc(entry.at_millis)),
-            escape(&entry.label)
-        ));
-        if let Some(waited) = entry.waited_millis {
-            out.push_str(&format!(
-                "<span class=\"when\">after {}</span>",
-                escape(&format_duration(waited))
-            ));
-        }
-        out.push_str("</div>\n</li>\n");
-    }
-    out.push_str("</ol>\n");
-}
-
-/// The outputs section: every artifact, its revisions, its final text, and the
+/// The outputs section: every artifact, every revision's text, and the
 /// agent-to-human diff when somebody edited it.
 fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
     out.push_str("<h2>What this task produced</h2>\n");
@@ -400,8 +365,9 @@ fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
         return;
     }
     out.push_str(
-        "<p class=\"lede\">Each output, with every revision it went through. Where a \
-         person edited what the company wrote, the change is shown line by line.</p>\n",
+        "<p class=\"lede\">Each output, with the text of every revision it went \
+         through. Where a person edited what the company wrote, the change is shown \
+         line by line.</p>\n",
     );
     for view in artifacts {
         let a = &view.artifact;
@@ -411,8 +377,19 @@ fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
             escape(&a.title),
             escape(&format_utc(a.updated_at_millis))
         ));
+        // What this output *is*. An `image` / `file` artifact carries a URL or a
+        // workspace path rather than prose, so a reader who is only shown the
+        // body has no way to tell a draft from a pointer at a file.
+        out.push_str(&format!(
+            "<p class=\"lede\">{}</p>\n",
+            escape(kind_label(a.kind))
+        ));
 
-        out.push_str("<table class=\"versions\">\n<tr><th>Revision</th><th>Written by</th><th>When</th><th>Why</th></tr>\n");
+        // Every revision, in order, with its own text. This used to be a
+        // metadata table plus the latest body only, which left the document
+        // short of the acceptance criterion ("artifact versions and lineage"):
+        // a reader could see that revision 1 existed and never learn what it
+        // said. The row and the text it describes now travel together.
         for v in &a.versions {
             let who = match v.author {
                 crate::ports::artifacts::ArtifactAuthor::Agent => {
@@ -422,21 +399,19 @@ fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
                     format!("{} (person)", v.author_id)
                 }
             };
+            out.push_str("<div class=\"revision\">\n");
             out.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                "<div class=\"entry\"><span class=\"when\">Revision {}</span>\
+                 <span class=\"what\">{} &middot; {}</span></div>\n",
                 v.version,
                 escape(&who),
                 escape(&format_utc(v.created_at_millis)),
-                escape(v.note.as_deref().unwrap_or("")),
             ));
-        }
-        out.push_str("</table>\n");
-
-        if let Some(latest) = a.versions.last() {
-            out.push_str(&format!(
-                "<div class=\"body\">{}</div>\n",
-                escape(&latest.body)
-            ));
+            if let Some(note) = v.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                out.push_str(&format!("<p class=\"lede\">{}</p>\n", escape(note)));
+            }
+            out.push_str(&format!("<div class=\"body\">{}</div>\n", body_html(&v.body)));
+            out.push_str("</div>\n");
         }
 
         if let Some(diff) = &view.human_edit_diff {
@@ -451,7 +426,7 @@ fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
                 diff.removed
             ));
             out.push_str("<div class=\"diff\">\n");
-            for line in &diff.lines {
+            for line in diff.lines.iter().take(MAX_DIFF_LINES) {
                 let (class, prefix) = match line.op {
                     crate::ports::artifacts::DiffOp::Insert => ("ins", "+ "),
                     crate::ports::artifacts::DiffOp::Delete => ("del", "- "),
@@ -463,9 +438,53 @@ fn render_artifacts(out: &mut String, artifacts: &[ArtifactView]) {
                     escape(&line.text)
                 ));
             }
+            let dropped = diff.lines.len().saturating_sub(MAX_DIFF_LINES);
+            if dropped > 0 {
+                out.push_str(&format!(
+                    "<div class=\"eq\">… {dropped} further lines of this change are not \
+                     shown. The full text of both revisions is printed above.</div>\n"
+                ));
+            }
             out.push_str("</div>\n");
         }
         out.push_str("</div>\n");
+    }
+}
+
+/// What an artifact is, in words rather than the wire token.
+fn kind_label(kind: crate::ports::artifacts::ArtifactKind) -> &'static str {
+    use crate::ports::artifacts::ArtifactKind;
+    match kind {
+        ArtifactKind::Text => "Written output.",
+        ArtifactKind::Markdown => "Written output (Markdown source).",
+        ArtifactKind::Image => {
+            "An image. The record carries where it is kept, not the picture itself."
+        }
+        ArtifactKind::File => "A file. The record carries where it is kept, not its contents.",
+    }
+}
+
+/// One revision's body, escaped and bounded.
+///
+/// Printing *every* revision (rather than only the latest) multiplies the
+/// document by the number of revisions, so each body carries a ceiling. The cut
+/// is announced in the document rather than silent: a reader must never be left
+/// believing they have the whole text when they do not.
+fn body_html(body: &str) -> String {
+    let mut cut = MAX_BODY_CHARS.min(body.len());
+    if cut < body.len() {
+        // Never split a UTF-8 sequence.
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!(
+            "{}<p class=\"muted\">… this revision is longer than the record prints. \
+             {} more characters were left out.</p>",
+            escape(&body[..cut]),
+            body.len() - cut
+        )
+    } else {
+        escape(body)
     }
 }
 
@@ -505,92 +524,24 @@ fn tone_class(kind: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Arithmetic mirrored from the console (#305)
+// Bounds
 // ---------------------------------------------------------------------------
 
-/// A duration and whether it is still running.
-struct Span {
-    millis: u64,
-    live: bool,
-}
-
-/// The task's worked time: each `dispatched` opens a window its `completed`
-/// closes, re-dispatch opens another, and an open window runs to `now`.
+/// The most characters of any one artifact revision the document prints.
 ///
-/// Mirrors `workedMillis` in `frontend/src/views/TaskDetailView.tsx`. The two
-/// are a hand-maintained pair: the screen must not be able to say "worked 4m"
-/// while the exported record of the same task says something else, and a Rust
-/// test cannot see the TS function.
-fn worked_millis(timeline: &[TimelineEntry], now: u64) -> Span {
-    let mut total = 0u64;
-    let mut open_at: Option<u64> = None;
-    for e in timeline {
-        match e.kind.as_str() {
-            "dispatched" => open_at = Some(e.at_millis),
-            // A `completed` with no open window is a card journaled before
-            // dispatch anchors existed: skipped, never counted from zero.
-            "completed" => {
-                if let Some(opened) = open_at.take() {
-                    total += e.at_millis.saturating_sub(opened);
-                }
-            }
-            _ => {}
-        }
-    }
-    let live = open_at.is_some();
-    if let Some(opened) = open_at {
-        total += now.saturating_sub(opened);
-    }
-    Span {
-        millis: total,
-        live,
-    }
-}
+/// The document is assembled as a single `String` and returned in one response,
+/// and printing every revision rather than only the latest multiplies its size
+/// by the revision count. This is the ceiling that keeps a task with a long
+/// editing history from producing an unbounded body. Generous on purpose — a
+/// long draft should arrive whole; only a pathological one is cut, and the cut
+/// says so in the document.
+const MAX_BODY_CHARS: usize = 200_000;
 
-/// The task's waiting-on-a-person time, interval-merged then summed.
+/// The most diff lines printed for one artifact's human edit.
 ///
-/// Mirrors `waitingMillis` in `frontend/src/views/TaskDetailView.tsx`, including
-/// the merge: two approvals parked at once mean the company waited *once* over
-/// the overlap, and double-counting could make waiting exceed the elapsed time
-/// it is compared against.
-fn waiting_millis(timeline: &[TimelineEntry], waiting_since: Option<u64>, now: u64) -> Span {
-    let mut spans: Vec<(u64, u64)> = timeline
-        .iter()
-        .filter(|e| e.kind == "approval")
-        // `None` means the host could not recover the park instant and `0` is a
-        // real instant sign-off. Neither is a span.
-        .filter_map(|e| {
-            e.waited_millis
-                .filter(|w| *w > 0)
-                .map(|w| (e.at_millis.saturating_sub(w), e.at_millis))
-        })
-        .collect();
-    let live = waiting_since.is_some();
-    if let Some(since) = waiting_since {
-        spans.push((since, now.max(since)));
-    }
-    spans.sort_unstable();
-
-    let mut total = 0u64;
-    let mut cursor: Option<(u64, u64)> = None;
-    for span in spans {
-        match cursor {
-            Some((start, end)) if span.0 <= end => cursor = Some((start, end.max(span.1))),
-            Some((start, end)) => {
-                total += end - start;
-                cursor = Some(span);
-            }
-            None => cursor = Some(span),
-        }
-    }
-    if let Some((start, end)) = cursor {
-        total += end - start;
-    }
-    Span {
-        millis: total,
-        live,
-    }
-}
+/// Unlike a body, a truncated diff loses nothing recoverable: both revisions are
+/// printed in full above it, so the reader can still see what changed.
+const MAX_DIFF_LINES: usize = 2_000;
 
 /// The pixel height of a waiting band, mirroring `waitingBandHeight` in the
 /// console: a log curve with a 12px floor and a 112px cap, so four seconds and

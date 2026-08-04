@@ -11,7 +11,9 @@
 //! request harness lives.
 
 use super::*;
-use crate::server::ops::tasks::{Lineage, LineageRef, TaskCard, TaskDetail, TimelineEntry};
+use crate::server::ops::tasks::{
+    Lineage, LineageRef, TaskCard, TaskDetail, TaskDurations, TimelineEntry,
+};
 
 /// 2026-08-05 09:00:00 UTC — a fixed clock, so the document is deterministic.
 const T0: u64 = 1_785_920_400_000;
@@ -42,36 +44,47 @@ fn card(title: &str) -> TaskCard {
 }
 
 /// A worked-then-finished task with a reply, a failed tool call and a sign-off.
+///
+/// Durations go through [`TaskDurations::compute`] — the same constructor
+/// `assemble_detail` uses — so the fixture cannot drift from the host read it
+/// stands in for.
 fn detail() -> TaskDetail {
+    detail_at(None)
+}
+
+/// [`detail`], optionally still parked on a person since `waiting_since`.
+fn detail_at(waiting_since: Option<u64>) -> TaskDetail {
     let mut approval = entry(4, T0 + 400_000, "approval", "Approval approved", None);
     approval.waited_millis = Some(120_000);
+    let timeline = vec![
+        entry(1, T0, "dispatched", "Dispatched", None),
+        entry(
+            2,
+            T0 + 60_000,
+            "reply",
+            "Reply from writer",
+            Some("First draft is up."),
+        ),
+        entry(
+            3,
+            T0 + 120_000,
+            "tool_failed",
+            "mailer · send failed",
+            Some("server rejected the call"),
+        ),
+        approval,
+        entry(
+            5,
+            T0 + 600_000,
+            "completed",
+            "Finished on writer → in_review",
+            Some("Posted."),
+        ),
+    ];
     TaskDetail {
         task: card("Launch post"),
-        timeline: vec![
-            entry(1, T0, "dispatched", "Dispatched", None),
-            entry(
-                2,
-                T0 + 60_000,
-                "reply",
-                "Reply from writer",
-                Some("First draft is up."),
-            ),
-            entry(
-                3,
-                T0 + 120_000,
-                "tool_failed",
-                "mailer · send failed",
-                Some("server rejected the call"),
-            ),
-            approval,
-            entry(
-                5,
-                T0 + 600_000,
-                "completed",
-                "Finished on writer → in_review",
-                Some("Posted."),
-            ),
-        ],
+        durations: TaskDurations::compute(&timeline, waiting_since, T0 + 900_000),
+        timeline,
         lineage: Lineage {
             parent: Some(LineageRef {
                 id: "t-parent".to_string(),
@@ -84,8 +97,14 @@ fn detail() -> TaskDetail {
                 column: "todo".to_string(),
             }],
         },
-        waiting_since: None,
+        waiting_since,
     }
+}
+
+/// Rebuilds a fixture's durations after its timeline was edited, so a test that
+/// reshapes the fixture still exports numbers that match what it shows.
+fn recompute(d: &mut TaskDetail, as_of: u64) {
+    d.durations = TaskDurations::compute(&d.timeline, d.waiting_since, as_of);
 }
 
 /// The acceptance bar: the document is readable prose, not a data dump.
@@ -101,7 +120,6 @@ fn the_document_reads_as_prose_not_as_data() {
         "Task record",
         "What was asked for",
         "What happened, in order",
-        "Sign-offs",
         "What this task produced",
         "Related work",
     ] {
@@ -174,9 +192,9 @@ fn the_worked_and_waiting_split_is_carried() {
 /// A still-parked task says so, and its live wait runs to now.
 #[test]
 fn a_task_still_waiting_says_so() {
-    let mut d = detail();
+    let mut d = detail_at(Some(T0 + 60_000));
     d.timeline.truncate(1); // dispatched only, still running
-    d.waiting_since = Some(T0 + 60_000);
+    recompute(&mut d, T0 + 300_000);
     let html = render_document("Acme Co", &d, &[], T0 + 300_000);
     assert!(html.contains("waiting on a person right now"));
     assert!(
@@ -191,6 +209,7 @@ fn a_task_still_waiting_says_so() {
 fn an_untouched_task_exports_an_honest_document() {
     let mut d = detail();
     d.timeline.clear();
+    recompute(&mut d, T0);
     d.task.note = None;
     d.lineage = Lineage {
         parent: None,
@@ -199,7 +218,6 @@ fn an_untouched_task_exports_an_honest_document() {
     let html = render_document("Acme Co", &d, &[], T0);
 
     assert!(html.contains("Nothing has happened on this task yet"));
-    assert!(html.contains("No decision needed a person's approval"));
     assert!(html.contains("This task recorded no output."));
     // Related work is omitted entirely when there is none — an empty heading is
     // noise in a document somebody reads top to bottom.
@@ -246,28 +264,38 @@ fn the_waiting_band_curve_mirrors_the_console() {
     assert!(waiting_band_height(u64::MAX) <= 112);
 }
 
-/// Overlapping waits are merged, not summed twice — the company waited once.
+/// The document prints the host's figures, not its own.
+///
+/// The worked/waiting arithmetic moved onto `TaskDurations` so the console and
+/// this renderer cannot disagree (#355 review); the merge and the window pairing
+/// are tested there. What is left to pin here is that the renderer *reads* those
+/// fields — a renderer that recomputed, or that ignored a live span, would still
+/// pass every other test in this file.
 #[test]
-fn overlapping_waits_are_merged() {
-    let mut first = entry(1, T0 + 300_000, "approval", "Approval approved", None);
-    first.waited_millis = Some(300_000); // [T0, T0+5m]
-    let mut second = entry(2, T0 + 420_000, "approval", "Approval approved", None);
-    second.waited_millis = Some(300_000); // [T0+2m, T0+7m]
-    let waiting = waiting_millis(&[first, second], None, T0);
-    assert_eq!(waiting.millis, 420_000, "the overlap was counted twice");
+fn the_document_prints_the_hosts_figures() {
+    let mut d = detail();
+    // Numbers no correct derivation from this timeline would produce.
+    d.durations = TaskDurations {
+        worked_millis: 3_600_000,
+        worked_live: false,
+        waiting_millis: 900_000,
+        waiting_live: false,
+        as_of_millis: T0,
+    };
+    let html = render_document("Acme Co", &d, &[], T0 + 900_000);
+    assert!(html.contains("1h 00m 00s"), "worked total not read: {html}");
+    assert!(html.contains("15m 00s"), "waiting total not read: {html}");
 
-    // A re-dispatched card accumulates both of its worked windows.
-    let worked = worked_millis(
-        &[
-            entry(1, T0, "dispatched", "Dispatched", None),
-            entry(2, T0 + 60_000, "completed", "Finished", None),
-            entry(3, T0 + 600_000, "dispatched", "Dispatched", None),
-            entry(4, T0 + 720_000, "completed", "Finished", None),
-        ],
-        T0,
-    );
-    assert_eq!(worked.millis, 180_000);
-    assert!(!worked.live);
+    // A live span is extended from the host's instant, not recomputed.
+    d.durations = TaskDurations {
+        worked_millis: 60_000,
+        worked_live: true,
+        waiting_millis: 0,
+        waiting_live: false,
+        as_of_millis: T0,
+    };
+    let html = render_document("Acme Co", &d, &[], T0 + 60_000);
+    assert!(html.contains("2m 00s"), "live worked not extended: {html}");
 }
 
 /// The filename is derived from the title, and always exists.
@@ -315,10 +343,159 @@ fn artifacts_carry_their_versions_and_the_human_edit() {
     assert!(html.contains("writer (company)"));
     assert!(html.contains("alex (person)"));
     assert!(html.contains("operator edit before approval"));
-    assert!(html.contains("Hello, world!"), "the final text is missing");
+    // Every revision's *text*, not only the latest. The acceptance criterion is
+    // "artifact versions and lineage"; printing a row per revision but the body
+    // of one told a reader that revision 1 existed without ever saying what it
+    // said (#355 review).
+    assert!(
+        html.contains("Hello world"),
+        "the first revision's text is missing: {html}"
+    );
+    assert!(
+        html.contains("Hello, world!"),
+        "the final revision's text is missing"
+    );
+    assert!(html.contains("Revision 1") && html.contains("Revision 2"));
+    // What the output is, so a reference-only artifact is not a bare path.
+    assert!(html.contains("Markdown source"), "the kind is not named");
     assert!(
         html.contains("A person changed"),
         "the human edit is not explained"
     );
     assert!(html.contains("class=\"ins\"") && html.contains("class=\"del\""));
+}
+
+/// An `image` / `file` artifact says what it is rather than showing a bare path.
+#[test]
+fn a_reference_artifact_says_what_it_is() {
+    use crate::ports::artifacts::{ArtifactKind, ArtifactRecord};
+    use crate::server::ops::artifacts::ArtifactView;
+
+    let view = ArtifactView::from(ArtifactRecord::new(
+        "a-2",
+        "t-1",
+        "Launch banner",
+        ArtifactKind::Image,
+        "workspace://renders/banner.png",
+        "designer",
+        T0,
+    ));
+    let html = render_document(
+        "Acme Co",
+        &detail(),
+        std::slice::from_ref(&view),
+        T0 + 900_000,
+    );
+    assert!(
+        html.contains("An image. The record carries where it is kept"),
+        "an image artifact renders as a bare path: {html}"
+    );
+}
+
+/// The artifact path escapes too — it is the largest agent-written surface in
+/// the document, and the one this file did not cover (#355 review).
+///
+/// `author_id`, the version note, the body and each diff line are all
+/// interpolated; any of them carrying a tag would turn an audit record into an
+/// attack the moment somebody opens it in a browser.
+#[test]
+fn artifact_text_cannot_become_markup() {
+    use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord};
+    use crate::server::ops::artifacts::ArtifactView;
+
+    let mut record = ArtifactRecord::new(
+        "a-1",
+        "t-1",
+        "<title>Draft</title>",
+        ArtifactKind::Markdown,
+        "<script>first()</script>",
+        "<b>writer</b>",
+        T0,
+    );
+    record.push_version(
+        "</div><script>second()</script>",
+        ArtifactAuthor::Operator,
+        "<i>alex</i>",
+        T0 + 60_000,
+        Some("<img src=x onerror=alert(1)>".to_string()),
+    );
+    let html = render_document(
+        "Acme Co",
+        &detail(),
+        std::slice::from_ref(&ArtifactView::from(record)),
+        T0 + 900_000,
+    );
+
+    for raw in [
+        "<script>first()</script>",
+        "<script>second()</script>",
+        "<b>writer</b>",
+        "<i>alex</i>",
+        "<img src=x",
+        "<title>Draft</title>",
+    ] {
+        assert!(!html.contains(raw), "artifact markup survived: {raw}");
+    }
+    // Escaped, not dropped — the reader still sees what was written.
+    assert!(html.contains("&lt;script&gt;first()&lt;/script&gt;"));
+    assert!(html.contains("&lt;b&gt;writer&lt;/b&gt; (company)"));
+    assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+}
+
+/// A pathological revision is cut, and the document says it was cut.
+///
+/// Every revision is printed now, so the body is the one input that scales with
+/// the task's editing history. The reader must never be left believing they hold
+/// the whole text when they do not.
+#[test]
+fn an_oversized_revision_is_bounded_and_says_so() {
+    use crate::ports::artifacts::{ArtifactKind, ArtifactRecord};
+    use crate::server::ops::artifacts::ArtifactView;
+
+    let body = "x".repeat(MAX_BODY_CHARS + 500);
+    let view = ArtifactView::from(ArtifactRecord::new(
+        "a-3",
+        "t-1",
+        "Long draft",
+        ArtifactKind::Text,
+        body.as_str(),
+        "writer",
+        T0,
+    ));
+    let html = render_document(
+        "Acme Co",
+        &detail(),
+        std::slice::from_ref(&view),
+        T0 + 900_000,
+    );
+    assert!(html.len() < body.len() + 60_000, "the body was not bounded");
+    assert!(
+        html.contains("500 more characters were left out"),
+        "the cut is silent: a reader cannot tell the text is incomplete"
+    );
+}
+
+/// The header names where the card came from (#352 lists the origin link).
+///
+/// The card carries a chat id, not a URL, and this document is read far from any
+/// console — so the record names the conversation rather than linking to it.
+/// Absent on a board-created card, which has no origin at all.
+#[test]
+fn the_header_names_the_conversation_the_task_came_from() {
+    let mut d = detail();
+    d.task.origin_chat_id = Some("strategy".to_string());
+    let html = render_document("Acme Co", &d, &[], T0 + 900_000);
+    assert!(
+        html.contains("<dt>Opened from</dt><dd>the strategy conversation</dd>"),
+        "the origin is carried but never printed: {html}"
+    );
+
+    // A card the board created has no origin, and gets no empty row for one.
+    let plain = render_document("Acme Co", &detail(), &[], T0 + 900_000);
+    assert!(!plain.contains("Opened from"));
+
+    // Whitespace is not an origin.
+    let mut blank = detail();
+    blank.task.origin_chat_id = Some("   ".to_string());
+    assert!(!render_document("Acme Co", &blank, &[], T0).contains("Opened from"));
 }
