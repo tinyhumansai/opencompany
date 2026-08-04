@@ -255,33 +255,32 @@ export function AppShell({
       </Sidebar>
 
       <SidebarInset>
-        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="mr-1 h-4" />
-          <h1 className="text-sm font-semibold">{TITLES[view]}</h1>
-          <div className="ml-auto flex items-center gap-2">
-            <StatusPill lifecycle={feed.status.lifecycle} className="hidden sm:inline-flex" />
-            <Button
-              variant="outline"
-              size="sm"
-              className="hidden sm:inline-flex"
-              onClick={() => setFeedbackOpen(true)}
-            >
-              <Flag className="size-4" />
-              Flag something
-            </Button>
-            <ThemeToggle />
-          </div>
-        </header>
+        {/* The Overview is the graph and nothing else — it takes the whole
+            frame, top bar included. Every other view keeps its chrome. */}
+        {view !== "overview" && (
+          <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
+            <SidebarTrigger className="-ml-1" />
+            <Separator orientation="vertical" className="mr-1 h-4" />
+            <h1 className="text-sm font-semibold">{TITLES[view]}</h1>
+            <div className="ml-auto flex items-center gap-2">
+              <StatusPill lifecycle={feed.status.lifecycle} className="hidden sm:inline-flex" />
+              <Button
+                variant="outline"
+                size="sm"
+                className="hidden sm:inline-flex"
+                onClick={() => setFeedbackOpen(true)}
+              >
+                <Flag className="size-4" />
+                Flag something
+              </Button>
+              <ThemeToggle />
+            </div>
+          </header>
+        )}
 
         <main className="flex flex-1 flex-col overflow-hidden">
           {view === "overview" && (
-            <Overview
-              feed={feed}
-              client={client}
-              company={company}
-              onNavigate={setView}
-            />
+            <Overview client={client} company={company} />
           )}
           {view === "conversation" && (
             <Conversation
