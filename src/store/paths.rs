@@ -22,7 +22,7 @@
 //! the only place that decision is made. It resolves to the instance workspace
 //! root in every branch, so the single `companies/` segment above is the only
 //! one; installs predating that carry an extra level and are moved up on boot by
-//! [`migrate_legacy_nest`](crate::store::migrate_legacy_nest).
+//! [`migrate_legacy_nest`](crate::store::migrate::migrate_legacy_nest).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -66,7 +66,7 @@ const REMOVED_HOME_ENV: &str = "OPENCOMPANY_HOME";
 /// `companies` leaf of its own on top of the one [`Bundle::new`] adds, nesting a
 /// default local install's bundles at `~/.opencompany/companies/companies/<slug>`.
 /// That leaf is gone; existing installs are moved up on first launch by
-/// [`migrate_legacy_nest`](crate::store::migrate_legacy_nest), which `serve`,
+/// [`migrate_legacy_nest`](crate::store::migrate::migrate_legacy_nest), which `serve`,
 /// `export`, and `import` all run before touching the home.
 ///
 /// An empty variable counts as unset: an empty `OPENCOMPANY_DATA_DIR` would
@@ -508,7 +508,7 @@ mod test {
         // The default no longer appends a `companies` leaf on top of the one
         // `Bundle::new` adds, so a default local install has the same
         // single-root shape as a hosted tenant. Existing doubled installs are
-        // moved up by `store::migrate_legacy_nest` rather than orphaned.
+        // moved up by `store::migrate::migrate_legacy_nest` rather than orphaned.
         assert_eq!(
             resolve(None, None, Some("/home/u")).unwrap(),
             PathBuf::from("/home/u/.opencompany")

@@ -23,20 +23,44 @@
 //! its own sake: otherwise an un-migrated install's first post-upgrade command
 //! fails to find its bundles.
 //!
+//! The harness workspace and the MCP registry are orphaned by the same shift:
+//! both hang off the resolved home rather than off a bundle
+//! (`runtime/builder.rs`), so an operator's installed MCP servers — and the
+//! environment values stored with them — would be left behind at
+//! `~/.opencompany/companies/mcp` exactly as the database was.
+//!
 //! The migration is a detect-and-move:
 //!
 //! - No `<home>/companies/companies` directory is a no-op. A hosted tenant, whose
 //!   home resolves to `/data`, takes this branch on every boot: two `stat`s that
 //!   find nothing.
-//! - A nest holding a `company.toml` or `meta.json` at its top level *is* a real
-//!   bundle whose slug happens to be `companies`, and is left alone.
-//! - Each entry is renamed up one level when the destination is free.
+//! - A nest that is itself **bundle-shaped** — holding any of the files or
+//!   subdirectories only a company owns — *is* a real bundle whose slug happens
+//!   to be `companies`, and is left alone. A manifest is deliberately not the
+//!   test: ~20 sites create a bundle through
+//!   [`Bundle::ensure_dirs`](crate::store::Bundle::ensure_dirs) with neither
+//!   `company.toml` nor `meta.json`, and under a sqlite or mongodb store the
+//!   manifest never reaches the filesystem at all while the keys, secrets and
+//!   task board still do. Keying off the manifest would have dissolved exactly
+//!   those installs — hosted ones included.
+//! - Only entries that are **themselves bundle-shaped directories** are
+//!   relocated. That is the same test one level down, and it is the second
+//!   guard: even if the check above ever misread a bundle as a nest, that
+//!   bundle's own `keys/`, `secrets/` and `tasks.json` are not bundle-shaped and
+//!   would stay where they are. Anything unrecognised is left exactly where it
+//!   is, silently — the legacy nest holds nothing but bundles, so an entry that
+//!   does not look like one is not something this migration knows how to place.
+//! - Each recognised entry is renamed up one level when the destination is free.
 //! - A destination that already exists is **skipped with a warning naming both
 //!   paths**, never merged: a user who ran the app both ways has two copies of
 //!   one company, and interleaving two event logs and two signing keys is
 //!   unrecoverable. Picking a winner is the same bet with the loser deleted.
 //! - The nest directory is removed only once emptied, so a crash mid-loop simply
 //!   resumes on the next boot. Idempotent by construction.
+//! - The harness workspace (`<home>/harness`) and the MCP runtime registry
+//!   (`<home>/mcp`) move up beside the workspace like the database, under the
+//!   same shape guard: a company really can be slugged `harness`, and its
+//!   canonical bundle is at exactly the path the legacy tree occupied.
 //! - The database and its `-wal`/`-shm` siblings resume the same way: the set is
 //!   detected from *any* surviving member, not from the database alone, so a run
 //!   that moved the database and then died is finished by the next boot rather
@@ -44,9 +68,21 @@
 //! - Only **regular files** are ever treated as the database. A company slugged
 //!   `opencompany.db` owns the directory at that exact path, and moving it would
 //!   delete the company.
+//! - Files move by `link`+`unlink`, never by `rename`: a rename replaces a
+//!   regular file silently, and a "is the destination free?" check taken
+//!   beforehand is stale the instant it is read. Directories keep `rename`,
+//!   which cannot replace a populated directory (`ENOTEMPTY`) or a regular file
+//!   (`ENOTDIR`) at all.
 //! - A source another process moved first is a success, not a failure: `serve`
 //!   and a hand-run `export` against one home both migrate, and neither should
 //!   abort because the other won the race.
+//!
+//! An install whose migration genuinely cannot complete — `EXDEV` because the
+//! nest is a mount point, a root-owned or read-only `companies/` — still boots:
+//! `--home ~/.opencompany/companies` resolves every bundle exactly where it
+//! already sits and finds no nest beneath it to migrate. That shape warns about
+//! the split workspace, correctly, and is the documented way to run an install
+//! this migration cannot move.
 //!
 //! Moves are announced on stderr rather than through `warn!`: the default
 //! `EnvFilter` drops warnings unless `RUST_LOG` is set, which would make the
@@ -69,10 +105,59 @@ use crate::error::OpenCompanyError;
 const LEGACY_SQLITE_FILES: &[&str] =
     &["opencompany.db", "opencompany.db-wal", "opencompany.db-shm"];
 
-/// Marker files that prove a directory is a company bundle rather than a nest of
-/// them. Their presence at `<home>/companies/companies` means the operator has a
-/// real company slugged `companies`, which must not be dissolved.
-const BUNDLE_MARKERS: &[&str] = &["company.toml", "meta.json"];
+/// Top-level files only a company bundle has, from the layout
+/// [`Bundle`](crate::store::Bundle) defines. These are the strong half of the
+/// shape test: a company slug is always a *directory*, so no nest of bundles can
+/// hold a `company.toml` or an `events.jsonl` of its own.
+///
+/// A manifest alone is not enough to identify a bundle — most of these files
+/// exist in installs that never materialize one — which is why the whole list is
+/// the marker rather than `company.toml`.
+const BUNDLE_FILES: &[&str] = &[
+    "company.toml",
+    "meta.json",
+    "events.jsonl",
+    "ledger.jsonl",
+    "journal.jsonl",
+    "inbox.jsonl",
+    "inbox-meta.json",
+    "tasks.json",
+    "facts.jsonl",
+    "artifacts.jsonl",
+    "users.json",
+    "user-invites.json",
+    "user-sessions.json",
+    "login-codes.json",
+    "usage.jsonl",
+    "skills.json",
+];
+
+/// Top-level subdirectories a company bundle owns — the four
+/// [`Bundle::ensure_dirs`](crate::store::Bundle::ensure_dirs) creates, plus the
+/// two written on first use. This is the weaker half of the test: a company
+/// *could* be slugged `keys` or `memory`, so a nest holding one of these reads
+/// as a bundle. That bias is deliberate and one-directional — it can only ever
+/// leave data where it is.
+const BUNDLE_DIRS: &[&str] = &[
+    "keys",
+    "secrets",
+    "memory",
+    "context",
+    "workspace",
+    "feedback",
+];
+
+/// Runtime trees written under the *home* rather than under a bundle, so the
+/// dropped `companies` leaf orphans them exactly as it orphaned the database.
+///
+/// `<home>/harness` holds every agent's working files
+/// (`runtime/builder.rs`, `workspace_root`); `<home>/mcp` holds the MCP runtime
+/// registry, whose persisted installs and stored environment values are
+/// reconnected on boot.
+const LEGACY_HOME_DIRS: &[(&str, Relocated)] = &[
+    ("harness", Relocated::HarnessWorkspace),
+    ("mcp", Relocated::McpRegistry),
+];
 
 /// What a migrated path holds, so the operator message names it accurately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +166,11 @@ pub enum Relocated {
     Company,
     /// The local sqlite database or one of its `-wal`/`-shm` siblings.
     Database,
+    /// The harness workspace tree holding every agent's working files.
+    HarnessWorkspace,
+    /// The MCP runtime registry: installed servers and their stored environment
+    /// values.
+    McpRegistry,
 }
 
 /// A same-named entry that already existed at its destination. Both copies are
@@ -119,6 +209,8 @@ impl NestMigration {
             let noun = match what {
                 Relocated::Company => "company bundle",
                 Relocated::Database => "local database file",
+                Relocated::HarnessWorkspace => "harness agent workspace",
+                Relocated::McpRegistry => "MCP server registry",
             };
             lines.push(format!(
                 "moved {noun} up out of the legacy nested layout: {}",
@@ -136,6 +228,15 @@ impl NestMigration {
                     "Two databases hold two separate histories. Keep one by hand \
                      and move or delete the other, including its -wal and -shm \
                      siblings."
+                }
+                Relocated::HarnessWorkspace => {
+                    "Two harness workspaces hold two sets of agent working \
+                     files. Keep one by hand and move or delete the other."
+                }
+                Relocated::McpRegistry => {
+                    "Two MCP registries hold two sets of installed servers and \
+                     the environment values stored with them. Keep one by hand \
+                     and move or delete the other."
                 }
             };
             lines.push(format!(
@@ -170,7 +271,22 @@ pub fn migrate_legacy_nest(home: &Path) -> Result<NestMigration> {
     let mut migration = NestMigration::default();
     migrate_bundles(&companies, &mut migration)?;
     migrate_sqlite(home, &companies, &mut migration)?;
+    migrate_home_dirs(home, &companies, &mut migration)?;
     Ok(migration)
+}
+
+/// Whether `dir` holds anything only a company bundle holds.
+///
+/// The manifest is not the test — see the [module docs](self) for why. Used
+/// twice, and in opposite directions: a bundle-shaped *nest* is a company that
+/// must not be dissolved, and a bundle-shaped *entry* is a company that must be
+/// moved up. Both readings fail safe on a miss, because the only thing an
+/// unrecognised path can do here is stay exactly where it already is.
+fn is_bundle_shaped(dir: &Path) -> bool {
+    BUNDLE_FILES
+        .iter()
+        .chain(BUNDLE_DIRS)
+        .any(|name| exists(&dir.join(name)))
 }
 
 /// Renames every `<companies>/companies/<slug>` up into `<companies>/<slug>`.
@@ -181,11 +297,10 @@ fn migrate_bundles(companies: &Path, migration: &mut NestMigration) -> Result<()
         return Ok(());
     }
     // A real bundle that happens to be slugged `companies`. Dissolving it would
-    // scatter its event log and keys across the companies directory.
-    if BUNDLE_MARKERS
-        .iter()
-        .any(|marker| exists(&nest.join(marker)))
-    {
+    // scatter its event log, task board and signing key across the companies
+    // directory — and a bundle needs no manifest at all to be one, which is what
+    // makes the shape rather than a marker file the test.
+    if is_bundle_shaped(&nest) {
         return Ok(());
     }
 
@@ -193,6 +308,13 @@ fn migrate_bundles(companies: &Path, migration: &mut NestMigration) -> Result<()
     names.sort();
     for name in names {
         let legacy = nest.join(&name);
+        // The second guard. The legacy nest holds nothing but bundles, so an
+        // entry that does not look like one is either a stray or evidence that
+        // this nest is a bundle after all. Either way it is not something this
+        // migration knows where to put, and leaving it costs nothing.
+        if !legacy.is_dir() || !is_bundle_shaped(&legacy) {
+            continue;
+        }
         let destination = companies.join(&name);
         if exists(&destination) {
             migration.collisions.push(Collision {
@@ -254,17 +376,65 @@ fn migrate_sqlite(home: &Path, companies: &Path, migration: &mut NestMigration) 
     // are checked and they find their destinations free. The one shape that
     // cannot be told apart — a legacy `-wal` with no legacy `.db`, beside an
     // unrelated canonical database — is not one sqlite produces.
-    if let Some((legacy, destination)) = moves.iter().find(|(_, dest)| exists(dest)) {
-        migration.collisions.push(Collision {
-            what: Relocated::Database,
-            legacy: legacy.clone(),
-            destination: destination.clone(),
-        });
-        return Ok(());
+    //
+    // A destination that is the *same file* as its source is not this case
+    // either: it is the link half of a move that died before unlinking the
+    // source, and reporting that as two databases would send the operator to
+    // resolve a collision between a file and itself.
+    for (legacy, destination) in &moves {
+        if exists(destination) && !same_file(legacy, destination)? {
+            migration.collisions.push(Collision {
+                what: Relocated::Database,
+                legacy: legacy.clone(),
+                destination: destination.clone(),
+            });
+            return Ok(());
+        }
     }
     for (legacy, destination) in moves {
+        let outcome = move_file_no_replace(&legacy, &destination)?;
+        match outcome {
+            Moved::Here => migration.moved.push((Relocated::Database, destination)),
+            Moved::Already => {}
+            // The scan above found this destination free and something claimed
+            // it in between. Stop the set rather than move the rest around it:
+            // whatever is there now is live, and the next boot resumes.
+            Moved::Occupied => {
+                migration.collisions.push(Collision {
+                    what: Relocated::Database,
+                    legacy,
+                    destination,
+                });
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Moves the runtime trees that hang off the *home* rather than off a bundle —
+/// the harness workspace and the MCP registry — up beside the workspace.
+///
+/// Guarded by the same shape test as the nest: `<home>/companies/harness` is
+/// both where the legacy harness tree sat and where a company slugged `harness`
+/// has its canonical bundle, and only one of the two is bundle-shaped.
+fn migrate_home_dirs(home: &Path, companies: &Path, migration: &mut NestMigration) -> Result<()> {
+    for (name, what) in LEGACY_HOME_DIRS {
+        let legacy = companies.join(name);
+        if !legacy.is_dir() || is_bundle_shaped(&legacy) {
+            continue;
+        }
+        let destination = home.join(name);
+        if exists(&destination) {
+            migration.collisions.push(Collision {
+                what: *what,
+                legacy,
+                destination,
+            });
+            continue;
+        }
         if rename_or_already_moved(&legacy, &destination)? {
-            migration.moved.push((Relocated::Database, destination));
+            migration.moved.push((*what, destination));
         }
     }
     Ok(())
@@ -339,6 +509,98 @@ fn rename_or_already_moved(from: &Path, to: &Path) -> Result<bool> {
     }
 }
 
+/// What one file move did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Moved {
+    /// This call performed the move.
+    Here,
+    /// The file was already at its destination — a previous run, or another
+    /// process, got there first. Nothing left to do and nothing to report.
+    Already,
+    /// Something else occupies the destination. Nothing was touched.
+    Occupied,
+}
+
+/// Moves a regular file, never replacing whatever is at the destination.
+///
+/// [`std::fs::rename`] replaces a regular file silently, and a separate "is the
+/// destination free?" check cannot close that: the answer is stale the moment it
+/// is read. The window is narrow and the loss is total — a `serve` that has
+/// already migrated and opened the database is writing a live
+/// `opencompany.db-wal` at the destination, and a rename over it drops every
+/// committed transaction that log still holds.
+///
+/// [`std::fs::hard_link`] fails when the destination exists, so the check and
+/// the move are one indivisible step and no interleaving can produce a
+/// replacement. The source is unlinked once the link is in place; a crash
+/// between the two leaves one file reachable under both names, which the next
+/// run recognises by device and inode and finishes rather than reporting as two
+/// databases.
+///
+/// Directories keep [`rename_or_already_moved`]: `rename` cannot replace a
+/// populated directory (`ENOTEMPTY`) or a regular file (`ENOTDIR`), so the only
+/// thing it can overwrite there is an empty directory, which holds nothing.
+fn move_file_no_replace(from: &Path, to: &Path) -> Result<Moved> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            remove_file(from)?;
+            Ok(Moved::Here)
+        }
+        // Another process moved this file between the scan and here.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && exists(to) => {
+            Ok(Moved::Already)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            if same_file(from, to)? {
+                // Our own link, from a run that died before the unlink.
+                remove_file(from)?;
+                return Ok(Moved::Already);
+            }
+            Ok(Moved::Occupied)
+        }
+        Err(source) => Err(OpenCompanyError::StoreIo {
+            path: from.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Whether two paths name one file — two links to a single inode rather than two
+/// copies.
+///
+/// Always `false` off unix, where a crash between `link` and `unlink` degrades
+/// to a reported collision the operator resolves by hand instead of resolving
+/// itself. Both paths must exist; every caller has just established that.
+fn same_file(a: &Path, b: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let left = std::fs::symlink_metadata(a).map_err(|source| OpenCompanyError::StoreIo {
+            path: a.to_path_buf(),
+            source,
+        })?;
+        let right = std::fs::symlink_metadata(b).map_err(|source| OpenCompanyError::StoreIo {
+            path: b.to_path_buf(),
+            source,
+        })?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        Ok(false)
+    }
+}
+
+/// Removes a file, naming it in the error.
+fn remove_file(path: &Path) -> Result<()> {
+    std::fs::remove_file(path).map_err(|source| OpenCompanyError::StoreIo {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -368,6 +630,26 @@ mod test {
             let dir = self.0.join(relative);
             std::fs::create_dir_all(&dir).expect("bundle dir");
             std::fs::write(dir.join("company.toml"), "[company]\n").expect("manifest");
+            dir
+        }
+
+        /// A bundle the way `Bundle::ensure_dirs` creates one: subdirectories
+        /// only, no `company.toml` and no `meta.json`. ~20 call sites produce
+        /// exactly this, and a sqlite or mongodb install never materializes a
+        /// manifest on the filesystem at all.
+        fn marker_less_bundle(&self, relative: &str) -> PathBuf {
+            let dir = self.0.join(relative);
+            for sub in ["memory", "context/blobs", "secrets", "keys"] {
+                std::fs::create_dir_all(dir.join(sub)).expect("bundle subdir");
+            }
+            std::fs::write(dir.join("keys/agent.ed25519"), "seed").expect("identity seed");
+            dir
+        }
+
+        /// A bare directory with nothing in it.
+        fn dir(&self, relative: &str) -> PathBuf {
+            let dir = self.0.join(relative);
+            std::fs::create_dir_all(&dir).expect("dir");
             dir
         }
 
@@ -521,6 +803,193 @@ mod test {
 
         assert!(migration.is_empty());
         assert!(home.path().join("companies/companies/meta.json").exists());
+    }
+
+    #[test]
+    fn a_marker_less_bundle_slugged_companies_is_not_dissolved() {
+        // The shape every `Bundle::ensure_dirs` call site produces, and the only
+        // shape a sqlite or mongodb install ever has on the filesystem: no
+        // manifest, no `meta.json`, and a signing key that cannot be re-derived.
+        // Reading it as a nest would rename `keys/`, `secrets/` and
+        // `tasks.json` up into `<home>/companies/` and orphan the identity —
+        // which is precisely the hosted case, since hosted is the non-fs store.
+        let home = TempHome::new("marker-less-slug");
+        home.marker_less_bundle("companies/companies");
+        home.write("companies/companies/tasks.json", "[]");
+
+        let migration = migrate_legacy_nest(home.path()).expect("leaves the bundle alone");
+
+        assert!(migration.is_empty(), "{migration:?}");
+        assert!(
+            home.path()
+                .join("companies/companies/keys/agent.ed25519")
+                .exists()
+        );
+        assert!(home.path().join("companies/companies/tasks.json").exists());
+        // Nothing was scattered up into the companies directory.
+        assert!(!home.path().join("companies/keys").exists());
+        assert!(!home.path().join("companies/secrets").exists());
+        assert!(!home.path().join("companies/tasks.json").exists());
+    }
+
+    #[test]
+    fn a_marker_less_nested_bundle_still_moves() {
+        // The widened guard must not cost the migration its purpose: a bundle
+        // with no manifest is exactly what a sqlite install has, and it is
+        // still nested one level too deep.
+        let home = TempHome::new("marker-less-nest");
+        home.marker_less_bundle("companies/companies/acme");
+
+        let migration = migrate_legacy_nest(home.path()).expect("migrates");
+
+        assert_eq!(migration.moved.len(), 1, "{migration:?}");
+        assert!(
+            home.path()
+                .join("companies/acme/keys/agent.ed25519")
+                .exists()
+        );
+        assert!(!home.path().join("companies/companies").exists());
+    }
+
+    #[test]
+    fn an_unrecognised_nest_entry_is_left_where_it_is() {
+        // Only bundle-shaped directories move. Anything else is either a stray
+        // or evidence the nest is a bundle after all, and either way this
+        // migration has nowhere to put it.
+        let home = TempHome::new("stray");
+        home.bundle("companies/companies/acme");
+        home.write("companies/companies/notes.txt", "stray\n");
+        home.dir("companies/companies/empty");
+
+        let migration = migrate_legacy_nest(home.path()).expect("migrates");
+
+        assert_eq!(migration.moved.len(), 1, "{migration:?}");
+        assert!(home.path().join("companies/acme/company.toml").exists());
+        assert!(home.path().join("companies/companies/notes.txt").exists());
+        assert!(!home.path().join("companies/notes.txt").exists());
+        // The nest survives because it is not empty — and the next boot, having
+        // nothing left it recognises, says nothing at all.
+        assert!(home.path().join("companies/companies").is_dir());
+        assert!(migrate_legacy_nest(home.path()).expect("rerun").is_empty());
+    }
+
+    #[test]
+    fn the_harness_and_mcp_trees_move_up_with_the_bundles() {
+        // Both hang off the resolved home rather than off a bundle, so the same
+        // one-level shift that orphaned the database orphans every agent's
+        // working files and the operator's installed MCP servers — including
+        // the environment values stored with them.
+        let home = TempHome::new("home-dirs");
+        home.bundle("companies/companies/acme");
+        home.write("companies/harness/acme/ceo/workspace/notes.md", "draft\n");
+        home.write("companies/mcp/registry.db", "installs");
+
+        let migration = migrate_legacy_nest(home.path()).expect("migrates");
+
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("harness/acme/ceo/workspace/notes.md"))
+                .unwrap(),
+            "draft\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("mcp/registry.db")).unwrap(),
+            "installs"
+        );
+        assert!(!home.path().join("companies/harness").exists());
+        assert!(!home.path().join("companies/mcp").exists());
+        let moved: Vec<Relocated> = migration.moved.iter().map(|(what, _)| *what).collect();
+        assert!(
+            moved.contains(&Relocated::HarnessWorkspace),
+            "{migration:?}"
+        );
+        assert!(moved.contains(&Relocated::McpRegistry), "{migration:?}");
+        // The report names them for what they are, not as company bundles.
+        let report = migration.report().join("\n");
+        assert!(report.contains("harness agent workspace"), "{report}");
+        assert!(report.contains("MCP server registry"), "{report}");
+    }
+
+    #[test]
+    fn a_company_slugged_like_the_harness_tree_is_never_moved_as_one() {
+        // `<home>/companies/harness` is both where the legacy harness tree sat
+        // and where a company slugged `harness` has its canonical bundle. Only
+        // one of the two is bundle-shaped.
+        let home = TempHome::new("harness-company");
+        home.marker_less_bundle("companies/harness");
+
+        let migration = migrate_legacy_nest(home.path()).expect("leaves the bundle alone");
+
+        assert!(migration.is_empty(), "{migration:?}");
+        assert!(
+            home.path()
+                .join("companies/harness/keys/agent.ed25519")
+                .exists()
+        );
+        assert!(
+            !home.path().join("harness").exists(),
+            "the bundle must not be relocated as a runtime tree"
+        );
+    }
+
+    #[test]
+    fn an_mcp_registry_at_the_destination_is_left_for_the_operator() {
+        // Two registries hold two sets of installed servers. Merging them is
+        // not a decision this migration can make.
+        let home = TempHome::new("mcp-collision");
+        home.write("companies/mcp/registry.db", "legacy");
+        home.write("mcp/registry.db", "canonical");
+
+        let migration = migrate_legacy_nest(home.path()).expect("migrates");
+
+        assert!(migration.moved.is_empty(), "{migration:?}");
+        assert_eq!(migration.collisions.len(), 1);
+        assert_eq!(migration.collisions[0].what, Relocated::McpRegistry);
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("mcp/registry.db")).unwrap(),
+            "canonical"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("companies/mcp/registry.db")).unwrap(),
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn a_file_move_never_replaces_the_destination() {
+        // The property the whole database set rests on. `rename` would have
+        // replaced the destination silently, and no check taken beforehand can
+        // close that window — only a move that cannot replace anything can.
+        let home = TempHome::new("no-replace");
+        let from = home.write("companies/opencompany.db", "legacy");
+        let to = home.write("opencompany.db", "live");
+
+        assert_eq!(
+            move_file_no_replace(&from, &to).expect("reports rather than replaces"),
+            Moved::Occupied
+        );
+
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "live");
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "legacy");
+    }
+
+    #[test]
+    fn a_half_linked_database_is_finished_rather_than_reported() {
+        // The crash window inside a no-replace move: the link is in place and
+        // the source is not yet unlinked, so one file is reachable under both
+        // names. Reading that as two databases would send the operator to
+        // resolve a collision between a file and itself.
+        let home = TempHome::new("half-linked");
+        let legacy = home.write("companies/opencompany.db", "one database");
+        std::fs::hard_link(&legacy, home.path().join("opencompany.db")).expect("half a move");
+
+        let migration = migrate_legacy_nest(home.path()).expect("finishes the move");
+
+        assert!(migration.collisions.is_empty(), "{migration:?}");
+        assert!(!legacy.exists(), "the source link is unlinked");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("opencompany.db")).unwrap(),
+            "one database"
+        );
     }
 
     #[test]

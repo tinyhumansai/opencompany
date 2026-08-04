@@ -1101,6 +1101,73 @@ mod test {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn no_command_resolves_a_home_without_migrating_it() {
+        // The test above pins the helper; this pins that the helper is the only
+        // door. A command that called `store::resolve_home` directly would read
+        // an un-migrated install and find no companies — and no runtime test
+        // would catch it, because the defect is a call that never happens. The
+        // needle is split so this assertion does not match its own source line.
+        let needle = concat!("store::", "resolve_home(");
+        let source = include_str!("opencompany.rs");
+        let production = source.split("\nmod test {").next().unwrap_or(source);
+
+        let direct: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(needle))
+            .collect();
+
+        assert_eq!(
+            direct.len(),
+            1,
+            "`resolve_home` belongs to `resolve_home_migrated` alone; found {direct:?}"
+        );
+        let (before_helper, _) = production
+            .split_once("fn resolve_home_migrated")
+            .expect("the helper is declared");
+        assert!(
+            !before_helper.contains(needle),
+            "the one call must be the one inside `resolve_home_migrated`"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_and_import_migrate_before_they_read() {
+        // Both commands run against an install whose first post-upgrade command
+        // may well be one of them, so neither may be the one that finds no
+        // bundles. Their results are irrelevant here — the migration happens
+        // before either touches a path, which is the whole point.
+        for command in ["export", "import"] {
+            let home = std::env::temp_dir().join(format!(
+                "oc-bin-{command}-migrate-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            let nested = home.join("companies/companies/acme");
+            std::fs::create_dir_all(&nested).expect("legacy bundle");
+            std::fs::write(nested.join("company.toml"), "[company]\n").expect("manifest");
+
+            match command {
+                "export" => {
+                    let out = home.join("out");
+                    let _ =
+                        run_export("acme".to_string(), Some(out), false, Some(home.clone())).await;
+                }
+                _ => {
+                    let _ = import_from_dir(&home.join("nothing-here"), Some(home.clone())).await;
+                }
+            }
+
+            assert!(
+                home.join("companies/acme/company.toml").exists(),
+                "`{command}` resolved a home without migrating it"
+            );
+            assert!(!home.join("companies/companies").exists());
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
     #[tokio::test]
     async fn register_company_loads_manifest_and_registers() {
         let home = std::env::temp_dir().join(format!("oc-bin-{}", std::process::id()));

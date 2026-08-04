@@ -79,9 +79,11 @@ pub use fs::{
 };
 pub use fs_ops::FsOps;
 pub use layout::DataLayout;
-pub use migrate::{
-    Collision, NestMigration, Relocated, migrate_legacy_nest, migrate_legacy_nest_announced,
-};
+// Only the boot entry point is re-exported here. The migration is a one-shot
+// step the binary runs before it reads anything, and its silent core and result
+// types are its own business — reachable at `store::migrate::*` for anyone
+// reading the rules, not part of the store's own surface.
+pub use migrate::migrate_legacy_nest_announced;
 pub use paths::{Bundle, DATA_DIR_ENV, home_divergence_warning, resolve_home};
 pub use select::{
     MemoryBackend, MemoryOverlay, StorageHandles, StorageKind, StorageSettings,
