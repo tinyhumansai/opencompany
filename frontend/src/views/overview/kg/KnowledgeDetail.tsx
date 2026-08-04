@@ -143,10 +143,10 @@ export function DeptOverviewCard({
  * instance, reports-to, sub-agents), the tools it holds, and its last run.
  */
 export function AgentHarnessCard({
-  agent, task, parentName, parentAgentId, subAgents, lastRun, runLabel,
+  agent, task, parentName, parentAgentId, subAgents, lastRun, runLabel, tools,
   onBack, onClose, onTool, onAgent, onTask,
 }: {
-  agent: { name: string; role: string; model: string; tier: string; instance: string; description: string; tools: string[] };
+  agent: { name: string; role: string; model: string; tier: string; instance: string; description: string };
   task: SopTask | null;
   parentName: string | null;
   parentAgentId: string | null;
@@ -154,6 +154,13 @@ export function AgentHarnessCard({
   lastRun: { ok: boolean; summary: string } | null;
   /** relative time of the last run, precomputed by the caller */
   runLabel?: string | null;
+  /**
+   * The agent's tools, already resolved to a display name — the caller
+   * carries `toolLabels`, so a name is resolved once and shared with every
+   * card (`SopTaskDetailCard`, `GraphHumanDetailCard`) rather than each one
+   * re-deriving its own label from the slug.
+   */
+  tools: { slug: string; name: string; mcp: boolean }[];
   onBack?: () => void;
   onClose?: () => void;
   onTool?: (slug: string) => void;
@@ -215,16 +222,12 @@ export function AgentHarnessCard({
           )}
         </div>
 
-        <SectionLabel icon={Wrench}>tools ({agent.tools.length})</SectionLabel>
+        <SectionLabel icon={Wrench}>tools ({tools.length})</SectionLabel>
         <div className="mb-4 flex flex-wrap gap-x-3 gap-y-1.5">
-          {agent.tools.map((slug) => (
-            <WikiLink
-              key={slug}
-              label={slug.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
-              onClick={onTool ? () => onTool(slug) : undefined}
-            />
+          {tools.map((t) => (
+            <WikiLink key={t.slug} label={t.name} mcp={t.mcp} onClick={onTool ? () => onTool(t.slug) : undefined} />
           ))}
-          {agent.tools.length === 0 && <span className="font-mono text-[10.5px] text-os-dim">no tools wired</span>}
+          {tools.length === 0 && <span className="font-mono text-[10.5px] text-os-dim">no tools wired</span>}
         </div>
 
         <SectionLabel icon={FileText}>last run</SectionLabel>

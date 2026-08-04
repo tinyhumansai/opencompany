@@ -1321,7 +1321,7 @@ export function KnowledgeGraph({
         })()}
       </>
     ),
-    [],
+    [focusTree],
   );
 
   // ── selection / panel data ────────────────────────────────────────────────
@@ -1566,6 +1566,7 @@ export function KnowledgeGraph({
       subAgents={selectedAgentSubs}
       lastRun={selectedAgentRun}
       runLabel={selectedAgentRun ? agoLabel(selectedAgentRun.finishedAt) : null}
+      tools={toolChips(selectedAgentId)}
       onClose={() => setSelectedAgentId(null)}
       onTool={selectToolSlug}
       onAgent={(id) => selectAgent(`emp:${id}`)}
