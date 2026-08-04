@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
+import { listPeople, type Person } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
 import { listSkills, type Skill } from "@/api/skills";
 import { listTasks, type Task } from "@/api/tasks";
@@ -25,12 +26,20 @@ interface Props {
 interface Sources {
   tasks: Task[];
   team: TeamMember[];
+  people: Person[];
   skills: Skill[];
   servers: McpServer[];
   toolsByServer: Record<string, McpTool[]>;
 }
 
-const EMPTY: Sources = { tasks: [], team: starterTeam(), skills: [], servers: [], toolsByServer: {} };
+const EMPTY: Sources = {
+  tasks: [],
+  team: starterTeam(),
+  people: [],
+  skills: [],
+  servers: [],
+  toolsByServer: {},
+};
 
 /**
  * The command centre: the company's knowledge graph, and nothing else.
@@ -56,9 +65,12 @@ export function Overview({ client, company }: Props) {
   useEffect(() => {
     let live = true;
     void (async () => {
-      const [tasks, roster, skills, mcp] = await Promise.all([
+      const [tasks, roster, people, skills, mcp] = await Promise.all([
         listTasks(client, company).catch(() => [] as Task[]),
         client.listTeam(company).catch(() => null),
+        // Only an admin may list people; a member just gets no humans on the
+        // graph, which is the right amount of information for them to have.
+        listPeople(client, company).catch(() => [] as Person[]),
         listSkills(client, company).catch(() => [] as Skill[]),
         client.listMcpServers(company).catch(() => ({ servers: [] as McpServer[] })),
       ]);
@@ -80,6 +92,7 @@ export function Overview({ client, company }: Props) {
       setSources({
         tasks,
         team: roster?.length ? roster.map(fromDto) : starterTeam(),
+        people,
         skills,
         servers: mcp.servers,
         toolsByServer: Object.fromEntries(toolLists),
@@ -95,6 +108,7 @@ export function Overview({ client, company }: Props) {
       adapt({
         members: sources.team,
         tasks: sources.tasks,
+        people: sources.people,
         skills: sources.skills,
         servers: sources.servers,
         toolsByServer: sources.toolsByServer,
@@ -104,7 +118,14 @@ export function Overview({ client, company }: Props) {
   );
 
   const graph = useMemo(
-    () => buildKnowledgeGraph(adapted.agents, adapted.departments, [], adapted.tasks),
+    () =>
+      buildKnowledgeGraph(
+        adapted.agents,
+        adapted.departments,
+        adapted.people,
+        adapted.tasks,
+        adapted.workflows,
+      ),
     [adapted],
   );
 

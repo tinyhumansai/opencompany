@@ -52,15 +52,28 @@ function member(name: string, role: string, description: string): TeamMember {
   return { id: id(), name, role, description, tone: toneFor(name) };
 }
 
-/** A generic starter team that fits any company; the operator edits from here. */
+/**
+ * A generic starter team that fits any company; the operator edits from here.
+ *
+ * It spans the functional areas a small company actually splits into — product,
+ * engineering, design, growth, operations — rather than a handful of generic
+ * roles, so a company that has not defined its own roster still reads as an org
+ * rather than a list.
+ */
 export function starterTeam(): TeamMember[] {
   return [
     member("Ops Lead", "Operations Lead", "Keeps work moving and unblocks the team."),
-    member("Researcher", "Researcher", "Gathers facts, sources, and context."),
-    member("Writer", "Writer", "Drafts copy, docs, and outbound messages."),
-    member("Designer", "Designer", "Creates visuals and holds the brand."),
-    member("Analyst", "Analyst", "Measures performance and reports back."),
     member("Front Desk", "Front Desk", "Scheduling, inbox, and everyday errands."),
+    member("Product Lead", "Product Manager", "Decides what gets built, and in what order."),
+    member("Researcher", "User Researcher", "Gathers facts, sources, and context."),
+    member("Analyst", "Data Analyst", "Measures performance and reports back."),
+    member("Engineer", "Software Engineer", "Builds and ships the product."),
+    member("Reviewer", "QA Engineer", "Tests changes before they reach anyone."),
+    member("Ops Engineer", "DevOps Engineer", "Runs the infrastructure and keeps it up."),
+    member("Designer", "Product Designer", "Creates visuals and holds the brand."),
+    member("Writer", "Content Writer", "Drafts copy, docs, and outbound messages."),
+    member("Marketer", "Growth Marketer", "Finds the audience and brings them in."),
+    member("Support", "Support Specialist", "Answers customers and closes the loop."),
   ];
 }
 

@@ -1,4 +1,4 @@
-import type { Agent, Department, Person, SopTask } from './schemas';
+import type { Agent, Department, Person, SopTask, Workflow } from './schemas';
 
 /**
  * The operating-knowledge graph that powers the /brain force graph — Alex's
@@ -11,7 +11,7 @@ import type { Agent, Department, Person, SopTask } from './schemas';
  * icons live in the component, colors are carried on the nodes that have a
  * brand one.
  */
-export type KGNodeKind = 'self' | 'team' | 'task' | 'employee' | 'person' | 'tool';
+export type KGNodeKind = 'self' | 'team' | 'workflow' | 'task' | 'step' | 'employee' | 'person' | 'tool';
 
 export type KGNode = {
   id: string;
@@ -21,7 +21,7 @@ export type KGNode = {
   color?: string; // life-area tint (teams)
 };
 
-export type KGEdgeKind = 'pillar' | 'sop' | 'does' | 'member' | 'uses' | 'reports';
+export type KGEdgeKind = 'pillar' | 'flow' | 'stage' | 'next' | 'runs' | 'sop' | 'does' | 'member' | 'uses' | 'reports';
 
 export type KGEdge = {
   source: string;
@@ -31,7 +31,12 @@ export type KGEdge = {
 
 export type KnowledgeGraph = { nodes: KGNode[]; edges: KGEdge[] };
 
-const RING: Record<KGNodeKind, number> = { self: 0, team: 1, task: 2, employee: 3, person: 3, tool: 4 };
+// Workflows share ring 2 with SOP tasks — both are work a department runs — and
+// a flow's stages share ring 3 with the workers, because a stage is where the
+// flow meets the worker who performs it.
+const RING: Record<KGNodeKind, number> = {
+  self: 0, team: 1, workflow: 2, task: 2, step: 3, employee: 3, person: 3, tool: 4,
+};
 
 export const SELF_ID = 'self';
 
@@ -87,6 +92,7 @@ export function buildKnowledgeGraph(
   departments: Department[],
   people: Person[] = [],
   tasks: SopTask[] = [],
+  workflows: Workflow[] = [],
 ): KnowledgeGraph {
   const nodes: KGNode[] = [];
   const edges: KGEdge[] = [];
@@ -116,6 +122,33 @@ export function buildKnowledgeGraph(
     const worker = workerNodeId(t.assigneeKind, t.assigneeId);
     edges.push({ source: `task:${t.id}`, target: worker, kind: 'does' });
     assignedWorkers.add(worker);
+  }
+
+  // Workflows (ring 2) — the multi-step routines a department runs. Unlike an
+  // SOP task, a flow passes through several workers, so it draws one `runs`
+  // edge per agent it touches.
+  const agentDeptIds = new Set(agents.map((a) => a.id));
+  for (const f of workflows) {
+    if (!usedDepts.has(f.departmentId)) continue;
+    nodes.push({ id: `flow:${f.id}`, kind: 'workflow', label: f.name, ring: RING.workflow });
+    edges.push({ source: `team:${f.departmentId}`, target: `flow:${f.id}`, kind: 'flow' });
+
+    // Each stage is its own node, chained to the next so the flow reads as a
+    // sequence rather than a bag, and handed to the agent who performs it.
+    const runners = f.agentIds.filter((id) => agentDeptIds.has(id));
+    let prevStep: string | null = null;
+    f.stages.forEach((stage, i) => {
+      const stepId = `step:${f.id}:${i}`;
+      nodes.push({ id: stepId, kind: 'step', label: stage, ring: RING.step });
+      edges.push({ source: `flow:${f.id}`, target: stepId, kind: 'stage' });
+      if (prevStep) edges.push({ source: prevStep, target: stepId, kind: 'next' });
+      prevStep = stepId;
+      // Stages are dealt round-robin across the department's agents: the flow
+      // knows its order, not who owns which step.
+      if (runners.length) {
+        edges.push({ source: stepId, target: `emp:${runners[i % runners.length]}`, kind: 'runs' });
+      }
+    });
   }
 
   const agentIds = new Set(agents.map((a) => a.id));

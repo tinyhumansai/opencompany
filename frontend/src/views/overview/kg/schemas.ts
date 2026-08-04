@@ -39,6 +39,18 @@ export interface Person {
   tools: string[];
 }
 
+export interface Workflow {
+  id: string;
+  departmentId: string;
+  name: string;
+  /** One line on what the flow does. */
+  summary: string;
+  /** The stage names, in order — the flow written out. */
+  stages: string[];
+  /** Agent ids the flow runs through. */
+  agentIds: string[];
+}
+
 export type SopAssigneeKind = "agent" | "person";
 
 export interface SopTask {

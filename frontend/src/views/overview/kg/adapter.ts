@@ -12,6 +12,8 @@
 // | server → tool       | what the server advertises    | yes   |
 // | teammate → department | nothing                     | **derived** |
 // | worker → tools      | nothing (`[tools] allow` is company-wide) | **derived** |
+// | human → department  | nothing (sign-in tells us who, not what) | **derived** |
+// | department → workflow | nothing (no flow API yet)   | **derived** |
 //
 // The two derived edges are placeholders: a company manifest has no department
 // field and no per-agent tool list, so this module invents a plausible
@@ -21,6 +23,7 @@
 // `[[agent]]` grows `department` and `tools`, delete `assignDepartment` and
 // `assignTools` and read them straight through.
 
+import type { Person as HostPerson } from "@/api/auth";
 import type { Skill } from "@/api/skills";
 import type { Task } from "@/api/tasks";
 import type { McpServer, McpTool } from "@/lib/mcp";
@@ -29,11 +32,11 @@ import type { TeamMember } from "@/lib/team";
 import { TASK_COLUMNS } from "@/lib/tasks-sample";
 import type { BrainGraphEdge, BrainGraphNode, MemoryGraph } from "./memory-core";
 import { distillMemoryGraph } from "./memory-core";
-import type { Agent, Department, SopTask } from "./schemas";
+import type { Agent, Department, Person, SopTask, Workflow } from "./schemas";
 
 /** Shown wherever the derived structure is on screen. */
 export const DERIVED_NOTICE =
-  "Departments and tool assignments are placeholders — this company doesn't declare them.";
+  "Departments, workflows, and tool assignments are placeholders — this company doesn't declare them.";
 
 /**
  * The department set. Keyed by the functional areas a small company actually
@@ -48,12 +51,18 @@ const DEPARTMENTS: Department[] = [
   { id: "dept-ops", name: "Operations", slug: "ops", tagline: "Keeping the machine running", color: "#eda100", order: 4 },
 ];
 
-/** Role keywords that place a teammate in a department, checked in order. */
+/**
+ * Role keywords that place a teammate in a department, checked in order.
+ *
+ * Order matters where a title names two areas: "Product Designer" is a
+ * designer, so Design is tested before Product, and Product's own words are
+ * the ones no other area claims.
+ */
 const ROLE_HINTS: { department: string; words: string[] }[] = [
-  { department: "dept-product", words: ["product", "pm", "strategy", "research", "analyst", "roadmap"] },
-  { department: "dept-engineering", words: ["engineer", "developer", "backend", "frontend", "qa", "data", "devops", "security"] },
   { department: "dept-design", words: ["design", "ux", "ui", "brand", "creative"] },
-  { department: "dept-growth", words: ["growth", "market", "sales", "writer", "content", "social"] },
+  { department: "dept-engineering", words: ["engineer", "developer", "backend", "frontend", "qa", "devops", "security", "infrastructure"] },
+  { department: "dept-growth", words: ["growth", "market", "sales", "writer", "content", "social", "campaign"] },
+  { department: "dept-product", words: ["product", "pm", "strategy", "research", "analyst", "data", "roadmap"] },
   { department: "dept-ops", words: ["ops", "operation", "support", "finance", "legal", "front desk", "admin"] },
 ];
 
@@ -89,12 +98,75 @@ export function assignTools(index: number, tools: string[]): string[] {
   );
 }
 
+/**
+ * One standing routine per department.
+ *
+ * **Derived.** The console has no flow API — the Workflows canvas draws a
+ * single hard-coded sample — so these are plausible routines for each area
+ * rather than anything the company declared. They exist to show the shape a
+ * real flow will take on the graph: a department runs a flow, and the flow
+ * passes through several of that department's agents in turn.
+ */
+const WORKFLOW_TEMPLATES: Omit<Workflow, "agentIds">[] = [
+  {
+    id: "flow-discovery",
+    departmentId: "dept-product",
+    name: "Discovery loop",
+    summary: "Turn a raw request into a specced, prioritised piece of work.",
+    stages: ["Intake", "Research", "Spec", "Prioritise"],
+  },
+  {
+    id: "flow-delivery",
+    departmentId: "dept-engineering",
+    name: "Ship it",
+    summary: "Take a spec through build, review, and release.",
+    stages: ["Plan", "Build", "Review", "Release"],
+  },
+  {
+    id: "flow-brand",
+    departmentId: "dept-design",
+    name: "Make it look right",
+    summary: "Draft, critique, and hand off the visuals for a piece of work.",
+    stages: ["Brief", "Draft", "Critique", "Hand off"],
+  },
+  {
+    id: "flow-campaign",
+    departmentId: "dept-growth",
+    name: "Campaign run",
+    summary: "Angle to published post, with the numbers read back after.",
+    stages: ["Angle", "Write", "Publish", "Measure"],
+  },
+  {
+    id: "flow-triage",
+    departmentId: "dept-ops",
+    name: "Inbound triage",
+    summary: "Sort what arrives, answer it, and escalate what needs a person.",
+    stages: ["Receive", "Sort", "Answer", "Escalate"],
+  },
+];
+
+/**
+ * Which department a human belongs to.
+ *
+ * **Derived.** Signing in tells the console who someone is, not what they work
+ * on. Admins sit with Operations — administering the company *is* operations —
+ * and everyone else is spread deterministically across the departments that
+ * exist, so humans read as part of the org rather than piled on one pillar.
+ */
+export function assignHumanDepartment(person: HostPerson, departments: Department[]): string {
+  if (person.role === "admin") return "dept-ops";
+  if (departments.length === 0) return "dept-ops";
+  return departments[hash(person.email) % departments.length].id;
+}
+
 export interface AdaptInput {
   members: TeamMember[];
   tasks: Task[];
   skills: Skill[];
   servers: McpServer[];
   toolsByServer: Record<string, McpTool[]>;
+  /** The humans who can sign in to this company. */
+  people: HostPerson[];
   /** Matches a board card to a roster member; the one real assignment edge. */
   ownedBy: (task: Task, member: TeamMember) => boolean;
 }
@@ -102,6 +174,8 @@ export interface AdaptInput {
 export interface Adapted {
   departments: Department[];
   agents: Agent[];
+  people: Person[];
+  workflows: Workflow[];
   tasks: SopTask[];
   /** Tool slug → display label, for the detail cards. */
   toolLabels: Record<string, string>;
@@ -163,12 +237,30 @@ export function adapt(input: AdaptInput): Adapted {
 
   // Only departments that ended up with somebody in them.
   const used = new Set(agents.map((a) => a.departmentId));
-  return {
-    departments: DEPARTMENTS.filter((d) => used.has(d.id)),
-    agents,
-    tasks,
-    toolLabels,
-  };
+  const departments = DEPARTMENTS.filter((d) => used.has(d.id));
+
+  const people: Person[] = input.people.map((p) => ({
+    id: p.id,
+    departmentId: assignHumanDepartment(p, departments),
+    // Falling back to the local part of the address keeps a real name off the
+    // graph only when nobody has set one.
+    name: p.displayName?.trim() || p.email.split("@")[0],
+    role: p.role === "admin" ? "Admin" : "Member",
+    // Humans get no derived tool shelf: an operator's tools are their browser,
+    // and inventing an MCP loadout for a person would read as a claim.
+    tools: [],
+  }));
+
+  // A flow only makes sense where its department has agents to run it; each is
+  // wired through that department's agents in roster order.
+  const workflows: Workflow[] = WORKFLOW_TEMPLATES.filter((f) => used.has(f.departmentId)).map(
+    (f) => ({
+      ...f,
+      agentIds: agents.filter((a) => a.departmentId === f.departmentId).map((a) => a.id),
+    }),
+  );
+
+  return { departments, agents, people, workflows, tasks, toolLabels };
 }
 
 /**

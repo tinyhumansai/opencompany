@@ -11,7 +11,7 @@ import {
   forceY,
   type Simulation,
 } from 'd3-force';
-import { ClipboardList, Sparkles, User, UserRound, Users, Wrench, type LucideIcon } from 'lucide-react';
+import { ClipboardList, Milestone, Sparkles, User, UserRound, Users, Workflow as WorkflowIcon, Wrench, type LucideIcon } from 'lucide-react';
 import { orderGraphDepartments, SELF_ID, toolSlugOf, type KGNode, type KGNodeKind, type KnowledgeGraph as KGData } from './model';
 import { branchPath, branchWidth, cyclicDeltaF, edgeArc, focusWheel, radialRestLayout, responsiveRingR, rotateAbout, shortestAngleDelta, treeLayout, wheelPoint, wheelStageGeom, wheelStageSpot, type RestLayoutResult, type TreeLayoutResult, type TreeNodePos } from './tree-layout';
 import { rafThrottle } from './raf-throttle';
@@ -46,6 +46,8 @@ const RIM_DELTA_DEG = (WHEEL_GEOM.delta * 180) / Math.PI;
 const CAT: Record<KGNodeKind, { color: string; Icon: LucideIcon; label: string; r: number }> = {
   self: { color: 'var(--text)', Icon: Sparkles, label: 'Notes', r: 18 },
   team: { color: 'var(--brain-1)', Icon: Users, label: 'Pillars', r: 15 },
+  workflow: { color: 'var(--brain-2)', Icon: WorkflowIcon, label: 'Workflows', r: 8.5 },
+  step: { color: 'var(--brain-2)', Icon: Milestone, label: 'Stages', r: 6 },
   task: { color: 'var(--muted)', Icon: ClipboardList, label: 'SOP tasks', r: 7 },
   person: { color: 'var(--warn)', Icon: UserRound, label: 'Humans', r: 10 },
   employee: { color: 'var(--accent)', Icon: User, label: 'AI agents', r: 10 },
@@ -57,6 +59,8 @@ const CAT: Record<KGNodeKind, { color: string; Icon: LucideIcon; label: string; 
 const TIER_OPACITY: Record<KGNodeKind, number> = {
   self: 1,
   team: 1,
+  workflow: 0.98,
+  step: 0.9,
   person: 0.98,
   employee: 0.98,
   task: 0.94,
@@ -124,7 +128,7 @@ const NOTE_COLOR = '#e35c35';
 const ORPHAN_COLOR = '#e35c35'; // rim dust dims via its lower fill opacity
 // the bright traveling sparks that fire along the links like synapses
 const SYNAPSE_COLOR = '#ffb08a';
-const SYNAPSE_N = 14;
+const SYNAPSE_N = 22;
 
 const memColor = (m: { id: string; cluster: number; links: number; type: string }) =>
   m.type === 'folder' ? HUB_COLOR : m.type === 'page' && m.links === 0 ? ORPHAN_COLOR : NOTE_COLOR;
@@ -259,6 +263,7 @@ export function KnowledgeGraph({
   const {
     adjacency, byId, tasksOfTeam, teamOfTask, workerOfTask, taskOfWorker,
     teamOfWorker, workersOfTeam, toolsOfWorker, workersOfTool,
+    teamOfFlow, flowsOfTeam, flowOfStep, stepsOfFlow,
   } = useMemo(() => {
     const adjacency = new Map<string, Set<string>>();
     const tasksOfTeam = new Map<string, string[]>();
@@ -269,6 +274,10 @@ export function KnowledgeGraph({
     const workersOfTeam = new Map<string, string[]>();
     const toolsOfWorker = new Map<string, string[]>();
     const workersOfTool = new Map<string, string[]>();
+    const teamOfFlow = new Map<string, string>();
+    const flowsOfTeam = new Map<string, string[]>();
+    const flowOfStep = new Map<string, string>();
+    const stepsOfFlow = new Map<string, string[]>();
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
     for (const n of graph.nodes) adjacency.set(n.id, new Set([n.id]));
     for (const e of graph.edges) {
@@ -288,6 +297,15 @@ export function KnowledgeGraph({
         (workersOfTool.get(e.target) ?? workersOfTool.set(e.target, []).get(e.target)!).push(e.source);
       }
     }
+    for (const e of graph.edges) {
+      if (e.kind === 'flow') {
+        teamOfFlow.set(e.target, e.source);
+        (flowsOfTeam.get(e.source) ?? flowsOfTeam.set(e.source, []).get(e.source)!).push(e.target);
+      } else if (e.kind === 'stage') {
+        flowOfStep.set(e.target, e.source);
+        (stepsOfFlow.get(e.source) ?? stepsOfFlow.set(e.source, []).get(e.source)!).push(e.target);
+      }
+    }
     for (const [task, worker] of workerOfTask) {
       const team = teamOfTask.get(task);
       if (team) teamOfWorker.set(worker, team);
@@ -298,6 +316,7 @@ export function KnowledgeGraph({
     return {
       adjacency, byId, tasksOfTeam, teamOfTask, workerOfTask, taskOfWorker,
       teamOfWorker, workersOfTeam, toolsOfWorker, workersOfTool,
+      teamOfFlow, flowsOfTeam, flowOfStep, stepsOfFlow,
     };
   }, [graph]);
 
@@ -309,6 +328,12 @@ export function KnowledgeGraph({
     if (!n) return null;
     if (n.kind === 'team') return n.id;
     if (n.kind === 'task') return teamOfTask.get(n.id) ?? null;
+    // A flow names its department in its id; a stage names its flow in its own.
+    if (n.kind === 'workflow') return teamOfFlow.get(n.id) ?? null;
+    if (n.kind === 'step') {
+      const flow = flowOfStep.get(n.id);
+      return flow ? teamOfFlow.get(flow) ?? null : null;
+    }
     if (isWorker(n.kind)) return teamOfWorker.get(n.id) ?? null;
     if (n.kind === 'tool') {
       const w = (workersOfTool.get(n.id) ?? [])[0];
@@ -337,6 +362,28 @@ export function KnowledgeGraph({
       set.add(SELF_ID);
       for (const w of workersOfTeam.get(id) ?? []) chainOfWorker(w, set);
       for (const t of tasksOfTeam.get(id) ?? []) set.add(t);
+      // a pillar lights its flows and every stage inside them
+      for (const f of flowsOfTeam.get(id) ?? []) {
+        set.add(f);
+        for (const st of stepsOfFlow.get(f) ?? []) set.add(st);
+      }
+    } else if (node.kind === 'workflow') {
+      set.add(SELF_ID);
+      const team = teamOfFlow.get(id);
+      if (team) set.add(team);
+      // a flow lights its stages, and whoever performs each of them
+      for (const st of stepsOfFlow.get(id) ?? []) {
+        set.add(st);
+        for (const m of adjacency.get(st) ?? []) if (isWorker(byId.get(m)?.kind ?? 'tool')) chainOfWorker(m, set);
+      }
+    } else if (node.kind === 'step') {
+      const flow = flowOfStep.get(id);
+      if (flow) {
+        set.add(flow);
+        const team = teamOfFlow.get(flow);
+        if (team) set.add(team);
+      }
+      for (const m of adjacency.get(id) ?? []) set.add(m);
     } else if (node.kind === 'task') {
       set.add(SELF_ID);
       const team = teamOfTask.get(id);
@@ -421,12 +468,27 @@ export function KnowledgeGraph({
       const team = users.length ? teamOfWorker.get(users[0]) ?? null : null;
       if (team) (toolsByPillar.get(team) ?? toolsByPillar.set(team, []).get(team)!).push(n.id);
     }
-    const pillars = teams.map((t) => ({
-      teamId: t.id,
-      taskIds: tasksOfTeam.get(t.id) ?? [],
-      workerIds: workersOfTeam.get(t.id) ?? [],
-      toolIds: toolsByPillar.get(t.id) ?? [],
-    }));
+    // Flows hang directly off their department; a stage hangs off its flow.
+    const flowsByPillar = new Map<string, string[]>();
+    const stepsByFlow = new Map<string, string[]>();
+    for (const e of graph.edges) {
+      if (e.kind === 'flow') {
+        (flowsByPillar.get(e.source) ?? flowsByPillar.set(e.source, []).get(e.source)!).push(e.target);
+      } else if (e.kind === 'stage') {
+        (stepsByFlow.get(e.source) ?? stepsByFlow.set(e.source, []).get(e.source)!).push(e.target);
+      }
+    }
+    const pillars = teams.map((t) => {
+      const flowIds = flowsByPillar.get(t.id) ?? [];
+      return {
+        teamId: t.id,
+        flowIds,
+        taskIds: tasksOfTeam.get(t.id) ?? [],
+        stepIds: flowIds.flatMap((f) => stepsByFlow.get(f) ?? []),
+        workerIds: workersOfTeam.get(t.id) ?? [],
+        toolIds: toolsByPillar.get(t.id) ?? [],
+      };
+    });
     return radialRestLayout({ selfId: SELF_ID, pillars, ringR: RING_R, cx: CX, cy: CY });
   }, [graph, tasksOfTeam, workersOfTeam, workersOfTool, teamOfWorker]);
 
@@ -765,8 +827,11 @@ export function KnowledgeGraph({
     let lastT = performance.now();
     let lastRotDeg = NaN;
     let frame = 0;
-    const ORBIT_S = 150; // seconds per full revolution — calm but visibly alive
-    const IDLE_MS = 15_000;
+    const ORBIT_S = 95; // seconds per full revolution — calm but visibly alive
+    // Long enough that reading the graph is not mistaken for abandoning it —
+              // the throttle is a power saver for a dashboard left on a wall, not a
+              // penalty for looking at something.
+    const IDLE_MS = 45_000;
     const step = () => {
       const c = camRef.current;
       const nowT = performance.now();
@@ -1413,6 +1478,8 @@ export function KnowledgeGraph({
           { label: 'Human', color: CAT.person.color, Icon: CAT.person.Icon },
           { label: 'AI agent', color: CAT.employee.color, Icon: CAT.employee.Icon },
           { label: 'Tool', color: CAT.tool.color, Icon: CAT.tool.Icon },
+          { label: 'Workflow', color: CAT.workflow.color, Icon: CAT.workflow.Icon },
+          { label: 'Stage', color: CAT.step.color, Icon: CAT.step.Icon },
           { label: 'SOP task', color: CAT.task.color, Icon: CAT.task.Icon },
         ] as const
       ).map(({ label, color, Icon }) => (

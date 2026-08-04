@@ -105,7 +105,16 @@ export function branchWidth(depth: number): number {
 export type RestLayoutInput = {
   selfId: string;
   /** ordered pillars; tools must be deduped to one primary pillar each */
-  pillars: { teamId: string; taskIds: string[]; workerIds: string[]; toolIds: string[] }[];
+  pillars: {
+    teamId: string;
+    /** workflows, laid out on the task ring beside the SOP tasks */
+    flowIds?: string[];
+    taskIds: string[];
+    /** workflow stages, laid out on the worker ring beside the workers */
+    stepIds?: string[];
+    workerIds: string[];
+    toolIds: string[];
+  }[];
   /** radius per depth: [self, team, task, worker, tool]. Omit to derive from width/height. */
   ringR?: number[];
   cx: number;
@@ -153,7 +162,12 @@ export function radialRestLayout(input: RestLayoutInput): RestLayoutResult {
   // so the first pillar stays at `startAngle` — for a balanced graph (equal
   // weights) this reproduces the old evenly-spaced sunburst exactly.
   const n = Math.max(1, pillars.length);
-  const weights = pillars.map((p) => Math.max(1, p.taskIds.length + p.workerIds.length + p.toolIds.length));
+  const weights = pillars.map((p) =>
+    Math.max(
+      1,
+      (p.flowIds?.length ?? 0) + p.taskIds.length + (p.stepIds?.length ?? 0) + p.workerIds.length + p.toolIds.length,
+    ),
+  );
   const total = weights.reduce((s, w) => s + w, 0) || 1;
   const spans = weights.map((w) => (w / total) * Math.PI * 2);
   const centersRaw: number[] = [];
@@ -175,8 +189,11 @@ export function radialRestLayout(input: RestLayoutInput): RestLayoutResult {
         positions.set(id, polar(r, center + t * half));
       });
     };
-    ring(p.taskIds, ringR[2]);
-    ring(p.workerIds, ringR[3]);
+    // Flows and stages share their ring with tasks and workers rather than
+    // getting rings of their own: five rings is already the whole radius, and
+    // interleaving them keeps each pillar's wedge readable.
+    ring([...(p.flowIds ?? []), ...p.taskIds], ringR[2]);
+    ring([...(p.stepIds ?? []), ...p.workerIds], ringR[3]);
     ring(p.toolIds, ringR[4]);
   });
 

@@ -12,9 +12,13 @@ Five concentric rings, read outward from the centre:
 |---|---|---|
 | 0 | the company, drawn as its memory constellation | `lib/memory.ts` (local store) |
 | 1 | departments (pillars) | **derived** — see below |
-| 2 | the jobs on each pillar | `…/tasks`, grouped through their assignee |
-| 3 | the teammate who does each job | `…/team`, matched by `task.assignee` |
+| 2 | the jobs on each pillar, and the workflows it runs | `…/tasks` grouped through their assignee; workflows **derived** |
+| 3 | the teammate who does each job, each workflow stage, and the humans | `…/team` matched by `task.assignee`; humans from `…/users`; stages **derived** |
 | 4 | that teammate's tools | **derived** — see below |
+
+Rings 2 and 3 each carry two kinds. A workflow sits beside the SOP tasks
+because both are work a department runs; a workflow's stages sit beside the
+workers because a stage is where the flow meets the person who performs it.
 
 Hover any node to trace its whole pillar chain. Click a pillar to grow it into
 a bottom-up tree; click a job for its steps, a teammate or tool for its card.
@@ -35,14 +39,21 @@ invented by `kg/adapter.ts`:
 - **Departments** come from keyword-matching each teammate's role, falling back
   to Operations.
 - **Tool assignments** are a deterministic deal from the company-wide tool list.
+- **Workflows and their stages** are templates — one routine per department —
+  because the console has no flow API; the Workflows canvas draws a single
+  hard-coded sample. Stages are dealt round-robin across the department's
+  agents.
+- **A human's department** is derived too: signing in says who someone is, not
+  what they work on. Admins sit with Operations; everyone else is spread
+  deterministically by their address.
 
 Both are deterministic, so nothing jumps between renders — but neither is
 something the company declared. `DERIVED_NOTICE` in `kg/adapter.ts` is the
 standing caveat. When `[[agent]]` grows `department` and `tools`, delete
 `assignDepartment` and `assignTools` and read them straight through.
 
-Everything else is real: a card's assignee, a skill's category, and the tools a
-connected MCP server advertises.
+Everything else is real: a card's assignee, a skill's category, the tools a
+connected MCP server advertises, and who can sign in.
 
 ## Files
 
