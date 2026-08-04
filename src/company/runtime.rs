@@ -419,22 +419,7 @@ impl CompanyRuntime {
             let task_id = task.id.clone();
             let run_id = self.open_run(task).await;
             let runtime = Arc::clone(self);
-            tokio::spawn(async move {
-                if let Err(err) = runtime
-                    .run_cycle(vec![CompanyEvent::TaskDispatched {
-                        task_id: task_id.clone(),
-                        run_id,
-                    }])
-                    .await
-                {
-                    tracing::warn!(
-                        company = %runtime.id,
-                        task = %task_id,
-                        error = %err,
-                        "task dispatch cycle failed"
-                    );
-                }
-            });
+            tokio::spawn(async move { runtime.run_dispatch_cycle(task_id, run_id).await });
             return;
         }
         // Default build / no harness: the board stays inert. The card rests in
@@ -442,6 +427,79 @@ impl CompanyRuntime {
         // minted either — nothing is attempting the card, so an attempt row would
         // be a fiction.
         let _ = task;
+    }
+
+    /// The body of a dispatch's detached cycle (issue #242), split out of the
+    /// `tokio::spawn` so the quiesce path below is reachable from a test.
+    ///
+    /// Owns the settle for the one dispatch failure the cycle's own terminality
+    /// backstop cannot see — see [`abandon_run`](Self::abandon_run).
+    #[cfg(feature = "openhuman")]
+    async fn run_dispatch_cycle(self: Arc<Self>, task_id: String, run_id: Option<String>) {
+        let Err(err) = self
+            .run_cycle(vec![CompanyEvent::TaskDispatched {
+                task_id: task_id.clone(),
+                run_id: run_id.clone(),
+            }])
+            .await
+        else {
+            return;
+        };
+        // Issue #290 meets issue #242. `ensure_accepting` refuses *before*
+        // `CycleRunner` takes the serial lock, so a dispatch that lands in the
+        // window while this runtime is being replaced never reaches `begin_run`
+        // — and the backstop inside the cycle only settles rows that cycle
+        // started. Every other dispatch failure is already covered in there.
+        // Left alone, the row minted a moment ago would sit `Pending` for the
+        // rest of the process's life: a card reading as under way by an attempt
+        // that never began, which nothing re-drives, and which the rebuild
+        // deliberately does *not* run the boot reaper to clean up.
+        if let Some(id) = run_id.as_deref()
+            && matches!(err, OpenCompanyError::Quiescing(_))
+        {
+            self.abandon_run(id).await;
+        }
+        tracing::warn!(
+            company = %self.id,
+            task = %task_id,
+            error = %err,
+            "task dispatch cycle failed"
+        );
+    }
+
+    /// Settles an attempt whose cycle was refused before it could start
+    /// (issue #290).
+    ///
+    /// `Pending` → terminal is exactly the move the transition table names for
+    /// "a dispatch that failed before the first turn"
+    /// ([`RunStatus::can_transition_to`](crate::ports::runs::RunStatus::can_transition_to)),
+    /// so this needs no new state — only a caller willing to use it.
+    ///
+    /// Recorded as [`RunStatus::Failed`](crate::ports::runs::RunStatus::Failed)
+    /// rather than `Cancelled`, for the same reason the boot reaper picks
+    /// `Failed`: the runtime went away underneath a card an operator had just
+    /// dispatched, and that is something they need to see and re-drive, not an
+    /// intentional stop filed quietly away. The reason string is its own
+    /// constant ([`RUNTIME_REPLACED_ERROR`](crate::ports::runs::RUNTIME_REPLACED_ERROR))
+    /// so a run list can tell "we swapped your runtime" apart from "the host
+    /// died". The card itself stays in `in_progress`, which is where every other
+    /// failed dispatch cycle leaves it.
+    ///
+    /// Best-effort and logged, never propagated: the dispatch has already
+    /// failed, and a bookkeeping write cannot make that better or worse.
+    #[cfg(feature = "openhuman")]
+    async fn abandon_run(&self, run_id: &str) {
+        let outcome = crate::ports::runs::RunOutcome::new(crate::ports::runs::RunStatus::Failed)
+            .with_error(crate::ports::runs::RUNTIME_REPLACED_ERROR);
+        if let Err(err) = self.ops.runs.finish_run(&self.id, run_id, outcome).await {
+            tracing::warn!(
+                company = %self.id,
+                run = %run_id,
+                error = %err,
+                "[runs] could not settle an attempt refused by a quiescing runtime; it stays \
+                 Pending until the next boot reaps it"
+            );
+        }
     }
 
     /// Mints this dispatch's [`RunStatus::Pending`] attempt row and returns its
@@ -1050,5 +1108,104 @@ mod tests {
                 .attempt,
             2
         );
+    }
+
+    /// Issue #290 against issue #242's write path: a card dragged into
+    /// `in_progress` while this runtime is being replaced must not leave an
+    /// attempt row claiming to be pending forever.
+    ///
+    /// The board write is deliberately *not* gated on the quiesce — only cycles
+    /// are — so this window is reachable, and the refusal happens before
+    /// `CycleRunner` starts the run, which puts it out of reach of the cycle's
+    /// own terminality backstop. A rebuild also skips the boot reaper by design,
+    /// so nothing else would ever clean the row up.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_dispatch_refused_by_a_quiescing_runtime_settles_its_attempt() {
+        use std::sync::Arc;
+
+        use crate::ports::TaskRecord;
+        use crate::ports::runs::{RUNTIME_REPLACED_ERROR, RunStatus};
+        use crate::ports::tasks::COLUMN_IN_PROGRESS;
+
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-run-quiesce-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest: crate::company::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .expect("manifest");
+        let id = crate::ports::types::CompanyId::new("acme");
+        let runtime = Arc::new(
+            crate::runtime::RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+                .with_id(id.clone())
+                .build()
+                .await
+                .expect("runtime"),
+        );
+
+        let card = TaskRecord {
+            id: "t-1".to_string(),
+            title: "Ship it".to_string(),
+            note: None,
+            column: COLUMN_IN_PROGRESS.to_string(),
+            priority: "medium".to_string(),
+            assignee: "ceo".to_string(),
+            updated_at_millis: 0,
+            origin_chat_id: None,
+            parent_task_id: None,
+        };
+
+        // Positive control: on a live runtime the cycle runs, so the row is
+        // settled by the backstop inside it and never reaches the path below.
+        let live = runtime.open_run(&card).await.expect("an attempt");
+        Arc::clone(&runtime)
+            .run_dispatch_cycle(card.id.clone(), Some(live.clone()))
+            .await;
+        let settled = runtime
+            .runs()
+            .get_run(&id, &live)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            settled.status.is_terminal(),
+            "the ordinary dispatch path still settles its own row"
+        );
+        assert_ne!(
+            settled.error.as_deref(),
+            Some(RUNTIME_REPLACED_ERROR),
+            "the live path must not be settled by the quiesce handler"
+        );
+
+        // The window this test exists for.
+        let stranded = runtime.open_run(&card).await.expect("an attempt");
+        runtime.quiesce().await;
+        Arc::clone(&runtime)
+            .run_dispatch_cycle(card.id.clone(), Some(stranded.clone()))
+            .await;
+
+        let abandoned = runtime
+            .runs()
+            .get_run(&id, &stranded)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            abandoned.status,
+            RunStatus::Failed,
+            "an attempt whose cycle was refused must not stay Pending"
+        );
+        assert_eq!(
+            abandoned.error.as_deref(),
+            Some(RUNTIME_REPLACED_ERROR),
+            "and it must say the runtime was swapped, not that the host died"
+        );
+        assert!(
+            abandoned.started_at_millis.is_none(),
+            "it never started, so it has no start time"
+        );
+        assert!(abandoned.finished_at_millis.is_some());
     }
 }

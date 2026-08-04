@@ -657,6 +657,11 @@ at least one approval finishes `waiting_approval`, not `succeeded` — a person
 must act. A failed, cancelled or paused run keeps the reason it stopped;
 relabelling it "waiting on you" would hide that reason.
 
+**A runtime being replaced is a fifth writer.** Writer 1 mints the row before
+writer 2 can start it, so a runtime swapped in between refuses the cycle and
+settles the row itself — and the boot reaper is *not* a safe fallback mid-life.
+See [rebuild.md](rebuild.md#attempt-rows-242).
+
 #### Correlation fields elsewhere
 
 Four additive `Option<String>` fields point back at a run. All are

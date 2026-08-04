@@ -962,10 +962,27 @@ impl RuntimeBuilder {
         // not stop a company from booting.
         //
         // Issue #290: suppressed on a rebuild. The whole argument above rests on
-        // "nothing from this process can be in flight yet", which is true at
-        // boot and false mid-life. A rebuild that reaped would settle live run
-        // records as dead — the exact bookkeeping corruption this sweep exists
-        // to clean up.
+        // "nothing from this process can be in flight yet" — true at boot, false
+        // the moment a company has been serving. Mid-life this sweep would be
+        // reclaiming rows it cannot prove are abandoned, which is the one thing
+        // it promises never to do.
+        //
+        // Precisely which rows are at risk, since the answer is narrower than it
+        // looks: `rebuild_company` quiesces and drains before reaching here, and
+        // both `begin_run` and the terminality backstop sit inside the serial
+        // lock, so no `Running` row survives the drain. `Pending` does — the
+        // dispatch choke point mints a row *outside* that lock, so a board write
+        // landing in the window leaves one behind. Reaping it would stamp the
+        // wrong reason on it ("the host restarted"), and if the rebuild then
+        // fails and `resume()` puts the company back to work, the row is already
+        // terminal: its cycle's `begin_run` is rejected and a genuinely live
+        // attempt runs with no record at all.
+        //
+        // Suppressing rather than leaning on the drain also keeps this resting
+        // on the invariant the reaper states instead of on the current call
+        // order. It costs nothing: a refused dispatch settles its own row
+        // (`CompanyRuntime::abandon_run`), and the next real boot sweeps
+        // anything that escapes.
         if handover.is_none()
             && let Err(err) = crate::ports::runs::reap_orphaned_runs(ops.runs.as_ref(), &id).await
         {
