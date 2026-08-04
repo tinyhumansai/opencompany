@@ -622,10 +622,21 @@ impl CompanyRuntime {
     ///
     /// What the retry dialog names. Read from the journal's executed record —
     /// the same append-only set that makes effects at-most-once — so it reports
-    /// what actually fired rather than what a timeline label says an agent
+    /// what was committed to run rather than what a timeline label says an agent
     /// intended.
     pub fn irreversible_effects(&self, task_id: &str) -> Vec<ExecutedEffect> {
         self.journal.irreversible_effects(task_id)
+    }
+
+    /// Whether this company's journal holds executed history it cannot describe
+    /// (issue #351) — a record written before descriptions existed.
+    ///
+    /// The companion to [`irreversible_effects`](Self::irreversible_effects):
+    /// an empty list only means "nothing irreversible for this card" while this
+    /// is `false`. When it is `true` the console confirms a retry regardless and
+    /// says so, rather than showing an all-clear it cannot stand behind.
+    pub fn has_undescribed_history(&self) -> bool {
+        self.journal.has_undescribed_history()
     }
 
     /// The approvals currently awaiting the operator.

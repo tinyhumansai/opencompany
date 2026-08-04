@@ -97,8 +97,13 @@ export interface TimelineEntry {
 /**
  * One irreversible effect a task already executed (#351).
  *
- * Read by the host from the runtime journal's executed record — what actually
- * fired — not from the timeline, which reports what an agent said it did.
+ * Read by the host from the runtime journal's executed record — what the
+ * runtime committed to run — not from the timeline, which reports what an agent
+ * said it did. The record is written before the effect is performed (that
+ * ordering is what makes effects at-most-once) and the runtime never
+ * re-attempts it, so an entry is something to assume happened rather than
+ * something proven to have finished.
+ *
  * `kind` is the dotted effect kind, the same vocabulary the Approvals page
  * receives; `effectDone` in `@/lib/language` turns it into the sentence a
  * person reads. There is deliberately no payload here, so a recipient or a
@@ -142,6 +147,16 @@ export interface TaskDetail {
    * one-click Retry and one that stops to say what already happened.
    */
   irreversibleEffects: IrreversibleEffect[];
+  /**
+   * Whether the company's journal holds executed history it cannot describe
+   * (#351) — records written before descriptions existed.
+   *
+   * The qualifier on {@link irreversibleEffects}: an empty list means "this
+   * card did nothing irreversible" only while this is `false`. When it is
+   * `true`, Retry confirms regardless and says earlier activity cannot be
+   * described, rather than presenting a gap as an all-clear.
+   */
+  historyIncomplete: boolean;
   /** Parent and children. */
   lineage: TaskLineage;
   /**

@@ -3793,6 +3793,53 @@ async fn a_task_with_no_irreversible_history_reports_an_empty_list() {
         "{:?}",
         body["irreversibleEffects"],
     );
+    assert_eq!(
+        body["historyIncomplete"].as_bool(),
+        Some(false),
+        "an empty list is only a single click when nothing is unaccounted for",
+    );
+}
+
+/// A journal holding a pre-#351 executed line cannot describe what already
+/// happened, and the read says so rather than letting an empty list read as an
+/// all-clear (maintainer review on #356).
+///
+/// Company-wide by necessity: an undescribed record carries no card either, so
+/// there is nothing to attribute it to.
+#[tokio::test]
+async fn an_undescribable_executed_line_marks_the_history_incomplete() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, _) = dispatched_task(&state, &company).await;
+
+    // A line as a pre-#351 build wrote it: a key, and no way to say what it was.
+    let path = runtime.journal.path().to_path_buf();
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+    }
+    let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    tokio::fs::write(
+        &path,
+        format!("{existing}{{\"record\":\"EffectExecuted\",\"key\":\"cyc-old:0\"}}\n"),
+    )
+    .await
+    .unwrap();
+    runtime.journal.load().await.unwrap();
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["irreversibleEffects"].as_array().unwrap().is_empty(),
+        "{:?}",
+        body["irreversibleEffects"],
+    );
+    assert_eq!(
+        body["historyIncomplete"].as_bool(),
+        Some(true),
+        "an empty list over an undescribable journal is 'cannot say', not 'nothing happened'",
+    );
 }
 
 /// #185 review follow-up: the lineage forest is enforced at the write boundary.

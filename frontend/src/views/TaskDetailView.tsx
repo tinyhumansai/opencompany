@@ -353,6 +353,7 @@ export function TaskDetailView({
               task={detail.task}
               inflight={inflight}
               irreversible={detail.irreversibleEffects}
+              historyIncomplete={detail.historyIncomplete}
               client={client}
               company={company}
               onChanged={load}
@@ -530,6 +531,7 @@ function ControlBar({
   task,
   inflight,
   irreversible,
+  historyIncomplete,
   client,
   company,
   onChanged,
@@ -538,8 +540,13 @@ function ControlBar({
 }: {
   task: Task;
   inflight: InflightRun | null;
-  /** What a retry would do again (#351). Empty means Retry stays one click. */
+  /**
+   * What a retry would do again (#351). Empty means Retry stays one click —
+   * unless `historyIncomplete` says the empty is a gap rather than an all-clear.
+   */
   irreversible: IrreversibleEffect[];
+  /** Whether the journal holds executed history it cannot describe (#351). */
+  historyIncomplete: boolean;
   client: OpenCompanyClient;
   company: string | null;
   onChanged: () => Promise<void> | void;
@@ -667,6 +674,7 @@ function ControlBar({
             label={resumeLabel}
             title={task.title}
             irreversible={irreversible}
+            historyIncomplete={historyIncomplete}
             disabled={busy}
             onConfirm={() => void patchColumn()}
           />
@@ -1104,25 +1112,40 @@ function EmptyState({ title, body }: { title: string; body: string }) {
  *
  * Nothing here re-derives risk from the timeline. The host answers with the
  * effects its journal recorded as executed, and an empty list means the journal
- * has nothing irreversible against this card, not that the console failed to
- * classify something.
+ * has nothing irreversible against this card — but only when
+ * `historyIncomplete` is false. That flag is the honest half: a journal written
+ * before #351 holds executed keys with no description, so "empty" there means
+ * "cannot say", and the dialog opens anyway to say exactly that rather than
+ * pass a gap off as an all-clear.
+ *
+ * Each row is what the runtime *committed to run*. The record is written before
+ * the effect is performed — that ordering is what makes effects at-most-once —
+ * and nothing ever re-attempts it, so an interrupted one still belongs on this
+ * list. The footnote says so; the sentences stay in the past tense because
+ * "must be assumed to have happened" is what an operator has to act on.
+ *
+ * Scope: **Task Detail only.** The board's own re-dispatch — dragging a card
+ * back into `in_progress` — has the same shape and the same read available to
+ * it, and is deliberately left for a follow-up rather than half-done here.
  */
 function RetryButton({
   label,
   title,
   irreversible,
+  historyIncomplete,
   disabled,
   onConfirm,
 }: {
   label: string;
   title: string;
   irreversible: IrreversibleEffect[];
+  historyIncomplete: boolean;
   disabled: boolean;
   onConfirm: () => void;
 }) {
-  // Nothing to warn about: the plain button, wired straight through, exactly as
-  // it behaved before this existed.
-  if (irreversible.length === 0) {
+  // Nothing to warn about and nothing unaccounted for: the plain button, wired
+  // straight through, exactly as it behaved before this existed.
+  if (irreversible.length === 0 && !historyIncomplete) {
     return (
       <Button variant="outline" size="sm" className="h-8" disabled={disabled} onClick={onConfirm}>
         <Play className="mr-1.5 size-3.5" />
@@ -1130,6 +1153,8 @@ function RetryButton({
       </Button>
     );
   }
+
+  const named = irreversible.length;
 
   return (
     <ConfirmButton
@@ -1141,27 +1166,47 @@ function RetryButton({
       }
       title={`${label} “${title}”?`}
       description={
-        irreversible.length === 1
-          ? "This task already did something that cannot be undone. Running it again may do it a second time."
-          : `This task already did ${irreversible.length} things that cannot be undone. Running it again may do them a second time.`
+        named === 0
+          ? "Running this again may repeat whatever the last attempt did."
+          : named === 1
+            ? "This task already did something that cannot be undone. Running it again may do it a second time."
+            : `This task already did ${named} things that cannot be undone. Running it again may do them a second time.`
       }
       details={
-        <ul className="space-y-1.5 rounded-lg border bg-muted/40 p-3 text-left text-xs">
-          {irreversible.map((e, i) => (
-            // Two effects of the same kind can land in the same millisecond, so
-            // the index carries the uniqueness the pair cannot.
-            <li key={`${e.kind}-${e.atMillis}-${i}`} className="flex items-start gap-2">
-              <AlertCircle
-                className="mt-px size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
-                aria-hidden
-              />
-              <span className="min-w-0 flex-1">{effectDone(e.kind, e.amountUsd)}</span>
-              <span className="shrink-0 tabular-nums text-muted-foreground">
-                {timeOf(e.atMillis)}
-              </span>
-            </li>
-          ))}
-        </ul>
+        <div className="space-y-2 text-left">
+          {named > 0 && (
+            <ul className="space-y-1.5 rounded-lg border bg-muted/40 p-3 text-xs">
+              {irreversible.map((e, i) => (
+                // Two effects of the same kind can land in the same millisecond,
+                // so the index carries the uniqueness the pair cannot.
+                <li key={`${e.kind}-${e.atMillis}-${i}`} className="flex items-start gap-2">
+                  <AlertCircle
+                    className="mt-px size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+                    aria-hidden
+                  />
+                  <span className="min-w-0 flex-1">{effectDone(e.kind, e.amountUsd)}</span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {timeOf(e.atMillis)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {historyIncomplete && (
+            // The list is short, not wrong. Say which, rather than let a
+            // truncated list read as the whole story.
+            <p className="text-xs text-muted-foreground">
+              Some of this company’s earlier activity was recorded before it kept a description, so
+              {named > 0 ? " this list may be incomplete." : " nothing here can be listed."}
+            </p>
+          )}
+          {named > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              Each is recorded the moment it was committed, so one that was interrupted still
+              appears — nothing is ever retried on its own.
+            </p>
+          )}
+        </div>
       }
       confirmLabel={`${label} anyway`}
       cancelLabel="Leave it alone"

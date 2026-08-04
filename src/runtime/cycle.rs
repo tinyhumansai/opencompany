@@ -166,13 +166,21 @@ impl<'a> CycleRunner<'a> {
         // cycle over the bookkeeping write would discard real model output to
         // record something whose only consequence is that a restart might re-arm
         // a spent grant (which then re-asks the operator — the safe direction).
+        //
+        // Issue #351: this is also where an operator-approved *tool call* gets
+        // described. It never passes through `execute_effect_once` — approving
+        // it mints a grant, and the tool runs inside the agent's next turn — so
+        // without a description here an approved `composio_execute` payment
+        // would reach no retry dialog at all.
         for id in self.rt.grants.drain_consumed() {
-            if let Err(err) = self.rt.journal.record_grant_consumed(&id).await {
+            let executed = self.consumed_grant_effect(&id);
+            if let Err(err) = self.rt.journal.record_grant_consumed(&id, executed).await {
                 tracing::warn!(
                     approval_id = %id,
                     error = %err,
                     "[approval] a grant was redeemed but its journal record failed; \
-                     a restart before it is re-written may re-arm it"
+                     a restart before it is re-written may re-arm it, and the call \
+                     it admitted will not be named on a retry confirmation"
                 );
             }
         }
@@ -364,6 +372,14 @@ working on):\n{}\n]",
     ///   `ApprovalResolved` arm re-dispatches the agent to re-issue the call for
     ///   real.
     ///
+    /// Both forks are described for the retry warning (issue #351), but at
+    /// different moments, because "it ran" happens at different moments. A
+    /// native effect is described by `execute_effect_once` as it commits. A tool
+    /// call is described when its grant is **redeemed** — minting one only means
+    /// the agent is now allowed to make the call, and describing it here would
+    /// warn about a payment for a grant that then quietly expired unused. See
+    /// [`consumed_grant_effect`](Self::consumed_grant_effect).
+    ///
     /// The journal record is written **before** the grant enters the live set.
     /// A crash between the two therefore replays as "granted", re-arming it —
     /// the safe direction. The reverse order would lose the operator's approval
@@ -403,6 +419,39 @@ working on):\n{}\n]",
             "[approval] minted a single-use grant; the agent will re-issue the call"
         );
         Ok(())
+    }
+
+    /// Describes a grant the agent just redeemed, so an operator-approved tool
+    /// call is named on the retry confirmation like a native effect is
+    /// (issue #351).
+    ///
+    /// The three facts all come off records the journal already keeps, joined on
+    /// the [`ApprovalId`] the redemption reports:
+    ///
+    /// * **what it was** — the effect the approval was parked with (or the
+    ///   amended one, which is what the grant was minted against). Read back
+    ///   rather than re-projected from the grant's tool name and arguments, so
+    ///   there is one projection and the operator is told about the call they
+    ///   actually saw;
+    /// * **whose card it was** — the same `approval_task` join the native
+    ///   approved path uses;
+    /// * **whether it can be taken back** — the same
+    ///   `ManifestApprovalGate::is_irreversible`, asked at the moment the tool
+    ///   ran rather than re-derived when somebody later opens the dialog.
+    ///
+    /// `None` when the park record is not recoverable — a grant rehydrated from
+    /// a journal whose park line predates this field, say. The redemption is
+    /// still journaled; it simply contributes no warning, which is the same
+    /// additive degradation a pre-#351 `EffectExecuted` line has.
+    fn consumed_grant_effect(&self, id: &ApprovalId) -> Option<ExecutedEffect> {
+        let effect = self.rt.journal.approval_effect(id)?;
+        Some(ExecutedEffect {
+            kind: effect.kind.clone(),
+            amount_usd: effect.amount_usd,
+            task_id: self.rt.journal.approval_task(id),
+            at_millis: now_millis(),
+            irreversible: self.rt.approval_gate.is_irreversible(&effect),
+        })
     }
 
     /// The deterministic answer to resolving an approval that is already gone.
@@ -577,6 +626,12 @@ pub(crate) async fn execute_effect_once(
     // place that has both the effect and the policy — and because "was this
     // irreversible?" is a question about the moment it ran, not about whatever
     // the cap happens to be when somebody later opens the retry dialog.
+    //
+    // The record describes what is *committed to run*, and stands even if
+    // `perform_effect` below then fails — that ordering is the at-most-once
+    // guarantee, and the runtime will never re-attempt the effect afterwards, so
+    // an operator has to assume it happened. Every wording downstream is
+    // qualified to match; see [`ExecutedEffect`].
     rt.journal
         .record_executed(
             key,
@@ -740,7 +795,20 @@ fn cycle_task_id(events: &[CompanyEvent], rt: &CompanyRuntime) -> Option<String>
         };
         let Some(candidate) = candidate else { continue };
         match &found {
-            Some(existing) if existing != &candidate => return None,
+            Some(existing) if existing != &candidate => {
+                // Every production call site passes a single-event batch, so
+                // reaching here means a caller started batching. Say so: the
+                // silent consequence is that everything this cycle executes is
+                // attributed to no card and named on no retry dialog, which
+                // looks exactly like a cycle that did nothing irreversible.
+                tracing::warn!(
+                    first = %existing,
+                    second = %candidate,
+                    "[cycle] a batch named two board tasks; effects it executes will be \
+                     attributed to neither and will not appear on a retry confirmation"
+                );
+                return None;
+            }
             Some(_) => {}
             None => found = Some(candidate),
         }
@@ -1635,7 +1703,10 @@ mod test {
                 .is_some()
         );
         for spent in rt2.grants.drain_consumed() {
-            rt2.journal.record_grant_consumed(&spent).await.unwrap();
+            rt2.journal
+                .record_grant_consumed(&spent, None)
+                .await
+                .unwrap();
         }
         drop(rt2);
 
@@ -2828,6 +2899,101 @@ mod test {
         let named = rt.irreversible_effects("t-7");
         assert_eq!(named.len(), 1, "{named:?}");
         assert_eq!(named[0].kind, "filing.submit");
+    }
+
+    /// **Issue #351, maintainer review on #356**: an approved *agent tool call*
+    /// is settled by minting a grant, not by `execute_effect_once`, so it writes
+    /// no `EffectExecuted` line and used to reach the retry dialog not at all.
+    ///
+    /// A card that both sent a native email and had an operator-approved
+    /// `composio_execute` payment fire would then open a confirmation naming
+    /// only the email — a warning understating what already happened, which is
+    /// worse than no warning, because it reads as a complete account.
+    ///
+    /// The description is attached at **redemption**, not at minting: a grant
+    /// that is minted and then expires unredeemed is a call that never ran, and
+    /// warning about it would be the false alarm this whole feature is careful
+    /// to avoid.
+    #[tokio::test]
+    async fn an_approved_tool_call_is_named_once_its_grant_is_redeemed() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let rt = RuntimeBuilder::new(home.clone(), manifest("supervised"))
+            .build()
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "action": "pay", "account": "acct-77" });
+
+        // The card's run asks to act in a connected account. `agent` being set
+        // is precisely what makes this a tool call rather than a native effect.
+        let host = CycleHostImpl::new(
+            rt.id().clone(),
+            "cyc-park".into(),
+            &rt,
+            Some("t-9".to_string()),
+        );
+        let disposition = host
+            .gate_effect(Effect {
+                kind: "composio_execute".into(),
+                group: EffectGroup::Send,
+                amount_usd: Some(2_400.0),
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: args.clone(),
+                agent: Some("finance".into()),
+            })
+            .await
+            .unwrap();
+        let EffectDisposition::PendingApproval(approval_id) = disposition else {
+            panic!("supervised must park a tool call: {disposition:?}");
+        };
+
+        rt.resolve_approval(&approval_id, Verdict::Approve, operator())
+            .await
+            .unwrap();
+        assert_eq!(rt.grants.live_count(), 1, "approving mints a grant");
+        assert!(
+            rt.irreversible_effects("t-9").is_empty(),
+            "a minted grant is permission, not a payment — nothing has run yet",
+        );
+
+        // The agent re-issues the call; the policy redeems the grant. The cycle
+        // journals the redemption after the turn, which is where the
+        // description is attached.
+        assert!(
+            rt.grants
+                .consume("finance", "composio_execute", &args)
+                .is_some()
+        );
+        let runner = CycleRunner::new(&rt);
+        for id in rt.grants.drain_consumed() {
+            let executed = runner.consumed_grant_effect(&id);
+            rt.journal
+                .record_grant_consumed(&id, executed)
+                .await
+                .unwrap();
+        }
+
+        let named = rt.irreversible_effects("t-9");
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(named[0].kind, "composio_execute");
+        assert_eq!(named[0].amount_usd, Some(2_400.0));
+        assert!(named[0].irreversible);
+        assert!(
+            rt.irreversible_effects("t-other").is_empty(),
+            "another card must not inherit this one's history",
+        );
+
+        // The description carries no arguments. The park and grant audit lines
+        // legitimately hold them; the line the retry dialog is built from does
+        // not.
+        let journal_path = Bundle::new(&home, rt.id()).journal_jsonl();
+        let raw = tokio::fs::read_to_string(&journal_path).await.unwrap();
+        let consumed = raw
+            .lines()
+            .find(|l| l.contains("GrantConsumed"))
+            .expect("the redemption is journaled");
+        assert!(!consumed.contains("acct-77"), "{consumed}");
     }
 
     /// Two cards dispatched in one batch: the cycle refuses to guess which owns

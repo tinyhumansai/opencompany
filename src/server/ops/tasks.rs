@@ -434,8 +434,15 @@ struct TimelineEntry {
 ///
 /// Drawn from the runtime journal's executed record — the same append-only set
 /// that makes an effect at-most-once — and **not** from the timeline. A
-/// timeline row says what an agent reported; this says what actually fired, and
-/// only the two together make a retry warning trustworthy.
+/// timeline row says what an agent reported; this says what the runtime
+/// committed to run, and only the two together make a retry warning
+/// trustworthy.
+///
+/// "Committed", not "completed": the journal writes the record before the effect
+/// is performed, which is what makes it at-most-once, and the runtime never
+/// re-attempts it afterwards. An entry is therefore something the operator must
+/// assume happened, not something proven to have finished — the console's
+/// wording is qualified to match.
 ///
 /// `kind` is the dotted effect kind, the same vocabulary the Approvals page
 /// already receives and maps to plain language client-side (`effectAction` in
@@ -515,6 +522,16 @@ struct TaskDetail {
     /// list is empty — so this array is the whole difference between one click
     /// and a stop-and-read.
     irreversible_effects: Vec<IrreversibleEffect>,
+    /// Whether the company's journal holds executed history it cannot describe
+    /// (issue #351) — records written before descriptions existed.
+    ///
+    /// Company-wide, not per-task, because an undescribed record carries no card
+    /// either; there is nothing to attribute it to. It is the qualifier on the
+    /// field above: an empty `irreversibleEffects` means "this card did nothing
+    /// irreversible" only while this is `false`. When it is `true` the console
+    /// confirms a retry regardless and says earlier activity cannot be
+    /// described, rather than presenting a gap as an all-clear.
+    history_incomplete: bool,
     /// Parent and children.
     lineage: Lineage,
     /// Epoch-millis the company started waiting on an operator *right now*
@@ -551,7 +568,9 @@ struct TaskDetail {
 ///   labelled as such so a reader is not misled;
 /// * **lineage** — parent and children, from `parent_task_id`;
 /// * **irreversible effects** — what the task already did that a retry would
-///   do again (issue #351), read straight off the journal's executed record.
+///   do again (issue #351), read straight off the journal's executed record,
+///   plus the `historyIncomplete` qualifier saying whether that record can
+///   describe everything it holds.
 ///
 /// 404s when the id names no card, matching `PATCH` / `DELETE`.
 async fn task_detail(
@@ -595,8 +614,9 @@ async fn task_detail(
             .min()
     });
 
-    // What a retry would re-do (issue #351). A pure journal read — no event
-    // scan — so a task that did nothing irreversible costs nothing extra.
+    // What a retry would re-do (issue #351). A pure journal read — one indexed
+    // lookup, no event scan — so a task that did nothing irreversible costs
+    // nothing extra however long the company has been running.
     let irreversible_effects = company
         .runtime
         .irreversible_effects(&task_id)
@@ -608,6 +628,7 @@ async fn task_detail(
         task: card.into(),
         timeline,
         irreversible_effects,
+        history_incomplete: company.runtime.has_undescribed_history(),
         lineage: Lineage { parent, children },
         waiting_since,
     }))
