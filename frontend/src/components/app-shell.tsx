@@ -281,7 +281,6 @@ export function AppShell({
               client={client}
               company={company}
               onNavigate={setView}
-              onFlag={() => setFeedbackOpen(true)}
             />
           )}
           {view === "conversation" && (

@@ -8,7 +8,6 @@
 // Both modes are stepped for their own surface rather than flipped, which is
 // why every entry names a light and a dark value.
 
-import type { ChartConfig } from "@/components/ui/chart";
 import type { Tone } from "./types";
 
 /** Text colour per tone, for the state line and ticker marks. */
@@ -27,16 +26,19 @@ export const TONE_MARK: Record<Tone, string> = {
   dim: "text-muted-foreground/60",
 };
 
-/** Board columns on the company map. Each node is direct-labelled as well. */
-export const COLUMN_MARK: Record<string, string> = {
-  backlog: "text-muted-foreground",
-  in_progress: "text-[#2a78d6] dark:text-[#3987e5]",
-  in_review: "text-[#1baf7a] dark:text-[#199e70]",
-  done: "text-[#008300] dark:text-[#008300]",
+/**
+ * One hue per branch of the graph — work, capability, tools — taken in the
+ * palette's fixed slot order (1 blue, 2 orange, 3 aqua). Three slots is
+ * deliberate: those are the ones that clear the colour-blindness floors when
+ * every pair can appear together, which on a sunburst they can.
+ *
+ * Depth is carried by size and weight rather than a fourth and fifth hue, so a
+ * hub and its leaves read as one branch at a glance. Every node also carries an
+ * icon and a label, and the legend names each kind — colour is never alone.
+ */
+export const BRANCH_MARK: Record<string, string> = {
+  company: "text-foreground",
+  work: "text-[#2a78d6] dark:text-[#3987e5]",
+  capability: "text-[#eb6834] dark:text-[#d95926]",
+  tools: "text-[#1baf7a] dark:text-[#199e70]",
 };
-
-/** Recharts series config for the Overview's two charts. Single series each. */
-export const CHART_CONFIG = {
-  value: { label: "Cards touched", theme: { light: "#2a78d6", dark: "#3987e5" } },
-  count: { label: "Cards", theme: { light: "#2a78d6", dark: "#3987e5" } },
-} satisfies ChartConfig;
