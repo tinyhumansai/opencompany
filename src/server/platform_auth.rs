@@ -738,6 +738,36 @@ mod test {
         assert!(JwtPlatformVerifier::new(secret).verify(&tampered).is_err());
     }
 
+    /// `alg: "none"` is the oldest JWT forgery there is: drop the signature,
+    /// keep whatever payload you like, and hope the verifier honors the header's
+    /// choice of algorithm. `Validation::new(Algorithm::HS256)` pins the
+    /// algorithm so it does not, and clearing `required_spec_claims` does not
+    /// loosen that — but only a test says so out loud. The same claims, signed,
+    /// are accepted, which leaves the header as the only thing the rejection can
+    /// be about.
+    #[cfg(feature = "platform-jwt")]
+    #[test]
+    fn jwt_verifier_refuses_an_unsigned_token() {
+        let secret = "signing-secret";
+        let claims = json!({"tenant": "tenant:victim", "scopes": ["platform", "operator"]});
+
+        // Assembled literally, from nothing but the wire shape: header, payload,
+        // and the empty signature an `alg: none` token carries.
+        let unsigned = format!(
+            "{}.{}.",
+            b64url_encode(br#"{"alg":"none","typ":"JWT"}"#),
+            b64url_encode(&serde_json::to_vec(&claims).expect("claims"))
+        );
+
+        assert!(
+            JwtPlatformVerifier::new(secret).verify(&unsigned).is_err(),
+            "an unsigned `alg: none` token must not resolve to platform claims"
+        );
+
+        let signed = sign(secret, &claims);
+        assert!(JwtPlatformVerifier::new(secret).verify(&signed).is_ok());
+    }
+
     #[test]
     fn unrecognized_token_is_rejected() {
         let verifier = StaticPlatformVerifier::new("top-secret");
