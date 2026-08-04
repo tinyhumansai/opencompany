@@ -3191,6 +3191,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::json!({ "counterparty": "annual-return" }),
             agent: None,
+            run_id: None,
         })
         .await
         .unwrap();
@@ -3203,6 +3204,7 @@ mod test {
             first_time_counterparty: false,
             payload: serde_json::Value::Null,
             agent: None,
+            run_id: None,
         })
         .await
         .unwrap();
@@ -3257,6 +3259,7 @@ mod test {
                 first_time_counterparty: false,
                 payload: serde_json::Value::Null,
                 agent: None,
+                run_id: None,
             })
             .await
             .unwrap();
@@ -3330,6 +3333,10 @@ mod test {
                 first_time_counterparty: false,
                 payload: args.clone(),
                 agent: Some("finance".into()),
+                // #242's attempt id. Stamped at dispatch; this test drives the
+                // host directly, so there is no attempt behind it — which is
+                // orthogonal to the card, and exactly why both fields exist.
+                run_id: None,
             })
             .await
             .unwrap();
