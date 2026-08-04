@@ -20,7 +20,6 @@ import {
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
@@ -81,38 +80,26 @@ interface NavItem {
   icon: LucideIcon;
 }
 
-interface NavGroup {
-  label: string;
-  items: NavItem[];
-}
-
-const NAV: NavGroup[] = [
-  {
-    label: "Operate",
-    items: [
-      { view: "overview", label: "Overview", icon: LayoutDashboard },
-      { view: "chat", label: "Chat", icon: MessagesSquare },
-      { view: "tasks", label: "Tasks", icon: SquareKanban },
-      { view: "skills", label: "Skills", icon: Sparkles },
-      { view: "workspace", label: "Workspace", icon: FolderClosed },
-      { view: "memory", label: "Memory", icon: Brain },
-      { view: "approvals", label: "Approvals", icon: ShieldCheck },
-      { view: "workflows", label: "Workflows", icon: Workflow },
-    ],
-  },
-  {
-    label: "Configure",
-    items: [
-      { view: "finances", label: "Finances", icon: Wallet },
-      { view: "settings", label: "Settings", icon: Settings2 },
-    ],
-  },
+// One flat list. The nav was grouped under "Operate" and "Configure" when the
+// second group held five entries; now that configuration is a section of its
+// own, a heading over two rows labelled more than it sorted.
+const NAV: NavItem[] = [
+  { view: "overview", label: "Overview", icon: LayoutDashboard },
+  { view: "chat", label: "Chat", icon: MessagesSquare },
+  { view: "tasks", label: "Tasks", icon: SquareKanban },
+  { view: "skills", label: "Skills", icon: Sparkles },
+  { view: "workspace", label: "Workspace", icon: FolderClosed },
+  { view: "memory", label: "Memory", icon: Brain },
+  { view: "approvals", label: "Approvals", icon: ShieldCheck },
+  { view: "workflows", label: "Workflows", icon: Workflow },
+  { view: "finances", label: "Finances", icon: Wallet },
+  { view: "settings", label: "Settings", icon: Settings2 },
 ];
 
 // Two views are routable without a nav entry: Feedback, which the sidebar
 // footer links to, and Inbox, which is unfinished and hidden until it is worth
 // showing — `#/inbox` still resolves so the work stays reachable.
-const VIEWS: View[] = [...NAV.flatMap((g) => g.items.map((i) => i.view)), "feedback", "inbox"];
+const VIEWS: View[] = [...NAV.map((i) => i.view), "feedback", "inbox"];
 
 interface Props {
   client: OpenCompanyClient;
@@ -153,28 +140,25 @@ export function AppShell({
           <SidebarCollapseToggle />
         </SidebarHeader>
         <SidebarContent>
-          {NAV.map((group) => (
-            <SidebarGroup key={group.label}>
-              <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
-              <SidebarMenu>
-                {group.items.map((item) => (
-                  <SidebarMenuItem key={item.view}>
-                    <SidebarMenuButton
-                      isActive={view === item.view}
-                      tooltip={item.label}
-                      onClick={() => setView(item.view)}
-                    >
-                      <item.icon />
-                      <span>{item.label}</span>
-                    </SidebarMenuButton>
-                    {item.view === "approvals" && pending > 0 && (
-                      <SidebarMenuBadge>{pending}</SidebarMenuBadge>
-                    )}
-                  </SidebarMenuItem>
-                ))}
-              </SidebarMenu>
-            </SidebarGroup>
-          ))}
+          <SidebarGroup>
+            <SidebarMenu>
+              {NAV.map((item) => (
+                <SidebarMenuItem key={item.view}>
+                  <SidebarMenuButton
+                    isActive={view === item.view}
+                    tooltip={item.label}
+                    onClick={() => setView(item.view)}
+                  >
+                    <item.icon />
+                    <span>{item.label}</span>
+                  </SidebarMenuButton>
+                  {item.view === "approvals" && pending > 0 && (
+                    <SidebarMenuBadge>{pending}</SidebarMenuBadge>
+                  )}
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroup>
         </SidebarContent>
         <SidebarFooter>
           <SidebarControls
