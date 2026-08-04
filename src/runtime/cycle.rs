@@ -45,7 +45,7 @@ use crate::runtime::delegation_tools::{
     unknown_desk_message,
 };
 use crate::runtime::grants::GrantedCall;
-use crate::runtime::journal::TaskLink;
+use crate::runtime::journal::{ExecutedEffect, TaskLink};
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 
@@ -171,6 +171,10 @@ impl<'a> CycleRunner<'a> {
         };
 
         // 4. Think + 5. Gate — the host services callbacks and gates effects.
+        // The card this cycle is working (issue #351) is read off the trigger
+        // events before `request` is handed to the brain, and is a different
+        // granularity from #242's `run_id`: which *card* an effect belongs to,
+        // not which attempt at it. Both ride the same cycle.
         let host = CycleHostImpl::new(
             company.clone(),
             cycle_id.clone(),
@@ -218,13 +222,21 @@ impl<'a> CycleRunner<'a> {
         // cycle over the bookkeeping write would discard real model output to
         // record something whose only consequence is that a restart might re-arm
         // a spent grant (which then re-asks the operator — the safe direction).
+        //
+        // Issue #351: this is also where an operator-approved *tool call* gets
+        // described. It never passes through `execute_effect_once` — approving
+        // it mints a grant, and the tool runs inside the agent's next turn — so
+        // without a description here an approved `composio_execute` payment
+        // would reach no retry dialog at all.
         for id in self.rt.grants.drain_consumed() {
-            if let Err(err) = self.rt.journal.record_grant_consumed(&id).await {
+            let executed = self.consumed_grant_effect(&id);
+            if let Err(err) = self.rt.journal.record_grant_consumed(&id, executed).await {
                 tracing::warn!(
                     approval_id = %id,
                     error = %err,
                     "[approval] a grant was redeemed but its journal record failed; \
-                     a restart before it is re-written may re-arm it"
+                     a restart before it is re-written may re-arm it, and the call \
+                     it admitted will not be named on a retry confirmation"
                 );
             }
         }
@@ -480,6 +492,14 @@ working on):\n{}\n]",
     ///   `ApprovalResolved` arm re-dispatches the agent to re-issue the call for
     ///   real.
     ///
+    /// Both forks are described for the retry warning (issue #351), but at
+    /// different moments, because "it ran" happens at different moments. A
+    /// native effect is described by `execute_effect_once` as it commits. A tool
+    /// call is described when its grant is **redeemed** — minting one only means
+    /// the agent is now allowed to make the call, and describing it here would
+    /// warn about a payment for a grant that then quietly expired unused. See
+    /// [`consumed_grant_effect`](Self::consumed_grant_effect).
+    ///
     /// The journal record is written **before** the grant enters the live set.
     /// A crash between the two therefore replays as "granted", re-arming it —
     /// the safe direction. The reverse order would lose the operator's approval
@@ -488,7 +508,17 @@ working on):\n{}\n]",
     async fn settle_approved_effect(&self, id: &ApprovalId, effect: Effect) -> Result<()> {
         let Some(agent) = effect.agent.clone() else {
             let key = format!("approval:{id}");
-            return execute_effect_once(self.rt, &key, &effect).await;
+            // The card that asked for this sign-off (issue #351). It is not
+            // this call's caller — an approval is resolved from the Approvals
+            // page, which knows only an id — so it comes off the parked record,
+            // which `record_resolved` deliberately does not erase.
+            let task_id = self
+                .rt
+                .journal
+                .approval_task(id)
+                .flatten()
+                .and_then(|task| task.task_id().map(str::to_string));
+            return execute_effect_once(self.rt, &key, &effect, task_id.as_deref()).await;
         };
         self.mint_grant(id, agent, effect).await
     }
@@ -514,6 +544,44 @@ working on):\n{}\n]",
             "[approval] minted a single-use grant; the agent will re-issue the call"
         );
         Ok(())
+    }
+
+    /// Describes a grant the agent just redeemed, so an operator-approved tool
+    /// call is named on the retry confirmation like a native effect is
+    /// (issue #351).
+    ///
+    /// The three facts all come off records the journal already keeps, joined on
+    /// the [`ApprovalId`] the redemption reports:
+    ///
+    /// * **what it was** — the effect the approval was parked with (or the
+    ///   amended one, which is what the grant was minted against). Read back
+    ///   rather than re-projected from the grant's tool name and arguments, so
+    ///   there is one projection and the operator is told about the call they
+    ///   actually saw;
+    /// * **whose card it was** — the same `approval_task` join the native
+    ///   approved path uses;
+    /// * **whether it can be taken back** — the same
+    ///   `ManifestApprovalGate::is_irreversible`, asked at the moment the tool
+    ///   ran rather than re-derived when somebody later opens the dialog.
+    ///
+    /// `None` when the park record is not recoverable — a grant rehydrated from
+    /// a journal whose park line predates this field, say. The redemption is
+    /// still journaled; it simply contributes no warning, which is the same
+    /// additive degradation a pre-#351 `EffectExecuted` line has.
+    fn consumed_grant_effect(&self, id: &ApprovalId) -> Option<ExecutedEffect> {
+        let effect = self.rt.journal.approval_effect(id)?;
+        Some(ExecutedEffect {
+            kind: effect.kind.clone(),
+            amount_usd: effect.amount_usd,
+            task_id: self
+                .rt
+                .journal
+                .approval_task(id)
+                .flatten()
+                .and_then(|task| task.task_id().map(str::to_string)),
+            at_millis: now_millis(),
+            irreversible: self.rt.approval_gate.is_irreversible(&effect),
+        })
     }
 
     /// The deterministic answer to resolving an approval that is already gone.
@@ -678,11 +746,34 @@ pub(crate) async fn execute_effect_once(
     rt: &CompanyRuntime,
     key: &str,
     effect: &Effect,
+    task_id: Option<&str>,
 ) -> Result<()> {
     if rt.journal.is_executed(key) {
         return Ok(());
     }
-    rt.journal.record_executed(key).await?;
+    // The commit now describes what it is committing (issue #351). Classified
+    // here, against the gate in force at execution time, because this is the one
+    // place that has both the effect and the policy — and because "was this
+    // irreversible?" is a question about the moment it ran, not about whatever
+    // the cap happens to be when somebody later opens the retry dialog.
+    //
+    // The record describes what is *committed to run*, and stands even if
+    // `perform_effect` below then fails — that ordering is the at-most-once
+    // guarantee, and the runtime will never re-attempt the effect afterwards, so
+    // an operator has to assume it happened. Every wording downstream is
+    // qualified to match; see [`ExecutedEffect`].
+    rt.journal
+        .record_executed(
+            key,
+            ExecutedEffect {
+                kind: effect.kind.clone(),
+                amount_usd: effect.amount_usd,
+                task_id: task_id.map(str::to_string),
+                at_millis: now_millis(),
+                irreversible: rt.approval_gate.is_irreversible(effect),
+            },
+        )
+        .await?;
     perform_effect(rt, effect).await
 }
 
@@ -948,7 +1039,7 @@ impl<'a> CycleHostImpl<'a> {
             PolicyDecision::Allow => {
                 let idx = self.counter.fetch_add(1, Ordering::Relaxed);
                 let key = format!("{}:{idx}", self.cycle_id);
-                execute_effect_once(self.rt, &key, &effect).await?;
+                execute_effect_once(self.rt, &key, &effect, self.task_id.as_deref()).await?;
                 self.executed
                     .lock()
                     .expect("executed poisoned")
@@ -1771,9 +1862,9 @@ mod test {
             run_id: None,
         };
 
-        execute_effect_once(&rt, "k1", &effect).await.unwrap();
+        execute_effect_once(&rt, "k1", &effect, None).await.unwrap();
         // Same key again: skipped, no second ledger entry.
-        execute_effect_once(&rt, "k1", &effect).await.unwrap();
+        execute_effect_once(&rt, "k1", &effect, None).await.unwrap();
 
         let record = rt.store().load(rt.id()).await.unwrap().unwrap();
         assert_eq!(record.ledger.len(), 1);
@@ -1784,7 +1875,9 @@ mod test {
             .await
             .unwrap();
         assert!(rt2.journal.is_executed("k1"));
-        execute_effect_once(&rt2, "k1", &effect).await.unwrap();
+        execute_effect_once(&rt2, "k1", &effect, None)
+            .await
+            .unwrap();
         let record = rt2.store.load(rt2.id()).await.unwrap().unwrap();
         assert_eq!(record.ledger.len(), 1);
     }
@@ -2044,7 +2137,10 @@ mod test {
                 .is_some()
         );
         for spent in rt2.grants.drain_consumed() {
-            rt2.journal.record_grant_consumed(&spent).await.unwrap();
+            rt2.journal
+                .record_grant_consumed(&spent, None)
+                .await
+                .unwrap();
         }
         drop(rt2);
 

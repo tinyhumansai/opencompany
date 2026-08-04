@@ -469,6 +469,52 @@ struct TaskApproval {
     waited_millis: Option<u64>,
 }
 
+/// One irreversible effect this task already executed (issue #351).
+///
+/// Drawn from the runtime journal's executed record — the same append-only set
+/// that makes an effect at-most-once — and **not** from the timeline. A
+/// timeline row says what an agent reported; this says what the runtime
+/// committed to run, and only the two together make a retry warning
+/// trustworthy.
+///
+/// "Committed", not "completed": the journal writes the record before the effect
+/// is performed, which is what makes it at-most-once, and the runtime never
+/// re-attempts it afterwards. An entry is therefore something the operator must
+/// assume happened, not something proven to have finished — the console's
+/// wording is qualified to match.
+///
+/// `kind` is the dotted effect kind, the same vocabulary the Approvals page
+/// already receives and maps to plain language client-side (`effectAction` in
+/// `frontend/src/lib/language.ts`). Sending the key and rendering the sentence
+/// keeps operator-facing wording in the one layer the glossary rule puts it in,
+/// rather than growing a second copy on the host.
+///
+/// Deliberately no payload. The journal does not retain one for an executed
+/// effect, so a recipient or a message body cannot reach this response even by
+/// accident — the same scrub discipline [`TimelineEntry`] documents.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IrreversibleEffect {
+    /// The dotted effect kind, e.g. `payment.send`.
+    kind: String,
+    /// Epoch-millis the effect was committed.
+    at_millis: u64,
+    /// The USD amount involved, if any — what makes "sent a payment" into
+    /// "sent a payment of $2,400".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_usd: Option<f64>,
+}
+
+impl From<crate::runtime::journal::ExecutedEffect> for IrreversibleEffect {
+    fn from(e: crate::runtime::journal::ExecutedEffect) -> Self {
+        Self {
+            kind: e.kind,
+            at_millis: e.at_millis,
+            amount_usd: e.amount_usd,
+        }
+    }
+}
+
 /// A neighbouring card in the lineage, trimmed to what a link needs.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -546,6 +592,24 @@ struct TaskDetail {
     /// an approval parked right now, blocking this card. This is the real
     /// query, joined on the task id the approval was parked with.
     approvals: Vec<TaskApproval>,
+    /// What this task has already done that cannot be undone (issue #351),
+    /// oldest first. Empty for a task that only read, thought, and replied.
+    ///
+    /// Re-running a task re-runs its effects. The console gates Retry behind a
+    /// confirmation that names these, and shows no confirmation at all when the
+    /// list is empty — so this array is the whole difference between one click
+    /// and a stop-and-read.
+    irreversible_effects: Vec<IrreversibleEffect>,
+    /// Whether the company's journal holds executed history it cannot describe
+    /// (issue #351) — records written before descriptions existed.
+    ///
+    /// Company-wide, not per-task, because an undescribed record carries no card
+    /// either; there is nothing to attribute it to. It is the qualifier on the
+    /// field above: an empty `irreversibleEffects` means "this card did nothing
+    /// irreversible" only while this is `false`. When it is `true` the console
+    /// confirms a retry regardless and says earlier activity cannot be
+    /// described, rather than presenting a gap as an all-clear.
+    history_incomplete: bool,
     /// The card's discussion thread, oldest first (issue #335).
     ///
     /// Served here rather than from a route of its own so the Discussion tab
@@ -588,7 +652,7 @@ struct TaskDetail {
 
 /// `GET …/tasks/{task_id}` — the Task Detail screen's single read (issue #185).
 ///
-/// Assembles four things the console would otherwise have to stitch client-side
+/// Assembles six things the console would otherwise have to stitch client-side
 /// (and could not, for the journal-derived halves):
 ///
 /// * **header** — the card itself;
@@ -605,9 +669,15 @@ struct TaskDetail {
 ///   (issue #333). An approval parked by a build older than that carries no id,
 ///   and only those fall back to the old run-window correlation — so a second
 ///   card worked in the same window can no longer absorb this one's sign-offs;
-/// * **lineage** — parent and children, from `parent_task_id`.
+/// * **lineage** — parent and children, from `parent_task_id`;
+/// * **irreversible effects** — what the task already did that a retry would
+///   do again (issue #351), read straight off the journal's executed record,
+///   plus the `historyIncomplete` qualifier saying whether that record can
+///   describe everything it holds;
+/// * **runs** — the card's recorded attempts (issue #242), read from the run
+///   store rather than the journal.
 ///
-/// Issue #335 added a fifth, **discussion** — the card's own message thread,
+/// Issue #335 added the seventh, **discussion** — the card's own message thread,
 /// folded out of the same journal traversal from
 /// [`TaskDiscussionPosted`](CompanyEvent::TaskDiscussionPosted). It is a
 /// separate array rather than another timeline `kind` because the two answer
@@ -739,6 +809,16 @@ async fn task_detail(
     }));
     approvals.sort_by(|a, b| a.at_millis.cmp(&b.at_millis).then_with(|| a.id.cmp(&b.id)));
 
+    // What a retry would re-do (issue #351). A pure journal read — one indexed
+    // lookup, no event scan — so a task that did nothing irreversible costs
+    // nothing extra however long the company has been running.
+    let irreversible_effects = company
+        .runtime
+        .irreversible_effects(&task_id)
+        .into_iter()
+        .map(IrreversibleEffect::from)
+        .collect();
+
     // An indexed store read, not another journal pass (issue #242).
     let runs = runs_for_task(&company, &task_id).await?;
 
@@ -746,6 +826,8 @@ async fn task_detail(
         task: card.into(),
         timeline,
         approvals,
+        irreversible_effects,
+        history_incomplete: company.runtime.has_undescribed_history(),
         discussion,
         discussion_has_more,
         lineage: Lineage { parent, children },
