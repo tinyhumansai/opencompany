@@ -37,6 +37,16 @@
 //!   unrecoverable. Picking a winner is the same bet with the loser deleted.
 //! - The nest directory is removed only once emptied, so a crash mid-loop simply
 //!   resumes on the next boot. Idempotent by construction.
+//! - The database and its `-wal`/`-shm` siblings resume the same way: the set is
+//!   detected from *any* surviving member, not from the database alone, so a run
+//!   that moved the database and then died is finished by the next boot rather
+//!   than being mistaken for a completed one.
+//! - Only **regular files** are ever treated as the database. A company slugged
+//!   `opencompany.db` owns the directory at that exact path, and moving it would
+//!   delete the company.
+//! - A source another process moved first is a success, not a failure: `serve`
+//!   and a hand-run `export` against one home both migrate, and neither should
+//!   abort because the other won the race.
 //!
 //! Moves are announced on stderr rather than through `warn!`: the default
 //! `EnvFilter` drops warnings unless `RUST_LOG` is set, which would make the
@@ -190,8 +200,9 @@ fn migrate_bundles(companies: &Path, migration: &mut NestMigration) -> Result<()
             });
             continue;
         }
-        rename(&legacy, &destination)?;
-        migration.moved.push((Relocated::Company, destination));
+        if rename_or_already_moved(&legacy, &destination)? {
+            migration.moved.push((Relocated::Company, destination));
+        }
     }
 
     // Only once emptied. A skipped collision keeps the nest, and the next boot
@@ -211,18 +222,36 @@ fn migrate_bundles(companies: &Path, migration: &mut NestMigration) -> Result<()
 /// A hosted tenant never has one: it resolves its home to the data root, so its
 /// database is written at `<root>/opencompany.db` to begin with.
 fn migrate_sqlite(home: &Path, companies: &Path, migration: &mut NestMigration) -> Result<()> {
-    // The second and last `stat` a settled install pays. The siblings are only
-    // looked for once the database itself is here.
-    if !exists(&companies.join(SQLITE_DB)) {
+    // **Regular files only.** A company whose slug happens to be
+    // `opencompany.db` has its canonical bundle at exactly
+    // `<home>/companies/opencompany.db`, and a bare existence check accepts that
+    // directory. Moving it up would delete the company from every bundle lookup
+    // and hand sqlite a directory to open. `slug` permits `.`, so this is a name
+    // an operator can really have.
+    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for name in LEGACY_SQLITE_FILES {
+        let legacy = companies.join(name);
+        if is_regular_file(&legacy)? {
+            moves.push((legacy, home.join(name)));
+        }
+    }
+    // Detection deliberately does **not** hinge on the database file alone. A
+    // previous run that moved `opencompany.db` and then died would leave the
+    // `-wal` behind, and keying off the database would read that as "already
+    // migrated" — pairing a relocated database with a stranded write-ahead log,
+    // which loses committed transactions. Any surviving member of the set is a
+    // migration to resume, so the next boot finishes what the last one started.
+    if moves.is_empty() {
         return Ok(());
     }
-    let moves: Vec<(PathBuf, PathBuf)> = LEGACY_SQLITE_FILES
-        .iter()
-        .map(|name| (companies.join(name), home.join(name)))
-        .filter(|(legacy, _)| exists(legacy))
-        .collect();
-    // Move the set or none of it. A half-move pairs a relocated database with a
-    // stranded write-ahead log, which is worse than not moving at all.
+    // An occupied destination among the files still to move means two databases,
+    // i.e. two histories. Skip the whole set and say so.
+    //
+    // A resumed half-move is not this case: there the database is already at its
+    // destination and is no longer among `moves`, so only the stranded siblings
+    // are checked and they find their destinations free. The one shape that
+    // cannot be told apart — a legacy `-wal` with no legacy `.db`, beside an
+    // unrelated canonical database — is not one sqlite produces.
     if let Some((legacy, destination)) = moves.iter().find(|(_, dest)| exists(dest)) {
         migration.collisions.push(Collision {
             what: Relocated::Database,
@@ -232,8 +261,9 @@ fn migrate_sqlite(home: &Path, companies: &Path, migration: &mut NestMigration) 
         return Ok(());
     }
     for (legacy, destination) in moves {
-        rename(&legacy, &destination)?;
-        migration.moved.push((Relocated::Database, destination));
+        if rename_or_already_moved(&legacy, &destination)? {
+            migration.moved.push((Relocated::Database, destination));
+        }
     }
     Ok(())
 }
@@ -269,16 +299,42 @@ fn read_dir_names(dir: &Path) -> Result<Vec<std::ffi::OsString>> {
         .collect()
 }
 
-/// Renames within one directory tree, reporting the source path on failure.
+/// Whether `path` is a regular file, following no symlink. Absent is `false`;
+/// an unreadable path is an error rather than a silent `false`.
+fn is_regular_file(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(OpenCompanyError::StoreIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Renames within one directory tree, returning whether *this* call performed
+/// the move.
 ///
-/// A failure aborts the boot rather than continuing with half an install: a
+/// A source that vanished between enumeration and rename, whose destination now
+/// exists, is another process having migrated it first — `Ok(false)`, not a
+/// failure. Running `opencompany export` against a home a `serve` process is
+/// booting is ordinary, and both commands migrate; aborting one of them on a
+/// `NotFound` that means "already done" would be a boot failure with nothing
+/// wrong behind it.
+///
+/// Every other failure aborts rather than continuing with half an install: a
 /// runtime that silently comes up missing companies is the exact symptom this
-/// migration exists to prevent.
-fn rename(from: &Path, to: &Path) -> Result<()> {
-    std::fs::rename(from, to).map_err(|source| OpenCompanyError::StoreIo {
-        path: from.to_path_buf(),
-        source,
-    })
+/// migration exists to prevent. A `NotFound` with the destination *also* absent
+/// is such a failure (a missing destination parent, say) and propagates.
+fn rename_or_already_moved(from: &Path, to: &Path) -> Result<bool> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && exists(to) => Ok(false),
+        Err(source) => Err(OpenCompanyError::StoreIo {
+            path: from.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +599,78 @@ mod test {
         assert_eq!(migration.collisions.len(), 1);
         assert!(!home.path().join("opencompany.db").exists());
         assert!(home.path().join("companies/opencompany.db").exists());
+    }
+
+    #[test]
+    fn a_company_slugged_like_the_database_is_never_moved_as_one() {
+        // `slug` permits `.`, so a company really can be called
+        // `opencompany.db` — and its canonical bundle is at exactly the path the
+        // legacy database would occupy. Moving that directory up would delete the
+        // company from every bundle lookup and hand sqlite a directory to open.
+        let home = TempHome::new("db-named-company");
+        home.bundle("companies/opencompany.db");
+        home.write("companies/opencompany.db/events.jsonl", "a real company\n");
+
+        let migration = migrate_legacy_nest(home.path()).expect("leaves the bundle alone");
+
+        assert!(migration.is_empty(), "{migration:?}");
+        assert!(
+            home.path()
+                .join("companies/opencompany.db/company.toml")
+                .exists()
+        );
+        assert!(
+            !home.path().join("opencompany.db").exists(),
+            "the bundle must not be relocated as a database"
+        );
+    }
+
+    #[test]
+    fn a_half_moved_database_set_is_finished_on_the_next_run() {
+        // A run that moved `opencompany.db` and then died leaves the sidecars
+        // behind. Keying detection off the database alone would call that
+        // finished, pairing a relocated database with a stranded write-ahead log
+        // — losing whatever the log still held.
+        let home = TempHome::new("half-moved-db");
+        home.write("opencompany.db", "already moved");
+        home.write("companies/opencompany.db-wal", "stranded wal");
+        home.write("companies/opencompany.db-shm", "stranded shm");
+
+        let migration = migrate_legacy_nest(home.path()).expect("resumes");
+
+        assert_eq!(migration.moved.len(), 2, "{migration:?}");
+        assert!(migration.collisions.is_empty(), "{migration:?}");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("opencompany.db-wal")).unwrap(),
+            "stranded wal"
+        );
+        assert!(home.path().join("opencompany.db-shm").exists());
+        assert!(!home.path().join("companies/opencompany.db-wal").exists());
+        // The already-moved database is untouched.
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("opencompany.db")).unwrap(),
+            "already moved"
+        );
+    }
+
+    #[test]
+    fn a_source_another_process_already_moved_is_not_a_failure() {
+        // `serve` booting and a hand-run `export` against one home both migrate.
+        // Losing that race must not abort the loser with a NotFound that means
+        // "already done".
+        let home = TempHome::new("raced");
+        let destination = home.write("companies/acme/company.toml", "[company]\n");
+        let vanished = home.path().join("companies/companies/acme/company.toml");
+
+        assert!(
+            !rename_or_already_moved(&vanished, &destination).expect("tolerated"),
+            "a vanished source whose destination now exists did not move here",
+        );
+
+        // A NotFound with the destination *also* absent is a real failure and
+        // still propagates, so this tolerance cannot mask a broken migration.
+        let nowhere = home.path().join("companies/companies/globex/company.toml");
+        assert!(rename_or_already_moved(&vanished, &nowhere).is_err());
     }
 
     #[test]

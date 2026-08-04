@@ -117,11 +117,25 @@ company invisible, so `serve`, `export`, and `import` all run
   bundle slugged `companies` and is left exactly as it is.
 - Every other entry is renamed up one level, and any `opencompany.db` (with its
   `-wal`/`-shm` siblings, as a set) moves from `<home>/companies/` to `<home>/`.
+  Only **regular files** count as the database: a company slugged
+  `opencompany.db` owns the directory at that exact path, and relocating it would
+  delete the company.
 - An occupied destination is **skipped**, never merged: two copies of one company
   hold two event logs and two signing keys, which cannot be interleaved. Both
   copies stay put and a warning names both paths.
 - The nest directory is removed only once emptied, so a crash mid-migration
   resumes on the next boot. Re-running a migrated install is silent.
+- The database set resumes the same way. It is detected from **any** surviving
+  member, not from `opencompany.db` alone, so a run that moved the database and
+  then died is finished by the next boot rather than being read as complete —
+  which would have paired a relocated database with a stranded write-ahead log
+  and lost whatever that log still held.
+- A source another process moved first is a success, not a failure. Running
+  `opencompany export` against a home a `serve` process is booting is ordinary
+  and both migrate; the loser of that race must not abort on a `NotFound` that
+  means "already done". Note that this is race *tolerance*, not a concurrency
+  guarantee: two processes sharing one home is unsupported for the same reason
+  the runtime journal is single-writer, and this migration does not change that.
 
 Moves are printed on stderr rather than logged through `warn!`, which the default
 `EnvFilter` drops unless `RUST_LOG` is set.
