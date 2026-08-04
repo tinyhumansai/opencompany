@@ -6,7 +6,6 @@ import {
   Inbox,
   LayoutDashboard,
   type LucideIcon,
-  MessageSquareWarning,
   MessagesSquare,
   Plug,
   Settings2,
@@ -128,13 +127,11 @@ const NAV: NavGroup[] = [
       { view: "settings", label: "Settings", icon: Settings2 },
     ],
   },
-  {
-    label: "Support",
-    items: [{ view: "feedback", label: "Feedback", icon: MessageSquareWarning }],
-  },
 ];
 
-const VIEWS = NAV.flatMap((g) => g.items.map((i) => i.view));
+// Feedback is reachable from the sidebar footer rather than the nav, but it
+// is still a real view — keep it routable so `#/feedback` resolves.
+const VIEWS: View[] = [...NAV.flatMap((g) => g.items.map((i) => i.view)), "feedback"];
 
 interface Props {
   client: OpenCompanyClient;
@@ -210,6 +207,8 @@ export function AppShell({
             activeCompany={company}
             onSwitchCompany={onSwitchCompany}
             onBackToPicker={onBackToPicker}
+            view={view}
+            onNavigate={setView}
           />
         </SidebarFooter>
         <SidebarRail />

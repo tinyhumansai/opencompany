@@ -1,6 +1,7 @@
-import { Building2, PanelLeft } from "lucide-react";
+import { Building2, MessageSquareWarning, PanelLeft } from "lucide-react";
 
 import type { CompanyStatus } from "@/api/types";
+import type { View } from "@/components/app-shell";
 
 import {
   DropdownMenu,
@@ -33,6 +34,9 @@ interface Props {
   activeCompany: string | null;
   onSwitchCompany: (id: string) => void;
   onBackToPicker?: () => void;
+  /** The active view, so the Feedback row can show as selected. */
+  view: View;
+  onNavigate: (view: View) => void;
 }
 
 /**
@@ -50,6 +54,8 @@ export function SidebarControls({
   activeCompany,
   onSwitchCompany,
   onBackToPicker,
+  view,
+  onNavigate,
 }: Props) {
   const { toggleSidebar, state } = useSidebar();
   const { label, tone } = lifecycle(lifecycleState);
@@ -70,6 +76,19 @@ export function SidebarControls({
             />
           </span>
           <span>{label}</span>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+
+      {/* Feedback is a destination like any nav item, but it belongs with the
+          standing controls at the bottom rather than in the working nav. */}
+      <SidebarMenuItem>
+        <SidebarMenuButton
+          tooltip="Feedback"
+          isActive={view === "feedback"}
+          onClick={() => onNavigate("feedback")}
+        >
+          <MessageSquareWarning />
+          <span>Feedback</span>
         </SidebarMenuButton>
       </SidebarMenuItem>
 
