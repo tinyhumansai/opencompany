@@ -31,7 +31,11 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar";
 import { FeedbackDialog } from "@/components/feedback-dialog";
-import { SidebarCollapseToggle, SidebarControls } from "@/components/sidebar-controls";
+import {
+  AutoCollapse,
+  SidebarCollapseToggle,
+  SidebarControls,
+} from "@/components/sidebar-controls";
 import { useCompany } from "@/hooks/use-company";
 import { useHashView } from "@/hooks/use-hash-view";
 import { Overview } from "@/views/Overview";
@@ -143,6 +147,7 @@ export function AppShell({
 
   return (
     <SidebarProvider>
+      <AutoCollapse view={view} />
       <Sidebar collapsible="icon">
         <SidebarHeader>
           <SidebarCollapseToggle />

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { Building2, MessageSquareWarning, PanelLeft } from "lucide-react";
 
 import type { CompanyStatus } from "@/api/types";
@@ -137,10 +138,11 @@ export function SidebarControls({
 /**
  * The collapse toggle, at the top of the sidebar.
  *
- * It sits above the nav rather than among the footer controls and wears the
- * primary color, because it is the one control here that acts on the sidebar
- * itself — everything below it navigates. The inverted fill also keeps it
- * findable once the rail is collapsed to icons.
+ * It sits above the nav rather than among the footer controls, because it is
+ * the one control here that acts on the sidebar itself — everything below it
+ * navigates. Expanded, it stays quiet and reads as another row; collapsed, it
+ * takes the primary fill, so the single control that gets the rail back is the
+ * one thing standing out in a column of identical icons.
  */
 export function SidebarCollapseToggle() {
   const { toggleSidebar, state } = useSidebar();
@@ -152,7 +154,10 @@ export function SidebarCollapseToggle() {
         <SidebarMenuButton
           tooltip={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           onClick={toggleSidebar}
-          className="bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/90 active:text-primary-foreground"
+          className={cn(
+            collapsed &&
+              "bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/90 active:text-primary-foreground",
+          )}
         >
           <PanelLeft className={cn("transition-transform", collapsed && "rotate-180")} />
           <span>Collapse</span>
@@ -161,3 +166,32 @@ export function SidebarCollapseToggle() {
     </SidebarMenu>
   );
 }
+
+/**
+ * Collapse the app's sidebar when entering a view that carries a nav of its
+ * own — Chat's channel rail, Settings' sub-page rail. Two full-width sidebars
+ * side by side leaves the actual content squeezed into what is left.
+ *
+ * It only ever collapses. Re-expanding on the way out would undo a collapse
+ * the operator chose for themselves, so leaving is their move to make.
+ *
+ * It fires once per arrival, tracked in a ref. `setOpen` is rebuilt whenever
+ * the sidebar's own open state changes, so an effect keyed on its identity
+ * would re-collapse the instant you expanded — pinning you shut for as long as
+ * you stayed on the view.
+ */
+export function AutoCollapse({ view }: { view: View }) {
+  const { setOpen } = useSidebar();
+  const acted = useRef<View | null>(null);
+
+  useEffect(() => {
+    if (acted.current === view) return;
+    acted.current = view;
+    if (NESTED_NAV_VIEWS.has(view)) setOpen(false);
+  }, [view, setOpen]);
+
+  return null;
+}
+
+/** The views that bring their own sidebar. */
+const NESTED_NAV_VIEWS = new Set<View>(["chat", "settings"]);
