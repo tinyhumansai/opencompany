@@ -1054,6 +1054,7 @@ async fn run_chat(
             // Nothing has run yet, so there is no deliverable to point at
             // (issue #339). The first successful settle stamps it.
             output: None,
+            plan: None,
         };
         if let Err(err) = runtime.upsert_task(&record).await {
             tracing::warn!(error = %err, "failed to open task card for chat request");

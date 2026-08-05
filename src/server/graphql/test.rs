@@ -737,6 +737,7 @@ async fn tasks_page_reflects_upserts_and_column_filter() {
                 origin_chat_id: None,
                 parent_task_id: None,
                 output: None,
+                plan: None,
             },
         )
         .await

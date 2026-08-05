@@ -677,6 +677,7 @@ async fn steer_task_validates_statuses_and_journals_acceptance() {
                 origin_chat_id: None,
                 parent_task_id: None,
                 output: None,
+                plan: None,
             },
         )
         .await
@@ -3266,6 +3267,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
         origin_chat_id: None,
         parent_task_id: parent.map(str::to_string),
         output: None,
+        plan: None,
     };
     for t in [
         card("t-parent", "Parent", None),
@@ -3449,6 +3451,7 @@ fn discussion_card(id: &str, title: &str) -> TaskRecord {
         origin_chat_id: None,
         parent_task_id: None,
         output: None,
+        plan: None,
     }
 }
 
@@ -3851,6 +3854,7 @@ async fn task_export_serves_a_readable_document_and_alters_nothing() {
                 origin_chat_id: None,
                 parent_task_id: None,
                 output: None,
+                plan: None,
             },
         )
         .await
@@ -3965,6 +3969,7 @@ async fn task_timeline_scopes_approvals_to_the_run_window() {
                 origin_chat_id: None,
                 parent_task_id: None,
                 output: None,
+                plan: None,
             },
         )
         .await
@@ -4064,6 +4069,7 @@ async fn dispatched_task(
                 origin_chat_id: None,
                 parent_task_id: None,
                 output: None,
+                plan: None,
             },
         )
         .await
@@ -4508,6 +4514,7 @@ async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals(
                 origin_chat_id: None,
                 parent_task_id: None,
                 output: None,
+                plan: None,
             },
         )
         .await

@@ -1586,6 +1586,7 @@ impl<'a> CycleHostImpl<'a> {
             // Nothing has run yet, so there is no deliverable to point at
             // (issue #339). The first successful settle stamps it.
             output: None,
+            plan: None,
         };
         self.rt.tasks().upsert(&self.company, &card).await?;
         Ok(ToolResult {
@@ -1677,6 +1678,7 @@ impl<'a> CycleHostImpl<'a> {
             // Nothing has run yet, so there is no deliverable to point at
             // (issue #339). The first successful settle stamps it.
             output: None,
+            plan: None,
         };
         self.rt.tasks().upsert(&self.company, &card).await?;
         Ok(ToolResult {
@@ -2177,6 +2179,7 @@ mod test {
                     // Nothing has run yet, so there is no deliverable to point at
                     // (issue #339). The first successful settle stamps it.
                     output: None,
+                    plan: None,
                 },
             )
             .await
@@ -2233,6 +2236,7 @@ mod test {
                     // Nothing has run yet, so there is no deliverable to point at
                     // (issue #339). The first successful settle stamps it.
                     output: None,
+                    plan: None,
                 },
             )
             .await
@@ -4809,6 +4813,7 @@ mod test {
                     // Nothing has run yet, so there is no deliverable to point at
                     // (issue #339). The first successful settle stamps it.
                     output: None,
+                    plan: None,
                 },
             )
             .await
@@ -4876,6 +4881,7 @@ mod test {
                     // Nothing has run yet, so there is no deliverable to point at
                     // (issue #339). The first successful settle stamps it.
                     output: None,
+                    plan: None,
                 },
             )
             .await

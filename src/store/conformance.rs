@@ -709,6 +709,7 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
         origin_chat_id: None,
         parent_task_id: None,
         output: None,
+        plan: None,
     };
 
     tasks.upsert(&alpha, &task("t1", "todo", 1)).await.unwrap();

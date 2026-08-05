@@ -93,6 +93,19 @@ pub(crate) struct TaskCard {
     /// for every card that carried no output before this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<crate::ports::tasks::TaskOutput>,
+    /// The brief the last planning pass wrote (issue #337).
+    ///
+    /// Projected verbatim rather than reshaped: the host already decided every
+    /// prerequisite verdict, and a second transcription here is how the badge
+    /// the console renders drifts from the verdict the dispatch gate used.
+    /// Omitted for a card nobody has planned, which is every card until it is
+    /// dragged into Planning — so the board's existing wire shape is unchanged.
+    ///
+    /// Nothing secret can ride here: the pass never puts a credential *value*
+    /// in front of the model, and a prerequisite carries only a name and a
+    /// verdict. See `docs/spec/runtime/planning.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plan: Option<crate::ports::tasks::TaskPlan>,
 }
 
 impl From<TaskRecord> for TaskCard {
@@ -108,6 +121,7 @@ impl From<TaskRecord> for TaskCard {
             parent_task_id: t.parent_task_id,
             origin_chat_id: t.origin_chat_id,
             output: t.output,
+            plan: t.plan,
         }
     }
 }
@@ -327,6 +341,11 @@ async fn create_task(
         // Nothing has run yet, so there is no deliverable to point at
         // (issue #339). The first successful settle stamps it.
         output: None,
+        // Issue #337: a plan is something the host *produces*, never something
+        // intake accepts. Nothing on the create body can set it, so a client
+        // cannot post a card that already claims to be planned — and cannot
+        // forge the prerequisite verdicts that decide whether it dispatches.
+        plan: None,
     };
     company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))

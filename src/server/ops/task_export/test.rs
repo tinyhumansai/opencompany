@@ -45,6 +45,7 @@ fn card(title: &str) -> TaskCard {
         // route would be a dead address in it. The deliverable itself is what
         // the export would have to carry, and that is a different change.
         output: None,
+        plan: None,
     }
 }
 

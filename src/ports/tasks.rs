@@ -40,13 +40,27 @@ use crate::ports::types::CompanyId;
 pub const COLUMN_TODO: &str = "todo";
 /// Between intake and dispatch: the card is being turned into a plan.
 ///
-/// **Inert today, deliberately.** Nothing writes it automatically — epic #183
-/// §4's auto-advance does, and that is blocked on #242/#243. The vocabulary
-/// lands first so §4's code can write `planning` through a write boundary that
-/// already accepts it; shipping the column later instead would leave
-/// #242-dependent code writing a column the host rejects. An operator may drag
-/// a card into it manually (any-column PATCH is today's contract) and nothing
-/// happens, which is correct: planning does not dispatch.
+/// **Live since issue #337.** Entering this column edge-fires one planning
+/// pass — a single tool-less model call that writes a [`TaskPlan`] onto the
+/// card ([`TaskRecord::plan`]) and then settles the card itself, three ways:
+///
+/// | Outcome | Landing |
+/// | --- | --- |
+/// | plan written, every hard prerequisite satisfied, assignee valid | [`COLUMN_IN_PROGRESS`] — the plan dispatches |
+/// | plan written, a hard prerequisite missing (or no valid assignee) | [`COLUMN_TODO`], the gap named on the note |
+/// | the pass itself failed (model error, timeout, unparseable output) | [`COLUMN_TODO`], the reason on the note, no plan |
+///
+/// So this column is **transient by construction**: a card resting here is a
+/// pass in flight, or a host that died mid-pass — which the boot sweep
+/// ([`sweep_stranded_planning`](crate::runtime::advance::sweep_stranded_planning))
+/// returns to To-do at the next start.
+///
+/// The drag into it is **opt-in and it spends money**, which is the change #337
+/// makes to the board's cost story: before this, `in_progress` was the only
+/// column whose entry cost anything. Todo → In Progress still dispatches
+/// unplanned, so nobody is forced through planning; but Todo → Planning is now
+/// a spend gate of its own, and on success it hands straight on to the dispatch
+/// gate without a second human step. See `docs/spec/runtime/planning.md`.
 pub const COLUMN_PLANNING: &str = "planning";
 /// The dispatch column: entering it hands the card to its assignee.
 pub const COLUMN_IN_PROGRESS: &str = "in_progress";
@@ -70,8 +84,8 @@ pub const COLUMN_DONE: &str = "done";
 /// `planning` added. `todo` absorbed both of `backlog`'s jobs — the unqueued
 /// pool and the lifecycle's return landing — so a card that cannot be planned
 /// goes back to `todo` with the reason on its note rather than into a second
-/// not-started column. `planning` is accepted but nothing writes it yet
-/// (see [`COLUMN_PLANNING`]).
+/// not-started column. Issue #337 then made `planning` live: entering it runs
+/// one planning pass and settles the card (see [`COLUMN_PLANNING`]).
 pub const BOARD_COLUMNS: [&str; 6] = [
     COLUMN_TODO,
     COLUMN_PLANNING,
@@ -210,6 +224,207 @@ pub const MAX_DISCUSSION_CHARS: usize = 4000;
 /// character boundary instead of panicking on a split codepoint.
 pub fn cap_discussion(text: &str) -> String {
     text.chars().take(MAX_DISCUSSION_CHARS).collect()
+}
+
+// ---------------------------------------------------------------------------
+// The plan brief (issue #337, epic #183 §4)
+// ---------------------------------------------------------------------------
+
+/// What a prerequisite is a prerequisite *of* — the surface the host checks it
+/// against.
+///
+/// The model proposes the kind; the **host** decides what to do with it. An
+/// invented or misspelled kind deserializes to [`Self::Other`] rather than
+/// failing the parse, and [`Other`](Self::Other) verifies to
+/// [`PrereqStatus::Unknown`] — so a model that reaches for a surface this host
+/// cannot inspect produces an honest "we could not check this", never a false
+/// clear and never a lost plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrereqKind {
+    /// A `[[connection]]` the company declares (GitHub, Slack, …), checked
+    /// against the same non-secret projection `GET …/connections` builds.
+    Connection,
+    /// A Composio-connected account, checked against the live toolkit list.
+    Composio,
+    /// A named MCP server, checked against the manifest ∪ runtime union.
+    Mcp,
+    /// A credential the company must hold for the work to be possible —
+    /// checked for **presence only**, never read.
+    Credential,
+    /// A path in the company's shared workspace tree.
+    File,
+    /// A tool namespace the assignee must be granted, checked against the
+    /// manifest allow-list and the approval policy.
+    Permission,
+    /// The teammate or desk the work is handed to.
+    Assignee,
+    /// A kind this host does not know how to check.
+    #[serde(other)]
+    Other,
+}
+
+impl PrereqKind {
+    /// The wire word, for a note line a person reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Composio => "composio",
+            Self::Mcp => "mcp",
+            Self::Credential => "credential",
+            Self::File => "file",
+            Self::Permission => "permission",
+            Self::Assignee => "assignee",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// The host's verdict on one prerequisite the model claimed.
+///
+/// Only [`Missing`](Self::Missing) blocks. The other three ride along on the
+/// brief: an approval-gated tool is a warning (the operator will be asked at
+/// the moment it is used, which is the design), and an inventory the host could
+/// not reach is an admission rather than a guess in either direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrereqStatus {
+    /// The host looked and found it. Does not block.
+    Satisfied,
+    /// The host looked and it is not there. **Blocks the dispatch.**
+    Missing,
+    /// Present, but the assignee's policy parks it for an operator when used.
+    /// A warning, not a blocker.
+    NeedsApproval,
+    /// The host could not check — an inventory that errored or timed out, or a
+    /// kind it does not know. Does not block; see the risk note in
+    /// `docs/spec/runtime/planning.md`.
+    Unknown,
+}
+
+impl PrereqStatus {
+    /// Whether this verdict stops the card from dispatching.
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    /// The wire word, for a note line a person reads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Satisfied => "satisfied",
+            Self::Missing => "missing",
+            Self::NeedsApproval => "needsApproval",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One thing the work needs before it can start: what the model claimed, and
+/// what the host found when it looked.
+///
+/// The split is the whole point. A model asked "is GitHub connected?" will
+/// answer from the prose in front of it; the host answers from the inventory.
+/// So the model only ever fills [`kind`](Self::kind), [`name`](Self::name) and
+/// the *why* half of [`note`](Self::note) — [`status`](Self::status) is stamped
+/// by [`verify`](crate::harness::planning) against a real surface, and the note
+/// is rewritten to say what an operator should actually do about it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prerequisite {
+    /// Which surface this is checked against.
+    pub kind: PrereqKind,
+    /// The thing itself: a provider slug, an MCP server name, a workspace
+    /// path, a tool namespace, a teammate id.
+    pub name: String,
+    /// The host's verdict. Never supplied by the model — see the type docs.
+    pub status: PrereqStatus,
+    /// One line a person can act on: why the work needs it, and where to go if
+    /// it is missing.
+    pub note: String,
+}
+
+/// One step of the plan.
+///
+/// The estimates are the model's guesses and are labelled as such everywhere
+/// they are rendered. **Nothing derives a budget from them** — the real caps
+/// are the manifest's `budget_usd_daily` and the capability tier, both enforced
+/// from live meter reads. An estimate that is wrong costs a person a moment of
+/// recalibration; an estimate wired into a gate would silently mis-fund work.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStep {
+    /// A short imperative title.
+    pub title: String,
+    /// What doing it actually involves.
+    pub detail: String,
+    /// The model's guess at what this step costs, in USD. Advisory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    /// The model's guess at how long this step takes. Advisory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_minutes: Option<u32>,
+}
+
+/// The brief one planning pass produced for a card (issue #337).
+///
+/// # Why a field and not an artifact, and not note prose
+///
+/// Not an **artifact**: issue #244's rule is that artifacts are deliverables
+/// *published from a run*, identified by `(task, source)`. A planning pass runs
+/// no run — there is no attempt row, no agent turn, no workspace file — so an
+/// artifact here would be a deliverable with no producer, and would show up in
+/// the Artifacts tab as though the work had output.
+///
+/// Not **note prose**: the note is the card's append-only history and is read
+/// as a transcript. Verdicts and estimates need structure the console can badge
+/// and the next pass can overwrite. The note still gets one appended outcome
+/// line per pass, so the history channel stays complete either way.
+///
+/// **Re-planning overwrites.** A second drag into Planning replaces this whole
+/// value; the note keeps the trail of both. The alternative — a vector of
+/// briefs — would make "the plan" ambiguous at exactly the moment the operator
+/// wants an answer.
+///
+/// Additive on the wire ([`serde(default)`] + skip-if-none), the same shape
+/// [`TaskRecord::origin_chat_id`] and [`TaskRecord::parent_task_id`] took, so
+/// no stored board needs migrating on any of the three backends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlan {
+    /// What this task actually is, restated by the planner.
+    pub description: String,
+    /// How to do it, in order.
+    pub steps: Vec<PlanStep>,
+    /// What it needs first, with the host's verdict on each.
+    pub prerequisites: Vec<Prerequisite>,
+    /// What could go wrong.
+    pub risks: Vec<String>,
+    /// How a person will know it worked.
+    pub verification: String,
+    /// What is in scope, and explicitly what is not.
+    pub scope: String,
+    /// The teammate the planner would hand it to. Applied to the card **only**
+    /// when the card had no assignee and this names a real one — a plan never
+    /// reassigns work a person already assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_assignee: Option<String>,
+    /// When the pass that produced this brief finished.
+    pub planned_at_millis: u64,
+}
+
+impl TaskPlan {
+    /// Every prerequisite whose verdict blocks the dispatch.
+    pub fn blockers(&self) -> Vec<&Prerequisite> {
+        self.prerequisites
+            .iter()
+            .filter(|p| p.status.blocks())
+            .collect()
+    }
+
+    /// Whether the plan clears the card to dispatch.
+    pub fn is_dispatchable(&self) -> bool {
+        self.blockers().is_empty()
+    }
 }
 
 /// Rewrites a stored column literal that no longer names a board column.
@@ -464,6 +679,14 @@ pub struct TaskRecord {
     /// lie about identity, which is the one thing the epic's link must not be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<TaskOutput>,
+    /// The brief the last planning pass wrote for this card (issue #337).
+    ///
+    /// `None` for a card nobody has planned — which is every card until it is
+    /// dragged into [`COLUMN_PLANNING`], and every card written before this
+    /// field existed. Overwritten by a re-plan; see [`TaskPlan`] for why it is
+    /// a structured field rather than an artifact or note prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<TaskPlan>,
 }
 
 /// Durable per-company task board. Company A's tasks MUST be invisible to
@@ -650,6 +873,132 @@ mod test {
 
         assert_eq!(cap_discussion("looks good to me"), "looks good to me");
         assert_eq!(cap_discussion(""), "");
+    }
+
+    // --- The plan brief (issue #337) ----------------------------------------
+
+    fn prereq(kind: PrereqKind, status: PrereqStatus) -> Prerequisite {
+        Prerequisite {
+            kind,
+            name: "github".to_string(),
+            status,
+            note: "the work opens a pull request".to_string(),
+        }
+    }
+
+    fn plan_with(prerequisites: Vec<Prerequisite>) -> TaskPlan {
+        TaskPlan {
+            description: "Open a PR that adds the changelog entry".to_string(),
+            steps: vec![PlanStep {
+                title: "Draft the entry".to_string(),
+                detail: "Write it against the released version".to_string(),
+                estimated_cost_usd: Some(0.02),
+                estimated_minutes: Some(5),
+            }],
+            prerequisites,
+            risks: vec!["the release may not be tagged yet".to_string()],
+            verification: "the PR exists and CI is green".to_string(),
+            scope: "the changelog only; no code changes".to_string(),
+            proposed_assignee: Some("maya".to_string()),
+            planned_at_millis: 42,
+        }
+    }
+
+    /// Only `missing` blocks. `needsApproval` and `unknown` ride on the brief
+    /// as warnings — an approval-gated tool is asked about at the moment it is
+    /// used, and an inventory the host could not reach is an admission, not a
+    /// verdict in either direction.
+    #[test]
+    fn only_a_missing_prerequisite_blocks_the_dispatch() {
+        assert!(PrereqStatus::Missing.blocks());
+        assert!(!PrereqStatus::Satisfied.blocks());
+        assert!(!PrereqStatus::NeedsApproval.blocks());
+        assert!(!PrereqStatus::Unknown.blocks());
+
+        let clear = plan_with(vec![
+            prereq(PrereqKind::Connection, PrereqStatus::Satisfied),
+            prereq(PrereqKind::Permission, PrereqStatus::NeedsApproval),
+            prereq(PrereqKind::Composio, PrereqStatus::Unknown),
+        ]);
+        assert!(clear.is_dispatchable());
+        assert!(clear.blockers().is_empty());
+
+        let blocked = plan_with(vec![
+            prereq(PrereqKind::Connection, PrereqStatus::Satisfied),
+            prereq(PrereqKind::Mcp, PrereqStatus::Missing),
+        ]);
+        assert!(!blocked.is_dispatchable());
+        assert_eq!(blocked.blockers().len(), 1);
+        assert_eq!(blocked.blockers()[0].kind, PrereqKind::Mcp);
+
+        // A plan claiming nothing is dispatchable — "needs nothing" is a
+        // legitimate answer, not a suspicious one.
+        assert!(plan_with(Vec::new()).is_dispatchable());
+    }
+
+    /// A kind this host cannot check must not fail the parse and must not read
+    /// as satisfied. It deserializes to `Other`, which the verifier stamps
+    /// `unknown` — the model gets to be wrong without costing us the plan.
+    #[test]
+    fn an_unknown_prerequisite_kind_parses_as_other() {
+        let raw = r#"{"kind":"quantum_flux","name":"x","status":"unknown","note":"n"}"#;
+        let parsed: Prerequisite = serde_json::from_str(raw).expect("an odd kind still parses");
+        assert_eq!(parsed.kind, PrereqKind::Other);
+        assert_eq!(parsed.status, PrereqStatus::Unknown);
+
+        // Every known kind still round-trips to its own variant.
+        for (wire, kind) in [
+            ("connection", PrereqKind::Connection),
+            ("composio", PrereqKind::Composio),
+            ("mcp", PrereqKind::Mcp),
+            ("credential", PrereqKind::Credential),
+            ("file", PrereqKind::File),
+            ("permission", PrereqKind::Permission),
+            ("assignee", PrereqKind::Assignee),
+        ] {
+            let raw = format!(r#"{{"kind":"{wire}","name":"x","status":"missing","note":"n"}}"#);
+            let parsed: Prerequisite = serde_json::from_str(&raw).expect("known kind");
+            assert_eq!(parsed.kind, kind);
+            assert_eq!(parsed.kind.as_str(), wire);
+        }
+    }
+
+    /// The additive-wire contract: a card persisted before #337 loads with no
+    /// plan, and a card that has never been planned serializes byte-identically
+    /// to the pre-#337 shape. This is what makes "no migration on any of the
+    /// three backends" true rather than hoped for.
+    #[test]
+    fn the_plan_field_is_additive_on_the_wire() {
+        let legacy = r#"{
+            "id": "t-1",
+            "title": "Unplanned work",
+            "column": "todo",
+            "priority": "medium",
+            "assignee": "maya",
+            "updatedAtMillis": 7
+        }"#;
+        let card: TaskRecord = serde_json::from_str(legacy).expect("a pre-#337 card parses");
+        assert!(card.plan.is_none());
+
+        let round_tripped = serde_json::to_string(&card).unwrap();
+        assert!(
+            !round_tripped.contains("plan"),
+            "an unplanned card must not grow a key: {round_tripped}"
+        );
+
+        // And a planned card round-trips its whole brief, verdicts included.
+        let planned = TaskRecord {
+            plan: Some(plan_with(vec![prereq(
+                PrereqKind::Connection,
+                PrereqStatus::Missing,
+            )])),
+            ..card
+        };
+        let json = serde_json::to_string(&planned).unwrap();
+        assert!(json.contains("\"status\":\"missing\""), "{json}");
+        assert!(json.contains("\"estimatedCostUsd\":0.02"), "{json}");
+        let back: TaskRecord = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back, planned);
     }
 
     /// Issue #301's whole migration, at the seam every persistence backend

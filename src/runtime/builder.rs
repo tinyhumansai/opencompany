@@ -2449,6 +2449,7 @@ mod test {
             origin_chat_id: None,
             parent_task_id: None,
             output: None,
+            plan: None,
         };
 
         let first_boot = RuntimeBuilder::new(home.clone(), manifest.clone())
