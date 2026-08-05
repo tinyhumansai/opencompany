@@ -1250,10 +1250,67 @@ pub async fn assert_artifact_store(artifacts: Arc<dyn ArtifactStore>) {
         "upsert replaces, never duplicates"
     );
 
+    // ── Issue #244: `source` is what an artifact is an artifact *of* ────────
+
+    // It survives the round trip on every backend. All three persist the record
+    // as an opaque JSON blob, so this is really asserting the blob is opaque —
+    // a backend that projected named columns would silently drop it.
+    let spec = ArtifactRecord::new(
+        "a3",
+        "t-3",
+        "Launch spec",
+        ArtifactKind::Markdown,
+        "# Spec",
+        "ceo",
+        10,
+    )
+    .with_source("specs/launch.md");
+    artifacts.upsert(&alpha, &spec).await.unwrap();
+    let back = artifacts.get(&alpha, "a3").await.unwrap().expect("a3");
+    assert_eq!(back.source.as_deref(), Some("specs/launch.md"));
+    assert_eq!(
+        back, spec,
+        "the whole record must still round-trip verbatim"
+    );
+
+    // A record written before #244 loads with `source: None` rather than
+    // failing — which is what marks it as legacy reply capture. `a2` above was
+    // built through `ArtifactRecord::new`, i.e. exactly the pre-#244 shape.
+    assert_eq!(
+        artifacts
+            .get(&alpha, "a2")
+            .await
+            .unwrap()
+            .expect("a2")
+            .source,
+        None
+    );
+
+    // Two different files on ONE card coexist as separate records. This is the
+    // shape identity exists for: without it, the second publish would have to
+    // either duplicate or overwrite, and the human-edit diff of whichever it
+    // hit would stop meaning anything.
+    let invoice = ArtifactRecord::new(
+        "a4",
+        "t-3",
+        "Invoice",
+        ArtifactKind::Markdown,
+        "# Invoice",
+        "ceo",
+        11,
+    )
+    .with_source("billing/invoice.md");
+    artifacts.upsert(&alpha, &invoice).await.unwrap();
+    let on_card = artifacts.list(&alpha, Some("t-3")).await.unwrap();
+    assert_eq!(on_card.len(), 2, "one card, two deliverables");
+    let mut sources: Vec<&str> = on_card.iter().filter_map(|a| a.source.as_deref()).collect();
+    sources.sort_unstable();
+    assert_eq!(sources, ["billing/invoice.md", "specs/launch.md"]);
+
     // Delete reports whether anything went, and does not touch the sibling.
     assert!(artifacts.delete(&alpha, "a1").await.unwrap());
     assert!(!artifacts.delete(&alpha, "a1").await.unwrap());
-    assert_eq!(artifacts.list(&alpha, None).await.unwrap().len(), 1);
+    assert_eq!(artifacts.list(&alpha, None).await.unwrap().len(), 3);
     assert_eq!(artifacts.list(&beta, None).await.unwrap().len(), 1);
 }
 
