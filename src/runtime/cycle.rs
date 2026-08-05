@@ -44,7 +44,7 @@ use crate::runtime::delegation_tools::{
     DELEGATE_TO_DESK_TOOL, DelegateArgs, SPAWN_TASK_TOOL, SpawnTaskArgs, desk_lead,
     unknown_desk_message,
 };
-use crate::runtime::grants::GrantedCall;
+use crate::runtime::grants::{GrantId, GrantScope, GrantedCall, StandingGrant};
 use crate::runtime::journal::{ExecutedEffect, TaskLink};
 use crate::runtime::types::CycleReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
@@ -541,7 +541,20 @@ working on):\n{}\n]",
         id: &ApprovalId,
         verdict: Verdict,
         by: Actor,
+        scope: GrantScope,
     ) -> Result<ResolveReceipt> {
+        // Issue #374: a broader scope is validated BEFORE the gate is touched.
+        //
+        // The order is the whole safety story of a bad scope request. Validating
+        // after `resolve_outcome` would have already dropped the approval from
+        // the parked queue and journaled a verdict, so a request naming an
+        // ungrantable tool would leave the operator with no card to re-decide
+        // and a resolution they never got the effect of. Checked first, a bad
+        // request changes nothing at all: the approval stays parked, no verdict
+        // is journaled, and the operator can simply approve it "once" instead.
+        if let GrantScope::Tool { .. } = scope {
+            self.check_broadly_grantable(id)?;
+        }
         let outcome = self
             .rt
             .approval_gate
@@ -551,7 +564,8 @@ working on):\n{}\n]",
         }
         self.rt.journal.record_resolved(id).await?;
         if let ResolveOutcome::Approved(effect) = outcome {
-            self.settle_approved_effect(id, effect).await?;
+            self.settle_approved_effect(id, effect, by.clone(), scope)
+                .await?;
         }
         // The follow-up event, so the brain learns the verdict. Returning it
         // (rather than appending it here) keeps the event logged exactly once:
@@ -595,7 +609,55 @@ working on):\n{}\n]",
     /// the safe direction. The reverse order would lose the operator's approval
     /// entirely on a crash, and the agent would come back asking for a
     /// permission it had already been given.
-    async fn settle_approved_effect(&self, id: &ApprovalId, effect: Effect) -> Result<()> {
+    /// Refuses a broad-scope request the runtime must not honour (issue #374),
+    /// **without touching the gate or the journal**.
+    ///
+    /// Two refusals, both read off the parked effect:
+    ///
+    /// * **native** (`agent: None`) — there is no tool and no agent to grant to.
+    ///   The runtime performs these itself; "this tool, for this teammate" names
+    ///   neither of the two things it needs.
+    /// * **not broadly grantable** — the effect's group is not
+    ///   [`EffectGroup::Other`](crate::ports::types::EffectGroup::Other), so it
+    ///   is a consequence the operator has to see per call.
+    ///
+    /// The group is read off the **parked effect** rather than re-derived from
+    /// the tool name, which is both cheaper and more honest: it is the
+    /// classification the card showed the operator, so what they see is what is
+    /// checked. It is also what lets this run in the default build, where the
+    /// harness classifier does not compile.
+    ///
+    /// An unknown or already-resolved id falls through to the ordinary
+    /// already-resolved path rather than erroring here — a double-click on the
+    /// scoped button must stay the no-op it is on the plain one.
+    fn check_broadly_grantable(&self, id: &ApprovalId) -> Result<()> {
+        let Some(effect) = self.rt.approval_gate.parked_effect(id) else {
+            return Ok(());
+        };
+        if effect.agent.is_none() {
+            return Err(OpenCompanyError::InvalidRequest(format!(
+                "'{}' is performed by the runtime itself, so there is no teammate's tool use to \
+                 grant; approve it once instead",
+                effect.kind
+            )));
+        }
+        if !effect.group.is_broadly_grantable() {
+            return Err(OpenCompanyError::InvalidRequest(format!(
+                "'{}' cannot be granted for a period — it is a {:?} action, which stays a \
+                 per-call decision; approve it once instead",
+                effect.kind, effect.group
+            )));
+        }
+        Ok(())
+    }
+
+    async fn settle_approved_effect(
+        &self,
+        id: &ApprovalId,
+        effect: Effect,
+        by: Actor,
+        scope: GrantScope,
+    ) -> Result<()> {
         let Some(agent) = effect.agent.clone() else {
             let key = format!("approval:{id}");
             // The card that asked for this sign-off (issue #351). It is not
@@ -610,7 +672,57 @@ working on):\n{}\n]",
                 .and_then(|task| task.task_id().map(str::to_string));
             return execute_effect_once(self.rt, &key, &effect, task_id.as_deref()).await;
         };
-        self.mint_grant(id, agent, effect).await
+        match scope {
+            GrantScope::Once => self.mint_grant(id, agent, effect).await,
+            GrantScope::Tool { expires_at_millis } => {
+                self.mint_standing_grant(id, agent, effect, by, expires_at_millis)
+                    .await
+            }
+        }
+    }
+
+    /// Journals then arms a **standing** grant: this tool, for this teammate,
+    /// until `expires_at_millis` (issue #374).
+    ///
+    /// Deliberately mints **only** the standing grant. Minting a single-use one
+    /// alongside it would be redundant — the standing grant already admits the
+    /// re-issued call — and worse than redundant: the single-use grant would go
+    /// unredeemed, and fifteen minutes later the TTL sweep would tell the
+    /// operator "the agent didn't act", about work that ran immediately.
+    ///
+    /// Same journal-before-live-set ordering, and the same crash direction, as
+    /// [`mint_grant`](Self::mint_grant): a crash between the two replays as
+    /// granted rather than losing the operator's decision.
+    async fn mint_standing_grant(
+        &self,
+        id: &ApprovalId,
+        agent: String,
+        effect: Effect,
+        by: Actor,
+        expires_at_millis: u64,
+    ) -> Result<()> {
+        let grant = StandingGrant {
+            id: GrantId::generate(),
+            agent,
+            // The tool, and nothing about the arguments. A standing grant has no
+            // `args` field to copy them into — that is the type's whole point.
+            tool: effect.kind.clone(),
+            granted_by: by,
+            approval_id: id.clone(),
+            at_millis: now_millis(),
+            expires_at_millis,
+        };
+        self.rt.journal.record_standing_granted(&grant).await?;
+        tracing::debug!(
+            approval_id = %id,
+            grant_id = %grant.id,
+            tool = %effect.kind,
+            agent = %grant.agent,
+            expires_at_millis,
+            "[approval] minted a standing grant; this tool will not ask again until it expires"
+        );
+        self.rt.grants.grant_standing(grant);
+        Ok(())
     }
 
     /// Journals then arms a single-use grant for `(agent, effect.kind,
@@ -750,8 +862,15 @@ working on):\n{}\n]",
         // re-issue the very call the operator edited, silently discarding the
         // edit — which is worse than not supporting amend at all, because the
         // operator would have every reason to believe their change took effect.
+        //
+        // Always `GrantScope::Once`. An argument edit and a standing grant are
+        // contradictory requests: the edit says "this exact call, with my
+        // correction", the standing grant says "any arguments, for a week". The
+        // route rejects the pairing as a 400, so this arm never sees a broader
+        // scope, and hard-coding it here means it cannot acquire one by accident.
         if let Some(effect) = &executed {
-            self.settle_approved_effect(id, effect.clone()).await?;
+            self.settle_approved_effect(id, effect.clone(), by.clone(), GrantScope::Once)
+                .await?;
         }
 
         // The follow-up event, so the brain learns the approval resolved (with
@@ -776,6 +895,14 @@ working on):\n{}\n]",
     pub async fn recover(&self) -> Result<()> {
         self.rt.journal.load().await?;
         self.rt.grants.rehydrate(self.rt.journal.replayed_grants());
+        // Issue #374: standing grants outlive a restart too — a week-long
+        // permission that evaporated on every deploy would be worse than not
+        // offering one. Anything already past its deadline is folded out by the
+        // replay itself, so a host that was down across an expiry cannot hand
+        // the permission back.
+        self.rt
+            .grants
+            .rehydrate_standing(self.rt.journal.replayed_standing_grants(now_millis()));
         Ok(())
     }
 
@@ -4691,5 +4818,316 @@ mod test {
             "done cards are not surfaced as open work: {:?}",
             seen[0]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Standing grants (issue #374)
+    // -----------------------------------------------------------------------
+
+    /// A harness tool call the operator IS allowed to grant broadly: an
+    /// `EffectGroup::Other` effect with no declared amount.
+    ///
+    /// `harness_effect` deliberately uses `Sign` and a real amount, because it
+    /// exists to prove the effect was not executed. Both would refuse a broad
+    /// scope, so the grantable case needs its own fixture.
+    fn grantable_effect(agent: &str, tool: &str, args: serde_json::Value) -> Effect {
+        Effect {
+            kind: tool.into(),
+            group: EffectGroup::Other,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: args,
+            agent: Some(agent.to_string()),
+            run_id: None,
+        }
+    }
+
+    fn in_an_hour() -> u64 {
+        now_millis() + 60 * 60 * 1000
+    }
+
+    fn tool_scope() -> GrantScope {
+        GrantScope::Tool {
+            expires_at_millis: in_an_hour(),
+        }
+    }
+
+    /// Parks `effect` the way a blocked harness tool call actually parks —
+    /// through `park_effect`, which bypasses the manifest gate's `evaluate`.
+    ///
+    /// `park_one` cannot serve here: it routes through `emit_effect`, and the
+    /// manifest gate auto-allows `EffectGroup::Other` under supervised. That is
+    /// correct for a native effect and irrelevant to a harness one, whose park
+    /// decision was already made inside the agent's turn by `ApprovalPolicy`.
+    async fn park_one_blocked_tool_call(
+        home: std::path::PathBuf,
+        effect: Effect,
+    ) -> (Arc<CompanyRuntime>, ApprovalId) {
+        let rt = Arc::new(
+            RuntimeBuilder::new(home, manifest("supervised"))
+                .with_brain(Arc::new(ParkingBrain { effect }))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "do it".into(),
+                by: None,
+                chat: None,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(report.parked.len(), 1);
+        let id = report.parked[0].clone();
+        (rt, id)
+    }
+
+    /// The headline: approving with the broader scope arms a standing grant, and
+    /// mints **no** single-use grant beside it.
+    ///
+    /// The second half is not tidiness. A redundant single-use grant would go
+    /// unredeemed — the standing grant already admits the re-issued call — and
+    /// fifteen minutes later the TTL sweep would tell the operator "the agent
+    /// didn't act", about work that ran immediately.
+    #[tokio::test]
+    async fn approving_with_a_tool_scope_mints_a_standing_grant_and_no_single_use_one() {
+        let home_dir = tmp_home();
+        let (rt, id) = park_one_blocked_tool_call(
+            home_dir.path().to_path_buf(),
+            grantable_effect("ops", "workspace_write", serde_json::json!({ "path": "a" })),
+        )
+        .await;
+
+        let (_, follow_up) = rt
+            .resolve_approval_spawned(&id, Verdict::Approve, operator(), tool_scope())
+            .await
+            .unwrap();
+        let _ = crate::company::runtime::join_follow_up(follow_up).await;
+
+        assert_eq!(rt.grants.standing_count(), 1);
+        assert_eq!(
+            rt.grants.live_count(),
+            0,
+            "no single-use grant is left behind to expire noisily"
+        );
+        let listed = rt.standing_grants();
+        assert_eq!(listed[0].tool, "workspace_write");
+        assert_eq!(listed[0].agent, "ops");
+        assert_eq!(listed[0].approval_id, id, "provenance back to the card");
+        assert_eq!(
+            listed[0].granted_by.id, "owner",
+            "the resolving actor is recorded, not a placeholder"
+        );
+    }
+
+    /// A scope the runtime must not honour changes **nothing**: the approval is
+    /// still parked and no verdict was journaled.
+    ///
+    /// This is why the check runs before `resolve_outcome`. Validating after it
+    /// would have dropped the card from the queue and recorded a resolution,
+    /// leaving the operator with nothing to re-decide and a verdict whose effect
+    /// never happened.
+    #[tokio::test]
+    async fn a_refused_scope_leaves_the_approval_parked_and_unjournaled() {
+        for effect in [
+            // A named consequence group — stays a per-call decision.
+            harness_effect("finance", "composio_execute", serde_json::json!({})),
+            // A native effect — no teammate and no tool to grant.
+            Effect {
+                kind: EMAIL_SEND_KIND.into(),
+                group: EffectGroup::Other,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "channel": "operator", "text": "hi" }),
+                agent: None,
+                run_id: None,
+            },
+        ] {
+            let home_dir = tmp_home();
+            let (rt, id) =
+                park_one_blocked_tool_call(home_dir.path().to_path_buf(), effect.clone()).await;
+
+            let err = rt
+                .resolve_approval_spawned(&id, Verdict::Approve, operator(), tool_scope())
+                .await
+                .expect_err("a scope the host cannot honour is refused");
+            assert!(
+                matches!(err, OpenCompanyError::InvalidRequest(_)),
+                "refusal must be a bad-request, not a server fault: {err:?}"
+            );
+
+            assert_eq!(
+                rt.pending_approvals().len(),
+                1,
+                "the card is still there to be decided: {}",
+                effect.kind
+            );
+            assert_eq!(rt.grants.standing_count(), 0);
+            assert_eq!(rt.grants.live_count(), 0);
+
+            // And the card is still decidable — nothing about the refused
+            // request consumed it. Declining rather than approving, so this
+            // asserts the queue state without dragging in whether the host has
+            // a mailer wired for the native case.
+            rt.resolve_approval(&id, Verdict::Deny, operator())
+                .await
+                .unwrap();
+            assert!(rt.pending_approvals().is_empty());
+        }
+    }
+
+    /// The default scope is byte-identical to pre-#374 behaviour.
+    ///
+    /// The existing suite passing untouched is the real proof; this pins the
+    /// negative the suite cannot state — that no number of ordinary approvals
+    /// ever *infers* a standing grant. A "we noticed you approve this a lot"
+    /// heuristic is the silent accumulation the issue forbids.
+    #[tokio::test]
+    async fn repeated_ordinary_approvals_never_infer_a_standing_grant() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let effect = grantable_effect("ops", "workspace_write", serde_json::json!({ "path": "a" }));
+
+        let rt = Arc::new(
+            RuntimeBuilder::new(home, manifest("supervised"))
+                .with_brain(Arc::new(ParkingBrain {
+                    effect: effect.clone(),
+                }))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        for _ in 0..5 {
+            let report = rt
+                .run_cycle(vec![CompanyEvent::OperatorMessage {
+                    text: "do it".into(),
+                    by: None,
+                    chat: None,
+                }])
+                .await
+                .unwrap();
+            let id = report.parked[0].clone();
+            rt.resolve_approval(&id, Verdict::Approve, operator())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            rt.grants.standing_count(),
+            0,
+            "a standing grant is only ever asked for, never inferred"
+        );
+    }
+
+    /// Standing grants survive a restart, and revoking one is durable too.
+    #[tokio::test]
+    async fn a_standing_grant_replays_on_boot_and_a_revoked_one_does_not() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let (rt, id) = park_one_blocked_tool_call(
+            home.clone(),
+            grantable_effect("ops", "workspace_write", serde_json::json!({ "path": "a" })),
+        )
+        .await;
+
+        let (_, follow_up) = rt
+            .resolve_approval_spawned(&id, Verdict::Approve, operator(), tool_scope())
+            .await
+            .unwrap();
+        let _ = crate::company::runtime::join_follow_up(follow_up).await;
+        let grant_id = rt.standing_grants()[0].id.clone();
+
+        // A fresh runtime over the same home rehydrates it.
+        let rt2 = Arc::new(
+            RuntimeBuilder::new(home.clone(), manifest("supervised"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        rt2.recover().await.unwrap();
+        assert_eq!(rt2.grants.standing_count(), 1);
+        assert_eq!(rt2.standing_grants()[0].id, grant_id);
+
+        // Revoke, then boot again: it must stay gone.
+        assert!(
+            rt2.revoke_standing_grant(&grant_id, operator())
+                .await
+                .unwrap()
+        );
+        assert_eq!(rt2.grants.standing_count(), 0);
+        assert!(
+            !rt2.revoke_standing_grant(&grant_id, operator())
+                .await
+                .unwrap(),
+            "revoking twice reports nothing to revoke"
+        );
+
+        let rt3 = Arc::new(
+            RuntimeBuilder::new(home, manifest("supervised"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        rt3.recover().await.unwrap();
+        assert_eq!(
+            rt3.grants.standing_count(),
+            0,
+            "a restart must not hand back a permission the operator took away"
+        );
+    }
+
+    /// The maintenance sweep retires a lapsed standing grant and journals it.
+    #[tokio::test]
+    async fn the_sweep_expires_a_lapsed_standing_grant() {
+        let home_dir = tmp_home();
+        let (rt, id) = park_one_blocked_tool_call(
+            home_dir.path().to_path_buf(),
+            grantable_effect("ops", "workspace_write", serde_json::json!({})),
+        )
+        .await;
+
+        // Already past its deadline the moment it is minted.
+        let (_, follow_up) = rt
+            .resolve_approval_spawned(
+                &id,
+                Verdict::Approve,
+                operator(),
+                GrantScope::Tool {
+                    expires_at_millis: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let _ = crate::company::runtime::join_follow_up(follow_up).await;
+        assert_eq!(rt.grants.standing_count(), 1);
+
+        rt.sweep_expired_grants().await.unwrap();
+        assert_eq!(rt.grants.standing_count(), 0);
+    }
+
+    /// The summary carries the flag only where the control is actually
+    /// offerable — and the card's own classification is what decides it.
+    #[tokio::test]
+    async fn the_summary_marks_only_broadly_grantable_cards() {
+        let home_dir = tmp_home();
+        let (rt, _) = park_one_blocked_tool_call(
+            home_dir.path().to_path_buf(),
+            grantable_effect("ops", "workspace_write", serde_json::json!({})),
+        )
+        .await;
+        assert!(rt.pending_approvals()[0].broadly_grantable);
+
+        // A named consequence group is not offerable.
+        let home_dir = tmp_home();
+        let (rt, _) = park_one(
+            home_dir.path().to_path_buf(),
+            harness_effect("finance", "composio_execute", serde_json::json!({})),
+        )
+        .await;
+        assert!(!rt.pending_approvals()[0].broadly_grantable);
     }
 }

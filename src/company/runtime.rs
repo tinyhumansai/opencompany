@@ -62,7 +62,7 @@ pub(crate) async fn join_follow_up(
 }
 use crate::runtime::CycleRunner;
 use crate::runtime::cycle::ResolveReceipt;
-use crate::runtime::grants::{GRANT_TTL_MILLIS, GrantSet};
+use crate::runtime::grants::{GRANT_TTL_MILLIS, GrantId, GrantScope, GrantSet, StandingGrant};
 use crate::runtime::journal::{ApprovalOrigin, ExecutedEffect, RuntimeJournal};
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::ops::mailer::MailSender;
@@ -776,7 +776,9 @@ impl CompanyRuntime {
         verdict: Verdict,
         by: Actor,
     ) -> Result<CycleReport> {
-        let (_, follow_up) = self.resolve_approval_spawned(id, verdict, by).await?;
+        let (_, follow_up) = self
+            .resolve_approval_spawned(id, verdict, by, GrantScope::Once)
+            .await?;
         join_follow_up(follow_up).await
     }
 
@@ -808,15 +810,21 @@ impl CompanyRuntime {
     /// follow-up cycle: a resolution that journaled the verdict and then failed
     /// to run its follow-up would leave the brain permanently unaware of an
     /// approval the operator had already granted.
+    /// `scope` is what the operator's approve buys (issue #374):
+    /// [`GrantScope::Once`] is the default and the pre-#374 behaviour byte for
+    /// byte; [`GrantScope::Tool`] mints a standing permission instead. A scope
+    /// the runtime must not honour is refused **before** the gate is touched, so
+    /// the approval stays parked and no verdict is journaled.
     pub async fn resolve_approval_spawned(
         self: &Arc<Self>,
         id: &ApprovalId,
         verdict: Verdict,
         by: Actor,
+        scope: GrantScope,
     ) -> Result<(ResolveReceipt, JoinHandle<Result<CycleReport>>)> {
         self.ensure_accepting()?;
         let receipt = CycleRunner::new(self)
-            .settle_approval(id, verdict, by)
+            .settle_approval(id, verdict, by, scope)
             .await?;
         Ok((receipt.clone(), self.spawn_follow_up(receipt)))
     }
@@ -991,7 +999,86 @@ impl CompanyRuntime {
             }
             ids.push(grant.approval_id);
         }
+
+        // Issue #374: standing grants lapse on the same maintenance tick.
+        //
+        // The sweep is housekeeping and an operator notice, never the
+        // enforcement — `GrantSet::match_standing` refuses an expired grant
+        // under the redemption lock, so "for one hour" means one hour and not
+        // "until the next tick after one hour". What this adds is the durable
+        // record and the line telling the operator a permission they granted has
+        // run out, so its silent return to asking is explained rather than
+        // mysterious.
+        for grant in self.grants.sweep_standing(now) {
+            self.journal.record_standing_expired(&grant.id, now).await?;
+            self.announce_to_operator(&format!(
+                "The standing permission for `{}` on `{}` has expired — it will ask for approval \
+                 again from now on.",
+                grant.tool, grant.agent
+            ))
+            .await;
+        }
         Ok(ids)
+    }
+
+    /// Every live standing permission, newest first (issue #374) — what the
+    /// console's "Standing permissions" section lists.
+    pub fn standing_grants(&self) -> Vec<StandingGrant> {
+        self.grants.standing()
+    }
+
+    /// Revokes a standing permission (issue #374), journaling who took it back
+    /// and when. `false` when there was nothing to revoke — already gone, swept,
+    /// or revoked from another browser — which the route answers as a 404 rather
+    /// than claiming to have done something.
+    ///
+    /// Takes effect on the **next** policy check. An already-admitted call is
+    /// not aborted: there is no abort lever inside an agent's turn, and killing
+    /// one mid-call is the lifecycle anti-pattern. The next check finds nothing
+    /// and re-parks.
+    pub async fn revoke_standing_grant(&self, id: &GrantId, by: Actor) -> Result<bool> {
+        let Some(grant) = self.grants.revoke_standing(id) else {
+            return Ok(false);
+        };
+        // Live-set removal first here, unlike minting. The orders are opposite on
+        // purpose and both fail safe: a crash while minting must not leave a
+        // permission live but unrecorded, and a crash while revoking must not
+        // leave one live that the operator has already been told is gone.
+        self.journal
+            .record_standing_revoked(id, by, now_millis())
+            .await?;
+        tracing::debug!(
+            grant_id = %id,
+            tool = %grant.tool,
+            agent = %grant.agent,
+            "[approval] revoked a standing grant; the next call re-parks"
+        );
+        Ok(true)
+    }
+
+    /// Best-effort one-liner on the operator channel.
+    ///
+    /// Best-effort by design, matching the approval and grant sweeps: a delivery
+    /// fault must not undo a state change that has already happened in memory
+    /// and in the journal.
+    async fn announce_to_operator(&self, text: &str) {
+        for channel in &self.channels {
+            if channel.channel_id() == crate::runtime::channel::OPERATOR_CHANNEL {
+                if let Err(e) = channel
+                    .send(crate::ports::types::OutboundMessage {
+                        task_id: None,
+                        channel: crate::runtime::channel::OPERATOR_CHANNEL.to_string(),
+                        text: text.to_string(),
+                        steps: Vec::new(),
+                        reply_to: None,
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, "an operator notice failed to send");
+                }
+                break;
+            }
+        }
     }
 
     /// Replays the journal to rebuild the executed-key set, the approval queue,
@@ -1063,6 +1150,13 @@ impl CompanyRuntime {
                 agent: p.effect.agent.clone(),
                 payload: crate::runtime::approval_display::display_payload(&p.effect),
                 thread: p.thread,
+                // Issue #374. Both halves matter: a native effect has no
+                // teammate and no tool to grant, and a named consequence group
+                // stays a per-call decision. Read off the parked effect, so the
+                // control is offered on exactly the classification the card
+                // itself is showing.
+                broadly_grantable: p.effect.agent.is_some()
+                    && p.effect.group.is_broadly_grantable(),
             })
             .collect()
     }

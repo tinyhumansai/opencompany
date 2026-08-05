@@ -139,4 +139,24 @@ pub struct ApprovalSummary {
     /// page and in no thread, exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// Whether the operator may grant this tool **broadly** — one standing
+    /// permission covering any arguments until a deadline (issue #374).
+    ///
+    /// `true` exactly when the effect came from a harness tool call *and* its
+    /// group is
+    /// [`EffectGroup::Other`](crate::ports::types::EffectGroup::Other). The
+    /// console renders the scope control only then, so the operator is never
+    /// offered a choice the host would refuse.
+    ///
+    /// **This flag is UX, not enforcement.** The host re-checks the same rule
+    /// when the resolve arrives, and answers 400 — a console that ignored this
+    /// field, or a hand-rolled request, gets no further than one that respects
+    /// it.
+    ///
+    /// Skipped when `false`, which is the common case, so a card that cannot be
+    /// granted broadly serializes exactly as it did before this field existed —
+    /// and an old console, which reads no such field, degrades to today's
+    /// approve-once behaviour by construction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadly_grantable: bool,
 }

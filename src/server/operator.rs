@@ -33,6 +33,7 @@ use crate::ports::types::{
     Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, OverlayDesk,
     OverlayDeskMember, OverlayDeskOrder, StoredEvent, TurnStep, Verdict,
 };
+use crate::runtime::grants::GrantScope;
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::chat_history::{MessageView, Viewer, history_for_desk};
 use crate::server::error::ApiError;
@@ -1408,7 +1409,7 @@ async fn run_resolve(
         }
         (verdict, None) => {
             runtime
-                .resolve_approval_spawned(&id, verdict, actor)
+                .resolve_approval_spawned(&id, verdict, actor, GrantScope::Once)
                 .await?
         }
     };
