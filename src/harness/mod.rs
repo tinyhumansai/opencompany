@@ -53,6 +53,11 @@ pub mod memory_loop;
 pub mod orchestrator;
 pub mod policy;
 pub mod provider;
+/// Issue #244: `publish_artifact` — the only way a workspace file becomes a
+/// deliverable — plus the staging queue the brain drains, the bounded workspace
+/// scan that detects unpublished work, and the follow-up nudge's prompt. See
+/// [`publish`].
+pub mod publish;
 pub mod run_trace;
 pub mod run_turn;
 pub mod search;
