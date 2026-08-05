@@ -157,6 +157,7 @@ pub async fn build_capabilities(
             pool,
             deps,
             company,
+            run_id.to_string(),
             run_request,
         ))),
     }
@@ -200,6 +201,10 @@ pub struct HarnessAgentRunner {
     pool: Arc<HarnessPool>,
     deps: HarnessDeps,
     company: CompanyId,
+    /// The run these agent nodes belong to (issue #395), stamped onto every
+    /// approval this node's turn parks so the Approvals page can say which
+    /// workflow run is waiting on the operator.
+    run_id: String,
     /// What the operator asked for on this run (issue #154), when they supplied
     /// it. A node's `prompt` is authored into the graph and is the same on every
     /// run, so without this the run's topic never reaches the teammate doing the
@@ -209,18 +214,136 @@ pub struct HarnessAgentRunner {
 
 impl HarnessAgentRunner {
     /// Builds a runner over an already-populated pool for `company`, carrying
-    /// the operator's run request (issue #154) when one was supplied.
+    /// the run's id (issue #395) and the operator's run request (issue #154)
+    /// when one was supplied.
     pub fn new(
         pool: Arc<HarnessPool>,
         deps: HarnessDeps,
         company: CompanyId,
+        run_id: String,
         run_request: Option<String>,
     ) -> Self {
         Self {
             pool,
             deps,
             company,
+            run_id,
             run_request,
+        }
+    }
+
+    /// Parks every approval-gated tool call this node's turn just recorded
+    /// (issue #395) — the drain the workflow path never had.
+    ///
+    /// # The hole this closes
+    ///
+    /// [`ApprovalPolicy`](crate::harness::policy::ApprovalPolicy) is installed
+    /// pool-wide on every roster agent with the shared
+    /// [`ApprovalRequestQueue`](crate::harness::policy::ApprovalRequestQueue),
+    /// so a gated tool call inside a workflow agent node **was** recorded. But
+    /// the only drain in the codebase is
+    /// [`park_approval_requests`](crate::harness::HarnessBrain), which lives
+    /// inside `run_cycle` and needs a
+    /// [`CycleHost`](crate::ports::brain::CycleHost). This path —
+    /// `run_agent` → [`HarnessPool::run_background`] → `run_inner` — never goes
+    /// near a cycle, so nothing drained, and the next chat cycle's
+    /// [`clear`](crate::harness::policy::ApprovalRequestQueue::clear) threw the
+    /// request away. The queue's own doc names this case. The leak was
+    /// prevented; the parking was never added. That is why the Approvals page
+    /// stayed "All clear" through a run an operator watched get gated.
+    ///
+    /// # Boundary, not drain
+    ///
+    /// `from` is taken *before* the turn, and only the tail above it is claimed
+    /// — see
+    /// [`take_from`](crate::harness::policy::ApprovalRequestQueue::take_from).
+    /// The queue is shared with whatever chat cycle happens to be running, and
+    /// `drain` would take that cycle's entries and clear the rest.
+    ///
+    /// This narrows the shared-queue race to a turn-sized window; it does not
+    /// eliminate it. If a chat turn pushes *while* this node's turn is running,
+    /// its request lands above the boundary and is parked here — with this
+    /// run's id stamped on it. The real fix is a per-run queue, which means
+    /// re-plumbing `ApprovalPolicy` installation out of `build_roster`; that is
+    /// deliberately out of scope for #395. The failure mode is a mis-attributed
+    /// `run_id` on a card that is otherwise correct and decidable, which is
+    /// strictly better than the request vanishing.
+    ///
+    /// # Never fails the node
+    ///
+    /// A park that errors is logged per entry and the loop continues. The turn
+    /// already happened, the model was already told it was refused, and failing
+    /// the node here would discard a completed turn's work over a queue write.
+    /// Same stance `park_approval_requests` takes, for the same reason.
+    async fn park_gated_calls(&self, from: usize) {
+        let queue = &self.deps.approval_requests;
+        // Issue #242's stamp, applied at the boundary the run owns: this is
+        // where an approval learns which workflow run is waiting on it.
+        queue.stamp_run(from, &self.run_id);
+        let requests = queue.take_from(from);
+        if requests.is_empty() {
+            return;
+        }
+
+        let Some(parking) = self
+            .deps
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.parking.as_ref())
+        else {
+            // Loud: these requests are already off the queue and are the only
+            // trace of calls the operator will never be asked about.
+            tracing::error!(
+                company = %self.company,
+                run_id = %self.run_id,
+                requests = requests.len(),
+                "workflow agent node: gated tool calls could NOT be parked — this runtime has \
+                 no approvals queue wired; the operator will not be asked about them"
+            );
+            return;
+        };
+
+        let cap = crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN;
+        if requests.len() > cap {
+            // Bounded exactly as the cycle drain is: a model that keeps
+            // re-trying a blocked tool must not be able to flood the queue.
+            tracing::warn!(
+                company = %self.company,
+                run_id = %self.run_id,
+                discarded = requests.len() - cap,
+                "workflow agent node: more gated tool calls than one turn may park; the excess \
+                 was discarded"
+            );
+        }
+        for request in requests.into_iter().take(cap) {
+            // The delivery precedent: a workflow run has no board card behind it
+            // and no conversation to raise the request in, so it is recorded
+            // explicitly unlinked (#333) and stays Approvals-page-only (#379).
+            match parking
+                .park_and_journal(
+                    &self.company,
+                    request.effect,
+                    crate::runtime::journal::TaskLink::Unlinked,
+                    None,
+                )
+                .await
+            {
+                Ok(approval_id) => tracing::info!(
+                    company = %self.company,
+                    run_id = %self.run_id,
+                    tool = %request.tool,
+                    approval_id = %approval_id,
+                    "workflow agent node: parked a gated tool call for operator approval"
+                ),
+                Err(err) => tracing::error!(
+                    company = %self.company,
+                    run_id = %self.run_id,
+                    tool = %request.tool,
+                    %err,
+                    "workflow agent node: failed to park a gated tool call; the operator will \
+                     not be asked about it"
+                ),
+            }
         }
     }
 }
@@ -240,10 +363,20 @@ impl AgentRunner for HarnessAgentRunner {
             agent = agent_ref,
             "workflow agent node: routing to harness pool"
         );
+        // Issue #395: where this turn's own approval requests begin, taken
+        // BEFORE the turn so the queue's append-only property makes it a valid
+        // entitlement boundary.
+        let from = self.deps.approval_requests.queued();
         let outcome = self
             .pool
             .run_background(&self.company, agent_ref, &message, &self.deps)
-            .await
+            .await;
+        // Drained on BOTH arms, deliberately. A turn that errored may still have
+        // had a tool call gated before it failed, and that request is just as
+        // real — leaving it on the queue hands it to the next chat cycle's
+        // `clear()`, which is the exact disappearance this issue is about.
+        self.park_gated_calls(from).await;
+        let outcome = outcome
             .map_err(|e| EngineError::Capability(format!("harness agent '{agent_ref}': {e}")))?;
         // Mirror the engine's `{ json, text, raw }` envelope shape: expose the
         // reply as `text` so a downstream `=item.text` binding resolves. A
