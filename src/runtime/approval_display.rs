@@ -113,8 +113,27 @@ pub fn display_payload(effect: &Effect) -> Option<Value> {
     if is_empty(&effect.payload) {
         return None;
     }
+    Some(redact(&effect.payload))
+}
+
+/// The redaction rule above, applied to a **bare** value.
+///
+/// The one seam that lets a second operator-facing surface reuse this rather
+/// than growing a redactor of its own. Issue #411's turn-step trace calls it to
+/// show *what a tool call was doing* — and those arguments are literally the
+/// same object [`display_payload`] shows on the approval card, because
+/// [`ApprovalPolicy::effect_for`](crate::harness::policy::ApprovalPolicy::effect_for)
+/// projects a gated call's arguments straight into `Effect::payload`. One rule,
+/// one denylist, one set of bounds: a key added to [`DENY_SEGMENTS`] tightens
+/// both surfaces at once, and neither can drift away from the other.
+///
+/// Unlike [`display_payload`] this makes no "is there anything worth showing"
+/// judgement — an empty object redacts to an empty object. The caller decides
+/// what to do with nothing, because "nothing" means different things on a card
+/// (omit the section) and in a trace (the call took no arguments).
+pub fn redact(value: &Value) -> Value {
     let mut budget = MAX_NODES;
-    Some(walk(&effect.payload, 0, &mut budget))
+    walk(value, 0, &mut budget)
 }
 
 /// Whether a payload carries nothing worth putting on a card.
