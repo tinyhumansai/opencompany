@@ -178,6 +178,11 @@ async fn run_workflow_inner(
     // message carries the topic — a node's authored `prompt` is the same on
     // every run and cannot say what was asked this time.
     let run_request = super::caps::run_request_text(&input);
+    // Issue #395: the trigger payload, kept before the engine consumes it. A
+    // paused gate's approval card has to carry the input the run was started
+    // with, because resuming means re-running the graph with that same input
+    // plus the approval — see `crate::runtime::workflow_resume`.
+    let trigger_input = input.clone();
     // Issue #170: the delivery ports are read off `deps` BEFORE it moves into
     // the capability bundle. Delivery is host-side and post-engine, so it is not
     // a capability — the engine never learns a report has a destination.
@@ -361,6 +366,25 @@ async fn run_workflow_inner(
         }
     };
 
+    // Issue #395: turn every gate the engine paused on into a decidable
+    // approval. Deliberately here, beside the delivery call and for the same
+    // reason: all three entry points — the console route, the cron scheduler,
+    // and the orchestrator's `run_workflow` tool — come through this function,
+    // and a scheduled run is exactly the case where nobody is watching the
+    // response that used to be the only place these ids appeared.
+    //
+    // Skipped for a cancelled run, which returns above: an operator who stopped
+    // a run is not asking to be asked about the gates it never reached.
+    park_pending_gates(
+        delivery.as_ref(),
+        record,
+        &workflow.id,
+        &run_id,
+        &trigger_input,
+        &outcome.pending_approvals,
+    )
+    .await;
+
     // Route every reached `output` node's report to its configured destination.
     // Deliberately here rather than in the HTTP handler: the orchestrator's
     // `run_workflow` tool and the trigger scheduler drive this same path, and a
@@ -376,6 +400,110 @@ async fn run_workflow_inner(
         deliveries,
         cancelled: false,
     })
+}
+
+/// Parks one approval card per gate the run paused on (issue #395).
+///
+/// # The hole this closes
+///
+/// A node marked `requires_approval` pauses the run, and the engine reports the
+/// gate's node id on `RunOutcome::pending_approvals`. Those ids flowed into
+/// exactly two places — the run route's HTTP response and the
+/// `WorkflowRunFinished` journal line — and **neither is an approval**. The
+/// Approvals page reads the journal's parked [`Effect`](crate::ports::types::Effect)s,
+/// so it was empty by construction: the run paused, the ids were recorded as
+/// trivia, and nothing an operator could act on ever existed. That is why a QA
+/// run with a `requires_approval` node left the page reading "All clear".
+///
+/// # Best-effort, and never fails the run
+///
+/// The engine has already settled by the time this runs; the graph's work is
+/// done and correct whatever happens here. A park that fails is logged loudly —
+/// it is the only trace of a decision the operator will never be asked for —
+/// and the next gate is still attempted. Failing the run instead would discard
+/// a completed run's output over an approvals-queue write.
+///
+/// # Dedupe
+///
+/// A run is re-runnable, and resuming one is itself a re-run, so the same gate
+/// on the same input will be reached again and again. Without a dedupe the
+/// queue fills with identical cards for one decision — which is exactly how an
+/// operator learns to rubber-stamp the queue. Identity is the gate, not the run;
+/// see [`already_parked`](crate::runtime::workflow_resume::already_parked).
+async fn park_pending_gates(
+    delivery: Option<&super::delivery::WorkflowDeliveryDeps>,
+    record: &CompanyRecord,
+    workflow_id: &str,
+    run_id: &str,
+    trigger_input: &Value,
+    pending: &[String],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let Some(parking) = delivery.and_then(|delivery| delivery.parking.as_ref()) else {
+        // Fails closed and loud, the same stance `deliver_outputs` takes for an
+        // unwired destination: the run genuinely paused, and on this build
+        // nobody can be asked to un-pause it.
+        tracing::error!(
+            company = %record.id,
+            workflow = %workflow_id,
+            %run_id,
+            gates = pending.len(),
+            "workflow: the run paused for approval but this runtime has no approvals queue \
+             wired, so the gates cannot be parked — the run cannot be continued"
+        );
+        return;
+    };
+
+    for node_id in pending {
+        let effect = crate::runtime::workflow_resume::gate_effect(
+            workflow_id,
+            node_id,
+            trigger_input,
+            run_id,
+        );
+        if crate::runtime::workflow_resume::already_parked(&parking.journal, &effect) {
+            tracing::debug!(
+                company = %record.id,
+                workflow = %workflow_id,
+                node = %node_id,
+                "workflow: this gate is already waiting on the operator; not asking twice"
+            );
+            continue;
+        }
+        // A workflow run has no board card behind it and no conversation to
+        // raise the request in — the same two facts the delivery park records
+        // (#333, #379).
+        match parking
+            .park_and_journal(
+                &record.id,
+                effect,
+                crate::runtime::journal::TaskLink::Unlinked,
+                None,
+            )
+            .await
+        {
+            Ok(approval_id) => tracing::info!(
+                company = %record.id,
+                workflow = %workflow_id,
+                node = %node_id,
+                %run_id,
+                %approval_id,
+                "workflow: parked a paused gate for operator approval; approving it starts a \
+                 continuation run"
+            ),
+            Err(err) => tracing::error!(
+                company = %record.id,
+                workflow = %workflow_id,
+                node = %node_id,
+                %run_id,
+                %err,
+                "workflow: a paused gate could NOT be parked for approval; the run cannot be \
+                 continued"
+            ),
+        }
+    }
 }
 
 /// What a run stopped by an operator settles with (issue #383).
@@ -1667,6 +1795,205 @@ to = "done"
             })
             .await;
         assert!(out.is_ok(), "a run below the limit must execute: {out:?}");
+    }
+
+    // --- #395: a paused gate becomes a decidable approval --------------------
+
+    /// The graph T4 uses, with the gate node reachable and an output behind it.
+    const GATED: &str = r#"
+id = "gated"
+name = "Gated"
+[[node]]
+id = "start"
+kind = "trigger"
+name = "Start"
+[[node]]
+id = "gate"
+kind = "tool_call"
+name = "Gate"
+requires_approval = true
+[node.config]
+slug = "csv_export"
+[[node]]
+id = "done"
+kind = "output"
+name = "Done"
+[[edge]]
+from = "start"
+to = "gate"
+[[edge]]
+from = "gate"
+to = "done"
+"#;
+
+    /// Deps with a real approvals queue — the production gate over a `full`
+    /// policy and a real on-disk journal.
+    ///
+    /// `full` is the mode that matters: it is the tier under which the manifest
+    /// gate's `evaluate` would *allow* most effects. Parking under it proves the
+    /// gate park is the already-decided path rather than a re-evaluation that
+    /// would quietly let the run continue.
+    fn deps_with_parking(
+        dir: &std::path::Path,
+    ) -> (HarnessDeps, Arc<crate::runtime::journal::RuntimeJournal>) {
+        let policy = toml::from_str("mode = \"full\"\n").expect("valid [policy] block");
+        let gate = Arc::new(crate::policy::ManifestApprovalGate::new(policy));
+        let journal = Arc::new(crate::runtime::journal::RuntimeJournal::new(
+            dir.join("journal.jsonl"),
+        ));
+        let mut deps = deps(dir);
+        deps.delivery = Some(super::super::delivery::WorkflowDeliveryDeps {
+            mail: None,
+            inbox: Arc::new(crate::store::FsInboxStore::new(dir)),
+            users: Arc::new(crate::store::FsOps::new(dir)),
+            channels: Vec::new(),
+            parking: Some(super::super::delivery::DeliveryParking {
+                approvals: gate,
+                journal: journal.clone(),
+            }),
+        });
+        (deps, journal)
+    }
+
+    /// The headline regression. A run that pauses on `requires_approval` must
+    /// leave a **parked effect** behind, not just an id on a response body —
+    /// the Approvals page reads the journal, so before #395 it stayed empty
+    /// however many gates a run paused on.
+    #[tokio::test]
+    async fn a_paused_gate_becomes_a_parked_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, journal) = deps_with_parking(dir.path());
+        let file = parse_workflow(GATED).expect("parses");
+
+        let run = run_workflow(
+            Arc::new(HarnessPool::new()),
+            deps,
+            &tools_record(),
+            &file,
+            serde_json::json!({ "request": "quarterly numbers" }),
+            &WorkflowRunContext::new(false),
+        )
+        .await
+        .expect("run pauses cleanly");
+        assert!(run.pending_approvals.iter().any(|id| id == "gate"));
+
+        let pending = journal.pending();
+        let card = pending
+            .iter()
+            .find(|p| p.effect.kind == crate::runtime::WORKFLOW_APPROVE_KIND)
+            .expect("the paused gate is waiting on the operator");
+        assert_eq!(card.effect.payload["workflow_id"], "gated");
+        assert_eq!(card.effect.payload["node_id"], "gate");
+        // Self-contained: the trigger input rides the card, which is what makes
+        // approve-after-restart resume without any live state.
+        assert_eq!(card.effect.payload["input"]["request"], "quarterly numbers");
+        // Native — no teammate asked, so approving must not mint a tool grant.
+        assert!(card.effect.agent.is_none());
+        // The run that paused, so the console can tie the card to the history.
+        assert!(card.effect.run_id.is_some());
+    }
+
+    /// Re-running the same graph with the same input must not stack a second
+    /// card for one decision — that is how an approvals queue becomes something
+    /// an operator rubber-stamps.
+    #[tokio::test]
+    async fn re_reaching_the_same_gate_does_not_ask_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, journal) = deps_with_parking(dir.path());
+        let file = parse_workflow(GATED).expect("parses");
+        let input = serde_json::json!({ "request": "same" });
+
+        for _ in 0..3 {
+            run_workflow(
+                Arc::new(HarnessPool::new()),
+                deps.clone(),
+                &tools_record(),
+                &file,
+                input.clone(),
+                &WorkflowRunContext::new(false),
+            )
+            .await
+            .expect("run pauses cleanly");
+        }
+
+        let gates = journal
+            .pending()
+            .into_iter()
+            .filter(|p| p.effect.kind == crate::runtime::WORKFLOW_APPROVE_KIND)
+            .count();
+        assert_eq!(gates, 1, "one gate, one decision, one card");
+    }
+
+    /// …but a **different** input at the same gate is a genuinely different
+    /// decision and must be asked about separately.
+    #[tokio::test]
+    async fn the_same_gate_on_a_different_input_is_a_second_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, journal) = deps_with_parking(dir.path());
+        let file = parse_workflow(GATED).expect("parses");
+
+        for request in ["first", "second"] {
+            run_workflow(
+                Arc::new(HarnessPool::new()),
+                deps.clone(),
+                &tools_record(),
+                &file,
+                serde_json::json!({ "request": request }),
+                &WorkflowRunContext::new(false),
+            )
+            .await
+            .expect("run pauses cleanly");
+        }
+
+        let gates = journal
+            .pending()
+            .into_iter()
+            .filter(|p| p.effect.kind == crate::runtime::WORKFLOW_APPROVE_KIND)
+            .count();
+        assert_eq!(gates, 2);
+    }
+
+    /// A run an operator stopped parks nothing. They are not asking to be asked
+    /// about gates the run never reached, and `cancelled_run` reports no pending
+    /// approvals for the same reason.
+    #[tokio::test]
+    async fn a_cancelled_run_parks_no_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, journal) = deps_with_parking(dir.path());
+        let file = parse_workflow(GATED).expect("parses");
+        let ctx = WorkflowRunContext::new(false);
+        ctx.cancel.cancel();
+
+        let run = run_workflow(
+            Arc::new(HarnessPool::new()),
+            deps,
+            &tools_record(),
+            &file,
+            serde_json::json!({ "request": "x" }),
+            &ctx,
+        )
+        .await
+        .expect("a cancelled run is Ok");
+        assert!(run.cancelled);
+        assert!(journal.pending().is_empty());
+    }
+
+    /// A graph with no gate parks nothing — the addition must be invisible to
+    /// every run that was already working.
+    #[tokio::test]
+    async fn a_run_that_pauses_on_nothing_parks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, journal) = deps_with_parking(dir.path());
+        let file = parse_workflow(GREET).expect("parses");
+        let rec = record();
+        let pool = Arc::new(HarnessPool::new());
+        pool.ensure(&rec, &deps).await.expect("roster builds");
+
+        let run = run_workflow(pool, deps, &rec, &file, Value::Null, &WorkflowRunContext::new(false))
+            .await
+            .expect("run completes");
+        assert!(run.pending_approvals.is_empty());
+        assert!(journal.pending().is_empty());
     }
 
     // --- issue #371: the per-node progress trail -----------------------------
