@@ -1003,14 +1003,62 @@ impl RuntimeBuilder {
         // order. It costs nothing: a refused dispatch settles its own row
         // (`CompanyRuntime::abandon_run`), and the next real boot sweeps
         // anything that escapes.
-        if handover.is_none()
-            && let Err(err) = crate::ports::runs::reap_orphaned_runs(ops.runs.as_ref(), &id).await
-        {
-            tracing::warn!(
-                company = %id,
-                error = %err,
-                "could not sweep orphaned run records at boot"
-            );
+        //
+        // Issue #337: the sweep now also makes the **board** truthful. Failing
+        // the row alone left the card sitting in In Progress claimed by an
+        // attempt that provably no longer exists — and because
+        // `task_enters_in_progress` fires on the *transition* into that column,
+        // which already happened, nothing would ever re-drive it. So each
+        // reaped run's card returns to To-do carrying the orphan reason, and a
+        // re-dispatch from there mints a fresh attempt rather than resuming a
+        // dead one.
+        //
+        // Suppressed on a rebuild for exactly the same reason the row sweep is,
+        // and not one step further: the proof that these attempts are abandoned
+        // is a boot-only proof, and a card is not a safer thing to guess about
+        // than a row. The move is guarded on top of that (`advance_settled_card`
+        // only ever leaves `in_progress`), so a card an operator parked in
+        // Paused or a later attempt landed in In Review is untouched even here.
+        if handover.is_none() {
+            match crate::ports::runs::reap_orphaned_runs(ops.runs.as_ref(), &id).await {
+                Ok(reaped) => {
+                    for run in reaped {
+                        match crate::runtime::advance::advance_settled_card(
+                            ops.tasks.as_ref(),
+                            &id,
+                            &run.task_id,
+                            crate::ports::runs::RunStatus::Failed,
+                            crate::ports::runs::ORPHAN_ERROR,
+                        )
+                        .await
+                        {
+                            Ok(Some(column)) => tracing::info!(
+                                company = %id,
+                                run = %run.id,
+                                task = %run.task_id,
+                                column,
+                                "returned a card stranded by a previous host process"
+                            ),
+                            Ok(None) => {}
+                            // One card that will not move must not stop the
+                            // rest and must not fail boot — record-keeping never
+                            // stops a company from starting.
+                            Err(err) => tracing::warn!(
+                                company = %id,
+                                run = %run.id,
+                                task = %run.task_id,
+                                error = %err,
+                                "reaped an orphaned run but could not return its card"
+                            ),
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    company = %id,
+                    error = %err,
+                    "could not sweep orphaned run records at boot"
+                ),
+            }
         }
 
         // Issue #371, the workflow-side equivalent of the sweep above, and it
@@ -2360,6 +2408,150 @@ mod test {
         assert_eq!(review.error, None);
 
         assert!(runs.list_stale_active(&id).await.unwrap().is_empty());
+    }
+
+    /// Issue #337, the crash-truthfulness half: reaping the *row* is not enough
+    /// — the **card** has to leave In Progress too, or the board keeps claiming
+    /// work that provably is not being done and nothing will ever re-drive it
+    /// (`task_enters_in_progress` fires on the transition, which already
+    /// happened).
+    ///
+    /// Three things at once, because they are one behaviour: the stranded card
+    /// returns to To-do with the reason readable on it, a card parked for a
+    /// person is untouched, and re-dispatching the returned card starts a
+    /// **new** attempt rather than resuming the dead one.
+    #[tokio::test]
+    async fn boot_returns_a_stranded_card_and_leaves_a_parked_one_alone() {
+        use crate::ports::runs::{NewRun, ORPHAN_ERROR, RunOutcome, RunStatus};
+        use crate::ports::tasks::{COLUMN_IN_PROGRESS, COLUMN_PAUSED, COLUMN_TODO, TaskRecord};
+
+        let home_dir = tmp_home("oc-run-reap-cards-");
+        let home = home_dir.path().to_path_buf();
+        let manifest = parse("[company]\nname=\"Acme\"\n[policy]\nmode=\"full\"\n");
+        let id = CompanyId::new("acme");
+        let card = |task: &str, column: &str| TaskRecord {
+            id: task.to_string(),
+            title: "Draft the spec".to_string(),
+            note: Some("[maya] started".to_string()),
+            column: column.to_string(),
+            priority: "medium".to_string(),
+            assignee: "ceo".to_string(),
+            updated_at_millis: 1,
+            origin_chat_id: None,
+            parent_task_id: None,
+        };
+
+        let first_boot = RuntimeBuilder::new(home.clone(), manifest.clone())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let runs = first_boot.runs().clone();
+        let tasks = first_boot.tasks().clone();
+
+        // `card-a` is being worked by an attempt that will die with the host.
+        // `card-b` is parked for a person, and its run is parked with it.
+        tasks
+            .upsert(&id, &card("card-a", COLUMN_IN_PROGRESS))
+            .await
+            .unwrap();
+        tasks
+            .upsert(&id, &card("card-b", COLUMN_PAUSED))
+            .await
+            .unwrap();
+        runs.create_run(
+            &id,
+            NewRun {
+                id: "run-a".to_string(),
+                task_id: "card-a".to_string(),
+                agent_id: "ceo".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        runs.begin_run(&id, "run-a", crate::ports::types::EventSeq::new(1))
+            .await
+            .unwrap();
+        runs.create_run(
+            &id,
+            NewRun {
+                id: "run-b".to_string(),
+                task_id: "card-b".to_string(),
+                agent_id: "ceo".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        runs.begin_run(&id, "run-b", crate::ports::types::EventSeq::new(2))
+            .await
+            .unwrap();
+        runs.finish_run(&id, "run-b", RunOutcome::new(RunStatus::Paused))
+            .await
+            .unwrap();
+
+        // The host dies here — `kill -9`, no settle, no journal entry.
+        drop(first_boot);
+
+        let second_boot = RuntimeBuilder::new(home.clone(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let tasks = second_boot.tasks();
+        let after = |task: &'static str| {
+            let tasks = tasks.clone();
+            let id = id.clone();
+            async move {
+                tasks
+                    .list(&id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.id == task)
+                    .expect("card survives the restart")
+            }
+        };
+
+        // The stranded card is back in To-do, and says why in words an operator
+        // can act on rather than silently.
+        let stranded = after("card-a").await;
+        assert_eq!(stranded.column, COLUMN_TODO);
+        let note = stranded.note.expect("note");
+        assert!(note.contains(ORPHAN_ERROR), "{note}");
+        assert!(
+            note.contains("[maya] started"),
+            "the note is append-only; what the run already said must survive: {note}"
+        );
+
+        // The parked card is exactly as it was. Its run was `Paused`, so the
+        // reaper never saw it — and even if it had, the mover only ever leaves
+        // In Progress.
+        let parked = after("card-b").await;
+        assert_eq!(parked.column, COLUMN_PAUSED);
+        assert_eq!(parked.note.as_deref(), Some("[maya] started"));
+
+        // Re-dispatching the returned card mints a **new** attempt. Nothing
+        // resurrects `run-a`, which is terminal.
+        let runs = second_boot.runs();
+        assert_eq!(
+            runs.get_run(&id, "run-a").await.unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+        let next = runs
+            .create_run(
+                &id,
+                NewRun {
+                    id: "run-a2".to_string(),
+                    task_id: "card-a".to_string(),
+                    agent_id: "ceo".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next.attempt, 2,
+            "a card that came back to To-do is re-tried, not resumed"
+        );
     }
 
     #[tokio::test]

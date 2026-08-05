@@ -575,7 +575,13 @@ fn check_transition(run: &RunRecord, next: RunStatus) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Fails every run still recorded as `Pending` or `Running` for `company`,
-/// returning how many were reclaimed.
+/// returning the records it reclaimed.
+///
+/// **The records, not a count (issue #337).** Each reaped row names a card that
+/// is still sitting in `in_progress` claimed by an attempt that provably no
+/// longer exists — so the caller needs the `task_id`s to make the board
+/// truthful, not just a number for the log line. Rows that could not be written
+/// are omitted, so the returned set is exactly "what was actually settled".
 ///
 /// ## Why an active row at boot is *provably* dead, not merely suspicious
 ///
@@ -610,13 +616,16 @@ fn check_transition(run: &RunRecord, next: RunStatus) -> Result<()> {
 /// **Parked runs are never touched.** `WaitingApproval` and `Paused` are
 /// waiting on a person or an external condition, not on a process; reaping them
 /// would delete real pending work every time the host restarted.
-pub async fn reap_orphaned_runs(runs: &dyn RunStore, company: &CompanyId) -> Result<u32> {
+pub async fn reap_orphaned_runs(
+    runs: &dyn RunStore,
+    company: &CompanyId,
+) -> Result<Vec<RunRecord>> {
     let stale = runs.list_stale_active(company).await?;
-    let mut reaped = 0u32;
+    let mut reaped = Vec::new();
     for run in stale {
         let outcome = RunOutcome::new(RunStatus::Failed).with_error(ORPHAN_ERROR);
         match runs.finish_run(company, &run.id, outcome).await {
-            Ok(_) => reaped += 1,
+            Ok(settled) => reaped.push(settled),
             // One unreclaimable row must not stop the rest, and must not fail
             // boot — but it is logged at warn, not swallowed, because a store
             // that cannot write at startup is a real problem.
@@ -628,10 +637,10 @@ pub async fn reap_orphaned_runs(runs: &dyn RunStore, company: &CompanyId) -> Res
             ),
         }
     }
-    if reaped > 0 {
+    if !reaped.is_empty() {
         tracing::info!(
             company = %company,
-            reaped,
+            reaped = reaped.len(),
             "failed run records stranded by a previous host process"
         );
     }

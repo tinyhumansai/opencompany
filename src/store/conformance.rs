@@ -2062,7 +2062,17 @@ pub async fn assert_run_reaper(runs: Arc<dyn crate::ports::runs::RunStore>) {
     let reaped = crate::ports::runs::reap_orphaned_runs(runs.as_ref(), &alpha)
         .await
         .unwrap();
-    assert_eq!(reaped, 2, "exactly the Pending and Running rows");
+    assert_eq!(reaped.len(), 2, "exactly the Pending and Running rows");
+    // Issue #337: the caller gets the records, not a count, because it has to
+    // return each reaped run's *card* to To-do — and for that it needs the
+    // `task_id`s. A count would leave the board claiming work nothing is doing.
+    let mut reaped_tasks: Vec<&str> = reaped.iter().map(|r| r.task_id.as_str()).collect();
+    reaped_tasks.sort_unstable();
+    assert_eq!(
+        reaped_tasks,
+        ["a", "b"],
+        "the cards of the pending and running rows"
+    );
 
     let status = |id: &'static str| {
         let runs = runs.clone();
@@ -2098,11 +2108,11 @@ pub async fn assert_run_reaper(runs: Arc<dyn crate::ports::runs::RunStore>) {
     );
 
     // The sweep is idempotent: a second boot finds nothing left to reclaim.
-    assert_eq!(
+    assert!(
         crate::ports::runs::reap_orphaned_runs(runs.as_ref(), &alpha)
             .await
-            .unwrap(),
-        0
+            .unwrap()
+            .is_empty()
     );
     assert!(
         runs.list_runs(&alpha, &RunFilter::active())
