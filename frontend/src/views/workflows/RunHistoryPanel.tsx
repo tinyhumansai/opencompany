@@ -283,6 +283,14 @@ function RunHistoryRow({
           . The steps above completed; the one still running was stopped where it
           was. Any approvals it had already raised are still waiting for you.
         </p>
+      ) : run.running ? (
+        // Same root cause as the tone bug: a run still walking its graph has no
+        // error, no cancellation and no deliveries yet, so it fell through to
+        // the "Finished" line below and told the operator it was over. It is
+        // not, and its reports have not been routed yet.
+        <p className="text-[11px] text-muted-foreground">
+          Still running — reports are routed when it finishes.
+        </p>
       ) : run.deliveries.length > 0 ? (
         // Deliberately the SAME component the live run drawer uses, so a report
         // reads identically whether it's on screen now or a week old.
