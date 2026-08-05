@@ -16,6 +16,9 @@ Supporting docs:
   bodies, and the single follow-up nudge
 - [manifest.md](manifest.md) — `company.toml` schema
 - [lifecycle.md](lifecycle.md) — company state machine and durability
+- [planning.md](planning.md) — the board's Planning station: one tool-less model
+  call per card, the host-gathered evidence pack, the prerequisite verdict
+  taxonomy, and the no-run/no-lock concurrency argument
 - [rebuild.md](rebuild.md) — replacing a registered runtime in place (quiesce →
   hand over → swap), so a first-time inference config needs no restart
 - [api.md](api.md) — HTTP routes and auth

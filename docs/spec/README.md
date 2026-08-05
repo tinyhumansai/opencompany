@@ -82,6 +82,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/events.md](runtime/events.md) | `CompanyEvent` vocabulary + journal correlation rules |
 | [runtime/manifest.md](runtime/manifest.md) | `company.toml` schema, `agents.toml` compatibility |
 | [runtime/lifecycle.md](runtime/lifecycle.md) | Company state machine and durability |
+| [runtime/planning.md](runtime/planning.md) | The Planning station: pass contract, prerequisite verdicts, boot sweep |
 | [runtime/api.md](runtime/api.md) | HTTP surface and auth model |
 | [runtime/config.md](runtime/config.md) | Configuration and the one-key story |
 | [company-as-agent/README.md](company-as-agent/README.md) | Companies as economy citizens |
