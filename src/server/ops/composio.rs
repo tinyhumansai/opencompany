@@ -48,6 +48,59 @@ use crate::server::ops::{ScopedCompany, scoped};
 const SWITCH_NOTE: &str =
     "Agents pick up the new Composio token on their next turn — no restart needed.";
 
+/// The providers the console offers when a company is in **open mode** (issue
+/// #397).
+///
+/// An empty `[tools.composio].toolkits` means "defer to the backend's
+/// server-enforced allowlist" — i.e. *every* toolkit is permitted, roughly a
+/// hundred slugs. The console previously read that same empty list as "offer
+/// nothing", so the one value meaning *allow everything* rendered zero provider
+/// rows on 19 of 20 shipped templates.
+///
+/// Two things are wrong with simply listing all hundred: the console does not
+/// know the backend's allowlist without a network round-trip on a page-load
+/// path, and a hundred rows is its own usability problem. So open mode offers
+/// this curated set — the toolkits a company actually reaches for first, each of
+/// which is in the backend's default allowlist — and the console pairs it with a
+/// free-text field that can authorize **any** slug the backend permits. The
+/// curated list is a starting point, never a ceiling: nothing here narrows what
+/// the backend or the agent-side allowlist admits.
+///
+/// This is a **console affordance only**. Agent-side toolkit admission is
+/// [`toolkit_allowed`](crate::harness::composio), which still treats an empty
+/// manifest list as "allow every toolkit" — unchanged by this constant.
+pub(crate) const OPEN_MODE_TOOLKITS: &[&str] = &[
+    "gmail",
+    "googlecalendar",
+    "googledrive",
+    "github",
+    "slack",
+    "notion",
+    "linear",
+    "discord",
+];
+
+/// The toolkits the console should offer for a company, and whether that answer
+/// came from open mode.
+///
+/// A non-empty manifest allowlist is authoritative and is offered verbatim — a
+/// company that deliberately narrowed its belt sees exactly what it chose.
+/// Empty means open mode, which offers [`OPEN_MODE_TOOLKITS`].
+///
+/// Returning the pair (rather than letting the console infer open mode from an
+/// empty list) is the whole point of the fix: the console must never again have
+/// to guess which of the two opposite meanings an empty list carries.
+fn effective_toolkits(manifest: &[String]) -> (bool, Vec<String>) {
+    if manifest.is_empty() {
+        (
+            true,
+            OPEN_MODE_TOOLKITS.iter().map(|s| (*s).to_string()).collect(),
+        )
+    } else {
+        (false, manifest.to_vec())
+    }
+}
+
 /// Builds the Composio management route fragment.
 ///
 /// The read/write-token plane (`GET …/composio`, `PUT …/composio/token`) is
@@ -86,8 +139,24 @@ struct ComposioStatusDto {
     credential_source: CredentialSource,
     /// The effective Composio backend URL (env override or default). Non-secret.
     backend_url: String,
-    /// The manifest toolkit allowlist (empty = defer to the backend allowlist).
+    /// The manifest toolkit allowlist verbatim (empty = defer to the backend
+    /// allowlist, i.e. open mode). Kept as-is so an operator can still see what
+    /// the manifest literally says; the console renders
+    /// [`Self::effective_toolkits`] instead.
     toolkits: Vec<String>,
+    /// Whether this company is in **open mode** — an empty manifest allowlist,
+    /// meaning the backend's own allowlist governs and every toolkit it permits
+    /// is reachable (issue #397).
+    ///
+    /// The console needs this told to it rather than inferred: an empty
+    /// `toolkits` means *allow everything*, which is the opposite of what an
+    /// empty list reads as.
+    open_mode: bool,
+    /// The toolkits the console offers as provider rows — the manifest list when
+    /// it is non-empty, else the curated [`OPEN_MODE_TOOLKITS`] starting set. In
+    /// open mode this is a suggestion, not a limit: any slug the backend permits
+    /// can still be authorized.
+    effective_toolkits: Vec<String>,
 }
 
 /// A mutating response: the resulting status plus the switch reminder.
@@ -177,12 +246,15 @@ async fn effective_status(runtime: &CompanyRuntime) -> Result<ComposioStatusDto,
         )
     };
     let credential_source = credential_source_for(stored, &env);
+    let (open_mode, effective) = effective_toolkits(&toolkits);
     Ok(ComposioStatusDto {
         in_build: cfg!(feature = "composio"),
         granted,
         credential_source,
         backend_url: backend_url_or_default(env_url, api_url),
         toolkits,
+        open_mode,
+        effective_toolkits: effective,
     })
 }
 
@@ -413,6 +485,61 @@ mod tests {
         (status, value, raw)
     }
 
+    /// Issue #397: an **empty** manifest allowlist means "defer to the backend"
+    /// — allow everything — so the status must report open mode and hand the
+    /// console a non-empty starting set. The old console gate keyed off
+    /// `toolkits.length > 0` and therefore rendered nothing in exactly the case
+    /// where everything is permitted.
+    #[tokio::test]
+    async fn an_empty_toolkit_list_is_open_mode_and_still_offers_providers() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        // No `[tools.composio]` section at all — the shape 19 of 20 templates ship.
+        let state = state_with_manifest(
+            &home,
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[tools]\nallow = [\"composio\"]\n",
+        )
+        .await;
+
+        let (status, dto, _) = send(&state, "GET", "/api/v1/company/composio", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dto["granted"], true);
+        assert_eq!(dto["toolkits"], json!([]), "the manifest list is verbatim");
+        assert_eq!(dto["openMode"], true);
+        let offered = dto["effectiveToolkits"]
+            .as_array()
+            .expect("open mode carries an effective toolkit list");
+        assert!(
+            !offered.is_empty(),
+            "open mode means allow-everything, so the console must be offered providers"
+        );
+        assert!(
+            offered.iter().any(|t| t == "github"),
+            "the curated set covers the common providers: {offered:?}"
+        );
+    }
+
+    /// The other half of #397: a company that deliberately narrowed its belt
+    /// sees exactly what it chose, and is NOT in open mode. A fix that offered
+    /// the curated set to everyone would silently widen every restrictive
+    /// manifest.
+    #[tokio::test]
+    async fn an_explicit_toolkit_list_is_offered_verbatim_and_is_not_open_mode() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(
+            &home,
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[tools]\nallow = [\"composio\"]\n[tools.composio]\ntoolkits = [\"gmail\"]\n",
+        )
+        .await;
+
+        let (status, dto, _) = send(&state, "GET", "/api/v1/company/composio", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dto["openMode"], false);
+        assert_eq!(dto["effectiveToolkits"], json!(["gmail"]));
+        assert_eq!(dto["toolkits"], json!(["gmail"]));
+    }
+
     /// The `credentialSource` matrix as the console consumes it, plus the
     /// write-only contract. Runs with no platform identity in the environment, so
     /// the instance contributes nothing and the company's own token is the only
@@ -527,6 +654,8 @@ mod tests {
             credential_source: CredentialSource::Attested,
             backend_url: "https://api.tinyhumans.ai".to_string(),
             toolkits: vec!["gmail".to_string()],
+            open_mode: false,
+            effective_toolkits: vec!["gmail".to_string()],
         };
         let json = serde_json::to_value(&dto).unwrap();
         assert_eq!(json["credentialSource"], "attested");
@@ -538,7 +667,9 @@ mod tests {
                 "granted",
                 "credentialSource",
                 "backendUrl",
-                "toolkits"
+                "toolkits",
+                "openMode",
+                "effectiveToolkits"
             ],
             "the read shape must stay exactly this: {keys:?}"
         );
