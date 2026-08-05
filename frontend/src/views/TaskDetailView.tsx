@@ -10,6 +10,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactElement,
   type ReactNode,
@@ -76,6 +77,7 @@ import {
   STEP_FAILURE_LABEL,
 } from "@/api/types";
 import type { OpenCompanyClient } from "@/api/client";
+import { hasFocus, type TaskFocus } from "@/lib/task-output";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -185,10 +187,24 @@ function timeOf(at: number): string {
   });
 }
 
+/**
+ * Which tab a card's output link asks for (issue #339).
+ *
+ * `timeline` for everything else — including a focus that names nothing, which
+ * is every navigation that existed before this — so the screen's default is
+ * untouched by the feature.
+ */
+function tabForFocus(focus?: TaskFocus): string {
+  if (focus?.artifactId) return "artifacts";
+  if (focus?.runId) return "attempts";
+  return "timeline";
+}
+
 export function TaskDetailView({
   client,
   company,
   taskId,
+  focus,
   onBack,
   onNavigate,
   onOpenThread,
@@ -198,6 +214,12 @@ export function TaskDetailView({
   client: OpenCompanyClient;
   company: string | null;
   taskId: string;
+  /**
+   * What the address asked this screen to open (issue #339): a pinned artifact
+   * or an attempt's trace. Empty — the ordinary "open the card" navigation —
+   * lands on the default tab, exactly as before.
+   */
+  focus?: TaskFocus;
   /** Return to the board. */
   onBack: () => void;
   /** Navigate the detail to a neighbouring (lineage) task. */
@@ -216,6 +238,23 @@ export function TaskDetailView({
   const [notFound, setNotFound] = useState(false);
   const [editing, setEditing] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  // Issue #339: the tab became controlled so a link can land on it. It still
+  // defaults to Timeline for every ordinary open — `tabForFocus` returns that
+  // whenever the address asked for nothing.
+  const [tab, setTab] = useState<string>(() => tabForFocus(focus));
+
+  // Follow a focus that arrives (or changes) after mount: a card link clicked
+  // while this screen is already open, or a back/forward between two links on
+  // the same card. Keyed on the focus's own identity rather than the object,
+  // because the parent rebuilds it on every hash event and an object dependency
+  // would yank the operator back to the linked tab on every re-render.
+  const focusKey = `${focus?.artifactId ?? ""}|${focus?.version ?? ""}|${focus?.runId ?? ""}`;
+  useEffect(() => {
+    if (!hasFocus(focus ?? {})) return;
+    setTab(tabForFocus(focus));
+    // `focus` is read through `focusKey`, which is what actually changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusKey]);
 
   // `isActive` is a per-effect-run token, not a shared ref: a superseded run
   // (e.g. taskId A→B) flips its own token to false so an in-flight `load()` from
@@ -405,7 +444,7 @@ export function TaskDetailView({
 
             <LineageRail lineage={detail.lineage} onNavigate={onNavigate} />
 
-            <Tabs defaultValue="timeline">
+            <Tabs value={tab} onValueChange={(next) => setTab(String(next))}>
               <TabsList>
                 <TabsTrigger value="timeline">Timeline</TabsTrigger>
                 <TabsTrigger value="attempts">
@@ -435,6 +474,7 @@ export function TaskDetailView({
                   company={company}
                   runs={detail.runs}
                   now={now}
+                  openRunId={focus?.runId}
                 />
               </TabsContent>
 
@@ -447,6 +487,8 @@ export function TaskDetailView({
                   client={client}
                   company={company}
                   taskId={detail.task.id}
+                  openArtifactId={focus?.artifactId}
+                  openVersion={focus?.version}
                 />
               </TabsContent>
 
@@ -1360,17 +1402,42 @@ function AttemptsTab({
   company,
   runs,
   now,
+  openRunId,
 }: {
   client: OpenCompanyClient;
   company: string | null;
   runs: RunSummary[];
   now: number;
+  /**
+   * An attempt the address asked to open (issue #339) — the *"this task
+   * produced no file"* link, whose deliverable is the trace itself.
+   */
+  openRunId?: string;
 }) {
   const [openId, setOpenId] = useState<string | null>(null);
   const open = useMemo(
     () => runs.find((r) => r.id === openId) ?? null,
     [runs, openId],
   );
+  // Apply a requested attempt once per distinct id. Once, because the parent
+  // re-renders this tab on every four-second poll and re-applying would reopen
+  // a drawer the operator has just closed; per distinct id, so a second link to
+  // a different attempt still lands.
+  const appliedRun = useRef<string | null>(null);
+  useEffect(() => {
+    if (!openRunId) {
+      // Forget the last application when the address stops naming one, so
+      // returning to the same link later opens it again.
+      appliedRun.current = null;
+      return;
+    }
+    if (appliedRun.current === openRunId) return;
+    // Runs arrive with the detail read, so wait for the row to exist rather
+    // than opening a drawer onto nothing.
+    if (!runs.some((r) => r.id === openRunId)) return;
+    appliedRun.current = openRunId;
+    setOpenId(openRunId);
+  }, [openRunId, runs]);
 
   if (runs.length === 0) {
     return (
@@ -1381,6 +1448,11 @@ function AttemptsTab({
     );
   }
 
+  // A link naming an attempt this card does not have: say so rather than
+  // silently showing the list, so a stale link reads as stale instead of as a
+  // broken screen.
+  const missing = Boolean(openRunId && !runs.some((r) => r.id === openRunId));
+
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
@@ -1388,6 +1460,12 @@ function AttemptsTab({
         than once, so several waits on one attempt is the expected record, not a
         fault.
       </p>
+      {missing && (
+        <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+          The attempt that link points at is no longer in this card's history.
+          Its other attempts are below.
+        </p>
+      )}
       <ol className="space-y-1.5">
         {runs.map((run) => (
           <AttemptRow

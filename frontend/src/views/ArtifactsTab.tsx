@@ -93,21 +93,41 @@ export function ArtifactsTab({
   client,
   company,
   taskId,
+  openArtifactId,
+  openVersion,
 }: {
   client: OpenCompanyClient;
   company: string | null;
   taskId: string;
+  /**
+   * An artifact the address asked to open (issue #339) — a card's link to the
+   * deliverable its run produced.
+   */
+  openArtifactId?: string;
+  /**
+   * The revision that run wrote. The link is pinned, so the reader lands on
+   * what the *task* produced rather than on whatever a human last edited; the
+   * banner in [`ArtifactDetail`] is what tells them the difference.
+   */
+  openVersion?: number;
 }) {
   const [artifacts, setArtifacts] = useState<ArtifactView[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
+  // The revision a deep link asked for, held here rather than in the detail so
+  // it survives the detail remounting on a poll. Cleared as soon as the reader
+  // picks a version themselves — the pin describes where they arrived, not a
+  // rail they are stuck on.
+  const [pinned, setPinned] = useState<number | null>(null);
 
   // A poll that lands mid-edit would swap the textarea's seed out from under
   // the operator, so the editor freezes the refresh while it is open. The ref
   // (rather than an effect dependency) keeps the timer itself untouched, so
   // closing the editor resumes on the next tick instead of restarting the poll.
   const editingRef = useRef(false);
+  // The `(artifact, version)` a card's link has already been honoured for.
+  const appliedLink = useRef<string | null>(null);
 
   const load = useCallback(
     async (isActive: () => boolean = () => true) => {
@@ -135,6 +155,10 @@ export function ArtifactsTab({
     setLoading(true);
     setArtifacts(null);
     setOpenId(null);
+    setPinned(null);
+    // A different card is a different set of deliverables, so a link already
+    // applied on the previous one must be allowed to apply again here.
+    appliedLink.current = null;
     void load(isActive);
     let timer: number | undefined;
     const stop = () => {
@@ -172,6 +196,40 @@ export function ArtifactsTab({
     [artifacts, openId],
   );
 
+  // Issue #339: honour a card's link once the rows it names have arrived.
+  //
+  // Applied once per distinct `(artifact, version)`, because this tab re-renders
+  // on a four-second poll and re-applying would drag the reader back to the
+  // linked revision every four seconds — including out of an edit they had just
+  // started.
+  const wanted = openArtifactId ? `${openArtifactId}|${openVersion ?? ""}` : null;
+  useEffect(() => {
+    if (!wanted || !openArtifactId) {
+      // Forget it when the address stops naming one, so the same link opened
+      // again later still works.
+      appliedLink.current = null;
+      return;
+    }
+    if (appliedLink.current === wanted) return;
+    // Rows arrive asynchronously; wait for the one the link names rather than
+    // opening a detail panel onto nothing.
+    if (!artifacts?.some((a) => a.id === openArtifactId)) return;
+    appliedLink.current = wanted;
+    setOpenId(openArtifactId);
+    setPinned(openVersion ?? null);
+  }, [wanted, openArtifactId, openVersion, artifacts]);
+
+  // A link naming a deliverable this card no longer has. It degrades to the
+  // list rather than to an error — but it says so, because a link that silently
+  // showed a different artifact would be worse than one that admits the target
+  // is gone. (The card's own link falls back to the run trace for exactly this
+  // case; this covers arriving here from an older copy of the address.)
+  const linkTargetGone = Boolean(
+    openArtifactId &&
+      artifacts !== null &&
+      !artifacts.some((a) => a.id === openArtifactId),
+  );
+
   // Replace one row in place after an append, so the freshly returned artifact
   // (with its now-present `humanEditDiff`) renders before the poll comes round.
   const replace = useCallback((next: ArtifactView) => {
@@ -203,12 +261,24 @@ export function ArtifactsTab({
         </Alert>
       )}
 
+      {linkTargetGone && (
+        <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+          The deliverable that link points at is no longer on this card. It may
+          have been deleted since. What the task still has is below.
+        </p>
+      )}
+
       {open ? (
         <ArtifactDetail
           client={client}
           company={company}
           artifact={open}
-          onBack={() => setOpenId(null)}
+          pinnedVersion={pinned}
+          onBack={() => {
+            setOpenId(null);
+            setPinned(null);
+          }}
+          onLeavePin={() => setPinned(null)}
           onAppended={replace}
           onRefresh={refresh}
           onEditingChange={setEditing}
@@ -304,7 +374,9 @@ function ArtifactDetail({
   client,
   company,
   artifact,
+  pinnedVersion,
   onBack,
+  onLeavePin,
   onAppended,
   onRefresh,
   onEditingChange,
@@ -312,13 +384,21 @@ function ArtifactDetail({
   client: OpenCompanyClient;
   company: string | null;
   artifact: ArtifactView;
+  /**
+   * The revision a card's link arrived on (issue #339) — what the *task*
+   * produced, as opposed to what the artifact says now. `null` for every
+   * ordinary open, which follows the newest version exactly as before.
+   */
+  pinnedVersion: number | null;
   onBack: () => void;
+  /** The reader has moved off the pinned revision under their own steam. */
+  onLeavePin: () => void;
   onAppended: (next: ArtifactView) => void;
   onRefresh: () => void;
   onEditingChange: (editing: boolean) => void;
 }) {
   const latest: ArtifactVersion | undefined = artifact.versions[artifact.versions.length - 1];
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(pinnedVersion);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
@@ -333,6 +413,29 @@ function ArtifactDetail({
     }
     return latest;
   }, [artifact.versions, latest, selected]);
+
+  /**
+   * Whether this panel is still showing the revision a card's link asked for,
+   * *and* a newer one exists.
+   *
+   * Both halves matter. Without the first, the banner would keep claiming a pin
+   * after the reader has clicked through the rail themselves. Without the
+   * second, a link to an untouched deliverable would carry a banner explaining
+   * a difference that does not exist.
+   */
+  const pinnedBehindLatest =
+    pinnedVersion !== null &&
+    selected === pinnedVersion &&
+    latest !== undefined &&
+    latest.version > pinnedVersion;
+  const editedSince = pinnedBehindLatest && latest?.author === "operator";
+
+  function selectVersion(version: number) {
+    setSelected(version);
+    // Moving off the pinned revision retires the banner: from here on the
+    // reader is navigating, not arriving.
+    if (version !== pinnedVersion) onLeavePin();
+  }
 
   useEffect(() => {
     onEditingChange(editing);
@@ -410,10 +513,36 @@ function ArtifactDetail({
         </p>
       </div>
 
+      {pinnedBehindLatest && latest && (
+        // Issue #339: *"a task whose output was later edited by a human still
+        // resolves, and says so."* The link is pinned, so the reader is looking
+        // at what the task produced — and this is the "says so" half, naming
+        // the newer revision and who wrote it rather than leaving the reader to
+        // notice the version rail.
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs">
+          <p className="text-muted-foreground">
+            Showing <span className="font-medium text-foreground">v{pinnedVersion}</span> — the
+            version this run produced. v{latest.version} exists
+            {editedSince
+              ? `, edited by ${latest.authorId || "an operator"}`
+              : `, written by ${latest.authorId || "the agent"}`}
+            .
+          </p>
+          <Button
+            variant="link"
+            size="sm"
+            className="h-auto p-0 text-xs"
+            onClick={() => selectVersion(latest.version)}
+          >
+            Go to the latest version
+          </Button>
+        </div>
+      )}
+
       <VersionRail
         versions={artifact.versions}
         shown={shown?.version ?? null}
-        onSelect={(v) => setSelected(v)}
+        onSelect={selectVersion}
         disabled={editing}
       />
 
