@@ -980,6 +980,12 @@ export function AppShell({
               <WorkflowsView
                 client={client}
                 company={company}
+                // Issue #339: `#/workflows/<workflowId>` names the graph to open
+                // on the canvas, so a finished task card can link to the
+                // workflow it built or ran. Same unvalidated second segment
+                // every other sub-page gets — only this view knows which
+                // workflow ids exist, so it does that check itself.
+                sub={sub}
                 runEventTick={workflowRunTick}
                 runEvents={workflowRunEvents}
               />

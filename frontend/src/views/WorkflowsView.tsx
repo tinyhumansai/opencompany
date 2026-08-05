@@ -88,6 +88,51 @@ const NODE_TYPES = { oc: WorkflowNode };
  * fold a fresh array identity on every render. */
 const EMPTY_RUN_EVENTS: CompanyStreamEvent[] = [];
 
+/** `decodeURIComponent` that survives a hand-edited address bar. A lone `%`
+ * makes it throw, and a malformed hash must not take the whole view down —
+ * comparing the raw segment simply fails to match, which is the right outcome. */
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Decompose the hash this view owns: `#/workflows/<workflowId>?run=<runId>`
+ * (issue #339).
+ *
+ * **The run id lives in a query string, not a third path segment, and that is
+ * load-bearing — do not "tidy" it into `#/workflows/<id>/runs/<runId>`.**
+ * `useHashView`'s `canonicalize()` runs on every `hashchange` and rewrites the
+ * hash to at most `head/sub`, so a third segment is silently dropped and the
+ * run id would never survive the first hash event. What saves the query is that
+ * the same function reads the path with everything after `?` stripped and
+ * early-returns once the two segments already match — so it looks at
+ * `workflows/<id>`, finds it identical, and leaves the URL alone, query and
+ * all. Two segments plus a query is the only shape that round-trips.
+ *
+ * Read from `location` rather than from the `sub` prop because the query is
+ * invisible to the router, and because the view's hash writer needs the
+ * *current* URL — not the router's copy of it, which lags a `replaceState` it
+ * never hears about — to know whether a write would be a no-op.
+ */
+function readWorkflowHash(): {
+  /** Whether the hash currently names this view at all. */
+  onWorkflows: boolean;
+  workflowId: string | null;
+  runId: string | null;
+} {
+  const [path, query] = window.location.hash.replace(/^#\/?/, "").split("?");
+  const [head, id] = path.split("/").filter(Boolean);
+  return {
+    onWorkflows: head === "workflows",
+    workflowId: id ? safeDecode(id) : null,
+    runId: query ? new URLSearchParams(query).get("run") : null,
+  };
+}
+
 /**
  * The live Workflows canvas. Reads the company's saved graphs from the host's
  * `…/workflows` routes, lets the operator pick one, renders its real nodes and
@@ -98,11 +143,22 @@ const EMPTY_RUN_EVENTS: CompanyStreamEvent[] = [];
 export function WorkflowsView({
   client,
   company,
+  sub = null,
   runEventTick = 0,
   runEvents = EMPTY_RUN_EVENTS,
 }: {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * The second hash segment — `#/workflows/<workflowId>` (issue #339), so a
+   * finished task card can link to the workflow it built or ran and land on
+   * that graph rather than on whichever one happens to sort first.
+   *
+   * Unvalidated, as the router documents: only this view knows which workflow
+   * ids exist, so it resolves the id against the loaded list itself and falls
+   * back to its own default when the id names nothing.
+   */
+  sub?: string | null;
   /**
    * Bumped by the shell on every `workflow_run_finished` SSE event (issue
    * #228), so a run that finishes while this tab is open shows up without a
@@ -247,6 +303,32 @@ export function WorkflowsView({
   // already watched, and one without it still gets the journaled answer.
   const liveRanRef = useRef<Set<string>>(new Set());
 
+  // ---- Issue #339: the canvas as a link target -----------------------------
+  //
+  // The workflow id asked for by the URL. Decoded here so it compares against
+  // the ids in `workflows` — the router hands the segment back exactly as it
+  // sits in the address bar, and the writer below percent-encodes it.
+  const requestedWorkflowId = useMemo(() => (sub ? safeDecode(sub) : null), [sub]);
+  // The run id asked for by `?run=`, which the router does NOT surface: it
+  // reads the hash with everything after `?` stripped, so a query string is
+  // invisible to it (and, crucially, survives its rewrite — see
+  // {@link readWorkflowHash}). Kept in state and refreshed on `hashchange` so a
+  // second card's link landing on an already-open canvas is noticed.
+  const [requestedRunId, setRequestedRunId] = useState<string | null>(
+    () => readWorkflowHash().runId,
+  );
+  useEffect(() => {
+    const onHash = () => setRequestedRunId(readWorkflowHash().runId);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  // The URL-requested ids this view has already acted on, so each request is
+  // honoured exactly once. Without these, every later re-render that carries a
+  // fresh `workflows` / `runs` array would re-apply the URL and drag the
+  // operator back off whatever they had since selected or cleared.
+  const appliedWorkflowRef = useRef<string | null>(null);
+  const appliedRunRef = useRef<string | null>(null);
+
   // Load the workflow list once, and auto-select the first entry.
   useEffect(() => {
     let live = true;
@@ -255,12 +337,27 @@ export function WorkflowsView({
         const rows = await listWorkflows(client, company);
         if (!live) return;
         setWorkflows(rows);
-        // Keep the selection only if it still exists in the freshly loaded list
-        // (this effect also reruns on company change) — otherwise a stale id
-        // from the previous company would fetch the wrong/nonexistent graph.
-        setSelectedId((prev) =>
-          prev && rows.some((r) => r.id === prev) ? prev : (rows[0]?.id ?? null),
-        );
+        setSelectedId((prev) => {
+          // Issue #339: a workflow id in the URL outranks both the held
+          // selection and the first-row default — the operator followed a link
+          // to *that* graph. Resolved here rather than left to the follow
+          // effect below purely to avoid the flash: selecting `rows[0]` first
+          // and correcting a render later would fetch a graph nobody asked for
+          // and show the wrong name in the picker on the way past.
+          //
+          // `requestedWorkflowId` is read from the closure and deliberately NOT
+          // a dependency: it changes on every picker click (the writer below
+          // mirrors the selection into the hash), and re-running this would
+          // spend a full list round trip on each one. Changes after mount are
+          // the follow effect's job.
+          if (requestedWorkflowId && rows.some((r) => r.id === requestedWorkflowId)) {
+            return requestedWorkflowId;
+          }
+          // Keep the selection only if it still exists in the freshly loaded list
+          // (this effect also reruns on company change) — otherwise a stale id
+          // from the previous company would fetch the wrong/nonexistent graph.
+          return prev && rows.some((r) => r.id === prev) ? prev : (rows[0]?.id ?? null);
+        });
         setError(null);
       } catch (e) {
         if (!live) return;
@@ -272,7 +369,67 @@ export function WorkflowsView({
     return () => {
       live = false;
     };
+    // `requestedWorkflowId` is read above but deliberately not a dependency —
+    // see the comment at the read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, company]);
+
+  // Issue #339: follow the URL while the view stays mounted — the operator
+  // clicks a second task card's link without ever leaving this tab, so the
+  // first-load resolution above never runs again.
+  //
+  // Guarded to once per distinct id: this also reruns whenever `workflows` gets
+  // a new array (a create, a rename, a company switch), and re-applying the URL
+  // then would yank the selection back from wherever the operator had moved it.
+  // A no-longer-current `sub` — the operator picked something else, so the hash
+  // no longer matches — is left alone precisely because it was already applied.
+  useEffect(() => {
+    if (!requestedWorkflowId || workflows.length === 0) return;
+    if (appliedWorkflowRef.current === requestedWorkflowId) return;
+    appliedWorkflowRef.current = requestedWorkflowId;
+    if (workflows.some((w) => w.id === requestedWorkflowId)) {
+      setSelectedId(requestedWorkflowId);
+      return;
+    }
+    // Say so rather than silently showing a different graph: the operator
+    // followed a link expecting one specific workflow, and a canvas quietly
+    // painting another one is worse than no canvas at all.
+    toast.error(`This company has no workflow “${requestedWorkflowId}”.`, {
+      description:
+        "It may have been renamed or deleted since the link was made. Showing the current selection instead.",
+    });
+  }, [requestedWorkflowId, workflows]);
+
+  // Issue #339: mirror the selection back into the hash, so whatever is on the
+  // canvas can be copied out of the address bar and shared.
+  //
+  // Reads `location` directly instead of comparing against `sub`: the router's
+  // state lags a `replaceState` it never hears about, and this comparison is
+  // the only thing stopping a write→hashchange→write loop.
+  //
+  // The `?run=` query is preserved implicitly. When the hash already names the
+  // selected workflow this early-returns and never touches the URL, so an
+  // arriving `#/workflows/x?run=r` keeps its run id; when the selection moves
+  // to a different workflow the query is dropped, which is correct — that run
+  // belongs to the graph being left behind.
+  //
+  // Replace vs push is decided by whether the hash already names a workflow.
+  // Filling in a bare `#/workflows` is this view resolving its own default, not
+  // a place the operator has been — pushing it would put an entry in the
+  // history stack that looks identical to the one before it, so their first
+  // Back press out of the tab would appear to do nothing. Moving from one named
+  // workflow to another IS a navigation they took, and Back should undo it.
+  useEffect(() => {
+    if (!selectedId) return;
+    const { onWorkflows, workflowId } = readWorkflowHash();
+    // Another view owns the hash (a company switch mid-navigation, a stale
+    // effect): rewriting it would drag the operator back here.
+    if (!onWorkflows) return;
+    if (workflowId === selectedId) return;
+    const next = `#/workflows/${encodeURIComponent(selectedId)}`;
+    if (workflowId === null) window.history.replaceState(null, "", next);
+    else window.location.hash = next.slice(1);
+  }, [selectedId]);
 
   // Fetch the selected workflow's full graph.
   useEffect(() => {
@@ -363,6 +520,8 @@ export function WorkflowsView({
         // Still THIS workflow's answer — "the host has no history for it" — so
         // the pair agrees and the copilot may proceed, told via `runsKnown`
         // that nothing is known about runs rather than that there were none.
+        // A `?run=` deep link reads the same signal (issue #339): it needs to
+        // hear "the fetch came back empty" rather than wait on one that has.
         setRunsFor(selectedId);
         setHistorySupported(false);
       }
@@ -663,6 +822,57 @@ export function WorkflowsView({
     setOverlayRun(null);
     setActiveRunId(null);
   }, [selectedId, company]);
+
+  // Issue #339: `?run=<runId>` — open the canvas showing that past run.
+  //
+  // Declared AFTER the clear effect above on purpose. Both can fire while a
+  // deep link resolves, and effects run in declaration order, so an overlay set
+  // here would otherwise be wiped by the very selection change that fetched the
+  // history it came from.
+  //
+  // Run ids arrive late by nature: the history is a separate fetch, so this
+  // waits for the SELECTED workflow's own history rather than reading whatever
+  // list is currently in `runs` (which, until then, is the previous
+  // workflow's).
+  useEffect(() => {
+    if (!requestedRunId) {
+      // The link no longer names a run — the operator moved to another
+      // workflow, or the hash was rewritten. Forget what was applied, so the
+      // same id arriving again later reads as a fresh request rather than as an
+      // echo of the one already handled.
+      appliedRunRef.current = null;
+      return;
+    }
+    if (appliedRunRef.current === requestedRunId) return;
+    if (!selectedId || runsFor !== selectedId) return;
+    appliedRunRef.current = requestedRunId;
+    // `runId` is optional on the wire: a row journaled before the entry point
+    // minted correlation ids carries none. Comparing it directly would let a
+    // `requestedRunId` of `undefined` match the first such row — hence the
+    // explicit presence check even though `requestedRunId` is a string here.
+    const match = runs.find((r) => r.runId != null && r.runId === requestedRunId);
+    if (!match) {
+      // Never leave the canvas mid-gesture: it keeps painting the live state,
+      // and the operator is told why the run they asked for isn't on it.
+      toast.error("That run isn't in this workflow's run history.", {
+        description:
+          "It may have aged out of the journal, or belong to a different workflow. The canvas is showing the current state instead.",
+      });
+      return;
+    }
+    if ((match.nodes?.length ?? 0) === 0) {
+      // Same guard the no-live-stream fallback uses: with no per-node trail
+      // there is nothing to paint, and the overlay banner would claim every
+      // node "was never reached" — a statement about the run that isn't true,
+      // only about what was recorded of it.
+      toast.info("That run has no step-by-step trail to show on the canvas.", {
+        description:
+          "It was recorded before per-node progress was journaled. Its delivery rows are in History.",
+      });
+      return;
+    }
+    setOverlayRun(match);
+  }, [requestedRunId, runs, runsFor, selectedId]);
 
   // The Run guard, derived rather than held: the request is in flight, or a run
   // we started has not settled yet.
