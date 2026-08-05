@@ -1401,6 +1401,8 @@ impl RuntimeBuilder {
                                 // MCP set each turn (MCP-freshness) rather than the
                                 // snapshot frozen here at boot.
                                 mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+                                pending_publishes:
+                                    crate::harness::publish::PendingPublishQueue::default(),
                                 // Issue #243: share the runtime's grant set, so a
                                 // grant the runtime mints on approve is the one
                                 // this agent's policy redeems on re-issue.

@@ -734,6 +734,34 @@ pub fn nudge_instruction(brief: &str, reply: &str, changed_files: &[String]) -> 
     )
 }
 
+/// The persona paragraph telling an agent what a deliverable is and how to
+/// hand one over.
+///
+/// Follows the `workspace_brief` precedent: **static**, never a snapshot. It
+/// explains the contract rather than listing anything that could go stale.
+///
+/// The tone matters as much as the content. The nudge exists precisely because
+/// agents forget to publish, and the temptation is to over-correct here with
+/// "always publish your output" — which produces published build logs and
+/// scratch notes, poisoning the churn signal the artifact port exists to
+/// measure. So this says what a deliverable *is*, says plainly that many tasks
+/// have none, and leaves the judgement where it belongs.
+pub fn publish_brief() -> String {
+    format!(
+        "\n\n## Deliverables\n\
+         If this task asks you to produce something — a document, a report, a draft, an export — \
+         write it to a file in your workspace and then publish it with `{PUBLISH_ARTIFACT_TOOL}`. \
+         That is what puts it on the task's Artifacts tab where the operator can read, edit and \
+         version it; a file you merely wrote is invisible to them, and pasting the whole document \
+         into your reply is not the same thing. Republish the same path on a later run to add a \
+         version rather than a duplicate.\n\
+         Publish only the finished thing somebody asked for. Scratch files, notes to yourself, \
+         logs and build output are not deliverables, and plenty of tasks — a question answered, a \
+         check run, a decision made — produce no file at all. Having nothing to publish is a \
+         normal outcome, not a gap to fill."
+    )
+}
+
 /// The note block recording what the agent said when it published nothing.
 ///
 /// The "why not" is kept and addressable rather than dropped, which is what

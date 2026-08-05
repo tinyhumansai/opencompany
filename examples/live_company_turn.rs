@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         delegations: opencompany::harness::orchestrator::DelegationQueue::default(),
         workflow_runner: opencompany::harness::orchestrator::WorkflowRunnerHandle::default(),
         mcp_failures: opencompany::harness::mcp_probe::McpFailureQueue::default(),
+        pending_publishes: Default::default(),
         approval_requests: opencompany::harness::policy::ApprovalRequestQueue::default(),
         secrets: None,
         web_allowed_domains: Vec::new(),
