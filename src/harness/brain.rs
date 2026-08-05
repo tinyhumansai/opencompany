@@ -24,9 +24,14 @@ use async_trait::async_trait;
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
 use crate::harness::build::agent_workspace;
+// The note shape is shared with the ungated system paths (issue #337): the
+// backstop, the quiescing-runtime settle and the boot reaper all append their
+// reason to a card, and a second copy of it here is how one card ends up with
+// two note formats depending on which path touched it last.
 use crate::harness::lifecycle::{self, TaskRunEnd};
 use crate::harness::orchestrator;
 use crate::harness::publish::{self, WorkspaceSnapshot};
+use crate::runtime::advance::append_result;
 // `Delegation` is only named by the test-only `run_delegation` wrapper and the
 // delegation tests (via `use super::*`); the cycle path drives the runner's
 // `handle_operator_message` and never spells the type out.
@@ -985,10 +990,19 @@ impl HarnessBrain {
     ///
     /// # Failure is contained
     ///
-    /// A provider fault, or the per-agent daily cap refusing the turn, logs a
-    /// warning and returns `None`. The run already completed its work and its
-    /// reply has already been decided; a bookkeeping turn must never fail or
-    /// delay it.
+    /// A provider fault logs a warning and returns `None`, falling through to
+    /// the fallback warning. The run already completed its work and its reply
+    /// has already been decided; a bookkeeping turn must never fail or delay it.
+    ///
+    /// The **per-agent daily cap** takes a different shape and needs saying:
+    /// `HarnessPool::run` refuses an over-cap turn with `Ok(notice)` rather than
+    /// an error, so a budget-refused nudge comes back as an ordinary reply and
+    /// is recorded verbatim on the card — `unpublished: <files> — agent: <agent>
+    /// has reached its daily spend cap of …`. That is left as-is on purpose:
+    /// the line is *true*, it explains why the files were never reviewed, and
+    /// the alternative is prose-matching the notice to special-case it, which is
+    /// exactly the content-classifier this issue rules out. No model call is
+    /// made either way, so the refusal costs nothing.
     ///
     /// An operator steer during the nudge discards the nudge's *reply* (no note
     /// line, no decline recorded) but keeps anything it published — losing a
@@ -1491,17 +1505,6 @@ fn settle(card: &mut TaskRecord, end: TaskRunEnd, responder: &str, body: &str) {
         body,
     ));
     card.column = lifecycle::landing_column(end).to_string();
-}
-
-/// Appends a responder-attributed result block to a card's note, preserving any
-/// prior note above it. Slice 1 has no first-class `TaskRecord.result` field, so
-/// the outcome lives in the note.
-fn append_result(prev: Option<&str>, responder: &str, body: &str) -> String {
-    let block = format!("[{responder}] {body}");
-    match prev.filter(|p| !p.is_empty()) {
-        Some(p) => format!("{p}\n\n{block}"),
-        None => block,
-    }
 }
 
 #[async_trait]

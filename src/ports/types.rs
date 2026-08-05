@@ -2363,7 +2363,10 @@ mod test {
             artifact_ids: vec!["art-1".to_string(), "art-2".to_string()],
         };
         let json = serde_json::to_string(&done).unwrap();
-        assert!(json.contains(r#""artifact_ids":["art-1","art-2"]"#), "{json}");
+        assert!(
+            json.contains(r#""artifact_ids":["art-1","art-2"]"#),
+            "{json}"
+        );
         assert_eq!(
             serde_json::from_str::<CompanyEvent>(&json).unwrap(),
             done,
