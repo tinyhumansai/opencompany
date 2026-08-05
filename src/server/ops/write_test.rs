@@ -3098,6 +3098,54 @@ async fn artifact_versions_capture_the_human_edit_and_diff() {
     )
     .await;
     assert_eq!(empty.as_array().unwrap().len(), 0);
+
+    // Issue #244: this record was created through the REST route, not by a
+    // publish, so it carries no `source` — and the response omits the key
+    // entirely rather than sending a null the console would have to special-case.
+    assert!(
+        listed[0].get("source").is_none(),
+        "a record with no source must not carry an empty one: {}",
+        listed[0]
+    );
+}
+
+/// Issue #244: a published artifact's `source` reaches the console.
+///
+/// The record is flattened into [`ArtifactView`], so this is really asserting
+/// that the projection stays a flatten and never becomes a hand-written field
+/// list — the moment it does, a new record field is silently invisible to the
+/// tab that exists to render it.
+#[tokio::test]
+async fn a_published_artifacts_source_reaches_the_console() {
+    use crate::ports::artifacts::{ArtifactKind, ArtifactRecord, ArtifactStore};
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let company = state.registry().list()[0].clone();
+    let runtime = state.registry().get(&company).expect("company");
+    let published = ArtifactRecord::new(
+        "art-1",
+        "t-1",
+        "Launch spec",
+        ArtifactKind::Markdown,
+        "# Spec",
+        "ceo",
+        1,
+    )
+    .with_source("specs/launch.md");
+    ArtifactStore::upsert(runtime.artifacts().as_ref(), &company, &published)
+        .await
+        .expect("seed");
+
+    let (status, listed) = send(&state, "GET", "/api/v1/company/tasks/t-1/artifacts", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed[0]["source"], "specs/launch.md");
+
+    let (status, one) = send(&state, "GET", "/api/v1/company/artifacts/art-1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["source"], "specs/launch.md");
 }
 
 /// #185: `GET …/tasks/{id}` assembles the header, the per-task timeline, and

@@ -2339,8 +2339,49 @@ mod test {
         };
         let json = serde_json::to_string(&done).unwrap();
         assert!(json.contains(r#""kind":"DeskTaskCompleted""#));
+        assert!(
+            !json.contains("artifact_ids"),
+            "a task that published nothing must add nothing to the log: {json}"
+        );
         let back: CompanyEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, done);
+    }
+
+    /// Issue #244: the terminal anchor names what the run published, and a line
+    /// written before the field existed still replays.
+    ///
+    /// The legacy blob is asserted verbatim because it is exactly what is
+    /// already on disk in every company's event log — if this ever fails, the
+    /// change needs a migration rather than a `#[serde(default)]`.
+    #[test]
+    fn desk_task_completed_carries_artifact_ids_and_still_reads_the_old_shape() {
+        let done = CompanyEvent::DeskTaskCompleted {
+            task_id: "t-1".to_string(),
+            desk: "ceo".to_string(),
+            output: "Drafted the launch spec.".to_string(),
+            column: "in_review".to_string(),
+            artifact_ids: vec!["art-1".to_string(), "art-2".to_string()],
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains(r#""artifact_ids":["art-1","art-2"]"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<CompanyEvent>(&json).unwrap(),
+            done,
+            "the ids must survive the round trip"
+        );
+
+        let legacy = r#"{"kind":"DeskTaskCompleted","task_id":"t-1","desk":"ceo","output":"shipped","column":"in_review"}"#;
+        assert_eq!(
+            serde_json::from_str::<CompanyEvent>(legacy).unwrap(),
+            CompanyEvent::DeskTaskCompleted {
+                task_id: "t-1".to_string(),
+                desk: "ceo".to_string(),
+                output: "shipped".to_string(),
+                column: "in_review".to_string(),
+                artifact_ids: Vec::new(),
+            },
+            "a pre-#244 journal line must replay with no artifacts, not fail"
+        );
     }
 
     #[test]
