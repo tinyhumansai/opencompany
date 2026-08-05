@@ -1,56 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import {
-  AtSign,
-  Check,
-  ChevronDown,
-  ChevronUp,
-  CreditCard,
-  FileSignature,
-  FileText,
-  Globe,
-  KeyRound,
-  Loader2,
-  Mail,
-  MessageSquare,
-  Repeat,
-  RefreshCw,
-  Rocket,
-  ShieldCheck,
-  SquareKanban,
-  type LucideIcon,
-  X,
-} from "lucide-react";
+import { useState } from "react";
+import { Check, Loader2, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
 import { ApiError, type ApprovalSummary, type Verdict } from "@/api/types";
+import {
+  ApprovalHeadline,
+  ApprovalMeta,
+  ApprovalPayload,
+  useAskerNames,
+} from "@/components/approval-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import type { CompanyFeed } from "@/hooks/use-company";
-import { approvalAction, approvalSummary, money, payloadLines, timeAgo } from "@/lib/language";
-import { cn } from "@/lib/utils";
-
-const KIND_ICONS: Record<string, LucideIcon> = {
-  "payment.send": CreditCard,
-  "subscription.start": Repeat,
-  "email.send": Mail,
-  "dm.external": MessageSquare,
-  "filing.submit": FileText,
-  "contract.accept": FileSignature,
-  "external.publish": Globe,
-  "website.deploy": Rocket,
-  "handle.register": AtSign,
-  "handle.renew": RefreshCw,
-  "key.rotate": KeyRound,
-};
-
-/**
- * How much of a payload is shown before it is clamped. Past either bound the
- * block collapses behind a "Show everything" toggle — a queue of approvals has
- * to stay scannable, and a forty-line argument object buries the next card.
- */
-const PREVIEW_LINES = 3;
-const PREVIEW_VALUE_CHARS = 160;
+import { approvalSummary } from "@/lib/language";
 
 /**
  * Below this, a lost connection cannot have outlived the fast part of a resolve.
@@ -260,181 +223,59 @@ function ApprovalCard({
   deciding: Verdict | null;
   onDecide: (verdict: Verdict) => void;
 }) {
-  const Icon = KIND_ICONS[a.kind] ?? ShieldCheck;
-  const lines = useMemo(() => payloadLines(a), [a]);
-  const taskId = a.task?.link === "task" ? a.task.id : null;
-  // An id the roster does not know still beats no attribution at all — the
-  // operator can at least tell two askers apart.
-  const asker = a.agent ? (askerNames.get(a.agent) ?? a.agent) : null;
-
   // No cross-card dimming: another card being decided is not this card's
   // business, and treating it as such is the visual half of the #373 bug.
   return (
     <Card>
       <CardContent className="flex flex-col gap-3 py-4">
-        <div className="flex items-start gap-4">
-          <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
-            <Icon className="size-5" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="font-medium">{approvalAction(a)}</p>
-            {a.amount_usd != null && (
-              <p className="text-xs font-medium text-muted-foreground">{money(a.amount_usd)}</p>
-            )}
-          </div>
-          {/* Disabled on THIS card's own state only — a decision in flight on
-              another card leaves these live. That is the whole of #373's
-              first cause. */}
-          <div className="flex shrink-0 gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={deciding !== null}
-              onClick={() => onDecide("deny")}
-            >
-              {deciding === "deny" ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <X className="size-4" />
-              )}{" "}
-              Decline
-            </Button>
-            <Button size="sm" disabled={deciding !== null} onClick={() => onDecide("approve")}>
-              {deciding === "approve" ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Check className="size-4" />
-              )}{" "}
-              Approve
-            </Button>
-          </div>
-        </div>
-
-        {lines.length > 0 && <PayloadBlock lines={lines} />}
-
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-          {asker && (
+        <ApprovalHeadline
+          approval={a}
+          /* Disabled on THIS card's own state only — a decision in flight on
+             another card leaves these live. That is the whole of #373's
+             first cause. */
+          actions={
             <>
-              <span>
-                Asked by <span className="font-medium text-foreground">{asker}</span>
-              </span>
-              <span aria-hidden>·</span>
-            </>
-          )}
-          {taskId && (
-            <>
-              <a
-                href={`#/tasks/${encodeURIComponent(taskId)}`}
-                className="flex w-fit items-center gap-1 rounded-full bg-accent px-2 py-0.5 font-medium text-accent-foreground transition-opacity hover:opacity-80"
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={deciding !== null}
+                onClick={() => onDecide("deny")}
               >
-                <SquareKanban className="size-3 shrink-0" />
-                Open the card
-              </a>
-              <span aria-hidden>·</span>
+                {deciding === "deny" ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <X className="size-4" />
+                )}{" "}
+                Decline
+              </Button>
+              <Button size="sm" disabled={deciding !== null} onClick={() => onDecide("approve")}>
+                {deciding === "approve" ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Check className="size-4" />
+                )}{" "}
+                Approve
+              </Button>
             </>
-          )}
-          <span>{timeAgo(a.at_millis, now)}</span>
-          {/* Honest copy for a request that spans an agent turn (#373): an
-              approve is not done when the button stops spinning, it is handed
-              to the agent. A decline IS terminal, so it only has to record. */}
-          {deciding && (
-            <>
-              <span aria-hidden>·</span>
-              <span className="text-foreground">
-                {deciding === "approve" ? "Waiting for the agent…" : "Recording…"}
-              </span>
-            </>
-          )}
-        </div>
+          }
+        />
+
+        <ApprovalPayload approval={a} />
+
+        <ApprovalMeta
+          approval={a}
+          now={now}
+          askerNames={askerNames}
+          /* Honest copy for a request that spans an agent turn (#373): an
+             approve is not done when the button stops spinning, it is handed
+             to the agent. A decline IS terminal, so it only has to record. */
+          status={
+            deciding ? (deciding === "approve" ? "Waiting for the agent…" : "Recording…") : undefined
+          }
+        />
       </CardContent>
     </Card>
   );
-}
-
-/**
- * The tool call's own arguments, verbatim (#372).
- *
- * Monospace and wrapping rather than truncating: a shell command cut off
- * mid-flag is exactly as un-decidable as no command at all, and `break-all` is
- * what keeps a long unbroken path or URL inside the card. Everything here was
- * redacted and bounded by the host, so `[redacted]` is a value the console
- * renders — never one it computes.
- */
-function PayloadBlock({ lines }: { lines: { label: string; value: string }[] }) {
-  const [expanded, setExpanded] = useState(false);
-  const clampable =
-    lines.length > PREVIEW_LINES || lines.some((l) => l.value.length > PREVIEW_VALUE_CHARS);
-  const shown = expanded || !clampable ? lines : lines.slice(0, PREVIEW_LINES);
-
-  return (
-    <div className="rounded-lg border bg-muted/40 px-3 py-2">
-      <div
-        className={cn(
-          "space-y-1 font-mono text-xs break-all whitespace-pre-wrap",
-          clampable && !expanded && "max-h-24 overflow-hidden",
-        )}
-      >
-        {shown.map((line) => (
-          <div key={line.label}>
-            <span className="text-muted-foreground">{line.label}: </span>
-            <span className="text-foreground">{line.value}</span>
-          </div>
-        ))}
-      </div>
-      {clampable && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-1.5 flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {expanded ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
-          {expanded ? "Show less" : "Show everything"}
-        </button>
-      )}
-    </div>
-  );
-}
-
-/**
- * Agent id → display name, for the "Asked by" line.
- *
- * One roster read per company, not one per card: the ids on the queue are
- * roster ids, and the roster is small and stable. A host without the roster
- * route 404s, which is caught here — the card then shows the raw id rather than
- * dropping the attribution, because "which teammate asked" stays useful even
- * when we cannot pretty-print it.
- */
-function useAskerNames(
-  client: OpenCompanyClient,
-  company: string | null,
-  approvals: ApprovalSummary[],
-): Map<string, string> {
-  const [names, setNames] = useState<Map<string, string>>(new Map());
-  // Keyed on the set of asker ids rather than on `approvals` itself: the feed
-  // hands us a fresh array on every poll, and depending on the array would
-  // refetch the roster every few seconds for a roster that rarely changes.
-  const askerKey = useMemo(
-    () =>
-      Array.from(new Set(approvals.map((a) => a.agent).filter((id): id is string => !!id)))
-        .sort()
-        .join(","),
-    [approvals],
-  );
-
-  useEffect(() => {
-    if (!askerKey) return;
-    let live = true;
-    void (async () => {
-      const roster = await client.listTeam(company).catch(() => []);
-      if (!live) return;
-      setNames(new Map(roster.map((m) => [m.id, m.name?.trim() || m.role])));
-    })();
-    return () => {
-      live = false;
-    };
-  }, [client, company, askerKey]);
-
-  return names;
 }
 
 function EmptyApprovals({ onGoToConversation }: { onGoToConversation: () => void }) {
