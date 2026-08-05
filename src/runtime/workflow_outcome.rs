@@ -393,6 +393,85 @@ mod test {
         assert_eq!(run_id.as_deref(), Some("run-42"));
     }
 
+    /// Issue #383: a run an operator stopped records `cancelled` and **no
+    /// error**, and the boot sweep leaves it alone because it settled properly.
+    ///
+    /// The three terminal readings are asserted against each other on purpose:
+    /// a cancelled run must not be confusable with a failed one (which carries
+    /// an error) or with an interrupted one (which carries the sweep's
+    /// synthetic error). Collapsing any pair would put a deliberate stop in the
+    /// failure count.
+    #[tokio::test]
+    async fn a_cancelled_run_records_cancelled_with_no_error() {
+        let (_home, events) = log();
+        let company = CompanyId::new("acme");
+        let mut run = run_with(Vec::new(), Vec::new());
+        run.cancelled = true;
+        start(&events, &company, "run-stopped", false).await;
+
+        record_run_finished(&events, &company, "digest", false, "run-stopped", Ok(&run)).await;
+        // The sweep must find nothing: the run is settled, not open.
+        sweep_interrupted_runs(&events, &company).await;
+
+        let journal = journaled(&events, &company).await;
+        assert_eq!(
+            journal.len(),
+            2,
+            "the sweep appended nothing to an already-settled run"
+        );
+        let CompanyEvent::WorkflowRunFinished {
+            cancelled, error, ..
+        } = &journal[1]
+        else {
+            panic!("expected a WorkflowRunFinished, got {:?}", journal[1]);
+        };
+        assert!(cancelled);
+        assert!(
+            error.is_none(),
+            "a stop is not a failure, so it carries no error: {error:?}"
+        );
+    }
+
+    /// The other two readings, for contrast: a failure carries an error and is
+    /// not cancelled, and the sweep's interrupted row is likewise not cancelled
+    /// — nobody stopped it, the host went away.
+    #[tokio::test]
+    async fn failed_and_interrupted_runs_are_never_flagged_cancelled() {
+        let (_home, events) = log();
+        let company = CompanyId::new("acme");
+
+        record_run_finished(
+            &events,
+            &company,
+            "digest",
+            false,
+            "run-bad",
+            Err("it broke"),
+        )
+        .await;
+        start(&events, &company, "run-dead", false).await;
+        sweep_interrupted_runs(&events, &company).await;
+
+        let settled: Vec<(Option<String>, bool)> = journaled(&events, &company)
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                CompanyEvent::WorkflowRunFinished {
+                    error, cancelled, ..
+                } => Some((error, cancelled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            settled,
+            vec![
+                (Some("it broke".to_string()), false),
+                (Some(INTERRUPTED_BY_RESTART.to_string()), false),
+            ],
+            "neither a failure nor a host restart may read as an operator stop"
+        );
+    }
+
     /// Appends a `WorkflowRunStarted` for `run_id`.
     async fn start(events: &Arc<dyn EventLog>, company: &CompanyId, run_id: &str, scheduled: bool) {
         events
