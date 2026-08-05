@@ -83,10 +83,47 @@ pub const MAX_ARTIFACT_BODY_BYTES: usize = 256 * 1024;
 
 /// Directory names the workspace scan never descends into.
 ///
-/// The sandbox hosts shell and code tools, so a single `npm install` or `cargo
-/// build` puts tens of thousands of entries under it. These are the three that
-/// account for essentially all of it.
-const SCAN_SKIP_DIRS: [&str; 3] = [".git", "node_modules", "target"];
+/// Two families, and the second one is not optional.
+///
+/// **Dependency and build trees** — `node_modules`, `target`. The sandbox hosts
+/// shell and code tools, so a single `npm install` or `cargo build` puts tens of
+/// thousands of entries under it.
+///
+/// **The runtime's own bookkeeping** — `sessions`, `session_raw`, `artifacts`,
+/// `checkpoints`. The agent's `workspace_dir` is *also* where OpenHuman writes
+/// its session transcripts (`sessions/<date>/*.md`, `session_raw/*.jsonl`), its
+/// own artifact store and its subagent checkpoints. Those are written on **every
+/// single run**, by the harness rather than by the agent, so without this the
+/// scan would report unpublished changes after every dispatch and the nudge
+/// would fire every time — asking an agent whether its own transcript is a
+/// deliverable. That is not a tuning detail; it is the difference between a
+/// feature and a permanent false positive.
+const SCAN_SKIP_DIRS: [&str; 6] = [
+    "node_modules",
+    "target",
+    "sessions",
+    "session_raw",
+    "artifacts",
+    "checkpoints",
+];
+
+/// File names the scan ignores wherever they appear.
+///
+/// `audit.log` is the per-workspace shell audit trail the `shell` toolbelt
+/// writes (`AuditConfig::log_path`), so any agent granted shell rewrites it on
+/// every run.
+const SCAN_SKIP_FILES: [&str; 1] = ["audit.log"];
+
+/// Whether a directory entry is hidden, and therefore skipped.
+///
+/// A blanket dot-prefix rule rather than an enumeration, because the runtime
+/// keeps growing dot-paths under the workspace — `.git`, `.openhuman/`
+/// (subagent checkpoints), `.runs/`, `.env`, `.memory-write.lock` — and an
+/// enumeration would go stale silently, in the direction of false positives.
+/// Nothing an agent is asked to deliver is a dotfile.
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
+}
 
 /// Hard ceiling on entries one workspace scan visits.
 ///
@@ -598,12 +635,15 @@ impl WorkspaceSnapshot {
                     continue;
                 };
                 if file_type.is_dir() {
-                    if !SCAN_SKIP_DIRS.contains(&name.as_str()) {
+                    if !is_hidden(&name) && !SCAN_SKIP_DIRS.contains(&name.as_str()) {
                         stack.push(path);
                     }
                     continue;
                 }
-                if !file_type.is_file() {
+                if !file_type.is_file()
+                    || is_hidden(&name)
+                    || SCAN_SKIP_FILES.contains(&name.as_str())
+                {
                     continue;
                 }
                 let Ok(meta) = entry.metadata() else {

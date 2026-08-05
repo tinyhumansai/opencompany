@@ -461,6 +461,45 @@ fn the_scan_skips_the_directories_an_exec_sandbox_fills() {
     assert!(before.changed_since(dir.path()).is_empty());
 }
 
+/// **The false-positive test that matters most.** The agent's `workspace_dir`
+/// is also where OpenHuman writes its own session transcripts, audit trail and
+/// checkpoints — on *every* run, by the harness rather than the agent. If the
+/// scan counted them, the nudge would fire after every single dispatch, asking
+/// an agent whether its own transcript is a deliverable.
+///
+/// Found the hard way: before these exclusions, every existing dispatch test
+/// grew a second model turn.
+#[test]
+fn the_scan_ignores_what_the_runtime_itself_writes() {
+    let dir = workspace(&[("spec.md", b"one")]);
+    let before = WorkspaceSnapshot::take(dir.path());
+
+    // Exactly what a real run leaves behind beside the agent's own work.
+    for path in [
+        "sessions/2026_08_05/1785952277_chief.md",
+        "session_raw/1785952277_chief.jsonl",
+        "artifacts/some-id/content",
+        "checkpoints/state.json",
+        ".openhuman/subagent_checkpoints/a.json",
+        ".runs/run-1.json",
+        "audit.log",
+        ".env",
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, b"runtime bookkeeping").unwrap();
+    }
+
+    assert!(
+        before.changed_since(dir.path()).is_empty(),
+        "the runtime's own files must never look like unpublished agent work"
+    );
+
+    // The agent's actual file is still seen, so the exclusions did not blind it.
+    std::fs::write(dir.path().join("spec.md"), b"one, revised").unwrap();
+    assert_eq!(before.changed_since(dir.path()), ["spec.md"]);
+}
+
 /// The entry cap. A truncated scan may only under-report — it feeds a warning,
 /// never a promotion, so missing something is the acceptable failure.
 #[test]
