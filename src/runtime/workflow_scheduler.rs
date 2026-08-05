@@ -81,7 +81,6 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::company::{WorkflowFile, list_workflows_union};
-use crate::ports::WorkflowRunContext;
 use crate::ports::types::CompanyId;
 use crate::ports::{DeliveryReport, DeliveryStatus};
 use crate::runtime::CompanyRegistry;
@@ -317,6 +316,14 @@ impl WorkflowScheduler {
                 // this is what turns a scheduled run's outcome from a host-stdout
                 // line into something the tenant's own console can read back.
                 let events = runtime.events().clone();
+                // Issue #383: cloned for the same reason as `events` — the task
+                // outlives this borrow of `runtime`. A cron fire is exactly the
+                // run an operator most needs to be able to stop: nobody chose
+                // its timing, and a wedged nightly run holds its overlap claim
+                // (above) until it ends, suppressing every later fire of that
+                // schedule. Registering it here is what puts a Cancel button on
+                // it in the console.
+                let supervisor = runtime.run_supervisor().clone();
                 // A FRESH TASK PER FIRE IS CORRECT HERE, and is not a hole in
                 // the `WORKFLOW_DEPTH` re-entry guard
                 // (`crate::workflows::runner`). That guard is a task-local
@@ -346,7 +353,11 @@ impl WorkflowScheduler {
                     // carry one. `scheduled: true` rides the run's
                     // `WorkflowRunStarted`, so the console can mark a cron fire
                     // as such *while it runs*, not only once it settles.
-                    let ctx = WorkflowRunContext::new(true);
+                    //
+                    // Issue #383: minted through the supervisor rather than
+                    // directly, which registers the run's stop signal. Held for
+                    // the whole run, including the outcome journalling below.
+                    let (ctx, _run_guard) = supervisor.begin(&workflow_id, true);
                     match runner.run(&company, &workflow, input, &ctx).await {
                         Ok(run) => {
                             // A manual run hands `deliveries` back in the HTTP
@@ -839,6 +850,7 @@ mod test {
                 output: Value::Null,
                 pending_approvals: Vec::new(),
                 deliveries: self.deliveries.clone(),
+                cancelled: false,
             })
         }
     }

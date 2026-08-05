@@ -1156,6 +1156,7 @@ pub fn orchestrator_tools(
     queue: &DelegationQueue,
     workflow_source_dir: Option<PathBuf>,
     workflow_runner: WorkflowRunnerHandle,
+    run_supervisor: crate::runtime::RunSupervisor,
     store: Arc<dyn CompanyStore>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(QueryCompanyTool::new(
@@ -1171,6 +1172,7 @@ pub fn orchestrator_tools(
         workflow_source_dir.clone(),
         store.clone(),
         workflow_runner,
+        run_supervisor,
         events.clone(),
     )));
     // `create_workflow` (issue #112) shares the same source dir the run tool
@@ -1245,6 +1247,14 @@ pub struct RunWorkflowTool {
     /// bodies — the only place a hosted tenant's workflows live (issue #168).
     store: Arc<dyn CompanyStore>,
     runner: WorkflowRunnerHandle,
+    /// The company's live set of cancellable runs (issue #383), so an
+    /// agent-initiated run is registered exactly like an operator's.
+    ///
+    /// It matters more here than anywhere else: this is the one entry point
+    /// nobody is watching a progress bar for, so a run an agent started on a
+    /// wedged node had no observer AND no way to be stopped. Registering it puts
+    /// it in the console's run history as `running` with a Cancel button.
+    run_supervisor: crate::runtime::RunSupervisor,
     /// The company's journal, so an agent-initiated run records an outcome like
     /// every other entry point (issues #228, #371).
     ///
@@ -1271,6 +1281,7 @@ impl RunWorkflowTool {
         source_dir: Option<PathBuf>,
         store: Arc<dyn CompanyStore>,
         runner: WorkflowRunnerHandle,
+        run_supervisor: crate::runtime::RunSupervisor,
         events: Option<Arc<dyn EventLog>>,
     ) -> Self {
         Self {
@@ -1278,6 +1289,7 @@ impl RunWorkflowTool {
             source_dir,
             store,
             runner,
+            run_supervisor,
             events,
         }
     }
@@ -1388,7 +1400,14 @@ impl Tool for RunWorkflowTool {
         // an agent asking for a run is closer to an operator pressing Run than
         // to a cron fire, and the flag drives exactly that distinction in the
         // console.
-        let ctx = WorkflowRunContext::new(false);
+        //
+        // Issue #383: minted through the supervisor so this run is cancellable
+        // too. Deliberately NOT spawned onto its own task, unlike the HTTP run
+        // route: this call sits inside an agent turn, and the `WORKFLOW_DEPTH`
+        // re-entry guard that bounds a workflow reaching back into itself is
+        // task-local. Spawning here would reset the depth mid-chain and turn the
+        // guard off exactly where it is load-bearing.
+        let (ctx, _run_guard) = self.run_supervisor.begin(&wid, false);
         match runner.run(&self.company, &file, input, &ctx).await {
             Ok(run) => {
                 tracing::debug!(
@@ -1407,6 +1426,27 @@ impl Tool for RunWorkflowTool {
                         Ok(&run),
                     )
                     .await;
+                }
+                // Issue #383: a cancelled run is `Ok`, so without this arm the
+                // agent would read the empty node summary as "the workflow did
+                // nothing" and quite reasonably try again — against a run an
+                // operator just deliberately stopped. Say what happened in
+                // words, as a `ToolResult::error` so the agent treats it as a
+                // reason to stop rather than a result to act on. It is still not
+                // a *failure* of the graph, which is why the journal records no
+                // error for it.
+                if run.cancelled {
+                    tracing::info!(
+                        company = %self.company,
+                        workflow = %wid,
+                        run_id = %ctx.run_id,
+                        "run_workflow: an operator stopped this run"
+                    );
+                    return Ok(ToolResult::error(format!(
+                        "Workflow `{wid}` was stopped by an operator before it finished. Its \
+                         completed steps are recorded in the run history. Don't retry it unless \
+                         you're asked to — someone chose to stop it."
+                    )));
                 }
                 let md = summarize_run(&file, &run);
                 Ok(ToolResult::success_with_markdown(
@@ -1830,6 +1870,7 @@ mod tests {
             }],
             pending_approvals: Vec::new(),
             error: None,
+            cancelled: false,
         });
 
         assert!(!summary.contains(RECIPIENT), "{summary}");
@@ -2542,6 +2583,7 @@ name = "Morning"
                 output: Value::Null,
                 pending_approvals: Vec::new(),
                 deliveries: Vec::new(),
+                cancelled: false,
             })
         }
     }
@@ -2602,6 +2644,7 @@ name = "Morning"
             &queue,
             None,
             WorkflowRunnerHandle::default(),
+            crate::runtime::RunSupervisor::default(),
             Arc::new(MemStore::default()),
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -2629,6 +2672,7 @@ name = "Morning"
             }),
             pending_approvals: Vec::new(),
             deliveries: Vec::new(),
+            cancelled: false,
         });
         let calls = runner_impl.calls.clone();
         let runner: Arc<dyn WorkflowRunner> = Arc::new(runner_impl);
@@ -2640,6 +2684,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             Arc::new(MemStore::default()),
             handle,
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = tool
@@ -2664,6 +2709,7 @@ name = "Morning"
             output: json!({ "nodes": { "worker": { "items": [] } } }),
             pending_approvals: vec!["worker".to_string()],
             deliveries: Vec::new(),
+            cancelled: false,
         }));
         let handle = WorkflowRunnerHandle::default();
         handle.set(&runner);
@@ -2673,6 +2719,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             Arc::new(MemStore::default()),
             handle,
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = tool
@@ -2695,6 +2742,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             Arc::new(MemStore::default()),
             WorkflowRunnerHandle::default(),
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = tool
@@ -2718,6 +2766,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             Arc::new(MemStore::default()),
             handle,
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = tool
@@ -2738,6 +2787,7 @@ name = "Morning"
             None,
             Arc::new(MemStore::default()),
             WorkflowRunnerHandle::default(),
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = tool.execute(json!({})).await.expect("execute");
@@ -2758,6 +2808,7 @@ name = "Morning"
             Some(std::path::PathBuf::from("/tmp")),
             Arc::new(MemStore::default()),
             handle,
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = tool
@@ -2845,6 +2896,7 @@ name = "Morning"
             output: json!({ "nodes": { "worker": { "items": ["hi"] } } }),
             pending_approvals: Vec::new(),
             deliveries: Vec::new(),
+            cancelled: false,
         }));
         let handle = WorkflowRunnerHandle::default();
         handle.set(&runner);
@@ -2853,6 +2905,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             store.clone(),
             handle,
+            crate::runtime::RunSupervisor::default(),
             None,
         );
         let result = run
@@ -2923,10 +2976,18 @@ name = "Morning"
             output: json!({ "nodes": { "done": { "items": ["ok"] } } }),
             pending_approvals: Vec::new(),
             deliveries: Vec::new(),
+            cancelled: false,
         }));
         let handle = WorkflowRunnerHandle::default();
         handle.set(&runner);
-        let run = RunWorkflowTool::new(company, None, store, handle, None);
+        let run = RunWorkflowTool::new(
+            company,
+            None,
+            store,
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+        );
         let result = run
             .execute(json!({ "id": "hosted" }))
             .await
