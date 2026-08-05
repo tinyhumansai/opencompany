@@ -253,12 +253,27 @@ export function CopilotPanel({
 
       <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-auto px-3 py-3">
         {/* What it can see and what it cannot do, stated before the first
-            question rather than discovered after it. */}
+            question rather than discovered after it.
+
+            The first line used to end "— not other workflows", which was an
+            over-claim: what the thread buys is transcript isolation, not a
+            confined responder. The teammate answering is the company's
+            orchestrator with its ordinary company-wide context and tools, so
+            the honest claim is about what is SENT with the question, not about
+            what the responder is unable to reach. Grounding and isolation are
+            both real and both verified; confinement is not, so it is not
+            claimed. See the header of `@/api/workflow-copilot`. */}
         <div className="rounded-lg border bg-muted/30 p-2 text-[11px] leading-snug text-muted-foreground">
           <p>
-            Answers are scoped to <span className="font-medium text-foreground">{graph.name}</span>.
-            It can see this workflow's steps and its recorded runs — not other
-            workflows.
+            Answers are grounded in{" "}
+            <span className="font-medium text-foreground">{graph.name}</span> — its steps
+            and its recorded runs are what gets sent with your question.
+          </p>
+          <p className="mt-1.5">
+            This conversation stays with this workflow: it isn't in the company
+            chat, and another workflow's copilot can't see it. The teammate
+            answering is your company's orchestrator though, so it can still
+            draw on what it knows about the rest of the company.
           </p>
           <p className="mt-1.5">
             It can explain and suggest, but{" "}
