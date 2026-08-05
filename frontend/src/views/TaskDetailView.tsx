@@ -3,9 +3,16 @@
 // timeline, and a controls bar; a 4s visibility-gated poll keeps it live while
 // the card is open. Cost/₹ is intentionally absent everywhere. The Artifacts tab is
 // its own self-fetching surface (#306, over #187's routes); Discussion stays an
-// honest stub pending its own backend.
+// honest stub pending its own backend. Export (#352) is a host-rendered
+// document the controls bar downloads — the console lays out none of it.
 
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactElement,
+} from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -18,6 +25,7 @@ import {
   CornerDownRight,
   CornerUpLeft,
   CornerUpRight,
+  Download,
   Hourglass,
   Layers,
   Loader2,
@@ -34,6 +42,7 @@ import {
 } from "lucide-react";
 
 import {
+  exportTaskRecord,
   getTaskDetail,
   listInflight,
   patchTask,
@@ -100,7 +109,10 @@ import { TaskEditDialog } from "./TaskEditDialog";
 const POLL_MS = 4000;
 
 function priorityStyle(priority: string): string {
-  return PRIORITY_STYLES[priority as keyof typeof PRIORITY_STYLES] ?? PRIORITY_STYLES.low;
+  return (
+    PRIORITY_STYLES[priority as keyof typeof PRIORITY_STYLES] ??
+    PRIORITY_STYLES.low
+  );
 }
 
 /** The column id → human label ("in_progress" → "In progress"), tolerating unknowns. */
@@ -109,73 +121,27 @@ function columnLabel(column: string): string {
 }
 
 /**
- * Sums the task's "worked" spans from its timeline: each `dispatched` opens a
- * window that its matching `completed` closes. Re-dispatch reopens a fresh
- * window, so multiple spans accumulate. A `completed` with no open window
- * (legacy cards journaled before dispatch anchors existed) is skipped rather
- * than counted from zero. When a window is still open, its running time to
- * `now` is included and `live` is true — the caller ticks it every second.
- */
-function workedMillis(timeline: TimelineEntry[], now: number): { millis: number; live: boolean } {
-  let total = 0;
-  let openAt: number | null = null;
-  for (const e of timeline) {
-    if (e.kind === "dispatched") {
-      openAt = e.atMillis;
-    } else if (e.kind === "completed" && openAt !== null) {
-      total += Math.max(0, e.atMillis - openAt);
-      openAt = null;
-    }
-  }
-  const live = openAt !== null;
-  if (openAt !== null) total += Math.max(0, now - openAt);
-  return { millis: total, live };
-}
-
-/**
- * The task's waiting-on-a-human spans, merged and summed (#305).
+ * Extends a host-computed duration to `now` while its span is still open.
  *
- * Each resolved approval carries `waitedMillis` — the host's exact park→resolve
- * span, already clamped to the run window — so a span is reconstructed as
- * `[atMillis - waitedMillis, atMillis]` rather than inferred from gaps between
- * rows. A still-parked approval has no resolution event yet, so the live wait
- * arrives separately as `waitingSince` and runs to `now`.
+ * The worked/waiting arithmetic — the dispatch-window pairing and the approval
+ * interval merge — used to live here *and* in the exporter
+ * (`src/server/ops/task_export.rs`), so the screen and the exported record of
+ * the same task could disagree about how long a person was waited on with
+ * nothing failing. The host now computes both totals once in `TaskDurations`
+ * and hands them to whoever reads the task; this is all that is left client-side.
  *
- * Spans are interval-merged before summing. Two approvals can be parked at once
- * — the company is waiting *once* over that overlap, not twice — and without
- * the merge the waiting figure could exceed the elapsed time it is subtracted
- * from, which would read as a bug to anyone doing the arithmetic.
+ * The extension is exact rather than an approximation, which is why the merge
+ * does not have to be repeated here: every closed span ends in the past, so past
+ * `asOf` the only interval still growing is the open one, and it grows second
+ * for second. `Math.max(0, …)` guards a client clock behind the host's.
  */
-function waitingMillis(
-  timeline: TimelineEntry[],
-  waitingSince: number | undefined,
+function extend(
+  total: number,
+  live: boolean,
+  asOf: number,
   now: number,
 ): { millis: number; live: boolean } {
-  const spans: Array<[number, number]> = [];
-  for (const e of timeline) {
-    if (e.kind !== "approval") continue;
-    const waited = e.waitedMillis;
-    // `undefined` means the host could not recover the park instant; `0` is a
-    // real (instant) sign-off. Neither contributes a span.
-    if (waited === undefined || waited <= 0) continue;
-    spans.push([e.atMillis - waited, e.atMillis]);
-  }
-  const live = waitingSince !== undefined;
-  if (waitingSince !== undefined) spans.push([waitingSince, Math.max(waitingSince, now)]);
-
-  spans.sort((a, b) => a[0] - b[0]);
-  let total = 0;
-  let cursor: [number, number] | null = null;
-  for (const span of spans) {
-    if (cursor && span[0] <= cursor[1]) {
-      cursor[1] = Math.max(cursor[1], span[1]);
-    } else {
-      if (cursor) total += cursor[1] - cursor[0];
-      cursor = [span[0], span[1]];
-    }
-  }
-  if (cursor) total += cursor[1] - cursor[0];
-  return { millis: Math.max(0, total), live };
+  return { millis: live ? total + Math.max(0, now - asOf) : total, live };
 }
 
 /**
@@ -200,7 +166,8 @@ function formatDuration(millis: number): string {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
+  if (h > 0)
+    return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
   if (m > 0) return `${m}m ${String(sec).padStart(2, "0")}s`;
   return `${sec}s`;
 }
@@ -292,7 +259,8 @@ export function TaskDetailView({
       }
     };
     const start = () => {
-      if (timer === undefined) timer = window.setInterval(() => void load(isActive), POLL_MS);
+      if (timer === undefined)
+        timer = window.setInterval(() => void load(isActive), POLL_MS);
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") {
@@ -312,11 +280,27 @@ export function TaskDetailView({
   }, [load]);
 
   const worked = useMemo(
-    () => (detail ? workedMillis(detail.timeline, now) : null),
+    () =>
+      detail
+        ? extend(
+            detail.durations.workedMillis,
+            detail.durations.workedLive,
+            detail.durations.asOfMillis,
+            now,
+          )
+        : null,
     [detail, now],
   );
   const waiting = useMemo(
-    () => (detail ? waitingMillis(detail.timeline, detail.waitingSince, now) : null),
+    () =>
+      detail
+        ? extend(
+            detail.durations.waitingMillis,
+            detail.durations.waitingLive,
+            detail.durations.asOfMillis,
+            now,
+          )
+        : null,
     [detail, now],
   );
 
@@ -362,7 +346,12 @@ export function TaskDetailView({
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex items-center gap-2 border-b px-4 py-3">
-        <Button variant="ghost" size="sm" className="-ml-2 h-8 px-2" onClick={onBack}>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="-ml-2 h-8 px-2"
+          onClick={onBack}
+        >
           <ArrowLeft className="mr-1.5 size-4" />
           Board
         </Button>
@@ -386,7 +375,11 @@ export function TaskDetailView({
       ) : detail ? (
         <ScrollArea className="min-h-0 flex-1">
           <div className="mx-auto w-full max-w-3xl space-y-5 p-4">
-            <DetailHeader task={detail.task} worked={worked} waiting={waiting} />
+            <DetailHeader
+              task={detail.task}
+              worked={worked}
+              waiting={waiting}
+            />
 
             <ControlBar
               task={detail.task}
@@ -445,7 +438,11 @@ export function TaskDetailView({
               </TabsContent>
 
               <TabsContent value="artifacts" className="mt-4">
-                <ArtifactsTab client={client} company={company} taskId={detail.task.id} />
+                <ArtifactsTab
+                  client={client}
+                  company={company}
+                  taskId={detail.task.id}
+                />
               </TabsContent>
 
               <TabsContent value="discussion" className="mt-4">
@@ -543,7 +540,10 @@ function DetailHeader({
               </span>
               {worked!.live && (
                 <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
-                  <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+                  <span
+                    className="size-1.5 animate-pulse rounded-full bg-current"
+                    aria-hidden
+                  />
                   live
                 </span>
               )}
@@ -560,7 +560,10 @@ function DetailHeader({
             </span>
             {waiting!.live && (
               <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
-                <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+                <span
+                  className="size-1.5 animate-pulse rounded-full bg-current"
+                  aria-hidden
+                />
                 on you
               </span>
             )}
@@ -624,7 +627,10 @@ function ControlBar({
   const pending = inflight?.pendingAction ?? null;
   const steerDisabled = busy || pending !== null;
 
-  async function steer(action: SteerAction, opts?: { instruction?: string; confirm?: boolean }) {
+  async function steer(
+    action: SteerAction,
+    opts?: { instruction?: string; confirm?: boolean },
+  ) {
     if (!inflight) return;
     setBusy(true);
     try {
@@ -642,12 +648,16 @@ function ControlBar({
   async function patchColumn() {
     setBusy(true);
     try {
-      const saved = await patchTask(client, company, task.id, { column: "in_progress" });
+      const saved = await patchTask(client, company, task.id, {
+        column: "in_progress",
+      });
       onSaved(saved);
       await onChanged();
       toast.success("Dispatched — the assignee is working on it.");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not dispatch the task");
+      toast.error(
+        e instanceof Error ? e.message : "could not dispatch the task",
+      );
     } finally {
       setBusy(false);
     }
@@ -665,13 +675,17 @@ function ControlBar({
     }
     setBusy(true);
     try {
-      const saved = await patchTask(client, company, task.id, { assignee: next });
+      const saved = await patchTask(client, company, task.id, {
+        assignee: next,
+      });
       onSaved(saved);
       await onChanged();
       setReassigning(false);
       toast.success("Reassigned.");
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not reassign the task");
+      toast.error(
+        e instanceof Error ? e.message : "could not reassign the task",
+      );
     } finally {
       setBusy(false);
     }
@@ -685,7 +699,10 @@ function ControlBar({
         {inflight ? (
           <>
             <span className="mr-1 inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-              <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+              <span
+                className="size-1.5 animate-pulse rounded-full bg-current"
+                aria-hidden
+              />
               In flight
             </span>
             {pending !== null ? (
@@ -717,7 +734,12 @@ function ControlBar({
                 </Button>
                 <ConfirmButton
                   trigger={
-                    <Button variant="outline" size="sm" className="h-8" disabled={steerDisabled}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      disabled={steerDisabled}
+                    >
                       <Ban className="mr-1.5 size-3.5" />
                       Cancel
                     </Button>
@@ -743,7 +765,9 @@ function ControlBar({
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          {busy && <Loader2 className="size-4 animate-spin text-muted-foreground" />}
+          {busy && (
+            <Loader2 className="size-4 animate-spin text-muted-foreground" />
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -758,10 +782,17 @@ function ControlBar({
             <UserCog className="mr-1.5 size-3.5" />
             Reassign
           </Button>
-          <Button variant="ghost" size="sm" className="h-8" disabled={busy} onClick={onEdit}>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8"
+            disabled={busy}
+            onClick={onEdit}
+          >
             <Pencil className="mr-1.5 size-3.5" />
             Edit
           </Button>
+          <ExportButton task={task} client={client} company={company} />
         </div>
       </div>
 
@@ -775,14 +806,17 @@ function ControlBar({
             disabled={steerDisabled}
             onChange={(e) => setInstruction(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && instruction.trim()) void steer("redirect", { instruction: instruction.trim() });
+              if (e.key === "Enter" && instruction.trim())
+                void steer("redirect", { instruction: instruction.trim() });
             }}
           />
           <Button
             size="sm"
             className="h-8"
             disabled={steerDisabled || !instruction.trim()}
-            onClick={() => void steer("redirect", { instruction: instruction.trim() })}
+            onClick={() =>
+              void steer("redirect", { instruction: instruction.trim() })
+            }
           >
             <Send className="mr-1.5 size-3.5" />
             Send
@@ -806,7 +840,12 @@ function ControlBar({
             disabled={busy}
             className="h-8 min-w-0 flex-1"
           />
-          <Button size="sm" className="h-8" disabled={busy} onClick={() => void saveAssignee()}>
+          <Button
+            size="sm"
+            className="h-8"
+            disabled={busy}
+            onClick={() => void saveAssignee()}
+          >
             Save
           </Button>
         </div>
@@ -851,7 +890,9 @@ function OriginThreadRow({
     >
       <MessagesSquare className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate">{label}</span>
-      <span className="shrink-0 text-muted-foreground">Open the conversation</span>
+      <span className="shrink-0 text-muted-foreground">
+        Open the conversation
+      </span>
     </button>
   );
 }
@@ -876,13 +917,17 @@ function LineageRail({
             onClick={() => onNavigate(lineage.parent!.id)}
           >
             <CornerUpLeft className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="min-w-0 flex-1 truncate">{lineage.parent.title}</span>
+            <span className="min-w-0 flex-1 truncate">
+              {lineage.parent.title}
+            </span>
             <Badge variant="secondary" className="shrink-0 font-normal">
               {columnLabel(lineage.parent.column)}
             </Badge>
           </button>
         )}
-        <div className="px-2.5 py-1 text-[11px] font-medium text-muted-foreground">This task</div>
+        <div className="px-2.5 py-1 text-[11px] font-medium text-muted-foreground">
+          This task
+        </div>
         {lineage.children.map((child) => (
           <button
             key={child.id}
@@ -964,11 +1009,17 @@ function groupTimeline(
 
   const items: TimelineItem[] = [];
   for (const g of groups) {
-    const waited = g.kind === "approval" ? g.entries[0].waitedMillis : undefined;
+    const waited =
+      g.kind === "approval" ? g.entries[0].waitedMillis : undefined;
     if (waited !== undefined && waited > 0) {
       // `wait-` prefixed so a band can never collide with a row key, which is
       // the bare sequence number.
-      items.push({ row: "wait", key: `wait-${g.entries[0].seq}`, millis: waited, live: false });
+      items.push({
+        row: "wait",
+        key: `wait-${g.entries[0].seq}`,
+        millis: waited,
+        live: false,
+      });
     }
     items.push({ row: "group", key: g.key, group: g });
   }
@@ -1005,7 +1056,8 @@ const KIND_ICON: Record<TimelineKind, ReactElement> = {
  * icon exactly as before.
  */
 function rowIcon(kind: TimelineKind, status?: StepStatus): ReactElement {
-  if (status === "running") return <Loader2 className="size-3.5 animate-spin" />;
+  if (status === "running")
+    return <Loader2 className="size-3.5 animate-spin" />;
   if (status === "error") return <AlertCircle className="size-3.5" />;
   return KIND_ICON[kind];
 }
@@ -1081,7 +1133,9 @@ function TimelineList({
 function WaitingBand({ millis, live }: { millis: number; live: boolean }) {
   // Height is quantised to the 4s poll while the band is live, so a 1s text tick
   // does not relayout the list underneath the reader's cursor every second.
-  const height = waitingBandHeight(live ? Math.round(millis / 4000) * 4000 : millis);
+  const height = waitingBandHeight(
+    live ? Math.round(millis / 4000) * 4000 : millis,
+  );
   return (
     <li
       className={cn(
@@ -1095,7 +1149,9 @@ function WaitingBand({ millis, live }: { millis: number; live: boolean }) {
     >
       <Hourglass className="size-3.5 shrink-0" aria-hidden />
       <span className="font-medium tabular-nums">
-        {live ? `Waiting on you · ${formatDuration(millis)}` : `Waited ${formatDuration(millis)}`}
+        {live
+          ? `Waiting on you · ${formatDuration(millis)}`
+          : `Waited ${formatDuration(millis)}`}
       </span>
     </li>
   );
@@ -1120,7 +1176,9 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
         <span className={cn("shrink-0", kindTone(group.kind, group.status))}>
           {rowIcon(group.kind, group.status)}
         </span>
-        <span className="min-w-0 flex-1 truncate font-medium">{group.label}</span>
+        <span className="min-w-0 flex-1 truncate font-medium">
+          {group.label}
+        </span>
         {group.count > 1 && (
           <Badge variant="outline" className="shrink-0 font-normal">
             ×{group.count}
@@ -1129,7 +1187,9 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
         {/* A run step's own duration (#242); journal entries carry none. */}
         {group.count === 1 && first.elapsedMs !== undefined && (
           <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-            {first.elapsedMs < 1000 ? `${first.elapsedMs}ms` : formatDuration(first.elapsedMs)}
+            {first.elapsedMs < 1000
+              ? `${first.elapsedMs}ms`
+              : formatDuration(first.elapsedMs)}
           </span>
         )}
         <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
@@ -1147,7 +1207,9 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
           {group.count > 1
             ? group.entries.map((e) => (
                 <div key={e.seq} className="text-[11px]">
-                  <div className="mb-0.5 text-muted-foreground">{timeOf(e.atMillis)}</div>
+                  <div className="mb-0.5 text-muted-foreground">
+                    {timeOf(e.atMillis)}
+                  </div>
                   {e.detail && (
                     <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">
                       {e.detail}
@@ -1216,7 +1278,10 @@ function AttemptsTab({
   now: number;
 }) {
   const [openId, setOpenId] = useState<string | null>(null);
-  const open = useMemo(() => runs.find((r) => r.id === openId) ?? null, [runs, openId]);
+  const open = useMemo(
+    () => runs.find((r) => r.id === openId) ?? null,
+    [runs, openId],
+  );
 
   if (runs.length === 0) {
     return (
@@ -1230,12 +1295,18 @@ function AttemptsTab({
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Every dispatch of this card, newest first. A card can enter review more than once, so
-        several waits on one attempt is the expected record, not a fault.
+        Every dispatch of this card, newest first. A card can enter review more
+        than once, so several waits on one attempt is the expected record, not a
+        fault.
       </p>
       <ol className="space-y-1.5">
         {runs.map((run) => (
-          <AttemptRow key={run.id} run={run} now={now} onOpen={() => setOpenId(run.id)} />
+          <AttemptRow
+            key={run.id}
+            run={run}
+            now={now}
+            onOpen={() => setOpenId(run.id)}
+          />
         ))}
       </ol>
       <RunDrawer
@@ -1287,10 +1358,15 @@ function AttemptRow({
         <div className="flex w-full items-center gap-2 text-xs">
           <Layers className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="shrink-0 font-medium">Attempt {run.attempt}</span>
-          <Badge variant="outline" className={cn("shrink-0 font-normal", runStatusTone(run.status))}>
+          <Badge
+            variant="outline"
+            className={cn("shrink-0 font-normal", runStatusTone(run.status))}
+          >
             {RUN_STATUS_LABEL[run.status]}
           </Badge>
-          <span className="min-w-0 flex-1 truncate text-muted-foreground">{run.agentId}</span>
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
+            {run.agentId}
+          </span>
           {elapsed !== null && (
             <span
               className={cn(
@@ -1365,7 +1441,10 @@ function RunDrawer({
           setError(null);
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : "could not load the attempt");
+        if (!cancelled)
+          setError(
+            e instanceof Error ? e.message : "could not load the attempt",
+          );
       }
     };
     void read();
@@ -1399,7 +1478,9 @@ function RunDrawer({
                 {elapsed !== null && (
                   <>
                     <span aria-hidden>·</span>
-                    <span className="tabular-nums">{formatDuration(elapsed)}</span>
+                    <span className="tabular-nums">
+                      {formatDuration(elapsed)}
+                    </span>
                   </>
                 )}
               </SheetDescription>
@@ -1408,18 +1489,22 @@ function RunDrawer({
               <div className="space-y-3 px-4 pb-4">
                 {run.error && (
                   <Alert variant="destructive">
-                    <AlertDescription className="text-xs">{run.error}</AlertDescription>
+                    <AlertDescription className="text-xs">
+                      {run.error}
+                    </AlertDescription>
                   </Alert>
                 )}
                 {error && (
                   <Alert variant="destructive">
-                    <AlertDescription className="text-xs">{error}</AlertDescription>
+                    <AlertDescription className="text-xs">
+                      {error}
+                    </AlertDescription>
                   </Alert>
                 )}
                 {run.stepCountCapped && (
                   <p className="text-[11px] text-muted-foreground">
-                    This attempt hit the per-run trace ceiling, so what follows is the start of
-                    the run, not all of it.
+                    This attempt hit the per-run trace ceiling, so what follows
+                    is the start of the run, not all of it.
                   </p>
                 )}
                 {detail === null && error === null ? (
@@ -1544,6 +1629,81 @@ function ApprovalsTab({ approvals, now }: { approvals: TaskApproval[]; now: numb
 }
 
 /**
+ * Exports the task's record as a document (#352).
+ *
+ * The host renders it — one implementation, so a scripted export gets the same
+ * file — and this is delivery only: fetch the document through the authenticated
+ * client, then hand it to the browser as a download. A plain `<a href>` would be
+ * simpler but would drop the `Authorization` header the platform-token
+ * deployment needs, so the bytes come back through `getDocument` — with the
+ * host's own filename — and go out through an object URL.
+ *
+ * Read-only by construction: the button triggers a GET, and the screen does not
+ * reload after it, because nothing about the task changed.
+ */
+function ExportButton({
+  task,
+  client,
+  company,
+}: {
+  task: Task;
+  client: OpenCompanyClient;
+  company: string | null;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  async function download() {
+    setBusy(true);
+    try {
+      const { text, filename } = await exportTaskRecord(
+        client,
+        company,
+        task.id,
+      );
+      const url = URL.createObjectURL(new Blob([text], { type: "text/html" }));
+      const link = document.createElement("a");
+      link.href = url;
+      // The host already named the file, and a blob download does not honour
+      // `Content-Disposition` on its own — so carry the host's name across
+      // rather than deriving a second one here, which could disagree with what
+      // a `curl -OJ` of the same route saves.
+      link.download = filename ?? `task-${task.id}.html`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      // Freed on the next tick: revoking synchronously can beat the click in
+      // some browsers and save an empty file.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      toast.success(
+        "Record downloaded. Open it in any browser, or print it to PDF.",
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "could not export the task");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-8"
+      disabled={busy}
+      title="Download this task's record as a document"
+      onClick={() => void download()}
+    >
+      {busy ? (
+        <Loader2 className="mr-1.5 size-3.5 animate-spin" />
+      ) : (
+        <Download className="mr-1.5 size-3.5" />
+      )}
+      Export
+    </Button>
+  );
+}
+
+/**
  * The Task Detail **Discussion** tab (#335): the card's own message thread.
  *
  * A task discussion is a thread of its own, not the company chat filtered to a
@@ -1656,7 +1816,9 @@ function DiscussionTab({
       setText("");
       await onPosted();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "could not post the message");
+      toast.error(
+        e instanceof Error ? e.message : "could not post the message",
+      );
     } finally {
       setBusy(false);
     }
@@ -1701,7 +1863,9 @@ function DiscussionTab({
                   {timeOf(m.atMillis)}
                 </span>
               </div>
-              <p className="mt-1 whitespace-pre-wrap break-words text-xs">{m.text}</p>
+              <p className="mt-1 whitespace-pre-wrap break-words text-xs">
+                {m.text}
+              </p>
             </li>
           ))}
         </ol>
@@ -1747,7 +1911,9 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   return (
     <div className="rounded-xl border border-dashed py-10 text-center">
       <p className="text-sm font-medium">{title}</p>
-      <p className="mx-auto mt-1 max-w-xs text-xs text-muted-foreground">{body}</p>
+      <p className="mx-auto mt-1 max-w-xs text-xs text-muted-foreground">
+        {body}
+      </p>
     </div>
   );
 }
@@ -1905,7 +2071,11 @@ function ConfirmButton({
           <AlertDialogCancel>{cancelLabel}</AlertDialogCancel>
           <AlertDialogAction
             onClick={onConfirm}
-            className={destructive ? "bg-destructive text-white hover:bg-destructive/90" : undefined}
+            className={
+              destructive
+                ? "bg-destructive text-white hover:bg-destructive/90"
+                : undefined
+            }
           >
             {confirmLabel}
           </AlertDialogAction>

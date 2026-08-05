@@ -59,19 +59,19 @@ pub fn router() -> Router<AppState> {
 /// A task card as the console renders it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskCard {
-    id: String,
-    title: String,
+pub(crate) struct TaskCard {
+    pub(crate) id: String,
+    pub(crate) title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
-    column: String,
-    priority: String,
-    assignee: String,
-    updated_at: u64,
+    pub(crate) note: Option<String>,
+    pub(crate) column: String,
+    pub(crate) priority: String,
+    pub(crate) assignee: String,
+    pub(crate) updated_at: u64,
     /// The card this one was spawned from (#185). Omitted on a lineage root so
     /// the board's existing wire shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
-    parent_task_id: Option<String>,
+    pub(crate) parent_task_id: Option<String>,
     /// The chat thread this card was opened from (issue #246).
     ///
     /// `TaskRecord::origin_chat_id` has existed since #151 (it is what lets a
@@ -81,7 +81,7 @@ struct TaskCard {
     /// which is every card the board created before this, so the existing wire
     /// shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
-    origin_chat_id: Option<String>,
+    pub(crate) origin_chat_id: Option<String>,
 }
 
 impl From<TaskRecord> for TaskCard {
@@ -405,20 +405,20 @@ async fn delete_task(
 /// card's note.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TimelineEntry {
+pub(crate) struct TimelineEntry {
     /// The journal sequence this entry came from — the console's stable key,
     /// and what makes the timeline strictly ordered.
-    seq: u64,
+    pub(crate) seq: u64,
     /// Epoch-millis the event was journaled.
-    at_millis: u64,
+    pub(crate) at_millis: u64,
     /// A stable wire word for what happened: `dispatched`, `reply`,
     /// `tool_failed`, `approval`, or `completed`.
-    kind: String,
+    pub(crate) kind: String,
     /// A short human label.
-    label: String,
+    pub(crate) label: String,
     /// Optional scrubbed detail (see the type docs for what may appear here).
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub(crate) detail: Option<String>,
     /// For an `approval` entry: how long the company sat waiting on the
     /// operator before this resolution landed (issue #305).
     ///
@@ -433,7 +433,7 @@ struct TimelineEntry {
     /// parked when this task was dispatched charges only the part of its wait
     /// that overlapped this run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    waited_millis: Option<u64>,
+    pub(crate) waited_millis: Option<u64>,
 }
 
 /// One approval that belongs to this task (issue #333).
@@ -450,23 +450,23 @@ struct TimelineEntry {
 /// task's view of what it asked for.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskApproval {
+pub(crate) struct TaskApproval {
     /// The approval's id — the same one the Approvals page resolves against.
-    id: String,
+    pub(crate) id: String,
     /// The parked effect's dotted kind, e.g. `payment.send`.
-    kind: String,
+    pub(crate) kind: String,
     /// Epoch-millis the effect parked.
-    at_millis: u64,
+    pub(crate) at_millis: u64,
     /// `pending`, `approved`, `denied`, or `expired`.
-    status: String,
+    pub(crate) status: String,
     /// Epoch-millis the resolution landed. Absent while pending.
     #[serde(skip_serializing_if = "Option::is_none")]
-    resolved_at_millis: Option<u64>,
+    pub(crate) resolved_at_millis: Option<u64>,
     /// The park → resolve span. Absent while pending (the console runs that
     /// clock itself from `atMillis`) and for an approval whose park instant the
     /// journal cannot recover.
     #[serde(skip_serializing_if = "Option::is_none")]
-    waited_millis: Option<u64>,
+    pub(crate) waited_millis: Option<u64>,
 }
 
 /// One irreversible effect this task already executed (issue #351).
@@ -494,7 +494,7 @@ struct TaskApproval {
 /// accident — the same scrub discipline [`TimelineEntry`] documents.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IrreversibleEffect {
+pub(crate) struct IrreversibleEffect {
     /// The dotted effect kind, e.g. `payment.send`.
     kind: String,
     /// Epoch-millis the effect was committed.
@@ -518,10 +518,10 @@ impl From<crate::runtime::journal::ExecutedEffect> for IrreversibleEffect {
 /// A neighbouring card in the lineage, trimmed to what a link needs.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LineageRef {
-    id: String,
-    title: String,
-    column: String,
+pub(crate) struct LineageRef {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) column: String,
 }
 
 impl From<&TaskRecord> for LineageRef {
@@ -537,18 +537,165 @@ impl From<&TaskRecord> for LineageRef {
 /// The parent/children view of a task.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Lineage {
+pub(crate) struct Lineage {
     /// The card this one was spawned from, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    parent: Option<LineageRef>,
+    pub(crate) parent: Option<LineageRef>,
     /// Cards spawned from this one, oldest-updated first for a stable render.
-    children: Vec<LineageRef>,
+    pub(crate) children: Vec<LineageRef>,
+}
+
+/// The worked/waiting split (issue #305), computed once by the host.
+///
+/// Both halves are derived from the same timeline the screen and the exported
+/// record are handed, and they used to be derived *twice* — once in
+/// `frontend/src/views/TaskDetailView.tsx`, once in the exporter — so the two
+/// could disagree about how long a person was waited on with nothing failing.
+/// The host does the arithmetic and both callers read the result, which is the
+/// same reason [`assemble_detail`] is shared rather than re-read.
+///
+/// **Live runs are the one thing a snapshot cannot carry.** A dispatch window
+/// that is still open, or an approval still parked, keeps growing after these
+/// totals are taken. `worked_live` / `waiting_live` mark those, and
+/// `as_of_millis` is the instant they were taken: a caller that wants a ticking
+/// figure adds `now - as_of_millis` to the live half and does nothing else.
+///
+/// That extension is *exact*, not an approximation, and it is why the merge
+/// does not have to be repeated client-side: every closed span ends in the past,
+/// so past `as_of_millis` the only interval still growing is the open one, and
+/// it grows second for second.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskDurations {
+    /// Milliseconds this task was actively worked, as of `as_of_millis`.
+    pub(crate) worked_millis: u64,
+    /// A dispatch window is still open — extend `worked_millis` from `as_of_millis`.
+    pub(crate) worked_live: bool,
+    /// Milliseconds the company spent waiting on a person, interval-merged.
+    pub(crate) waiting_millis: u64,
+    /// An approval is still parked — extend `waiting_millis` from `as_of_millis`.
+    pub(crate) waiting_live: bool,
+    /// The instant both totals were taken.
+    pub(crate) as_of_millis: u64,
+}
+
+impl TaskDurations {
+    /// Both totals, over one timeline, as of `as_of_millis`.
+    ///
+    /// The single construction site, so a caller cannot assemble a `TaskDetail`
+    /// whose durations disagree with its timeline.
+    pub(crate) fn compute(
+        timeline: &[TimelineEntry],
+        waiting_since: Option<u64>,
+        as_of_millis: u64,
+    ) -> Self {
+        let (worked_millis, worked_live) = worked_span(timeline, as_of_millis);
+        let (waiting_millis, waiting_live) = waiting_span(timeline, waiting_since, as_of_millis);
+        Self {
+            worked_millis,
+            worked_live,
+            waiting_millis,
+            waiting_live,
+            as_of_millis,
+        }
+    }
+
+    /// The worked total extended to `now` when a window is still open.
+    pub(crate) fn worked_at(&self, now: u64) -> u64 {
+        self.extend(self.worked_millis, self.worked_live, now)
+    }
+
+    /// The waiting total extended to `now` when an approval is still parked.
+    pub(crate) fn waiting_at(&self, now: u64) -> u64 {
+        self.extend(self.waiting_millis, self.waiting_live, now)
+    }
+
+    fn extend(&self, total: u64, live: bool, now: u64) -> u64 {
+        if live {
+            total + now.saturating_sub(self.as_of_millis)
+        } else {
+            total
+        }
+    }
+}
+
+/// The task's worked time: each `dispatched` opens a window its `completed`
+/// closes, re-dispatch opens another, and an open window runs to `now`.
+///
+/// A `completed` with no open window is a card journaled before dispatch
+/// anchors existed: skipped, never counted from zero.
+fn worked_span(timeline: &[TimelineEntry], now: u64) -> (u64, bool) {
+    let mut total = 0u64;
+    let mut open_at: Option<u64> = None;
+    for e in timeline {
+        match e.kind.as_str() {
+            "dispatched" => open_at = Some(e.at_millis),
+            "completed" => {
+                if let Some(opened) = open_at.take() {
+                    total += e.at_millis.saturating_sub(opened);
+                }
+            }
+            _ => {}
+        }
+    }
+    let live = open_at.is_some();
+    if let Some(opened) = open_at {
+        total += now.saturating_sub(opened);
+    }
+    (total, live)
+}
+
+/// The task's waiting-on-a-person time, interval-merged then summed.
+///
+/// Each resolved approval carries `waited_millis` — the exact park→resolve span,
+/// already clamped to the run window — so a span is reconstructed as
+/// `[at_millis - waited_millis, at_millis]` rather than inferred from gaps. A
+/// still-parked approval has no resolution event yet and arrives as
+/// `waiting_since`, running to `now`.
+///
+/// The merge matters: two approvals parked at once mean the company waited
+/// *once* over the overlap, and double-counting could make waiting exceed the
+/// elapsed time it is compared against.
+fn waiting_span(timeline: &[TimelineEntry], waiting_since: Option<u64>, now: u64) -> (u64, bool) {
+    let mut spans: Vec<(u64, u64)> = timeline
+        .iter()
+        .filter(|e| e.kind == "approval")
+        // `None` means the host could not recover the park instant and `0` is a
+        // real instant sign-off. Neither is a span.
+        .filter_map(|e| {
+            e.waited_millis
+                .filter(|w| *w > 0)
+                .map(|w| (e.at_millis.saturating_sub(w), e.at_millis))
+        })
+        .collect();
+    let live = waiting_since.is_some();
+    if let Some(since) = waiting_since {
+        spans.push((since, now.max(since)));
+    }
+    spans.sort_unstable();
+
+    let mut total = 0u64;
+    let mut cursor: Option<(u64, u64)> = None;
+    for span in spans {
+        match cursor {
+            Some((start, end)) if span.0 <= end => cursor = Some((start, end.max(span.1))),
+            Some((start, end)) => {
+                total += end - start;
+                cursor = Some(span);
+            }
+            None => cursor = Some(span),
+        }
+    }
+    if let Some((start, end)) = cursor {
+        total += end - start;
+    }
+    (total, live)
 }
 
 /// One message in a task's discussion thread (issue #335).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DiscussionMessage {
+pub(crate) struct DiscussionMessage {
     /// The journal sequence the post came from — the console's stable key, and
     /// what makes the thread strictly ordered. Shares its numbering with
     /// [`TimelineEntry::seq`]: both project out of the same journal.
@@ -578,11 +725,11 @@ struct PostDiscussion {
 /// The assembled Task Detail response.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskDetail {
+pub(crate) struct TaskDetail {
     /// The card header — the same shape `GET /tasks` returns per card.
-    task: TaskCard,
+    pub(crate) task: TaskCard,
     /// The per-task event stream, oldest first.
-    timeline: Vec<TimelineEntry>,
+    pub(crate) timeline: Vec<TimelineEntry>,
     /// This task's own approvals, oldest first — still-parked ones included
     /// (issue #333).
     ///
@@ -591,7 +738,10 @@ struct TaskDetail {
     /// run window, and showed nothing at all for the one state that matters:
     /// an approval parked right now, blocking this card. This is the real
     /// query, joined on the task id the approval was parked with.
-    approvals: Vec<TaskApproval>,
+    pub(crate) approvals: Vec<TaskApproval>,
+    /// The worked/waiting split, so the screen and the exported record cannot
+    /// disagree about it.
+    pub(crate) durations: TaskDurations,
     /// What this task has already done that cannot be undone (issue #351),
     /// oldest first. Empty for a task that only read, thought, and replied.
     ///
@@ -599,7 +749,7 @@ struct TaskDetail {
     /// confirmation that names these, and shows no confirmation at all when the
     /// list is empty — so this array is the whole difference between one click
     /// and a stop-and-read.
-    irreversible_effects: Vec<IrreversibleEffect>,
+    pub(crate) irreversible_effects: Vec<IrreversibleEffect>,
     /// Whether the company's journal holds executed history it cannot describe
     /// (issue #351) — records written before descriptions existed.
     ///
@@ -609,7 +759,7 @@ struct TaskDetail {
     /// irreversible" only while this is `false`. When it is `true` the console
     /// confirms a retry regardless and says earlier activity cannot be
     /// described, rather than presenting a gap as an all-clear.
-    history_incomplete: bool,
+    pub(crate) history_incomplete: bool,
     /// The card's discussion thread, oldest first (issue #335).
     ///
     /// Served here rather than from a route of its own so the Discussion tab
@@ -620,15 +770,15 @@ struct TaskDetail {
     ///
     /// Capped at the newest [`DISCUSSION_PAGE`] posts; older ones are fetched
     /// on demand with `?discussionBefore=`.
-    discussion: Vec<DiscussionMessage>,
+    pub(crate) discussion: Vec<DiscussionMessage>,
     /// Whether the thread has posts older than the ones in `discussion`.
     ///
     /// The console's "load earlier" affordance, and the honest half of the cap:
     /// a truncated thread that did not say it was truncated would read as the
     /// whole conversation.
-    discussion_has_more: bool,
+    pub(crate) discussion_has_more: bool,
     /// Parent and children.
-    lineage: Lineage,
+    pub(crate) lineage: Lineage,
     /// The card's recorded attempts, newest first (issue #242).
     ///
     /// Additive: a card dispatched before run records existed legitimately
@@ -637,7 +787,7 @@ struct TaskDetail {
     /// [`TASK_DETAIL_RUN_LIMIT`](crate::server::ops::runs::TASK_DETAIL_RUN_LIMIT)
     /// — a card can be re-dispatched without limit, and this read stays one
     /// cheap call.
-    runs: Vec<RunSummary>,
+    pub(crate) runs: Vec<RunSummary>,
     /// Epoch-millis the company started waiting on an operator *right now*
     /// (issue #305), or `None` when nothing is currently parked for this run.
     ///
@@ -647,7 +797,7 @@ struct TaskDetail {
     /// screen most needs to see. Set only while the run window is open, and
     /// only from approvals parked at or after the window opened.
     #[serde(skip_serializing_if = "Option::is_none")]
-    waiting_since: Option<u64>,
+    pub(crate) waiting_since: Option<u64>,
 }
 
 /// `GET …/tasks/{task_id}` — the Task Detail screen's single read (issue #185).
@@ -697,6 +847,36 @@ async fn task_detail(
     Path(TaskPath { task_id }): Path<TaskPath>,
     Query(query): Query<TaskDetailQuery>,
 ) -> Result<Json<TaskDetail>, ApiError> {
+    Ok(Json(
+        assemble_detail_with_cursor(&company, &task_id, query.discussion_before).await?,
+    ))
+}
+
+/// Assembles the Task Detail read. [`task_detail`] serves it as JSON; the
+/// export document (issue #352) renders the *same value* to HTML.
+///
+/// That sharing is the export's redaction guarantee, and the reason this is a
+/// function rather than a body inlined into the handler. An exporter that read
+/// the journal itself would be a second, unreviewed path to the same events —
+/// one scrub away from disagreeing with the console about what an operator is
+/// allowed to see. Here there is nothing to keep in step: the document renders
+/// what the screen renders because it is handed the identical value.
+pub(crate) async fn assemble_detail(
+    company: &ScopedCompany,
+    task_id: &str,
+) -> Result<TaskDetail, ApiError> {
+    assemble_detail_with_cursor(company, task_id, None).await
+}
+
+/// Assembles task detail with an optional discussion cursor for the paged JSON
+/// read. Export always calls [`assemble_detail`] and therefore receives the
+/// newest discussion page while rendering the same core projection.
+async fn assemble_detail_with_cursor(
+    company: &ScopedCompany,
+    task_id: &str,
+    discussion_before: Option<u64>,
+) -> Result<TaskDetail, ApiError> {
+    let task_id = task_id.to_string();
     let rows = company.runtime.tasks().list(company.id()).await?;
     let card = rows
         .iter()
@@ -740,10 +920,10 @@ async fn task_detail(
         discussion_has_more,
         window_opened_at: open_window_at,
     } = fold_task_journal(
-        &company,
+        company,
         &task_id,
         DiscussionWindow {
-            before_seq: query.discussion_before,
+            before_seq: discussion_before,
             first: DISCUSSION_PAGE,
         },
         &task_runs,
@@ -809,6 +989,10 @@ async fn task_detail(
     }));
     approvals.sort_by(|a, b| a.at_millis.cmp(&b.at_millis).then_with(|| a.id.cmp(&b.id)));
 
+    // The split is computed here, once, so the console and the exported record
+    // read the same numbers rather than deriving them separately (#352 review).
+    let durations = TaskDurations::compute(&timeline, waiting_since, now_millis());
+
     // What a retry would re-do (issue #351). A pure journal read — one indexed
     // lookup, no event scan — so a task that did nothing irreversible costs
     // nothing extra however long the company has been running.
@@ -820,12 +1004,13 @@ async fn task_detail(
         .collect();
 
     // An indexed store read, not another journal pass (issue #242).
-    let runs = runs_for_task(&company, &task_id).await?;
+    let runs = runs_for_task(company, &task_id).await?;
 
-    Ok(Json(TaskDetail {
+    Ok(TaskDetail {
         task: card.into(),
         timeline,
         approvals,
+        durations,
         irreversible_effects,
         history_incomplete: company.runtime.has_undescribed_history(),
         discussion,
@@ -833,7 +1018,7 @@ async fn task_detail(
         lineage: Lineage { parent, children },
         runs,
         waiting_since,
-    }))
+    })
 }
 
 /// How many journal events one `read_from` page pulls.
@@ -1520,5 +1705,119 @@ async fn steer_task(
                 ))))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod durations_test {
+    use super::*;
+
+    /// 2026-08-05 09:00:00 UTC.
+    const T0: u64 = 1_785_920_400_000;
+
+    fn entry(at: u64, kind: &str, waited: Option<u64>) -> TimelineEntry {
+        TimelineEntry {
+            seq: at,
+            at_millis: at,
+            kind: kind.to_string(),
+            label: kind.to_string(),
+            detail: None,
+            waited_millis: waited,
+        }
+    }
+
+    /// A re-dispatched card accumulates every worked window, not just the first.
+    #[test]
+    fn worked_accumulates_every_dispatch_window() {
+        let d = TaskDurations::compute(
+            &[
+                entry(T0, "dispatched", None),
+                entry(T0 + 60_000, "completed", None),
+                entry(T0 + 600_000, "dispatched", None),
+                entry(T0 + 720_000, "completed", None),
+            ],
+            None,
+            T0,
+        );
+        assert_eq!(d.worked_millis, 180_000);
+        assert!(!d.worked_live);
+    }
+
+    /// A `completed` with no open window is legacy data: skipped, not counted
+    /// from zero, which would report the whole epoch as worked time.
+    #[test]
+    fn a_completion_without_a_dispatch_is_not_counted_from_zero() {
+        let d = TaskDurations::compute(&[entry(T0 + 60_000, "completed", None)], None, T0);
+        assert_eq!(d.worked_millis, 0);
+    }
+
+    /// Overlapping waits are merged, not summed twice — the company waited once.
+    #[test]
+    fn overlapping_waits_are_merged() {
+        let d = TaskDurations::compute(
+            &[
+                entry(T0 + 300_000, "approval", Some(300_000)), // [T0,     T0+5m]
+                entry(T0 + 420_000, "approval", Some(300_000)), // [T0+2m,  T0+7m]
+            ],
+            None,
+            T0,
+        );
+        assert_eq!(d.waiting_millis, 420_000, "the overlap was counted twice");
+        assert!(!d.waiting_live);
+    }
+
+    /// A sign-off resolved instantly (`0`) or with no recoverable park instant
+    /// (`None`) is not a span. Counting either would invent waiting time.
+    #[test]
+    fn an_instant_or_unknown_sign_off_is_not_a_wait() {
+        let d = TaskDurations::compute(
+            &[
+                entry(T0 + 60_000, "approval", Some(0)),
+                entry(T0 + 120_000, "approval", None),
+            ],
+            None,
+            T0,
+        );
+        assert_eq!(d.waiting_millis, 0);
+    }
+
+    /// The live halves run to `as_of`, and `*_at` extends them past it.
+    ///
+    /// This is the property the console's 1s tick and the exporter both rely on:
+    /// a reader adds elapsed time to the live half and nothing else, because
+    /// every closed span already ended before `as_of_millis`.
+    #[test]
+    fn live_spans_extend_exactly_and_sealed_ones_do_not() {
+        let live = TaskDurations::compute(
+            &[entry(T0, "dispatched", None)],
+            Some(T0 + 60_000),
+            T0 + 300_000,
+        );
+        assert!(live.worked_live && live.waiting_live);
+        assert_eq!(live.worked_millis, 300_000);
+        assert_eq!(live.waiting_millis, 240_000);
+        // One more minute of wall clock adds one minute to each live half.
+        assert_eq!(live.worked_at(T0 + 360_000), 360_000);
+        assert_eq!(live.waiting_at(T0 + 360_000), 300_000);
+
+        let sealed = TaskDurations::compute(
+            &[
+                entry(T0, "dispatched", None),
+                entry(T0 + 600_000, "completed", None),
+            ],
+            None,
+            T0 + 600_000,
+        );
+        assert!(!sealed.worked_live && !sealed.waiting_live);
+        // A finished task's totals do not move, however late it is read.
+        assert_eq!(sealed.worked_at(T0 + 99_000_000), 600_000);
+        assert_eq!(sealed.waiting_at(T0 + 99_000_000), 0);
+    }
+
+    /// A client clock behind the host's cannot subtract from a total.
+    #[test]
+    fn a_reader_clock_behind_the_host_does_not_go_backwards() {
+        let d = TaskDurations::compute(&[entry(T0, "dispatched", None)], None, T0 + 300_000);
+        assert_eq!(d.worked_at(T0), 300_000);
     }
 }

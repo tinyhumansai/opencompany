@@ -37,6 +37,7 @@ address check for `{id}`, operator + `sole()` for the alias).
 | Surface (`ops::*`) | Routes |
 |---|---|
 | `tasks` | `POST …/tasks`, `GET …/tasks`, `GET …/tasks/{id}` (the Task Detail read, #185), `PATCH`/`DELETE …/tasks/{id}`, `GET …/tasks/inflight`, `POST …/tasks/{id}/steer` (#111), `POST …/tasks/{id}/discussion` (#335) |
+| `task_export` | `GET …/tasks/{id}/export` (the task's record as a document, #352) |
 | `memory` | `POST …/memory`, `DELETE …/memory/{id}` (journals `MemoryFactDeleted`) |
 | `workspace` | `GET …/workspace`, `GET …/workspace/file/{id}`, `POST …/workspace`, `PUT …/workspace/file/{id}`, `PATCH`/`DELETE …/workspace/{id}` (the two `GET`s are REST twins of the GraphQL reads — the console has no GraphQL client, #177) |
 | `skills` | `POST …/skills`, `GET …/skills/registry`, `POST …/skills/{slug}/install\|uninstall`, `PUT …/skills/{slug}` |
@@ -47,6 +48,73 @@ address check for `{id}`, operator + `sole()` for the alias).
 | `smtp` | `PUT …/smtp`, `POST …/smtp/test` |
 | `connections` (feature `oauth`) | `POST …/connections/{provider}/start\|disconnect`, `GET /api/v1/oauth/callback` |
 | `workflows` | `POST …/workflows`, `GET …/workflows`, `GET …/workflows/runs`, `POST …/workflows/cron/preview`, `GET …/workflows/{wid}`, `PUT …/workflows/{wid}`, `DELETE …/workflows/{wid}`, `POST …/workflows/{wid}/run` |
+
+### Exporting a task's record (issue #352)
+
+`GET …/tasks/{taskId}/export` answers **one self-contained HTML file** carrying
+what the Task Detail screen shows: the header and the worked/waiting split, the
+whole ordered timeline with its details expanded, the text of every artifact
+revision and the human-edit diff, and the neighbouring cards. `Content-Type:
+text/html`, `Content-Disposition: attachment`, so `curl -OJ` lands a named file
+and the console's Export button downloads one.
+
+**Why HTML rather than Markdown or PDF.** The bar in epic #184 is "a
+non-technical person can read it unaided", which already rules out the JSON the
+screen fetches. HTML opens by double-click on any machine with no reader
+installed and nothing to explain; it keeps the **proportional waiting bands**
+(#305) that are the entire point of the worked/waiting work — a four-hour wait
+must not look like a four-second one, which is exactly what a text format
+flattens; and the reader's own browser prints it to the PDF a client asks for by
+name. It also costs **no new dependency**: the document is `format!` plus
+inlined CSS, no templating engine, no PDF crate, no headless browser. Markdown
+was rejected because it loses the proportions and, opened in a text editor by
+the non-technical reader this exists for, shows raw `##` and `|`. PDF was
+rejected because generating one means a new rendering stack for an artifact the
+browser already produces from this file.
+
+**Why the server renders it.** One implementation serves the console button and
+an automated caller alike, so an audit or scheduled export needs no second
+renderer. A client-side document would live only inside the React view — the
+same place the record is stuck today.
+
+**Redaction is structural, not procedural.** The handler renders
+`tasks::assemble_detail` and `artifacts::artifacts_for_task` — the *same values*
+`GET …/tasks/{id}` and the Artifacts tab return. It never reads the event log
+itself, so there is no second path whose scrubbing could drift from the
+console's; `detail` text is scrubbed at source before either caller sees it.
+Everything interpolated is HTML-escaped, so a card titled `<script>…</script>`
+renders as text in a file that will be opened in a browser and forwarded on.
+
+**Exporting is a pure read** — no journal entry, no column change, no state on
+the task. A test compares the board rows and the journal length across the call,
+because an audit export that modifies what it audits is worse than none.
+
+**One figure, computed once.** The worked/waiting split (#305) is computed
+host-side in `TaskDurations` and carried on `TaskDetail`, so the console and the
+exported record read the same numbers instead of deriving them separately. It
+used to be a hand-maintained mirror between `task_export.rs` and
+`frontend/src/views/TaskDetailView.tsx`: they agreed, but nothing failed if they
+stopped, and the failure mode is an exported record disagreeing with the screen
+about how long a person was waited on. `TaskDurations` carries the totals plus
+`workedLive` / `waitingLive` and `asOfMillis`; a caller wanting a ticking figure
+adds `now - asOfMillis` to the live half, which is exact because every closed
+span already ended before `asOfMillis`. The waiting *band height* stays mirrored
+— it is presentation, and a drifted pixel curve misleads nobody about a fact.
+
+**No sign-offs section, until #333 lands.** #352 deferred it explicitly: until an
+approval carries a task id, the only sign-offs attributable to a card are the
+resolutions that fell inside its run window, which is a correlation rather than a
+link. An imprecise attribution is least acceptable in the one artifact that goes
+to a client or an auditor, so the document omits the section rather than printing
+it with a caveat. When #333 (PR #349) merges, `TaskDetail` gains an `approvals[]`
+keyed by a real id and the section lands reading that — including the pending
+sign-offs that have no resolution event and so cannot appear at all today.
+
+**Bounded output.** The document is one `String` in one response, and it prints
+every revision of every artifact, so a long editing history scales it. Each
+revision body is capped (`MAX_BODY_CHARS`) and each human-edit diff is capped
+(`MAX_DIFF_LINES`); both cuts are announced in the document, because a reader
+must never be left believing they hold the whole text when they do not.
 
 ### The per-task discussion (issue #335)
 

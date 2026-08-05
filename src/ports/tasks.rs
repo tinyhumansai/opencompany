@@ -99,6 +99,33 @@ pub fn is_board_column(column: &str) -> bool {
     BOARD_COLUMNS.contains(&column)
 }
 
+/// The human label for a column id (`in_progress` → `In progress`).
+///
+/// The board's ids are wire words; anything a person reads needs the label. The
+/// console has carried these in `TASK_COLUMNS`
+/// (`frontend/src/lib/tasks-sample.ts`) since #205 — this is the host's half,
+/// added for the exported task record (issue #352), which is read by people who
+/// have never seen the board and must not be shown `in_review`.
+///
+/// Like [`BOARD_COLUMNS`], the two lists are a hand-maintained mirror: a Rust
+/// test cannot see the TS one, so a renamed label is a deliberate two-place
+/// edit. An unknown id falls back to itself rather than to a guess, so a column
+/// added on one side still prints something truthful.
+///
+/// `pub(crate)`: presentation is not part of the port's contract, and the only
+/// consumer is the exported record. Widen it if a second surface needs it.
+pub(crate) fn column_label(column: &str) -> &str {
+    match column {
+        COLUMN_TODO => "To-do",
+        COLUMN_PLANNING => "Planning",
+        COLUMN_IN_PROGRESS => "In progress",
+        COLUMN_PAUSED => "Paused",
+        COLUMN_IN_REVIEW => "In review",
+        COLUMN_DONE => "Done",
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The per-task discussion (issue #335)
 // ---------------------------------------------------------------------------
@@ -273,6 +300,29 @@ mod test {
         assert!(!is_board_column("To-do"));
         assert!(!is_board_column("inprogress"));
         assert!(!is_board_column(""));
+    }
+
+    /// Issue #352: every board column has a human label, and an unknown id
+    /// prints itself rather than a guess. The labels are the mirror of the
+    /// console's `TASK_COLUMNS`; asserting them against literals is what makes a
+    /// rename a deliberate two-place edit.
+    #[test]
+    fn every_column_has_a_human_label() {
+        assert_eq!(column_label(COLUMN_TODO), "To-do");
+        assert_eq!(column_label(COLUMN_PLANNING), "Planning");
+        assert_eq!(column_label(COLUMN_IN_PROGRESS), "In progress");
+        assert_eq!(column_label(COLUMN_PAUSED), "Paused");
+        assert_eq!(column_label(COLUMN_IN_REVIEW), "In review");
+        assert_eq!(column_label(COLUMN_DONE), "Done");
+        for column in BOARD_COLUMNS {
+            let label = column_label(column);
+            assert!(!label.is_empty());
+            assert!(
+                !label.contains('_'),
+                "{column} still reads as a wire word: {label}"
+            );
+        }
+        assert_eq!(column_label("something_new"), "something_new");
     }
 
     /// Issue #335: a long paste is truncated on a character boundary, never on
