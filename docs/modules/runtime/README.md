@@ -48,6 +48,27 @@ count dropping to zero — so a schedule saved later onto a still-unwired compan
 is reported rather than swallowed by the latch. A company with no scheduled
 workflows and no runner is not misconfigured and stays silent.
 
+`workflow_spawn.rs` owns the two things every entry point that *starts* a
+workflow run owes it: minting the run id through the `RunSupervisor` (so the id
+the console correlates SSE frames on is also the address a cancel is sent to),
+and journalling the outcome through `record_run_finished` on **both** arms with
+the `RunGuard` held across the write. The console run route and the
+approved-gate resume arm both go through `WorkflowSpawn`, so they cannot drift.
+It holds four cloned handles rather than an `Arc<CompanyRuntime>`, which is what
+lets a caller with only a `&CompanyRuntime` start a run. The cron scheduler
+above keeps its own spawn body — it wraps the same two steps in a schedule claim
+and a per-delivery log sweep that only make sense for a fire nobody is watching.
+
+`workflow_resume.rs` is what approving a paused `requires_approval` node
+actually does (issue #395). The engine **settles** a paused run rather than
+suspending it, so there is nothing to resume: the module reads the workflow id,
+node id and trigger input off the parked `workflow.approve` effect, unions the
+gate id into the input's `approvals` array, and starts a fresh supervised run.
+That makes it restart-durable for free — the parked card is self-contained, so
+journal replay is all a continuation needs — at the documented cost that
+upstream nodes re-execute. See
+[`docs/spec/company-brain/approvals.md`](../../spec/company-brain/approvals.md).
+
 ## Background listeners
 
 Two per-company background loops sit beside the scheduler, both spawned in

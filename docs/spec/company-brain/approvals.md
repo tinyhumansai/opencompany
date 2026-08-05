@@ -217,6 +217,48 @@ Note this is the *tool* gate (`ApprovalPolicy`), which is a different path from
 the *effect* gate (`ManifestApprovalGate::evaluate`) the taxonomy above
 describes. A harness tool call parks directly and never reaches `evaluate`.
 
+## Approvals inside a workflow run (issue #395)
+
+A workflow run is not a cycle, and for a long time that meant nothing a run
+parked ever reached this queue. Two distinct holes, both now closed.
+
+**A gated tool call inside an `agent` node.** The node's turn runs on the same
+pool and the same `ApprovalPolicy` as chat, so a blocked call *was* recorded on
+the shared request queue — but the only drain lived inside `run_cycle` behind a
+`CycleHost`, which the workflow path never reaches. The request sat there until
+the next chat cycle cleared the queue, and the operator was never asked. The
+node now takes a queue boundary before its turn, claims only the tail its own
+turn added, and parks each entry. Approving one is the ordinary single-use grant
+above: the workflow has already finished with the refusal narrated, so the
+approved call **runs standalone** and does not feed downstream nodes.
+
+**A node marked `requires_approval`.** The engine reports these as node ids on
+the run outcome, which reached the HTTP response and the `WorkflowRunFinished`
+line — neither of which is an approval. Each pending gate now parks a
+`workflow.approve` effect carrying the workflow id, the node id and the trigger
+input, deduped on that triple so a re-run does not stack a second card for one
+decision. It is a **native** effect (no `agent`), so approving performs it
+rather than minting a grant.
+
+### Approving a paused gate re-runs the workflow
+
+The engine **settles** a paused run — nothing holds a task, a connection or a
+continuation. So there is nothing to resume, and "continue" necessarily means
+starting a fresh supervised run with the approved gate id unioned into the
+trigger input's `approvals` array. The parked effect carries everything that
+needs, which is what makes it survive a restart: journal replay rehydrates the
+card and approving it still continues the work.
+
+The cost is stated rather than hidden: **upstream nodes re-execute**. Agent
+nodes re-spend tokens, and a reached `output` node **re-delivers** — a
+warm-recipient email sends again, because the established-thread check is
+state-based, not run-based. A gate normally sits *before* the side-effecting
+node it guards, which is the entire reason to author one, so this is acceptable
+for now; it is a real constraint on where a gate belongs in a graph.
+
+A gate nobody decides ages out on the ordinary TTL to a default deny. Since the
+paused run settled long ago, that costs nothing and cancels nothing.
+
 ## Where the request is raised (issue #379)
 
 An approval is not only a queue entry; it is an interruption of a conversation.
