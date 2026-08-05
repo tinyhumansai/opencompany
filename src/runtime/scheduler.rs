@@ -330,6 +330,7 @@ mod test {
             for event in &req.events {
                 if let CompanyEvent::ScheduleFired { prompt, .. } = event {
                     responses.push(OutboundMessage {
+                        message_id: None,
                         task_id: None,
                         channel: "operator".into(),
                         text: format!("scheduled: {prompt}"),

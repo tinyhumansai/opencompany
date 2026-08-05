@@ -67,6 +67,7 @@ mod test {
         assert_eq!(adapter.channel_id(), "email");
         adapter
             .send(OutboundMessage {
+                message_id: None,
                 task_id: None,
                 channel: "email".into(),
                 text: "hello".into(),
@@ -96,6 +97,7 @@ mod test {
         let adapter = OpenHumanChannelAdapter::new("email", rpc);
         let err = adapter
             .send(OutboundMessage {
+                message_id: None,
                 task_id: None,
                 channel: "email".into(),
                 text: "hi".into(),

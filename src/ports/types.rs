@@ -238,6 +238,21 @@ pub enum CompanyEvent {
         /// migrating.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat: Option<String>,
+        /// The message this one replies to, as that message's own sequence
+        /// position (issue #364) — what makes a thread reply survive a reload.
+        ///
+        /// A **parent id, not a thread object**: the console already folds a
+        /// transcript by parent, so a thread is exactly "the messages pointing
+        /// at this one". Recording it that way costs one optional field and
+        /// needs no lifecycle, no membership, and no second addressing scheme
+        /// beside `chat`, which stays the channel the whole thread lives in.
+        ///
+        /// `None` on a message posted straight into a channel — which is every
+        /// message journaled before this field existed, and correctly so: they
+        /// were never thread replies. Additive on exactly the `by` / `chat`
+        /// terms above, so no stored record migrates.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<EventSeq>,
     },
     /// An inbound webhook fired.
     WebhookReceived {
@@ -363,6 +378,54 @@ pub enum CompanyEvent {
         /// record needs migrating.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
+        /// The message this reply belongs under, as that message's own sequence
+        /// position (issue #364).
+        ///
+        /// Set to the **operator message's** parent, not to the operator
+        /// message itself: a reply typed inside a thread and the answer it
+        /// draws are two halves of one exchange, and both belong under the row
+        /// the thread hangs off. Pointing the answer at the question would nest
+        /// a thread inside a thread, which the transcript has no way to render.
+        ///
+        /// `None` for a reply in the channel itself and for every reply
+        /// journaled before this field existed. Additive on the same terms as
+        /// `task_id` above.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<EventSeq>,
+    },
+    /// A reaction was set or cleared on one chat message (issue #364).
+    ///
+    /// **Per-user rows, event-sourced.** A reaction is a fact about a person —
+    /// "who reacted" is most of what a reaction is for — so the durable record
+    /// is one line per person per emoji rather than a count, and the count is
+    /// derived on read. A count could not answer "did I already react?" for
+    /// anyone but the last writer, and a mutable tally on an append-only log
+    /// would have to be rewritten in place, which this log cannot do.
+    ///
+    /// `on` is explicit rather than implied-toggle so the write is
+    /// **idempotent**: a retried request, a double tap, or two consoles racing
+    /// converge on the state the caller asked for instead of flipping twice.
+    /// Folding keeps the last event per `(message, actor, emoji)`.
+    ReactionToggled {
+        /// The message reacted to, by its sequence position — the same id
+        /// `chat/history` returns for that message.
+        ///
+        /// Deliberately not validated as still-existing on read: the log is
+        /// append-only, so a message named here was real when the reaction was
+        /// made. A reaction whose message is not in the desk being read simply
+        /// folds into nothing.
+        message_seq: EventSeq,
+        /// The emoji, as the console sent it. Length-bounded and rejected for
+        /// control characters at the route, so a journal line can never carry a
+        /// blob or a newline dressed as a reaction.
+        emoji: String,
+        /// Whether the reaction is now set (`true`) or cleared (`false`).
+        on: bool,
+        /// Who reacted. `None` for a machine/platform credential, which has no
+        /// person behind it — read back as "operator", exactly as
+        /// `OperatorMessage`'s `by` is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
     },
     /// The Operator deleted a durable memory fact. Journaled for the audit trail
     /// per the Operator-rights section of `docs/spec/company-brain/memory.md`.
@@ -1329,6 +1392,25 @@ pub struct OutboundMessage {
     /// would be a trap for whoever wires the next reader.
     #[serde(default, rename = "taskId", skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// The durable id this bubble was journaled under (issue #364) — the
+    /// sequence position of its `AgentReply`, which is the same id
+    /// `chat/history` returns for it on a later reload.
+    ///
+    /// The enabler for everything durable that references a message. Until this
+    /// existed a freshly-sent bubble had only a browser-minted counter id, so a
+    /// thread reply or a reaction made against it named something no other
+    /// reader — a reload, a second operator — could resolve.
+    ///
+    /// **Stamped by the chat route after journaling, not produced by a brain.**
+    /// A brain emits an answer; it does not know where the answer will land in
+    /// the log, and every non-chat delivery path (a channel send, a workflow
+    /// step) journals nothing at all and correctly leaves this `None`.
+    ///
+    /// Additive and omitted when absent, so an old console ignores it and a new
+    /// console reads its absence as "this host predates durable message ids"
+    /// and says so rather than offering an action that cannot persist.
+    #[serde(default, rename = "messageId", skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// One visible step in an agent turn's processing timeline, surfaced in the
@@ -2365,6 +2447,7 @@ mod test {
     #[test]
     fn outbound_message_steps_are_additive_and_omitted_when_empty() {
         let no_steps = OutboundMessage {
+            message_id: None,
             task_id: None,
             channel: "operator".to_string(),
             text: "hi".to_string(),
@@ -2379,6 +2462,7 @@ mod test {
         assert!(legacy.steps.is_empty());
 
         let with_steps = OutboundMessage {
+            message_id: None,
             task_id: None,
             channel: "operator".to_string(),
             text: "done".to_string(),
@@ -2403,6 +2487,7 @@ mod test {
     #[test]
     fn outbound_message_task_id_is_additive_and_omitted_when_absent() {
         let no_card = OutboundMessage {
+            message_id: None,
             task_id: None,
             channel: "operator".to_string(),
             text: "hi".to_string(),
@@ -2420,6 +2505,7 @@ mod test {
         assert!(legacy.task_id.is_none());
 
         let with_card = OutboundMessage {
+            message_id: None,
             task_id: Some("t-42".to_string()),
             channel: "operator".to_string(),
             text: "opened one".to_string(),
@@ -2451,6 +2537,7 @@ mod test {
 
         // A tool-less reply serializes without the `steps` key.
         let tool_less = CompanyEvent::AgentReply {
+            parent: None,
             task_id: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
@@ -2462,6 +2549,7 @@ mod test {
 
         // A reply with a timeline round-trips it.
         let with_steps = CompanyEvent::AgentReply {
+            parent: None,
             task_id: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
@@ -2500,6 +2588,7 @@ mod test {
 
         // An untagged reply keeps the legacy wire shape exactly.
         let untagged = CompanyEvent::AgentReply {
+            parent: None,
             chat_id: "main".to_string(),
             agent_id: "ceo".to_string(),
             text: "hi".to_string(),
@@ -2513,6 +2602,7 @@ mod test {
 
         // A dispatch-produced reply carries the key and round-trips.
         let tagged = CompanyEvent::AgentReply {
+            parent: None,
             chat_id: "t-1".to_string(),
             agent_id: "ceo".to_string(),
             text: "done".to_string(),
@@ -2595,6 +2685,101 @@ mod test {
         );
     }
 
+    /// Issue #364: a thread parent round-trips, and a message journaled before
+    /// threads existed still replays — as unparented, which is the truth about
+    /// it and not a default standing in for one.
+    ///
+    /// The legacy blobs are asserted verbatim because they are exactly what is
+    /// already on disk in every company's log. A message that never was a thread
+    /// reply must serialize byte-for-byte as it always did, so export/import and
+    /// the cross-backend round-trip need no migration.
+    #[test]
+    fn a_thread_parent_round_trips_and_a_pre_thread_line_still_loads() {
+        for legacy in [
+            r#"{"kind":"OperatorMessage","text":"hi"}"#,
+            r#"{"kind":"AgentReply","chat_id":"main","agent_id":"ceo","text":"hi"}"#,
+        ] {
+            let event: CompanyEvent = serde_json::from_str(legacy).unwrap();
+            match &event {
+                CompanyEvent::OperatorMessage { parent, .. }
+                | CompanyEvent::AgentReply { parent, .. } => assert!(
+                    parent.is_none(),
+                    "a pre-#364 line was never a thread reply: {legacy}"
+                ),
+                other => panic!("unexpected variant: {other:?}"),
+            }
+            assert_eq!(
+                serde_json::to_string(&event).unwrap(),
+                legacy,
+                "an unparented message must serialize exactly as it did before"
+            );
+        }
+
+        let threaded = CompanyEvent::OperatorMessage {
+            parent: Some(EventSeq::new(41)),
+            text: "a follow-up".into(),
+            by: None,
+            chat: Some("studio".into()),
+        };
+        let json = serde_json::to_string(&threaded).unwrap();
+        assert!(json.contains(r#""parent":41"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<CompanyEvent>(&json).unwrap(),
+            threaded
+        );
+
+        let answered = CompanyEvent::AgentReply {
+            parent: Some(EventSeq::new(41)),
+            task_id: None,
+            chat_id: "studio".into(),
+            agent_id: "ceo".into(),
+            text: "on it".into(),
+            steps: Vec::new(),
+        };
+        let json = serde_json::to_string(&answered).unwrap();
+        assert!(json.contains(r#""parent":41"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<CompanyEvent>(&json).unwrap(),
+            answered
+        );
+    }
+
+    /// Issue #364: a reaction round-trips, and an unattributed one adds no
+    /// `by` key — the same additive contract every optional actor here keeps.
+    #[test]
+    fn a_reaction_round_trips() {
+        let anonymous = CompanyEvent::ReactionToggled {
+            message_seq: EventSeq::new(4),
+            emoji: "👍".into(),
+            on: true,
+            by: None,
+        };
+        let json = serde_json::to_string(&anonymous).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"ReactionToggled","message_seq":4,"emoji":"👍","on":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CompanyEvent>(&json).unwrap(),
+            anonymous
+        );
+
+        let attributed = CompanyEvent::ReactionToggled {
+            message_seq: EventSeq::new(4),
+            emoji: "🎉".into(),
+            on: false,
+            by: Some(Actor {
+                kind: ActorKind::User,
+                id: "u1".into(),
+            }),
+        };
+        let json = serde_json::to_string(&attributed).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CompanyEvent>(&json).unwrap(),
+            attributed
+        );
+    }
+
     #[test]
     fn an_operator_message_journaled_before_attribution_still_loads() {
         // Exactly what is already on disk in every existing company's event
@@ -2604,6 +2789,7 @@ mod test {
         assert_eq!(
             event,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,
@@ -2617,6 +2803,7 @@ mod test {
         // export/import and the fs/sqlite/mongo round-trip stay green without
         // touching a single stored record.
         let event = CompanyEvent::OperatorMessage {
+            parent: None,
             text: "hi".into(),
             by: None,
             chat: None,
@@ -2630,6 +2817,7 @@ mod test {
     #[test]
     fn an_attributed_message_round_trips_with_its_actor() {
         let event = CompanyEvent::OperatorMessage {
+            parent: None,
             text: "hi".into(),
             by: Some(Actor {
                 kind: ActorKind::User,
@@ -2658,6 +2846,7 @@ mod test {
     fn company_event_variants_round_trip_tagged() {
         let events = vec![
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,

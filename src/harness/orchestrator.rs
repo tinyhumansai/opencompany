@@ -581,6 +581,21 @@ fn summarize_event(event: &CompanyEvent) -> String {
         CompanyEvent::PaymentReceived { amount_usd, .. } => format!("payment ${amount_usd:.2}"),
         CompanyEvent::LifecycleChanged { from, to, .. } => format!("lifecycle {from} → {to}"),
         CompanyEvent::MemoryFactDeleted { .. } => "memory fact deleted".to_string(),
+        // Issue #364. The emoji is carried — a reaction with the emoji taken out
+        // says nothing at all — and it is the one part of a reaction that cannot
+        // be free text: the route bounds it and refuses control characters. The
+        // message it is about is named by sequence position, which is an
+        // ordinal, and `by` is dropped for the same reason every arm here drops
+        // it: a user id is neither one-line-worthy nor insight.
+        CompanyEvent::ReactionToggled {
+            message_seq,
+            emoji,
+            on,
+            ..
+        } => {
+            let verb = if *on { "reacted" } else { "un-reacted" };
+            format!("{verb} {emoji} on message {message_seq}")
+        }
         // Issue #403. The change word and the toolkit slug are both fixed
         // vocabulary, so neither can carry anything a company typed. `by` is
         // dropped: this is a non-sensitive one-liner for the insight surface,

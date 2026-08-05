@@ -186,6 +186,11 @@ impl<'a> CycleRunner<'a> {
         }
 
         let cycle_id = crate::ports::generate_id();
+        // Issue #364: the report carries the input seqs too, so the chat route
+        // can tell the console the durable id of the message it just sent. The
+        // brain needs the same list, and it is the append loop above — the one
+        // place that knows it — that produced it.
+        let input_seqs = event_seqs.clone();
         let request = CycleRequest {
             cycle_id: cycle_id.clone(),
             company_id: company.clone(),
@@ -277,6 +282,7 @@ impl<'a> CycleRunner<'a> {
             executed_effects,
             parked,
             persisted_seq,
+            input_seqs,
         })
     }
 
@@ -811,10 +817,12 @@ working on):\n{}\n]",
                 text: "This approval was already resolved.".to_string(),
                 steps: Vec::new(),
                 reply_to: None,
+                message_id: None,
             }],
             executed_effects: Vec::new(),
             parked: Vec::new(),
             persisted_seq: None,
+            input_seqs: Vec::new(),
         }
     }
 
@@ -1032,6 +1040,7 @@ async fn perform_effect(rt: &CompanyRuntime, effect: &Effect) -> Result<()> {
             if adapter.channel_id() == channel {
                 adapter
                     .send(OutboundMessage {
+                        message_id: None,
                         task_id: None,
                         channel: channel.to_string(),
                         text: text.to_string(),
@@ -1204,6 +1213,10 @@ fn cycle_task_id(
             | CompanyEvent::AgentReply { .. }
             | CompanyEvent::ApprovalParked { .. }
             | CompanyEvent::MemoryFactDeleted { .. }
+            // A reaction (issue #364) is a reader's response to a message that
+            // already exists. It starts no work and rivals no conversation, so
+            // it passes through exactly like every other record here.
+            | CompanyEvent::ReactionToggled { .. }
             // A credential or connection change (issue #403) is a record of an
             // admin's decision, not a stimulus: it names no card and competes
             // with none.
@@ -1308,6 +1321,10 @@ fn cycle_thread_id(
             | CompanyEvent::AgentReply { .. }
             | CompanyEvent::ApprovalParked { .. }
             | CompanyEvent::MemoryFactDeleted { .. }
+            // A reaction (issue #364) is a reader's response to a message that
+            // already exists. It starts no work and rivals no conversation, so
+            // it passes through exactly like every other record here.
+            | CompanyEvent::ReactionToggled { .. }
             // A credential or connection change (issue #403) is a record of an
             // admin's decision, not a stimulus: it names no card and competes
             // with none.
@@ -1820,6 +1837,7 @@ mod test {
                 if let CompanyEvent::OperatorMessage { text, .. } = event {
                     host.emit_effect(self.effect.clone()).await?;
                     responses.push(OutboundMessage {
+                        message_id: None,
                         task_id: None,
                         channel: "operator".into(),
                         text: format!("handled: {text}"),
@@ -1852,6 +1870,7 @@ mod test {
                 if let CompanyEvent::OperatorMessage { text, .. } = event {
                     host.park_effect(self.effect.clone()).await?;
                     responses.push(OutboundMessage {
+                        message_id: None,
                         task_id: None,
                         channel: "operator".into(),
                         text: format!("that needs your approval: {text}"),
@@ -1880,6 +1899,7 @@ mod test {
             Ok(CycleResult {
                 channel_responses: vec![
                     OutboundMessage {
+                        message_id: None,
                         task_id: None,
                         channel: "operator".into(),
                         text: "orchestrator".into(),
@@ -1887,6 +1907,7 @@ mod test {
                         reply_to: None,
                     },
                     OutboundMessage {
+                        message_id: None,
                         task_id: None,
                         // Addressed by *agent id*: no adapter answers to this.
                         channel: "maya".into(),
@@ -1923,6 +1944,7 @@ mod test {
             .unwrap();
 
         rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            parent: None,
             text: "hand it off".into(),
             by: None,
             chat: None,
@@ -1988,6 +2010,7 @@ mod test {
             }
             Ok(CycleResult {
                 channel_responses: vec![OutboundMessage {
+                    message_id: None,
                     task_id: None,
                     channel: "operator".into(),
                     text: "settled".into(),
@@ -2330,6 +2353,7 @@ mod test {
 
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,
@@ -2352,6 +2376,7 @@ mod test {
         assert_eq!(
             stored[0].event,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None
@@ -2428,6 +2453,7 @@ mod test {
 
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "file it".into(),
                 by: None,
                 chat: None,
@@ -2487,6 +2513,7 @@ mod test {
         );
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "do it".into(),
                 by: None,
                 chat: None,
@@ -2550,6 +2577,7 @@ mod test {
         );
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "do it".into(),
                 by: None,
                 chat: None,
@@ -2809,6 +2837,7 @@ mod test {
         );
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "do it".into(),
                 by: None,
                 chat: None,
@@ -2974,6 +3003,7 @@ mod test {
 
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "file it".into(),
                 by: None,
                 chat: None,
@@ -3052,6 +3082,7 @@ mod test {
 
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "send that email".into(),
                 by: None,
                 chat: None,
@@ -3107,6 +3138,7 @@ mod test {
                 .unwrap();
             let report = rt
                 .run_cycle(vec![CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: "file it".into(),
                     by: None,
                     chat: None,
@@ -3166,6 +3198,7 @@ mod test {
 
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "file it".into(),
                 by: None,
                 chat: None,
@@ -3233,6 +3266,7 @@ mod test {
 
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "file it".into(),
                 by: None,
                 chat: None,
@@ -3276,6 +3310,7 @@ mod test {
         async fn run_cycle(&self, req: CycleRequest, _host: &dyn CycleHost) -> Result<CycleResult> {
             Ok(CycleResult {
                 channel_responses: vec![OutboundMessage {
+                    message_id: None,
                     task_id: None,
                     channel: "operator".into(),
                     text: "thought about it".into(),
@@ -3319,6 +3354,7 @@ mod test {
             .unwrap();
 
         rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            parent: None,
             text: "how are we doing".into(),
             by: None,
             chat: None,
@@ -3539,11 +3575,13 @@ mod test {
 
         let (ra, rb) = tokio::join!(
             one.run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "a".into(),
                 by: None,
                 chat: None
             }]),
             two.run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "b".into(),
                 by: None,
                 chat: None
@@ -3593,6 +3631,7 @@ mod test {
             .unwrap();
 
         rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            parent: None,
             text: "send it".into(),
             by: None,
             chat: None,
@@ -4174,6 +4213,7 @@ mod test {
         };
 
         let chat = || CompanyEvent::OperatorMessage {
+            parent: None,
             text: "hi".into(),
             by: None,
             chat: None,
@@ -4312,11 +4352,13 @@ mod test {
             _ => None,
         };
         let addressed = |chat: &str| CompanyEvent::OperatorMessage {
+            parent: None,
             text: "pay the invoice".into(),
             by: None,
             chat: Some(chat.to_string()),
         };
         let unaddressed = || CompanyEvent::OperatorMessage {
+            parent: None,
             text: "hi".into(),
             by: None,
             chat: None,
@@ -4444,6 +4486,7 @@ mod test {
                 output: String::new(),
             },
             CompanyEvent::AgentReply {
+                parent: None,
                 chat_id: "desk-ops".into(),
                 agent_id: "ops".into(),
                 text: "done".into(),
@@ -4758,6 +4801,7 @@ mod test {
 
         // Asking the desk directly (by name) surfaces the handed task...
         rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            parent: None,
             text: "what are you working on?".into(),
             by: None,
             chat: Some("Engineering".into()),
@@ -4768,6 +4812,7 @@ mod test {
         // ...and asking with no address (the orchestrator) does NOT get the
         // desk's briefing folded into it.
         rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            parent: None,
             text: "status?".into(),
             by: None,
             chat: None,
@@ -4818,6 +4863,7 @@ mod test {
             .await
             .unwrap();
         rt.run_cycle(vec![CompanyEvent::OperatorMessage {
+            parent: None,
             text: "what's up?".into(),
             by: None,
             chat: Some("eng".into()),
@@ -4885,6 +4931,7 @@ mod test {
         );
         let report = rt
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "do it".into(),
                 by: None,
                 chat: None,
@@ -5016,6 +5063,7 @@ mod test {
         for _ in 0..5 {
             let report = rt
                 .run_cycle(vec![CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: "do it".into(),
                     by: None,
                     chat: None,

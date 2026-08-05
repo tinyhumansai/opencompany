@@ -118,6 +118,26 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Deleted memory fact {fact_id}"),
             "memory.fact_deleted",
         ),
+        // Issue #364. Written for completeness, not for a live path: this
+        // function normalizes a cycle's *input* events, and a reaction is
+        // appended straight to the log by its route — it drives no cycle, so a
+        // brain never sees one here. Spelled out rather than swept into a
+        // wildcard so the next variant that IS a stimulus cannot inherit a
+        // silent default. `by` is dropped, as every other arm drops it.
+        CompanyEvent::ReactionToggled {
+            message_seq,
+            emoji,
+            on,
+            ..
+        } => (
+            Role::System,
+            "operator".to_string(),
+            format!(
+                "{} {emoji} on message {message_seq}",
+                if *on { "Reacted" } else { "Un-reacted" }
+            ),
+            "reaction.toggled",
+        ),
         // Issue #403. Worth telling the brain, because it changes what the
         // brain can *do*: a cleared credential is why a tool it had yesterday
         // stops answering today, and without this that reads as an unexplained
@@ -370,6 +390,7 @@ pub(crate) fn channel_message_from_effect(effect: &Effect) -> Option<OutboundMes
         .or_else(|| payload_str(payload, "message"))?
         .to_string();
     Some(OutboundMessage {
+        message_id: None,
         task_id: None,
         channel,
         text,

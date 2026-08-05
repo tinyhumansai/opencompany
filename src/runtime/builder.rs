@@ -3228,6 +3228,7 @@ mod test {
         // lead `eng2`, not the blueprint lead `eng1`.
         runtime
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "who leads?".to_string(),
                 by: None,
                 chat: Some("eng".to_string()),

@@ -845,6 +845,7 @@ async fn post_to_channel(
     };
     adapter
         .send(OutboundMessage {
+            message_id: None,
             task_id: None,
             channel: channel_id.to_string(),
             text: format!("{subject}\n\n{text}"),

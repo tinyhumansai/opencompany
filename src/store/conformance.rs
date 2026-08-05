@@ -167,6 +167,7 @@ pub async fn assert_isolation_by_company(
         .append(
             &alpha,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "a".into(),
                 by: None,
                 chat: None,
@@ -293,6 +294,7 @@ pub async fn assert_append_only_event_and_ledger(
         .append(
             &id,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "e0".into(),
                 by: None,
                 chat: None,
@@ -304,6 +306,7 @@ pub async fn assert_append_only_event_and_ledger(
         .append(
             &id,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "e1".into(),
                 by: None,
                 chat: None,
@@ -321,6 +324,7 @@ pub async fn assert_append_only_event_and_ledger(
         .append(
             &id,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "e2".into(),
                 by: None,
                 chat: None,
@@ -354,6 +358,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
             .append(
                 &alpha,
                 CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: format!("a{expected}"),
                     by: None,
                     chat: None,
@@ -369,6 +374,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
         .append(
             &beta,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "b0".into(),
                 by: None,
                 chat: None,
@@ -421,6 +427,7 @@ pub async fn assert_export_totality(
     let mut appended = Vec::new();
     for i in 0..4 {
         let ev = CompanyEvent::OperatorMessage {
+            parent: None,
             text: format!("event {i}"),
             by: None,
             chat: None,

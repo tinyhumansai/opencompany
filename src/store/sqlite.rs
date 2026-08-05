@@ -2340,6 +2340,7 @@ mod test {
             .append(
                 &id,
                 CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: "hi".into(),
                     by: None,
                     chat: None,
@@ -2391,6 +2392,7 @@ mod test {
         s.append(
             &id,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,
@@ -2402,6 +2404,7 @@ mod test {
         assert_eq!(
             received.event,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None
@@ -2487,6 +2490,7 @@ mod test {
             s.append(
                 &id,
                 CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: "persist".into(),
                     by: None,
                     chat: None,
@@ -2502,6 +2506,7 @@ mod test {
         assert_eq!(
             events[0].event,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "persist".into(),
                 by: None,
                 chat: None,

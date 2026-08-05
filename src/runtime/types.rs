@@ -58,6 +58,25 @@ pub struct CycleReport {
     pub parked: Vec<ApprovalId>,
     /// The sequence of the last event appended this cycle, if any.
     pub persisted_seq: Option<EventSeq>,
+    /// The sequence each of this cycle's **input** events was journaled under,
+    /// in the order they were handed in (issue #364).
+    ///
+    /// `persisted_seq` next door is the *last* append and cannot answer this:
+    /// by the time a cycle returns it names whatever the cycle wrote last, not
+    /// the operator message that started it. Without a per-input seq the chat
+    /// route has no durable id for the message the operator just sent, so a
+    /// thread reply or a reaction made against it names a browser-minted
+    /// counter that nothing else can resolve.
+    ///
+    /// Read off the append loop, which already computes it — the alternative
+    /// (journaling the message in the route before calling the runtime) would
+    /// either double-journal it or move the append out of the one place that
+    /// orders it against the rest of the cycle.
+    ///
+    /// Empty on a synthetic report (an already-resolved approval) and on a
+    /// report deserialized from before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_seqs: Vec<EventSeq>,
 }
 
 /// A compact status snapshot for a running company.

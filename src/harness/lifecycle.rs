@@ -345,6 +345,7 @@ pub fn relay_reply(
     origin_chat_id: String,
 ) -> OutboundMessage {
     OutboundMessage {
+        message_id: None,
         task_id: None,
         channel: orchestrator.to_string(),
         text: relay_text(card, responder, orchestrator),

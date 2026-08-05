@@ -980,6 +980,7 @@ impl CompanyRuntime {
                 if channel.channel_id() == crate::runtime::channel::OPERATOR_CHANNEL {
                     if let Err(e) = channel
                         .send(crate::ports::types::OutboundMessage {
+                            message_id: None,
                             task_id: None,
                             channel: crate::runtime::channel::OPERATOR_CHANNEL.to_string(),
                             text: text.clone(),
@@ -1066,6 +1067,11 @@ impl CompanyRuntime {
             if channel.channel_id() == crate::runtime::channel::OPERATOR_CHANNEL {
                 if let Err(e) = channel
                     .send(crate::ports::types::OutboundMessage {
+                        // A channel send, not a journaled chat reply: there is
+                        // no `AgentReply` behind this line and so no sequence
+                        // position to name (issue #364). Same as the grant-expiry
+                        // notice above, which this generalizes.
+                        message_id: None,
                         task_id: None,
                         channel: crate::runtime::channel::OPERATOR_CHANNEL.to_string(),
                         text: text.to_string(),

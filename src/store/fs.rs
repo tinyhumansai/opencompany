@@ -1038,6 +1038,7 @@ mod test {
             .append(
                 &id,
                 CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: "a".into(),
                     by: None,
                     chat: None,
@@ -1049,6 +1050,7 @@ mod test {
             .append(
                 &id,
                 CompanyEvent::OperatorMessage {
+                    parent: None,
                     text: "b".into(),
                     by: None,
                     chat: None,
@@ -1077,6 +1079,7 @@ mod test {
         log.append(
             &id,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,
@@ -1088,6 +1091,7 @@ mod test {
         assert_eq!(
             received.event,
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None

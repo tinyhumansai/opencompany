@@ -649,6 +649,7 @@ mod test {
         let id = runtime.id().clone();
         runtime
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "kick off".into(),
                 by: None,
                 chat: None,
@@ -1313,6 +1314,7 @@ mod test {
         let id = runtime.id().clone();
         runtime
             .run_cycle(vec![CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,
