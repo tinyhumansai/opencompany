@@ -549,6 +549,20 @@ pub enum CompanyEvent {
         /// pause. Lets a reader tell a successful run from a stopped one
         /// without re-deriving it from `output`.
         column: String,
+        /// The artifacts this run published (issue #244), by id — empty when it
+        /// published nothing, which is the common and entirely legitimate case.
+        ///
+        /// The terminal anchor is where a reader asks *"what did this task
+        /// produce?"*, and before #244 the only answer available was `output`,
+        /// which is the chat reply and not a deliverable. Carrying the ids here
+        /// means a card in a terminal column can link to what it actually made
+        /// without a second query against the artifact store.
+        ///
+        /// Additive: `#[serde(default)]` so every journal line written before
+        /// this field existed still replays, and skipped when empty so the
+        /// no-deliverable case adds nothing to the log.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifact_ids: Vec<String>,
     },
     /// A human posted to a task's discussion thread (issue #335).
     ///
@@ -2321,6 +2335,7 @@ mod test {
             desk: "ceo".to_string(),
             output: "shipped".to_string(),
             column: "in_review".to_string(),
+            artifact_ids: Vec::new(),
         };
         let json = serde_json::to_string(&done).unwrap();
         assert!(json.contains(r#""kind":"DeskTaskCompleted""#));

@@ -4134,6 +4134,7 @@ mod test {
                         task_id: "t-9".into(),
                         desk: "ops".into(),
                         column: "done".into(),
+                        artifact_ids: Vec::new(),
                         output: String::new(),
                     },
                 ],
@@ -4300,6 +4301,7 @@ mod test {
                 task_id: "t-9".into(),
                 desk: "ops".into(),
                 column: "done".into(),
+                artifact_ids: Vec::new(),
                 output: String::new(),
             },
             CompanyEvent::AgentReply {

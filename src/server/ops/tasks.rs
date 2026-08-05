@@ -1371,6 +1371,7 @@ fn fold_page(
                 desk,
                 output,
                 column,
+                ..
             } if id == task_id => {
                 window_opened_at = None;
                 Some((

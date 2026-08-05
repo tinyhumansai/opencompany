@@ -3171,6 +3171,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
             desk: "ceo".into(),
             output: "shipped".into(),
             column: "in_review".into(),
+            artifact_ids: Vec::new(),
         },
     ] {
         runtime.events().append(&company, event).await.unwrap();
@@ -3853,6 +3854,7 @@ async fn task_timeline_scopes_approvals_to_the_run_window() {
             desk: "ceo".into(),
             output: "shipped".into(),
             column: "in_review".into(),
+            artifact_ids: Vec::new(),
         },
         // After the window closed — must not leak either.
         approval("after"),
@@ -4246,6 +4248,7 @@ async fn a_task_that_never_waited_reports_no_waiting_fields() {
                 desk: "ceo".into(),
                 output: "shipped".into(),
                 column: "in_review".into(),
+                artifact_ids: Vec::new(),
             },
         )
         .await

@@ -2340,6 +2340,7 @@ members = ["nobody"]
                 desk: "eng".to_string(),
                 output: "shipped".to_string(),
                 column: "done".to_string(),
+                artifact_ids: Vec::new(),
             },
             at_millis: 30,
         });
