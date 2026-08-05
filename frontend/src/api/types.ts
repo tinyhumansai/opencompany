@@ -400,6 +400,22 @@ export interface ConnectionState {
   credentialSource?: ConnectionCredentialSource;
   /** The connected account label, when known (e.g. an email or workspace). */
   account?: string;
+  /**
+   * Which namespace(s) report this provider connected — `native` for the
+   * host's own `oauth/{provider}` catalog, `composio` for a Composio
+   * connection. Empty when not connected (issue #316).
+   *
+   * The host reconciles both namespaces into one row, so the page can no
+   * longer show the same provider twice with two different answers. Optional
+   * so a host predating this field still parses.
+   */
+  via?: ("native" | "composio")[];
+  /**
+   * A Composio path exists for this company but could not be read, so
+   * `connected: false` means "we could not check", not "no". Render that
+   * distinction rather than a confident disconnected state.
+   */
+  unverified?: boolean;
 }
 
 /** Response of `POST .../connections/{provider}/start`: where to send the user. */

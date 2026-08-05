@@ -168,6 +168,19 @@ export function ConnectionsView({ client, company }: Props) {
 
         <ChannelsSection client={client} company={company} />
 
+        {load === "ready" && (
+          <Alert data-testid="connections-catalog-advisory">
+            <Info className="size-4" />
+            <AlertTitle>Agents reach these providers through Composio</AlertTitle>
+            <AlertDescription>
+              Connecting below records the account against this company, but the tool belt your
+              agents actually run on is wired in the Composio section above — that is where a
+              connection becomes something an agent can do. Connect Gmail, GitHub or Slack there
+              first (issue #396).
+            </AlertDescription>
+          </Alert>
+        )}
+
         {load === "loading" ? (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
@@ -257,6 +270,12 @@ function ConnectionCard({
   const source = state?.credentialSource;
   const managedByPlatform = source === "attested" || (platformManaged && source === undefined);
   const noRoute = source === "none";
+  // Which namespace actually backs this connection. `native` alone means the
+  // credential sits in the host's catalog, which no agent tool reads yet — worth
+  // distinguishing from a Composio connection, which is a live capability.
+  const via = state?.via ?? [];
+  const nativeOnly = connected && via.length > 0 && !via.includes("composio");
+  const unverified = state?.unverified === true;
   return (
     <Card className={cn(connected && "border-primary/30")}>
       <CardContent className="flex h-full flex-col gap-3 py-4">
@@ -274,6 +293,17 @@ function ConnectionCard({
             <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
               {connected && state?.account ? state.account : provider.description}
             </p>
+            {connected && via.length > 0 && (
+              <p className="mt-0.5 text-xs text-muted-foreground" data-testid={`connection-via-${provider.id}`}>
+                via {via.join(" + ")}
+                {nativeOnly && " — stored here; agents use the Composio connection"}
+              </p>
+            )}
+            {!connected && unverified && (
+              <p className="mt-0.5 text-xs text-amber-600 dark:text-amber-400">
+                Couldn&apos;t check the Composio connection — state unknown.
+              </p>
+            )}
           </div>
         </div>
         <div className="mt-auto">
