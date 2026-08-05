@@ -191,9 +191,15 @@ export function WorkflowsView({
   // button must be disabled during the request too, and a rejected request
   // never produces a run id.
   const [starting, setStarting] = useState(false);
-  // Set when the cancel route 404s on a run we know is live, which is what an
-  // older host answers. The affordance then says so instead of pretending.
-  const [cancelUnsupported, setCancelUnsupported] = useState(false);
+  // The run whose cancel came back 404, if any.
+  //
+  // Deliberately a run id rather than a boolean. A 404 is ambiguous — either
+  // the host has no cancel route, or the run settled a moment before we asked,
+  // which is perfectly normal — so a global flag would let one ordinary race
+  // hide the Stop button for every later run in the session. Scoping it to the
+  // run means the worst case is losing the affordance on the run that was
+  // already over.
+  const [cancelUnsupportedFor, setCancelUnsupportedFor] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   // Run ids the live fold has actually seen frames for. The fallback above
   // consults it so a console WITH a working stream never double-paints a run it
@@ -384,10 +390,10 @@ export function WorkflowsView({
    * the host has only *fired* the signal at that point, and the
    * `workflow_run_finished` frame is what actually says it stopped.
    *
-   * A `404` here is ambiguous by design (unknown run, or already settled), but
-   * on a run we believe is live the likely cause is a host predating this
-   * route — so say that once and hide the affordance, rather than showing a
-   * button that always errors.
+   * A `404` here is ambiguous by design (unknown run, or already settled), so
+   * the affordance is withdrawn only for **this** run, not for the session: the
+   * settled-a-moment-ago case is ordinary, and a global flag would let one such
+   * race hide Stop for every later run.
    */
   const cancel = useCallback(async () => {
     if (!activeRunId) return;
@@ -397,7 +403,7 @@ export function WorkflowsView({
       toast.info("Stopping the run…");
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) {
-        setCancelUnsupported(true);
+        setCancelUnsupportedFor(activeRunId);
         toast.error("This host can't stop runs", {
           description:
             "It's running a version without run cancellation, or the run already finished. It will still settle on its own.",
@@ -520,6 +526,25 @@ export function WorkflowsView({
     const mine = runs.find((r) => r.runId === activeRunId);
     if (mine && !mine.running) setActiveRunId(null);
   }, [runs, activeRunId]);
+
+  // …but that release needs something to *re-read* the history, and without SSE
+  // nothing does.
+  //
+  // The fetch fired when the run was accepted usually returns the row already
+  // marked `running: true`, and the effect above only ever sees that one stale
+  // snapshot: `runsTick` is bumped by the run POST and `runEventTick` only by
+  // frames that are not arriving. So `activeRunId` stayed set, the Run controls
+  // stayed disabled, and the view was wedged for the rest of the session — on
+  // precisely the deployments detaching a run was meant to help.
+  //
+  // Polling stops on its own: the effect above clears `activeRunId` the moment
+  // a settled row lands, and that unmounts this interval. With a working stream
+  // the live fold clears it first, so at most one extra fetch is spent.
+  useEffect(() => {
+    if (!activeRunId || !historySupported) return;
+    const timer = window.setInterval(() => setRunsTick((n) => n + 1), 2_000);
+    return () => window.clearInterval(timer);
+  }, [activeRunId, historySupported]);
 
   // Switching workflow (or company) clears the canvas: another graph's node ids
   // are meaningless here, and a stale mark on a same-named node would be a lie.
@@ -657,7 +682,7 @@ export function WorkflowsView({
               in flight — which is knowable at all because the host now hands
               back the run id before the run ends. Hidden once the host has told
               us it cannot stop runs, rather than left there to fail every time. */}
-          {activeRunId && !cancelUnsupported && (
+          {activeRunId && cancelUnsupportedFor !== activeRunId && (
             <Button
               size="sm"
               variant="outline"
