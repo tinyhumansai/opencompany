@@ -1189,6 +1189,14 @@ impl RuntimeBuilder {
         // from the harness arm for `CompanyRuntime::set_run_supervisor` below.
         #[cfg(feature = "openhuman")]
         let mut run_supervisor: Option<crate::runtime::RunSupervisor> = None;
+        // Issue #337: the company's planning station, built from the SAME
+        // `Arc<dyn HarnessModel>` the roster's agents run on so a console BYOK
+        // switch re-points planning exactly as it re-points a turn. Captured
+        // from the harness arm — where the provider is constructed — for
+        // `CompanyRuntime::set_planner` below, the pattern the three handles
+        // above already use.
+        #[cfg(feature = "openhuman")]
+        let mut planner: Option<Arc<crate::harness::planning::TaskPlanner>> = None;
 
         // Load the persisted record BEFORE constructing the brain so the brain's
         // in-memory record carries the operator overlays (team, desk memberships,
@@ -1571,6 +1579,13 @@ impl RuntimeBuilder {
                             // `set_workflow_runner`, so this is not a strong cycle.
                             deps.workflow_runner.set(&runner);
                             wf_runner = Some(runner);
+                            // Issue #337: built from these same deps, so it
+                            // shares the tenant provider and the model override
+                            // rather than resolving a second credential path
+                            // that could drift from the roster's.
+                            planner = Some(Arc::new(
+                                crate::harness::planning::TaskPlanner::from_deps(&deps),
+                            ));
                             Some(Arc::new(
                                 // Issue #242: the same run store the dispatch
                                 // choke point mints into and the boot reaper
@@ -1788,6 +1803,25 @@ impl RuntimeBuilder {
         #[cfg(feature = "openhuman")]
         if let Some(wf_runner) = wf_runner {
             runtime.set_workflow_runner(wf_runner);
+        }
+
+        // Issue #337: install the planning station, so a card dragged into
+        // Planning is actually planned rather than resting in a column nothing
+        // reads. Without it — the default build, or an openhuman build with no
+        // resolvable inference source — the column stays inert exactly as it
+        // was before #337, and the boot sweep returns anything left there.
+        //
+        // Deliberately NOT inherited across a rebuild, unlike the harness pool
+        // above. A pool carries each agent's conversation history, which is why
+        // dropping it would lose something; a planner carries a model handle and
+        // a set of in-flight card ids. Rebuilding it from the successor's deps
+        // is what makes a console BYOK switch reach planning, and the in-flight
+        // set it leaves behind is empty of anything that matters — a pass
+        // interrupted by a rebuild has no settle to reach the board, and the
+        // card it was planning is recovered by the next boot's sweep.
+        #[cfg(feature = "openhuman")]
+        if let Some(planner) = planner {
+            runtime.set_planner(planner);
         }
 
         // Boot lifecycle step 3: going-public. Best-effort and non-blocking —

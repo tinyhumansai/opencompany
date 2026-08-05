@@ -62,6 +62,10 @@ pub mod mcp_probe;
 pub mod memory;
 pub mod memory_loop;
 pub mod orchestrator;
+/// Issue #337: the planning station — one tool-less model call per card entering
+/// `planning`, with the host gathering the evidence and verifying every
+/// prerequisite the model claims. See [`planning`].
+pub mod planning;
 pub mod policy;
 pub mod provider;
 /// Issue #244: `publish_artifact` — the only way a workspace file becomes a
