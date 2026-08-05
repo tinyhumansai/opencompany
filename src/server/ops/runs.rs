@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::error::OpenCompanyError;
 use crate::ports::runs::{RunFilter, RunRecord, RunStatus, RunStepRecord};
-use crate::ports::types::{TokenUsage, TurnStepKind, TurnStepStatus};
+use crate::ports::types::{TokenUsage, TurnStepFailure, TurnStepKind, TurnStepStatus};
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
 
@@ -230,18 +230,35 @@ struct RunStepEntry {
     at_millis: u64,
     /// `tool_call` · `thinking` · `note`.
     kind: TurnStepKind,
-    /// `ok` · `error` · `running`.
+    /// `ok` · `error` · `running` · `awaiting_approval`.
     ///
     /// `running` is a real, expected terminal state of a *row*: a killed host
     /// leaves the tool call that was in flight exactly as the sink wrote it.
     /// It means in-flight-when-the-trace-stopped, never failed.
+    ///
+    /// `awaiting_approval` (issue #411) is the other state that is not a
+    /// failure: the call was gated and is waiting on a person. It used to
+    /// arrive here as `error`, which made the one step an operator could act on
+    /// look like the one thing that had crashed.
     status: TurnStepStatus,
     /// A short, server-computed human label. Never derived from tool arguments
     /// or output.
     label: String,
-    /// Whitelisted, already-scrubbed enrichment. Never raw tool output.
+    /// **What the step was doing** — its arguments, already put through issue
+    /// #372's host-side redactor and bounded by the harness (issue #411).
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// **What came back** — a shape summary, an intrinsic tool's own message,
+    /// or a failure's plain-language cause (issue #411). Never a remote body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    /// The typed reason the step did not succeed (issue #411). Absent on a
+    /// success, on a step still `running`, and on a parked one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<TurnStepFailure>,
+    /// The result was cut before the agent could read all of it (issue #410).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
     /// How long the step took, when known (tool calls report it; thinking and
     /// note steps do not).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +274,9 @@ impl From<RunStepRecord> for RunStepEntry {
             status: record.step.status,
             label: record.step.label,
             detail: record.step.detail,
+            result: record.step.result,
+            failure: record.step.failure,
+            truncated: record.step.truncated,
             elapsed_ms: record.step.elapsed_ms,
         }
     }
@@ -517,8 +537,8 @@ mod tests {
             kind,
             status,
             label: label.to_string(),
-            detail: None,
             elapsed_ms: matches!(kind, TurnStepKind::ToolCall).then_some(42),
+            ..TurnStep::default()
         }
     }
 
