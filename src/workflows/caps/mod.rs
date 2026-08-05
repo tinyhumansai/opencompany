@@ -275,6 +275,16 @@ impl HarnessAgentRunner {
     /// already happened, the model was already told it was refused, and failing
     /// the node here would discard a completed turn's work over a queue write.
     /// Same stance `park_approval_requests` takes, for the same reason.
+    ///
+    /// # A run cancelled mid-turn parks nothing, deliberately
+    ///
+    /// Stopping a run drops the engine future *mid-await* (issue #383), which
+    /// takes this call with it — so a call the policy had already gated stays on
+    /// the shared queue and the next chat cycle's `clear` discards it. That is
+    /// the intended outcome, not a residual leak: an operator who stopped a run
+    /// is not asking to be asked about the work they stopped. It is the same
+    /// judgement `cancelled_run` makes in reporting no `pending_approvals`, and
+    /// the same one `park_pending_gates` makes in skipping a cancelled run.
     async fn park_gated_calls(&self, from: usize) {
         let queue = &self.deps.approval_requests;
         // Issue #242's stamp, applied at the boundary the run owns: this is
