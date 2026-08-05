@@ -44,6 +44,12 @@ pub mod composio;
 /// live tools are behind `composio`, which CI never *runs*) — see
 /// [`composio_catalog`].
 pub mod composio_catalog;
+/// End-to-end proof that #410's narrowable, self-describing Composio listing is
+/// reachable from a real turn on two large toolkits — the harness, the grant
+/// gate, the approval policy and the Composio client are all real; only the
+/// model's choices and the Composio backend are scripted. Test-only.
+#[cfg(all(test, feature = "composio"))]
+mod composio_turn_test;
 pub mod cost;
 /// Hosted embeddings compute for the in-pod memory engine's meaning tier (188c2).
 /// Needs the `tinycortex` crate's `EmbeddingBackend` trait, so it links only when
