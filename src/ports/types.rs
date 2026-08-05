@@ -797,6 +797,28 @@ pub enum EffectGroup {
     Other,
 }
 
+impl EffectGroup {
+    /// May a tool in this group be granted **broadly** — one standing
+    /// permission covering any arguments until a deadline (issue #374)?
+    ///
+    /// Only [`Other`](Self::Other). Every named group is a consequence the
+    /// operator has to see per call: Spend moves money, Send reaches a
+    /// counterparty, Sign and Publish are externally visible and not reversible
+    /// by the company alone, Hire commits it to someone, Identity changes who it
+    /// is. None of those are things to hand over for a week at a time.
+    ///
+    /// **This is the rule; it lives here so there is one of it.** The tool-name
+    /// → group mapping is `classify_group` in `crate::harness::policy`, which
+    /// compiles only under the `openhuman` feature, while the three places that
+    /// enforce this — the mint path, the approval summary the card reads, and
+    /// the resolve route's 400 — are all in the default build. Expressing the
+    /// rule twice across that seam is exactly the drift the issue forbids, so
+    /// both sides call this.
+    pub fn is_broadly_grantable(&self) -> bool {
+        matches!(self, Self::Other)
+    }
+}
+
 /// A side effect the brain wants to perform, submitted to the approval gate.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Effect {
