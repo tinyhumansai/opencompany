@@ -15,6 +15,10 @@
 
 pub mod caps;
 pub mod delivery;
+/// Issue #395: end-to-end proof that a tool call gated inside a workflow agent
+/// node reaches the Approvals page and survives the next chat cycle.
+#[cfg(test)]
+mod gated_tool_turn_test;
 pub mod runner;
 pub mod translate;
 
