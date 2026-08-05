@@ -6,6 +6,17 @@ import { cn } from "@/lib/utils";
 import { Avatar } from "./Avatar";
 import type { Channel, ChannelSection } from "./model";
 
+/**
+ * What an unread badge actually claims (issue #364).
+ *
+ * The one thing on this rail that is still console-local: unread is derived
+ * here from when this tab last looked at a channel, because the host has no
+ * read-receipt surface. Transcripts, threads and reactions are all the host's
+ * now — this is not, and it says so rather than letting an operator read the
+ * badge as "unread by my team".
+ */
+const UNREAD_IS_LOCAL = "Estimated in this browser — unread is not tracked on the company.";
+
 interface Props {
   sections: ChannelSection[];
   activeId: string | null;
@@ -89,7 +100,10 @@ function Section({
         />
         <span className="truncate">{section.label}</span>
         {hiddenUnread > 0 && (
-          <span className="ml-auto rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground">
+          <span
+            title={UNREAD_IS_LOCAL}
+            className="ml-auto rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground"
+          >
             {hiddenUnread > 99 ? "99+" : hiddenUnread}
           </span>
         )}
@@ -148,6 +162,11 @@ function ChannelRow({
       {hasUnread && (
         <span
           data-testid="channel-unread"
+          // Issue #364: unread is derived in this browser from what this tab has
+          // seen — the host keeps no read receipts. Two consoles will disagree,
+          // and a badge that quietly means something narrower than it looks is
+          // worse than one that says so.
+          title={UNREAD_IS_LOCAL}
           className="shrink-0 rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground"
         >
           {unread > 99 ? "99+" : unread}

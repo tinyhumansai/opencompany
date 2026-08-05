@@ -17,7 +17,12 @@ import { setInboxEnabled } from "@/api/inbox";
 import { ApiError, type ApprovalSummary, type TeamMemberDto, type TurnStep, type Verdict } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { type ChatMessage, makeMessage } from "@/lib/chat";
+import {
+  makeMessage,
+  reconcileIds,
+  toHostMessageId,
+  type ChatMessage,
+} from "@/lib/chat";
 import { defaultDesks, type Desk } from "@/lib/desks";
 import { readLastChannel } from "@/lib/last-channel";
 import { fromDto, newMember, starterTeam, type TeamMember } from "@/lib/team";
@@ -41,6 +46,7 @@ import {
   dmChannelId,
   findChannel,
   firstChannel,
+  resolveDmChannelId,
   toggleReaction,
   type DecidedApproval,
   type Transcripts,
@@ -361,16 +367,30 @@ export function ChatView({
   // channel `firstChannel` returns when they hadn't. It never selected anything
   // the line below wouldn't; it only made "main" look like a real channel id
   // (issue #368).
-  const channel = desks ? (findChannel(sections, sub) ?? firstChannel(sections)) : null;
+  /**
+   * A `#/chat/dm:…` link minted before issue #364 re-keyed DMs onto the
+   * teammate's id, mapped onto the id that channel has now.
+   *
+   * One release of grace for a bookmarked or pasted link. Resolution only —
+   * nothing is ever addressed or stored under the old id, so this shim can be
+   * deleted without leaving anything stranded.
+   */
+  const resolvedSub =
+    sub && !findChannel(sections, sub) ? resolveDmChannelId(sub, members) : null;
+  const channel = desks
+    ? (findChannel(sections, resolvedSub ?? sub) ?? firstChannel(sections))
+    : null;
   /**
    * The hash named a channel this company doesn't have, and the first-channel
    * fallback answered instead.
    *
    * Only meaningful once the desks are in: before that, *every* id looks
    * unknown. Derived rather than stored, so it clears itself the moment the
-   * hash changes — there is no stale banner to dismiss.
+   * hash changes — there is no stale banner to dismiss. A legacy DM link that
+   * the shim above resolved is not unknown; it found its channel.
    */
-  const unknownChannel = desks && sub && !findChannel(sections, sub) ? sub : null;
+  const unknownChannel =
+    desks && sub && !resolvedSub && !findChannel(sections, sub) ? sub : null;
 
   /**
    * Who is in the channel on screen — `null` when it names no membership, in
@@ -516,6 +536,21 @@ export function ChatView({
    * counts the company, which is all it can honestly claim.
    */
   const headerCount = active.kind === "dm" ? 2 : (inChannel?.length ?? members.length);
+  /**
+   * The teammate on the other end of this DM exists only in the console (issue
+   * #364) — a starter-roster row, or one added while the host had no team write
+   * plane.
+   *
+   * Worth saying out loud, and worth being precise about *what* is local. The
+   * transcript is not: the DM is addressed by a reload-stable id now, so the
+   * host journals it and gives it back. What is missing is the other half of the
+   * conversation — there is no such agent on the company, so nothing on the
+   * roster answers. Claiming the whole channel was console-local would be the
+   * old, wrong story; saying nothing would leave an operator waiting for a reply
+   * that is never coming.
+   */
+  const consoleOnlyMember =
+    active.kind === "dm" && !fromHost && active.member ? active.member.name : null;
 
   const append = (channelId: string, ...added: ChatMessage[]) =>
     setTranscripts((t) => ({ ...t, [channelId]: [...(t[channelId] ?? []), ...added] }));
@@ -523,12 +558,20 @@ export function ChatView({
   /**
    * Post a line and thread the company's answer back into the same place.
    * `parentId` set means the exchange stays inside the thread panel.
+   *
+   * The thread is now a fact about the transcript, not about this browser: the
+   * parent goes to the host with the message, and both halves come back under
+   * it on the next reload (issue #364). A parent that has no durable id yet is
+   * dropped from the request rather than sent as a local counter the host
+   * cannot resolve — the row's own actions are disabled in that window, so this
+   * is the belt to that brace.
    */
   async function send(text: string, parentId?: string) {
     if (sending) return;
     const target = active.id;
     const chatId = activeThreadId;
-    append(target, makeMessage("you", text, { parentId }));
+    const local = makeMessage("you", text, { parentId });
+    append(target, local);
     setSending(true);
     // Claim the thread for the duration of the POST. The backend journals an
     // `AgentReply` for our own turn too and pushes it over SSE mid-await, so
@@ -536,13 +579,28 @@ export function ChatView({
     // below — two bubbles for one turn.
     if (chatId) onSendStart?.(chatId);
     try {
-      const reply = await client.chat(text, company, chatId);
+      const reply = await client.chat(text, company, chatId, toHostMessageId(parentId));
       const replies = reply.responses.length
         ? reply.responses.map((r) =>
-            makeMessage("company", r.text, { channel: r.channel, parentId, steps: r.steps, taskId: r.taskId }),
+            makeMessage("company", r.text, {
+              channel: r.channel,
+              parentId,
+              steps: r.steps,
+              taskId: r.taskId,
+              messageId: r.messageId,
+            }),
           )
         : [makeMessage("system", "(no reply)", { parentId })];
       append(target, ...replies);
+      // Swap the optimistic id for the durable one the host assigned, so this
+      // bubble can be replied to and reacted on straight away — and so anything
+      // that started replying to it mid-flight follows it (`reconcileIds`).
+      if (reply.messageId) {
+        setTranscripts((t) => ({
+          ...t,
+          [target]: reconcileIds(t[target] ?? [], local.id, reply.messageId!),
+        }));
+      }
       onReply?.();
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : "something went wrong";
@@ -553,13 +611,40 @@ export function ChatView({
     }
   }
 
-  function react(messageId: string, emoji: string) {
-    setTranscripts((t) => ({
-      ...t,
-      [active.id]: (t[active.id] ?? []).map((m) =>
-        m.id === messageId ? { ...m, reactions: toggleReaction(m.reactions, emoji) } : m,
-      ),
-    }));
+  /**
+   * Set or clear the operator's own reaction on a message (issue #364).
+   *
+   * Optimistic, then reconciled by failure: the chip flips at once because a
+   * reaction that waits for a round trip feels broken, and rolls back if the
+   * host refuses. It never guesses — a host with no reactions route says so,
+   * once, instead of leaving a chip that will be gone on the next reload.
+   */
+  async function react(messageId: string, emoji: string) {
+    const seq = toHostMessageId(messageId);
+    if (!seq) return;
+    const before = transcripts[active.id] ?? [];
+    const on = !before.some(
+      (m) => m.id === messageId && m.reactions?.some((r) => r.emoji === emoji && r.mine),
+    );
+    const apply = (rows: ChatMessage[]) =>
+      rows.map((m) =>
+        m.id === messageId
+          ? { ...m, reactions: toggleReaction(m.reactions, emoji, "you") }
+          : m,
+      );
+    setTranscripts((t) => ({ ...t, [active.id]: apply(t[active.id] ?? []) }));
+    try {
+      await client.reactToMessage(seq, emoji, on, company);
+    } catch (error) {
+      setTranscripts((t) => ({ ...t, [active.id]: apply(t[active.id] ?? []) }));
+      toast.error(
+        error instanceof ApiError && error.status === 404
+          ? "This host doesn't keep reactions yet."
+          : error instanceof Error
+            ? error.message
+            : "Couldn't save that reaction.",
+      );
+    }
   }
 
   /**
@@ -723,6 +808,19 @@ export function ChatView({
               decidingApprovals={decidingApprovals}
               onDecideApproval={onDecideApproval}
             />
+            {consoleOnlyMember && (
+              <p
+                role="status"
+                className="flex shrink-0 items-center gap-1.5 border-t bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground"
+              >
+                <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
+                <span className="min-w-0">
+                  <span className="font-medium text-foreground">{consoleOnlyMember}</span> only
+                  exists in this console — the company has no such teammate, so nobody answers
+                  here. The transcript is still saved and survives a reload.
+                </span>
+              </p>
+            )}
             <MessageComposer
               placeholder={`Message ${channelTitle(channel)}`}
               disabled={sending}

@@ -2,7 +2,7 @@
 // rules the timeline reads. Everything here is pure — the view owns the state.
 
 import type { ApprovalSummary, DeskDto, Verdict } from "@/api/types";
-import type { ChatMessage } from "@/lib/chat";
+import type { ChatMessage, Reaction } from "@/lib/chat";
 import { defaultDesks, type Desk } from "@/lib/desks";
 import { initials as nameInitials, type TeamMember } from "@/lib/team";
 
@@ -119,22 +119,47 @@ export function buildChannels(members: TeamMember[], desks: Desk[] = defaultDesk
 /**
  * A DM's channel id, and so its URL.
  *
- * Keyed on the teammate's name rather than their roster id: the starter roster
- * mints ids from a module counter (`lib/team.ts`), so they differ between two
- * calls in the same session and a `#/chat/dm:member-3` link would point at a
- * different person — or nobody — on the next mount.
+ * Keyed on the teammate's **id**, which is now the one stable thing about them
+ * (issue #364). A host roster entry has always had a stable agent id; what was
+ * missing was a stable id for a console-invented teammate, and `lib/team.ts`'s
+ * counter was why this used to key on the name instead.
  *
- * The slug alone is not enough: it keeps only `[a-z0-9]`, so a name written
- * entirely in a non-Latin script slugifies to nothing, and two names that
- * slugify alike (or both empty) would collide onto the same id — the second
- * teammate's DM becomes unreachable and their messages merge with the
- * first's. A short hash of the full name, appended after the slug, keeps the
- * id both name-derived and unique.
+ * Keying on the name had a cost that only shows up later: renaming a teammate
+ * silently moved their DM to a new URL and orphaned every message already
+ * journaled under the old one. An id does not change when a person's name does,
+ * which is the entire reason to prefer it.
  */
 export function dmChannelId(member: TeamMember): string {
+  return `dm:${member.id}`;
+}
+
+/**
+ * The name-derived DM id this console minted before issue #364.
+ *
+ * Kept for one release, and for one purpose: a `#/chat/dm:ada-1f3k` link that
+ * somebody bookmarked or pasted into a ticket still has to land on Ada's DM.
+ * Only {@link resolveDmChannelId} calls it — nothing addresses a channel by it,
+ * so no new state is ever written under a legacy id.
+ */
+export function legacyDmChannelId(member: TeamMember): string {
   const name = member.name.trim();
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   return `dm:${slug ? `${slug}-` : ""}${nameHash(name)}`;
+}
+
+/**
+ * The current DM channel id a URL segment names, or `null` when it names no
+ * DM this company has.
+ *
+ * Resolves the current id first, then the pre-#364 name-derived form, so an old
+ * link keeps working without the old id ever becoming addressable again.
+ */
+export function resolveDmChannelId(id: string, members: TeamMember[]): string | null {
+  if (!id.startsWith("dm:")) return null;
+  const match = members.find(
+    (m) => dmChannelId(m) === id || legacyDmChannelId(m) === id,
+  );
+  return match ? dmChannelId(match) : null;
 }
 
 function nameHash(name: string): string {
@@ -436,16 +461,64 @@ export function formatDay(at: number): string {
 /** The palette the hover bar offers, in the order it offers them. */
 export const QUICK_REACTIONS = ["👍", "🎉", "👀", "✅", "❤️"] as const;
 
-/** Toggle one emoji on a message, returning the next reaction map. */
+/**
+ * Toggle the reader's own reaction, leaving everyone else's alone (issue #364).
+ *
+ * Reactions are per-person rows now, so a toggle adds or removes exactly one —
+ * the reader's. It used to replace a count, which meant tapping an emoji
+ * somebody else had already used silently wiped their reaction.
+ *
+ * `label` is how the reader will be shown in the chip's tooltip until the host
+ * says otherwise. Returns `undefined` for an empty result so a message with no
+ * reactions carries no key at all.
+ */
 export function toggleReaction(
-  reactions: Record<string, number> | undefined,
+  reactions: Reaction[] | undefined,
   emoji: string,
-): Record<string, number> | undefined {
-  const next = { ...(reactions ?? {}) };
-  if (next[emoji]) {
-    delete next[emoji];
-  } else {
-    next[emoji] = 1;
+  label: string,
+): Reaction[] | undefined {
+  const rows = reactions ?? [];
+  const mine = rows.some((r) => r.emoji === emoji && r.mine);
+  const next = mine
+    ? rows.filter((r) => !(r.emoji === emoji && r.mine))
+    : [...rows, { emoji, by: label, mine: true }];
+  return next.length ? next : undefined;
+}
+
+/** Whether the reader has already reacted to a message with this emoji. */
+export function hasReacted(reactions: Reaction[] | undefined, emoji: string): boolean {
+  return !!reactions?.some((r) => r.emoji === emoji && r.mine);
+}
+
+/** One emoji's chip: its rows collapsed into a count and a who-list. */
+export interface ReactionChip {
+  emoji: string;
+  count: number;
+  /** Whether one of the rows is the reader's. */
+  mine: boolean;
+  /** Everyone who reacted with it, in the order the host listed them. */
+  by: string[];
+}
+
+/**
+ * Group per-person reaction rows into the chips the row renders.
+ *
+ * Chips keep first-reacted order rather than sorting by count, so a message's
+ * reactions do not reshuffle under the reader as others react.
+ */
+export function reactionChips(reactions: Reaction[] | undefined): ReactionChip[] {
+  const chips: ReactionChip[] = [];
+  const byEmoji = new Map<string, ReactionChip>();
+  for (const row of reactions ?? []) {
+    let chip = byEmoji.get(row.emoji);
+    if (!chip) {
+      chip = { emoji: row.emoji, count: 0, mine: false, by: [] };
+      byEmoji.set(row.emoji, chip);
+      chips.push(chip);
+    }
+    chip.count += 1;
+    chip.mine ||= row.mine;
+    chip.by.push(row.by);
   }
-  return Object.keys(next).length ? next : undefined;
+  return chips;
 }

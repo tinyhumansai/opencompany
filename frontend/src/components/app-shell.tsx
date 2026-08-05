@@ -45,7 +45,7 @@ import { type AgentReplyEvent, type CompanyStreamEvent, useEvents } from "@/hook
 import { useHashView } from "@/hooks/use-hash-view";
 import { toast } from "sonner";
 
-import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
+import { type ChatMessage, fromHistory, hostMessageId, makeMessage } from "@/lib/chat";
 import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { defaultDesks, type Desk } from "@/lib/desks";
 import { writeLastChannel } from "@/lib/last-channel";
@@ -643,6 +643,11 @@ export function AppShell({
             makeMessage("company", event.text, {
               channel: event.agentId,
               taskId: event.taskId,
+              // Issue #364: a reply to a thread joins that thread live, instead
+              // of appearing in the channel and moving on the next reload. The
+              // host names the parent by its own id, so it takes the same
+              // namespace prefix a hydrated line does.
+              parentId: event.parentId ? hostMessageId(event.parentId) : undefined,
             }),
           ],
         };

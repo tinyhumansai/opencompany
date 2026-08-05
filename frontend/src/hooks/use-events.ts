@@ -24,6 +24,12 @@ export type CompanyStreamEvent =
        * chat reply.
        */
       taskId?: string;
+      /**
+       * The message this reply belongs under (issue #364) — its thread inside
+       * the channel. Absent for a reply in the channel itself, and on a host
+       * that predates persisted threads.
+       */
+      parentId?: string;
     }
   | { type: "task_dispatched"; seq: number; atMillis: number; taskId: string }
   | { type: "task_steered"; seq: number; atMillis: number; taskId: string; action: string }
@@ -151,6 +157,12 @@ export interface AgentReplyEvent {
   text: string;
   /** The board card this reply opened (issue #246), when it opened one. */
   taskId?: string;
+  /**
+   * The **host-side** id of the message this reply belongs under (issue #364).
+   * Namespaced into a console id by the injector, which is what knows about the
+   * `h` prefix.
+   */
+  parentId?: string;
 }
 
 interface Options {
@@ -359,6 +371,9 @@ function handleEvent(
         // not POST for, e.g. an inbound Telegram turn — carries its "card
         // opened" chip too, rather than only the locally-awaited copy.
         taskId: event.taskId,
+        // Issue #364: and lands in the same thread a reload would put it in,
+        // rather than arriving in the channel and jumping on the next refresh.
+        parentId: event.parentId,
       });
       break;
     // Issue #379. No toast: the rising-edge "needs a sign-off" toast off the

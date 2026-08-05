@@ -2,12 +2,15 @@ import { MessageSquareReply } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Markdown } from "@/components/markdown";
-import type { ChatMessage } from "@/lib/chat";
+import { isHostMessageId, type ChatMessage } from "@/lib/chat";
 import { cn } from "@/lib/utils";
 import { Avatar } from "./Avatar";
 import {
   formatTime,
+  hasReacted,
   QUICK_REACTIONS,
+  reactionChips,
+  type ReactionChip,
   type Sender,
   type TimelineEntry,
 } from "./model";
@@ -22,6 +25,27 @@ interface Props {
 }
 
 /**
+ * Why replying and reacting are unavailable on a row, or `undefined` when they
+ * are not (issue #364).
+ *
+ * Derived from the row's own id rather than passed down, because the id *is*
+ * the answer: a thread reply and a reaction both have to name a message the
+ * host has journaled, and only an `h`-prefixed id names one. A row still
+ * carrying its optimistic counter (the POST has not landed) or one from a host
+ * with no durable ids at all cannot be named by either.
+ *
+ * The reason is a sentence, not a boolean, because a control that just stops
+ * working reads as a bug. This is the on-screen label for the one thing about
+ * this feature that is genuinely conditional on the host.
+ */
+function actionsUnavailableFor(message: ChatMessage): string | undefined {
+  if (isHostMessageId(message.id)) return undefined;
+  return message.from === "system"
+    ? "Console-only line — there is nothing saved to reply to."
+    : "Not saved yet — a reply or a reaction needs a message this company has stored.";
+}
+
+/**
  * One line in the channel.
  *
  * The layout is a fixed avatar gutter plus a flexible body, which is what
@@ -32,6 +56,8 @@ interface Props {
  */
 export function MessageRow({ entry, threadOpen, onOpenThread, onReact }: Props) {
   const { message, sender, continuation, replies } = entry;
+  const chips = reactionChips(message.reactions);
+  const actionsUnavailable = actionsUnavailableFor(message);
 
   if (sender.kind === "system") {
     return (
@@ -69,8 +95,12 @@ export function MessageRow({ entry, threadOpen, onOpenThread, onReact }: Props) 
         {message.steps && message.steps.length > 0 && <StepTimeline steps={message.steps} />}
         {message.taskId && <CardChip taskId={message.taskId} />}
 
-        {message.reactions && (
-          <Reactions reactions={message.reactions} onReact={(e) => onReact(message.id, e)} />
+        {chips.length > 0 && (
+          <Reactions
+            chips={chips}
+            disabledReason={actionsUnavailable}
+            onReact={(e) => onReact(message.id, e)}
+          />
         )}
 
         {replies.length > 0 && (
@@ -91,6 +121,8 @@ export function MessageRow({ entry, threadOpen, onOpenThread, onReact }: Props) 
       <ActionBar
         onReply={() => onOpenThread(message.id)}
         onReact={(emoji) => onReact(message.id, emoji)}
+        reacted={(emoji) => hasReacted(message.reactions, emoji)}
+        disabledReason={actionsUnavailable}
       />
     </article>
   );
@@ -107,25 +139,44 @@ function AuthorLine({ sender, at }: { sender: Sender; at: number }) {
   );
 }
 
+/**
+ * The reaction chips under a line.
+ *
+ * Each chip carries a count *and* names everyone behind it in its tooltip —
+ * "who reacted" is most of what a reaction is for, and a bare count answers
+ * none of it. The reader's own chip is highlighted, which is what makes it
+ * legible as a toggle rather than a tally that only goes up.
+ */
 function Reactions({
-  reactions,
+  chips,
+  disabledReason,
   onReact,
 }: {
-  reactions: Record<string, number>;
+  chips: ReactionChip[];
+  disabledReason?: string;
   onReact: (emoji: string) => void;
 }) {
   return (
     <div className="mt-1 flex flex-wrap gap-1">
-      {Object.entries(reactions).map(([emoji, count]) => (
+      {chips.map((chip) => (
         <button
-          key={emoji}
+          key={chip.emoji}
           type="button"
-          onClick={() => onReact(emoji)}
-          className="flex items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-xs transition-colors hover:bg-primary/20"
-          aria-label={`Remove ${emoji} reaction`}
+          disabled={!!disabledReason}
+          onClick={() => onReact(chip.emoji)}
+          title={disabledReason ?? `${chip.by.join(", ")} reacted with ${chip.emoji}`}
+          className={cn(
+            "flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs transition-colors",
+            chip.mine
+              ? "border-primary/40 bg-primary/10 hover:bg-primary/20"
+              : "border-border bg-muted/60 hover:bg-muted",
+            disabledReason && "cursor-not-allowed opacity-60 hover:bg-inherit",
+          )}
+          aria-pressed={chip.mine}
+          aria-label={`${chip.emoji} — ${chip.by.join(", ")}`}
         >
-          <span aria-hidden>{emoji}</span>
-          <span className="tabular-nums text-[11px] font-medium">{count}</span>
+          <span aria-hidden>{chip.emoji}</span>
+          <span className="tabular-nums text-[11px] font-medium">{chip.count}</span>
         </button>
       ))}
     </div>
@@ -136,18 +187,32 @@ function Reactions({
 function ActionBar({
   onReply,
   onReact,
+  reacted,
+  disabledReason,
 }: {
   onReply: () => void;
   onReact: (emoji: string) => void;
+  /** Whether the reader has already reacted with an emoji, to mark the button. */
+  reacted: (emoji: string) => boolean;
+  /** Why both actions are unavailable, shown as the tooltip when they are. */
+  disabledReason?: string;
 }) {
+  const disabled = !!disabledReason;
   return (
     <div className="absolute -top-3 right-4 z-10 hidden items-center gap-0.5 rounded-lg border bg-popover p-0.5 shadow-sm group-hover/message:flex group-focus-within/message:flex">
       {QUICK_REACTIONS.map((emoji) => (
         <button
           key={emoji}
           type="button"
+          disabled={disabled}
           onClick={() => onReact(emoji)}
-          className="flex size-7 items-center justify-center rounded-md text-sm transition-colors hover:bg-accent"
+          title={disabledReason}
+          aria-pressed={reacted(emoji)}
+          className={cn(
+            "flex size-7 items-center justify-center rounded-md text-sm transition-colors hover:bg-accent",
+            reacted(emoji) && "bg-primary/10",
+            disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
+          )}
           aria-label={`React with ${emoji}`}
         >
           <span aria-hidden>{emoji}</span>
@@ -158,9 +223,10 @@ function ActionBar({
         variant="ghost"
         size="icon"
         className="size-7"
+        disabled={disabled}
         onClick={onReply}
         aria-label="Reply in thread"
-        title="Reply in thread"
+        title={disabledReason ?? "Reply in thread"}
       >
         <MessageSquareReply className="size-4" />
       </Button>
