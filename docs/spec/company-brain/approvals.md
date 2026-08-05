@@ -112,6 +112,80 @@ and replayed on boot, so a restart between approving and re-issuing does not
 drop the approval. Consumed and expired grants are folded out on replay: a
 resurrected single-use grant would not be single-use.
 
+### Standing grants: this tool, for this teammate, until a deadline
+
+Single-use is the right default and was, for a while, the only scope — which
+made it the whole design. An agent reaching for the same tool repeatedly
+produced a stream of near-identical cards, and the operator's rational escapes
+were approving blind or switching the company to `full`, throwing the gate away
+to stop it nagging. So an approve now carries a **scope**:
+
+- **just this once** — the default, and byte-identical to the single-use grant
+  above. Needs no interaction: a body with no `scope` key is exactly the
+  pre-#374 request.
+- **this tool, for this teammate** — a **standing grant**, with a mandatory
+  duration of 1 hour, 8 hours, or 7 days.
+
+A standing grant is a distinct type from a single-use one, not a scope flag on
+it, and both differences are load-bearing: it has **no arguments field**, so it
+cannot argument-match or be widened into doing so; and its **expiry is not
+optional**, so it cannot live forever. The duration is stored as an absolute
+epoch-millis deadline, capped at 7 days server-side — a request past the cap is
+a **400, never a silent clamp**, because quietly shortening a duration would
+leave the operator believing a permission is live when it lapsed days earlier.
+
+Expiry is enforced at **redemption**, under the same lock as the match, and also
+swept on the scheduler's maintenance tick. The sweep is housekeeping and an
+operator notice; it is never the enforcement, or "for one hour" would mean
+"until the next tick after one hour".
+
+#### What can never be granted broadly
+
+Exactly the tools whose consequence group is the catch-all `Other`. Anything the
+classifier calls **Spend, Send, Sign, Publish, Hire or Identity** stays a
+per-call decision, forever, with nobody having to remember to add it to a list —
+the rule delegates to the taxonomy at the top of this document rather than
+keeping a second hand-written set of "safe" tools, which would be written once
+and then silently accrue every new tool by omission.
+
+The console hides the control for a card it cannot be used on; that is UX. The
+**enforcement** is host-side at mint time, so a hand-rolled request for a
+standing grant on a Send-group tool is a 400 rather than a permission. Native
+effects are refused too: the runtime performs those itself, so "this tool, for
+this teammate" names neither of the two things it needs.
+
+A refused scope changes nothing at all — the approval stays parked and no
+verdict is journaled — so the operator can simply approve it once instead.
+
+Known and deliberate: `shell` classifies as `Other` and is therefore grantable.
+Narrowing it belongs in the classifier — giving shell a consequence class — not
+in a second ad-hoc exclusion list, which is the drift this design exists to
+avoid. It is operator opt-in, time-boxed, revocable, and both `never_do` and the
+`readonly` brake outrank it.
+
+#### Listing and revoking
+
+`GET {scope}/grants` lists the live standing permissions; `DELETE
+{scope}/grants/{gid}` takes one back, 404 when it is already gone. Both are
+journaled with the **resolving operator's real identity**, so "who opened this
+up" is answerable later. Revocation takes effect on the tool's **next** call — a
+call already admitted is not aborted, because there is no abort lever inside an
+agent's turn and killing one mid-call is the lifecycle anti-pattern; the next
+policy check finds nothing and re-parks.
+
+The list carries no arguments, because a standing grant has none — so it opens
+no second redaction surface.
+
+Lifecycle records: `StandingGrantMinted` → `StandingGrantRevoked` |
+`StandingGrantExpired`. Replay folds out revoked and expired grants *and*
+anything already past its deadline, so a host that was down across an expiry
+cannot hand the permission back on boot.
+
+Per-use auditing is tracing-only in v1: mint, revoke and expiry are journaled
+with actor and timestamps, but each admitted call writes no journal record.
+Defensible because a standing grant only ever admits `Other`-group tools and
+never a priced call; a per-use record is additive later.
+
 ### Precedence at the tool gate
 
 A tool call is decided in this order:
@@ -121,9 +195,16 @@ A tool call is decided in this order:
    deliberately: a grant is an operator saying yes to one call, `never_do` is
    the company saying not ever, and the standing rule is the one meant to
    survive a socially engineered operator.
-2. a live **grant** matching agent + tool + exact arguments → allow, once.
-3. `[policy].always_approve` → park.
-4. mode dispatch (`readonly` / `supervised` / `full`).
+2. a live **single-use grant** matching agent + tool + exact arguments →
+   allow, once.
+3. a live **standing grant** matching agent + tool, unexpired → allow. Placed
+   immediately below single-use consumption so a matching single-use grant
+   still *burns*: masking it would leave the operator's one-off approval to
+   expire and be announced as "the agent didn't act", about a call that ran.
+   This arm refuses a **priced** call (a declared amount, a metered read), so a
+   standing grant can never admit money by placement rather than by promise.
+4. `[policy].always_approve` → park.
+5. mode dispatch (`readonly` / `supervised` / `full`).
 
 The grant sits **above** `always_approve` on purpose. A tool on that list still
 parks the first time, which is what the list is for; but once the operator has
