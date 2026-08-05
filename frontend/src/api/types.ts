@@ -193,6 +193,21 @@ export interface ApprovalSummary {
    */
   agent?: string | null;
   /**
+   * Whether the operator may grant this tool **broadly** — one standing
+   * permission covering any arguments until a deadline (#374).
+   *
+   * `true` exactly when the effect came from a harness tool call and its
+   * consequence group is the catch-all one. Anything that spends, sends, signs,
+   * publishes, hires or touches identity stays a per-call decision, so the scope
+   * control is not rendered for it.
+   *
+   * **This is a hint, not the boundary.** The host re-checks the same rule when
+   * the resolve arrives and answers 400, so ignoring this field buys nothing.
+   * Optional and defaulting to absent, which is how an old host degrades: no
+   * field, no control, approve-once exactly as before.
+   */
+  broadly_grantable?: boolean;
+  /**
    * What the effect will actually do — the tool call's arguments (#372).
    *
    * Already redacted and bounded by the host
@@ -234,6 +249,42 @@ export interface ResolveReceipt {
 }
 
 export type Verdict = "approve" | "deny";
+
+/**
+ * What an approve buys (#374).
+ *
+ * `once` is the default and needs no interaction: one call, with exactly the
+ * arguments the operator saw. `tool` is the broader option, and its duration is
+ * mandatory — there is no unbounded form, on the wire or in the UI.
+ */
+export type GrantScope = { kind: "once" } | { kind: "tool"; expiresInMillis: number };
+
+/** The duration options offered with the broader scope. Nothing else is valid. */
+export const GRANT_DURATIONS: { label: string; millis: number }[] = [
+  { label: "1 hour", millis: 60 * 60 * 1000 },
+  { label: "8 hours", millis: 8 * 60 * 60 * 1000 },
+  { label: "7 days", millis: 7 * 24 * 60 * 60 * 1000 },
+];
+
+/**
+ * One standing permission, as `GET {scope}/grants` returns it (#374).
+ *
+ * Carries **no arguments** — a standing grant has none, which is what makes it
+ * structurally unable to be widened into an argument-matching rule, and why this
+ * list needs no redaction of its own.
+ */
+export interface StandingGrant {
+  id: string;
+  /** The teammate it was granted to. */
+  agent: string;
+  /** The tool it admits, with any arguments. */
+  tool: string;
+  /** Who granted it: a signed-in user, or the platform credential. */
+  granted_by: { kind: string; id: string };
+  at_millis: number;
+  /** Epoch-millis it stops admitting calls. */
+  expires_at_millis: number;
+}
 
 export type FeedbackCategory =
   | "wrong-output"

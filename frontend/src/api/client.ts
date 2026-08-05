@@ -30,10 +30,12 @@ import {
   type FeedbackResponse,
   type FeedbackSummary,
   type FinancesDto,
+  type GrantScope,
   type InboxDto,
   type InboxMessageDto,
   type ResolveReceipt,
   type SetBudgetInput,
+  type StandingGrant,
   type TeamMemberDto,
   type UsageDto,
   type Verdict,
@@ -342,17 +344,52 @@ export class OpenCompanyClient {
     verdict: Verdict,
     note?: string,
     company?: string | null,
-    options: { detach?: boolean } = {},
+    options: { detach?: boolean; scope?: GrantScope } = {},
   ): Promise<ChatResponse | ResolveReceipt> {
-    const body: { verdict: Verdict; note?: string; detach?: boolean } = { verdict };
+    const body: {
+      verdict: Verdict;
+      note?: string;
+      detach?: boolean;
+      scope?: "once" | "tool";
+      expires_in_millis?: number;
+    } = { verdict };
     if (note) body.note = note;
     if (options.detach) body.detach = true;
+    // Issue #374. The `once` scope is sent as *nothing at all*, not as
+    // `scope: "once"`: the omitted-field form is what an old host understands,
+    // so a new console against an old host keeps working instead of 400ing on a
+    // key that host has never heard of. Only the broader scope is ever on the
+    // wire, and it always carries its duration — the host rejects it otherwise.
+    if (options.scope?.kind === "tool") {
+      body.scope = "tool";
+      body.expires_in_millis = options.scope.expiresInMillis;
+    }
     const answer = await this.request<unknown>(
       "POST",
       `${this.scope(company)}/approvals/${encodeURIComponent(approvalId)}`,
       body,
     );
     return isResolveReceipt(answer) ? answer : (answer as ChatResponse);
+  }
+
+  /** The live standing permissions, newest first (#374). */
+  listGrants(company?: string | null): Promise<StandingGrant[]> {
+    return this.request<StandingGrant[]>("GET", `${this.scope(company)}/grants`);
+  }
+
+  /**
+   * Take a standing permission back (#374).
+   *
+   * Effective on the tool's **next** call — a call already underway is not
+   * aborted. A 404 means it was already gone (revoked elsewhere, or expired),
+   * which the caller should treat as success: the permission is not live either
+   * way, and the list refresh will show that.
+   */
+  revokeGrant(grantId: string, company?: string | null): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `${this.scope(company)}/grants/${encodeURIComponent(grantId)}`,
+    );
   }
 
   /** Capture feedback (optionally preview the exact issue body first). */
