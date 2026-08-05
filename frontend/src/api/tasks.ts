@@ -4,6 +4,7 @@
 
 import type { OpenCompanyClient } from "./client";
 import type { RunSummary } from "./runs";
+import type { TurnStepFailure } from "./types";
 
 /** A board card as the host returns it. */
 export interface Task {
@@ -92,8 +93,12 @@ export type TimelineKind =
  * glitch: the trace is written *as the turn executes*, so a host killed
  * mid-tool-call leaves that call recorded exactly as it stood. It means
  * in-flight-when-the-trace-stopped — render it as such, never as a failure.
+ *
+ * `awaiting_approval` (#411) is the other non-failure: the call was gated and
+ * is waiting on a person. Use {@link isFailedStep} rather than testing for
+ * "not ok", which would sweep both of these in as failures.
  */
-export type StepStatus = "ok" | "error" | "running";
+export type StepStatus = "ok" | "error" | "running" | "awaiting_approval";
 
 /**
  * One entry on a task's timeline (#185) — the same scrubbed vocabulary the host
@@ -117,8 +122,22 @@ export interface TimelineEntry {
   kind: TimelineKind;
   /** A short, past-tense human label rendered verbatim. */
   label: string;
-  /** Optional scrubbed detail; expands under the row when present. */
+  /**
+   * Optional scrubbed detail; expands under the row when present. On a run
+   * step this is **what the call was doing** — its arguments, redacted
+   * host-side and bounded (#411).
+   */
   detail?: string;
+  /**
+   * On a run step: **what came back** — a shape summary, an intrinsic tool's
+   * own message, or a failure's plain-language cause (#411). Absent on
+   * task-timeline entries, which have no such notion.
+   */
+  result?: string;
+  /** On a run step: the typed reason it did not succeed (#411). */
+  failure?: TurnStepFailure;
+  /** On a run step: the result was cut before the agent read all of it (#410). */
+  truncated?: boolean;
   /**
    * How a run-trace step ended (#242). Absent on task-timeline entries, which
    * have no such notion — so `undefined` means "not a step", never "unknown

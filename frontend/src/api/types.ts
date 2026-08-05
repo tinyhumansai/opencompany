@@ -33,23 +33,96 @@ export interface CompanyStatus {
 /** What kind of processing step this is (drives the timeline icon). */
 export type TurnStepKind = "tool_call" | "thinking" | "note";
 
-/** How a processing step ended. */
-export type TurnStepStatus = "ok" | "error" | "running";
+/**
+ * How a processing step ended.
+ *
+ * `awaiting_approval` (#411) is **not** a failure: the call was gated and is
+ * waiting on a person. It used to arrive as `error`, which made the one step an
+ * operator could act on look like the one thing that had crashed. Anything
+ * counting failures must key on `error` alone — see {@link isFailedStep}.
+ */
+export type TurnStepStatus = "ok" | "error" | "running" | "awaiting_approval";
+
+/**
+ * Why a step did not succeed, in the failure's own terms (#411). Mirrors
+ * `TurnStepFailure` in `src/ports/types.rs`.
+ *
+ * Rendered by lookup, never by reading the prose in `result` — the whole point
+ * is that the console switches on a known state instead of pattern-matching a
+ * sentence. Absent on a success, on a step still `running`, and on a parked
+ * one (its status already says what it is).
+ */
+export type TurnStepFailure =
+  | "declined"
+  | "blocked_by_policy"
+  | "unauthorized"
+  | "missing_permission"
+  | "missing_app"
+  | "timeout"
+  | "unavailable"
+  | "failed";
 
 /**
  * One visible step in an agent turn's processing timeline. Mirrors `TurnStep`
  * in `src/ports/types.rs`. The host folds and scrubs these from the turn's
- * progress stream: `label`/`detail` never carry raw tool arguments, tool
- * output, or call ids — only a safe label and an optional scrubbed detail.
+ * progress stream: nothing here carries raw tool output or call ids, and
+ * arguments reach `detail` only through the host-side redactor an approval card
+ * already uses (#372).
  */
 export interface TurnStep {
   kind: TurnStepKind;
   status: TurnStepStatus;
   label: string;
-  /** A muted, scrubbed detail (e.g. an MCP `server · tool`, a failure cause). */
+  /**
+   * **What the step was doing** — its arguments, redacted host-side and
+   * bounded (#411). This is what tells two calls to the same tool apart.
+   */
   detail?: string;
+  /**
+   * **What came back** — a shape summary (`"12 items"`), an intrinsic tool's
+   * own message, or a failure's plain-language cause (#411). Never a remote
+   * body's content.
+   */
+  result?: string;
+  /** The typed reason the step did not succeed (#411). */
+  failure?: TurnStepFailure;
+  /** The result was cut before the agent could read all of it (#410). */
+  truncated?: boolean;
   /** How long a tool call took, in milliseconds, when known. */
   elapsedMs?: number;
+}
+
+/**
+ * Short, operator-facing copy for each {@link TurnStepFailure}, plus the word
+ * for a parked step.
+ *
+ * One table, used by both render surfaces (the chat bubble's step timeline and
+ * the task Attempts tab), so a failure cannot be named two different things
+ * depending on where you happen to be looking at it.
+ */
+export const STEP_FAILURE_LABEL: Record<TurnStepFailure, string> = {
+  declined: "Declined",
+  blocked_by_policy: "Blocked by policy",
+  unauthorized: "Unauthorized",
+  missing_permission: "Missing permission",
+  missing_app: "App unavailable",
+  timeout: "Timed out",
+  unavailable: "Service unavailable",
+  failed: "Failed",
+};
+
+/** The word for a step waiting on a person. Not a failure. */
+export const AWAITING_APPROVAL_LABEL = "Awaiting approval";
+
+/**
+ * Whether a step counts as **failed**.
+ *
+ * The single place the question is answered on the client, mirroring
+ * `TurnStepStatus::is_failure` on the host. A parked step is deliberately not a
+ * failure (#411).
+ */
+export function isFailedStep(status: TurnStepStatus | undefined): boolean {
+  return status === "error";
 }
 
 /** One channel reply from a cycle. */
