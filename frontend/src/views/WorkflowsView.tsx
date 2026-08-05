@@ -690,6 +690,15 @@ export function WorkflowsView({
 
   const selected = workflows.find((w) => w.id === selectedId) ?? null;
 
+  // id → display name, for the toolbar picker's closed state. A workflow's id
+  // is not its name, and the trigger renders the raw value unless it is handed
+  // this mapping — issue #270, where the closed picker read
+  // `e2e_conflict_1785687393855` while the open popup read "Conflict probe".
+  const workflowLabels = useMemo(
+    () => Object.fromEntries(workflows.map((w) => [w.id, w.name])),
+    [workflows],
+  );
+
   // The full node model (kind/name/summary/agent/config) for the clicked node,
   // looked up from the loaded graph so the inspector shows fields the laid-out
   // canvas node data doesn't carry (agent, config, …).
@@ -738,21 +747,32 @@ export function WorkflowsView({
         </div>
         <div className="flex items-center gap-2">
           <Select
-            value={selectedId ?? undefined}
+            // Issue #406, half one. NOT `selectedId ?? undefined`: Base UI
+            // decides controlled-vs-uncontrolled ONCE, on the first render,
+            // from `value !== undefined` — and on that render the list has not
+            // arrived, so `selectedId` is still null. Handing it `undefined`
+            // there locked the picker uncontrolled for its whole life, and
+            // every selection this view makes for itself — the auto-select
+            // when the list lands, a card in Browse, the re-select after a
+            // delete — then moved `selectedId` without ever reaching the
+            // picker, which went on rendering its own untouched initial value.
+            // Clicking an option worked, which is why only the operator saw
+            // this. `null` is Base UI's own "nothing is selected", so passing
+            // it keeps the picker controlled from the first render on.
+            value={selectedId}
             onValueChange={(v) => setSelectedId(v)}
             disabled={loadingList || workflows.length === 0}
+            // Issue #406, half two. This map is what makes the trigger show a
+            // name instead of an id (#270). It replaces a `SelectValue`
+            // function child that did the same lookup by hand — because a
+            // function child ALSO overrides `placeholder`, which is how an
+            // empty selection came to render nothing at all rather than "Pick
+            // a workflow". Formatting through `items` leaves the placeholder
+            // reachable.
+            items={workflowLabels}
           >
             <SelectTrigger className="h-8 w-56">
-              {/* The trigger renders the raw value unless told otherwise, and a
-                  workflow's id is not its name — the closed picker showed
-                  `e2e_conflict_1785687393855` where the popup showed "Conflict
-                  probe". Resolve it back through the list the popup is built
-                  from; fall back to the id if the list has not arrived yet. */}
-              <SelectValue placeholder={loadingList ? "Loading…" : "Pick a workflow"}>
-                {(selected) =>
-                  workflows.find((w) => w.id === selected)?.name ?? String(selected ?? "")
-                }
-              </SelectValue>
+              <SelectValue placeholder={loadingList ? "Loading…" : "Pick a workflow"} />
             </SelectTrigger>
             <SelectContent>
               {workflows.map((w) => (
