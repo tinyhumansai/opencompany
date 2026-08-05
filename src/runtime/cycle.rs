@@ -1100,10 +1100,9 @@ fn cycle_thread_id(
             // (`chat: None`) went to the orchestrator with no conversation of its
             // own — a rival, not a neutral pass-through, for the same reason a
             // non-card turn rivals a card above.
-            CompanyEvent::OperatorMessage { chat, .. } => match chat {
-                Some(chat) => Some(chat.clone()),
-                None => return None,
-            },
+            // `?` rather than a match: an unaddressed message short-circuits the
+            // whole scan to `None`, which is the rival behaviour described above.
+            CompanyEvent::OperatorMessage { chat, .. } => Some(chat.as_ref()?.clone()),
             CompanyEvent::ApprovalResolved { approval_id, .. } => {
                 match approval_thread(approval_id) {
                     // Resolved an approval raised in a conversation: this cycle
