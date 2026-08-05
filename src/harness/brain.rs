@@ -1332,6 +1332,7 @@ impl HarnessBrain {
                 label: format!("MCP: {} unavailable", failure.server),
                 detail: Some(failure.scrubbed_message.clone()),
                 elapsed_ms: None,
+                ..TurnStep::default()
             });
             if let Some(events) = self.deps.events.as_ref() {
                 // Best-effort **per failure**. `drain` is a `mem::take`, so the

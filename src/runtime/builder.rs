@@ -2095,6 +2095,7 @@ mod test {
                             label: label.to_string(),
                             detail: None,
                             elapsed_ms: None,
+                            ..TurnStep::default()
                         },
                     },
                 )

@@ -1293,15 +1293,106 @@ pub struct TurnStep {
     /// the tool's server-computed `display_label`, else its tool name — never
     /// from tool arguments or output.
     pub label: String,
-    /// An optional muted detail: whitelisted, scrubbed enrichment (e.g. an MCP
-    /// `server · tool`, a delegated desk, a task title) or a plain-language
-    /// failure cause. **Never** raw tool output or arguments.
+    /// **What the step was doing** — a compact rendering of the call's
+    /// arguments, passed through the *same* host-side redactor an approval card
+    /// uses ([`crate::runtime::approval_display`], issue #372) and then bounded.
+    ///
+    /// This is what makes two calls to the same tool tell apart (issue #411):
+    /// two workspace reads used to render identically because nothing about
+    /// *what* was read reached the operator.
+    ///
+    /// Before #411 this field doubled as the failure cause. That moved to
+    /// [`result`](Self::result), which is where "what came back" belongs;
+    /// already-persisted rows keep whatever string they hold and still render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// **What came back** (issue #411).
+    ///
+    /// On success: a *summary* — the intrinsic tool's own OpenCompany-authored
+    /// output (bounded), or for every other tool a structural shape line
+    /// (`"12 items"`, `"2.4 kB"`) and never its content, because a remote body
+    /// is exactly what must not reach this surface.
+    ///
+    /// On a failure or a park: the plain-language cause in the failure's own
+    /// terms — the classifier's `cause_plain`, or the intrinsic tool's own
+    /// message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// The typed reason a step did not succeed (issue #411), so the console
+    /// renders a **known state** rather than parsing prose.
+    ///
+    /// `None` on a success, on a still-`Running` step, and on a step
+    /// [`AwaitingApproval`](TurnStepStatus::AwaitingApproval) — a park is not a
+    /// failure, and its status already says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TurnStepFailure>,
+    /// The result was **cut** before the agent could read all of it (issue
+    /// #410).
+    ///
+    /// Carried as its own typed flag rather than buried in prose, because a
+    /// silently truncated result is a distinct, actionable state: the call
+    /// succeeded, and the answer is still incomplete. That combination is
+    /// invisible in a status word, which is precisely how #410 stayed hidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// How long the step took in milliseconds, when known (tool calls report it;
     /// thinking/note steps do not).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+}
+
+/// `skip_serializing_if` for a `bool` that defaults to `false`, so a step that
+/// was not truncated serializes exactly as it did before the field existed and
+/// every stored row round-trips byte-identically.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for TurnStep {
+    /// A blank tool-call step, so the several construction sites that fill only
+    /// the fields they know can say `..TurnStep::default()` instead of
+    /// restating every optional field. The `kind`/`status` here are
+    /// placeholders that every real caller overrides.
+    fn default() -> Self {
+        Self {
+            kind: TurnStepKind::ToolCall,
+            status: TurnStepStatus::Ok,
+            label: String::new(),
+            detail: None,
+            result: None,
+            failure: None,
+            truncated: false,
+            elapsed_ms: None,
+        }
+    }
+}
+
+impl TurnStepStatus {
+    /// Whether this status means the step **failed**.
+    ///
+    /// The one place the question is answered, so the console's "N failed"
+    /// count, the destructive tone and any host-side tally cannot disagree.
+    /// [`AwaitingApproval`](Self::AwaitingApproval) is deliberately **not** a
+    /// failure: it is work waiting on a person (issue #411).
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::Error)
+    }
+
+    /// The `snake_case` word this status serializes as.
+    ///
+    /// The live turn-stream frame carries its status as a `&'static str` rather
+    /// than as this enum (it is a dumb transport that models no harness types),
+    /// so it needs the word without a serde round-trip. Deriving it here means
+    /// the live frame and the persisted step cannot disagree about what to call
+    /// the same state.
+    pub fn wire_word(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Running => "running",
+            Self::AwaitingApproval => "awaiting_approval",
+        }
+    }
 }
 
 /// The kind of a [`TurnStep`], driving its icon in the timeline. Serialized in
@@ -1319,7 +1410,7 @@ pub enum TurnStepKind {
 }
 
 /// How a [`TurnStep`] ended. Serialized in `snake_case` (`ok` / `error` /
-/// `running`).
+/// `running` / `awaiting_approval`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStepStatus {
@@ -1329,6 +1420,60 @@ pub enum TurnStepStatus {
     Error,
     /// Started but no completion was observed by the end of the turn.
     Running,
+    /// **Gated: waiting on a person** (issue #411).
+    ///
+    /// The approval policy refused the call inline and parked the projected
+    /// effect on the operator's queue. The turn genuinely could not continue —
+    /// but nothing *broke*, and counting it as a failure was the single most
+    /// misleading thing the timeline did: the one step an operator can act on
+    /// rendered as a crash.
+    ///
+    /// A distinct status rather than an [`Error`](Self::Error) carrying a
+    /// reason, because the "N failed" summary and the destructive tone both key
+    /// off the status word. A reason field would have left both still lying.
+    AwaitingApproval,
+}
+
+/// Why a [`TurnStep`] did not succeed, in the failure's own terms (issue #411).
+///
+/// The console renders a *known state* off this instead of pattern-matching the
+/// prose in [`TurnStep::result`] — a classifier keyed on a display string is the
+/// anti-pattern this exists to remove. The variants are a projection of
+/// OpenHuman's own `ToolFailureClass`, mapped in one exhaustive `match` in
+/// [`crate::harness::steps`], so a class added upstream is a compile error here
+/// rather than a silent fall-through to "something went wrong".
+///
+/// Deliberately **narrower** than the upstream class set: it is the vocabulary
+/// an operator can act on, not the vocabulary the classifier reasons in. The
+/// two connectivity classes (`ServiceUnavailable` / `ModelConnection`) collapse
+/// into [`Unavailable`](Self::Unavailable) because "wait, or check the link" is
+/// one action; the two refusal classes (`Denied` / `ApprovalExpired`) collapse
+/// into [`Declined`](Self::Declined) for the same reason.
+///
+/// Serialized in `snake_case`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStepFailure {
+    /// A person refused the action, or the approval request expired before
+    /// anyone answered. Never retried on its own.
+    Declined,
+    /// The company's own safety settings refused the action outright.
+    BlockedByPolicy,
+    /// The credentials the call needed are missing, expired, or were rejected —
+    /// an unauthorized response. The fix is a reconnect, not a retry.
+    Unauthorized,
+    /// The host lacks an operating-system permission the call needed.
+    MissingPermission,
+    /// A program or application the call needed is not available.
+    MissingApp,
+    /// The call ran past its deadline and was stopped.
+    Timeout,
+    /// A service the call depends on — an upstream API, or the model provider —
+    /// could not be reached.
+    Unavailable,
+    /// Genuinely unclassified. The honest residue, and the *only* case that may
+    /// read as "something went wrong": every state above used to land here.
+    Failed,
 }
 
 // ---------------------------------------------------------------------------
@@ -2119,6 +2264,7 @@ mod test {
             label: "Searching the web".to_string(),
             detail: Some("brave · search".to_string()),
             elapsed_ms: Some(1234),
+            ..TurnStep::default()
         };
         let json = serde_json::to_value(&step).unwrap();
         assert_eq!(json["kind"], "tool_call");
@@ -2139,6 +2285,7 @@ mod test {
             label: "Thinking".to_string(),
             detail: None,
             elapsed_ms: None,
+            ..TurnStep::default()
         };
         let json = serde_json::to_value(&bare).unwrap();
         assert_eq!(json["kind"], "thinking");
@@ -2182,6 +2329,7 @@ mod test {
                 label: "MCP: brave unavailable".to_string(),
                 detail: Some("server rejected the call".to_string()),
                 elapsed_ms: None,
+                ..TurnStep::default()
             }],
             reply_to: None,
         };
@@ -2265,6 +2413,7 @@ mod test {
                 label: "Reading messages".to_string(),
                 detail: None,
                 elapsed_ms: Some(12),
+                ..TurnStep::default()
             }],
         };
         let back: CompanyEvent =

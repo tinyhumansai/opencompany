@@ -890,6 +890,7 @@ mod test {
                 label: "Reading messages".to_string(),
                 detail: None,
                 elapsed_ms: Some(12),
+                ..TurnStep::default()
             },
         };
         let json = serde_json::to_string(&record).unwrap();

@@ -2446,6 +2446,7 @@ mod test {
                         label: "Reading messages".to_string(),
                         detail: None,
                         elapsed_ms: Some(9),
+                        ..TurnStep::default()
                     }],
                 },
             )
@@ -3308,6 +3309,7 @@ mod test {
                 label: "Reading messages".into(),
                 detail: None,
                 elapsed_ms: Some(12),
+                ..TurnStep::default()
             }],
         }))
         .expect("agent_reply is an attention signal");

@@ -1911,6 +1911,7 @@ pub async fn assert_run_store(runs: Arc<dyn crate::ports::runs::RunStore>) {
             label: label.to_string(),
             detail: None,
             elapsed_ms: Some(5),
+            ..TurnStep::default()
         },
     };
 
