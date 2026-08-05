@@ -125,6 +125,20 @@ export function effectDone(kind: string, amountUsd?: number | null): string {
 const TOOL_LABELS: Readonly<Record<string, string>> = {
   shell: "Run a terminal command",
   glob: "Search files in its workspace",
+  // Issue #374 added a second reader of these labels — the Standing permissions
+  // list — where the payload block that used to disambiguate an unlabelled tool
+  // does not exist. Two permissions both reading "Use one of its tools" would be
+  // indistinguishable, so the tools that can actually hold one (the catch-all
+  // `Other` group) need real words rather than the generic fallback.
+  workspace_write: "Edit a note in its workspace",
+  workspace_read: "Read a note in its workspace",
+  workspace_list: "List its workspace notes",
+  memory_store: "Save something to its memory",
+  memory_recall: "Look something up in its memory",
+  web_fetch: "Fetch a web page",
+  query_company: "Look up something about the company",
+  // `mcp_registry_tool_call` is deliberately absent: EFFECT_LABELS already
+  // names it and is consulted first, so an entry here would be unreachable.
 };
 
 /**

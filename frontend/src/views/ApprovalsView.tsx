@@ -92,7 +92,7 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
   const [inFlight, setInFlight] = useState<ReadonlyMap<string, Verdict>>(() => new Map());
   const { approvals, now } = feed;
   const askerNames = useAskerNames(client, company, approvals);
-  const { grants, refreshGrants } = useStandingGrants(client, company);
+  const { grants, granterNames, refreshGrants } = useStandingGrants(client, company);
 
   const markInFlight = (id: string, verdict: Verdict | null) =>
     setInFlight((prev) => {
@@ -209,6 +209,7 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
           grants={grants}
           now={now}
           askerNames={askerNames}
+          granterNames={granterNames}
           onRevoke={async (id) => {
             try {
               await client.revokeGrant(id, company);
@@ -244,6 +245,10 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
  */
 function useStandingGrants(client: OpenCompanyClient, company: string | null) {
   const [grants, setGrants] = useState<StandingGrant[]>([]);
+  // Actor id → what to call them. Without this the row reads "granted by
+  // 019fd3d1bddf-000000000005", which is a runtime identifier in front of an
+  // operator — the thing the glossary rule forbids, and useless besides.
+  const [granterNames, setGranterNames] = useState<Map<string, string>>(new Map());
 
   const refreshGrants = useCallback(async () => {
     const next = await client.listGrants(company).catch(() => [] as StandingGrant[]);
@@ -256,6 +261,31 @@ function useStandingGrants(client: OpenCompanyClient, company: string | null) {
       const next = await client.listGrants(company).catch(() => [] as StandingGrant[]);
       if (live) setGrants(next);
     })();
+    // Who the granter ids belong to. Two reads, both allowed to fail: the
+    // roster is admin-only, so a member sees no names and the row falls back to
+    // a neutral phrase rather than to a raw id.
+    void (async () => {
+      const [me, users] = await Promise.all([
+        client
+          .get<{ id: string; email: string; displayName?: string }>(
+            `${client.scopeFor(company)}/auth/me`,
+          )
+          .catch(() => null),
+        client
+          .get<{ id: string; email: string; display_name?: string }[]>(
+            `${client.scopeFor(company)}/users`,
+          )
+          .catch(() => []),
+      ]);
+      if (!live) return;
+      const names = new Map<string, string>();
+      for (const u of users) names.set(u.id, u.display_name?.trim() || u.email);
+      // "you" outranks the roster name: an operator reading their own audit
+      // trail should not have to recognise their own user id or email.
+      if (me) names.set(me.id, "you");
+      setGranterNames(names);
+    })();
+
     // Slow on purpose. Mint and revoke from another browser are only
     // poll-visible in v1 (there is no event for them), and a permission list is
     // not something an operator watches change — a minute is well inside the
@@ -267,7 +297,7 @@ function useStandingGrants(client: OpenCompanyClient, company: string | null) {
     };
   }, [client, company, refreshGrants]);
 
-  return { grants, refreshGrants };
+  return { grants, granterNames, refreshGrants };
 }
 
 /**
@@ -281,11 +311,14 @@ function StandingPermissions({
   grants,
   now,
   askerNames,
+  granterNames,
   onRevoke,
 }: {
   grants: StandingGrant[];
   now: number;
   askerNames: Map<string, string>;
+  /** Actor id → display name; empty when the roster read was not permitted. */
+  granterNames: Map<string, string>;
   onRevoke: (id: string) => Promise<void>;
 }) {
   // Per row, not one flag for the section — #373's lesson: a single in-flight
@@ -321,7 +354,7 @@ function StandingPermissions({
                   <p className="text-xs text-muted-foreground">
                     {askerNames.get(g.agent) ?? g.agent} ·{" "}
                     {expired ? "expired" : `expires ${untilLabel(g.expires_at_millis, now)}`} ·
-                    granted {timeAgo(g.at_millis, now)} by {g.granted_by.id}
+                    granted {timeAgo(g.at_millis, now)} by {granterLabel(g, granterNames)}
                   </p>
                 </div>
                 <Button
@@ -345,6 +378,19 @@ function StandingPermissions({
       </div>
     </section>
   );
+}
+
+/**
+ * What to call whoever granted a permission.
+ *
+ * Never the raw actor id: that is a runtime identifier, and showing one to an
+ * operator is both against the glossary rule and useless — nobody recognises a
+ * uuid. When the roster cannot be read (a member, not an admin) the row says
+ * "someone with admin access", which is less information but not misleading.
+ */
+function granterLabel(g: StandingGrant, granterNames: Map<string, string>): string {
+  if (g.granted_by.kind !== "user") return "an automation";
+  return granterNames.get(g.granted_by.id) ?? "someone with admin access";
 }
 
 /** "in 42m" / "in 6h" / "in 3d" — how long a permission has left. */
