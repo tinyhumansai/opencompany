@@ -222,11 +222,12 @@ export function ArtifactsTab({
       ) : (
         !error && (
           <div className="rounded-xl border border-dashed py-10 text-center">
-            <p className="text-sm font-medium">No artifacts for this task yet</p>
+            <p className="text-sm font-medium">No deliverables for this task</p>
             <p className="mx-auto mt-1 max-w-sm text-xs text-muted-foreground">
-              A dispatch that finishes successfully records what the agent produced here, as a
-              version you can browse and edit. Files an agent writes into the workspace are not
-              captured yet — that producer is tracked separately (#244).
+              An agent publishes a file it wrote to put it here, where you can browse, edit and
+              version it. Plenty of tasks produce no file at all — a question answered, a check
+              run — and this stays empty for those. Nothing is captured automatically, so an empty
+              tab means nothing was produced, not that something was lost.
             </p>
           </div>
         )
@@ -235,7 +236,19 @@ export function ArtifactsTab({
   );
 }
 
-/** One artifact in the list: title, kind, how many versions, and the edit signal. */
+/**
+ * One artifact in the list: title, where it came from, kind, how many versions,
+ * and the edit signal.
+ *
+ * A **published** record shows its workspace path, which is what makes the list
+ * read as a set of files somebody produced rather than a pile of text blobs.
+ *
+ * A record with no `source` is a **legacy capture** (#244): before publishing
+ * existed, every completed dispatch minted an artifact from its chat reply,
+ * refusals and blocker messages included. Those are demoted with a muted label
+ * rather than deleted — the past is not rewritten, but the list must stop
+ * claiming they are deliverables.
+ */
 function ArtifactRow({ artifact, onOpen }: { artifact: ArtifactView; onOpen: () => void }) {
   const Icon = KIND_ICON[artifact.kind];
   const diff = artifact.humanEditDiff;
@@ -246,7 +259,18 @@ function ArtifactRow({ artifact, onOpen }: { artifact: ArtifactView; onOpen: () 
         onClick={onOpen}
       >
         <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-medium">{artifact.title}</span>
+        <span className="flex min-w-0 flex-1 flex-col items-start">
+          <span className="w-full truncate font-medium">{artifact.title}</span>
+          {artifact.source ? (
+            <span className="w-full truncate font-mono text-[10px] text-muted-foreground">
+              {artifact.source}
+            </span>
+          ) : (
+            <span className="w-full truncate text-[10px] italic text-muted-foreground">
+              chat reply (legacy capture)
+            </span>
+          )}
+        </span>
         {diff && <EditedBadge diff={diff} />}
         <Badge variant="outline" className="shrink-0 font-normal capitalize">
           {artifact.kind}
@@ -368,6 +392,19 @@ function ArtifactDetail({
             {artifact.kind}
           </Badge>
         </div>
+        {artifact.source ? (
+          <p className="mt-1.5 truncate font-mono text-[11px] text-muted-foreground">
+            {artifact.source}
+          </p>
+        ) : (
+          // A legacy capture. Saying so plainly is the point: an operator
+          // reading a refusal message should not have to work out why a blocker
+          // is filed as a deliverable.
+          <p className="mt-1.5 text-[11px] italic text-muted-foreground">
+            Captured from the agent's chat reply before deliverables were published explicitly —
+            this is a record of what was said, not a file the agent produced.
+          </p>
+        )}
         <p className="mt-2 text-[11px] text-muted-foreground">
           Created {whenOf(artifact.createdAtMillis)} · updated {whenOf(artifact.updatedAtMillis)}
         </p>
