@@ -78,7 +78,13 @@ pub mod types;
 /// the console's run route and the cron [`WorkflowScheduler`] so a run's history
 /// is uniform no matter what started it. See [`workflow_outcome`].
 pub mod workflow_outcome;
+/// Issue #395: resuming a workflow run that paused on a `requires_approval`
+/// node, once the operator has signed the gate off. See [`workflow_resume`].
+pub mod workflow_resume;
 pub mod workflow_scheduler;
+/// Issue #395: the supervisor-registration + outcome-journalling discipline
+/// every workflow entry point owes, in one place. See [`workflow_spawn`].
+pub mod workflow_spawn;
 
 pub use advance::{SYSTEM_ATTRIBUTION, advance_settled_card, append_result};
 pub use builder::{RuntimeBuilder, company_id_from_name};
@@ -93,7 +99,9 @@ pub use scheduler::{Clock, CompanyScheduler, FakeClock, SystemClock};
 pub use tools::StubToolProvider;
 pub use types::{ApprovalSummary, CompanyStatus, CycleReport};
 pub use workflow_outcome::{record_run_finished, sweep_interrupted_runs};
+pub use workflow_resume::WORKFLOW_APPROVE_KIND;
 pub use workflow_scheduler::WorkflowScheduler;
+pub use workflow_spawn::WorkflowSpawn;
 
 // The assembly struct lives under `company/` to match the `ports.md` sketch
 // (`src/company/runtime.rs`); re-export it here as the kernel's public surface.

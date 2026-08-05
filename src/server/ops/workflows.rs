@@ -25,7 +25,7 @@
 //! [`DeliveryReport`](crate::ports::DeliveryReport) rows lived in the console
 //! drawer until it was dismissed, and a scheduled run's reached only host
 //! stdout. The run route now journals every finished run through
-//! [`record_run_finished`] — the same helper the cron
+//! [`record_run_finished`](crate::runtime::record_run_finished) — the same helper the cron
 //! [`WorkflowScheduler`](crate::runtime::WorkflowScheduler) calls, so history is
 //! uniform whatever started the run — and `GET /workflows/runs` folds those
 //! events back out, newest first.
@@ -87,7 +87,6 @@ use crate::ports::types::{
     CompanyEvent, CompanyRecord, EventSeq, OverlayWorkflow, WorkflowNodeStatus,
 };
 use crate::runtime::cron::{CivilTime, CronExpr};
-use crate::runtime::record_run_finished;
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
 
@@ -858,7 +857,7 @@ impl IntoResponse for RunWorkflowOk {
 /// would break the guard is spawning *inside* an existing run's chain — which is
 /// why the orchestrator's `run_workflow` tool deliberately does NOT use this.
 fn spawn_workflow_run(
-    runtime: std::sync::Arc<crate::company::runtime::CompanyRuntime>,
+    runtime: &crate::company::runtime::CompanyRuntime,
     runner: std::sync::Arc<dyn crate::ports::WorkflowRunner>,
     workflow: WorkflowFile,
     input: Value,
@@ -866,49 +865,11 @@ fn spawn_workflow_run(
     String,
     tokio::task::JoinHandle<crate::Result<crate::ports::WorkflowRun>>,
 ) {
-    // Issue #371 mints the id above the runner so the error arm can still
-    // correlate; issue #383 mints it HERE, through the supervisor, so the same
-    // id is also an address an operator can send "stop" to. Deliberately not a
-    // second identifier — the run id the console already correlates SSE frames
-    // on IS the cancellation handle.
-    let (ctx, guard) = runtime.run_supervisor().begin(&workflow.id, false);
-    let run_id = ctx.run_id.clone();
-    let handle = tokio::spawn(async move {
-        // Held for the whole run INCLUDING the journal write below, so the
-        // window in which a cancel is accepted matches the window in which it
-        // can still do anything. Dropping on every exit path, unwind included,
-        // is why this is a guard rather than a call at the end.
-        let _guard = guard;
-        let result = runner.run(runtime.id(), &workflow, input, &ctx).await;
-        // Issue #228: journaled on BOTH arms. The caller may well have closed
-        // the tab; the record is what is still there tomorrow.
-        match result.as_ref() {
-            Ok(run) => {
-                record_run_finished(
-                    runtime.events(),
-                    runtime.id(),
-                    &workflow.id,
-                    false,
-                    &ctx.run_id,
-                    Ok(run),
-                )
-                .await;
-            }
-            Err(err) => {
-                record_run_finished(
-                    runtime.events(),
-                    runtime.id(),
-                    &workflow.id,
-                    false,
-                    &ctx.run_id,
-                    Err(err.to_string().as_str()),
-                )
-                .await;
-            }
-        }
-        result
-    });
-    (run_id, handle)
+    // Issue #395: the supervisor registration and the both-arms outcome
+    // journalling that used to live here now live in `WorkflowSpawn`, because
+    // approving a paused workflow gate starts a run too and owes exactly the
+    // same two things. One copy of the discipline, two entry points.
+    crate::runtime::WorkflowSpawn::new(runtime, runner).spawn(workflow, input, false)
 }
 
 /// `POST …/workflows/{wid}/run` (both scope forms).
@@ -958,7 +919,7 @@ async fn run_workflow(
     // modes cannot drift in what they start. Issue #228's journalling now lives
     // inside the task rather than around this await.
     let (run_id, handle) =
-        spawn_workflow_run(company.runtime.clone(), runner.clone(), file, body.input);
+        spawn_workflow_run(company.runtime.as_ref(), runner.clone(), file, body.input);
 
     if detach {
         // Returned before the engine has walked a node. From here the client
