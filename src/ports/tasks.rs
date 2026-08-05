@@ -239,7 +239,7 @@ pub fn cap_discussion(text: &str) -> String {
 /// [`PrereqStatus::Unknown`] — so a model that reaches for a surface this host
 /// cannot inspect produces an honest "we could not check this", never a false
 /// clear and never a lost plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PrereqKind {
     /// A `[[connection]]` the company declares (GitHub, Slack, …), checked

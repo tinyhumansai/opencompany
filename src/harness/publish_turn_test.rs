@@ -381,6 +381,7 @@ fn card(id: &str) -> TaskRecord {
         origin_chat_id: None,
         parent_task_id: None,
         output: None,
+        plan: None,
     }
 }
 

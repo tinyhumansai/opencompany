@@ -36,11 +36,32 @@ use crate::ports::{
 /// from the task port (#205) so this edge and the write boundary that validates
 /// the column cannot drift onto two different literals.
 use crate::ports::tasks::COLUMN_IN_PROGRESS as IN_PROGRESS;
+/// The board column a task must enter to be planned (issue #337). Read from the
+/// task port for the same reason the dispatch literal is.
+use crate::ports::tasks::COLUMN_PLANNING as PLANNING;
 
 /// Whether an upsert moves a card **into** `in_progress` (the dispatch edge).
 /// A card already in `in_progress` re-saved is not a fresh dispatch.
 fn task_enters_in_progress(prev_column: Option<&str>, next_column: &str) -> bool {
     next_column == IN_PROGRESS && prev_column != Some(IN_PROGRESS)
+}
+
+/// Whether an upsert moves a card **into** `planning` (the planning edge,
+/// issue #337).
+///
+/// Edge-fired on the *transition*, exactly like the dispatch edge above, and
+/// the shape is what gives the pass its "one per entry, no retry" property for
+/// free: a card already in Planning that is re-saved — an edit, a re-title, a
+/// note appended by the pass itself — is not a fresh entry, so it cannot start
+/// a second pass or bill a second model call.
+///
+/// It is a **spend gate**, and it is the second one the board has. Before #337
+/// only `in_progress` cost anything; a drag into Planning now buys one model
+/// call. That is deliberate and it is opt-in — Todo → In Progress still
+/// dispatches unplanned, so nobody is routed through planning who did not ask
+/// to be.
+fn task_enters_planning(prev_column: Option<&str>, next_column: &str) -> bool {
+    next_column == PLANNING && prev_column != Some(PLANNING)
 }
 
 /// Awaits a spawned follow-up cycle and flattens its two failure modes into one
@@ -214,6 +235,18 @@ pub struct CompanyRuntime {
     /// Feature-gated so the default build is unaffected.
     #[cfg(feature = "openhuman")]
     pub(crate) harness: Option<Arc<crate::harness::HarnessPool>>,
+    /// Issue #337: the company's planning station, when wired. Mirrors
+    /// [`harness`](Self::harness) — same feature gate, same
+    /// `None`-means-inert contract, wired by the
+    /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) from the same
+    /// `Arc<dyn HarnessModel>` the roster runs on.
+    ///
+    /// `None` (the default build, or any runtime built without a harness)
+    /// leaves the planning edge inert: a card dragged into Planning simply
+    /// rests there, exactly as it did before #337, and the boot sweep returns
+    /// it at the next start.
+    #[cfg(feature = "openhuman")]
+    pub(crate) planner: Option<Arc<crate::harness::planning::TaskPlanner>>,
     /// MCP installs and live connections for this runtime. The wrapper owns a
     /// company-home-scoped OpenHuman config while the live registry remains
     /// shared in-process with harness agents.
@@ -275,6 +308,8 @@ impl CompanyRuntime {
             quiesced: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "openhuman")]
             harness: None,
+            #[cfg(feature = "openhuman")]
+            planner: None,
             #[cfg(feature = "mcp")]
             mcp: None,
         }
@@ -318,6 +353,21 @@ impl CompanyRuntime {
     #[cfg(feature = "openhuman")]
     pub fn harness(&self) -> Option<&Arc<crate::harness::HarnessPool>> {
         self.harness.as_ref()
+    }
+
+    /// Issue #337: attach the company's planning station after construction
+    /// (called by the [`RuntimeBuilder`](crate::runtime::RuntimeBuilder)).
+    #[cfg(feature = "openhuman")]
+    pub fn set_planner(&mut self, planner: Arc<crate::harness::planning::TaskPlanner>) {
+        self.planner = Some(planner);
+    }
+
+    /// The company's planning station, if one is wired. `None` leaves the
+    /// planning edge inert — the card rests in Planning and the boot sweep
+    /// returns it.
+    #[cfg(feature = "openhuman")]
+    pub fn planner(&self) -> Option<&Arc<crate::harness::planning::TaskPlanner>> {
+        self.planner.as_ref()
     }
 
     /// Attaches the embedded MCP runtime used by REST and harness agents.
@@ -422,15 +472,26 @@ impl CompanyRuntime {
         &self.ops.tasks
     }
 
-    /// Upserts a board task and edge-fires a dispatch when the write moves the
-    /// card **into** `in_progress` — the drag into `in_progress` is the human
-    /// approval gate. The single write site for REST task mutations, so the
-    /// trigger cannot be bypassed by writing straight to the store.
+    /// Upserts a board task and edge-fires the board's two automatic entries:
+    /// a **dispatch** when the write moves the card into `in_progress`, and a
+    /// **planning pass** when it moves the card into `planning` (issue #337).
     ///
-    /// The dispatch is detached (see [`dispatch_task`](Self::dispatch_task)), so
-    /// the HTTP write returns immediately; the agent turn's result lands back on
-    /// the card asynchronously. Without an attached harness the board stays inert
-    /// — the card simply rests in `in_progress`.
+    /// The single write site for REST task mutations, so neither trigger can be
+    /// bypassed by writing straight to the store — and, just as importantly,
+    /// the planning pass's own settle routes back through here, so a plan hands
+    /// its card on through exactly the edge a human drag would fire rather than
+    /// through a second copy of the dispatch gate.
+    ///
+    /// Both are edge-fired on the *transition*, never on the state: a card
+    /// re-saved in the column it is already in is an edit, not a fresh entry,
+    /// and must not spend a second time. The two are also mutually exclusive by
+    /// construction — one write names one target column — so a card cannot be
+    /// planned and dispatched by the same upsert.
+    ///
+    /// Both are detached (`tokio::spawn`), so the HTTP write returns at once and
+    /// the result lands on the card asynchronously. Without an attached harness
+    /// both are no-ops and the board stays inert — the card simply rests where
+    /// it was put.
     pub async fn upsert_task(self: &Arc<Self>, task: &TaskRecord) -> Result<()> {
         let prev_column = self
             .ops
@@ -441,11 +502,42 @@ impl CompanyRuntime {
             .find(|t| t.id == task.id)
             .map(|t| t.column);
         let dispatch = task_enters_in_progress(prev_column.as_deref(), &task.column);
+        let plan = task_enters_planning(prev_column.as_deref(), &task.column);
         self.ops.tasks.upsert(&self.id, task).await?;
         if dispatch {
             self.dispatch_task(task).await;
         }
+        if plan {
+            self.plan_task(task);
+        }
         Ok(())
+    }
+
+    /// Fires the detached planning pass for a card that just entered
+    /// `planning` (issue #337). In the default build — and on any runtime built
+    /// without a harness — this is a no-op, keeping the column inert.
+    ///
+    /// Detached for the same reason [`dispatch_task`](Self::dispatch_task) is:
+    /// a pass makes a model call, and the board write that triggered it is an
+    /// HTTP request an operator is waiting on.
+    ///
+    /// Synchronous (no `async fn`) because there is nothing to await before the
+    /// spawn. Unlike a dispatch, a pass mints **no** attempt row — there is no
+    /// run, so there is nothing to write ahead of the spawn and nothing for a
+    /// boot reaper to find. The card's own presence in `planning` is what
+    /// records that a pass was started, and
+    /// [`sweep_stranded_planning`](crate::runtime::advance::sweep_stranded_planning)
+    /// is what recovers it if this process dies before the pass settles.
+    #[allow(unused_variables)]
+    fn plan_task(self: &Arc<Self>, task: &TaskRecord) {
+        #[cfg(feature = "openhuman")]
+        if self.planner.is_some() {
+            let task_id = task.id.clone();
+            let runtime = Arc::clone(self);
+            tokio::spawn(async move {
+                crate::harness::planning::run_planning_pass(runtime, task_id).await
+            });
+        }
     }
 
     /// Fires the detached [`TaskDispatched`] cycle for a task when a harness is
@@ -1298,7 +1390,69 @@ impl std::fmt::Debug for CompanyRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::task_enters_in_progress;
+    use super::{task_enters_in_progress, task_enters_planning};
+
+    /// Issue #337: the planning edge, on the same terms as the dispatch one.
+    /// Entering the column fires; resting in it does not.
+    #[test]
+    fn planning_fires_only_on_entering_planning() {
+        // The drag this feature exists for.
+        assert!(task_enters_planning(Some("todo"), "planning"));
+        // A card created straight into Planning is a genuine entry too.
+        assert!(task_enters_planning(None, "planning"));
+        // Already planning, re-saved — an edit, the pass's own note append, a
+        // re-title. This is what makes "one pass per entry, no retry" a
+        // property of the edge rather than a rule the planner has to remember,
+        // and it is what stops the settle's own write re-triggering the pass.
+        assert!(!task_enters_planning(Some("planning"), "planning"));
+        // Leaving Planning never fires it — including the success settle.
+        assert!(!task_enters_planning(Some("planning"), "in_progress"));
+        assert!(!task_enters_planning(Some("planning"), "todo"));
+        // No other column entry fires it.
+        for column in ["todo", "in_progress", "paused", "in_review", "done"] {
+            assert!(!task_enters_planning(Some("todo"), column), "{column}");
+        }
+    }
+
+    /// The two edges are mutually exclusive by construction: one write names
+    /// one target column, so no upsert can both plan and dispatch a card. This
+    /// is what makes the "planning happens BEFORE dispatch" ordering structural
+    /// rather than a matter of which `if` runs first in `upsert_task`.
+    #[test]
+    fn no_single_write_both_plans_and_dispatches() {
+        for prev in [None, Some("todo"), Some("planning"), Some("in_progress")] {
+            for next in [
+                "todo",
+                "planning",
+                "in_progress",
+                "paused",
+                "in_review",
+                "done",
+            ] {
+                assert!(
+                    !(task_enters_planning(prev, next) && task_enters_in_progress(prev, next)),
+                    "{prev:?} → {next} fires both edges"
+                );
+            }
+        }
+    }
+
+    /// The success settle's shape, pinned end to end: a pass that clears the
+    /// card writes `planning → in_progress`, which is NOT a planning entry (so
+    /// it cannot loop) and IS a dispatch entry (so the plan actually hands the
+    /// work on). Both halves matter; either one alone would be a bug.
+    #[test]
+    fn a_cleared_plan_hands_the_card_on_without_replanning_it() {
+        assert!(
+            !task_enters_planning(Some("planning"), "in_progress"),
+            "the settle must not re-enter the pass it is settling"
+        );
+        assert!(
+            task_enters_in_progress(Some("planning"), "in_progress"),
+            "the settle must fire the dispatch edge — that is why it routes \
+             through upsert_task rather than the plain store port"
+        );
+    }
 
     #[test]
     fn dispatch_only_on_entering_in_progress() {
