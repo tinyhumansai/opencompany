@@ -10,6 +10,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { useTheme } from "next-themes";
 import {
+  Bot,
   History,
   LayoutGrid,
   Loader2,
@@ -77,6 +78,7 @@ import {
 } from "@/views/workflows/graph";
 import { LastRunChip, RunHistoryPanel } from "@/views/workflows/RunHistoryPanel";
 import { WorkflowIndex, type IndexMode } from "@/views/workflows/WorkflowIndex";
+import { CopilotPanel } from "@/views/workflows/CopilotPanel";
 import { RunResultPanel } from "@/views/workflows/RunResultPanel";
 import { NodeDetailPanel } from "@/views/workflows/NodeDetailPanel";
 
@@ -230,6 +232,8 @@ export function WorkflowsView({
   // "No recent runs" rather than "never run": see `WorkflowIndex`.
   const [indexRuns, setIndexRuns] = useState<WorkflowRunOutcome[]>([]);
   const [indexRunsLoaded, setIndexRunsLoaded] = useState(false);
+  // Issue #303: the per-workflow copilot panel is open.
+  const [copilotOpen, setCopilotOpen] = useState(false);
   // Run ids the live fold has actually seen frames for. The fallback above
   // consults it so a console WITH a working stream never double-paints a run it
   // already watched, and one without it still gets the journaled answer.
@@ -801,6 +805,27 @@ export function WorkflowsView({
             <LayoutGrid className="mr-1.5 size-4" />
             Browse
           </Button>
+          {/* Issue #303. Needs a loaded graph, not just a selection: the
+              copilot's whole grounding IS the graph, and opening it against a
+              workflow that failed to load would give it nothing to answer
+              from. */}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setCopilotOpen((open) => !open);
+              // The inspector occupies the same corner. Two stacked panels on
+              // top of each other is worse than either alone.
+              setSelectedNodeId(null);
+            }}
+            disabled={!graph}
+            aria-pressed={copilotOpen}
+            data-testid="workflow-copilot-toggle"
+            title="Ask about this workflow — what it does, or why a run failed."
+          >
+            <Bot className="mr-1.5 size-4" />
+            Copilot
+          </Button>
           {historySupported && (
             <Button
               size="sm"
@@ -1000,8 +1025,27 @@ export function WorkflowsView({
               <Controls showInteractive={false} />
               <MiniMap pannable zoomable className="!hidden sm:!block" />
             </ReactFlow>
-            {selectedNode && (
-              <NodeDetailPanel node={selectedNode} onClose={() => setSelectedNodeId(null)} />
+            {/* Issue #303: the copilot and the node inspector share the canvas's
+                right edge, and the copilot wins while it is open — it was
+                opened deliberately, whereas a node click is incidental and is
+                already cleared when the copilot opens. */}
+            {copilotOpen && graph ? (
+              <CopilotPanel
+                // Remount per workflow. The panel replays that workflow's own
+                // transcript on mount, and keying it means a workflow switch
+                // can never leave the previous conversation on screen — the
+                // "no cross-workflow leakage" criterion, on the client side.
+                key={graph.id}
+                client={client}
+                company={company}
+                graph={graph}
+                runs={runs}
+                onClose={() => setCopilotOpen(false)}
+              />
+            ) : (
+              selectedNode && (
+                <NodeDetailPanel node={selectedNode} onClose={() => setSelectedNodeId(null)} />
+              )
             )}
           </>
         )}
