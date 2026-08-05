@@ -160,6 +160,19 @@ harness and a mocked inference backend — and one needs an external MCP server:
 Point `PW_HOST_BINARY` at a feature-gated build, or `PW_BASE_URL` at a host you
 brought up yourself, to cover those.
 
+The managed host starts from an **empty** environment and is handed only what it
+needs, so an inherited `OPENCOMPANY_PUBLIC_URL`, `OPENCOMPANY_MAIL_*`,
+`OPENCOMPANY_STORAGE` or `OPENCOMPANY_TENANT_ID` cannot quietly change what you
+are testing — the first two would stop the host echoing the sign-in code and
+strand the suite in bootstrap. Name anything else it should receive, such as a
+feature-gated build's inference credentials, in `PW_HOST_PASSTHROUGH` (a
+space-separated list of variable names).
+
+`PW_HOST_DATA_DIR` is wiped at the start of each run, so a run only ever deletes
+inside `../target/e2e`. Point it anywhere else and it is reused as it stands,
+with a line saying so — a mistyped or inherited value cannot take a directory
+you care about with it.
+
 The `dist/` can be served as static files by any web server (or mounted by the
 OpenCompany host); use `window.OPENCOMPANY_CONFIG` to point it at the API.
 
