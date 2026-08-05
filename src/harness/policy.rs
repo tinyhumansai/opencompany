@@ -1475,6 +1475,7 @@ mod tests {
             tool: tool.to_string(),
             args,
             at_millis: 1_000,
+            origin_thread: None,
         }
     }
 
@@ -1679,6 +1680,7 @@ mod tests {
             tool: "composio_execute".into(),
             args: args.clone(),
             at_millis: 1_000,
+            origin_thread: None,
         });
 
         queue.clear();

@@ -123,4 +123,20 @@ pub struct ApprovalSummary {
     /// did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// The chat thread this approval was raised in (issue #379) — a desk id for
+    /// a channel, a roster agent id for a direct message.
+    ///
+    /// The key that lets the console draw the request as a card *inside* that
+    /// conversation. Not derivable from [`agent`](Self::agent): a desk channel
+    /// and a direct message to that desk's lead are answered by the same
+    /// teammate, so placing the card by asker would raise one conversation's
+    /// request inside the other.
+    ///
+    /// `None` — and omitted from the wire — for an approval with no
+    /// conversation behind it (a workflow delivery, a scheduler tick) and for
+    /// every park journaled before this field existed. Both mean the same
+    /// thing to a reader: no channel owns it, so it appears on the Approvals
+    /// page and in no thread, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }

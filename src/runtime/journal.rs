@@ -92,6 +92,26 @@ enum JournalRecord {
         /// replay instead of failing to parse.
         #[serde(default)]
         task: Option<TaskLink>,
+        /// Which **chat thread** produced the parking cycle (issue #379) — the
+        /// desk id for a channel, the roster agent id for a direct message.
+        ///
+        /// The correlation key that lets an approval be raised in the
+        /// conversation that asked for it. [`Effect::agent`] cannot do that job:
+        /// a desk channel and a direct message to that desk's lead resolve to
+        /// the same agent id, so placing the card by asker would raise a
+        /// channel's request inside the lead's private DM.
+        ///
+        /// A plain `Option<String>` rather than a [`TaskLink`]-style enum,
+        /// because nothing downstream falls back to a heuristic when it is
+        /// absent: an approval with no thread matches no channel filter and
+        /// stays Approvals-page-only, which is exactly today's behaviour. So
+        /// "parked by a host that did not record threads" and "parked by a turn
+        /// with no conversation behind it" need not be told apart — both mean
+        /// "no channel owns this", and both are correct.
+        ///
+        /// `#[serde(default)]` is what lets a pre-#379 line replay.
+        #[serde(default)]
+        thread: Option<String>,
     },
     /// A parked approval that has since been resolved (approved or denied).
     ApprovalResolved {
@@ -175,6 +195,14 @@ pub struct PendingApproval {
     /// Which board task this approval was parked for (issue #333). `None` only
     /// for a journal line written before the link existed — see [`TaskLink`].
     pub task: Option<TaskLink>,
+    /// The chat thread that produced the parking cycle (issue #379) — a desk id
+    /// for a channel, a roster agent id for a direct message.
+    ///
+    /// `None` for a pre-#379 journal line *and* for every park with no
+    /// conversation behind it (a workflow delivery, a scheduler tick, a cycle
+    /// whose triggers were ambiguous). Both are the same fact downstream: no
+    /// channel owns this approval, so it is shown on the Approvals page only.
+    pub thread: Option<String>,
 }
 
 /// What an approval *was*, retained for the whole life of the journal — after
@@ -221,6 +249,15 @@ pub struct ApprovalOrigin {
     /// a workflow delivery, a scheduler tick, and the hosted brain's own gate.
     /// That is why it cannot be the only key — see [`task`](Self::task).
     pub run_id: Option<String>,
+    /// The chat thread the parking cycle answered (issue #379).
+    ///
+    /// The **conversation-level** key, and orthogonal to the two above: a chat
+    /// turn has a thread and no card, a dispatched card has a card and no
+    /// thread, and a desk turn triggered from a channel has both. Retained here
+    /// (not only on the live queue) so a *resolved* approval's origin thread is
+    /// still recoverable — which is what lets a follow-up cycle's own re-park
+    /// stay in the channel the first sign-off was asked in.
+    pub thread: Option<String>,
 }
 
 /// One approval currently waiting in the in-memory queue.
@@ -230,6 +267,9 @@ struct ParkedApproval {
     at_millis: u64,
     /// `None` only for a journal line written before #333.
     task: Option<TaskLink>,
+    /// The chat thread that parked it (issue #379); `None` when no conversation
+    /// produced it, or on a pre-#379 line.
+    thread: Option<String>,
 }
 
 /// A side effect that was **committed to run** (issue #351): what it was, which
@@ -536,6 +576,7 @@ impl RuntimeJournal {
                 effect,
                 at_millis,
                 task,
+                thread,
             } => {
                 state.retain_approval_effect(&id, &effect);
                 state.origins.insert(
@@ -545,6 +586,7 @@ impl RuntimeJournal {
                         kind: effect.kind.clone(),
                         task: task.clone(),
                         run_id: effect.run_id.clone(),
+                        thread: thread.clone(),
                     },
                 );
                 state.parked.insert(
@@ -553,6 +595,7 @@ impl RuntimeJournal {
                         effect,
                         at_millis,
                         task,
+                        thread,
                     },
                 );
             }
@@ -625,12 +668,19 @@ impl RuntimeJournal {
     /// it is, [`TaskLink::Task`] or [`TaskLink::Unlinked`], so that a missing
     /// link can only ever mean "written before #333". A caller with an
     /// `Option<&str>` in hand converts with [`TaskLink::from_task_id`].
+    ///
+    /// `thread` **is** an `Option`, and deliberately so (issue #379): unlike the
+    /// task link, nothing downstream distinguishes "no conversation produced
+    /// this" from "this host does not record conversations". Both mean no
+    /// channel owns the approval, and both correctly leave it on the Approvals
+    /// page alone.
     pub async fn record_parked(
         &self,
         id: &ApprovalId,
         effect: &Effect,
         at_millis: u64,
         task: TaskLink,
+        thread: Option<String>,
     ) -> Result<()> {
         {
             let mut state = self.state.lock().expect("journal state poisoned");
@@ -641,6 +691,7 @@ impl RuntimeJournal {
                     kind: effect.kind.clone(),
                     task: Some(task.clone()),
                     run_id: effect.run_id.clone(),
+                    thread: thread.clone(),
                 },
             );
             state.parked.insert(
@@ -649,6 +700,7 @@ impl RuntimeJournal {
                     effect: effect.clone(),
                     at_millis,
                     task: Some(task.clone()),
+                    thread: thread.clone(),
                 },
             );
             state.retain_approval_effect(id, effect);
@@ -658,6 +710,7 @@ impl RuntimeJournal {
             effect: effect.clone(),
             at_millis,
             task: Some(task),
+            thread,
         })
         .await
     }
@@ -828,6 +881,26 @@ impl RuntimeJournal {
             .map(|o| o.task.clone())
     }
 
+    /// The chat thread recorded for one approval (issue #379), read the same
+    /// per-id way as [`approval_task`](Self::approval_task) and for the same
+    /// reason — the origins map is unbounded, and a cycle needs at most the
+    /// couple of ids in its own batch.
+    ///
+    /// The outer `Option` is "no such approval"; the inner is "no conversation
+    /// behind it" (which a pre-#379 line is indistinguishable from, by design).
+    /// Reading it off the retained origin rather than the live queue is what
+    /// makes it answerable *after* the approval resolved — the case
+    /// [`cycle_thread_id`](crate::runtime::cycle) needs so a second sign-off
+    /// re-parks in the channel the first one was asked in.
+    pub fn approval_thread(&self, id: &ApprovalId) -> Option<Option<String>> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .origins
+            .get(id)
+            .map(|o| o.thread.clone())
+    }
+
     /// Records a minted single-use grant (issue #243).
     ///
     /// Called *before* the grant enters the live set, so the ordering failure
@@ -912,6 +985,7 @@ impl RuntimeJournal {
                 effect: parked.effect.clone(),
                 at_millis: parked.at_millis,
                 task: parked.task.clone(),
+                thread: parked.thread.clone(),
             })
             .collect();
         out.sort_by(|a, b| {
@@ -1214,7 +1288,13 @@ mod test {
         let id = ApprovalId::new("appr-tool");
 
         journal
-            .record_parked(&id, &effect(), 1_000, TaskLink::Task { id: "t-1".into() })
+            .record_parked(
+                &id,
+                &effect(),
+                1_000,
+                TaskLink::Task { id: "t-1".into() },
+                None,
+            )
             .await
             .unwrap();
         journal.record_resolved(&id).await.unwrap();
@@ -1276,7 +1356,7 @@ mod test {
         };
 
         journal
-            .record_parked(&id, &parked, 1_000, TaskLink::Unlinked)
+            .record_parked(&id, &parked, 1_000, TaskLink::Unlinked, None)
             .await
             .unwrap();
         journal.record_resolved(&id).await.unwrap();
@@ -1317,6 +1397,7 @@ mod test {
                 },
                 1_000,
                 TaskLink::Unlinked,
+                None,
             )
             .await
             .unwrap();
@@ -1348,7 +1429,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-1");
         journal
-            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked)
+            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked, None)
             .await
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
@@ -1385,7 +1466,13 @@ mod test {
         let theirs = ApprovalId::new("appr-theirs");
         let orphan = ApprovalId::new("appr-orphan");
         journal
-            .record_parked(&mine, &effect(), 1_000, TaskLink::Task { id: "t-1".into() })
+            .record_parked(
+                &mine,
+                &effect(),
+                1_000,
+                TaskLink::Task { id: "t-1".into() },
+                None,
+            )
             .await
             .unwrap();
         journal
@@ -1394,12 +1481,13 @@ mod test {
                 &effect(),
                 1_100,
                 TaskLink::Task { id: "t-2".into() },
+                None,
             )
             .await
             .unwrap();
         // No card behind it (a workflow delivery, an operator-chat turn).
         journal
-            .record_parked(&orphan, &effect(), 1_200, TaskLink::Unlinked)
+            .record_parked(&orphan, &effect(), 1_200, TaskLink::Unlinked, None)
             .await
             .unwrap();
 
@@ -1426,6 +1514,7 @@ mod test {
                 kind: "filing.submit".into(),
                 task: Some(TaskLink::Task { id: "t-1".into() }),
                 run_id: None,
+                thread: None,
             }),
         );
         assert_eq!(
@@ -1478,7 +1567,7 @@ mod test {
         // fact, written explicitly, and must not read back as the legacy shape.
         let fresh = ApprovalId::new("appr-new");
         journal
-            .record_parked(&fresh, &effect(), 5_000, TaskLink::Unlinked)
+            .record_parked(&fresh, &effect(), 5_000, TaskLink::Unlinked, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1497,6 +1586,96 @@ mod test {
         );
     }
 
+    /// A park line written before #379 has no `thread` key. It must replay as
+    /// "no thread" rather than failing to parse — which is what leaves every
+    /// already-parked approval on the Approvals page and in no channel, exactly
+    /// as it was before this shipped.
+    ///
+    /// The second half is the one that has to keep working after the resolution:
+    /// the thread is read off the retained origin, so it survives the queue
+    /// removal. That is what lets a follow-up cycle's own re-park stay in the
+    /// channel the first sign-off was asked in.
+    #[tokio::test]
+    async fn a_pre_379_parked_line_replays_with_no_thread_and_a_stamped_one_survives_resolution() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        let legacy = serde_json::json!({
+            "record": "ApprovalParked",
+            "id": "appr-legacy",
+            "effect": effect(),
+            "at_millis": 4_000,
+            "task": { "link": "unlinked" },
+        });
+        tokio::fs::write(&path, format!("{legacy}\n"))
+            .await
+            .unwrap();
+
+        let journal = RuntimeJournal::new(&path);
+        journal.load().await.expect("a pre-#379 line still replays");
+        let legacy_id = ApprovalId::new("appr-legacy");
+        assert_eq!(journal.pending().len(), 1);
+        assert_eq!(
+            journal.pending()[0].thread,
+            None,
+            "no key means no conversation owns it",
+        );
+        assert_eq!(journal.approval_thread(&legacy_id), Some(None));
+        assert_eq!(
+            journal.approval_task(&legacy_id),
+            Some(Some(TaskLink::Unlinked)),
+            "the #333 link is untouched by the new field",
+        );
+
+        // A park stamped with the desk channel that produced it.
+        let stamped = ApprovalId::new("appr-desk");
+        journal
+            .record_parked(
+                &stamped,
+                &effect(),
+                5_000,
+                TaskLink::Unlinked,
+                Some("desk-finance".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            journal
+                .pending()
+                .iter()
+                .find(|p| p.id == stamped)
+                .unwrap()
+                .thread,
+            Some("desk-finance".to_string()),
+        );
+
+        // Resolving drains the queue but must not drain the origin thread —
+        // the follow-up cycle reads it back from here.
+        journal.record_resolved(&stamped).await.unwrap();
+        assert!(journal.pending().iter().all(|p| p.id != stamped));
+        assert_eq!(
+            journal.approval_thread(&stamped),
+            Some(Some("desk-finance".to_string())),
+        );
+
+        // And it round-trips through a reload, from the raw line.
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let stamped_line = raw
+            .lines()
+            .find(|l| l.contains("appr-desk"))
+            .expect("the stamped park was appended");
+        assert!(
+            stamped_line.contains(r#""thread":"desk-finance""#),
+            "a thread-stamped park must say so on disk: {stamped_line}",
+        );
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        assert_eq!(
+            reloaded.approval_thread(&stamped),
+            Some(Some("desk-finance".to_string())),
+        );
+        assert_eq!(reloaded.approval_thread(&legacy_id), Some(None));
+    }
+
     #[tokio::test]
     async fn expired_record_removes_parked_and_survives_reload() {
         let dir = tmp_dir();
@@ -1504,7 +1683,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-exp");
         journal
-            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked)
+            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked, None)
             .await
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
@@ -1528,7 +1707,7 @@ mod test {
         let journal = RuntimeJournal::new(&path);
         let id = ApprovalId::new("appr-amend");
         journal
-            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked)
+            .record_parked(&id, &effect(), now_millis(), TaskLink::Unlinked, None)
             .await
             .unwrap();
 
@@ -1569,11 +1748,11 @@ mod test {
         let resolved = ApprovalId::new("appr-resolved");
         let expired = ApprovalId::new("appr-expired");
         journal
-            .record_parked(&resolved, &effect(), 1_000, TaskLink::Unlinked)
+            .record_parked(&resolved, &effect(), 1_000, TaskLink::Unlinked, None)
             .await
             .unwrap();
         journal
-            .record_parked(&expired, &effect(), 2_000, TaskLink::Unlinked)
+            .record_parked(&expired, &effect(), 2_000, TaskLink::Unlinked, None)
             .await
             .unwrap();
 
@@ -1604,6 +1783,7 @@ mod test {
             tool: "composio_execute".into(),
             args: serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" }),
             at_millis,
+            origin_thread: None,
         }
     }
 
@@ -1700,7 +1880,7 @@ mod test {
 
         let parked_id = ApprovalId::new("appr-parked");
         journal
-            .record_parked(&parked_id, &effect(), 500, TaskLink::Unlinked)
+            .record_parked(&parked_id, &effect(), 500, TaskLink::Unlinked, None)
             .await
             .unwrap();
         journal

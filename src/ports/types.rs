@@ -260,6 +260,41 @@ pub enum CompanyEvent {
         /// The task payload.
         task: serde_json::Value,
     },
+    /// An effect was parked for the operator's sign-off (issue #379).
+    ///
+    /// The counterpart to [`ApprovalResolved`](Self::ApprovalResolved), and the
+    /// reason it exists: parking was journal-only, so a console learned about a
+    /// new request only when its feed next polled — far too late to raise the
+    /// request inside the conversation that produced it.
+    ///
+    /// **Deliberately thin.** An id, a dotted kind, and the thread it came from
+    /// — no payload, no asker. The parked effect's arguments are redacted and
+    /// bounded exactly once, in
+    /// [`pending_approvals`](crate::company::CompanyRuntime::pending_approvals),
+    /// and putting them on a durable event would open a second surface that has
+    /// to redact. A reader reacts to this by re-reading the approvals feed,
+    /// which is where the safe projection lives.
+    ApprovalParked {
+        /// The approval now awaiting the operator.
+        approval_id: ApprovalId,
+        /// The parked effect's dotted kind, e.g. `payment.send`. Enough for a
+        /// reader to decide whether it cares before it re-reads the feed.
+        ///
+        /// Named `effect_kind` rather than `kind` because `CompanyEvent` is
+        /// serialized internally-tagged **under `kind`** — a variant field of
+        /// that name collides with the tag and does not compile. The projected
+        /// SSE frame calls it `kind` regardless: that envelope discriminates on
+        /// `type`, so the short name is free there.
+        effect_kind: String,
+        /// The chat thread the parking cycle was answering — a desk id for a
+        /// channel, a roster agent id for a direct message.
+        ///
+        /// `None` when no conversation produced it (a workflow delivery, a
+        /// scheduler tick, an ambiguous batch), which is also every park
+        /// journaled before this existed. Omitted from the wire when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<String>,
+    },
     /// An operator resolved a parked approval.
     ApprovalResolved {
         /// The approval that was resolved.

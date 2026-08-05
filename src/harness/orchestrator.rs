@@ -549,6 +549,16 @@ fn summarize_event(event: &CompanyEvent) -> String {
         // into what is a pure function over one event — real coupling for a
         // non-load-bearing insight string. The id is carried instead, which is
         // enough to correlate against the approvals surface and costs nothing.
+        // Issue #379. Same reasoning as the resolution arm below: the id, and
+        // only the id, plus the effect's dotted kind — which is a type name, not
+        // a payload. The thread it was raised in is deliberately not named: a
+        // thread id is a desk or a roster agent, and this string is a
+        // non-sensitive one-liner, not a routing surface.
+        CompanyEvent::ApprovalParked {
+            approval_id,
+            effect_kind,
+            ..
+        } => format!("approval {approval_id} parked ({effect_kind})"),
         CompanyEvent::ApprovalResolved {
             approval_id,
             verdict,

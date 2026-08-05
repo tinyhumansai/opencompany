@@ -82,6 +82,22 @@ pub struct GrantedCall {
     pub args: serde_json::Value,
     /// Epoch-millis the grant was minted, for TTL expiry.
     pub at_millis: u64,
+    /// The chat thread the approval was raised in (issue #379) — copied off the
+    /// approval's origin when the grant is minted, so the re-dispatched turn's
+    /// reply is journaled back into the conversation that asked for it.
+    ///
+    /// Deliberately **not** part of the redemption match: the operator approved
+    /// a call, not a location, and a grant that failed to match because the
+    /// turn came back on a different thread would silently re-park. It rides
+    /// along purely as routing.
+    ///
+    /// `None` when the parked approval carried no thread (a workflow delivery,
+    /// a scheduler tick) and on a grant replayed from a journal line written
+    /// before this field existed. Both fall back to
+    /// [`agent`](Self::agent) — today's behaviour, which is right for a DM and
+    /// was never right for a desk channel.
+    #[serde(default)]
+    pub origin_thread: Option<String>,
 }
 
 /// The live grant set: a cheap shared handle, the same pattern as
@@ -211,6 +227,7 @@ mod test {
             tool: tool.to_string(),
             args,
             at_millis: 1_000,
+            origin_thread: None,
         }
     }
 

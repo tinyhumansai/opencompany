@@ -694,6 +694,31 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             o["column"] = json!(column);
             o
         }
+        // Issue #379: a request just parked, so a console watching the
+        // conversation it came from can raise the card live instead of waiting
+        // for its next approvals poll.
+        //
+        // Three keys and no more — deny-by-default, like every other arm here.
+        // No `payload`: the effect's arguments are redacted exactly once, in
+        // `pending_approvals`, and this frame deliberately does not become a
+        // second place that has to. No `agent` either: the console reads the
+        // asker off the same refreshed summary. What is here is only enough to
+        // decide *whether* to refresh and *where* the card belongs.
+        CompanyEvent::ApprovalParked {
+            approval_id,
+            effect_kind,
+            thread,
+        } => {
+            let mut o = envelope("approval_parked");
+            o["approvalId"] = json!(approval_id.as_ref());
+            o["kind"] = json!(effect_kind);
+            // Omitted when no conversation produced it, so a page-only approval
+            // is page-only on the wire too.
+            if let Some(thread) = thread {
+                o["chatId"] = json!(thread);
+            }
+            o
+        }
         CompanyEvent::ApprovalResolved {
             approval_id,
             verdict,
@@ -3284,6 +3309,57 @@ mod test {
         // The scrubbed timeline rides along so a live listener sees the steps.
         assert_eq!(v["steps"][0]["label"], "Reading messages");
         assert_eq!(v["steps"][0]["status"], "ok");
+    }
+
+    /// Issue #379: the park frame carries an id, a kind and the channel — and
+    /// **nothing else**.
+    ///
+    /// The negative half is the load-bearing one. The effect's arguments are
+    /// redacted in exactly one place (`pending_approvals`), and if this frame
+    /// ever grew a `payload` key it would become a second surface that has to
+    /// redact and one day will not. Asserting the absence is what makes that a
+    /// build failure rather than a leak.
+    #[test]
+    fn projects_approval_parked_with_a_channel_and_no_payload() {
+        let v = super::project_event(&stored(CompanyEvent::ApprovalParked {
+            approval_id: ApprovalId::new("appr-1"),
+            effect_kind: "payment.send".into(),
+            thread: Some("desk-finance".into()),
+        }))
+        .expect("a parked approval is an attention signal");
+        assert_eq!(v["type"], "approval_parked");
+        assert_eq!(v["approvalId"], "appr-1");
+        assert_eq!(v["kind"], "payment.send");
+        assert_eq!(v["chatId"], "desk-finance");
+        for forbidden in ["payload", "agent", "amountUsd", "effect", "args"] {
+            assert!(
+                v.get(forbidden).is_none(),
+                "the park frame must stay thin — `{forbidden}` leaked: {v}",
+            );
+        }
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            6,
+            "type, seq, atMillis, approvalId, kind, chatId — and nothing more: {v}",
+        );
+    }
+
+    /// A park with no conversation behind it omits the channel entirely, so a
+    /// console filtering by thread matches it nowhere and it stays on the
+    /// Approvals page (#379).
+    #[test]
+    fn projects_approval_parked_without_a_channel_when_no_thread_produced_it() {
+        let v = super::project_event(&stored(CompanyEvent::ApprovalParked {
+            approval_id: ApprovalId::new("appr-cron"),
+            effect_kind: "email.send".into(),
+            thread: None,
+        }))
+        .expect("a parked approval is an attention signal");
+        assert_eq!(v["type"], "approval_parked");
+        assert!(
+            v.get("chatId").is_none(),
+            "a page-only approval must carry no channel: {v}",
+        );
     }
 
     #[test]

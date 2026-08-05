@@ -59,6 +59,20 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             task.to_string(),
             "a2a.task_received",
         ),
+        // Issue #379: the brain is told a request is now waiting, so it can
+        // reason about being blocked rather than only learning when the verdict
+        // arrives. The kind is the effect's type name; the payload is not here
+        // and never should be — the operator has not consented to it yet.
+        CompanyEvent::ApprovalParked {
+            approval_id,
+            effect_kind,
+            ..
+        } => (
+            Role::System,
+            "approvals".to_string(),
+            format!("parked {effect_kind} approval {approval_id}"),
+            "approval.parked",
+        ),
         CompanyEvent::ApprovalResolved {
             approval_id,
             verdict,

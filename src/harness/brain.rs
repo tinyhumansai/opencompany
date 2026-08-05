@@ -3740,6 +3740,7 @@ members = ["eng1", "eng2"]
                 tool: "composio_execute".into(),
                 args: args.clone(),
                 at_millis: now_millis(),
+                origin_thread: None,
             });
         let brain = brain_with_queue_and_events(dir.path(), requests, log.clone());
 
@@ -3817,6 +3818,7 @@ members = ["eng1", "eng2"]
                 tool: "composio_execute".into(),
                 args: serde_json::json!({}),
                 at_millis: now_millis(),
+                origin_thread: None,
             });
         let brain = brain_with_queue_and_events(dir.path(), requests, log.clone());
 

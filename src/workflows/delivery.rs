@@ -670,6 +670,9 @@ async fn park_effect(
             &effect,
             now_millis(),
             crate::runtime::journal::TaskLink::Unlinked,
+            // Issue #379: a workflow delivery has no conversation behind it, so
+            // there is no thread to raise it in. It stays Approvals-page-only.
+            None,
         )
         .await
     {
