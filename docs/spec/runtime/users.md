@@ -18,6 +18,14 @@ This is distinct from, and weaker than, the machine credentials in
 | Bootstrap | The manifest's `[users] admins` list |
 | Roles | `admin` (may invite and administer) / `member` |
 
+An `admin` is also what the write plane means by authority over the company: the
+routes that decide what the company reaches the world as — its Composio and
+provider connections, its inference provider and key, its mail identity, its
+Telegram bot, its MCP servers — require one. See
+[the write plane](../../modules/server/authority.md)
+for the table and the reasoning. A `member` reads those surfaces but does not
+change them.
+
 ## Storage
 
 Three ports, all keyed by `CompanyId` like every other:

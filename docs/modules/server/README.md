@@ -34,6 +34,13 @@ prosumer alias — by the `scoped` helper; the `ScopedCompany` extractor resolve
 the target runtime and enforces authorization per form (platform-or-operator +
 address check for `{id}`, operator + `sole()` for the alias).
 
+### Addressing is not authority
+
+`ScopedCompany` answers *may this principal talk to this company*, and stops
+there. A write that decides something **for** the company — what it reaches the
+world as — takes `AdminScopedCompany` instead. The routes, the reasoning, and
+why this is not a read/write split: [authority.md](authority.md).
+
 | Surface (`ops::*`) | Routes |
 |---|---|
 | `tasks` | `POST …/tasks`, `GET …/tasks`, `GET …/tasks/{id}` (the Task Detail read, #185), `PATCH`/`DELETE …/tasks/{id}`, `GET …/tasks/inflight`, `POST …/tasks/{id}/steer` (#111), `POST …/tasks/{id}/discussion` (#335) |
