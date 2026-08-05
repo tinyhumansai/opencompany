@@ -31,6 +31,7 @@ import {
   Rocket,
   ShieldCheck,
   SquareKanban,
+  Workflow,
   type LucideIcon,
 } from "lucide-react";
 
@@ -51,6 +52,7 @@ const KIND_ICONS: Record<string, LucideIcon> = {
   "handle.register": AtSign,
   "handle.renew": RefreshCw,
   "key.rotate": KeyRound,
+  "workflow.approve": Workflow,
 };
 
 /**

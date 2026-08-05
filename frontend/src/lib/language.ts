@@ -51,6 +51,12 @@ const EFFECT_LABELS = {
   mcp_registry_tool_call: "Use a connected tool",
   media_generate_image: "Generate an image",
   media_generate_video: "Generate a video",
+  // A workflow run that paused on a step marked "needs approval" (#395). The
+  // card is journal-driven like every other, so it renders through the existing
+  // projection — but without a glossary entry it fell through to "Do something
+  // that needs your sign-off", which tells an operator nothing about what they
+  // are about to restart. The payload names the workflow and the step.
+  "workflow.approve": "Continue a paused workflow",
 };
 
 export function effectAction(kind: string): string {
@@ -90,6 +96,7 @@ const EFFECT_DONE_LABELS = {
   mcp_registry_tool_call: "Used a connected tool",
   media_generate_image: "Generated an image",
   media_generate_video: "Generated a video",
+  "workflow.approve": "Continued a paused workflow",
 } satisfies Record<keyof typeof EFFECT_LABELS, string>;
 
 /**
