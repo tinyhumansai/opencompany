@@ -10,6 +10,8 @@
 //! its result type but wires no implementation — a runtime with no runner leaves
 //! the run route reporting "not wired", exactly like the other networked seams.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +42,20 @@ pub struct WorkflowRun {
     /// "silently dropped".
     #[serde(default)]
     pub deliveries: Vec<DeliveryReport>,
+    /// Whether an operator stopped this run before it reached its terminal
+    /// node(s) (issue #383).
+    ///
+    /// **A cancelled run is not a failed one.** The graph did nothing wrong and
+    /// the host did not go away — a human decided it had seen enough. That
+    /// distinction is the point of a separate flag rather than an `error`
+    /// string: the console's three terminal wordings ("failed", "interrupted by
+    /// a host restart", "stopped by an operator") stay distinguishable, and a
+    /// deliberate stop never lands in the failure count.
+    ///
+    /// `#[serde(default)]` so a `WorkflowRun` deserialized from a pre-#383
+    /// payload still loads, as `false`.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// What became of one attempt to deliver an `output` node's report.
@@ -263,7 +279,7 @@ pub struct DeliveryReport {
 /// [`WorkflowRunner::run`](WorkflowRunner::run) makes the compiler enumerate
 /// every entry point, which is the whole point — an entry point that forgot to
 /// mint an id would silently journal an uncorrelatable run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct WorkflowRunContext {
     /// The correlation id for this run, minted by the entry point.
     pub run_id: String,
@@ -272,16 +288,143 @@ pub struct WorkflowRunContext {
     /// event so the console can tell a nobody-was-watching run from a Run-button
     /// one *while it is happening*, not only once it settles.
     pub scheduled: bool,
+    /// The stop signal for this run (issue #383).
+    ///
+    /// A context built by
+    /// [`RunSupervisor::begin`](crate::runtime::RunSupervisor::begin) shares this
+    /// handle with the supervisor's registry, so
+    /// `POST …/workflows/runs/{runId}/cancel` can reach a run that is still
+    /// walking its graph. A context built by [`new`](Self::new) carries a handle
+    /// nobody else holds — nothing can ever fire it, which is exactly right for
+    /// a test or an entry point that opted out of registration.
+    pub cancel: RunCancel,
 }
 
+/// A one-way stop signal for one workflow run (issue #383).
+///
+/// # Why this is not the engine's `CancellationToken`
+///
+/// tinyflows *has* a `CancellationToken`, but no public entry point accepts one
+/// **together with** a `RunObserver`: `run_cancellable` hardcodes a
+/// `NoopObserver`, `run_with_observer` hardcodes a fresh token, and
+/// `build_and_run` — which takes both — is private. Reaching for the engine's
+/// token would therefore cost every cancellable run its per-node progress
+/// events (issue #371), which is a strictly worse trade than stopping the run
+/// host-side. So the runner selects on this signal instead and drops the engine
+/// future when it fires.
+///
+/// It also could not live here even if the engine's would do: this type is on
+/// the port, and the port compiles in the **default build**, which links no
+/// `tinyflows` at all.
+///
+/// # Semantics
+///
+/// Firing this stops the run **mid-await**, it does not let the current node
+/// finish. A node that was half way through an external side effect stays half
+/// way through it — the same class of outcome as the host being killed, which
+/// the boot sweep already handles, only operator-initiated and therefore more
+/// frequent. "Stopped", not "finished".
+///
+/// Cheap to [`Clone`] (a shared handle); firing is idempotent and safe from any
+/// thread.
+#[derive(Clone)]
+pub struct RunCancel {
+    /// A `watch` rather than a `Notify`: the runner has to be able to *await*
+    /// the signal inside a `select!`, and it must not matter whether the cancel
+    /// arrives before or after that await is first polled. A watch channel
+    /// carries the state, so a cancel that lands first is still observed;
+    /// `Notify` only carries an edge. The [`Arc`] keeps the sender alive for as
+    /// long as any handle exists, so a receiver can never see the channel close.
+    tx: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for RunCancel {
+    fn default() -> Self {
+        Self {
+            tx: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+}
+
+impl std::fmt::Debug for RunCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunCancel")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl RunCancel {
+    /// An un-fired signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fires the signal. Idempotent, and infallible by construction —
+    /// `send_replace` does not care whether anyone is listening, so cancelling a
+    /// run whose future has already settled is a silent no-op rather than an
+    /// error the caller has to decide what to do about.
+    pub fn cancel(&self) {
+        self.tx.send_replace(true);
+    }
+
+    /// Whether the signal has fired.
+    pub fn is_cancelled(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    /// Resolves once the signal has fired — **including when it fired before
+    /// this was first polled**, which is the whole reason for the watch channel.
+    ///
+    /// Cancel-safe: it holds no state of its own between polls, so dropping it
+    /// (which is what `select!` does to the losing branch) loses nothing.
+    pub async fn cancelled(&self) {
+        let mut rx = self.tx.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // Unreachable: `self` holds an `Arc` of the sender, so the
+                // channel cannot close while this future exists. Park rather
+                // than return, because returning would read as "cancelled" to
+                // every caller and stop a healthy run.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Equality over the run's **identity**, not its live state.
+///
+/// [`RunCancel`] is a shared handle whose value changes under both sides, so
+/// including it would make two clones of one context compare unequal the moment
+/// one of them was cancelled. The id and the scheduled flag are what callers
+/// (and tests) actually mean by "the same run context".
+impl PartialEq for WorkflowRunContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.run_id == other.run_id && self.scheduled == other.scheduled
+    }
+}
+
+impl Eq for WorkflowRunContext {}
+
 impl WorkflowRunContext {
-    /// A context with a freshly minted run id.
+    /// A context with a freshly minted run id and an unregistered stop signal.
     ///
     /// `scheduled` says whether a cron started the run rather than an operator.
+    ///
+    /// **The run this builds cannot be cancelled from the console**, because
+    /// nothing but this context holds the signal. Entry points that want an
+    /// operator to be able to stop the run go through
+    /// [`RunSupervisor::begin`](crate::runtime::RunSupervisor::begin) instead,
+    /// which mints the same thing and registers the handle. This constructor
+    /// stays for tests and for any caller that deliberately runs unregistered.
     pub fn new(scheduled: bool) -> Self {
         Self {
             run_id: crate::ports::ids::generate_id(),
             scheduled,
+            cancel: RunCancel::new(),
         }
     }
 }

@@ -608,6 +608,22 @@ pub enum CompanyEvent {
         /// currently the quietest**. `None` on a run that completed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Whether an operator stopped this run (issue #383) rather than it
+        /// finishing or failing.
+        ///
+        /// Deliberately **not** folded into [`error`](Self::WorkflowRunFinished):
+        /// a cancelled run carries no error at all, because nothing went wrong.
+        /// Three terminal readings now exist and each has to stay legible on its
+        /// own — a run that *failed* (an `error` naming a node), one
+        /// *interrupted by a host restart* (the boot sweep's synthetic error),
+        /// and one *stopped by an operator* (this flag, no error). Collapsing
+        /// any pair of them would put a deliberate stop in the failure count.
+        ///
+        /// Additive and replay-safe: `#[serde(default)]` decodes every row
+        /// written before #383 as `false`, and `skip_serializing_if` keeps a
+        /// non-cancelled run's line byte-identical to what it was.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancelled: bool,
     },
     /// A workflow run began (issue #371) — the opening bracket of a run's
     /// per-node progress trail.
@@ -3087,6 +3103,7 @@ mod test {
             ],
             pending_approvals: vec!["review".to_string()],
             error: None,
+            cancelled: false,
         };
         assert_eq!(round_trip(&event), event);
     }
@@ -3102,6 +3119,7 @@ mod test {
             deliveries: Vec::new(),
             pending_approvals: Vec::new(),
             error: Some("agent node `worker` had no inference source".to_string()),
+            cancelled: false,
         };
         assert_eq!(round_trip(&event), event);
     }
@@ -3129,6 +3147,7 @@ mod test {
                 deliveries: Vec::new(),
                 pending_approvals: Vec::new(),
                 error: None,
+                cancelled: false,
             }
         );
         // …and serializing it back emits nothing extra.
@@ -3216,6 +3235,7 @@ mod test {
                 deliveries: Vec::new(),
                 pending_approvals: vec!["review".to_string()],
                 error: None,
+                cancelled: false,
             }
         );
     }
