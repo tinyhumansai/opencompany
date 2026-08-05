@@ -332,7 +332,7 @@ impl<'a> CycleRunner<'a> {
                 Some(err) => format!("{RUN_CYCLE_FAILED_ERROR}: {err}"),
                 None => RUN_UNSETTLED_ERROR.to_string(),
             };
-            let outcome = RunOutcome::new(RunStatus::Failed).with_error(reason);
+            let outcome = RunOutcome::new(RunStatus::Failed).with_error(reason.clone());
             if let Err(err) = self.rt.runs().finish_run(company, id, outcome).await {
                 tracing::warn!(
                     company = %company,
@@ -340,6 +340,48 @@ impl<'a> CycleRunner<'a> {
                     error = %err,
                     "[runs] the terminality backstop could not settle an attempt row"
                 );
+                // The row is still active, so the card is still truthfully
+                // "being worked". Moving it now would claim an outcome the run
+                // history does not record.
+                continue;
+            }
+            // Issue #337: the card, too. Settling the row without moving the
+            // card is exactly the stranding this backstop exists to prevent,
+            // one level up — a brain that ignores `TaskDispatched`, or one that
+            // errored, leaves a card sitting in In Progress that nothing will
+            // ever re-drive, because `task_enters_in_progress` fires on the
+            // *transition* into that column and that already happened.
+            //
+            // The reason goes onto the note so the board says why, and the move
+            // is guarded: a card an operator has since dragged, or that a later
+            // attempt parked, is left exactly where it is.
+            match crate::runtime::advance::advance_settled_card(
+                self.rt.tasks().as_ref(),
+                company,
+                &run.task_id,
+                RunStatus::Failed,
+                &reason,
+            )
+            .await
+            {
+                Ok(Some(column)) => tracing::info!(
+                    company = %company,
+                    run = %id,
+                    task = %run.task_id,
+                    column,
+                    "[runs] the terminality backstop returned a stranded card"
+                ),
+                Ok(None) => {}
+                // Best-effort, like every other write here: the attempt row is
+                // already settled and the cycle's own outcome must not be
+                // replaced by a board-write fault.
+                Err(err) => tracing::warn!(
+                    company = %company,
+                    run = %id,
+                    task = %run.task_id,
+                    error = %err,
+                    "[runs] the terminality backstop settled an attempt but could not move its card"
+                ),
             }
         }
     }
@@ -1932,6 +1974,129 @@ mod test {
         );
         assert_eq!(run.error.as_deref(), Some(RUN_UNSETTLED_ERROR));
         assert!(run.finished_at_millis.is_some());
+    }
+
+    /// Issue #337: the backstop settles the **card** as well as the row.
+    ///
+    /// Driven offline through the default build's echo brain, which ignores
+    /// `TaskDispatched` entirely — so nothing produces a rich settle and the
+    /// backstop is the only thing that can move anything. Before this, it
+    /// closed the row and left the card in In Progress: the board claimed work
+    /// that provably was not happening, and nothing would re-drive it, because
+    /// `task_enters_in_progress` fires on the transition and that already
+    /// happened.
+    #[tokio::test]
+    async fn the_backstop_returns_a_card_its_run_abandoned() {
+        use crate::ports::tasks::{COLUMN_IN_PROGRESS, COLUMN_TODO, TaskRecord};
+
+        let home_dir = tmp_home();
+        let rt = RuntimeBuilder::fs_defaults(home_dir.path().to_path_buf(), manifest("full"))
+            .await
+            .unwrap();
+        rt.tasks()
+            .upsert(
+                rt.id(),
+                &TaskRecord {
+                    id: "t-1".to_string(),
+                    title: "Draft the spec".to_string(),
+                    note: None,
+                    column: COLUMN_IN_PROGRESS.to_string(),
+                    priority: "medium".to_string(),
+                    assignee: "ceo".to_string(),
+                    updated_at_millis: 1,
+                    origin_chat_id: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let run_id = pending_run(&rt, "t-1").await;
+
+        rt.run_cycle(vec![CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+            run_id: Some(run_id),
+        }])
+        .await
+        .expect("the cycle itself succeeds");
+
+        let card = rt
+            .tasks()
+            .list(rt.id())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == "t-1")
+            .expect("card");
+        assert_eq!(
+            card.column, COLUMN_TODO,
+            "an unsettled attempt must not leave its card claiming to be worked"
+        );
+        let note = card.note.expect("the board must say why");
+        assert!(note.contains(RUN_UNSETTLED_ERROR), "{note}");
+    }
+
+    /// The guard, at the backstop: a card an operator has already parked is
+    /// **not** dragged back to To-do by a late settle. The row still closes —
+    /// the two are independent, and only one of them is the operator's.
+    #[tokio::test]
+    async fn the_backstop_leaves_a_parked_card_exactly_where_the_operator_put_it() {
+        use crate::ports::tasks::{COLUMN_PAUSED, TaskRecord};
+
+        let home_dir = tmp_home();
+        let rt = RuntimeBuilder::fs_defaults(home_dir.path().to_path_buf(), manifest("full"))
+            .await
+            .unwrap();
+        rt.tasks()
+            .upsert(
+                rt.id(),
+                &TaskRecord {
+                    id: "t-1".to_string(),
+                    title: "Draft the spec".to_string(),
+                    note: Some("[operator] parked this".to_string()),
+                    column: COLUMN_PAUSED.to_string(),
+                    priority: "medium".to_string(),
+                    assignee: "ceo".to_string(),
+                    updated_at_millis: 1,
+                    origin_chat_id: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let run_id = pending_run(&rt, "t-1").await;
+
+        rt.run_cycle(vec![CompanyEvent::TaskDispatched {
+            task_id: "t-1".into(),
+            run_id: Some(run_id.clone()),
+        }])
+        .await
+        .expect("the cycle itself succeeds");
+
+        let card = rt
+            .tasks()
+            .list(rt.id())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == "t-1")
+            .expect("card");
+        assert_eq!(card.column, COLUMN_PAUSED);
+        assert_eq!(
+            card.note.as_deref(),
+            Some("[operator] parked this"),
+            "a refused move must not annotate the card either"
+        );
+        // …and the row is still closed, because bookkeeping is not the
+        // operator's business.
+        assert_eq!(
+            rt.runs()
+                .get_run(rt.id(), &run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Failed
+        );
     }
 
     /// The other backstop arm: the brain **errored**. The cycle error still
