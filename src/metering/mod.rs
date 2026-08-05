@@ -10,7 +10,7 @@
 //!   balance → [`Finances`] (balance, budget vs spend, revenue, spend by
 //!   category, the transaction journal).
 //!
-//! Two write-side pieces sit here rather than at their (feature-gated) call
+//! The write-side pieces sit here rather than at their (feature-gated) call
 //! sites, so their contracts are compiled and tested by the default CI build —
 //! see each module's docs:
 //!
@@ -26,6 +26,12 @@
 //!   [`SampleKind::Inference`](crate::ports::usage::SampleKind) samples behind
 //!   the token series and the token/cost totals, for **every** cognition path
 //!   rather than only the `openhuman` harness (issue #174).
+//! - [`planning`] mints the
+//!   [`SampleKind::PlanningCall`](crate::ports::usage::SampleKind) samples one
+//!   planning pass produces (issue #337) — charged to the whole-company bucket
+//!   rather than to the card's assignee, because planning is frequently what
+//!   *picks* the assignee and because a teammate at its daily cap must not be
+//!   unable to have work planned for it.
 //!
 //! WS2 owns the async-graphql wrappers (`graphql/usage.rs`,
 //! `graphql/finances.rs`); this module deliberately has no async-graphql
@@ -43,6 +49,9 @@ pub mod daily_budget;
 mod finances;
 pub mod inference;
 pub mod oauth;
+/// Issue #337: the planning pass's usage sample and its company-bucket
+/// attribution rule. See [`planning`].
+pub mod planning;
 pub mod search;
 mod types;
 mod usage;
@@ -55,6 +64,7 @@ pub use inference::{
     inference_sample, record_inference_usage,
 };
 pub use oauth::{UNKNOWN_PROVIDER, oauth_call_sample, record_oauth_call};
+pub use planning::{planning_sample, record_planning_usage};
 pub use search::{
     FALLBACK_SEARCH_COST_USD, MANAGED_SEARCH_PROVIDER, record_search_call, search_call_sample,
 };
