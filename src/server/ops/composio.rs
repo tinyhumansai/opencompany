@@ -975,15 +975,18 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{raw}");
     }
 
-    /// A machine credential cannot set the company's Composio token.
+    /// A machine credential may set the company's token — and is **named** in
+    /// the trail when it does.
     ///
-    /// It is a *verified platform* principal, so it clears the addressing
-    /// check that [`ScopedCompany`] applies — and is then refused anyway,
-    /// because a token names no person and this write must be attributable to
-    /// one. The status is `401`, not `403`: the guard resolves a human session
-    /// and there is none.
+    /// This is the deliberate half of the issue's "cannot, or if it may, the
+    /// write is attributed". Refusing the hosting control plane a route it
+    /// already sits above (it provisions the tenant and holds its database
+    /// credentials) would be ceremony, not a boundary, and it would contradict
+    /// the two-principal model in `docs/spec/runtime/config.md`. What it does
+    /// not get is anonymity: the entry names the tenant, so a machine-made
+    /// change is as reviewable afterwards as a human one.
     #[tokio::test]
-    async fn a_machine_credential_cannot_set_the_token() {
+    async fn a_machine_credential_is_named_when_it_sets_the_token() {
         use crate::server::platform_auth::{
             PlatformAuthConfig, PlatformClaims, UnsignedTenantVerifier,
         };
@@ -1000,7 +1003,7 @@ mod tests {
             companies: None,
         });
 
-        let (status, body, raw) = send_as(
+        let (status, _, raw) = send_as(
             &state,
             "PUT",
             "/api/v1/company/composio/token",
@@ -1008,8 +1011,27 @@ mod tests {
             Auth::Bearer(token),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{raw}");
-        assert_eq!(body["code"], "unauthorized", "{body}");
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+        let events = runtime
+            .events()
+            .read_from(runtime.id(), crate::ports::types::EventSeq::new(0), 100)
+            .await
+            .unwrap();
+        let by = events
+            .iter()
+            .find_map(|stored| match &stored.event {
+                crate::ports::types::CompanyEvent::ToolAccessChanged { by, .. } => by.clone(),
+                _ => None,
+            })
+            .expect("the machine write is journaled");
+        assert_eq!(
+            by.kind,
+            crate::ports::types::ActorKind::System,
+            "a machine is a machine, not a person: {by:?}"
+        );
+        assert_eq!(by.id, "tenant:platform", "the tenant is named: {by:?}");
     }
 
     /// Every accepted change to the company's tool access names the person who
