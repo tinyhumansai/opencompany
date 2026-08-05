@@ -57,7 +57,13 @@ POST   …/workflows/runs/{runId}/cancel       stop a run that is still walking 
 
 `detach` is the same idea as the approval one and reads the same way. Omitted
 (or `false`) the response is the settled run — `{ output, pendingApprovals,
-deliveries, runId }`, byte-unchanged. Set, the host answers **`202 Accepted`**
+deliveries, runId }`, byte-unchanged, plus `cancelled: true` **only** when the
+run was stopped while the request was still open. A synchronous run is
+cancellable like any other: its id is registered before the first node runs and
+the console learns it from the `workflow_run_started` frame, so a cancel can
+land mid-request. Without that flag the resulting `output: null` with no
+approvals and no deliveries would be indistinguishable from a run that
+legitimately produced nothing. Set, the host answers **`202 Accepted`**
 with `{ "runId": "…", "detached": true }` before the engine walks a node; the
 run is then followed through the `workflow_run_started` / `workflow_node_finished`
 / `workflow_run_finished` frames it already keys by that `runId`, and read back

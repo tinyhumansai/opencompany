@@ -777,6 +777,23 @@ struct RunWorkflowResponse {
     /// has been painting belong to the run it just awaited rather than a cron
     /// fire that overlapped it.
     run_id: String,
+    /// Whether an operator stopped this run while the request was still open
+    /// (issue #383).
+    ///
+    /// **A synchronous run is cancellable too**, which is easy to miss: the run
+    /// id is registered the moment `spawn_workflow_run` returns, and the console
+    /// learns it from the `workflow_run_started` SSE frame — so
+    /// `POST …/runs/{rid}/cancel` is reachable long before this response is
+    /// written. When that happens the runner resolves to a cancelled run whose
+    /// `output` is `null` with no approvals and no deliveries, which without
+    /// this flag is indistinguishable from a run that legitimately produced null
+    /// output and routed nothing.
+    ///
+    /// Omitted when false, exactly like
+    /// [`WorkflowRunOutcome::cancelled`](WorkflowRunOutcome), so an existing
+    /// caller's body is byte-unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cancelled: bool,
 }
 
 /// The `detach: true` response (issue #383): the run's id, handed back before
@@ -968,6 +985,7 @@ async fn run_workflow(
             pending_approvals: run.pending_approvals,
             deliveries: run.deliveries,
             run_id,
+            cancelled: run.cancelled,
         })),
         Ok(Err(err)) => Err(ApiError(err).into_response()),
         Err(join) => {
@@ -1930,6 +1948,7 @@ mod tests {
                 reason: crate::ports::DeliveryReason::RecipientNotEstablished,
             }],
             run_id: "run-1".into(),
+            cancelled: false,
         })
         .unwrap();
         assert_eq!(json["deliveries"][0]["node"], "done");
@@ -1959,6 +1978,7 @@ mod tests {
                 reason: crate::ports::DeliveryReason::ParkedForApproval,
             }],
             run_id: "run-1".into(),
+            cancelled: false,
         })
         .unwrap();
         assert_eq!(json["deliveries"][0]["status"], "pending");
@@ -1973,6 +1993,7 @@ mod tests {
             pending_approvals: Vec::new(),
             deliveries: Vec::new(),
             run_id: "run-1".into(),
+            cancelled: false,
         })
         .unwrap();
         assert_eq!(json["deliveries"], serde_json::json!([]));
@@ -3838,6 +3859,89 @@ label = "ok"
             assert!(
                 !c.completed.load(Ordering::SeqCst),
                 "the run must not have completed its work"
+            );
+        }
+
+        /// **A synchronous run can be cancelled mid-request, and its response
+        /// has to say so.**
+        ///
+        /// Easy to miss, because "detached" and "cancellable" sound like the
+        /// same feature: the run id is registered the moment the task is
+        /// spawned, and the console learns it from the `workflow_run_started`
+        /// frame — so the cancel route is reachable well before the synchronous
+        /// response is written. The runner then resolves to a cancelled run
+        /// whose `output` is `null` with no approvals and no deliveries, which
+        /// is byte-identical to a run that legitimately produced nothing. This
+        /// caller was the last reader in the PR still left guessing.
+        #[tokio::test]
+        async fn a_synchronous_run_cancelled_mid_request_says_so_in_its_response() {
+            let home_dir = home();
+            let c = stalled_company(home_dir.path()).await;
+
+            let mut running = Box::pin(
+                c.app
+                    .clone()
+                    .oneshot(run_request(serde_json::json!({ "input": {} }))),
+            );
+            // Wait until the runner is actually parked, then find the run the
+            // way the console does — by its id — and stop it.
+            tokio::select! {
+                _ = &mut running => panic!("the run answered before the runner was under way"),
+                () = c.entered.notified() => {}
+            }
+            // Off the supervisor rather than the journal: this stub is the
+            // `WorkflowRunner` port, so it never reaches the harness runner that
+            // writes `WorkflowRunStarted`. The supervisor is the registration
+            // the cancel route itself consults, which makes it the more direct
+            // assertion anyway — the id is addressable while the request is open.
+            let live = c.runtime.run_supervisor().live();
+            assert_eq!(live.len(), 1, "the open synchronous run is registered");
+            let (run_id, workflow_id) = live.into_iter().next().unwrap();
+            assert_eq!(workflow_id, "demo");
+            let response = c
+                .app
+                .clone()
+                .oneshot(cancel_request(&run_id))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a synchronous run is cancellable while its request is open"
+            );
+
+            // The still-open request now answers, and must not read as a clean
+            // empty success.
+            let response = running.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(body["cancelled"], true, "{body}");
+            assert_eq!(body["runId"], run_id.as_str(), "{body}");
+            assert!(
+                !c.completed.load(Ordering::SeqCst),
+                "the run must not have completed its work"
+            );
+        }
+
+        /// …and the flag is omitted entirely on a run nobody stopped, so an
+        /// existing caller's body is byte-unchanged.
+        #[tokio::test]
+        async fn an_uncancelled_synchronous_response_omits_the_flag() {
+            let home_dir = home();
+            let c = stalled_company(home_dir.path()).await;
+            c.release.notify_one();
+
+            let response = c
+                .app
+                .clone()
+                .oneshot(run_request(serde_json::json!({ "input": {} })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert!(
+                body.get("cancelled").is_none(),
+                "a run nobody stopped carries no flag at all: {body}"
             );
         }
 
