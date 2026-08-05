@@ -30,12 +30,12 @@ use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::{
-    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, OverlayDesk,
+    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, EventSeq, OutboundMessage, OverlayDesk,
     OverlayDeskMember, OverlayDeskOrder, StoredEvent, TurnStep, Verdict,
 };
 use crate::runtime::grants::{GrantId, GrantScope, MAX_STANDING_GRANT_MILLIS};
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
-use crate::server::chat_history::{MessageView, Viewer, history_for_desk};
+use crate::server::chat_history::{MessageView, ReactionView, Viewer, history_for_desk};
 use crate::server::error::ApiError;
 use crate::server::graphql::auth::GqlAuth;
 use crate::server::ops::language::{self, DEFAULT_DESK};
@@ -50,6 +50,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/companies/{id}", get(company_status))
         .route("/api/v1/companies/{id}/chat", post(operator_chat))
         .route("/api/v1/companies/{id}/chat/history", get(chat_history))
+        // Set or clear one reaction on one message (issue #364). Not registered
+        // through `scoped` because the two forms take different path tuples.
+        .route(
+            "/api/v1/companies/{id}/chat/messages/{seq}/reactions",
+            post(react_to_message_scoped),
+        )
         .route("/api/v1/companies/{id}/approvals", get(list_approvals))
         .route(
             "/api/v1/companies/{id}/approvals/{aid}",
@@ -58,6 +64,10 @@ pub fn router() -> Router<AppState> {
         // Single-company aliases (no id; resolved via the sole registered company).
         .route("/api/v1/company/chat", post(operator_chat_single))
         .route("/api/v1/company/chat/history", get(chat_history_single))
+        .route(
+            "/api/v1/company/chat/messages/{seq}/reactions",
+            post(react_to_message_single),
+        )
         .route("/api/v1/company/approvals", get(list_approvals_single))
         .route(
             "/api/v1/company/approvals/{aid}",
@@ -615,8 +625,12 @@ async fn company_events(
 /// domain fields that already exist on the [`CompanyEvent`], and any variant not
 /// explicitly listed — `OperatorMessage` (the operator's own echo),
 /// `WebhookReceived` / `A2aTaskReceived` (raw third-party payloads),
-/// `ScheduleFired`, `FeedbackFiled`, `MemoryFactDeleted` — is dropped so nothing
-/// unexpected (or secret-bearing) ever reaches the console. The actor (`by`) on
+/// `ScheduleFired`, `FeedbackFiled`, `MemoryFactDeleted`, `ReactionToggled` —
+/// is dropped so nothing unexpected (or secret-bearing) ever reaches the
+/// console. `ReactionToggled` is dropped on purpose rather than by oversight
+/// (issue #364): a reaction carries the reacting *person*, this stream has no
+/// per-viewer projection to resolve one into a label, and a reaction is
+/// reload-visible, which is all the issue asks for. The actor (`by`) on
 /// `ApprovalResolved` / `LifecycleChanged` is intentionally omitted: the console
 /// renders the attention item without it, and it can carry a user id.
 ///
@@ -640,11 +654,19 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             text,
             steps,
             task_id,
+            parent,
         } => {
             let mut o = envelope("agent_reply");
             o["chatId"] = json!(chat_id);
             o["agentId"] = json!(agent_id);
             o["text"] = json!(text);
+            // Issue #364: which thread inside the channel this reply belongs
+            // to, so a console watching live folds it under the same row a
+            // reload would. Omitted for a reply in the channel itself, so the
+            // legacy frame is unchanged.
+            if let Some(parent) = parent {
+                o["parentId"] = json!(parent.value().to_string());
+            }
             // Scrubbed timeline (same shape the POST body carries); omitted
             // when empty so a tool-less reply's wire form is unchanged.
             if !steps.is_empty() {
@@ -951,13 +973,33 @@ struct ChatMessage {
     /// The desk the message is addressed to. Defaults to the "General" desk.
     #[serde(default)]
     chat: Option<String>,
+    /// The message this one replies to, by its id (issue #364) — a thread reply
+    /// rather than a new line in the channel.
+    ///
+    /// A string, not a number, because that is what every other message id on
+    /// this API is: `chat/history` returns `id: "42"`, and a console that had to
+    /// remember which surface wanted which type would eventually get it wrong.
+    /// Parsed to a sequence position here, and a value that is not one is a 400
+    /// rather than a silently-dropped thread.
+    #[serde(default)]
+    parent: Option<String>,
 }
 
 /// A chat or approval-resolution response: the company's channel replies.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChatResponse {
     /// Channel responses produced by the cycle.
     responses: Vec<OutboundMessage>,
+    /// The durable id the operator's own message was journaled under (issue
+    /// #364), so the console can replace the local id it minted optimistically
+    /// with one a reload — or another operator — can resolve.
+    ///
+    /// Omitted when the cycle journaled nothing, and by every host predating
+    /// this field; a console that finds it missing knows not to offer actions
+    /// that would need it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
 }
 
 /// Runs one operator-chat cycle, returning the report and, when a complaint
@@ -967,6 +1009,7 @@ async fn run_chat(
     runtime: Arc<CompanyRuntime>,
     message: ChatMessage,
     by: Option<Actor>,
+    parent: Option<EventSeq>,
 ) -> Result<(CycleReport, Option<String>), ApiError> {
     runtime.ensure_running().await?;
     // Operator-chat feedback intent: a complaint phrase ("that was wrong — flag
@@ -1020,6 +1063,9 @@ async fn run_chat(
             // Thread the addressed desk through so the orchestrator brain can
             // route to that desk's lead member (issue #53).
             chat: message.chat,
+            // …and the message being replied to, so the thread is a fact about
+            // the transcript rather than about one browser (issue #364).
+            parent,
         }])
         .await?;
     Ok((report, feedback_note))
@@ -1038,19 +1084,36 @@ async fn chat_and_emit(
         .chat
         .clone()
         .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string());
-    let (report, feedback_note) = run_chat(runtime.clone(), message, by).await?;
+    // Issue #364: a thread reply names its parent by id. Rejected here rather
+    // than dropped, so a console sending a malformed parent learns that its
+    // reply would have landed in the channel instead of quietly finding it
+    // there later.
+    let parent = match message.parent.as_deref() {
+        Some(raw) => Some(parse_message_id(raw)?),
+        None => None,
+    };
+    let (mut report, feedback_note) = run_chat(runtime.clone(), message, by, parent).await?;
     emit_cycle_webhooks(state, id, &report).await;
     if let Some(note) = feedback_note {
         emit_feedback_webhook(state, id, &note).await;
     }
     // Journal each reply against the addressed desk so desk history can be read
     // back (GraphQL `Chat.history`, WS2c). Single-responder in v1.
-    for response in &report.responses {
-        let _ = runtime
+    //
+    // The append's returned sequence used to be discarded. It is the reply's
+    // durable id (issue #364) — the same id `chat/history` gives it on the next
+    // reload — so it goes back on the bubble, and a reaction or a thread reply
+    // made against a bubble the operator can still see names something every
+    // other reader can resolve.
+    for response in &mut report.responses {
+        let journaled = runtime
             .events()
             .append(
                 id,
                 CompanyEvent::AgentReply {
+                    // The answer joins the thread its question was asked in,
+                    // rather than opening one under the question (issue #364).
+                    parent,
                     // Issue #246: carry the card this turn opened onto the
                     // durable record, so the console's "card opened" chip
                     // survives a transcript reload instead of living only on
@@ -1070,10 +1133,39 @@ async fn chat_and_emit(
                 },
             )
             .await;
+        // Best-effort, exactly as it always was: a journal failure must not
+        // sink a reply the operator can already read. It only costs the bubble
+        // its durable id, which the console reads as "not saved" and refuses to
+        // thread or react on — the honest degradation.
+        match journaled {
+            Ok(seq) => response.message_id = Some(seq.value().to_string()),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "failed to journal a chat reply; the bubble has no durable id"
+            ),
+        }
     }
     Ok(Json(ChatResponse {
+        // The operator's own message is the cycle's single input event, so its
+        // sequence is the first the cycle journaled (issue #364).
+        message_id: report.input_seqs.first().map(|seq| seq.value().to_string()),
         responses: report.responses,
     }))
+}
+
+/// Parses a message id from the wire into the sequence position it names.
+///
+/// Message ids are stringified sequence positions everywhere this API exposes
+/// them, so this is the one place that turns one back — and the one place that
+/// refuses. A 400 rather than a silent `None`: a thread reply whose parent was
+/// dropped lands in the channel instead, which looks to the operator like the
+/// reply went missing.
+fn parse_message_id(raw: &str) -> Result<EventSeq, ApiError> {
+    raw.trim().parse::<u64>().map(EventSeq::new).map_err(|_| {
+        ApiError(OpenCompanyError::InvalidRequest(format!(
+            "'{raw}' is not a message id"
+        )))
+    })
 }
 
 /// Resolves who is sending a chat message.
@@ -1181,6 +1273,39 @@ struct ChatHistoryMessageDto {
     /// existed — so the legacy shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
+    /// The message this one replies to (issue #364), so a thread survives a
+    /// reload instead of collapsing into the channel. Omitted on a message
+    /// posted straight into the channel — which is every message journaled
+    /// before threads were persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<String>,
+    /// Who reacted to this message with what (issue #364), one row per person
+    /// per emoji. Omitted when nobody has, keeping the legacy shape.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reactions: Vec<ChatReactionDto>,
+}
+
+/// One person's reaction on a history message. Mirrors `Reaction` in
+/// `frontend/src/lib/chat.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatReactionDto {
+    /// The emoji.
+    emoji: String,
+    /// Who reacted, as a display label — never a raw user id.
+    by: String,
+    /// Whether the reading viewer is the one who reacted.
+    mine: bool,
+}
+
+impl From<ReactionView> for ChatReactionDto {
+    fn from(view: ReactionView) -> Self {
+        Self {
+            emoji: view.emoji,
+            by: view.by_label,
+            mine: view.mine,
+        }
+    }
 }
 
 impl From<MessageView> for ChatHistoryMessageDto {
@@ -1194,6 +1319,12 @@ impl From<MessageView> for ChatHistoryMessageDto {
             mine: view.mine,
             steps: view.steps,
             task_id: view.task_id,
+            parent_id: view.parent_id,
+            reactions: view
+                .reactions
+                .into_iter()
+                .map(ChatReactionDto::from)
+                .collect(),
         }
     }
 }
@@ -1303,6 +1434,132 @@ async fn chat_history_single(
     let runtime = sole(&state).map_err(IntoResponse::into_response)?;
     let id = runtime.id().clone();
     chat_history_response(&state, &id, runtime, &headers, query).await
+}
+
+/// Body for `POST {scope}/chat/messages/{seq}/reactions` (issue #364).
+#[derive(Debug, Deserialize)]
+struct ReactionBody {
+    /// The emoji to set or clear.
+    emoji: String,
+    /// `true` to set the reaction, `false` to clear it. Explicit rather than a
+    /// toggle so the request is idempotent: a retry, a double tap, or two
+    /// consoles racing all converge on what the caller asked for.
+    on: bool,
+}
+
+/// The longest emoji this route accepts, in bytes.
+///
+/// A ZWJ sequence (a flag, a family, a profession with a skin tone) is a
+/// handful of code points, so the cap has to be well above one character — but
+/// this field ends up in an append-only journal read by the operator
+/// projection, and nothing about "a reaction" needs more room than a grapheme
+/// cluster or two.
+const REACTION_MAX_BYTES: usize = 64;
+
+/// Checks an emoji is something a person could have tapped.
+///
+/// Deliberately **not** a Unicode emoji-property check: the console's palette is
+/// its own, a future one may offer more, and refusing an emoji this host has
+/// never heard of would break that for no safety gain. What it does refuse is
+/// what would make a reaction a smuggling channel — an empty string, a blob, and
+/// any control character (a newline in particular, which would let one journal
+/// line pretend to be two).
+fn validate_emoji(emoji: &str) -> Result<(), ApiError> {
+    let invalid = |why: &str| {
+        Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+            "a reaction {why}"
+        ))))
+    };
+    if emoji.trim().is_empty() {
+        return invalid("needs an emoji");
+    }
+    if emoji.len() > REACTION_MAX_BYTES {
+        return invalid("must be a single emoji, not a message");
+    }
+    if emoji.chars().any(char::is_control) {
+        return invalid("cannot contain control characters");
+    }
+    Ok(())
+}
+
+/// Shared body for both scope forms of the reaction route.
+///
+/// Authorized through [`chat_actor`] — the same gate a *send* passes. Reacting
+/// is writing into a company's transcript, so it can be neither easier nor
+/// harder than saying something in it.
+async fn react_to_message(
+    state: &AppState,
+    company: &CompanyId,
+    runtime: Arc<CompanyRuntime>,
+    headers: &HeaderMap,
+    seq: String,
+    body: ReactionBody,
+) -> Result<StatusCode, Response> {
+    let by = chat_actor(headers, state, company).await?;
+    let message_seq = parse_message_id(&seq).map_err(IntoResponse::into_response)?;
+    validate_emoji(&body.emoji).map_err(IntoResponse::into_response)?;
+    // The target must be a message. Without this the route would happily hang a
+    // reaction off an approval, a lifecycle change, or a sequence position that
+    // has never existed — none of which any reader could render, and all of
+    // which would sit in the log forever claiming otherwise.
+    let target = runtime
+        .events()
+        .read_from(company, message_seq, 1)
+        .await
+        .map_err(|e| ApiError(e).into_response())?;
+    let is_message = target
+        .first()
+        .filter(|stored| stored.seq == message_seq)
+        .is_some_and(|stored| {
+            matches!(
+                stored.event,
+                CompanyEvent::OperatorMessage { .. } | CompanyEvent::AgentReply { .. }
+            )
+        });
+    if !is_message {
+        return Err(
+            ApiError(OpenCompanyError::NotFound(format!("no chat message {seq}"))).into_response(),
+        );
+    }
+    runtime
+        .events()
+        .append(
+            company,
+            CompanyEvent::ReactionToggled {
+                message_seq,
+                emoji: body.emoji,
+                on: body.on,
+                by,
+            },
+        )
+        .await
+        .map_err(|e| ApiError(e).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/companies/{id}/chat/messages/{seq}/reactions` — set or clear
+/// one reaction on one message (issue #364).
+async fn react_to_message_scoped(
+    State(state): State<AppState>,
+    Path((id, seq)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ReactionBody>,
+) -> Result<StatusCode, Response> {
+    let company = CompanyId::new(&id);
+    let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
+    react_to_message(&state, &company, runtime, &headers, seq, body).await
+}
+
+/// `POST /api/v1/company/chat/messages/{seq}/reactions` (single-company alias).
+async fn react_to_message_single(
+    State(state): State<AppState>,
+    Path(seq): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ReactionBody>,
+) -> Result<StatusCode, Response> {
+    let runtime = sole(&state).map_err(IntoResponse::into_response)?;
+    let id = runtime.id().clone();
+    react_to_message(&state, &id, runtime, &headers, seq, body).await
 }
 
 /// `GET /api/v1/companies/{id}/approvals`.
@@ -1620,6 +1877,7 @@ async fn run_resolve(
     let report = crate::company::runtime::join_follow_up(follow_up).await?;
     emit_cycle_webhooks(state, company, &report).await;
     Ok(Json(ChatResponse {
+        message_id: None,
         responses: report.responses,
     })
     .into_response())
@@ -2568,6 +2826,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    parent: None,
                     task_id: None,
                     chat_id: "General".to_string(),
                     agent_id: "ceo".to_string(),
@@ -2582,6 +2841,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    parent: None,
                     task_id: None,
                     chat_id: "main".to_string(),
                     agent_id: "ceo".to_string(),
@@ -2637,6 +2897,7 @@ mod test {
             .append(
                 runtime.id(),
                 CompanyEvent::AgentReply {
+                    parent: None,
                     task_id: None,
                     chat_id: "main".to_string(),
                     agent_id: "ceo".to_string(),
@@ -2703,6 +2964,7 @@ mod test {
                 .append(
                     runtime.id(),
                     CompanyEvent::AgentReply {
+                        parent: None,
                         task_id,
                         chat_id: "main".to_string(),
                         agent_id: "ceo".to_string(),
@@ -2776,6 +3038,365 @@ mod test {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 0);
+    }
+
+    /* ---- issue #364: durable ids, threads, reactions, channel isolation ---- */
+
+    /// Posts a chat message and returns the decoded `ChatResponse` body.
+    async fn post_chat(app: &Router, cookie: &str, body: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "chat POST failed");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Reads a desk's history. `desk` empty reads the default General thread.
+    async fn get_history(app: &Router, cookie: &str, desk: &str) -> Vec<serde_json::Value> {
+        let uri = if desk.is_empty() {
+            "/api/v1/company/chat/history".to_string()
+        } else {
+            format!("/api/v1/company/chat/history?desk={desk}")
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value.as_array().cloned().unwrap_or_default()
+    }
+
+    /// Sets or clears one reaction, returning the status.
+    async fn post_reaction(
+        app: &Router,
+        cookie: &str,
+        seq: &str,
+        emoji: &str,
+        on: bool,
+    ) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/company/chat/messages/{seq}/reactions"))
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "emoji": emoji, "on": on }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The enabler for everything else in #364: a sent message comes back with
+    /// the durable id it was journaled under, on both halves of the exchange —
+    /// the operator's own line and each reply — and those ids are the same ones
+    /// `chat/history` returns on the next read.
+    #[tokio::test]
+    async fn chat_response_carries_durable_message_ids() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let sent = post_chat(&app, &cookie, r#"{"text":"hi"}"#).await;
+        let mine = sent["messageId"].as_str().expect("own message id");
+        let reply = sent["responses"][0]["messageId"]
+            .as_str()
+            .expect("reply message id");
+        assert_ne!(mine, reply, "the two halves are separate journal lines");
+
+        let history = get_history(&app, &cookie, "").await;
+        let ids: Vec<&str> = history.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&mine), "own id absent from history: {ids:?}");
+        assert!(
+            ids.contains(&reply),
+            "reply id absent from history: {ids:?}"
+        );
+    }
+
+    /// A thread reply survives a reload: the parent id posted with the message
+    /// comes back on both the operator's line and the answer it drew, so a
+    /// rehydrating console folds the exchange under the same row it was typed
+    /// under instead of flattening it into the channel.
+    #[tokio::test]
+    async fn thread_replies_survive_a_history_reload() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let root = post_chat(&app, &cookie, r#"{"text":"the plan"}"#).await;
+        let root_id = root["messageId"].as_str().unwrap().to_string();
+
+        let threaded = post_chat(
+            &app,
+            &cookie,
+            &serde_json::json!({ "text": "a follow-up", "parent": root_id }).to_string(),
+        )
+        .await;
+        assert!(
+            threaded["responses"][0]["messageId"]
+                .as_str()
+                .is_some_and(|id| id != root_id),
+            "the answer is its own journal line, not the root's"
+        );
+
+        let history = get_history(&app, &cookie, "").await;
+        let parented: Vec<(&str, Option<&str>)> = history
+            .iter()
+            .map(|m| (m["text"].as_str().unwrap(), m["parentId"].as_str()))
+            .collect();
+        // The root sits in the channel; both halves of the threaded exchange
+        // hang off it — the answer under the row the thread opened from, not
+        // under the question, so a thread never nests inside a thread.
+        assert!(
+            parented.contains(&("the plan", None)),
+            "root should be unparented: {parented:?}"
+        );
+        assert!(
+            parented.contains(&("a follow-up", Some(root_id.as_str()))),
+            "threaded message lost its parent: {parented:?}"
+        );
+        assert!(
+            parented
+                .iter()
+                .any(|(text, parent)| *text == "You said: a follow-up"
+                    && *parent == Some(root_id.as_str())),
+            "the reply to a threaded message left the thread: {parented:?}"
+        );
+    }
+
+    /// A parent that is not a message id is a 400, not a silently-flattened
+    /// thread: a reply that quietly lands in the channel reads to the operator
+    /// as a reply that went missing.
+    #[tokio::test]
+    async fn chat_rejects_a_parent_that_is_not_a_message_id() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hi","parent":"m3"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A reaction records who reacted and survives a reload; clearing it removes
+    /// the row; and setting the same reaction twice leaves exactly one row —
+    /// the explicit `on` flag is what makes the write idempotent.
+    #[tokio::test]
+    async fn reactions_persist_are_attributed_and_are_idempotent() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let sent = post_chat(&app, &cookie, r#"{"text":"ship it"}"#).await;
+        let target = sent["messageId"].as_str().unwrap().to_string();
+
+        assert_eq!(
+            post_reaction(&app, &cookie, &target, "👍", true).await,
+            StatusCode::NO_CONTENT
+        );
+        // Twice, deliberately: a retry or a double tap must not double the row.
+        assert_eq!(
+            post_reaction(&app, &cookie, &target, "👍", true).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let history = get_history(&app, &cookie, "").await;
+        let reacted = history
+            .iter()
+            .find(|m| m["id"].as_str() == Some(target.as_str()))
+            .expect("the reacted-to message is still in history");
+        let rows = reacted["reactions"].as_array().expect("reactions present");
+        assert_eq!(rows.len(), 1, "one row per person per emoji: {rows:?}");
+        assert_eq!(rows[0]["emoji"], "👍");
+        assert_eq!(rows[0]["mine"], true, "the reader is the one who reacted");
+        assert!(
+            rows[0]["by"].as_str().is_some_and(|by| !by.is_empty()),
+            "a reaction names who made it: {rows:?}"
+        );
+
+        // Clearing drops the row entirely rather than leaving a zero behind.
+        assert_eq!(
+            post_reaction(&app, &cookie, &target, "👍", false).await,
+            StatusCode::NO_CONTENT
+        );
+        let history = get_history(&app, &cookie, "").await;
+        let cleared = history
+            .iter()
+            .find(|m| m["id"].as_str() == Some(target.as_str()))
+            .unwrap();
+        assert!(
+            cleared.get("reactions").is_none(),
+            "a cleared reaction leaves no row: {cleared:?}"
+        );
+    }
+
+    /// A reaction may only name a chat message. A sequence position that holds
+    /// something else — or nothing at all — is a 404, so the log can never carry
+    /// a reaction no reader could render.
+    #[tokio::test]
+    async fn reactions_refuse_a_target_that_is_not_a_message() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+        let not_a_message = runtime
+            .events()
+            .append(
+                runtime.id(),
+                CompanyEvent::FeedbackFiled {
+                    note: "unrelated".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        assert_eq!(
+            post_reaction(
+                &app,
+                &cookie,
+                &not_a_message.value().to_string(),
+                "👍",
+                true
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        // A sequence position nothing has ever occupied.
+        assert_eq!(
+            post_reaction(&app, &cookie, "99999", "👍", true).await,
+            StatusCode::NOT_FOUND
+        );
+        // And a target that is not a sequence position at all.
+        assert_eq!(
+            post_reaction(&app, &cookie, "m3", "👍", true).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// A reaction is a journal line read by the operator projection, so it takes
+    /// an emoji and not a payload: empty, oversized, and control-character
+    /// bodies are all refused.
+    #[tokio::test]
+    async fn reactions_refuse_a_body_that_is_not_an_emoji() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let sent = post_chat(&app, &cookie, r#"{"text":"hi"}"#).await;
+        let target = sent["messageId"].as_str().unwrap().to_string();
+
+        for bad in ["", "   ", "yes\nno", &"x".repeat(REACTION_MAX_BYTES + 1)] {
+            assert_eq!(
+                post_reaction(&app, &cookie, &target, bad, true).await,
+                StatusCode::BAD_REQUEST,
+                "accepted a non-emoji reaction: {bad:?}"
+            );
+        }
+        // A multi-code-point emoji is still one reaction, and is accepted.
+        assert_eq!(
+            post_reaction(&app, &cookie, &target, "👩‍💻", true).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// Regression for the third acceptance item of #364, which the console's
+    /// own scoping already satisfied but nothing pinned: a message posted in one
+    /// channel must be absent from another, end to end through the route — not
+    /// only in the `owns` predicate. Reactions ride the same boundary.
+    #[tokio::test]
+    async fn a_message_in_one_channel_is_absent_from_another() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let in_studio = post_chat(&app, &cookie, r#"{"text":"studio only","chat":"studio"}"#).await;
+        let studio_id = in_studio["messageId"].as_str().unwrap().to_string();
+        post_chat(&app, &cookie, r#"{"text":"general only"}"#).await;
+        assert_eq!(
+            post_reaction(&app, &cookie, &studio_id, "👀", true).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let studio: Vec<String> = get_history(&app, &cookie, "studio")
+            .await
+            .iter()
+            .map(|m| m["text"].as_str().unwrap().to_string())
+            .collect();
+        let general = get_history(&app, &cookie, "").await;
+        let general_texts: Vec<&str> = general
+            .iter()
+            .map(|m| m["text"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            studio.iter().any(|t| t == "studio only"),
+            "the desk lost its own message: {studio:?}"
+        );
+        assert!(
+            !studio.iter().any(|t| t == "general only"),
+            "a General message leaked into the desk: {studio:?}"
+        );
+        assert!(
+            general_texts.contains(&"general only"),
+            "General lost its own message: {general_texts:?}"
+        );
+        assert!(
+            !general_texts.contains(&"studio only"),
+            "a desk message leaked into General: {general_texts:?}"
+        );
+        // The reaction is on the desk's message, so it is not visible from a
+        // channel that cannot see the message it is about.
+        assert!(
+            general.iter().all(|m| m.get("reactions").is_none()),
+            "a reaction crossed a channel boundary: {general:?}"
+        );
     }
 
     #[tokio::test]
@@ -3500,6 +4121,7 @@ mod test {
     fn projects_agent_reply_with_chat_fields_and_steps() {
         use crate::ports::types::{TurnStep, TurnStepKind, TurnStepStatus};
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            parent: None,
             task_id: None,
             chat_id: "General".into(),
             agent_id: "ceo".into(),
@@ -3523,6 +4145,48 @@ mod test {
         // The scrubbed timeline rides along so a live listener sees the steps.
         assert_eq!(v["steps"][0]["label"], "Reading messages");
         assert_eq!(v["steps"][0]["status"], "ok");
+        // A channel reply names no thread, so the legacy frame is unchanged.
+        assert!(v.get("parentId").is_none(), "unexpected parentId: {v}");
+    }
+
+    /// A threaded reply carries its parent onto the live frame (issue #364), so
+    /// a console watching the stream folds it under the same row a reload would
+    /// — otherwise a thread answer arrives live in the channel and then jumps
+    /// into the thread on the next refresh.
+    #[test]
+    fn projects_agent_reply_with_its_thread_parent() {
+        let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            parent: Some(EventSeq::new(4)),
+            task_id: None,
+            chat_id: "General".into(),
+            agent_id: "ceo".into(),
+            text: "in the thread".into(),
+            steps: Vec::new(),
+        }))
+        .expect("agent_reply is an attention signal");
+        assert_eq!(v["parentId"], "4");
+    }
+
+    /// A reaction is deliberately NOT on the attention stream (issue #364).
+    ///
+    /// Pinned rather than left to the deny-by-default fall-through, because the
+    /// omission is a decision and not an oversight: the frame would have to
+    /// carry the reacting person, and this stream has no per-viewer projection
+    /// to turn an actor into a label. Reload-visibility is what the issue asks
+    /// for. If someone later decides reactions should stream, this test is
+    /// where they say so out loud.
+    #[test]
+    fn projects_nothing_for_a_reaction() {
+        assert!(
+            super::project_event(&stored(CompanyEvent::ReactionToggled {
+                message_seq: EventSeq::new(4),
+                emoji: "👍".into(),
+                on: true,
+                by: None,
+            }))
+            .is_none(),
+            "a reaction must not reach the console over SSE"
+        );
     }
 
     /// Issue #379: the park frame carries an id, a kind and the channel — and
@@ -3579,6 +4243,7 @@ mod test {
     #[test]
     fn projects_agent_reply_omits_empty_steps() {
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
+            parent: None,
             task_id: None,
             chat_id: "General".into(),
             agent_id: "ceo".into(),
@@ -3600,6 +4265,7 @@ mod test {
     #[test]
     fn projects_task_id_only_when_the_event_is_correlated() {
         let reply = super::project_event(&stored(CompanyEvent::AgentReply {
+            parent: None,
             task_id: Some("t-1".into()),
             chat_id: "t-1".into(),
             agent_id: "ceo".into(),
@@ -3982,6 +4648,7 @@ mod test {
         // still drops everything it dropped before.
         let dropped = [
             CompanyEvent::OperatorMessage {
+                parent: None,
                 text: "hi".into(),
                 by: None,
                 chat: None,
