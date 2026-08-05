@@ -21,7 +21,13 @@ const VERIFY_PATH = "/api/v1/company/auth/verify";
  * from a broken host, which is exactly what issue #271 sent people chasing.
  */
 export default async function globalSetup(config: FullConfig) {
-  const storageState = process.env.PW_STORAGE_STATE;
+  // Read the RESOLVED path off the config, not `process.env.PW_STORAGE_STATE`.
+  // The config now defaults it when it is the one bringing the host up (issue
+  // #406), and reading the raw variable meant this returned early in exactly
+  // that case — writing no session, and leaving every spec to fail on a
+  // storage-state file nobody had created. The env var still wins where it is
+  // set: the config honours it first.
+  const storageState = config.projects[0]?.use.storageState as string | undefined;
   if (!storageState) return;
 
   const baseURL = config.projects[0]?.use.baseURL as string | undefined;
