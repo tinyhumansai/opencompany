@@ -118,7 +118,8 @@ use crate::company::WorkflowFile;
 use crate::company::runtime::CompanyMail;
 use crate::company::{WorkflowDestinationDef, WorkflowNodeKind};
 use crate::ports::types::{
-    Actor, ActorKind, CompanyId, CompanyRecord, Effect, EffectGroup, OutboundMessage, Verdict,
+    Actor, ActorKind, ApprovalId, CompanyId, CompanyRecord, Effect, EffectGroup, OutboundMessage,
+    Verdict,
 };
 use crate::ports::{
     ApprovalGate, ChannelAdapter, DeliveryReason, DeliveryReport, DeliveryStatus, EmailRecord,
@@ -567,8 +568,21 @@ async fn park_cold_recipient(
         run_id: None,
     };
 
-    match park_effect(parking, &record.id, effect).await {
-        Ok(()) => {
+    // No board task is behind a workflow delivery, so the approval is parked
+    // explicitly unlinked (issue #333) — recorded as "belongs to no card" rather
+    // than left blank, so no task's Approvals tab adopts it by happening to be
+    // mid-run when it parked. Issue #379: it has no conversation behind it
+    // either, so there is no thread to raise it in; it stays Approvals-page-only.
+    match parking
+        .park_and_journal(
+            &record.id,
+            effect,
+            crate::runtime::journal::TaskLink::Unlinked,
+            None,
+        )
+        .await
+    {
+        Ok(_) => {
             tracing::info!(
                 company = %record.id,
                 node = %node_id,
@@ -613,97 +627,112 @@ async fn park_cold_recipient(
     }
 }
 
-/// Parks `effect` on the gate and journals it — **both halves or neither**.
-///
-/// The gate is in-memory; the journal is the durable record `/approvals` reads
-/// and boot replay rehydrates. A gate entry the journal never recorded is the
-/// worst of the three possible outcomes: it shows up in the operator's queue
-/// now, vanishes on the next restart, and backs a `pending` row that promises a
-/// card which no longer exists.
-///
-/// Bundling the two handles in [`DeliveryParking`] makes the *mis-wiring* of
-/// that state unrepresentable, but it does nothing about a **partial failure at
-/// runtime** — `park` succeeding and `record_parked` erroring (a full disk, a
-/// read-only volume, a serialization fault). So the journal write is treated as
-/// the commit point: if it fails, the gate entry is retracted before returning
-/// the error, and the caller degrades to the `skipped` row it already emits for
-/// a parking failure.
-///
-/// Retraction has to undo **two** things, because a failed `record_parked` has
-/// already mutated the journal's in-memory queue (it inserts before it appends,
-/// so the entry is live even though nothing reached disk):
-///
-/// 1. [`ApprovalGate::resolve`] with [`Verdict::Deny`] — the trait's only
-///    removal verb, and the honest one: this effect must never execute. It is
-///    attributed to [`ActorKind::System`](crate::ports::types::ActorKind::System)
-///    (the runtime itself, as boot replay and the TTL sweep are) rather than to
-///    an operator who made no such decision.
-/// 2. [`RuntimeJournal::record_resolved`] — which also removes before it
-///    appends, so it clears the in-memory queue entry that would otherwise show
-///    the operator a card `/approvals` lists but the gate can no longer
-///    execute. Its own append will usually fail for the same reason the first
-///    one did; that is fine and expected, since there is no `ApprovalParked`
-///    line on disk for it to pair with anyway.
-///
-/// The ordering cannot simply be inverted to dodge this: `record_parked` needs
-/// the [`ApprovalId`](crate::ports::types::ApprovalId) that `park` mints, so the
-/// gate write must come first.
-///
-/// Both rollback steps deliberately ignore their own errors and the **original**
-/// journal error propagates — the report is reported unsent either way, and
-/// losing the real cause behind a cleanup error would make the failure harder to
-/// diagnose, not easier.
-async fn park_effect(
-    parking: &DeliveryParking,
-    company: &CompanyId,
-    effect: Effect,
-) -> Result<(), crate::error::OpenCompanyError> {
-    let approval_id = parking.approvals.park(company, effect.clone()).await?;
-    if let Err(err) = parking
-        .journal
-        // No board task is behind a workflow delivery, so the approval is
-        // parked explicitly unlinked (issue #333) — recorded as "belongs to no
-        // card" rather than left blank, so no task's Approvals tab adopts it by
-        // happening to be mid-run when it parked.
-        .record_parked(
-            &approval_id,
-            &effect,
-            now_millis(),
-            crate::runtime::journal::TaskLink::Unlinked,
-            // Issue #379: a workflow delivery has no conversation behind it, so
-            // there is no thread to raise it in. It stays Approvals-page-only.
-            None,
-        )
-        .await
-    {
-        // Roll back to "never parked". Both steps deliberately swallow their own
-        // errors — `err` below is the one worth surfacing.
-        if let Err(rollback) = parking
-            .approvals
-            .resolve(
-                &approval_id,
-                Verdict::Deny,
-                Actor {
-                    kind: ActorKind::System,
-                    id: "workflow-delivery".to_string(),
-                },
-            )
+impl DeliveryParking {
+    /// Parks `effect` on the gate and journals it — **both halves or neither**.
+    ///
+    /// The gate is in-memory; the journal is the durable record `/approvals`
+    /// reads and boot replay rehydrates. A gate entry the journal never recorded
+    /// is the worst of the three possible outcomes: it shows up in the
+    /// operator's queue now, vanishes on the next restart, and backs a `pending`
+    /// row that promises a card which no longer exists.
+    ///
+    /// Bundling the two handles in [`DeliveryParking`] makes the *mis-wiring* of
+    /// that state unrepresentable, but it does nothing about a **partial failure
+    /// at runtime** — `park` succeeding and `record_parked` erroring (a full
+    /// disk, a read-only volume, a serialization fault). So the journal write is
+    /// treated as the commit point: if it fails, the gate entry is retracted
+    /// before returning the error, and the caller degrades to whatever it does
+    /// when parking is unavailable.
+    ///
+    /// Retraction has to undo **two** things, because a failed `record_parked`
+    /// has already mutated the journal's in-memory queue (it inserts before it
+    /// appends, so the entry is live even though nothing reached disk):
+    ///
+    /// 1. [`ApprovalGate::resolve`] with [`Verdict::Deny`] — the trait's only
+    ///    removal verb, and the honest one: this effect must never execute. It
+    ///    is attributed to
+    ///    [`ActorKind::System`](crate::ports::types::ActorKind::System) (the
+    ///    runtime itself, as boot replay and the TTL sweep are) rather than to
+    ///    an operator who made no such decision.
+    /// 2. [`RuntimeJournal::record_resolved`] — which also removes before it
+    ///    appends, so it clears the in-memory queue entry that would otherwise
+    ///    show the operator a card `/approvals` lists but the gate can no longer
+    ///    execute. Its own append will usually fail for the same reason the
+    ///    first one did; that is fine and expected, since there is no
+    ///    `ApprovalParked` line on disk for it to pair with anyway.
+    ///
+    /// The ordering cannot simply be inverted to dodge this: `record_parked`
+    /// needs the [`ApprovalId`](crate::ports::types::ApprovalId) that `park`
+    /// mints, so the gate write must come first.
+    ///
+    /// Both rollback steps deliberately ignore their own errors and the
+    /// **original** journal error propagates — the effect is unparked either
+    /// way, and losing the real cause behind a cleanup error would make the
+    /// failure harder to diagnose, not easier.
+    ///
+    /// # Why this is `pub(crate)` rather than a private free function (#395)
+    ///
+    /// It was private to this module while cold-recipient delivery was the only
+    /// caller. Issue #395 found two more places that must park an effect from
+    /// *outside* a cycle — a workflow agent node's gated tool call, and a
+    /// `requires_approval` node the engine paused on — and neither has a
+    /// [`CycleHost`](crate::ports::brain::CycleHost) to reach
+    /// [`park_effect`](crate::ports::brain::CycleHost::park_effect) through.
+    ///
+    /// Widening `CycleHost` for them would have been the wrong seam: that trait
+    /// is the *cycle's* whole effect surface, and a workflow run is not a cycle.
+    /// What all three callers actually share is this transaction. So it becomes
+    /// a method on the bundle that already carries both handles — and which is
+    /// already threaded down the workflow path as
+    /// [`HarnessDeps::delivery`](crate::harness::HarnessDeps)`.parking`.
+    ///
+    /// `task_link` and `thread` are parameters rather than the hardcoded
+    /// `Unlinked` / `None` delivery used, because they are the two facts only
+    /// the caller knows: which board card owns the request, and which
+    /// conversation to raise it in.
+    pub(crate) async fn park_and_journal(
+        &self,
+        company: &CompanyId,
+        effect: Effect,
+        task_link: crate::runtime::journal::TaskLink,
+        thread: Option<String>,
+    ) -> Result<ApprovalId, crate::error::OpenCompanyError> {
+        let approval_id = self.approvals.park(company, effect.clone()).await?;
+        if let Err(err) = self
+            .journal
+            .record_parked(&approval_id, &effect, now_millis(), task_link, thread)
             .await
         {
-            tracing::error!(
-                company = %company,
-                error = %rollback,
-                "workflow delivery: a parked effect could not be journaled AND could not be \
-                 retracted from the approval gate; it may linger in the queue until restart"
-            );
+            // Roll back to "never parked". Both steps deliberately swallow their
+            // own errors — `err` below is the one worth surfacing.
+            if let Err(rollback) = self
+                .approvals
+                .resolve(
+                    &approval_id,
+                    Verdict::Deny,
+                    Actor {
+                        kind: ActorKind::System,
+                        id: "workflow-delivery".to_string(),
+                    },
+                )
+                .await
+            {
+                tracing::error!(
+                    company = %company,
+                    error = %rollback,
+                    "workflow: a parked effect could not be journaled AND could not be \
+                     retracted from the approval gate; it may linger in the queue until restart"
+                );
+            }
+            // Clears the in-memory queue entry `record_parked` inserted before
+            // it failed to write. Its append will usually fail too — expected,
+            // and ignored: there is no `ApprovalParked` line on disk to pair
+            // with.
+            let _ = self.journal.record_resolved(&approval_id).await;
+            return Err(err);
         }
-        // Clears the in-memory queue entry `record_parked` inserted before it
-        // failed to write. Its append will usually fail too — expected, and
-        // ignored: there is no `ApprovalParked` line on disk to pair with.
-        let _ = parking.journal.record_resolved(&approval_id).await;
-        return Err(err);
+        Ok(approval_id)
     }
-    Ok(())
 }
 
 /// The active admins' email addresses, in store order. An unreadable user store
