@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::ports::runs::RunStatus;
 use crate::ports::types::CompanyId;
 
 // ---------------------------------------------------------------------------
@@ -97,6 +98,65 @@ pub const LEGACY_COLUMN_BACKLOG: &str = "backlog";
 /// Whether `column` names a column the board actually renders.
 pub fn is_board_column(column: &str) -> bool {
     BOARD_COLUMNS.contains(&column)
+}
+
+/// Where a card lands when its attempt settles into `status` — the single
+/// authority for the board's automatic edge (issue #337, epic #183 §4).
+///
+/// `None` means **do not move the card**: [`RunStatus::Pending`] and
+/// [`RunStatus::Running`] are not settled at all, and a run still in flight has
+/// no landing to write.
+///
+/// The mapping, and why each row is what it is:
+///
+/// | Settled status | Column | Why |
+/// | --- | --- | --- |
+/// | [`Succeeded`](RunStatus::Succeeded) | [`COLUMN_IN_REVIEW`] | a person accepts the result |
+/// | [`WaitingApproval`](RunStatus::WaitingApproval) | [`COLUMN_IN_REVIEW`] | a person authorises the call |
+/// | [`Paused`](RunStatus::Paused) | [`COLUMN_PAUSED`] | resumed, not approved |
+/// | [`Failed`](RunStatus::Failed) | [`COLUMN_TODO`] | with the run's error on the card |
+/// | [`Cancelled`](RunStatus::Cancelled) | [`COLUMN_TODO`] | with the cancellation reason on the card |
+/// | [`Pending`](RunStatus::Pending) / [`Running`](RunStatus::Running) | — | not settled |
+///
+/// # `Succeeded` lands in review, **not** in Done
+///
+/// This is an operator decision (2026-08-05) and it deliberately supersedes the
+/// `Succeeded → Done` row in epic #183 §4: **[`COLUMN_DONE`] is reached only by
+/// a person**, through [`review_landing_column`](crate::harness::lifecycle::review_landing_column).
+/// A clean success is a result somebody still has to accept, and auto-filing it
+/// as done would make the terminal column mean "the model stopped talking"
+/// rather than "we shipped this".
+///
+/// The consequence is that In Review carries **two** meanings — *approve this
+/// call* and *accept this result* — which are not interchangeable. The card is
+/// what disambiguates them: every settle stamps its own reason onto the note,
+/// so an operator opening an In Review card reads whether they are authorising
+/// an action or signing off finished work rather than having to guess.
+///
+/// # Why it lives on the port
+///
+/// Three writers need it and only one of them can see the harness:
+/// `run_task`'s settle (feature-gated), the cycle's terminality backstop and
+/// the boot reaper's card sweep (both ungated). `crate::harness::lifecycle` is
+/// `#[cfg(feature = "openhuman")]`, so it re-exports this rather than owning
+/// it — the same argument that moved [`BOARD_COLUMNS`] here in issue #205.
+///
+/// The match is **exhaustive over [`RunStatus`] with no wildcard**, so adding a
+/// status is a compile error here first: a new run state must state where its
+/// card goes rather than silently inheriting somebody else's answer.
+pub fn column_for_settled_run(status: RunStatus) -> Option<&'static str> {
+    match status {
+        // A person acts next either way; the note says which act is wanted.
+        RunStatus::Succeeded | RunStatus::WaitingApproval => Some(COLUMN_IN_REVIEW),
+        // Waiting on something other than a person — resume is a plain
+        // `column → in_progress` PATCH, which re-fires dispatch.
+        RunStatus::Paused => Some(COLUMN_PAUSED),
+        // Not reviewable work. Epic #183 §3: a card that cannot proceed returns
+        // to To-do carrying the reason, never into a stuck column of its own.
+        RunStatus::Failed | RunStatus::Cancelled => Some(COLUMN_TODO),
+        // Still in flight. Nothing to land.
+        RunStatus::Pending | RunStatus::Running => None,
+    }
 }
 
 /// The human label for a column id (`in_progress` → `In progress`).
@@ -323,6 +383,86 @@ mod test {
             );
         }
         assert_eq!(column_label("something_new"), "something_new");
+    }
+
+    /// Issue #337: the whole automatic edge, pinned status by status.
+    ///
+    /// Every row is asserted against a literal rather than derived, because the
+    /// table *is* the decision — a mapping that computed itself from some other
+    /// property could drift without this failing.
+    #[test]
+    fn a_settled_run_lands_its_card_by_the_table() {
+        assert_eq!(
+            column_for_settled_run(RunStatus::Succeeded),
+            Some(COLUMN_IN_REVIEW)
+        );
+        assert_eq!(
+            column_for_settled_run(RunStatus::WaitingApproval),
+            Some(COLUMN_IN_REVIEW)
+        );
+        assert_eq!(
+            column_for_settled_run(RunStatus::Paused),
+            Some(COLUMN_PAUSED)
+        );
+        assert_eq!(column_for_settled_run(RunStatus::Failed), Some(COLUMN_TODO));
+        assert_eq!(
+            column_for_settled_run(RunStatus::Cancelled),
+            Some(COLUMN_TODO)
+        );
+        // Not settled — an in-flight attempt has no landing to write.
+        assert_eq!(column_for_settled_run(RunStatus::Pending), None);
+        assert_eq!(column_for_settled_run(RunStatus::Running), None);
+    }
+
+    /// The operator decision of 2026-08-05, pinned as its own test because it
+    /// supersedes the `Succeeded → Done` row epic #183 §4 originally wrote.
+    ///
+    /// **Done is reached only by a person.** Nothing in the automatic edge may
+    /// write [`COLUMN_DONE`]; the only route there is
+    /// `review_landing_column(Approve)`. If a future change makes a settle land
+    /// in Done, it fails here first.
+    #[test]
+    fn the_automatic_edge_never_writes_done() {
+        assert_eq!(
+            column_for_settled_run(RunStatus::Succeeded),
+            Some(COLUMN_IN_REVIEW),
+            "a clean success stops for a person; Done is not automatic"
+        );
+        for status in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::WaitingApproval,
+            RunStatus::Paused,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            assert_ne!(
+                column_for_settled_run(status),
+                Some(COLUMN_DONE),
+                "{status} must not auto-advance a card to Done"
+            );
+        }
+    }
+
+    /// Whatever the table says must be a column the board actually renders —
+    /// otherwise a settle writes a card straight off the board, which is the
+    /// silent disappearance [`BOARD_COLUMNS`] exists to prevent.
+    #[test]
+    fn every_landing_is_a_real_board_column() {
+        for status in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::WaitingApproval,
+            RunStatus::Paused,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            if let Some(column) = column_for_settled_run(status) {
+                assert!(is_board_column(column), "{status} lands in '{column}'");
+            }
+        }
     }
 
     /// Issue #335: a long paste is truncated on a character boundary, never on
