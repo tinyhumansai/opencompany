@@ -72,6 +72,80 @@ export interface TaskOutput {
   workflows?: TaskOutputWorkflow[];
 }
 
+/**
+ * What surface a plan's prerequisite is checked against (issue #337).
+ *
+ * The model proposes the kind; the host decides what to do with it. A kind this
+ * host cannot check arrives as `other` and always carries `unknown`.
+ */
+export type PrereqKind =
+  | "connection"
+  | "composio"
+  | "mcp"
+  | "credential"
+  | "file"
+  | "permission"
+  | "assignee"
+  | "other";
+
+/**
+ * The **host's** verdict on a prerequisite — never the model's claim.
+ *
+ * Only `missing` blocks a card from dispatching. `needsApproval` means the tool
+ * is there but the call will stop for a person, and `unknown` means an
+ * inventory could not be reached, which is deliberately not treated as absent:
+ * an outage must not make every card unplannable.
+ */
+export type PrereqStatus = "satisfied" | "missing" | "needsApproval" | "unknown";
+
+/** One thing the work needs first, with the host's verdict on it. */
+export interface Prerequisite {
+  kind: PrereqKind;
+  /** A provider slug, MCP server name, workspace path, tool namespace or id. */
+  name: string;
+  status: PrereqStatus;
+  /** One line a person can act on. */
+  note: string;
+}
+
+/**
+ * One step of a plan.
+ *
+ * The estimates are the model's guesses and must be rendered as guesses.
+ * Nothing on either side of the wire budgets from them — the real caps are the
+ * teammate's daily limit and the capability tier, both enforced host-side from
+ * live meter reads.
+ */
+export interface PlanStep {
+  title: string;
+  detail: string;
+  estimatedCostUsd?: number;
+  estimatedMinutes?: number;
+}
+
+/**
+ * The brief a planning pass wrote for a card (issue #337).
+ *
+ * Read-only on this side: the console never posts a plan, and the host's create
+ * body has no field for one, so a prerequisite verdict cannot be forged from a
+ * browser. Re-planning replaces the whole object; the card's note keeps the
+ * history of both passes.
+ */
+export interface TaskPlan {
+  description: string;
+  steps: PlanStep[];
+  prerequisites: Prerequisite[];
+  risks: string[];
+  verification: string;
+  scope: string;
+  /**
+   * The teammate the planner would hand it to. Applied to the card only when it
+   * had no assignee — a plan never reassigns work a person routed.
+   */
+  proposedAssignee?: string;
+  plannedAtMillis: number;
+}
+
 /** A board card as the host returns it. */
 export interface Task {
   id: string;
@@ -102,6 +176,11 @@ export interface Task {
    * discover what it produced would cost one read per card per poll.
    */
   output?: TaskOutput;
+  /**
+   * The brief the last planning pass wrote (issue #337). Absent for a card
+   * nobody has planned, which is every card until it is dragged into Planning.
+   */
+  plan?: TaskPlan;
 }
 
 /** The create body; the host defaults column→`todo`, priority→`medium`. */
@@ -115,10 +194,16 @@ export interface CreateTask {
    * The chat thread this card is being opened from (issue #246). Set by the
    * transcript's "Add to board" action; the board's `+` button omits it.
    *
-   * Note what is deliberately NOT sent alongside it: `column`. Dropping a card
-   * into `in_progress` is what dispatches an agent turn — it spends money — so
-   * the server's intake default decides where a chat-created card lands, and
-   * the human drag stays the only spend gate.
+   * Note what is deliberately NOT sent alongside it: `column`. Entering a
+   * column is what spends money, so the server's intake default decides where a
+   * chat-created card lands and a **human drag** stays the only way to start
+   * spending on it.
+   *
+   * Since issue #337 there are two such columns, not one. `in_progress`
+   * dispatches an agent turn; `planning` buys one planning pass, which on
+   * success hands the card straight on to `in_progress` without asking again.
+   * So a drag into Planning is informed consent to both, and neither can be
+   * reached from this body.
    */
   originChatId?: string;
 }
