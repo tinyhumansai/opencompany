@@ -12,6 +12,11 @@
 //!   trigger nodes (issue #169). Both share the [`cron`] matcher and [`Clock`].
 //! - The [`journal`] backs at-most-once effects and the durable approval queue.
 
+/// Issue #337: the one guarded mover for the board's automatic edge. Advances a
+/// settled attempt's card **only** from `in_progress`, so a card an operator
+/// parked in Paused or In Review is never yanked back by a late settle. See
+/// [`advance`].
+pub mod advance;
 /// Issue #372: the host-side projection of a parked effect's payload onto the
 /// approval card — shown in full by default, with a credential-key denylist as
 /// the safety net, and bounded so an agent-authored blob cannot reach a
@@ -75,6 +80,7 @@ pub mod types;
 pub mod workflow_outcome;
 pub mod workflow_scheduler;
 
+pub use advance::{SYSTEM_ATTRIBUTION, advance_settled_card, append_result};
 pub use builder::{RuntimeBuilder, company_id_from_name};
 pub use channel::{OPERATOR_CHANNEL, OperatorChannel};
 pub use cron::{CivilTime, CronExpr};
