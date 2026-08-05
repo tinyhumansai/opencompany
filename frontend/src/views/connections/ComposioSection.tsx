@@ -70,6 +70,13 @@ export function ComposioSection({ client, company }: Props) {
   // Only meaningful in the attested state, where the paste card is an override
   // rather than the way in.
   const [showOverride, setShowOverride] = useState(false);
+  // Open mode only: a slug typed into the "another provider" field. Open mode
+  // permits every toolkit the backend allows, and the curated rows are a
+  // starting point rather than the whole set (issue #397).
+  const [otherToolkit, setOtherToolkit] = useState("");
+  // Slugs connected through that field this session, so they get a row of their
+  // own instead of vanishing after a successful sign-in.
+  const [extraToolkits, setExtraToolkits] = useState<string[]>([]);
 
   const requestGeneration = useRef(0);
   const pollTimers = useRef<Record<string, number>>({});
@@ -86,8 +93,10 @@ export function ComposioSection({ client, company }: Props) {
   const refreshConnections = useCallback(
     async (s: ComposioStatus) => {
       // Listing connections needs *a* credential — any tier. With none there is
-      // nothing to authorize against, and the call 409s.
-      if (s.credentialSource === "none" || s.toolkits.length === 0) {
+      // nothing to authorize against, and the call 409s. Keyed off the
+      // EFFECTIVE list, not the manifest one: in open mode the manifest list is
+      // empty precisely because everything is allowed (issue #397).
+      if (s.credentialSource === "none" || s.effectiveToolkits.length === 0) {
         setConnected({});
         return;
       }
@@ -121,6 +130,8 @@ export function ComposioSection({ client, company }: Props) {
     setStatus(null);
     setConnected({});
     setShowOverride(false);
+    setOtherToolkit("");
+    setExtraToolkits([]);
     setLoad("loading");
     void refresh();
   }, [refresh]);
@@ -206,7 +217,12 @@ export function ComposioSection({ client, company }: Props) {
   const byoToken = status?.credentialSource === "static";
   // No credential of any tier: there is nothing to authorize a provider against.
   const noCredential = status?.credentialSource === "none";
-  const showProviders = load === "ready" && status !== null && status.toolkits.length > 0;
+  // Issue #397: gate on the EFFECTIVE list. The old gate read
+  // `toolkits.length > 0`, and an empty manifest list means "defer to the
+  // backend allowlist" — allow everything — so the one value meaning *every
+  // provider* rendered *no* providers on 19 of 20 shipped templates.
+  const showProviders = load === "ready" && status !== null && status.effectiveToolkits.length > 0;
+  const openMode = status?.openMode === true;
   // In the attested state the paste card is a deliberate override; everywhere
   // else it is the only way to connect, so it is always on screen.
   const showTokenCard = !attested || showOverride || byoToken;
@@ -266,8 +282,18 @@ export function ComposioSection({ client, company }: Props) {
                     authorize against. Paste a token below first.
                   </p>
                 )}
+                {openMode && (
+                  <p className="rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+                    This company allows <span className="font-medium">any</span> provider Composio
+                    offers — these are the common ones. Connect a different provider by its slug
+                    below.
+                  </p>
+                )}
                 <ul className="divide-y divide-border">
-                  {status.toolkits.map((toolkit) => {
+                  {[
+                    ...status.effectiveToolkits,
+                    ...extraToolkits.filter((t) => !status.effectiveToolkits.includes(t)),
+                  ].map((toolkit) => {
                     const isConnected = connected[toolkit.toLowerCase()] === true;
                     const isSigningIn = signingIn === toolkit;
                     return (
@@ -296,6 +322,36 @@ export function ComposioSection({ client, company }: Props) {
                     );
                   })}
                 </ul>
+                {openMode && (
+                  <div className="flex items-end gap-2 border-t border-border pt-3">
+                    <div className="flex-1 space-y-1">
+                      <Label htmlFor="composio-other-toolkit" className="text-xs">
+                        Another provider
+                      </Label>
+                      <Input
+                        id="composio-other-toolkit"
+                        autoComplete="off"
+                        placeholder="composio toolkit slug, e.g. hubspot"
+                        value={otherToolkit}
+                        disabled={noCredential}
+                        onChange={(e) => setOtherToolkit(e.target.value)}
+                      />
+                    </div>
+                    <Button
+                      variant="outline"
+                      disabled={signingIn !== null || noCredential || !otherToolkit.trim()}
+                      onClick={() => {
+                        const slug = otherToolkit.trim().toLowerCase();
+                        setOtherToolkit("");
+                        setExtraToolkits((t) => (t.includes(slug) ? t : [...t, slug]));
+                        void signIn(slug);
+                      }}
+                    >
+                      <LogIn className="size-4" />
+                      Sign in
+                    </Button>
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}

@@ -34,8 +34,26 @@ export interface ComposioStatus {
   credentialSource: ComposioCredentialSource;
   /** The effective Composio backend URL (non-secret). */
   backendUrl: string;
-  /** The manifest toolkit allowlist (empty = defer to the backend allowlist). */
+  /** The manifest toolkit allowlist verbatim (empty = defer to the backend allowlist). */
   toolkits: string[];
+  /**
+   * Whether this company is in **open mode** — an empty manifest allowlist,
+   * which means the backend's own allowlist governs and every toolkit it
+   * permits is reachable (issue #397).
+   *
+   * The host tells us rather than letting us infer it: an empty `toolkits`
+   * means *allow everything*, which is the opposite of what an empty list
+   * reads as. Gating provider rows on `toolkits.length > 0` was exactly that
+   * misreading, and it left 19 of 20 shipped templates with nothing to click.
+   */
+  openMode: boolean;
+  /**
+   * The toolkits to render as provider rows — the manifest list when non-empty,
+   * else a curated starting set. In open mode this is a suggestion, not a
+   * limit: any slug the backend permits can still be authorized, which is what
+   * the "other provider" field is for.
+   */
+  effectiveToolkits: string[];
 }
 
 /** A mutating response: the resulting status plus a plain-language note. */
