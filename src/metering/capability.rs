@@ -236,13 +236,23 @@ pub fn plan_named(name: &str) -> Option<CapabilityPlan> {
     })
 }
 
-/// Total inference tokens (input + output) across a sample window. OAuth-call
-/// samples carry no token spend and are ignored, so a tool-heavy turn never
-/// inflates the token budget.
+/// Total model tokens (input + output) across a sample window — every kind that
+/// actually moves tokens.
+///
+/// [`SampleKind::OauthCall`] carries no token spend and
+/// [`SampleKind::SearchCall`] is a priced request rather than a completion, so
+/// neither can inflate the token budget; a tool-heavy turn is not a token-heavy
+/// one.
+///
+/// [`SampleKind::PlanningCall`] **is** counted (issue #337). A planning pass is
+/// a real completion against the tenant's own inference budget; it is only
+/// filed under a different kind because it belongs to the company rather than
+/// to a teammate. Excluding it would leave a company able to plan indefinitely
+/// after crossing the tier ceiling that is supposed to have stopped it.
 pub fn tokens_in(samples: &[UsageSample]) -> u64 {
     samples
         .iter()
-        .filter(|s| s.kind == SampleKind::Inference)
+        .filter(|s| matches!(s.kind, SampleKind::Inference | SampleKind::PlanningCall))
         .map(|s| s.input_tokens.saturating_add(s.output_tokens))
         .fold(0u64, |acc, t| acc.saturating_add(t))
 }
@@ -361,6 +371,26 @@ mod tests {
     #[test]
     fn tokens_in_empty_is_zero() {
         assert_eq!(tokens_in(&[]), 0);
+    }
+
+    /// Issue #337: a planning pass spends the tenant's inference budget just as
+    /// a teammate's turn does, so it counts toward the tier ceiling. Without
+    /// this a company could keep planning after the budget that was supposed to
+    /// stop it had been exhausted — the tokens are spent either way, and a
+    /// ceiling that only some completions respect is not a ceiling.
+    #[test]
+    fn tokens_in_counts_planning_passes() {
+        let planning = UsageSample {
+            kind: SampleKind::PlanningCall,
+            agent: crate::metering::UNATTRIBUTED_AGENT.into(),
+            ..inference_sample(300, 100)
+        };
+        assert_eq!(tokens_in(&[planning.clone()]), 400);
+        // And it adds to a teammate's, rather than replacing or shadowing it.
+        assert_eq!(
+            tokens_in(&[inference_sample(100, 50), planning, oauth_sample()]),
+            550
+        );
     }
 
     // --- exhaustion / denial ------------------------------------------------

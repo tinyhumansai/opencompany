@@ -49,6 +49,26 @@ pub enum SampleKind {
     /// has connected no account. A search is a *priced* call on the managed
     /// platform, so it carries a real `cost_usd` and gets its own counter.
     SearchCall,
+    /// One completed planning pass — the single tool-less model call a card
+    /// makes on entering `planning` (issue #337).
+    ///
+    /// Deliberately **not** [`Self::Inference`], even though it is literally an
+    /// inference call, because the two answer different questions. Every
+    /// `Inference` sample is a *teammate's* turn: it is attributed to an agent,
+    /// it may carry a `run_id`, and it is what the per-teammate token chart and
+    /// the daily-spend cap are reasoning about. A planning pass belongs to no
+    /// teammate — planning is frequently what *picks* the teammate — so it is
+    /// charged to the whole-company bucket
+    /// ([`UNATTRIBUTED_AGENT`](crate::metering::UNATTRIBUTED_AGENT)) with no
+    /// `run_id`, and a separate kind is what lets an operator later ask "how
+    /// much are we spending on planning?" without that answer being tangled up
+    /// in "how much did Maya spend?".
+    ///
+    /// It **does** count toward the capability-tier token budget (issue #108):
+    /// see [`tokens_in`](crate::metering::tokens_in). Excluding it would let a
+    /// company plan indefinitely after its tier budget was exhausted, which is
+    /// exactly the leak the tier exists to close.
+    PlanningCall,
 }
 
 /// One metered usage event.
