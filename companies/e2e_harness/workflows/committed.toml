@@ -1,0 +1,49 @@
+# Workflow graph: committed — the e2e suite's *source-defined* fixture.
+#
+# Its whole job is to be a workflow the console must REFUSE to change: it lives
+# in the company source tree, so the host answers 409 to a `PUT` and to a
+# `DELETE` on it, and `workflow-edit-delete.spec.ts` asserts the console says so
+# before the click (Edit and Delete disabled, both explaining that the remedy is
+# to edit `workflows/committed.toml` in the company repository).
+#
+# The spec has referenced this file by name — "Committed flow", and the path in
+# the disabled-button title — since it was written, but the file itself was
+# never committed, so both of its source-defined cases failed against a live
+# host. Nothing noticed, because the suite is typechecked by CI and run by
+# nobody (issue #406). It is deliberately *not* listed in `[workflows].enabled`
+# in ../company.toml: the console lists every `workflows/*.toml` it finds, and
+# leaving it disabled keeps it out of the scheduler while the suite runs.
+#
+# Keep the id, the name and the two node ids stable — the spec pins all four.
+
+id = "committed"
+name = "Committed flow"
+description = "A workflow defined in the company source tree, so the console may not edit or delete it."
+
+[[node]]
+id = "start"
+kind = "trigger"
+name = "Every weekday morning"
+summary = "The schedule fires."
+schedule = "0 9 * * MON-FRI"
+
+[[node]]
+id = "draft"
+kind = "agent"
+name = "Draft the note"
+summary = "Turn the morning's notes into a short written update."
+agent = "writer"
+
+[[node]]
+id = "done"
+kind = "output"
+name = "Hand it to the operator"
+summary = "Park the draft for review."
+
+[[edge]]
+from = "start"
+to = "draft"
+
+[[edge]]
+from = "draft"
+to = "done"

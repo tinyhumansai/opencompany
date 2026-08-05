@@ -1,9 +1,13 @@
 # The end-to-end test harness company.
 #
-# A copy of `companies/openhuman_demo` with one addition: a `[users] admins`
-# list, so the Playwright wiring suite (frontend/test/e2e) can log in through
-# the real magic-link flow and drive the operator console against a running
-# host. See `frontend/test/e2e/wiring.spec.ts`.
+# A copy of `companies/openhuman_demo` with two additions:
+#
+#   * a `[users] admins` list, so the Playwright wiring suite
+#     (frontend/test/e2e) can log in through the real magic-link flow and drive
+#     the operator console against a running host — see
+#     `frontend/test/e2e/wiring.spec.ts`;
+#   * `workflows/committed.toml`, a source-defined workflow the console must
+#     refuse to edit or delete — see `frontend/test/e2e/workflow-edit-delete.spec.ts`.
 #
 # Every [[agent]] becomes one live openhuman agent when built with the
 # `openhuman` feature and an inference credential is present. Without a
