@@ -834,7 +834,7 @@ mod test {
             company: &CompanyId,
             workflow: &WorkflowFile,
             input: Value,
-            _ctx: &crate::ports::WorkflowRunContext,
+            ctx: &crate::ports::WorkflowRunContext,
         ) -> crate::Result<WorkflowRun> {
             self.started.lock().unwrap().push(Recorded {
                 company: company.as_ref().to_string(),
@@ -842,8 +842,21 @@ mod test {
                 input,
             });
             if let Some(gate) = &self.gate {
-                let permit = gate.acquire().await.expect("gate open");
-                permit.forget();
+                // Issue #383: a parked run races its gate against the stop
+                // signal, mirroring what the real runner does with the engine
+                // future. Without this the double would ignore a cancel and the
+                // scheduler test below could not observe one.
+                tokio::select! {
+                    permit = gate.acquire() => permit.expect("gate open").forget(),
+                    () = ctx.cancel.cancelled() => {
+                        return Ok(WorkflowRun {
+                            output: Value::Null,
+                            pending_approvals: Vec::new(),
+                            deliveries: Vec::new(),
+                            cancelled: true,
+                        });
+                    }
+                }
             }
             self.completed.fetch_add(1, Ordering::SeqCst);
             Ok(WorkflowRun {
@@ -1788,6 +1801,96 @@ to = "done"
         assert_eq!(scheduler.tick().await, 1);
         wait_for(|| started.lock().unwrap().len() == 1).await;
         assert_eq!(started.lock().unwrap()[0].workflow, "healthy");
+    }
+
+    /// **Issue #383: a cron fire is cancellable from the console.**
+    ///
+    /// This is the claim the scheduler's comment makes and nothing pinned. It
+    /// is worth pinning because the two things that make it true are both easy
+    /// to undo without breaking anything else: the context has to be minted
+    /// through the supervisor **inside** the spawned task, and the guard has to
+    /// be held across `record_run_finished` rather than dropped after the run.
+    /// Moving `begin` out of the task, or binding the guard to `_`, would still
+    /// pass every other test in this module — the run would fire, complete and
+    /// journal exactly as before, and simply stop being stoppable.
+    ///
+    /// The cron case matters more than the manual one: nobody chose the timing,
+    /// and a wedged nightly run holds its overlap claim, suppressing every later
+    /// fire of that schedule until it ends.
+    #[tokio::test]
+    async fn a_scheduled_run_can_be_cancelled_while_it_is_in_flight() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let company = "cancel-cron-co";
+        let gate = Arc::new(Semaphore::new(0));
+        let (runner, started, _completed) = RecordingRunner::gated(gate.clone());
+        let registry = company_with_overlays(
+            &home,
+            company,
+            vec![overlay("digest", Some("* * * * *"))],
+            Some(runner),
+            "running",
+        )
+        .await;
+        let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 13, 9, 0)));
+        let mut scheduler = WorkflowScheduler::new(registry.clone(), clock);
+
+        assert_eq!(scheduler.tick().await, 1);
+        wait_for(|| started.lock().unwrap().len() == 1).await;
+
+        // Discover the run the way the cancel route does — off the company's
+        // own supervisor. Nobody handed this id to anybody: the scheduler minted
+        // it inside a spawned task, which is exactly why registration is what
+        // makes a cron fire reachable at all.
+        let runtime = registry
+            .get(&CompanyId::new(company))
+            .expect("the company is registered");
+        wait_for(|| !runtime.run_supervisor().is_empty()).await;
+        let live = runtime.run_supervisor().live();
+        assert_eq!(live.len(), 1, "the in-flight cron run is registered");
+        let (run_id, workflow_id) = live.into_iter().next().unwrap();
+        assert_eq!(workflow_id, "digest");
+
+        assert!(
+            runtime.run_supervisor().cancel(&run_id),
+            "an in-flight cron run is cancellable"
+        );
+
+        // It settles as stopped — never released through the gate, so the only
+        // way it could have finished is the cancel.
+        let outcomes = loop {
+            let outcomes = run_outcomes(&registry, company).await;
+            if !outcomes.is_empty() {
+                break outcomes;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(outcomes.len(), 1);
+        let CompanyEvent::WorkflowRunFinished {
+            scheduled,
+            cancelled,
+            error,
+            run_id: journaled_id,
+            ..
+        } = &outcomes[0]
+        else {
+            unreachable!("filtered above")
+        };
+        assert!(
+            *scheduled,
+            "a cron fire stays flagged scheduled when stopped"
+        );
+        assert!(*cancelled, "the outcome must record the stop");
+        assert!(error.is_none(), "a stop is not a failure: {error:?}");
+        assert_eq!(
+            journaled_id.as_deref(),
+            Some(run_id.as_str()),
+            "the outcome carries the id the supervisor registered"
+        );
+
+        // And the guard let go — held across the journal write above, released
+        // once the task ended.
+        wait_for(|| runtime.run_supervisor().is_empty()).await;
     }
 
     /// A scheduled run still executing suppresses the next fire; once it
