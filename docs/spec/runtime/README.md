@@ -11,6 +11,9 @@ Supporting docs:
 - [ports.md](ports.md) — the port trait contracts (normative)
 - [events.md](events.md) — the `CompanyEvent` vocabulary those ports carry, and
   the run/task/approval correlation rules a journal reader folds on
+- [artifacts.md](artifacts.md) — what makes something a deliverable: the
+  explicit-publish rule, `(task, source)` identity, body caps and reference
+  bodies, and the single follow-up nudge
 - [manifest.md](manifest.md) — `company.toml` schema
 - [lifecycle.md](lifecycle.md) — company state machine and durability
 - [rebuild.md](rebuild.md) — replacing a registered runtime in place (quiesce →

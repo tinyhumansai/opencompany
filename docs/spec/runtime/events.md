@@ -44,7 +44,10 @@ orchestrator's `create_workflow` tool; journaled best-effort after persist),
 `TaskSteered` (an operator paused, cancelled, or redirected an in-flight task
 or delegation), `DeskTaskCompleted` (a dispatched board task finished its run —
 the terminal anchor a per-task timeline ends on; "completed" means the run
-stopped, not that it succeeded, and `column` carries where the card landed),
+stopped, not that it succeeded, `column` carries where the card landed, and
+`artifact_ids` names the deliverables the run published — empty, and omitted
+from the wire, for the many tasks that produce no file; see
+[artifacts.md](artifacts.md)),
 `TaskDiscussionPosted` (a human posted to a card's discussion thread, issue
 #335 — the Discussion tab's whole store, folded back out by
 `GET …/tasks/{task_id}` beside that card's timeline), `WorkflowUpdated` /
