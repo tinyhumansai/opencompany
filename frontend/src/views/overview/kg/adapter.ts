@@ -29,7 +29,7 @@ import type { Person as HostPerson } from "@/api/auth";
 import type { Skill } from "@/api/skills";
 import type { Task } from "@/api/tasks";
 import type { MemoryEntry } from "@/api/memory";
-import type { McpServer, McpTool } from "@/lib/mcp";
+import type { McpServer, McpToolInfo } from "@/api/types";
 import type { TeamMember } from "@/lib/team";
 import { TASK_COLUMNS } from "@/lib/tasks-sample";
 import type { BrainGraphEdge, BrainGraphNode, MemoryGraph } from "./memory-core";
@@ -178,7 +178,8 @@ export interface AdaptInput {
   tasks: Task[];
   skills: Skill[];
   servers: McpServer[];
-  toolsByServer: Record<string, McpTool[]>;
+  /** Keyed by server **name** — the key `.../mcp/servers` identifies a server by. */
+  toolsByServer: Record<string, McpToolInfo[]>;
   /** The humans who can sign in to this company. */
   people: HostPerson[];
   /** Matches a board card to a roster member; the one real assignment edge. */
@@ -209,8 +210,8 @@ export function adapt(input: AdaptInput): Adapted {
     toolSlugs.push(slug);
   }
   for (const server of input.servers) {
-    for (const tool of input.toolsByServer[server.server_id] ?? []) {
-      const slug = `mcp-${server.server_id}-${tool.name}`;
+    for (const tool of input.toolsByServer[server.name] ?? []) {
+      const slug = `mcp-${server.name}-${tool.name}`;
       toolLabels[slug] = tool.name;
       toolSlugs.push(slug);
     }
