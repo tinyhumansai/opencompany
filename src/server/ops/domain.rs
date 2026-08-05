@@ -23,7 +23,7 @@ use crate::company::dns::{self, DomainStatus};
 use crate::company::runtime::CompanyRuntime;
 use crate::ports::types::SecretValue;
 use crate::server::error::ApiError;
-use crate::server::ops::{DOMAIN_KEY, ScopedCompany, scoped};
+use crate::server::ops::{AdminScopedCompany, DOMAIN_KEY, ScopedCompany, scoped};
 
 /// Builds the domain route fragment.
 pub fn router() -> Router<AppState> {
@@ -66,8 +66,12 @@ async fn load_domain(runtime: &CompanyRuntime) -> Result<Option<DomainStatus>, A
 }
 
 /// `PUT …/domain` (both scope forms).
+/// Requires authority over the company (issue #403) — the domain is the
+/// company's mail identity. `POST …/domain/verify` deliberately stays open: it
+/// re-checks DNS for a domain only an admin could have set, and changes nothing
+/// a member could not already read.
 async fn put_domain(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Json(body): Json<SetDomain>,
 ) -> Result<Json<DomainStatus>, ApiError> {
     store_domain(company.runtime, &body.domain).await

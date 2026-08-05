@@ -36,7 +36,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::UsageMetering;
 use crate::server::error::ApiError;
-use crate::server::ops::{ScopedCompany, scoped};
+use crate::server::ops::{AdminScopedCompany, ScopedCompany, scoped};
 
 /// The reminder attached to a mutating response that the running brain can act
 /// on: a per-tenant provider re-resolves its config each turn, so a switch
@@ -253,9 +253,15 @@ async fn get_status(company: ScopedCompany) -> Result<Json<InferenceStatusDto>, 
 
 /// `PUT …/inference` — set (or replace) the runtime provider override, and
 /// optionally rotate the write-only outbound credential.
+///
+/// Requires authority over the company (issue #403). This route sets the base
+/// URL every agent's prompts and completions travel to, and the key they are
+/// billed against; deciding that is deciding how the company thinks. `POST
+/// …/inference/test` stays open — it probes the config as already stored,
+/// naming no destination of its own.
 async fn set_config(
     State(state): State<AppState>,
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Json(body): Json<SetInference>,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let runtime = company.runtime.as_ref();
@@ -339,7 +345,9 @@ async fn set_config(
 /// manifest `[inference]` (or the managed default). The stored credential is
 /// left in place (harmless for the managed default; still resolves for a
 /// manifest provider) — clear it explicitly with `PUT { key: "" }`.
-async fn revert_config(company: ScopedCompany) -> Result<Json<MutationResponse>, ApiError> {
+/// Requires authority over the company (issue #403) — same reasoning as the
+/// set: reverting decides which model the company thinks with.
+async fn revert_config(company: AdminScopedCompany) -> Result<Json<MutationResponse>, ApiError> {
     let runtime = company.runtime.as_ref();
     clear_runtime_config(runtime.id(), runtime.secrets().as_ref())
         .await

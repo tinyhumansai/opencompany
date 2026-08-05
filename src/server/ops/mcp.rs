@@ -30,7 +30,7 @@ use crate::company::mcp::{
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::server::error::ApiError;
-use crate::server::ops::{ScopedCompany, scoped};
+use crate::server::ops::{AdminScopedCompany, ScopedCompany, scoped};
 
 /// The reminder attached to every mutating response: a live agent's tool set is
 /// rebuilt lazily, so an edit reaches agents on the next harness rebuild.
@@ -251,8 +251,17 @@ async fn list_servers(company: ScopedCompany) -> Result<Json<Vec<McpServerDto>>,
 }
 
 /// `POST …/mcp/servers` — add a runtime MCP server (+ optional token).
+///
+/// Requires authority over the company (issue #403). Registering a server hands
+/// the company's agents a new set of tools and an endpoint to call them at, so
+/// it settles what the company can reach — the same question the Composio
+/// routes settle, reached from a different direction. `PUT`/`DELETE` follow for
+/// the same reason (a `PUT` can also swap the auth material on a server the
+/// company already trusts), as does `oauth/start`, which registers a client.
+/// The probes — `GET …/tools`, `POST …/test` — stay open: they exercise a
+/// server an admin already added and name no endpoint of their own.
 async fn add_server(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Json(body): Json<AddServer>,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let runtime = company.runtime.as_ref();
@@ -311,7 +320,7 @@ async fn add_server(
 /// `PUT …/mcp/servers/{name}` — update a server (enable/disable, tool lists,
 /// endpoint, or rotate token). A manifest server gets a runtime override entry.
 async fn update_server(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Path(NamePath { name }): Path<NamePath>,
     body: Option<Json<UpdateServer>>,
 ) -> Result<Json<MutationResponse>, ApiError> {
@@ -389,7 +398,7 @@ async fn update_server(
 /// `DELETE …/mcp/servers/{name}` — remove a runtime server (409 for a manifest
 /// server, which can only be disabled).
 async fn delete_server(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Path(NamePath { name }): Path<NamePath>,
 ) -> Result<StatusCode, ApiError> {
     let runtime = company.runtime.as_ref();
@@ -633,7 +642,7 @@ async fn test_server(company: ScopedCompany, Path(NamePath { name }): Path<NameP
 #[cfg(feature = "mcp")]
 async fn start_oauth(
     axum::extract::State(state): axum::extract::State<AppState>,
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Path(NamePath { name }): Path<NamePath>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use crate::company::mcp_oauth;
@@ -666,7 +675,10 @@ async fn start_oauth(
 /// Without the `mcp` feature there is no OAuth transport, so starting a sign-in
 /// is "not wired" (the console's Sign in button degrades gracefully).
 #[cfg(not(feature = "mcp"))]
-async fn start_oauth(company: ScopedCompany, Path(NamePath { name }): Path<NamePath>) -> Response {
+async fn start_oauth(
+    company: AdminScopedCompany,
+    Path(NamePath { name }): Path<NamePath>,
+) -> Response {
     let _ = (company, name);
     crate::server::ops::not_wired("mcp oauth")
 }

@@ -38,7 +38,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::company::telegram::{TELEGRAM_SECRET_KEY, TELEGRAM_TOKEN_KEY, scrub_token};
 use crate::ports::types::{CompanyId, SecretValue};
 use crate::server::error::ApiError;
-use crate::server::ops::{ScopedCompany, scoped};
+use crate::server::ops::{AdminScopedCompany, ScopedCompany, scoped};
 
 /// The non-secret status of a company's Telegram channel. Carries presence
 /// booleans, how inbound arrives, and the webhook URL when there is a usable
@@ -140,8 +140,12 @@ struct TelegramConfigBody {
 }
 
 /// `PUT …/channels/telegram` — store token and/or secret, return status.
+///
+/// Requires authority over the company (issue #403): this token *is* the bot
+/// the company speaks as, so replacing it moves the company's Telegram voice
+/// to whoever holds the new one.
 async fn put_channel(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     State(state): State<AppState>,
     Json(body): Json<TelegramConfigBody>,
 ) -> Result<Json<TelegramChannelStatus>, ApiError> {
@@ -187,8 +191,10 @@ async fn put_channel(
 /// cleared credential is stored as the empty string; every read site treats an
 /// empty value as "unset" (the webhook rejects a blank secret, delivery skips a
 /// blank token).
+/// Requires authority over the company (issue #403) — the inverse of the
+/// write above, and no less consequential: it takes the channel down.
 async fn delete_channel(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     State(state): State<AppState>,
 ) -> Result<Json<TelegramChannelStatus>, ApiError> {
     let runtime = &company.runtime;
@@ -227,7 +233,7 @@ struct SetWebhookResult {
 /// reachable https URL (issue #203): Telegram would accept nothing, or worse
 /// accept a URL it can never deliver to — which also blocks `getUpdates` and so
 /// would take the working polling path down with it.
-async fn set_webhook(company: ScopedCompany, State(state): State<AppState>) -> Response {
+async fn set_webhook(company: AdminScopedCompany, State(state): State<AppState>) -> Response {
     use axum::response::IntoResponse;
 
     let runtime = &company.runtime;

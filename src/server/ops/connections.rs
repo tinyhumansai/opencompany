@@ -58,7 +58,7 @@ use crate::ports::normalize_email;
 use crate::ports::now_millis;
 use crate::ports::types::{CompanyId, SecretValue};
 use crate::server::error::ApiError;
-use crate::server::ops::{ScopedCompany, oauth_key, scoped};
+use crate::server::ops::{AdminScopedCompany, oauth_key, scoped};
 use crate::server::webhook::{DefaultHashSigner, WebhookSigner};
 
 /// How long a signed `state` nonce stays valid.
@@ -387,8 +387,15 @@ fn build_authorize(
 }
 
 /// `POST …/connections/{provider}/start` (both scope forms).
+///
+/// Requires authority over the company (issue #403) — this is the native-hatch
+/// twin of `POST …/composio/authorize`, and the connection it begins is the
+/// company's. Note that the connect-time identity check below
+/// ([`account_mismatch`]) already assumed as much: it compares the connected
+/// account against the company's *admin* addresses. Until now anyone could
+/// reach the flow that check guards; now the two agree.
 async fn start(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     State(state): State<AppState>,
     Path(ProviderPath { provider }): Path<ProviderPath>,
 ) -> Result<Json<StartResponse>, ApiError> {
@@ -728,8 +735,11 @@ async fn do_disconnect(
 }
 
 /// `POST …/connections/{provider}/disconnect` (both scope forms).
+/// Requires authority over the company (issue #403). Disconnecting deletes the
+/// stored tokens and best-effort revokes them upstream — irreversible, and a
+/// decision about the company's access rather than the caller's.
 async fn disconnect(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Path(ProviderPath { provider }): Path<ProviderPath>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     do_disconnect(company.runtime, &provider).await

@@ -32,7 +32,7 @@ use crate::ports::types::SecretValue;
 use crate::ports::{generate_id, now_millis};
 use crate::server::error::ApiError;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
-use crate::server::ops::{SMTP_KEY, ScopedCompany, scoped};
+use crate::server::ops::{AdminScopedCompany, SMTP_KEY, scoped};
 
 /// The SMTP security mode. Mirrors the console's `SmtpSecurity`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -145,8 +145,11 @@ async fn store_credentials(
 }
 
 /// `PUT …/smtp` (both scope forms).
+///
+/// Requires authority over the company (issue #403): these credentials are the
+/// address the company's mail goes out as.
 async fn put_smtp(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Json(creds): Json<SmtpCredentials>,
 ) -> Result<Json<SmtpStatus>, ApiError> {
     store_credentials(company.runtime, creds).await
@@ -263,8 +266,13 @@ pub fn local_part(address: &str) -> String {
 }
 
 /// `POST …/smtp/test` (both scope forms).
+///
+/// Requires authority over the company (issue #403). Grouped with the write
+/// rather than with the read-only probes because the caller chooses the
+/// recipient: it sends real mail from the company's address to an address
+/// supplied in the request body.
 async fn test_smtp(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     State(state): State<AppState>,
     body: Option<Json<TestSend>>,
 ) -> Result<Json<TestResult>, Response> {
