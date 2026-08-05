@@ -78,6 +78,13 @@ pub mod steer;
 pub mod steps;
 pub mod tool_dispatcher;
 pub mod toolbelt;
+/// End-to-end proof that an agent granted `files` and **not** `shell` can write
+/// a relative path on a company that has never run — the #409 provisioning gap,
+/// which only exists before anything has created the agent's workspace. Covers
+/// a manifest teammate and a runtime overlay teammate, and pins that a traversal
+/// out of a provisioned sandbox is still refused. Test-only.
+#[cfg(test)]
+mod workspace_provision_turn_test;
 pub mod workspace_tools;
 /// End-to-end proof that the #237 workspace tools are reachable from a real
 /// turn, with only the model's choices stubbed. Test-only.
@@ -1173,6 +1180,32 @@ impl HarnessPool {
                     ))
                 })?
         };
+
+        // Renew the agent's sandbox directory at the moment it acts (issue
+        // #409). `build_agent` already created it, but a roster is built once
+        // and then cached behind fingerprints — and handed *across* an in-place
+        // rebuild — so a workspace that goes missing afterwards (a restored or
+        // wiped data dir, an operator clearing the tree, a boot that raced a
+        // not-yet-mounted volume) would otherwise stay missing for the life of
+        // the process, and every relative file write would be refused as if it
+        // had tried to escape the sandbox. Two syscalls on the already-exists
+        // path, against a turn that is about to call a model — not worth
+        // deferring off the runtime thread.
+        //
+        // Deliberately not fatal, for the same reason `build_agent`'s attempt is
+        // not: an agent with no file grant runs a perfectly good turn without
+        // this directory. The `error!` (not `warn!`) records the one condition
+        // under which the misdirecting guard message can still be reached, so it
+        // is greppable next to the refusal it explains.
+        if let Err(error) = build::ensure_agent_workspace(&deps.workspace_root, company, agent_id) {
+            tracing::error!(
+                company = %company,
+                agent = agent_id,
+                workspace = %build::agent_workspace(&deps.workspace_root, company, agent_id).display(),
+                %error,
+                "[harness] could not create the agent workspace before dispatch; relative file writes will be refused (the refusal will read as a workspace escape, but the cause is this missing directory)"
+            );
+        }
 
         // Plan-level total-token ceiling (issue #188): a HARD dispatch refusal
         // that never reaches the model once the tenant's total period spend
