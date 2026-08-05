@@ -154,20 +154,58 @@ impl HarnessBrain {
         &self,
         approval_id: &crate::ports::types::ApprovalId,
     ) -> Result<Option<OutboundMessage>> {
-        let Some(grant) = self.deps.approval_requests.grants().peek(approval_id) else {
+        // What the resolution actually minted, whichever scope it was (#374).
+        //
+        // Both scopes have to be looked up here or the broader one is inert: it
+        // arms a permission and then never re-dispatches the agent that was
+        // waiting on it, so the parked call the operator just approved is one
+        // the agent never re-issues. Peeking only the single-use set — the
+        // pre-#374 behaviour — silently no-ops on a miss, which is right for
+        // every legitimate miss and catastrophic for this one.
+        struct Redispatch {
+            agent: String,
+            tool: String,
+            instruction: String,
+            origin_thread: Option<String>,
+        }
+
+        let grants = self.deps.approval_requests.grants();
+        let grant = if let Some(grant) = grants.peek(approval_id) {
+            // Re-issue verbatim. The grant admits ONE call matching these
+            // arguments exactly, so any drift the model introduces will simply
+            // re-park — the instruction is emphatic because a re-worded argument
+            // silently costs the operator a second approval round-trip.
+            let args = serde_json::to_string(&grant.args).unwrap_or_else(|_| "{}".to_string());
+            Redispatch {
+                instruction: format!(
+                    "Operator approved your `{tool}` call. Re-issue it now with EXACTLY these \
+                     arguments: {args}. Do not modify them.",
+                    tool = grant.tool,
+                ),
+                tool: grant.tool,
+                agent: grant.agent,
+                origin_thread: grant.origin_thread,
+            }
+        } else if let Some(standing) = grants.peek_standing_by_approval(approval_id) {
+            // No exact-arguments pin, and deliberately so: a standing grant
+            // admits any arguments, which is precisely what the operator
+            // consented to by choosing this scope. Pinning them anyway would
+            // make the broader scope behave like the narrow one on its first
+            // call and confuse the model about what it is allowed to do next.
+            Redispatch {
+                instruction: format!(
+                    "Operator granted your use of `{tool}` until further notice. Re-issue your \
+                     call now.",
+                    tool = standing.tool,
+                ),
+                tool: standing.tool,
+                agent: standing.agent,
+                origin_thread: standing.origin_thread,
+            }
+        } else {
             return Ok(None);
         };
-
-        // Re-issue verbatim. The grant admits ONE call matching these arguments
-        // exactly, so any drift the model introduces will simply re-park — the
-        // instruction is emphatic because a re-worded argument silently costs the
-        // operator a second approval round-trip.
-        let args = serde_json::to_string(&grant.args).unwrap_or_else(|_| "{}".to_string());
-        let instruction = format!(
-            "Operator approved your `{tool}` call. Re-issue it now with EXACTLY these \
-             arguments: {args}. Do not modify them.",
-            tool = grant.tool,
-        );
+        let instruction = grant.instruction.clone();
 
         let guard = self.deps.steer.register(
             &self.record.id,
@@ -4427,6 +4465,133 @@ members = ["eng1", "eng2"]
         let legacy = replies_for(None).await;
         assert_eq!(legacy.len(), 1);
         assert_eq!(legacy[0].0, "ceo");
+    }
+
+    /// Issue #374: a resolution that minted only a STANDING grant must still
+    /// re-dispatch the agent.
+    ///
+    /// This is the feature's happy path, and it was the one real gap in the
+    /// plan. `redispatch_granted_call` peeked only the single-use set and
+    /// no-ops silently on a miss — correct for every legitimate miss (a deny, a
+    /// native effect, a legacy park) and catastrophic here: the operator picks
+    /// the broader scope, the permission is armed, and the call they were
+    /// looking at never runs. It would have looked exactly like #243's original
+    /// bug, one scope over.
+    #[tokio::test]
+    async fn a_standing_grant_also_redispatches_its_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log: Arc<dyn crate::ports::EventLog> =
+            Arc::new(crate::store::FsEventLog::new(dir.path().to_path_buf()));
+        let requests = crate::harness::policy::ApprovalRequestQueue::default();
+        requests
+            .grants()
+            .grant_standing(crate::runtime::grants::StandingGrant {
+                id: crate::runtime::grants::GrantId::new("g1"),
+                agent: "ceo".into(),
+                tool: "workspace_write".into(),
+                granted_by: crate::ports::types::Actor {
+                    kind: crate::ports::types::ActorKind::User,
+                    id: "user-1".into(),
+                },
+                approval_id: ApprovalId::new("appr-1"),
+                at_millis: now_millis(),
+                expires_at_millis: now_millis() + 60 * 60 * 1000,
+                origin_thread: None,
+            });
+        let brain = brain_with_queue_and_events(dir.path(), requests, log.clone());
+
+        let result = brain
+            .run_cycle(
+                cycle_over(vec![approval_resolved("appr-1", Verdict::Approve)]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        assert_eq!(result.channel_responses.len(), 1);
+        let bubble = &result.channel_responses[0];
+        assert_eq!(bubble.channel, "ceo");
+        assert_ne!(
+            bubble.text, "Acknowledged.",
+            "a standing grant must re-dispatch, not fall through to the no-op"
+        );
+        assert!(bubble.text.contains("workspace_write"), "{}", bubble.text);
+        // No exact-arguments pin: a standing grant admits any arguments, which
+        // is what the operator consented to by choosing this scope. Telling the
+        // model to reproduce a specific argument object would make the broad
+        // scope behave like the narrow one.
+        assert!(
+            !bubble.text.contains("Do not modify them"),
+            "a standing grant must not pin arguments: {}",
+            bubble.text
+        );
+
+        // And it is journaled, so the echo survives a refresh.
+        let stored = log
+            .read_from(&CompanyId::new("acme"), crate::ports::EventSeq::new(0), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|e| matches!(e.event, CompanyEvent::AgentReply { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// The routing half of #379 holds for the broader scope too: the
+    /// continuation lands in the thread the operator asked in, not the agent's
+    /// own line.
+    #[tokio::test]
+    async fn a_standing_grant_replies_into_the_thread_it_was_raised_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let log: Arc<dyn crate::ports::EventLog> =
+            Arc::new(crate::store::FsEventLog::new(dir.path().to_path_buf()));
+        let requests = crate::harness::policy::ApprovalRequestQueue::default();
+        requests
+            .grants()
+            .grant_standing(crate::runtime::grants::StandingGrant {
+                id: crate::runtime::grants::GrantId::new("g1"),
+                agent: "ceo".into(),
+                tool: "workspace_write".into(),
+                granted_by: crate::ports::types::Actor {
+                    kind: crate::ports::types::ActorKind::User,
+                    id: "user-1".into(),
+                },
+                approval_id: ApprovalId::new("appr-1"),
+                at_millis: now_millis(),
+                expires_at_millis: now_millis() + 60 * 60 * 1000,
+                // A DESK channel, whose lead is `ceo` — the exact pair that
+                // diverges.
+                origin_thread: Some("desk-ops".into()),
+            });
+        let brain = brain_with_queue_and_events(dir.path(), requests, log.clone());
+
+        brain
+            .run_cycle(
+                cycle_over(vec![approval_resolved("appr-1", Verdict::Approve)]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+
+        let stored = log
+            .read_from(&CompanyId::new("acme"), crate::ports::EventSeq::new(0), 100)
+            .await
+            .unwrap();
+        let threads: Vec<String> = stored
+            .iter()
+            .filter_map(|e| match &e.event {
+                CompanyEvent::AgentReply { chat_id, .. } => Some(chat_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            threads,
+            vec!["desk-ops".to_string()],
+            "the work resumes where the operator approved it, not in the lead's DM"
+        );
     }
 
     /// A DENIED approval runs no turn. "No" must never re-dispatch anything.

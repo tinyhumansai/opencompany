@@ -984,7 +984,13 @@ fn classify_group(tool_name: &str) -> EffectGroup {
         EffectGroup::Spend
     } else if name.contains("email") || name.contains("send") || name.contains("message") {
         EffectGroup::Send
-    } else if name.contains("sign") || name.contains("file") {
+    } else if name.contains("sign") || name.contains("file") || name.contains("filing") {
+        // `filing` is the second arm issue #374 adds, found the same way as
+        // `deploy` and for the same reason. `approvals.md` lists `filing.submit`
+        // under Sign, but the substring above is `file`, which `filing` does not
+        // contain — so a `filing_submit` tool classified as `Other`, and `Other`
+        // now means "may be granted for a week". No such tool exists today, so
+        // this closes the gap before it can be walked into rather than after.
         EffectGroup::Sign
     } else if name.contains("publish") || name.contains("post") || name.contains("deploy") {
         // `deploy` is new with issue #374 and closes the one consequence class
@@ -2329,6 +2335,7 @@ mod tests {
             approval_id: crate::ports::types::ApprovalId::new("appr-1"),
             at_millis: 1_000,
             expires_at_millis,
+            origin_thread: None,
         }
     }
 
@@ -2527,13 +2534,20 @@ mod tests {
             "workspace_read",
             "shell",
             "mcp_registry_tool_call",
-            "read_file",
+            "web_fetch",
         ] {
             assert!(
                 broadly_grantable(tool),
                 "{tool} classifies as Other and is grantable"
             );
         }
+        // The classifier is substring heuristics, and it errs toward a
+        // consequence group — `read_file` matches the `file` arm and lands in
+        // `Sign` despite being a pure read. That is the SAFE direction: a
+        // misclassified tool loses the broader scope and keeps asking, rather
+        // than gaining a scope it should not have. Pinned so the asymmetry is
+        // deliberate rather than discovered.
+        assert!(!broadly_grantable("read_file"));
         for tool in [
             "composio_execute",
             "composio_authorize",
