@@ -32,6 +32,7 @@ import {
   type FinancesDto,
   type InboxDto,
   type InboxMessageDto,
+  type ResolveReceipt,
   type SetBudgetInput,
   type TeamMemberDto,
   type UsageDto,
@@ -317,19 +318,41 @@ export class OpenCompanyClient {
   }
 
   /** Approve or deny a parked approval; returns the follow-up reply. */
-  resolveApproval(
+  /**
+   * Resolve a parked approval.
+   *
+   * Two answer shapes, chosen by `detach` (#383):
+   *
+   * * **default** — the response holds the follow-up turn's replies
+   *   (`ChatResponse`). The Approvals page wants this: it is not sitting in a
+   *   transcript, so the body is its only sight of what happened next.
+   * * **detached** — the response is a receipt (`ResolveReceipt`) and the
+   *   continuation arrives on the event stream's `agent_reply` frame instead.
+   *   The **inline chat card** must use this (#379): rendering the POST body
+   *   *and* receiving the SSE echo would deliver one reply to the channel
+   *   twice, and detach has exactly one delivery path so the race cannot exist.
+   *
+   * The parse is deliberately tolerant rather than trusting the flag. A host
+   * that predates #383 ignores `detach` and answers with `responses` anyway, so
+   * the caller is handed whichever shape actually arrived — and never a receipt
+   * fabricated from a body that isn't one.
+   */
+  async resolveApproval(
     approvalId: string,
     verdict: Verdict,
     note?: string,
     company?: string | null,
-  ): Promise<ChatResponse> {
-    const body: { verdict: Verdict; note?: string } = { verdict };
+    options: { detach?: boolean } = {},
+  ): Promise<ChatResponse | ResolveReceipt> {
+    const body: { verdict: Verdict; note?: string; detach?: boolean } = { verdict };
     if (note) body.note = note;
-    return this.request<ChatResponse>(
+    if (options.detach) body.detach = true;
+    const answer = await this.request<unknown>(
       "POST",
       `${this.scope(company)}/approvals/${encodeURIComponent(approvalId)}`,
       body,
     );
+    return isResolveReceipt(answer) ? answer : (answer as ChatResponse);
   }
 
   /** Capture feedback (optionally preview the exact issue body first). */
@@ -643,4 +666,20 @@ function httpError(res: Response, text: string): ApiError {
     console.debug(`[api] ${res.status} ${res.url}: unrecognised error body`, err.detail);
   }
   return err;
+}
+
+/**
+ * Whether a resolve answered with a **receipt** rather than the follow-up
+ * turn's replies (#383).
+ *
+ * Structural, not a flag read. `detach: true` is a *request*, and a host that
+ * predates the option ignores it and answers with `responses` — trusting the
+ * request would then have the caller read `recorded` off a body that has no
+ * such key and report a decision as unrecorded. Distinguishing on `recorded`
+ * versus `responses` reads what actually arrived.
+ */
+function isResolveReceipt(answer: unknown): answer is ResolveReceipt {
+  if (typeof answer !== "object" || answer === null) return false;
+  const body = answer as Record<string, unknown>;
+  return typeof body.recorded === "boolean" && !Array.isArray(body.responses);
 }

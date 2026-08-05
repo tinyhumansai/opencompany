@@ -205,6 +205,32 @@ export interface ApprovalSummary {
    * object, so every read of it is a narrowing one.
    */
   payload?: unknown;
+  /**
+   * The chat thread this approval was raised in (#379) — the **host** thread id,
+   * which is a desk id for a channel and a roster agent id for a direct message.
+   * Resolve it to a console channel id with `channelIdForThread`.
+   *
+   * Not derivable from {@link agent}: a desk channel and a direct message to
+   * that desk's lead are answered by the same teammate, so placing a card by
+   * asker would raise one conversation's request inside the other.
+   *
+   * Absent for an approval no conversation produced (a workflow delivery, a
+   * scheduler tick) and for one parked before the field existed. Both mean the
+   * same thing here: it matches no channel and belongs to the Approvals page
+   * alone, exactly as every approval did before this shipped.
+   */
+  thread?: string | null;
+}
+
+/**
+ * The answer to a **detached** resolve (#383): the verdict is durable, and that
+ * is all it claims. The agent's continuation arrives afterwards on the event
+ * stream's `agent_reply` frame.
+ */
+export interface ResolveReceipt {
+  recorded: boolean;
+  /** There was nothing left to resolve — a double-click, not a failure. */
+  alreadyResolved: boolean;
 }
 
 export type Verdict = "approve" | "deny";
