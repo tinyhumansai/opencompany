@@ -240,10 +240,13 @@ pub struct OutboundMessage {
 }
 
 pub struct TurnStep {
-    pub kind: TurnStepKind,      // tool_call | thinking | note
-    pub status: TurnStepStatus,  // ok | error | running
-    pub label: String,           // display_label, else the tool name
-    pub detail: Option<String>,  // whitelisted enrichment, or a scrubbed cause
+    pub kind: TurnStepKind,           // tool_call | thinking | note
+    pub status: TurnStepStatus,       // ok | error | running | awaiting_approval
+    pub label: String,                // display_label, else the tool name
+    pub detail: Option<String>,       // WHAT IT WAS DOING — redacted arguments
+    pub result: Option<String>,       // WHAT CAME BACK — a summary, or a cause
+    pub failure: Option<TurnStepFailure>,  // WHY IT STOPPED — typed
+    pub truncated: bool,              // the result was cut before it was read
     pub elapsed_ms: Option<u64>,
 }
 ```
@@ -255,12 +258,45 @@ console distinguishes it from a tool-backed one, and how a silently-failed MCP
 call becomes visible (surfaced as an `error` step on the operator bubble rather
 than a vague acknowledgement).
 
-Security: `steps` never carry raw tool arguments, tool output, or call ids —
-only a safe label, a whitelisted/scrubbed detail, and an elapsed time. They are
-never written to the memory store (`memory_loop::outcome_chunk` stays
+A step answers three questions (issue #411). Before it did, a failure was the
+single sentence "Something went wrong with this action.", and a call *blocked
+pending approval*, an *unauthorized* response and a *truncated* result all
+rendered identically:
+
+- **`detail` — what it was doing.** The call's arguments, so two reads of two
+  different files stop looking alike.
+- **`result` — what came back.** An intrinsic OpenCompany tool's own message; a
+  shape (`"12 items"`, `"4.2k characters"`) for anything else; a
+  plain-language cause on a failure.
+- **`failure` — why it stopped**, as a typed `TurnStepFailure`
+  (`unauthorized` · `timeout` · `declined` · `blocked_by_policy` ·
+  `missing_permission` · `missing_app` · `unavailable` · `failed`), projected
+  from OpenHuman's `ToolFailureClass` in one exhaustive match. The console
+  renders a known state; it never pattern-matches the prose in `result`.
+
+Two statuses are **not** failures and must not be counted as such
+(`TurnStepStatus::is_failure` is the one place that question is answered):
+`running` (in flight when the trace stopped) and `awaiting_approval` (the
+approval gate parked the call — it is waiting on a person). `truncated` marks a
+result the harness cut (issue #410): a *success* whose answer is incomplete,
+which no status word can express.
+
+Security: `steps` never carry raw tool **output** or call ids. Arguments reach
+`detail` only through `runtime::approval_display::redact` — the same host-side
+redactor an approval card uses (issue #372), reused rather than re-derived, so
+one denylist governs both surfaces. That is safe because a gated call's
+arguments *are* the parked effect's payload the card already shows; it also
+means #372's documented limit applies here too (the denylist matches on keys, so
+a credential hidden in free text under a benign key is shown on both surfaces by
+the same rule). A remote tool's output never contributes content — only a shape.
+Steps are never written to the memory store (`memory_loop::outcome_chunk` stays
 text-only), so a step detail can never be retrieved and re-injected into a later
 turn. The fold + scrub lives in `src/harness/steps.rs` (compiled under the
 `openhuman` feature). Non-harness brains (echo, medulla) emit no steps.
+
+The same `TurnStep` rows are persisted per attempt by the run trace (issue #242)
+and rendered on **both** surfaces — the chat bubble and the task Attempts tab —
+from one projection, so the two cannot tell an operator different stories.
 
 ## ToolProvider
 
