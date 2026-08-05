@@ -152,6 +152,20 @@ export function approvalAction(a: ApprovalSummary): string {
   );
 }
 
+/**
+ * What a tool does, in plain language, from its identifier alone (#374).
+ *
+ * The Standing permissions list has no approval to hand to
+ * {@link approvalAction} — the card it came from was resolved and is gone — but
+ * the glossary rule at the top of this file still applies: an operator must
+ * never be shown `workspace_write` and asked to reason about it. Same first two
+ * rungs as {@link approvalAction}, with a fallback that names a tool without
+ * pretending to know which one.
+ */
+export function toolAction(kind: string): string {
+  return labelFor(EFFECT_LABELS, kind) ?? labelFor(TOOL_LABELS, kind) ?? "Use one of its tools";
+}
+
 /** A one-line, human summary of what needs approval. */
 export function approvalSummary(a: ApprovalSummary): string {
   const action = approvalAction(a);

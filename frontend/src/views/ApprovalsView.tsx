@@ -1,19 +1,26 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Check, Loader2, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
-import { ApiError, type ApprovalSummary, type Verdict } from "@/api/types";
+import {
+  ApiError,
+  type ApprovalSummary,
+  type GrantScope,
+  type StandingGrant,
+  type Verdict,
+} from "@/api/types";
 import {
   ApprovalHeadline,
   ApprovalMeta,
   ApprovalPayload,
+  ApprovalScopeControl,
   useAskerNames,
 } from "@/components/approval-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import type { CompanyFeed } from "@/hooks/use-company";
-import { approvalSummary } from "@/lib/language";
+import { approvalSummary, timeAgo, toolAction } from "@/lib/language";
 
 /**
  * Below this, a lost connection cannot have outlived the fast part of a resolve.
@@ -85,6 +92,7 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
   const [inFlight, setInFlight] = useState<ReadonlyMap<string, Verdict>>(() => new Map());
   const { approvals, now } = feed;
   const askerNames = useAskerNames(client, company, approvals);
+  const { grants, refreshGrants } = useStandingGrants(client, company);
 
   const markInFlight = (id: string, verdict: Verdict | null) =>
     setInFlight((prev) => {
@@ -94,30 +102,37 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
       return next;
     });
 
-  async function decide(a: ApprovalSummary, verdict: Verdict) {
+  async function decide(a: ApprovalSummary, verdict: Verdict, scope: GrantScope) {
     // Per-row guard: only a double-press on THIS card is ignored. The global
     // early return that used to live here made every other card inert too.
     if (inFlight.has(a.id)) return;
     markInFlight(a.id, verdict);
     const startedAt = Date.now();
     try {
-      await client.resolveApproval(a.id, verdict, undefined, company);
+      await client.resolveApproval(a.id, verdict, undefined, company, { scope });
       // Issue #243: approving no longer just records a verdict — it hands the
       // agent a single-use grant and re-dispatches it to make the call. The old
       // "Approved: …" read as "done", which was the exact lie that made the
       // missing re-dispatch invisible: the operator saw a success toast for work
       // that had silently dead-ended. Say what is actually happening instead.
       // Declining IS terminal, so its wording is unchanged.
+      // Say which scope actually landed. "Approved" alone would read the same
+      // for a one-off and for a week-long permission, and the operator has to be
+      // able to tell those apart from the confirmation they just got.
       const line =
-        verdict === "approve"
-          ? `Approved — the agent is completing the action: ${approvalSummary(a)}`
-          : `Declined: ${approvalSummary(a)}`;
+        verdict !== "approve"
+          ? `Declined: ${approvalSummary(a)}`
+          : scope.kind === "tool"
+            ? `Approved — ${toolAction(a.kind).toLowerCase()} won't ask again until this permission expires. Take it back under Standing permissions.`
+            : `Approved — the agent is completing the action: ${approvalSummary(a)}`;
       onResolved(line);
       toast.success(line);
       // The agent's reply arrives as a journaled `AgentReply` on its own thread,
       // so no extra plumbing is needed here — the existing feed refresh plus the
       // per-agent DM thread (#151) surface it.
       void feed.refresh();
+      // A tool-scoped approve minted a permission, so the list below is stale.
+      if (scope.kind === "tool") void refreshGrants();
     } catch (err) {
       // Issue #380: a failed request is not the same as a failed decision.
       //
@@ -180,15 +195,165 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
                   now={now}
                   askerNames={askerNames}
                   deciding={inFlight.get(a.id) ?? null}
-                  onDecide={(verdict) => void decide(a, verdict)}
+                  onDecide={(verdict, scope) => void decide(a, verdict, scope)}
                 />
               ))}
             </div>
           </>
         )}
+
+        {/* Below the queue, and shown even when the queue is empty — a standing
+            permission with nothing currently parked is exactly the state an
+            operator most needs to be able to find and take back. */}
+        <StandingPermissions
+          grants={grants}
+          now={now}
+          askerNames={askerNames}
+          onRevoke={async (id) => {
+            try {
+              await client.revokeGrant(id, company);
+              toast.success("Permission revoked — this tool will ask again from its next call.");
+            } catch (err) {
+              // A 404 means it was already gone (revoked elsewhere, or expired).
+              // The operator's intent is satisfied either way, so this is not an
+              // error to them — only a stale list, which the refresh below fixes.
+              if (err instanceof ApiError && err.status === 404) {
+                toast.info("That permission was already gone.");
+              } else {
+                const msg = err instanceof ApiError ? err.message : "something went wrong";
+                toast.error(`Couldn't revoke it — ${msg}`);
+                throw err;
+              }
+            } finally {
+              void refreshGrants();
+            }
+          }}
+        />
       </div>
     </div>
   );
+}
+
+/**
+ * The live standing permissions, polled alongside the approvals feed (#374).
+ *
+ * Its own read rather than a field on the feed: grants change on operator
+ * action, not on company activity, so they do not need the feed's cadence — and
+ * a host that predates the route 404s, which is caught here so the section
+ * simply does not appear rather than breaking the page.
+ */
+function useStandingGrants(client: OpenCompanyClient, company: string | null) {
+  const [grants, setGrants] = useState<StandingGrant[]>([]);
+
+  const refreshGrants = useCallback(async () => {
+    const next = await client.listGrants(company).catch(() => [] as StandingGrant[]);
+    setGrants(next);
+  }, [client, company]);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const next = await client.listGrants(company).catch(() => [] as StandingGrant[]);
+      if (live) setGrants(next);
+    })();
+    // Slow on purpose. Mint and revoke from another browser are only
+    // poll-visible in v1 (there is no event for them), and a permission list is
+    // not something an operator watches change — a minute is well inside the
+    // shortest duration on offer.
+    const timer = setInterval(() => void refreshGrants(), 60_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [client, company, refreshGrants]);
+
+  return { grants, refreshGrants };
+}
+
+/**
+ * What the operator has opened up, and how to take it back (#374).
+ *
+ * Renders nothing when there is nothing standing — including against a host
+ * that has no grants route at all, which reads back as an empty list. The
+ * section appearing is itself the signal that something is open.
+ */
+function StandingPermissions({
+  grants,
+  now,
+  askerNames,
+  onRevoke,
+}: {
+  grants: StandingGrant[];
+  now: number;
+  askerNames: Map<string, string>;
+  onRevoke: (id: string) => Promise<void>;
+}) {
+  // Per row, not one flag for the section — #373's lesson: a single in-flight
+  // slot makes deciding one row freeze every other row on the screen.
+  const [revoking, setRevoking] = useState<ReadonlySet<string>>(() => new Set());
+  if (grants.length === 0) return null;
+
+  const mark = (id: string, busy: boolean) =>
+    setRevoking((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+
+  return (
+    <section className="mt-8">
+      <h2 className="mb-1 text-sm font-medium text-muted-foreground">Standing permissions</h2>
+      <p className="mb-3 text-xs text-muted-foreground">
+        Tools you've let a teammate use without asking each time. Each one expires on its own;
+        you can end it sooner.
+      </p>
+      <div className="flex flex-col gap-2">
+        {grants.map((g) => {
+          const busy = revoking.has(g.id);
+          const expired = g.expires_at_millis <= now;
+          return (
+            <Card key={g.id}>
+              <CardContent className="flex flex-wrap items-center gap-3 py-3">
+                <div className="min-w-0 flex-1">
+                  {/* Phrased, never the raw identifier — the glossary rule. */}
+                  <p className="truncate text-sm font-medium">{toolAction(g.tool)}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {askerNames.get(g.agent) ?? g.agent} ·{" "}
+                    {expired ? "expired" : `expires ${untilLabel(g.expires_at_millis, now)}`} ·
+                    granted {timeAgo(g.at_millis, now)} by {g.granted_by.id}
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => {
+                    mark(g.id, true);
+                    void onRevoke(g.id)
+                      .catch(() => {})
+                      .finally(() => mark(g.id, false));
+                  }}
+                >
+                  {busy ? <Loader2 className="size-4 animate-spin" /> : <X className="size-4" />}{" "}
+                  Revoke
+                </Button>
+              </CardContent>
+            </Card>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/** "in 42m" / "in 6h" / "in 3d" — how long a permission has left. */
+function untilLabel(atMillis: number, now: number): string {
+  const mins = Math.max(0, Math.round((atMillis - now) / 60_000));
+  if (mins < 60) return `in ${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `in ${hours}h`;
+  return `in ${Math.round(hours / 24)}d`;
 }
 
 /**
@@ -221,8 +386,14 @@ function ApprovalCard({
   askerNames: Map<string, string>;
   /** The verdict this card is waiting on, or `null` when it is idle (#373). */
   deciding: Verdict | null;
-  onDecide: (verdict: Verdict) => void;
+  onDecide: (verdict: Verdict, scope: GrantScope) => void;
 }) {
+  // Per-card, like the in-flight verdict and for the same reason: two cards can
+  // be open at once and each carries its own decision. Defaults to `once`, so a
+  // card decided without touching the control behaves exactly as it did before
+  // #374 — the scope is opt-in at every level, including this one.
+  const [scope, setScope] = useState<GrantScope>({ kind: "once" });
+
   // No cross-card dimming: another card being decided is not this card's
   // business, and treating it as such is the visual half of the #373 bug.
   return (
@@ -239,7 +410,9 @@ function ApprovalCard({
                 variant="outline"
                 size="sm"
                 disabled={deciding !== null}
-                onClick={() => onDecide("deny")}
+                /* A decline never carries a scope — there is nothing to grant,
+                   and the host refuses the pairing anyway. */
+                onClick={() => onDecide("deny", { kind: "once" })}
               >
                 {deciding === "deny" ? (
                   <Loader2 className="size-4 animate-spin" />
@@ -248,7 +421,11 @@ function ApprovalCard({
                 )}{" "}
                 Decline
               </Button>
-              <Button size="sm" disabled={deciding !== null} onClick={() => onDecide("approve")}>
+              <Button
+                size="sm"
+                disabled={deciding !== null}
+                onClick={() => onDecide("approve", scope)}
+              >
                 {deciding === "approve" ? (
                   <Loader2 className="size-4 animate-spin" />
                 ) : (
@@ -261,6 +438,14 @@ function ApprovalCard({
         />
 
         <ApprovalPayload approval={a} />
+
+        <ApprovalScopeControl
+          approval={a}
+          askerNames={askerNames}
+          scope={scope}
+          onChange={setScope}
+          disabled={deciding !== null}
+        />
 
         <ApprovalMeta
           approval={a}

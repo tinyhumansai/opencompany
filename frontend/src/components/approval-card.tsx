@@ -35,7 +35,7 @@ import {
 } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
-import type { ApprovalSummary } from "@/api/types";
+import { GRANT_DURATIONS, type ApprovalSummary, type GrantScope } from "@/api/types";
 import { approvalAction, money, payloadLines, timeAgo } from "@/lib/language";
 import { cn } from "@/lib/utils";
 
@@ -194,6 +194,112 @@ export function ApprovalPayload({ approval }: { approval: ApprovalSummary }) {
       )}
     </div>
   );
+}
+
+/**
+ * The scope control: what this approve buys (#374).
+ *
+ * Rendered **only** when the host marked the card `broadly_grantable`, so the
+ * operator is never offered a choice the host would refuse. That is UX, not the
+ * boundary — the host re-checks and answers 400 — but offering an option that
+ * cannot work is its own kind of lie.
+ *
+ * Two options, and the default needs no interaction at all: doing nothing
+ * approves once, exactly as before this existed. Picking the broader option
+ * forces a duration, because there is no unbounded form to fall back to; the
+ * radio and the duration are one control rather than two so an operator cannot
+ * arrive at "for a period, unspecified".
+ *
+ * Lives here rather than in either view because both surfaces that decide an
+ * approval must say the same thing about what a decision means. Two copies of
+ * this wording would drift, and the half that drifted would be the one somebody
+ * was reading when it mattered.
+ */
+export function ApprovalScopeControl({
+  approval: a,
+  askerNames,
+  scope,
+  onChange,
+  disabled,
+}: {
+  approval: ApprovalSummary;
+  /** Roster names, so the sentence says who — the same map the meta line uses. */
+  askerNames: Map<string, string>;
+  scope: GrantScope;
+  onChange: (scope: GrantScope) => void;
+  disabled?: boolean;
+}) {
+  const name = `scope-${a.id}`;
+  if (!a.broadly_grantable) return null;
+
+  return (
+    <fieldset
+      disabled={disabled}
+      className="rounded-lg border bg-muted/30 px-3 py-2 text-sm disabled:opacity-60"
+    >
+      <legend className="px-1 text-xs text-muted-foreground">If you approve</legend>
+      <div className="flex flex-col gap-1.5">
+        <label className="flex items-center gap-2">
+          <input
+            type="radio"
+            name={name}
+            checked={scope.kind === "once"}
+            onChange={() => onChange({ kind: "once" })}
+            className="size-3.5 accent-primary"
+          />
+          <span>Just this once</span>
+        </label>
+        <label className="flex flex-wrap items-center gap-2">
+          <input
+            type="radio"
+            name={name}
+            checked={scope.kind === "tool"}
+            // Picking the broader scope commits to a duration immediately —
+            // the first option, not an empty one — so there is no state in
+            // which "for a period" is selected with no period.
+            onChange={() =>
+              onChange({ kind: "tool", expiresInMillis: GRANT_DURATIONS[0].millis })
+            }
+            className="size-3.5 accent-primary"
+          />
+          <span>Let {askerLabel(a, askerNames)} use this tool for</span>
+          <select
+            value={scope.kind === "tool" ? scope.expiresInMillis : GRANT_DURATIONS[0].millis}
+            disabled={scope.kind !== "tool"}
+            onChange={(e) =>
+              onChange({ kind: "tool", expiresInMillis: Number(e.target.value) })
+            }
+            aria-label="How long this permission lasts"
+            className="rounded-md border bg-background px-1.5 py-0.5 text-xs disabled:opacity-50"
+          >
+            {GRANT_DURATIONS.map((d) => (
+              <option key={d.millis} value={d.millis}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {scope.kind === "tool" && (
+        <p className="mt-1.5 px-1 text-xs text-muted-foreground">
+          It won't ask again for this tool until then — with any arguments. You can take it
+          back from Standing permissions at any time.
+        </p>
+      )}
+    </fieldset>
+  );
+}
+
+/**
+ * Who the broader scope would be granted to, by name.
+ *
+ * Falls back to the raw agent id, then to "this teammate". Naming the wrong
+ * teammate would be worse than naming none, so this only ever narrows from what
+ * the host actually said — it never guesses.
+ */
+function askerLabel(a: ApprovalSummary, askerNames: Map<string, string>): string {
+  if (!a.agent) return "this teammate";
+  return askerNames.get(a.agent) ?? a.agent;
 }
 
 /**
