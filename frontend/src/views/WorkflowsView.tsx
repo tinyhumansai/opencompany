@@ -149,6 +149,14 @@ export function WorkflowsView({
   // vanished when the drawer was dismissed and a scheduled run's never reached
   // the operator at all.
   const [runs, setRuns] = useState<WorkflowRunOutcome[]>([]);
+  // Which workflow the rows in `runs` were fetched for.
+  //
+  // `graph` and `runs` are two independent requests off the same selection, so
+  // a switch can land the new graph while the previous workflow's history is
+  // still in state. Anything that pairs the two — the copilot's grounding — has
+  // to be able to tell that the pair does not agree yet, and a bare "is it
+  // loading" flag cannot: the mismatch outlives the load when a fetch fails.
+  const [runsFor, setRunsFor] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   // A host predating the runs route answers 404. That is not an error worth
   // showing — the rest of the view works — so it just means "no history here".
@@ -318,6 +326,7 @@ export function WorkflowsView({
     // whether the host serves this route.
     if (!selectedId) {
       setRuns([]);
+      setRunsFor(null);
       return;
     }
     let live = true;
@@ -329,6 +338,7 @@ export function WorkflowsView({
         });
         if (!live) return;
         setRuns(rows);
+        setRunsFor(selectedId);
         setHistorySupported(true);
         // Issue #371, the no-live-stream fallback. If the run we just POSTed is
         // in this page and nothing was ever *reported* live (only the frontier
@@ -350,6 +360,10 @@ export function WorkflowsView({
         // Degrade quietly: an older host simply has no history to show.
         console.debug("[WorkflowsView] run history unavailable", e);
         setRuns([]);
+        // Still THIS workflow's answer — "the host has no history for it" — so
+        // the pair agrees and the copilot may proceed, told via `runsKnown`
+        // that nothing is known about runs rather than that there were none.
+        setRunsFor(selectedId);
         setHistorySupported(false);
       }
     })();
@@ -1041,6 +1055,9 @@ export function WorkflowsView({
                 graph={graph}
                 runs={runs}
                 runsKnown={historySupported}
+                // The graph on screen and the history in `runs` must be the
+                // same workflow's before anything is grounded on the pair.
+                runsReady={runsFor === graph.id}
                 onClose={() => setCopilotOpen(false)}
               />
             ) : (

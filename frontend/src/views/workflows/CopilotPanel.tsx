@@ -53,6 +53,7 @@ export function CopilotPanel({
   graph,
   runs,
   runsKnown,
+  runsReady,
   onClose,
 }: {
   client: OpenCompanyClient;
@@ -64,6 +65,17 @@ export function CopilotPanel({
   runs: WorkflowRunOutcome[];
   /** Whether the host served that history at all — see {@link CopilotContext}. */
   runsKnown: boolean;
+  /**
+   * Whether `runs` is the history of THIS workflow rather than the one selected
+   * before it.
+   *
+   * The graph and the run history are two independent requests, so a workflow
+   * switch can land the new graph while the previous workflow's runs are still
+   * on screen. Grounding an answer on that pair is worse than not grounding it
+   * at all — it would describe workflow B's steps using workflow A's failures —
+   * so the panel refuses to send until the two agree.
+   */
+  runsReady: boolean;
   onClose: () => void;
 }) {
   const [messages, setMessages] = useState<CopilotMessage[]>([]);
@@ -73,17 +85,35 @@ export function CopilotPanel({
   // The cognition path the company actually booted onto. `null` until the read
   // lands, or when the host does not serve the route.
   const [cognition, setCognition] = useState<CognitionPath | null>(null);
+  // Whether that read has come back yet — either way, answer or failure.
+  //
+  // Separate from `cognition` because `null` is genuinely ambiguous: it is both
+  // "not asked yet" and "asked, and this host does not serve the route". The
+  // echo gate has to tell those apart, or it is open for the whole round trip
+  // and a fast question gets exactly the parroted reply the gate exists to
+  // prevent.
+  const [inferenceChecked, setInferenceChecked] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Bumped whenever the conversation this panel is holding changes identity.
+  // An in-flight request captures it and drops its result if it no longer
+  // matches — see `send`.
+  const conversation = useRef(0);
 
   const workflowId = graph.id;
   const sourceDefined = graph.editable === false;
 
   // Replay this workflow's transcript. Keyed on the workflow id, so switching
   // workflow swaps transcripts rather than appending to the previous one.
+  //
+  // This is also the one place the conversation's identity changes, so it is
+  // where the generation is bumped: any request still in flight for the
+  // previous (workflow, company) pair is abandoned from here on.
   useEffect(() => {
     let live = true;
+    conversation.current += 1;
     setMessages([]);
     setError(null);
+    setSending(false);
     (async () => {
       const replayed = await loadCopilotHistory(client, company, workflowId);
       if (live) setMessages(replayed);
@@ -97,16 +127,22 @@ export function CopilotPanel({
   // company answers 200 with an echo, so this read is the only way to tell.
   useEffect(() => {
     let live = true;
+    setInferenceChecked(false);
     (async () => {
       try {
         const status = await getInferenceStatus(client, company);
         if (live) setCognition(status.cognition);
       } catch (e) {
-        // A host without the route tells us nothing either way. Staying `null`
-        // lets the composer work — refusing to send because we could not
-        // confirm would break the copilot on hosts where it works fine.
+        // A host without the route tells us nothing either way. Leaving
+        // `cognition` null lets the composer work once the check has *settled*
+        // — refusing to send because we could not confirm would break the
+        // copilot on hosts where it works fine.
         console.debug("[CopilotPanel] inference status unavailable", e);
         if (live) setCognition(null);
+      } finally {
+        // Settled either way: this is what re-opens the composer, so it must
+        // run on the failure path too or an older host disables it forever.
+        if (live) setInferenceChecked(true);
       }
     })();
     return () => {
@@ -121,10 +157,26 @@ export function CopilotPanel({
   }, [messages, sending]);
 
   const echoing = cognition === "echo";
+  // Nothing may be asked until BOTH the echo check has settled and the run
+  // history on screen is this workflow's. Either one unresolved means a
+  // question would be answered on a footing we cannot vouch for.
+  const ready = inferenceChecked && runsReady;
 
   const send = useCallback(async () => {
     const question = draft.trim();
-    if (!question || sending || echoing) return;
+    if (!question || sending || echoing || !ready) return;
+    // Which conversation this request belongs to.
+    //
+    // The panel is keyed on the workflow id by its parent, so switching
+    // workflow normally unmounts this instance and React drops its state
+    // updates on the floor. That is not a guarantee worth relying on from in
+    // here: it lives in another file, and it does NOT hold when the id is
+    // stable across the change — switching company to one that happens to have
+    // a workflow of the same id keeps the key identical, so the panel is
+    // reused and an in-flight reply from the previous company would land in
+    // the new transcript. Comparing the generation makes the guarantee local.
+    const generation = conversation.current;
+    const mine = () => conversation.current === generation;
     setDraft("");
     setError(null);
     setMessages((prev) => [
@@ -140,6 +192,7 @@ export function CopilotPanel({
         { graph, runs, runsKnown },
         question,
       );
+      if (!mine()) return;
       setMessages((prev) => [
         ...prev,
         // An empty `responses` array is a real answer shape, not a crash: the
@@ -163,11 +216,14 @@ export function CopilotPanel({
             }))),
       ]);
     } catch (e) {
+      if (!mine()) return;
       setError(e instanceof Error ? e.message : "the copilot could not answer");
     } finally {
-      setSending(false);
+      // Guarded too: an abandoned request clearing this would re-enable the
+      // composer for a NEWER question that is still in flight.
+      if (mine()) setSending(false);
     }
-  }, [client, company, draft, echoing, graph, runs, runsKnown, sending, workflowId]);
+  }, [client, company, draft, echoing, graph, ready, runs, runsKnown, sending, workflowId]);
 
   const placeholder = useMemo(
     () =>
@@ -292,8 +348,14 @@ export function CopilotPanel({
               void send();
             }
           }}
-          disabled={sending || echoing}
-          placeholder={echoing ? "Inference isn't configured." : placeholder}
+          disabled={sending || echoing || !ready}
+          placeholder={
+            echoing
+              ? "Inference isn't configured."
+              : !ready
+                ? "Checking what this company can answer with…"
+                : placeholder
+          }
           aria-label={`Ask the copilot about ${graph.name}`}
           className="mb-2 max-h-32 min-h-16 resize-none text-xs"
           data-testid="workflow-copilot-input"
@@ -302,7 +364,7 @@ export function CopilotPanel({
           size="sm"
           className="w-full"
           onClick={() => void send()}
-          disabled={sending || echoing || !draft.trim()}
+          disabled={sending || echoing || !ready || !draft.trim()}
           data-testid="workflow-copilot-send"
         >
           {sending ? (
