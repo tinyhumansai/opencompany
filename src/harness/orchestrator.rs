@@ -410,6 +410,19 @@ impl Tool for QueryCompanyTool {
                     fact.body.trim()
                 ));
             }
+            // Issue #410, the same silent-cut class one tool over: this list was
+            // capped at FACT_LIMIT with no marker, so a company past twenty facts
+            // handed the orchestrator a partial memory that read as complete —
+            // and the narrowing argument that would have fixed it (`query`) was
+            // never mentioned at the point the cut happened.
+            if facts.len() > FACT_LIMIT {
+                md.push_str(&format!(
+                    "\n[TRUNCATED — {} more fact(s) not shown. This is NOT the whole record. \
+                     Narrow it with `{QUERY_COMPANY_TOOL}({{\"query\": \"<substring>\"}})` before \
+                     concluding a fact is absent.]\n",
+                    facts.len() - FACT_LIMIT
+                ));
+            }
         }
         md.push_str("\n## Recent activity\n");
         if recent.is_empty() {
@@ -2364,6 +2377,69 @@ members = ["nobody"]
             1,
             "a post must not hold a slot of its own: {out}"
         );
+    }
+
+    /// Issue #410, point 4 (audit the same silent-cut class elsewhere): the
+    /// fact list is capped at [`FACT_LIMIT`], and it used to be capped in
+    /// silence. A company past twenty facts handed the orchestrator a partial
+    /// memory that read as complete, so "we have no record of that" was a
+    /// conclusion it could reach from a truncated list. The cut now says it
+    /// happened and names the argument that narrows it.
+    #[tokio::test]
+    async fn query_company_says_when_the_fact_list_was_cut() {
+        use crate::ports::FactStore;
+        use crate::ports::facts::{FactKind, FactRecord};
+
+        struct ManyFacts(usize);
+        #[async_trait]
+        impl FactStore for ManyFacts {
+            async fn list(
+                &self,
+                _company: &CompanyId,
+                _query: Option<&str>,
+                _kind: Option<FactKind>,
+            ) -> crate::Result<Vec<FactRecord>> {
+                Ok((0..self.0)
+                    .map(|i| FactRecord {
+                        id: format!("f-{i}"),
+                        kind: FactKind::Fact,
+                        title: format!("Fact {i}"),
+                        body: format!("Body {i}"),
+                        source: "ceo".to_string(),
+                        updated_at_millis: i as u64,
+                    })
+                    .collect())
+            }
+            async fn upsert(&self, _c: &CompanyId, _f: &FactRecord) -> crate::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _c: &CompanyId, _id: &str) -> crate::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        // Exactly at the cap: complete, so no notice.
+        let exact: Arc<dyn FactStore> = Arc::new(ManyFacts(FACT_LIMIT));
+        let out = QueryCompanyTool::new(CompanyId::new("acme"), Some(exact), None, None, None)
+            .execute(json!({}))
+            .await
+            .expect("execute")
+            .output_for_llm(true);
+        assert!(!out.contains("TRUNCATED"), "nothing was cut: {out}");
+
+        // Past the cap: the cut is announced, counted, and points at `query`.
+        let many: Arc<dyn FactStore> = Arc::new(ManyFacts(FACT_LIMIT + 7));
+        let out = QueryCompanyTool::new(CompanyId::new("acme"), Some(many), None, None, None)
+            .execute(json!({}))
+            .await
+            .expect("execute")
+            .output_for_llm(true);
+        assert!(
+            out.contains("TRUNCATED"),
+            "the cut must be announced: {out}"
+        );
+        assert!(out.contains("7 more fact(s) not shown"), "{out}");
+        assert!(out.contains("query_company"), "{out}");
     }
 
     #[tokio::test]
