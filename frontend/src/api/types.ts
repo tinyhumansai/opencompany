@@ -148,6 +148,13 @@ export interface OutboundMessage {
    * wrong. The bubble's `steps` timeline still shows every spawn.
    */
   taskId?: string;
+  /**
+   * The durable id this reply was journaled under (issue #364) — the id
+   * `chat/history` will return for it. Absent on a reply the host could not
+   * journal, and on a host that predates the field; either way the console
+   * treats the bubble as un-threadable rather than inventing an id for it.
+   */
+  messageId?: string;
 }
 
 /** Channel-specific reply addressing. Mirrors `ReplyTo` in `src/ports/types.rs`. */
@@ -231,11 +238,38 @@ export interface ChatHistoryMessageDto {
    * renders identically whichever surface hydrated the transcript.
    */
   taskId?: string;
+  /**
+   * The message this one replies to (issue #364), by that message's own `id`.
+   * Absent for a message posted straight into the channel — which is every
+   * message journaled before threads were persisted.
+   */
+  parentId?: string;
+  /**
+   * Who reacted to this message with what (issue #364), one row per person per
+   * emoji. Absent when nobody has, and on a host that predates the field.
+   */
+  reactions?: ChatReactionDto[];
+}
+
+/** One person's reaction. Mirrors `ChatReactionDto` in `src/server/operator.rs`. */
+export interface ChatReactionDto {
+  emoji: string;
+  /** Who reacted, as a display label — never a raw user id. */
+  by: string;
+  /** Whether the reading viewer is the one who reacted. */
+  mine: boolean;
 }
 
 /** Response of `/chat` and approval-resolution routes. */
 export interface ChatResponse {
   responses: OutboundMessage[];
+  /**
+   * The durable id the operator's own message was journaled under (issue #364)
+   * — the id `chat/history` will return for it. Absent on a host that predates
+   * the field, which the console reads as "this message cannot be threaded or
+   * reacted to" rather than guessing an id.
+   */
+  messageId?: string;
 }
 
 /** One parked approval from `/approvals`. */

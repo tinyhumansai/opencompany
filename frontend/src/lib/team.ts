@@ -81,11 +81,42 @@ export function fromDto(dto: TeamMemberDto): TeamMember {
   };
 }
 
-let n = 0;
-const id = () => `member-${n++}`;
+/**
+ * A stable id for a teammate the console invented (issue #364).
+ *
+ * Derived from the role, not minted from a counter. The counter was the reason
+ * nothing about a console-only teammate survived a reload: `member-3` named a
+ * different person on the next mount — or nobody — so the DM's URL, its unread
+ * count, and the transcript the host journaled under that id all pointed at
+ * someone else. A role slug is the same on every mount of every tab.
+ *
+ * The hash suffix is not decoration. Slugifying keeps only `[a-z0-9]`, so a
+ * role written in a non-Latin script slugifies to nothing and two roles that
+ * slugify alike collide — and a collision here means two teammates sharing one
+ * DM, with their messages merged. The hash of the full role keeps the id
+ * readable *and* distinct.
+ */
+export function localMemberId(role: string): string {
+  const trimmed = role.trim();
+  const slug = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return `member-${slug ? `${slug}-` : ""}${roleHash(trimmed)}`;
+}
+
+function roleHash(role: string): string {
+  let hash = 0;
+  for (let i = 0; i < role.length; i++) hash = (hash * 31 + role.charCodeAt(i)) | 0;
+  return (hash >>> 0).toString(36);
+}
 
 function member(name: string, role: string, description: string): TeamMember {
-  return { id: id(), name, role, description, tone: toneFor(name), inboxEnabled: false };
+  return {
+    id: localMemberId(role),
+    name,
+    role,
+    description,
+    tone: toneFor(name),
+    inboxEnabled: false,
+  };
 }
 
 /**
@@ -113,9 +144,17 @@ export function starterTeam(): TeamMember[] {
   ];
 }
 
-/** Create a member from operator-entered fields. */
+/**
+ * Create a member from operator-entered fields, for a host with no team write
+ * plane — so the id is console-derived and, since issue #364, reload-stable.
+ *
+ * Keyed on the **name** rather than the role: an operator adding a teammate by
+ * hand is naming a person, and two of them may well share a role ("Engineer").
+ * The starter roster keys on role because that is what distinguishes its
+ * fabricated rows.
+ */
 export function newMember(fields: { name: string; role: string; description: string }): TeamMember {
-  const memberId = id();
+  const memberId = localMemberId(fields.name);
   return {
     id: memberId,
     name: fields.name.trim(),

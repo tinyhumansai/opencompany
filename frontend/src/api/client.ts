@@ -219,10 +219,43 @@ export class OpenCompanyClient {
    * unknown ids fall to the orchestrator, so callers can always pass the active
    * thread id safely.
    */
-  chat(text: string, company?: string | null, chat?: string | null): Promise<ChatResponse> {
-    const body: { text: string; chat?: string } = { text };
+  chat(
+    text: string,
+    company?: string | null,
+    chat?: string | null,
+    /**
+     * The host-side id of the message being replied to, making this a thread
+     * reply rather than a new line in the channel (issue #364). Never a console
+     * id — callers strip the `h` prefix with `toHostMessageId` first.
+     */
+    parent?: string | null,
+  ): Promise<ChatResponse> {
+    const body: { text: string; chat?: string; parent?: string } = { text };
     if (chat) body.chat = chat;
+    if (parent) body.parent = parent;
     return this.request<ChatResponse>("POST", `${this.scope(company)}/chat`, body);
+  }
+
+  /**
+   * Set or clear one reaction on one message (issue #364).
+   *
+   * `on` is explicit rather than a toggle so the call is idempotent: a retry or
+   * a double tap converges on what the caller asked for instead of flipping
+   * twice. `messageSeq` is the host-side id (no `h` prefix). Hosts that predate
+   * the route return 404 — callers roll their optimistic change back and say
+   * the host can't keep reactions.
+   */
+  reactToMessage(
+    messageSeq: string,
+    emoji: string,
+    on: boolean,
+    company?: string | null,
+  ): Promise<void> {
+    return this.request<void>(
+      "POST",
+      `${this.scope(company)}/chat/messages/${encodeURIComponent(messageSeq)}/reactions`,
+      { emoji, on },
+    );
   }
 
   /**

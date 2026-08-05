@@ -1,5 +1,14 @@
 import type { ChatHistoryMessageDto, TurnStep } from "@/api/types";
 
+/** One person's reaction on one line. Mirrors `ChatReactionDto` on the host. */
+export interface Reaction {
+  emoji: string;
+  /** Who reacted, as a display label — never a raw user id. */
+  by: string;
+  /** Whether the reader is the one who reacted. */
+  mine: boolean;
+}
+
 /** One line in the conversation with the company. */
 export interface ChatMessage {
   id: string;
@@ -15,10 +24,21 @@ export interface ChatMessage {
   /**
    * The message this one replies to. A line with a parent is a thread reply:
    * it stays out of the channel timeline and renders inside the thread panel.
+   *
+   * Always another line's `id`, so it moves with {@link reconcileIds} when an
+   * optimistic id is replaced by the durable one the host assigned.
    */
   parentId?: string;
-  /** Emoji → count. Absent until someone reacts. */
-  reactions?: Record<string, number>;
+  /**
+   * Who reacted to this line with what — one row per person per emoji, not a
+   * count (issue #364).
+   *
+   * A count could not say who reacted, and could not tell the reader whether
+   * one of the reactions was their own, which is what makes a chip a toggle.
+   * The renderer groups these into chips; nothing groups a count back into
+   * people. Absent until someone reacts.
+   */
+  reactions?: Reaction[];
   /**
    * The scrubbed processing steps behind a company reply (tool calls, thinking,
    * surfaced failures), rendered as a timeline above the bubble. Absent/empty
@@ -67,7 +87,14 @@ export function titleFromMessage(text: string): string {
 let seq = 0;
 const nextId = () => `m${seq++}`;
 
-/** Build a stamped message. `at` is injected so callers stay pure/testable. */
+/**
+ * Build a stamped message. `at` is injected so callers stay pure/testable.
+ *
+ * `messageId` is the host's own id for the line, when the caller already has
+ * one — a reply that came back from the chat POST does. Passing it means the
+ * bubble is born durable and can be replied to or reacted on immediately,
+ * rather than waiting for a reconciliation it does not need.
+ */
 export function makeMessage(
   from: ChatMessage["from"],
   text: string,
@@ -77,10 +104,11 @@ export function makeMessage(
     parentId?: string;
     steps?: TurnStep[];
     taskId?: string;
+    messageId?: string;
   } = {},
 ): ChatMessage {
   return {
-    id: nextId(),
+    id: opts.messageId ? hostMessageId(opts.messageId) : nextId(),
     from,
     text,
     at: opts.at ?? Date.now(),
@@ -102,10 +130,17 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
   return entries.map((entry) => {
     const from: ChatMessage["from"] = entry.mine ? "you" : "company";
     return {
-      id: `h${entry.id}`,
+      id: hostMessageId(entry.id),
       from,
       text: entry.text,
       at: entry.atMillis,
+      // The host names the parent by its own id, which lives in the same
+      // namespace as `entry.id` — so it takes the same prefix, or the reply
+      // would point at a line no console id matches (issue #364).
+      parentId: entry.parentId ? hostMessageId(entry.parentId) : undefined,
+      // Reactions come through whoever the host said reacted; nothing is
+      // inferred here, `mine` included.
+      reactions: entry.reactions?.length ? entry.reactions : undefined,
       // A sent message never carries a channel; only attribute one when the
       // line came from someone/something else, mirroring `ChatPane.send`.
       channel: from === "company" ? entry.channel : undefined,
@@ -118,4 +153,70 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       taskId: from === "company" ? entry.taskId : undefined,
     };
   });
+}
+
+/**
+ * The console id for a message the host has journaled (issue #364).
+ *
+ * Two id namespaces meet in a transcript, and keeping them apart is the whole
+ * job of this prefix: `m<n>` is a browser-minted counter that means nothing
+ * outside this tab, and `h<seq>` is the host's own sequence position, which any
+ * reader — a reload, a second operator — resolves to the same message. The `h`
+ * is what lets {@link isHostMessageId} tell "saved" from "not saved yet"
+ * without asking the server.
+ */
+export function hostMessageId(seq: string): string {
+  return `h${seq}`;
+}
+
+/** Whether an id names a message the host has journaled. */
+export function isHostMessageId(id: string | undefined): boolean {
+  return !!id && id.startsWith("h");
+}
+
+/**
+ * The host-side id an `h`-prefixed console id names, or `null` for a local one.
+ *
+ * The inverse of {@link hostMessageId}, used when a durable id has to go back
+ * over the wire — a thread reply's parent, a reaction's target.
+ */
+export function toHostMessageId(id: string | undefined): string | null {
+  return isHostMessageId(id) ? id!.slice(1) : null;
+}
+
+/**
+ * Replace an optimistic message id with the durable one the host assigned, and
+ * re-point anything that was already replying to it (issue #364).
+ *
+ * The subtle half is the re-parenting, and it is why this is a named function
+ * with its own tests rather than three lines inside a `setState`. A send is
+ * rendered before the POST resolves, so a fast operator can open a thread on
+ * that bubble and reply to it while its id is still the local counter. Swapping
+ * only the parent's own id would leave those replies pointing at an id that no
+ * longer exists — they would silently drop out of the thread and reappear in
+ * the channel, which reads as the console losing them.
+ *
+ * Pure and total: unknown ids pass through, and a list with nothing to change
+ * is returned as-is so React sees no new array.
+ */
+export function reconcileIds(
+  messages: ChatMessage[],
+  localId: string,
+  hostSeq: string,
+): ChatMessage[] {
+  const nextId = hostMessageId(hostSeq);
+  if (nextId === localId) return messages;
+  let changed = false;
+  const next = messages.map((m) => {
+    const isTarget = m.id === localId;
+    const isChild = m.parentId === localId;
+    if (!isTarget && !isChild) return m;
+    changed = true;
+    return {
+      ...m,
+      ...(isTarget ? { id: nextId } : {}),
+      ...(isChild ? { parentId: nextId } : {}),
+    };
+  });
+  return changed ? next : messages;
 }
