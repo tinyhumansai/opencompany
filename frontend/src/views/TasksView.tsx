@@ -1,5 +1,13 @@
 import { type DragEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Play, Plus } from "lucide-react";
+import {
+  FileText,
+  ListTree,
+  Loader2,
+  Paperclip,
+  Play,
+  Plus,
+  ScrollText,
+} from "lucide-react";
 
 import { createTask, listTasks, patchTask, type Task } from "@/api/tasks";
 import type { OpenCompanyClient } from "@/api/client";
@@ -19,6 +27,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { ADD_TASK_COLUMN, PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
+import {
+  extraOutputCount,
+  primaryLink,
+  readTaskFocus,
+  type TaskFocus,
+  type TaskLink,
+} from "@/lib/task-output";
 import { toast } from "sonner";
 import { TaskDetailView } from "./TaskDetailView";
 
@@ -111,6 +126,12 @@ export function TasksView({
   // The open card's id, mirrored in `#/tasks/<id>` so the detail survives a
   // refresh and honors back/forward.
   const [detailId, setDetailId] = useState<string | null>(readTaskDetailId);
+  // What the address asks the detail screen to open (issue #339): a pinned
+  // artifact, or an attempt's trace. Empty for a plain `#/tasks/<id>`, which is
+  // the ordinary "open the card" navigation and lands on the default tab.
+  const [focus, setFocus] = useState<TaskFocus>(() =>
+    readTaskFocus(window.location.hash),
+  );
   const [creating, setCreating] = useState(false);
   const mounted = useRef(true);
   // A real HTML5 drag fires a trailing click; suppress it so a drag never also
@@ -151,7 +172,13 @@ export function TasksView({
 
   // Follow browser back/forward and manual edits of the `#/tasks/<id>` sub-hash.
   useEffect(() => {
-    const onHash = () => setDetailId(readTaskDetailId());
+    const onHash = () => {
+      setDetailId(readTaskDetailId());
+      // Re-read the focus too, so a card link clicked while the detail is
+      // already open (a `+N more` row, or a second card's link) actually moves
+      // the screen rather than only changing the address bar.
+      setFocus(readTaskFocus(window.location.hash));
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -205,10 +232,15 @@ export function TasksView({
   const openDetail = useCallback((id: string) => {
     window.location.hash = `/tasks/${encodeURIComponent(id)}`;
     setDetailId(id);
+    // An ordinary open carries no focus, and must clear any it inherited —
+    // otherwise opening a second card would re-apply the first card's artifact
+    // pin to a screen that has never heard of it.
+    setFocus({});
   }, []);
   const closeDetail = useCallback(() => {
     window.location.hash = "/tasks";
     setDetailId(null);
+    setFocus({});
   }, []);
 
   /**
@@ -293,6 +325,7 @@ export function TasksView({
         client={client}
         company={company}
         taskId={detailId}
+        focus={focus}
         onBack={closeDetail}
         onNavigate={openDetail}
         onOpenThread={onOpenThread}
@@ -514,6 +547,7 @@ function TaskItem({
           <span className="truncate text-xs text-muted-foreground">{task.assignee}</span>
         </div>
       )}
+      {SHOWS_OUTPUT_LINK.has(task.column) && <OutputLinkRow task={task} />}
       {task.column === "paused" && (
         <Button
           variant="outline"
@@ -528,6 +562,70 @@ function TaskItem({
           <Play className="mr-1.5 size-3.5" />
           Resume
         </Button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The columns whose cards show what they produced (issue #339).
+ *
+ * Done **and In review**, which is a correction to how the epic is worded. A
+ * clean success no longer lands in Done — it stops in In review, and Done is
+ * reached only when a person accepts it. So a card that has produced something
+ * spends most of its visible life in In review, and showing the link only in
+ * Done would hide it during exactly the stretch where somebody is deciding
+ * whether to accept the work and needs to read it.
+ *
+ * Not the earlier columns: a card in To-do or In progress either has no output
+ * yet or has one from a superseded attempt, and advertising that mid-run would
+ * suggest the work in flight is already finished.
+ */
+const SHOWS_OUTPUT_LINK = new Set(["in_review", "done"]);
+
+function LinkIcon({ kind }: { kind: TaskLink["kind"] }) {
+  const className = "size-3.5 shrink-0";
+  if (kind === "artifact") return <Paperclip className={className} />;
+  if (kind === "workflow") return <ListTree className={className} />;
+  if (kind === "trace") return <ScrollText className={className} />;
+  return <FileText className={className} />;
+}
+
+/**
+ * One line on a finished card: *here is the thing this task produced*.
+ *
+ * Every card in these columns gets one, including the ones that produced no
+ * file — for those the link opens the attempt's trace, which is the deliverable
+ * when there is no document. A card that recorded no attempt at all links to
+ * itself, which is honest rather than absent.
+ *
+ * The anchor stops its own click from bubbling: the whole card is a button that
+ * opens the detail screen, and without this a click on the link would both
+ * follow the href and fire the card's `onOpen`, racing two navigations.
+ */
+function OutputLinkRow({ task }: { task: Task }) {
+  const link = primaryLink(task);
+  const extra = extraOutputCount(task);
+  return (
+    <div className="mt-3 flex items-center gap-2 border-t pt-2 text-xs">
+      <a
+        href={link.href}
+        title={link.hint}
+        onClick={(e) => e.stopPropagation()}
+        className="flex min-w-0 items-center gap-1.5 text-muted-foreground hover:text-foreground hover:underline"
+      >
+        <LinkIcon kind={link.kind} />
+        <span className="truncate">{link.label}</span>
+      </a>
+      {extra > 0 && (
+        <a
+          href={`#/tasks/${encodeURIComponent(task.id)}`}
+          title="Open the task to see everything it produced."
+          onClick={(e) => e.stopPropagation()}
+          className="shrink-0 text-muted-foreground hover:text-foreground hover:underline"
+        >
+          +{extra} more
+        </a>
       )}
     </div>
   );
