@@ -119,12 +119,20 @@ export function ApprovalsView({ client, company, feed, onResolved, onGoToConvers
       // Say which scope actually landed. "Approved" alone would read the same
       // for a one-off and for a week-long permission, and the operator has to be
       // able to tell those apart from the confirmation they just got.
+      //
+      // …and only say "the agent" when there IS one (#395). A card with no
+      // `agent` is one the runtime performs itself — a paused workflow gate, a
+      // cold-recipient report — and naming an agent there is the same shape of
+      // small lie the wording above exists to remove. The work is still in
+      // flight either way, so both halves say so; only the actor changes.
       const line =
         verdict !== "approve"
           ? `Declined: ${approvalSummary(a)}`
           : scope.kind === "tool"
             ? `Approved — ${toolAction(a.kind).toLowerCase()} won't ask again until this permission expires. Take it back under Standing permissions.`
-            : `Approved — the agent is completing the action: ${approvalSummary(a)}`;
+            : a.agent
+              ? `Approved — the agent is completing the action: ${approvalSummary(a)}`
+              : `Approved — carrying it out now: ${approvalSummary(a)}`;
       onResolved(line);
       toast.success(line);
       // The agent's reply arrives as a journaled `AgentReply` on its own thread,
