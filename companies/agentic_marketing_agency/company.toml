@@ -85,7 +85,11 @@ description = "Acquisition and lifecycle."
 members = ["paid_ads_manager", "email_marketer"]
 
 # Integrations to prioritize wiring. Intent only — scopes and why, never
-# secrets. The manager injects real OAuth credentials at runtime.
+# secrets. Nothing here provisions a credential: the manager injects no
+# OPENCOMPANY_OAUTH_* variable into a tenant, so the native Connect flow is the
+# self-hosted hatch only (see src/server/ops/connections.rs). On the hosted
+# platform, agents reach Gmail / Slack / GitHub through Composio, which
+# authenticates with the instance's own platform identity.
 [[connection]]
 provider = "slack"
 priority = "high"
