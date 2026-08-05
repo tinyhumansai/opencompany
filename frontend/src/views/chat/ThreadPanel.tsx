@@ -1,6 +1,7 @@
 import { X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Markdown } from "@/components/markdown";
 import type { ChatMessage } from "@/lib/chat";
 import { Avatar } from "./Avatar";
 import { MessageComposer } from "./MessageComposer";
@@ -83,7 +84,7 @@ function Line({ channel, message }: { channel: Channel; message: ChatMessage }) 
             {formatTime(message.at)}
           </span>
         </div>
-        <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.text}</p>
+        <Markdown className="text-sm leading-6 break-words prose-p:my-0 prose-pre:my-1.5 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1">{message.text}</Markdown>
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import { MessageSquareReply } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Markdown } from "@/components/markdown";
 import type { ChatMessage } from "@/lib/chat";
 import { cn } from "@/lib/utils";
 import { Avatar } from "./Avatar";
@@ -63,7 +64,7 @@ export function MessageRow({ entry, threadOpen, onOpenThread, onReact }: Props) 
 
       <div className="flex min-w-0 flex-1 flex-col">
         {!continuation && <AuthorLine sender={sender} at={message.at} />}
-        <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.text}</p>
+        <Markdown className="text-sm leading-6 break-words prose-p:my-0 prose-pre:my-1.5 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1">{message.text}</Markdown>
 
         {message.steps && message.steps.length > 0 && <StepTimeline steps={message.steps} />}
         {message.taskId && <CardChip taskId={message.taskId} />}
