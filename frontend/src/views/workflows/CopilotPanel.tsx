@@ -52,6 +52,7 @@ export function CopilotPanel({
   company,
   graph,
   runs,
+  runsKnown,
   onClose,
 }: {
   client: OpenCompanyClient;
@@ -61,6 +62,8 @@ export function CopilotPanel({
   graph: WorkflowGraph;
   /** That workflow's OWN run history (the server-scoped read). */
   runs: WorkflowRunOutcome[];
+  /** Whether the host served that history at all — see {@link CopilotContext}. */
+  runsKnown: boolean;
   onClose: () => void;
 }) {
   const [messages, setMessages] = useState<CopilotMessage[]>([]);
@@ -134,7 +137,7 @@ export function CopilotPanel({
         client,
         company,
         workflowId,
-        { graph, runs },
+        { graph, runs, runsKnown },
         question,
       );
       setMessages((prev) => [
@@ -164,7 +167,7 @@ export function CopilotPanel({
     } finally {
       setSending(false);
     }
-  }, [client, company, draft, echoing, graph, runs, sending, workflowId]);
+  }, [client, company, draft, echoing, graph, runs, runsKnown, sending, workflowId]);
 
   const placeholder = useMemo(
     () =>
@@ -207,6 +210,16 @@ export function CopilotPanel({
             {sourceDefined
               ? " This one is defined by a file in the company source tree, so changes belong in the company repository."
               : " Apply a change yourself with Edit — that's the path that checks the graph and refuses a stale write."}
+          </p>
+          {/* The copilot is a company chat turn, and a chat turn that reads as
+              an instruction opens a board card. That is the host's ordinary
+              behaviour, not a copilot quirk — but an operator who was not told
+              would find a card they never asked for, so say it once, up front,
+              and frame it as what it is: how a request gets recorded when the
+              copilot itself cannot act on it. */}
+          <p className="mt-1.5">
+            Asking for a change may open a card on the board — that's how the
+            company records work to pick up.
           </p>
         </div>
 

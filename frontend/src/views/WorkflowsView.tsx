@@ -1040,6 +1040,7 @@ export function WorkflowsView({
                 company={company}
                 graph={graph}
                 runs={runs}
+                runsKnown={historySupported}
                 onClose={() => setCopilotOpen(false)}
               />
             ) : (

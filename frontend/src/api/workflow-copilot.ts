@@ -94,6 +94,15 @@ export interface CopilotContext {
   graph: WorkflowGraph;
   /** The workflow's OWN runs, newest first — the server-scoped history read. */
   runs: WorkflowRunOutcome[];
+  /**
+   * Whether the host served run history at all.
+   *
+   * Distinguishes "this workflow has never run" from "this host has no run
+   * history to give" — both arrive here as an empty `runs`, and telling the
+   * model the first when the second is true would have it reason confidently
+   * from an absence that means nothing.
+   */
+  runsKnown: boolean;
 }
 
 /**
@@ -106,7 +115,7 @@ export interface CopilotContext {
  * the truth.
  */
 export function composeCopilotMessage(context: CopilotContext, question: string): string {
-  const { graph, runs } = context;
+  const { graph, runs, runsKnown } = context;
   const editable = graph.editable === false;
 
   const lines: string[] = [
@@ -157,7 +166,13 @@ export function composeCopilotMessage(context: CopilotContext, question: string)
 
   lines.push(``, `## Recent runs`);
   const recent = runs.slice(0, CONTEXT_RUNS);
-  if (recent.length === 0) {
+  if (!runsKnown) {
+    // Not the same as "it has never run", and the difference matters: a model
+    // told "no runs" will happily conclude the workflow has never been used.
+    lines.push(
+      `This host does not serve run history, so nothing is known about whether this workflow has run. Do not infer that it has never run.`,
+    );
+  } else if (recent.length === 0) {
     // Said exactly this way because it is what the console knows. The history
     // read is scoped to this workflow server-side, so "none recorded" here is a
     // stronger and more honest statement than the cards can make.
