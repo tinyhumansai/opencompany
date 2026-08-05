@@ -107,10 +107,7 @@ impl WorkflowSpawn {
             // it can still do anything. Dropping on every exit path, unwind
             // included, is why this is a guard rather than a call at the end.
             let _guard = guard;
-            let result = self
-                .runner
-                .run(&self.company, &workflow, input, &ctx)
-                .await;
+            let result = self.runner.run(&self.company, &workflow, input, &ctx).await;
             // Issue #228: journaled on BOTH arms. The caller may well have
             // closed the tab; the record is what is still there tomorrow.
             let outcome = match result.as_ref() {

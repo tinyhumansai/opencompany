@@ -1989,9 +1989,16 @@ to = "done"
         let pool = Arc::new(HarnessPool::new());
         pool.ensure(&rec, &deps).await.expect("roster builds");
 
-        let run = run_workflow(pool, deps, &rec, &file, Value::Null, &WorkflowRunContext::new(false))
-            .await
-            .expect("run completes");
+        let run = run_workflow(
+            pool,
+            deps,
+            &rec,
+            &file,
+            Value::Null,
+            &WorkflowRunContext::new(false),
+        )
+        .await
+        .expect("run completes");
         assert!(run.pending_approvals.is_empty());
         assert!(journal.pending().is_empty());
     }

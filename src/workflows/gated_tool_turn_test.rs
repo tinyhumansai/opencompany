@@ -283,7 +283,9 @@ async fn a_gated_tool_call_inside_a_workflow_node_parks_for_approval() {
     let card = pending
         .iter()
         .find(|p| p.effect.kind == "shell")
-        .unwrap_or_else(|| panic!("the gated shell call should be waiting on the operator: {pending:?}"));
+        .unwrap_or_else(|| {
+            panic!("the gated shell call should be waiting on the operator: {pending:?}")
+        });
 
     // `agent: Some` is what routes approval to a single-use grant and a
     // re-dispatch, rather than to the native executor — which for a tool call

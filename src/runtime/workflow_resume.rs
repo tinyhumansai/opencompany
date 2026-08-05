@@ -68,8 +68,8 @@
 use serde_json::{Map, Value};
 
 use crate::Result;
-use crate::company::runtime::CompanyRuntime;
 use crate::company::load_workflow_union;
+use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::Effect;
 use crate::runtime::workflow_spawn::WorkflowSpawn;
@@ -181,7 +181,11 @@ pub fn already_parked(journal: &crate::runtime::journal::RuntimeJournal, effect:
 pub async fn resume_from_effect(runtime: &CompanyRuntime, effect: &Effect) -> Result<()> {
     let workflow_id = required_str(effect, PAYLOAD_WORKFLOW_ID)?;
     let node_id = required_str(effect, PAYLOAD_NODE_ID)?;
-    let input = effect.payload.get(PAYLOAD_INPUT).cloned().unwrap_or(Value::Null);
+    let input = effect
+        .payload
+        .get(PAYLOAD_INPUT)
+        .cloned()
+        .unwrap_or(Value::Null);
 
     // Through the runtime's own accessor so a build without workflow execution
     // gives an honest error instead of a compile-time edge — this module is in
@@ -202,13 +206,12 @@ pub async fn resume_from_effect(runtime: &CompanyRuntime, effect: &Effect) -> Re
         .await?
         .map(|record| record.overlay_workflows)
         .unwrap_or_default();
-    let workflow = load_workflow_union(runtime.source_dir(), &overlays, workflow_id)?.ok_or_else(
-        || {
+    let workflow =
+        load_workflow_union(runtime.source_dir(), &overlays, workflow_id)?.ok_or_else(|| {
             OpenCompanyError::CompanyNotFound(format!(
                 "workflow {workflow_id} (it was approved, but the graph no longer exists)"
             ))
-        },
-    )?;
+        })?;
 
     let input = with_approval(input, node_id);
     // The handle is dropped on purpose. The task holds its own guard, journals
@@ -318,7 +321,11 @@ mod tests {
     fn a_different_gate_input_or_workflow_is_a_different_decision() {
         let base = effect("digest", "gate", serde_json::json!({ "request": "x" }));
         for other in [
-            effect("digest", "second-gate", serde_json::json!({ "request": "x" })),
+            effect(
+                "digest",
+                "second-gate",
+                serde_json::json!({ "request": "x" }),
+            ),
             effect("other", "gate", serde_json::json!({ "request": "x" })),
             effect("digest", "gate", serde_json::json!({ "request": "y" })),
         ] {
@@ -450,11 +457,14 @@ mod decide_tests {
             input: Value,
             ctx: &WorkflowRunContext,
         ) -> crate::Result<WorkflowRun> {
-            self.started.lock().expect("recording runner").push(StartedRun {
-                workflow_id: workflow.id.clone(),
-                input,
-                run_id: ctx.run_id.clone(),
-            });
+            self.started
+                .lock()
+                .expect("recording runner")
+                .push(StartedRun {
+                    workflow_id: workflow.id.clone(),
+                    input,
+                    run_id: ctx.run_id.clone(),
+                });
             Ok(WorkflowRun {
                 output: json!({ "ok": true }),
                 pending_approvals: Vec::new(),
@@ -522,7 +532,10 @@ mode = "full"
     async fn runtime(
         home: &std::path::Path,
         with_runner: bool,
-    ) -> (Arc<crate::company::runtime::CompanyRuntime>, Arc<RecordingRunner>) {
+    ) -> (
+        Arc<crate::company::runtime::CompanyRuntime>,
+        Arc<RecordingRunner>,
+    ) {
         let mut rt = RuntimeBuilder::new(home.to_path_buf(), manifest())
             .with_seed_dir(home.to_path_buf())
             .build()
