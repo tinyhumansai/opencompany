@@ -143,6 +143,23 @@ that it holds: `workflow-edit-delete.spec.ts` spent months red against a fixture
 that was never committed, and nothing reported it. Run the suite before touching
 a view it covers.
 
+### What a default-feature host cannot cover
+
+The host `test/e2e/host.sh` starts is the default feature set, which boots the
+offline echo brain. That is enough for the great majority of the suite, but four
+specs need an agent that actually executes — a build with the `openhuman`
+harness and a mocked inference backend — and one needs an external MCP server:
+
+| Spec | Needs |
+|------|-------|
+| `wiring.spec.ts` | the harness + a mock LLM backend echoing `__MOCK_LLM__` |
+| `chat-to-card.spec.ts` (card chip) | an orchestrator that opens a card |
+| `workflow-run-history.spec.ts` (durable history) | a workflow run that executes |
+| `mcp.spec.ts` | `PW_MCP_SERVER` pointing at a live MCP server |
+
+Point `PW_HOST_BINARY` at a feature-gated build, or `PW_BASE_URL` at a host you
+brought up yourself, to cover those.
+
 The `dist/` can be served as static files by any web server (or mounted by the
 OpenCompany host); use `window.OPENCOMPANY_CONFIG` to point it at the API.
 
