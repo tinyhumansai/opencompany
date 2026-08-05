@@ -187,6 +187,43 @@ export interface WorkflowRunResult {
   runId?: string;
 }
 
+/**
+ * The `detach: true` answer (issue #383): the run's id, before it has finished.
+ *
+ * `detached` is the discriminator and it is always `true`. See
+ * {@link isDetached} for why the shape rather than the request is what the
+ * console must read.
+ */
+export interface WorkflowRunAccepted {
+  runId: string;
+  detached: true;
+}
+
+/**
+ * What `POST …/workflows/{wid}/run` can answer with — a settled run, or an
+ * accepted one.
+ */
+export type WorkflowRunResponse = WorkflowRunResult | WorkflowRunAccepted;
+
+/**
+ * Whether the host answered "accepted, watch the stream" rather than "here is
+ * the finished run".
+ *
+ * **Discriminates on the response, never on what we asked for**, and that is
+ * the whole compatibility story. A host predating #383 ignores the unknown
+ * `detach` field — the body has no `deny_unknown_fields` — and answers the full
+ * synchronous `200`. So a console that assumed "I asked to detach, therefore
+ * this is a run id" would read a settled run's body as an acceptance and then
+ * wait forever for frames that already arrived.
+ *
+ * Reading `detached` back is also what makes the older-host case *work* rather
+ * than merely not crash: the settled body is a perfectly good answer, so the
+ * console simply uses it.
+ */
+export function isDetached(response: WorkflowRunResponse): response is WorkflowRunAccepted {
+  return (response as WorkflowRunAccepted).detached === true;
+}
+
 /** One node's outcome inside a run (issue #371). */
 export interface WorkflowRunNode {
   nodeId: string;
@@ -236,6 +273,19 @@ export interface WorkflowRunOutcome {
    * open, at boot — so nothing sits here spinning forever.
    */
   running?: boolean;
+  /**
+   * True for a run an operator stopped (issue #383).
+   *
+   * Separate from {@link error} because it is a separate outcome: a cancelled
+   * run carries no error, so reading only `error` would render a deliberate
+   * stop as a clean success. With `error` this gives the three terminal
+   * readings the history distinguishes — failed, interrupted by a host restart,
+   * stopped by an operator.
+   *
+   * Optional on the type, not the wire: a host predating #383 sends nothing,
+   * and absent must read as "not cancelled".
+   */
+  cancelled?: boolean;
 }
 
 export function listWorkflows(
@@ -255,15 +305,55 @@ export function getWorkflow(
   );
 }
 
+/**
+ * Runs a workflow.
+ *
+ * With `detach` the host answers as soon as the run has an id (`202`), instead
+ * of holding the request open for the whole run — which is what stops a proxy's
+ * idle timeout from severing a healthy multi-minute run. The outcome then
+ * arrives over the event stream and in {@link listWorkflowRuns}.
+ *
+ * **Always check {@link isDetached} on the result**, whatever you asked for: a
+ * host predating #383 ignores the flag and answers with the settled run, and
+ * that answer is fine to use.
+ */
 export function runWorkflow(
   client: OpenCompanyClient,
   company: string | null,
   wid: string,
   input?: unknown,
-): Promise<WorkflowRunResult> {
-  return client.post<WorkflowRunResult>(
+  options?: { detach?: boolean },
+): Promise<WorkflowRunResponse> {
+  return client.post<WorkflowRunResponse>(
     `${client.scopeFor(company)}/workflows/${encodeURIComponent(wid)}/run`,
-    { input: input ?? {} },
+    { input: input ?? {}, ...(options?.detach ? { detach: true } : {}) },
+  );
+}
+
+/**
+ * Stops a run that is still walking its graph (issue #383).
+ *
+ * Resolves when the host has fired the stop signal — **not** when the run has
+ * wound down. The run settles a moment later and announces itself on the event
+ * stream with `cancelled`, which is the frame to believe.
+ *
+ * Throws `404` when the run is unknown or has already settled (one answer:
+ * there is nothing to stop) and when the host predates this route. Callers
+ * should tell those apart by context rather than by the status, and degrade to
+ * "this host can't stop runs" rather than surfacing a raw error.
+ *
+ * Stopping is not finishing: the executing node is dropped mid-flight, so an
+ * external side effect it had started may be half-done. Completed nodes stay in
+ * the run history, and approvals earlier nodes parked stay valid in the queue.
+ */
+export function cancelWorkflowRun(
+  client: OpenCompanyClient,
+  company: string | null,
+  runId: string,
+): Promise<{ cancelling: boolean }> {
+  return client.post<{ cancelling: boolean }>(
+    `${client.scopeFor(company)}/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+    {},
   );
 }
 

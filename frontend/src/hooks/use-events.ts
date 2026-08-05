@@ -55,6 +55,14 @@ export type CompanyStreamEvent =
       error?: string;
       /** The run's correlation id (issue #371). Absent on a pre-#371 row. */
       runId?: string;
+      /**
+       * Present only when an operator stopped the run (issue #383).
+       *
+       * A stopped run carries NO `error`, so without reading this a console
+       * would render a cancel as a clean success — and tell the operator who
+       * just pressed Cancel that the run finished fine.
+       */
+      cancelled?: boolean;
     }
   // Issue #371: the live per-node progress trail. A run announces itself, then
   // reports each non-trigger node as it finishes, so the canvas can show which
@@ -337,6 +345,17 @@ function handleEvent(
       if (event.error) {
         toast.error("A workflow run failed", {
           description: `${event.workflowId} — ${event.error}`,
+        });
+        break;
+      }
+      // Issue #383. A stop somebody asked for is not an alarm, so this is an
+      // acknowledgement rather than an error toast — but it must not fall
+      // through to the "everything went fine" path either, which would tell the
+      // operator who pressed Cancel that the run completed. Checked BEFORE the
+      // delivery scan because a cancelled run has no deliveries to scan.
+      if (event.cancelled) {
+        toast.info("A workflow run was stopped", {
+          description: `${event.workflowId} — stopped by an operator. Steps that finished are in the run history.`,
         });
         break;
       }
