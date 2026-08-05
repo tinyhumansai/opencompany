@@ -59,6 +59,7 @@ import {
   type TaskApproval,
   type TaskApprovalStatus,
   type TaskDetail,
+  type TaskPlan,
   type TimelineEntry,
   type TimelineKind,
 } from "@/api/tasks";
@@ -109,6 +110,7 @@ import { effectDone } from "@/lib/language";
 import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
 import { ArtifactsTab } from "./ArtifactsTab";
+import { TaskPlanBrief } from "./TaskPlanBrief";
 import { AssigneeSelect } from "./AssigneeSelect";
 import { TaskEditDialog } from "./TaskEditDialog";
 
@@ -198,6 +200,17 @@ function tabForFocus(focus?: TaskFocus): string {
   if (focus?.artifactId) return "artifacts";
   if (focus?.runId) return "attempts";
   return "timeline";
+}
+
+/**
+ * How many of a plan's prerequisites are actually stopping the card (#337).
+ *
+ * Only `missing` blocks. `needsApproval` and `unknown` ride on the brief as
+ * warnings — the host does not treat either as a reason to hold the work, so
+ * neither may show up as a count that reads like one.
+ */
+function blockerCount(plan: TaskPlan): number {
+  return plan.prerequisites.filter((p) => p.status === "missing").length;
 }
 
 export function TaskDetailView({
@@ -455,6 +468,26 @@ export function TaskDetailView({
                     </span>
                   )}
                 </TabsTrigger>
+                {/*
+                  * Issue #337: only for a card somebody planned. A tab that is
+                  * empty on every card until Planning is used would be clutter
+                  * on the four screens out of five that never see one.
+                  *
+                  * The blocker count rides the trigger, in the Attempts count's
+                  * shape, because it is the one thing worth seeing without a
+                  * click: a card sitting in To-do with "Plan 2" in red answers
+                  * "why didn't this start?" from the tab bar.
+                  */}
+                {detail.task.plan && (
+                  <TabsTrigger value="plan">
+                    Plan
+                    {blockerCount(detail.task.plan) > 0 && (
+                      <span className="ml-1.5 tabular-nums text-destructive">
+                        {blockerCount(detail.task.plan)}
+                      </span>
+                    )}
+                  </TabsTrigger>
+                )}
                 <TabsTrigger value="approvals">Approvals</TabsTrigger>
                 <TabsTrigger value="artifacts">Artifacts</TabsTrigger>
                 <TabsTrigger value="discussion">Discussion</TabsTrigger>
@@ -477,6 +510,12 @@ export function TaskDetailView({
                   openRunId={focus?.runId}
                 />
               </TabsContent>
+
+              {detail.task.plan && (
+                <TabsContent value="plan" className="mt-4">
+                  <TaskPlanBrief plan={detail.task.plan} />
+                </TabsContent>
+              )}
 
               <TabsContent value="approvals" className="mt-4">
                 <ApprovalsTab approvals={detail.approvals} now={now} />
