@@ -596,6 +596,9 @@ impl<'a> DelegationRunner<'a> {
                     // scope and still writes `None`; lineage for those is written
                     // through the task API's `parentTaskId` instead.
                     parent_task_id: self.task.clone(),
+                    // Nothing has run yet, so there is no deliverable to point
+                    // at (issue #339). The first successful settle stamps it.
+                    output: None,
                 };
                 tasks.upsert(self.company, &card).await?;
                 // Issue #246: report the card so the caller can surface it. The

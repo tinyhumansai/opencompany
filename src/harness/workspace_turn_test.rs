@@ -274,6 +274,7 @@ async fn harness(
         workflow_runner: WorkflowRunnerHandle::default(),
         mcp_failures: McpFailureQueue::default(),
         pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+        workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
         approval_requests: ApprovalRequestQueue::default(),
         secrets: None,
         web_allowed_domains: Vec::new(),

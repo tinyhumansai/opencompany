@@ -89,6 +89,11 @@ pub mod steer;
 pub mod steps;
 pub mod tool_dispatcher;
 pub mod toolbelt;
+/// Issue #339: the staging queue the orchestrator's `run_workflow` /
+/// `create_workflow` tools push a workflow reference onto and the
+/// [`HarnessBrain`] drains at the end of a dispatch, so a card that built or
+/// ran a workflow can link to it. See [`workflow_refs`].
+pub mod workflow_refs;
 /// End-to-end proof that an agent granted `files` and **not** `shell` can write
 /// a relative path on a company that has never run — the #409 provisioning gap,
 /// which only exists before anything has created the agent's workspace. Covers
@@ -238,6 +243,20 @@ pub struct HarnessDeps {
     /// — every path degrades to "this task produced no artifact", which is a
     /// legitimate outcome rather than a failure.
     pub pending_publishes: crate::harness::publish::PendingPublishQueue,
+    /// The shared queue the orchestrator's `run_workflow` / `create_workflow`
+    /// tools stage a workflow reference onto and the [`HarnessBrain`] drains at
+    /// the end of a dispatch (issue #339) — the workflow half of a card's
+    /// output link.
+    ///
+    /// Same cheap-shared-handle pattern as [`Self::pending_publishes`], and for
+    /// the same structural reason: the tools are built **once per agent** while
+    /// the card varies **per dispatch**, so a tool cannot hold a task id and has
+    /// to hand its work to something that does.
+    ///
+    /// Default is an empty queue, which simply means no card ever links to a
+    /// workflow — the stamp falls back to the attempt's trace, which is a
+    /// complete answer rather than a missing one.
+    pub workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue,
     /// The shared approval-request queue every agent's [`ApprovalPolicy`] pushes
     /// a `RequireApproval` decision onto and the [`HarnessBrain`] drains after a
     /// turn, parking each request through
@@ -1968,6 +1987,7 @@ description = "Builds the product."
                 workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
                 mcp_failures: McpFailureQueue::default(),
                 pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+                workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
                 approval_requests: ApprovalRequestQueue::default(),
                 secrets: None,
                 web_allowed_domains: Vec::new(),
@@ -2033,6 +2053,7 @@ description = "Builds the product."
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -2323,6 +2344,7 @@ description = "Builds the product."
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -2485,6 +2507,7 @@ description = "Builds the product."
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: Some(secrets.clone()),
             web_allowed_domains: Vec::new(),
@@ -2799,6 +2822,7 @@ description = "Builds the product."
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -2958,6 +2982,7 @@ description = "Sets direction."
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -3101,6 +3126,7 @@ description = "Sets direction."
             workflow_runner: crate::harness::orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),

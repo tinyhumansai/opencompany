@@ -1403,6 +1403,12 @@ impl RuntimeBuilder {
                                 mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
                                 pending_publishes:
                                     crate::harness::publish::PendingPublishQueue::default(),
+                                // Issue #339: the workflow half of a card's
+                                // output link, staged by the orchestrator's
+                                // workflow tools and drained by the same
+                                // dispatch settle that drains the publishes.
+                                workflow_refs:
+                                    crate::harness::workflow_refs::WorkflowRefQueue::default(),
                                 // Issue #243: share the runtime's grant set, so a
                                 // grant the runtime mints on approve is the one
                                 // this agent's policy redeems on re-issue.

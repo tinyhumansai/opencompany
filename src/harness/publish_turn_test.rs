@@ -307,6 +307,7 @@ fn brain(base_url: String, grants: &str, dir: &std::path::Path) -> (HarnessBrain
         workflow_runner: WorkflowRunnerHandle::default(),
         mcp_failures: McpFailureQueue::default(),
         pending_publishes: Default::default(),
+        workflow_refs: Default::default(),
         approval_requests: ApprovalRequestQueue::default(),
         secrets: None,
         web_allowed_domains: Vec::new(),
@@ -356,6 +357,7 @@ fn card(id: &str) -> TaskRecord {
         updated_at_millis: 1,
         origin_chat_id: None,
         parent_task_id: None,
+        output: None,
     }
 }
 
