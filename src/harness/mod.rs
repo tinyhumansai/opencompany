@@ -39,6 +39,11 @@ pub mod brain;
 pub mod build;
 pub mod capability_budget;
 pub mod composio;
+/// Issue #410: how a Composio action catalogue is narrowed and rendered for an
+/// agent, and why every cut it makes describes itself. Pure and un-gated (the
+/// live tools are behind `composio`, which CI never *runs*) — see
+/// [`composio_catalog`].
+pub mod composio_catalog;
 pub mod cost;
 /// Hosted embeddings compute for the in-pod memory engine's meaning tier (188c2).
 /// Needs the `tinycortex` crate's `EmbeddingBackend` trait, so it links only when
