@@ -1073,6 +1073,10 @@ fn cycle_task_id(
             | CompanyEvent::AgentReply { .. }
             | CompanyEvent::ApprovalParked { .. }
             | CompanyEvent::MemoryFactDeleted { .. }
+            // A credential or connection change (issue #403) is a record of an
+            // admin's decision, not a stimulus: it names no card and competes
+            // with none.
+            | CompanyEvent::ToolAccessChanged { .. }
             | CompanyEvent::McpCallFailed { .. }
             | CompanyEvent::WorkflowCreated { .. }
             | CompanyEvent::WorkflowUpdated { .. }
@@ -1173,6 +1177,10 @@ fn cycle_thread_id(
             | CompanyEvent::AgentReply { .. }
             | CompanyEvent::ApprovalParked { .. }
             | CompanyEvent::MemoryFactDeleted { .. }
+            // A credential or connection change (issue #403) is a record of an
+            // admin's decision, not a stimulus: it names no card and competes
+            // with none.
+            | CompanyEvent::ToolAccessChanged { .. }
             | CompanyEvent::McpCallFailed { .. }
             | CompanyEvent::WorkflowCreated { .. }
             | CompanyEvent::WorkflowUpdated { .. }

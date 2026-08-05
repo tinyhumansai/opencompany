@@ -118,6 +118,23 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Deleted memory fact {fact_id}"),
             "memory.fact_deleted",
         ),
+        // Issue #403. Worth telling the brain, because it changes what the
+        // brain can *do*: a cleared credential is why a tool it had yesterday
+        // stops answering today, and without this that reads as an unexplained
+        // failure. `by` is deliberately dropped — the sidecar needs to know the
+        // company's tool access moved, not which human moved it, and the actor
+        // is a user id. Same omission the operator SSE projection makes.
+        CompanyEvent::ToolAccessChanged {
+            change, toolkit, ..
+        } => (
+            Role::System,
+            "operator".to_string(),
+            match toolkit {
+                Some(toolkit) => format!("Tool access changed: {change} ({toolkit})"),
+                None => format!("Tool access changed: {change}"),
+            },
+            "tool_access.changed",
+        ),
         CompanyEvent::TaskDispatched { task_id, .. } => (
             Role::System,
             "board".to_string(),

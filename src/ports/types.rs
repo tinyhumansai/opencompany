@@ -370,6 +370,43 @@ pub enum CompanyEvent {
         /// The id of the deleted fact.
         fact_id: String,
     },
+    /// An admin changed what this company's agents reach third parties through
+    /// (issue #403): the Composio credential the company presents, or a
+    /// provider connection authorized under it.
+    ///
+    /// Journaled for the audit trail, the same reason
+    /// [`MemoryFactDeleted`](Self::MemoryFactDeleted) is — a company's tool
+    /// access is one of the few things about it that can be changed without
+    /// leaving any other mark, so "how did we come to be connected through
+    /// *that* account" has to be answerable afterwards.
+    ///
+    /// **Deliberately carries no credential and no URL.** A journal line is
+    /// append-only, exported, and read by the operator projection; the token
+    /// is write-only over the whole API and does not stop being so here. A
+    /// stable wire word, an optional toolkit slug, and the person — nothing
+    /// else.
+    ToolAccessChanged {
+        /// What changed, as a stable wire word: `credential_set`,
+        /// `credential_cleared`, or `provider_authorization_started`.
+        ///
+        /// The last is deliberately *started*, not *completed*: Composio runs
+        /// the OAuth on its own side with no callback here, so all this host
+        /// witnesses is that an admin asked for a connect URL for that
+        /// toolkit. Naming it a completed connection would put a claim in the
+        /// audit trail that nothing verified.
+        change: String,
+        /// The toolkit slug for a provider authorization (`gmail`, `slack`, …).
+        /// `None` for a credential change, which is not per-provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        toolkit: Option<String>,
+        /// Who made the change. The routes that emit this require an admin
+        /// session, so in practice it is always `Some` and always a person;
+        /// the `Option` matches the
+        /// [`WorkflowCreated`](Self::WorkflowCreated) precedent and lets an
+        /// already-persisted log load unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
     /// A board task was moved into `in_progress` and dispatched to its assignee
     /// for one agent turn on the embedded runtime. Journaled so the dispatch is
     /// auditable and replayable. Only the `openhuman` `HarnessBrain` acts on it;
