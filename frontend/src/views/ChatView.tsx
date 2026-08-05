@@ -41,6 +41,7 @@ import {
   findChannel,
   firstChannel,
   toggleReaction,
+  type DecidedApproval,
   type Transcripts,
 } from "./chat/model";
 
@@ -109,7 +110,7 @@ interface Props {
   onDecideApproval?: (approval: ApprovalSummary, verdict: Verdict) => void;
   /** The verdict each card is waiting on, and the ones already witnessed. */
   decidingApprovals?: ReadonlyMap<string, Verdict>;
-  decidedApprovals?: Record<string, Verdict>;
+  decidedApprovals?: Record<string, DecidedApproval>;
 }
 
 /**
@@ -386,19 +387,22 @@ export function ChatView({
   }, [desks, channel, approvals, chatChannelByThread]);
 
   /**
-   * A card the operator decided is kept on screen even once the feed has
-   * dropped it, so the decision visibly lands instead of the card vanishing
-   * mid-glance. The shell owns the witnessed map; this only re-hydrates the
-   * summary the row needs to keep rendering.
+   * Cards the operator has already decided, which the feed no longer carries.
+   *
+   * The host drops a resolved approval from `GET …/approvals` at once, so these
+   * cannot be re-derived from `approvals` — they come from the shell's witnessed
+   * map, which keeps the last-seen summary precisely so a decided card can
+   * settle in place rather than blinking out of the thread.
    */
   const settledApprovals = useMemo(() => {
-    if (!decidedApprovals || !channel) return [];
+    if (!decidedApprovals || !channel || !desks) return [];
     const live = new Set(channelApprovals.map((a) => a.id));
     const byThread = chatChannelByThread ?? {};
-    return (approvals ?? [])
-      .filter((a) => !live.has(a.id) && decidedApprovals[a.id])
+    return Object.values(decidedApprovals)
+      .map((d) => d.approval)
+      .filter((a) => !live.has(a.id))
       .filter((a) => a.thread && byThread[a.thread] === channel.id);
-  }, [decidedApprovals, channel, channelApprovals, approvals, chatChannelByThread]);
+  }, [decidedApprovals, channel, desks, channelApprovals, chatChannelByThread]);
 
   const askerNames = useAskerNames(client, company, channelApprovals);
 

@@ -328,6 +328,21 @@ export function buildTimeline(messages: ChatMessage[], channel: Channel): Timeli
 }
 
 /**
+ * An approval this console has watched being decided (#379).
+ *
+ * The **summary is kept, not just the verdict**, and that is the whole point:
+ * the host drops a resolved approval from `GET …/approvals` immediately, so a
+ * console holding only the verdict has nothing left to draw and the card blinks
+ * out of the thread the moment it is decided — which reads as the request
+ * having been lost, not answered. Keeping the last-seen summary is what lets it
+ * settle in place instead.
+ */
+export interface DecidedApproval {
+  verdict: Verdict;
+  approval: ApprovalSummary;
+}
+
+/**
  * One row of a channel, which is no longer only a message (#379).
  *
  * A parked approval is a **distinct kind**, not a synthetic `ChatMessage`. It
@@ -372,7 +387,7 @@ export type TimelineItem =
 export function buildTimelineItems(
   entries: TimelineEntry[],
   approvals: ApprovalSummary[],
-  decided: Record<string, Verdict> = {},
+  decided: Record<string, DecidedApproval> = {},
 ): TimelineItem[] {
   const items: TimelineItem[] = entries.map((entry) => ({
     kind: "message" as const,
@@ -386,7 +401,7 @@ export function buildTimelineItems(
       key: `approval:${approval.id}`,
       at: approval.at_millis,
       approval,
-      decided: decided[approval.id] ?? null,
+      decided: decided[approval.id]?.verdict ?? null,
     });
   }
   // Stable within a millisecond: a card raised by the very turn whose reply

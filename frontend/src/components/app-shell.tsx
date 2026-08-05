@@ -56,6 +56,7 @@ import {
   channelIdForThread,
   deskFromDto,
   dmChannelId,
+  type DecidedApproval,
   type Transcripts,
 } from "@/views/chat/model";
 import { Conversation } from "@/views/Conversation";
@@ -292,13 +293,15 @@ export function AppShell({
   //
   // `deciding` is the request in flight, per approval — a map, not a single
   // slot, because deciding one card must not freeze the others (#373's bug, one
-  // surface over). `decided` is the verdict already witnessed, from either
-  // surface: a resolved approval leaves `feed.approvals` on the next refresh, so
-  // without this the card would vanish mid-glance instead of settling.
+  // surface over). `decided` is what has already been witnessed, from either
+  // surface, and it keeps the **whole summary** rather than just the verdict:
+  // the host drops a resolved approval from the feed at once, so a console
+  // holding only a verdict has nothing left to draw and the card blinks out of
+  // the thread the instant it is decided.
   const [decidingApprovals, setDecidingApprovals] = useState<ReadonlyMap<string, Verdict>>(
     () => new Map(),
   );
-  const [decidedApprovals, setDecidedApprovals] = useState<Record<string, Verdict>>({});
+  const [decidedApprovals, setDecidedApprovals] = useState<Record<string, DecidedApproval>>({});
 
   const pending = feed.status.pending_approvals;
 
@@ -760,7 +763,7 @@ export function AppShell({
     markDeciding(approval.id, verdict);
     try {
       await client.resolveApproval(approval.id, verdict, undefined, company, { detach: true });
-      setDecidedApprovals((prev) => ({ ...prev, [approval.id]: verdict }));
+      setDecidedApprovals((prev) => ({ ...prev, [approval.id]: { verdict, approval } }));
       toast.success(
         verdict === "approve"
           ? "Approved — the agent is completing the action."
@@ -814,9 +817,15 @@ export function AppShell({
     onApprovalEvent: (event: CompanyStreamEvent) => {
       if (event.type === "approval_resolved") {
         const verdict: Verdict = event.verdict === "approve" ? "approve" : "deny";
-        setDecidedApprovals((prev) =>
-          prev[event.approvalId] ? prev : { ...prev, [event.approvalId]: verdict },
-        );
+        // Snapshot the summary from the feed as it stands *now* — before the
+        // refresh below drops it. An id this console never had a summary for
+        // records nothing, which is right: there is no card to settle.
+        const approval = feed.approvals.find((a) => a.id === event.approvalId);
+        if (approval) {
+          setDecidedApprovals((prev) =>
+            prev[event.approvalId] ? prev : { ...prev, [event.approvalId]: { verdict, approval } },
+          );
+        }
       }
       void feed.refresh();
     },
