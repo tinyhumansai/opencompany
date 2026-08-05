@@ -1060,6 +1060,9 @@ mod test {
             origin_chat_id: None,
             parent_task_id: None,
             output: None,
+            // #339's baseline fixture stays baseline: it exists to prove the
+            // output stamp round-trips against a card carrying nothing else.
+            plan: None,
         }
     }
 

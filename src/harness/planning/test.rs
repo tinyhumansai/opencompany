@@ -633,6 +633,10 @@ fn card(id: &str, assignee: &str) -> TaskRecord {
         origin_chat_id: None,
         parent_task_id: None,
         plan: None,
+        // A card entering Planning has never run, so it has produced nothing
+        // to link to (issue #339). Load-bearing rather than a default: the
+        // re-plan test below starts from a card that HAS an output.
+        output: None,
     }
 }
 
@@ -921,6 +925,51 @@ async fn a_plan_fills_a_blank_assignee_but_never_reassigns_one() {
         after.plan.expect("plan").proposed_assignee.as_deref(),
         Some("maya"),
         "the proposal is still recorded on the brief, it is just not applied"
+    );
+}
+
+/// Re-planning a card that has already produced something must **not** erase
+/// the link to it (#337 meeting #339).
+///
+/// The two features write the same record from opposite ends: #339 stamps
+/// `output` when an attempt succeeds, #337 writes `plan` when a card is
+/// planned. A settle that rebuilt the card from its own fields rather than
+/// read-modify-writing the live one would silently drop the other's stamp —
+/// and the operator would lose the link to finished work by asking for it to be
+/// re-planned, which is the worst possible moment to lose it.
+///
+/// Pinned as its own test because nothing about the code makes the coupling
+/// visible: the settle never mentions `output` at all, and it is precisely that
+/// silence that has to keep being true.
+#[tokio::test]
+async fn a_re_plan_does_not_erase_what_an_earlier_attempt_produced() {
+    use crate::ports::tasks::TaskOutput;
+
+    let (_home, runtime) = runtime_with(ScriptedModel::replying(CLEAN_PLAN)).await;
+    let produced = TaskOutput {
+        run_id: "run-7".to_string(),
+        attempt: Some(2),
+        at_millis: 1_000,
+        artifacts: Vec::new(),
+        workflows: Vec::new(),
+    };
+    let mut already_delivered = card("t-13", "maya");
+    already_delivered.output = Some(produced.clone());
+    runtime
+        .tasks()
+        .upsert(runtime.id(), &already_delivered)
+        .await
+        .unwrap();
+
+    run_planning_pass(Arc::clone(&runtime), "t-13".to_string()).await;
+
+    let after = read(&runtime, "t-13").await;
+    assert_eq!(after.column, COLUMN_IN_PROGRESS);
+    assert!(after.plan.is_some(), "the new plan lands");
+    assert_eq!(
+        after.output,
+        Some(produced),
+        "the link to what the card already produced must survive a re-plan"
     );
 }
 
