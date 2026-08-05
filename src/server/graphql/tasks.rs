@@ -8,7 +8,21 @@ use super::pagination::Page;
 use crate::company::runtime::CompanyRuntime;
 use crate::ports::tasks::TaskRecord;
 
-/// One card on the company's task board. Mirrors [`TaskRecord`].
+/// One card on the company's task board. Mirrors [`TaskRecord`] — **partially,
+/// and on purpose**.
+///
+/// This projection is deliberately narrower than the REST `TaskCard`: it has
+/// never carried `parentTaskId`, `originChatId`, or the note-adjacent detail
+/// the console's screens read, because the GraphQL surface answers *"what is on
+/// the board"* rather than *"what happened to this card"*.
+///
+/// The output link (issue #339) is omitted for the same reason and is a real
+/// gap, named rather than hidden: it is a **console link** — it resolves to
+/// artifact-viewer and run-trace routes that only the operator console has —
+/// so projecting it here would publish addresses no GraphQL consumer can
+/// follow. A consumer that wants a card's deliverable should read the artifact
+/// and run surfaces directly. Widen this the day a GraphQL client needs the
+/// correlation itself rather than the link.
 #[derive(SimpleObject)]
 #[graphql(name = "Task")]
 pub struct TaskGql {

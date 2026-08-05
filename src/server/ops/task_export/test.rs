@@ -40,6 +40,11 @@ fn card(title: &str) -> TaskCard {
         updated_at: T0 + 600_000,
         parent_task_id: None,
         origin_chat_id: None,
+        // The export document is deliberately link-free (issue #339): it is
+        // read offline, by people who never saw the board, so a console hash
+        // route would be a dead address in it. The deliverable itself is what
+        // the export would have to carry, and that is a different change.
+        output: None,
     }
 }
 

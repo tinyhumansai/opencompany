@@ -488,6 +488,95 @@ async fn a_task_created_from_a_thread_remembers_and_reads_back_that_thread() {
     assert!(blank.get("originChatId").is_none(), "{blank}");
 }
 
+/// Issue #339: the card's output link reaches the console on **both** reads.
+///
+/// The board read matters as much as task detail here, and that is the whole
+/// point: the link is rendered on the card, so a board that had to open every
+/// card to discover what it produced would cost N reads per four-second poll.
+///
+/// A card that never succeeded omits the key entirely rather than sending
+/// `null`, so the pre-#339 wire shape is unchanged for every card the board
+/// created — which is also what the console reads as "link to the card itself".
+#[tokio::test]
+async fn a_stamped_card_hands_its_output_link_to_both_reads() {
+    use crate::ports::artifacts::ArtifactKind;
+    use crate::ports::tasks::{
+        TaskOutput, TaskOutputAction, TaskOutputArtifact, TaskOutputWorkflow,
+    };
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    // A card the board created: no attempt has run, so no link.
+    let (_, plain) = send(
+        &state,
+        "POST",
+        "/api/v1/company/tasks",
+        Some(json!({"title": "Typed on the board"})),
+    )
+    .await;
+    assert!(
+        plain.get("output").is_none(),
+        "a card that never succeeded must not grow the key: {plain}"
+    );
+    let id = plain["id"].as_str().unwrap().to_string();
+
+    // Stamp it the way a successful settle does, through the plain store port.
+    let company = CompanyId::new("acme");
+    let runtime = state.registry().get(&company).unwrap();
+    let mut card = runtime
+        .tasks()
+        .list(&company)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == id)
+        .expect("card");
+    card.output = Some(TaskOutput {
+        run_id: "run-2".to_string(),
+        attempt: Some(2),
+        at_millis: 42,
+        artifacts: vec![TaskOutputArtifact {
+            artifact_id: "a-1".to_string(),
+            version: 3,
+            title: "Launch spec".to_string(),
+            kind: ArtifactKind::Markdown,
+        }],
+        workflows: vec![TaskOutputWorkflow {
+            workflow_id: "digest".to_string(),
+            run_id: Some("wf-1".to_string()),
+            action: TaskOutputAction::Ran,
+        }],
+    });
+    runtime.tasks().upsert(&company, &card).await.unwrap();
+
+    // The board read — the one the card's own link is rendered from.
+    let (_, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    let listed = board
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == json!(id))
+        .expect("the card is on the board");
+    assert_eq!(listed["output"]["runId"], "run-2");
+    assert_eq!(listed["output"]["attempt"], 2);
+    assert_eq!(listed["output"]["artifacts"][0]["artifactId"], "a-1");
+    assert_eq!(
+        listed["output"]["artifacts"][0]["version"], 3,
+        "the link must carry the version the run wrote, not just the record"
+    );
+    assert_eq!(listed["output"]["artifacts"][0]["kind"], "markdown");
+    assert_eq!(listed["output"]["workflows"][0]["workflowId"], "digest");
+    assert_eq!(listed["output"]["workflows"][0]["action"], "ran");
+
+    // …and task detail, where the operator opens what the link points at.
+    let (status, detail) = send(&state, "GET", &format!("/api/v1/company/tasks/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["task"]["output"]["runId"], "run-2");
+    assert_eq!(detail["task"]["output"]["artifacts"][0]["version"], 3);
+}
+
 /// Issue #246 spend gate, at the HTTP boundary. The transcript's "Add to
 /// board" action omits `column` on purpose so the *server* decides where a
 /// chat-created card lands — and the one thing that must never happen is that

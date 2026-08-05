@@ -82,6 +82,17 @@ pub(crate) struct TaskCard {
     /// shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) origin_chat_id: Option<String>,
+    /// What the card's latest successful attempt produced (issue #339) — the
+    /// link that turns a finished card into something the operator can open.
+    ///
+    /// Rides the **board** read, not just task detail, because the link is
+    /// rendered on the card itself: a board that had to open every card to find
+    /// out what it produced would be N reads per poll. It is bounded — one
+    /// entry per published file, one per workflow — and omitted entirely for a
+    /// card that has never succeeded, so the existing wire shape is unchanged
+    /// for every card that carried no output before this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output: Option<crate::ports::tasks::TaskOutput>,
 }
 
 impl From<TaskRecord> for TaskCard {
@@ -96,6 +107,7 @@ impl From<TaskRecord> for TaskCard {
             updated_at: t.updated_at_millis,
             parent_task_id: t.parent_task_id,
             origin_chat_id: t.origin_chat_id,
+            output: t.output,
         }
     }
 }
