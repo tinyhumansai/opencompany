@@ -210,15 +210,28 @@ impl HarnessBrain {
         // the thread from the event log, and without this the operator would
         // approve, watch the agent answer, refresh, and find the answer gone.
         //
-        // `chat_id` is the AGENT id (not the approval id) so `chat_history::owns`
-        // routes it into that desk's thread — the same thread the original
-        // request came from, which is where the operator is looking.
+        // `chat_id` is the thread the approval was RAISED in (issue #379), not
+        // the agent id. Those agree for a direct message and diverge for a desk
+        // channel — a channel's request and a DM to that channel's lead are
+        // answered by the same teammate — so keying on the agent quietly
+        // delivered a channel's continuation into the lead's private line. The
+        // operator approved in one place and the work resumed in another they
+        // were not looking at, which is the whole failure this issue names.
+        //
+        // Falls back to the agent when the grant carries no origin thread: a
+        // pre-#379 journal line, or an approval with no conversation behind it.
+        // That is exactly the previous behaviour, kept for exactly the cases it
+        // was already right for.
+        let reply_thread = grant
+            .origin_thread
+            .clone()
+            .unwrap_or_else(|| grant.agent.clone());
         if let Some(events) = self.deps.events.as_ref()
             && let Err(err) = events
                 .append(
                     &self.record.id,
                     CompanyEvent::AgentReply {
-                        chat_id: grant.agent.clone(),
+                        chat_id: reply_thread.clone(),
                         agent_id: grant.agent.clone(),
                         text: text.clone(),
                         steps: Vec::new(),
@@ -3799,6 +3812,88 @@ members = ["eng1", "eng2"]
         );
         assert_eq!(replies[0].1, "ceo");
         assert_eq!(replies[0].2, bubble.text);
+    }
+
+    /// Issue #379, and a live bug before it: the continuation must be journaled
+    /// into the thread the operator **asked in**, not the agent's own line.
+    ///
+    /// The two are the same string for a direct message and diverge for a desk
+    /// channel — the channel and a DM to that channel's lead are answered by the
+    /// same teammate — so keying on the agent quietly delivered a channel's
+    /// continuation into the lead's private DM. The operator approved in one
+    /// place and the work resumed somewhere they were not looking.
+    ///
+    /// Asserted in **both directions**, because one alone would pass on a
+    /// mistake: a desk-origin reply must not appear in the lead's DM history,
+    /// and a DM-origin reply must not appear in the desk's.
+    #[tokio::test]
+    async fn a_redeemed_grant_replies_in_the_thread_the_approval_was_raised_in() {
+        async fn replies_for(origin: Option<&str>) -> Vec<(String, String)> {
+            let dir = tempfile::tempdir().unwrap();
+            let log: Arc<dyn crate::ports::EventLog> =
+                Arc::new(crate::store::FsEventLog::new(dir.path().to_path_buf()));
+            let requests = crate::harness::policy::ApprovalRequestQueue::default();
+            requests
+                .grants()
+                .grant(crate::runtime::grants::GrantedCall {
+                    approval_id: ApprovalId::new("appr-1"),
+                    agent: "ceo".into(),
+                    tool: "composio_execute".into(),
+                    args: serde_json::json!({ "tool_slug": "GMAIL_SEND_EMAIL" }),
+                    at_millis: now_millis(),
+                    origin_thread: origin.map(str::to_string),
+                });
+            let brain = brain_with_queue_and_events(dir.path(), requests, log.clone());
+            brain
+                .run_cycle(
+                    cycle_over(vec![approval_resolved("appr-1", Verdict::Approve)]),
+                    &NoopHost,
+                )
+                .await
+                .expect("cycle runs");
+            log.read_from(&CompanyId::new("acme"), crate::ports::EventSeq::new(0), 100)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|e| match &e.event {
+                    CompanyEvent::AgentReply {
+                        chat_id, agent_id, ..
+                    } => Some((chat_id.clone(), agent_id.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // Raised in a desk channel: the continuation belongs to the channel.
+        let desk = replies_for(Some("desk-finance")).await;
+        assert_eq!(desk.len(), 1);
+        assert_eq!(
+            desk[0].0, "desk-finance",
+            "a channel's approval must resume in that channel",
+        );
+        assert_ne!(
+            desk[0].0, "ceo",
+            "and must NOT land in the desk lead's private DM — the bug this fixes",
+        );
+        // The asker is still credited: only the destination changed.
+        assert_eq!(desk[0].1, "ceo");
+
+        // Raised in a direct message with that same lead: the mirror image. Same
+        // agent, different thread, and the desk channel must not see it.
+        let dm = replies_for(Some("ceo")).await;
+        assert_eq!(dm.len(), 1);
+        assert_eq!(dm[0].0, "ceo");
+        assert_ne!(
+            dm[0].0, "desk-finance",
+            "a private line's approval must not resume in the desk channel",
+        );
+
+        // No origin thread — a pre-#379 grant, or an approval with no
+        // conversation behind it. Falls back to the agent, which is exactly the
+        // previous behaviour, kept for the cases it was already right for.
+        let legacy = replies_for(None).await;
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].0, "ceo");
     }
 
     /// A DENIED approval runs no turn. "No" must never re-dispatch anything.
