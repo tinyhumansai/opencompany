@@ -4952,3 +4952,183 @@ async fn concurrent_reparents_cannot_race_a_cycle_onto_the_board() {
         .count();
     assert_eq!(parented, 1, "a cycle reached the board: {board}");
 }
+
+// ---------------------------------------------------------------------------
+// Who may decide on the company's behalf (issue #403)
+// ---------------------------------------------------------------------------
+
+/// Sends with an explicit cookie, so the role boundary can be driven with a
+/// member session rather than the harness admin.
+async fn send_cookie(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    cookie: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", cookie);
+    let request = match body {
+        Some(body) => request
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => request.body(Body::empty()).unwrap(),
+    };
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// Every route that decides what this company reaches the outside world *as* —
+/// which credential it presents, which third-party account its agents act
+/// through, where its mail and its model calls go — refuses a member.
+///
+/// One table rather than a test per module, on purpose. The gap issue #403
+/// reported was not that one route forgot a check; it was that a whole plane
+/// shared an extractor whose name did not suggest "any member may write". A
+/// per-module test would have let the next route added to that plane be added
+/// without one. This list is the plane, and a new route joins it here.
+///
+/// The assertion is `403` specifically, not merely "not 200": a `404` or a
+/// `409` would also be non-200 while meaning the route simply did not run, and
+/// that would pass a test which proves nothing.
+#[tokio::test]
+async fn a_member_cannot_change_what_the_company_reaches_the_world_as() {
+    let home_dir = home();
+    let state = state_with_company(home_dir.path()).await;
+    let member =
+        crate::server::test_support::seed_session(&state, "acme", crate::ports::UserRole::Member)
+            .await;
+
+    let cases: Vec<(&str, &str, Option<Value>)> = vec![
+        // The company's Composio identity, and the accounts its agents use.
+        (
+            "PUT",
+            "/api/v1/company/composio/token",
+            Some(json!({ "token": "x" })),
+        ),
+        (
+            "POST",
+            "/api/v1/company/composio/authorize",
+            Some(json!({ "toolkit": "gmail" })),
+        ),
+        // The model every agent thinks with, and the key it is billed against.
+        (
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({ "provider": "openai_compatible", "baseUrl": "https://example.test" })),
+        ),
+        ("DELETE", "/api/v1/company/inference", None),
+        // The company's outbound mail identity — and a send from its address.
+        (
+            "PUT",
+            "/api/v1/company/smtp",
+            Some(
+                json!({ "provider": "smtp", "host": "mail.example.test", "port": 587,
+                         "username": "u", "password": "p", "from": "a@example.test" }),
+            ),
+        ),
+        (
+            "POST",
+            "/api/v1/company/smtp/test",
+            Some(json!({ "to": "elsewhere@example.test" })),
+        ),
+        (
+            "PUT",
+            "/api/v1/company/domain",
+            Some(json!({"domain": "x.test"})),
+        ),
+        // The Telegram bot the company speaks as, and where its updates land.
+        (
+            "PUT",
+            "/api/v1/company/channels/telegram",
+            Some(json!({ "botToken": "x" })),
+        ),
+        ("DELETE", "/api/v1/company/channels/telegram", None),
+        ("POST", "/api/v1/company/channels/telegram/webhook", None),
+        // Which tool servers exist, and the credentials they carry.
+        (
+            "POST",
+            "/api/v1/company/mcp/servers",
+            Some(json!({ "name": "evil", "endpoint": "https://example.test" })),
+        ),
+        (
+            "PUT",
+            "/api/v1/company/mcp/servers/anything",
+            Some(json!({ "endpoint": "https://example.test" })),
+        ),
+        ("DELETE", "/api/v1/company/mcp/servers/anything", None),
+        (
+            "POST",
+            "/api/v1/company/mcp/servers/anything/oauth/start",
+            None,
+        ),
+    ];
+
+    for (method, uri, body) in cases {
+        let (status, response) = send_cookie(&state, method, uri, body, &member).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} let a member through: {response}"
+        );
+        assert_eq!(
+            response["code"], "forbidden",
+            "{method} {uri} refused without saying why: {response}"
+        );
+    }
+}
+
+/// The other side, on the same table: the harness admin is refused by none of
+/// them on role grounds.
+///
+/// Several answer `409`/`404`/`502` for their own reasons — no feature in this
+/// build, no such server, no reachable host — and that is the point. What must
+/// never appear is `403`, which would mean the guard caught the wrong person
+/// and the fix had quietly removed the capability instead of assigning it.
+#[tokio::test]
+async fn an_admin_is_refused_by_none_of_them() {
+    let home_dir = home();
+    let state = state_with_company(home_dir.path()).await;
+
+    let cases: Vec<(&str, &str, Option<Value>)> = vec![
+        (
+            "PUT",
+            "/api/v1/company/composio/token",
+            Some(json!({ "token": "x" })),
+        ),
+        (
+            "PUT",
+            "/api/v1/company/domain",
+            Some(json!({"domain": "x.test"})),
+        ),
+        (
+            "PUT",
+            "/api/v1/company/channels/telegram",
+            Some(json!({ "botToken": "x" })),
+        ),
+        (
+            "POST",
+            "/api/v1/company/mcp/servers",
+            Some(json!({ "name": "svc", "endpoint": "https://example.test" })),
+        ),
+    ];
+
+    for (method, uri, body) in cases {
+        let (status, response) = send(&state, method, uri, body).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} refused an admin: {response}"
+        );
+    }
+}
