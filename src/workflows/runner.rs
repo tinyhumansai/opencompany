@@ -214,9 +214,20 @@ async fn run_workflow_inner(
     // Drive the engine with an observer when there is somewhere to put the
     // frames, and exactly as before when there is not.
     let outcome = match events.as_ref() {
-        None => tinyflows::engine::run(&compiled, input, &capabilities)
-            .await
-            .map_err(map_engine_error)?,
+        None => {
+            // Issue #383: even with nowhere to report progress, a run stays
+            // stoppable. `Box::pin` rather than `tokio::pin!` because the losing
+            // branch has to be **dropped**, and a `tokio::pin!`ed local lives to
+            // the end of its scope.
+            let mut engine = Box::pin(tinyflows::engine::run(&compiled, input, &capabilities));
+            tokio::select! {
+                outcome = &mut engine => outcome.map_err(map_engine_error)?,
+                () = ctx.cancel.cancelled() => {
+                    drop(engine);
+                    return Ok(cancelled_run());
+                }
+            }
+        }
         Some(events) => {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<NodeProgress>();
             let collector = tokio::spawn({
@@ -249,9 +260,47 @@ async fn run_workflow_inner(
 
             let observer: Arc<dyn tinyflows::observability::RunObserver> =
                 Arc::new(ProgressObserver { tx });
-            let outcome =
-                tinyflows::engine::run_with_observer(&compiled, input, &capabilities, &observer)
-                    .await;
+            // Issue #383: the engine call is raced against the run's stop signal
+            // instead of awaited outright.
+            //
+            // # Why a host-side select rather than the engine's own token
+            //
+            // tinyflows has a `CancellationToken`, and no public entry point
+            // takes one **with** an observer: `run_cancellable` hardcodes a
+            // `NoopObserver`, `run_with_observer` hardcodes a fresh token, and
+            // `build_and_run` — which takes both — is private. Using the token
+            // would therefore cost every cancellable run the per-node progress
+            // issue #371 just added, and fixing that properly means a change two
+            // submodules deep. Filed upstream instead; see `RunCancel`.
+            //
+            // # What this costs, stated honestly
+            //
+            // Dropping the future stops the run **mid-await** — it does not let
+            // the executing node finish. A node part way through an external
+            // side effect stays part way through it. That is the same class of
+            // outcome as the host being killed, which the boot sweep already
+            // settles; this is just operator-initiated and so more frequent.
+            // `Box::pin` because the losing branch must be droppable, which a
+            // `tokio::pin!`ed local is not.
+            let mut engine = Box::pin(tinyflows::engine::run_with_observer(
+                &compiled,
+                input,
+                &capabilities,
+                &observer,
+            ));
+            let outcome = tokio::select! {
+                outcome = &mut engine => Some(outcome),
+                () = ctx.cancel.cancelled() => None,
+            };
+            // **Drop the engine future before the observer, on both arms.** The
+            // engine holds observer `Arc` clones inside its per-node handlers;
+            // on the completion arm they are already gone (the graph died inside
+            // the call), but on the cancel arm the future still owns them, so
+            // dropping `observer` alone would NOT close the channel — the
+            // collector below would then block until the drain timeout on every
+            // single cancel, and the timeout would hide it. `cancel_latency_…`
+            // pins that this stays fast.
+            drop(engine);
 
             // Drop the last sender, then join — in that order, and before
             // anything else. The drop closes the channel so the collector's
@@ -291,7 +340,15 @@ async fn run_workflow_inner(
                 ),
             }
 
-            outcome.map_err(map_engine_error)?
+            // Returned only AFTER the drain above, so a cancelled run's
+            // completed nodes are journaled exactly like a completed run's —
+            // the trail is the whole answer to "how far did it get before I
+            // stopped it?", and it must be durable before the caller writes the
+            // finish.
+            match outcome {
+                Some(outcome) => outcome.map_err(map_engine_error)?,
+                None => return Ok(cancelled_run()),
+            }
         }
     };
 
@@ -308,7 +365,31 @@ async fn run_workflow_inner(
         output: outcome.output,
         pending_approvals: outcome.pending_approvals,
         deliveries,
+        cancelled: false,
     })
+}
+
+/// What a run stopped by an operator settles with (issue #383).
+///
+/// Empty on every field but the flag, and each emptiness is a claim rather than
+/// a shrug:
+///
+/// * **no `output`** — the engine future was dropped, so there is no final state
+///   to report. A partial one would be a new shape nothing downstream parses;
+/// * **no `deliveries`** — `deliver_outputs` is deliberately not called. A
+///   cancelled run must not email anybody a report of work it did not finish,
+///   and an absent row already means "not reached" everywhere else;
+/// * **no `pending_approvals`** — approvals earlier nodes already parked are
+///   journal-backed and independent of the run, so they stay in the queue and
+///   an operator may still approve or deny them. Listing them here would imply
+///   this run is still waiting on them, which it is not.
+fn cancelled_run() -> WorkflowRun {
+    WorkflowRun {
+        output: Value::Null,
+        pending_approvals: Vec::new(),
+        deliveries: Vec::new(),
+        cancelled: true,
+    }
 }
 
 /// Maps a tinyflows [`EngineError`](tinyflows::error::EngineError) onto the crate
@@ -407,6 +488,7 @@ description = "Runs Acme."
 
     fn deps(dir: &std::path::Path) -> HarnessDeps {
         HarnessDeps {
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             provider: Arc::new(MockProvider::new("mock: ")),
             provider_slug: "mock".to_string(),
             context: Arc::new(FsContextStore::new(dir)),
