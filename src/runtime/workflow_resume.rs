@@ -393,3 +393,348 @@ mod tests {
         assert!(required_str(&e, PAYLOAD_WORKFLOW_ID).is_err());
     }
 }
+
+/// The decide path, end to end over a real runtime (issue #395).
+///
+/// These sit apart from the unit tests above because they need the whole
+/// machine: a real [`CompanyRuntime`], a real approval gate, a real journal on
+/// disk, and a [`WorkflowRunner`](crate::ports::WorkflowRunner) that records
+/// what it was asked to run.
+///
+/// The runner is the only double, and it is the right one to fake: what is under
+/// test is *whether a run is started, with what input, and how many times* —
+/// never what the engine then does with the graph, which the engine's own suite
+/// and `workflows::runner` already cover. Faking it also puts these tests in the
+/// **default lane**, which is where this module compiles and where CI's headline
+/// clippy/test run lives.
+#[cfg(test)]
+mod decide_tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::company::CompanyManifest;
+    use crate::ports::types::{Actor, ActorKind, ApprovalId, CompanyId, Verdict};
+    use crate::ports::{WorkflowRun, WorkflowRunContext, WorkflowRunner};
+    use crate::runtime::RuntimeBuilder;
+    use crate::runtime::journal::TaskLink;
+
+    /// What the resume actually asked for.
+    #[derive(Clone, Debug)]
+    struct StartedRun {
+        workflow_id: String,
+        input: Value,
+        run_id: String,
+    }
+
+    /// A runner that records every run it is handed and settles immediately.
+    #[derive(Default)]
+    struct RecordingRunner {
+        started: Mutex<Vec<StartedRun>>,
+    }
+
+    impl RecordingRunner {
+        fn started(&self) -> Vec<StartedRun> {
+            self.started.lock().expect("recording runner").clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowRunner for RecordingRunner {
+        async fn run(
+            &self,
+            _company: &CompanyId,
+            workflow: &crate::company::WorkflowFile,
+            input: Value,
+            ctx: &WorkflowRunContext,
+        ) -> crate::Result<WorkflowRun> {
+            self.started.lock().expect("recording runner").push(StartedRun {
+                workflow_id: workflow.id.clone(),
+                input,
+                run_id: ctx.run_id.clone(),
+            });
+            Ok(WorkflowRun {
+                output: json!({ "ok": true }),
+                pending_approvals: Vec::new(),
+                deliveries: Vec::new(),
+                cancelled: false,
+            })
+        }
+    }
+
+    const GATED_TOML: &str = r#"
+id = "gated"
+name = "Gated"
+[[node]]
+id = "start"
+kind = "trigger"
+name = "Start"
+[[node]]
+id = "gate"
+kind = "output"
+name = "Gate"
+requires_approval = true
+[[edge]]
+from = "start"
+to = "gate"
+"#;
+
+    fn manifest() -> CompanyManifest {
+        toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "ceo"
+role = "Chief"
+
+[policy]
+mode = "full"
+"#,
+        )
+        .expect("manifest parses")
+    }
+
+    fn operator() -> Actor {
+        Actor {
+            kind: ActorKind::Operator,
+            id: "owner".into(),
+        }
+    }
+
+    /// A seeded home whose `workflows/` directory holds the gated graph, so the
+    /// resume's loader finds it exactly as the console run route would.
+    fn seed_home() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("opencompany-resume-")
+            .tempdir()
+            .expect("tempdir");
+        let workflows = dir.path().join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows dir");
+        std::fs::write(workflows.join("gated.toml"), GATED_TOML).expect("seed graph");
+        dir
+    }
+
+    /// A runtime with the recording runner installed and the graph on disk.
+    async fn runtime(
+        home: &std::path::Path,
+        with_runner: bool,
+    ) -> (Arc<crate::company::runtime::CompanyRuntime>, Arc<RecordingRunner>) {
+        let mut rt = RuntimeBuilder::new(home.to_path_buf(), manifest())
+            .with_seed_dir(home.to_path_buf())
+            .build()
+            .await
+            .expect("runtime builds");
+        let runner = Arc::new(RecordingRunner::default());
+        if with_runner {
+            rt.set_workflow_runner(runner.clone());
+        }
+        (Arc::new(rt), runner)
+    }
+
+    /// Parks a gate card the way the workflow runner does, returning its id.
+    async fn park_gate(
+        rt: &Arc<crate::company::runtime::CompanyRuntime>,
+        input: Value,
+    ) -> ApprovalId {
+        let effect = gate_effect("gated", "gate", &input, "run-that-paused");
+        let id = rt
+            .approvals
+            .park(rt.id(), effect.clone())
+            .await
+            .expect("parks");
+        rt.journal()
+            .record_parked(
+                &id,
+                &effect,
+                crate::ports::now_millis(),
+                TaskLink::Unlinked,
+                None,
+            )
+            .await
+            .expect("journals");
+        id
+    }
+
+    /// The resume spawns its run on a detached task, so give it a moment to be
+    /// recorded. Bounded so a genuine failure fails rather than hangs.
+    async fn wait_for_runs(runner: &Arc<RecordingRunner>, want: usize) -> Vec<StartedRun> {
+        for _ in 0..200 {
+            let started = runner.started();
+            if started.len() >= want {
+                return started;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        runner.started()
+    }
+
+    /// The headline: approving a parked gate starts a **new** run, carrying the
+    /// gate id in the trigger input's `approvals` so the node that paused now
+    /// proceeds.
+    #[tokio::test]
+    async fn approving_a_gate_starts_a_continuation_run() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate(&rt, json!({ "request": "quarterly numbers" })).await;
+        assert_eq!(rt.pending_approvals().len(), 1);
+
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("resolves");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(started.len(), 1, "approving must start exactly one run");
+        assert_eq!(started[0].workflow_id, "gated");
+        // The gate is approved…
+        assert_eq!(started[0].input["approvals"], json!(["gate"]));
+        // …and the operator's original topic survives, so the re-run does the
+        // same work rather than a blank one.
+        assert_eq!(started[0].input["request"], "quarterly numbers");
+        // A new causal root, not the paused run's id.
+        assert_ne!(started[0].run_id, "run-that-paused");
+        assert!(rt.pending_approvals().is_empty(), "the card is decided");
+    }
+
+    /// Denying starts nothing. The paused run was already settled, so "nothing
+    /// runs" is the whole outcome — there is no task to cancel.
+    #[tokio::test]
+    async fn denying_a_gate_starts_nothing() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate(&rt, json!({ "request": "x" })).await;
+
+        rt.resolve_approval(&id, Verdict::Deny, operator())
+            .await
+            .expect("resolves");
+
+        // Give a spurious spawn the same window the approve test allows.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(runner.started().is_empty(), "a denied gate must not run");
+        assert!(rt.pending_approvals().is_empty());
+    }
+
+    /// Approving twice — a double-click, or a retried request — starts one run.
+    /// At-most-once comes from `execute_effect_once`'s `approval:<id>` key; this
+    /// pins that the resume arm really is under it.
+    #[tokio::test]
+    async fn approving_twice_starts_one_run() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate(&rt, json!({ "request": "x" })).await;
+
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("first resolve");
+        let _ = rt.resolve_approval(&id, Verdict::Approve, operator()).await;
+
+        let started = wait_for_runs(&runner, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            runner.started().len(),
+            1,
+            "a second approve must not start a second run: {started:?}"
+        );
+    }
+
+    /// A host restart between the park and the approval must lose nothing. The
+    /// parked effect is self-contained and the journal replays it, so a fresh
+    /// runtime over the same home still resumes.
+    #[tokio::test]
+    async fn a_gate_parked_before_a_restart_still_resumes_after_it() {
+        let home = seed_home();
+        {
+            let (rt, _) = runtime(home.path(), true).await;
+            park_gate(&rt, json!({ "request": "survives" })).await;
+        } // the "process" goes away
+
+        // A fresh runtime over the same home, rehydrated from the journal.
+        let (rt, runner) = runtime(home.path(), true).await;
+        rt.recover().await.expect("replay rehydrates the park");
+        let pending = rt.pending_approvals();
+        let card = pending
+            .iter()
+            .find(|a| a.kind == WORKFLOW_APPROVE_KIND)
+            .expect("the gate survived the restart");
+
+        rt.resolve_approval(&card.id, Verdict::Approve, operator())
+            .await
+            .expect("resolves");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].input["approvals"], json!(["gate"]));
+        assert_eq!(started[0].input["request"], "survives");
+    }
+
+    /// A gate nobody decided expires to a default deny, and an expired card can
+    /// never start a run.
+    ///
+    /// The TTL clock is driven explicitly rather than by waiting: `sweep_expired`
+    /// takes `now` as a parameter, so a far-future reading exercises the real
+    /// expiry path on the real gate. What it proves is structural — expiry
+    /// removes the parked effect, so a later approve resolves to `NotParked` and
+    /// `settle_approved_effect` (the only route to `perform_effect`) is never
+    /// reached. This is the "nothing is ever held open" claim: the paused run
+    /// settled long ago, and its card ages out like any other.
+    #[tokio::test]
+    async fn an_undecided_gate_expires_and_starts_nothing() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate(&rt, json!({ "request": "x" })).await;
+
+        let expired = rt
+            .approval_gate
+            .sweep_expired(crate::ports::now_millis() + crate::policy::DEFAULT_TTL_MILLIS + 1);
+        assert_eq!(expired, vec![id.clone()], "the gate ages out like any card");
+
+        // Approving after expiry is the already-resolved no-op, not a run.
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("an expired card resolves as already-resolved, not an error");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            runner.started().is_empty(),
+            "an expired gate must never start a continuation run"
+        );
+    }
+
+    /// A build with no workflow execution says so at the moment the operator
+    /// clicks Approve, rather than leaving them watching for a run that will
+    /// never appear.
+    #[tokio::test]
+    async fn approving_on_a_build_with_no_runner_says_so() {
+        let home = seed_home();
+        let (rt, _) = runtime(home.path(), false).await;
+        let id = park_gate(&rt, json!({ "request": "x" })).await;
+
+        let err = rt
+            .resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect_err("must surface the gap");
+        assert!(
+            err.to_string().contains("no workflow execution"),
+            "the message must name the gap: {err}"
+        );
+    }
+
+    /// A gate whose graph was deleted between parking and approving names that,
+    /// rather than failing with something the operator cannot act on.
+    #[tokio::test]
+    async fn approving_a_gate_whose_graph_is_gone_names_it() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate(&rt, json!({ "request": "x" })).await;
+        std::fs::remove_file(home.path().join("workflows").join("gated.toml")).expect("delete");
+
+        let err = rt
+            .resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect_err("must surface the missing graph");
+        assert!(err.to_string().contains("gated"), "{err}");
+        assert!(runner.started().is_empty());
+    }
+}
