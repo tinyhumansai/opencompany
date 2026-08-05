@@ -503,7 +503,7 @@ impl CompanyRuntime {
         if let Some(id) = run_id.as_deref()
             && matches!(err, OpenCompanyError::Quiescing(_))
         {
-            self.abandon_run(id).await;
+            self.abandon_run(id, &task_id).await;
         }
         tracing::warn!(
             company = %self.id,
@@ -528,13 +528,21 @@ impl CompanyRuntime {
     /// intentional stop filed quietly away. The reason string is its own
     /// constant ([`RUNTIME_REPLACED_ERROR`](crate::ports::runs::RUNTIME_REPLACED_ERROR))
     /// so a run list can tell "we swapped your runtime" apart from "the host
-    /// died". The card itself stays in `in_progress`, which is where every other
-    /// failed dispatch cycle leaves it.
+    /// died".
+    ///
+    /// **Issue #337: the card comes back too.** This used to settle the row and
+    /// deliberately leave the card in `in_progress`, "which is where every other
+    /// failed dispatch cycle leaves it". That was true and it was the bug: the
+    /// dispatch edge fires on the *transition* into In Progress, which has
+    /// already happened, so nothing re-drives the card and an operator is left
+    /// staring at work that is provably not being done. It now returns to To-do
+    /// carrying the reason, through the guarded mover — so a card that has since
+    /// been dragged, parked or landed by a later attempt is untouched.
     ///
     /// Best-effort and logged, never propagated: the dispatch has already
     /// failed, and a bookkeeping write cannot make that better or worse.
     #[cfg(feature = "openhuman")]
-    async fn abandon_run(&self, run_id: &str) {
+    async fn abandon_run(&self, run_id: &str, task_id: &str) {
         let outcome = crate::ports::runs::RunOutcome::new(crate::ports::runs::RunStatus::Failed)
             .with_error(crate::ports::runs::RUNTIME_REPLACED_ERROR);
         if let Err(err) = self.ops.runs.finish_run(&self.id, run_id, outcome).await {
@@ -544,6 +552,27 @@ impl CompanyRuntime {
                 error = %err,
                 "[runs] could not settle an attempt refused by a quiescing runtime; it stays \
                  Pending until the next boot reaps it"
+            );
+            // The row is still Pending, so the card is still truthfully claimed
+            // by an attempt. Leave it for the boot reaper to settle both.
+            return;
+        }
+        if let Err(err) = crate::runtime::advance::advance_settled_card(
+            self.ops.tasks.as_ref(),
+            &self.id,
+            task_id,
+            crate::ports::runs::RunStatus::Failed,
+            crate::ports::runs::RUNTIME_REPLACED_ERROR,
+        )
+        .await
+        {
+            tracing::warn!(
+                company = %self.id,
+                run = %run_id,
+                task = %task_id,
+                error = %err,
+                "[runs] settled an attempt refused by a quiescing runtime but could not return \
+                 its card; it stays in progress until the next boot"
             );
         }
     }
