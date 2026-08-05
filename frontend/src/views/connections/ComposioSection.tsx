@@ -21,6 +21,17 @@ import { Skeleton } from "@/components/ui/skeleton";
 interface Props {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * Whether this viewer may change what the company connects through (issue
+   * #403) — the credential its agents present, and which provider accounts
+   * they act through.
+   *
+   * **Courtesy, not enforcement.** The host refuses both writes with a 403
+   * whatever this says. What it prevents is offering a Sign in button that
+   * cannot complete, or a token field whose Save is refused only after the
+   * operator has already pasted a live credential into it.
+   */
+  canManage: boolean;
 }
 
 /** Friendly display labels for the common toolkits; slug-cased fallback otherwise. */
@@ -58,7 +69,7 @@ function toolkitLabel(slug: string): string {
  * takes effect on the agents' next turn, no restart. Hidden entirely when the
  * feature is not in the build.
  */
-export function ComposioSection({ client, company }: Props) {
+export function ComposioSection({ client, company, canManage }: Props) {
   const [load, setLoad] = useState<"loading" | "ready" | "unavailable">("loading");
   const [status, setStatus] = useState<ComposioStatus | null>(null);
   const [token, setToken] = useState("");
@@ -225,7 +236,11 @@ export function ComposioSection({ client, company }: Props) {
   const openMode = status?.openMode === true;
   // In the attested state the paste card is a deliberate override; everywhere
   // else it is the only way to connect, so it is always on screen.
-  const showTokenCard = !attested || showOverride || byoToken;
+  // Issue #403: the credential card is an admin's. A member still sees the
+  // status line above ("token set" / "linked via cluster identity"), which is
+  // what tells them why their agents can reach Gmail; what they do not get is a
+  // field that invites them to paste a credential the host will refuse.
+  const showTokenCard = canManage && (!attested || showOverride || byoToken);
 
   return (
     <section className="space-y-3">
@@ -236,7 +251,9 @@ export function ComposioSection({ client, company }: Props) {
         </h3>
       </div>
       <p className="text-sm text-muted-foreground">
-        {attested
+        {!canManage
+          ? "Your agents reach Gmail, Slack & GitHub through Composio. Which account they act through belongs to the company, so an admin manages it — this is what is wired today."
+          : attested
           ? "Give your agents Gmail, Slack & GitHub via Composio. This company is linked through this instance's own cluster identity — there is no key to copy and nothing stored here. Sign in per provider below."
           : "Give your agents Gmail, Slack & GitHub via Composio. Paste this company's Composio OAuth token — it is the identity the backend bills and isolates, stored securely and never shown again — then sign in per provider below. A change takes effect on the next turn, no restart."}
       </p>
@@ -303,6 +320,8 @@ export function ComposioSection({ client, company }: Props) {
                           <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
                             <Check className="size-3" /> connected
                           </span>
+                        ) : !canManage ? (
+                          <span className="text-xs text-muted-foreground">not connected</span>
                         ) : (
                           <Button
                             size="sm"
@@ -322,7 +341,7 @@ export function ComposioSection({ client, company }: Props) {
                     );
                   })}
                 </ul>
-                {openMode && (
+                {openMode && canManage && (
                   <div className="flex items-end gap-2 border-t border-border pt-3">
                     <div className="flex-1 space-y-1">
                       <Label htmlFor="composio-other-toolkit" className="text-xs">
@@ -356,7 +375,7 @@ export function ComposioSection({ client, company }: Props) {
             </Card>
           )}
 
-          {attested && !showTokenCard && (
+          {canManage && attested && !showTokenCard && (
             <Button variant="outline" size="sm" onClick={() => setShowOverride(true)}>
               <KeyRound className="size-4" />
               Use your own Composio account instead

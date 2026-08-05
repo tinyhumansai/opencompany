@@ -2,6 +2,7 @@ import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { ChevronDown, ChevronRight, Info, Loader2, Play, Plug, Trash2, Unplug } from "lucide-react";
 import { toast } from "sonner";
 
+import { me as fetchMe } from "@/api/auth";
 import { ApiError } from "@/api/types";
 import type { OpenCompanyClient } from "@/api/client";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -30,6 +31,10 @@ export function McpServersView({ client, company }: Props) {
   const [args, setArgs] = useState("");
   const [url, setUrl] = useState("");
   const [env, setEnv] = useState("{}");
+  // Installing or removing a server changes what tools the company's agents can
+  // call, so it is an admin's (issue #403). Courtesy only: the host answers 403
+  // whatever this says. Reading the installed set stays open.
+  const [canManage, setCanManage] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -49,6 +54,22 @@ export function McpServersView({ client, company }: Props) {
     setLoad("loading");
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      let admin = false;
+      try {
+        admin = (await fetchMe(client, company)).role === "admin";
+      } catch {
+        // No user plane on this host, or not signed in — treat as non-admin.
+      }
+      if (live) setCanManage(admin);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company]);
 
   async function install(event: FormEvent) {
     event.preventDefault();
@@ -130,80 +151,93 @@ export function McpServersView({ client, company }: Props) {
           </Alert>
         ) : (
           <>
-            <Card>
-              <CardHeader>
-                <CardTitle>Install a server</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <form className="grid gap-4 md:grid-cols-2" onSubmit={install}>
-                  <Field label="Name">
-                    <Input
-                      data-testid="mcp-install-name"
-                      value={name}
-                      onChange={(event) => setName(event.target.value)}
-                      required
-                    />
-                  </Field>
-                  <Field label="Transport">
-                    <select
-                      className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
-                      value={transport}
-                      onChange={(event) => setTransport(event.target.value as McpTransport)}
-                    >
-                      <option value="stdio">Local command (stdio)</option>
-                      <option value="http">Remote HTTP</option>
-                    </select>
-                  </Field>
-                  {transport === "stdio" ? (
-                    <>
-                      <Field label="Command">
-                        <Input
-                          data-testid="mcp-install-command"
-                          value={command}
-                          onChange={(event) => setCommand(event.target.value)}
-                          placeholder="node"
-                          required
-                        />
-                      </Field>
-                      <Field label="Arguments">
-                        <Input
-                          data-testid="mcp-install-args"
-                          value={args}
-                          onChange={(event) => setArgs(event.target.value)}
-                          placeholder="/path/to/server.mjs"
-                        />
-                      </Field>
-                    </>
-                  ) : (
-                    <Field label="URL">
+            {!canManage && (
+              <Alert>
+                <Info className="size-4" />
+                <AlertTitle>Only an admin can change this company&apos;s tool servers</AlertTitle>
+                <AlertDescription>
+                  A server here hands every agent a new set of tools, so an admin installs and
+                  removes them. You can see what is installed.
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {canManage && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Install a server</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <form className="grid gap-4 md:grid-cols-2" onSubmit={install}>
+                    <Field label="Name">
                       <Input
-                        value={url}
-                        onChange={(event) => setUrl(event.target.value)}
-                        placeholder="https://example.com/mcp"
+                        data-testid="mcp-install-name"
+                        value={name}
+                        onChange={(event) => setName(event.target.value)}
                         required
                       />
                     </Field>
-                  )}
-                  <Field label="Environment JSON" className="md:col-span-2">
-                    <Textarea
-                      value={env}
-                      onChange={(event) => setEnv(event.target.value)}
-                      placeholder='{"API_KEY":"…"}'
-                      rows={3}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Values are write-only and never returned by the API.
-                    </p>
-                  </Field>
-                  <div className="md:col-span-2">
-                    <Button data-testid="mcp-install-submit" type="submit" disabled={busy === "install"}>
-                      {busy === "install" && <Loader2 className="size-4 animate-spin" />}
-                      Install server
-                    </Button>
-                  </div>
-                </form>
-              </CardContent>
-            </Card>
+                    <Field label="Transport">
+                      <select
+                        className="h-8 rounded-lg border border-input bg-background px-2.5 text-sm"
+                        value={transport}
+                        onChange={(event) => setTransport(event.target.value as McpTransport)}
+                      >
+                        <option value="stdio">Local command (stdio)</option>
+                        <option value="http">Remote HTTP</option>
+                      </select>
+                    </Field>
+                    {transport === "stdio" ? (
+                      <>
+                        <Field label="Command">
+                          <Input
+                            data-testid="mcp-install-command"
+                            value={command}
+                            onChange={(event) => setCommand(event.target.value)}
+                            placeholder="node"
+                            required
+                          />
+                        </Field>
+                        <Field label="Arguments">
+                          <Input
+                            data-testid="mcp-install-args"
+                            value={args}
+                            onChange={(event) => setArgs(event.target.value)}
+                            placeholder="/path/to/server.mjs"
+                          />
+                        </Field>
+                      </>
+                    ) : (
+                      <Field label="URL">
+                        <Input
+                          value={url}
+                          onChange={(event) => setUrl(event.target.value)}
+                          placeholder="https://example.com/mcp"
+                          required
+                        />
+                      </Field>
+                    )}
+                    <Field label="Environment JSON" className="md:col-span-2">
+                      <Textarea
+                        value={env}
+                        onChange={(event) => setEnv(event.target.value)}
+                        placeholder='{"API_KEY":"…"}'
+                        rows={3}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Values are write-only and never returned by the API.
+                      </p>
+                    </Field>
+                    <div className="md:col-span-2">
+                      <Button data-testid="mcp-install-submit" type="submit" disabled={busy === "install"}>
+                        {busy === "install" && <Loader2 className="size-4 animate-spin" />}
+                        Install server
+                      </Button>
+                    </div>
+                  </form>
+                </CardContent>
+              </Card>
+            )}
 
             <section className="space-y-3">
               <h3 className="font-medium">Installed servers</h3>
@@ -221,6 +255,7 @@ export function McpServersView({ client, company }: Props) {
                     client={client}
                     company={company}
                     busy={busy}
+                    canManage={canManage}
                     onLifecycle={(action) => void lifecycle(server, action)}
                   />
                 ))
@@ -238,12 +273,15 @@ function ServerCard({
   client,
   company,
   busy,
+  canManage,
   onLifecycle,
 }: {
   server: McpServer;
   client: OpenCompanyClient;
   company: string | null;
   busy: string | null;
+  /** Whether this viewer may connect, disconnect or uninstall (issue #403). */
+  canManage: boolean;
   onLifecycle: (action: "connect" | "disconnect" | "uninstall") => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -304,29 +342,32 @@ function ServerCard({
             {titleCase(server.status)}
           </Badge>
           <span className="text-xs text-muted-foreground">{server.tool_count} tools</span>
-          {server.status === "connected" ? (
+          {canManage &&
+            (server.status === "connected" ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy !== null}
+                onClick={() => onLifecycle("disconnect")}
+              >
+                <Unplug /> Disconnect
+              </Button>
+            ) : (
+              <Button size="sm" disabled={busy !== null} onClick={() => onLifecycle("connect")}>
+                <Plug /> Connect
+              </Button>
+            ))}
+          {canManage && (
             <Button
-              variant="outline"
-              size="sm"
+              variant="ghost"
+              size="icon-sm"
               disabled={busy !== null}
-              onClick={() => onLifecycle("disconnect")}
+              onClick={() => onLifecycle("uninstall")}
+              aria-label={`Uninstall ${server.name}`}
             >
-              <Unplug /> Disconnect
-            </Button>
-          ) : (
-            <Button size="sm" disabled={busy !== null} onClick={() => onLifecycle("connect")}>
-              <Plug /> Connect
+              <Trash2 />
             </Button>
           )}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            disabled={busy !== null}
-            onClick={() => onLifecycle("uninstall")}
-            aria-label={`Uninstall ${server.name}`}
-          >
-            <Trash2 />
-          </Button>
         </div>
         {server.last_error && <p className="text-sm text-destructive">{server.last_error}</p>}
         {expanded && server.status === "connected" && (

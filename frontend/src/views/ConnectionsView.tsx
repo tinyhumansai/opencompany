@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { me as fetchMe } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
 import {
   addMcpServer,
@@ -63,6 +64,16 @@ export function ConnectionsView({ client, company }: Props) {
   const [load, setLoad] = useState<Load>("loading");
   const [states, setStates] = useState<Record<string, ConnectionState>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  // Whether this viewer may change what the company connects through (issue
+  // #403). A connection belongs to the company, so changing one is an admin's
+  // call; reading the page is everyone's.
+  //
+  // **Courtesy, not enforcement.** The host refuses every write on this page
+  // with a 403 whatever this says. All hiding the controls prevents is offering
+  // an operator a button that cannot work — which on this page would be a
+  // particularly poor greeting, since the failure arrives only after they have
+  // pasted a live credential into a form that could never submit it.
+  const [canManage, setCanManage] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -79,6 +90,22 @@ export function ConnectionsView({ client, company }: Props) {
     setLoad("loading");
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      let admin = false;
+      try {
+        admin = (await fetchMe(client, company)).role === "admin";
+      } catch {
+        // No user plane on this host, or not signed in — treat as non-admin.
+      }
+      if (live) setCanManage(admin);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company]);
 
   async function connect(p: ConnectionProvider) {
     if (busy) return;
@@ -160,13 +187,25 @@ export function ConnectionsView({ client, company }: Props) {
           </Alert>
         )}
 
-        <McpServersSection client={client} company={company} />
+        {!canManage && (
+          <Alert data-testid="connections-read-only">
+            <Info className="size-4" />
+            <AlertTitle>Only an admin can change what this company connects through</AlertTitle>
+            <AlertDescription>
+              A connection belongs to the company — it is the account your agents act through — so
+              an admin manages it. You can see everything that is wired here; ask an admin to add,
+              change or remove one.
+            </AlertDescription>
+          </Alert>
+        )}
 
-        <InferenceSection client={client} company={company} />
+        <McpServersSection client={client} company={company} canManage={canManage} />
 
-        <ComposioSection client={client} company={company} />
+        <InferenceSection client={client} company={company} canManage={canManage} />
 
-        <ChannelsSection client={client} company={company} />
+        <ComposioSection client={client} company={company} canManage={canManage} />
+
+        <ChannelsSection client={client} company={company} canManage={canManage} />
 
         {load === "ready" && (
           <Alert data-testid="connections-catalog-advisory">
@@ -203,7 +242,7 @@ export function ConnectionsView({ client, company }: Props) {
                       provider={p}
                       state={states[p.id]}
                       platformManaged={platformManaged}
-                      disabled={load === "unavailable"}
+                      disabled={load === "unavailable" || !canManage}
                       busy={busy === p.id}
                       onConnect={() => void connect(p)}
                       onDisconnect={() => void disconnect(p)}
@@ -374,9 +413,12 @@ type ToolsState =
 function McpServersSection({
   client,
   company,
+  canManage,
 }: {
   client: OpenCompanyClient;
   company: string | null;
+  /** Whether this viewer may add, edit or remove servers (issue #403). */
+  canManage: boolean;
 }) {
   const [load, setLoad] = useState<McpLoad>("loading");
   const [servers, setServers] = useState<McpServer[]>([]);
@@ -627,11 +669,11 @@ function McpServersSection({
                         <span className="ml-auto flex items-center gap-2">
                           <Switch
                             checked={server.enabled}
-                            disabled={busy === server.name}
+                            disabled={busy === server.name || !canManage}
                             onCheckedChange={(v) => void toggle(server, v)}
                             aria-label={`Enable ${server.name}`}
                           />
-                          {health?.authHint === "oauth_required" && (
+                          {health?.authHint === "oauth_required" && canManage && (
                             <Button
                               variant="default"
                               size="sm"
@@ -667,7 +709,7 @@ function McpServersSection({
                           >
                             <ChevronDown className="size-4" /> Tools
                           </Button>
-                          {server.source === "runtime" && (
+                          {server.source === "runtime" && canManage && (
                             <Button
                               variant="ghost"
                               size="sm"
@@ -691,94 +733,101 @@ function McpServersSection({
               </ul>
             )}
 
-            <div className="space-y-2 border-t border-border pt-3">
-              {addError && (
-                <Alert variant="destructive">
-                  <AlertTriangle className="size-4" />
-                  <AlertTitle>Couldn&apos;t add the server</AlertTitle>
-                  <AlertDescription>{addError}</AlertDescription>
-                </Alert>
-              )}
-              <div className="grid gap-2 sm:grid-cols-2 sm:items-end">
-                <div className="space-y-1">
-                  <Label htmlFor="mcp-name" className="text-xs">
-                    Name
-                  </Label>
-                  <Input
-                    id="mcp-name"
-                    value={name}
-                    placeholder="notion"
-                    onChange={(e) => setName(e.target.value)}
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label htmlFor="mcp-endpoint" className="text-xs">
-                    Endpoint
-                  </Label>
-                  <Input
-                    id="mcp-endpoint"
-                    name="mcp-endpoint-url"
-                    value={endpoint}
-                    placeholder="https://host/mcp"
-                    autoComplete="url"
-                    onChange={(e) => setEndpoint(e.target.value)}
-                  />
-                </div>
-              </div>
-              <div className="grid gap-2 sm:grid-cols-[auto_1fr_1fr_auto] sm:items-end">
-                <div className="space-y-1">
-                  <Label htmlFor="mcp-auth-kind" className="text-xs">
-                    Auth
-                  </Label>
-                  <select
-                    id="mcp-auth-kind"
-                    value={authKind}
-                    onChange={(e) => setAuthKind(e.target.value as McpAuthKind)}
-                    className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-xs"
-                  >
-                    <option value="bearer">Bearer token</option>
-                    <option value="header">Custom header</option>
-                    <option value="query_param">Query parameter</option>
-                  </select>
-                </div>
-                {authKind !== "bearer" && (
+            {/* Adding a server hands the agents a new set of tools, so the
+                whole form goes for a member rather than leaving fields that
+                cannot be submitted (issue #403). Test and Tools above stay:
+                they probe a server an admin already added, and the host
+                deliberately leaves those open. */}
+            {canManage && (
+              <div className="space-y-2 border-t border-border pt-3">
+                {addError && (
+                  <Alert variant="destructive">
+                    <AlertTriangle className="size-4" />
+                    <AlertTitle>Couldn&apos;t add the server</AlertTitle>
+                    <AlertDescription>{addError}</AlertDescription>
+                  </Alert>
+                )}
+                <div className="grid gap-2 sm:grid-cols-2 sm:items-end">
                   <div className="space-y-1">
-                    <Label htmlFor="mcp-auth-field" className="text-xs">
-                      {authKind === "header" ? "Header name" : "Parameter name"}
+                    <Label htmlFor="mcp-name" className="text-xs">
+                      Name
                     </Label>
                     <Input
-                      id="mcp-auth-field"
-                      value={authFieldName}
-                      placeholder={authKind === "header" ? "X-Api-Key" : "apiKey"}
-                      autoComplete="off"
-                      onChange={(e) => setAuthFieldName(e.target.value)}
+                      id="mcp-name"
+                      value={name}
+                      placeholder="notion"
+                      onChange={(e) => setName(e.target.value)}
                     />
                   </div>
-                )}
-                <div className="space-y-1">
-                  <Label htmlFor="mcp-token" className="text-xs">
-                    {authKind === "bearer" ? "Token (optional)" : "Credential value"}
-                  </Label>
-                  <Input
-                    id="mcp-token"
-                    name="mcp-token-secret"
-                    type="password"
-                    value={token}
-                    placeholder="write-only"
-                    autoComplete="new-password"
-                    onChange={(e) => setToken(e.target.value)}
-                  />
+                  <div className="space-y-1">
+                    <Label htmlFor="mcp-endpoint" className="text-xs">
+                      Endpoint
+                    </Label>
+                    <Input
+                      id="mcp-endpoint"
+                      name="mcp-endpoint-url"
+                      value={endpoint}
+                      placeholder="https://host/mcp"
+                      autoComplete="url"
+                      onChange={(e) => setEndpoint(e.target.value)}
+                    />
+                  </div>
                 </div>
-                <Button disabled={busy === "add"} onClick={() => void add()}>
-                  {busy === "add" ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Plus className="size-4" />
+                <div className="grid gap-2 sm:grid-cols-[auto_1fr_1fr_auto] sm:items-end">
+                  <div className="space-y-1">
+                    <Label htmlFor="mcp-auth-kind" className="text-xs">
+                      Auth
+                    </Label>
+                    <select
+                      id="mcp-auth-kind"
+                      value={authKind}
+                      onChange={(e) => setAuthKind(e.target.value as McpAuthKind)}
+                      className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-xs"
+                    >
+                      <option value="bearer">Bearer token</option>
+                      <option value="header">Custom header</option>
+                      <option value="query_param">Query parameter</option>
+                    </select>
+                  </div>
+                  {authKind !== "bearer" && (
+                    <div className="space-y-1">
+                      <Label htmlFor="mcp-auth-field" className="text-xs">
+                        {authKind === "header" ? "Header name" : "Parameter name"}
+                      </Label>
+                      <Input
+                        id="mcp-auth-field"
+                        value={authFieldName}
+                        placeholder={authKind === "header" ? "X-Api-Key" : "apiKey"}
+                        autoComplete="off"
+                        onChange={(e) => setAuthFieldName(e.target.value)}
+                      />
+                    </div>
                   )}
-                  Add
-                </Button>
+                  <div className="space-y-1">
+                    <Label htmlFor="mcp-token" className="text-xs">
+                      {authKind === "bearer" ? "Token (optional)" : "Credential value"}
+                    </Label>
+                    <Input
+                      id="mcp-token"
+                      name="mcp-token-secret"
+                      type="password"
+                      value={token}
+                      placeholder="write-only"
+                      autoComplete="new-password"
+                      onChange={(e) => setToken(e.target.value)}
+                    />
+                  </div>
+                  <Button disabled={busy === "add"} onClick={() => void add()}>
+                    {busy === "add" ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Plus className="size-4" />
+                    )}
+                    Add
+                  </Button>
+                </div>
               </div>
-            </div>
+            )}
           </CardContent>
         </Card>
       )}

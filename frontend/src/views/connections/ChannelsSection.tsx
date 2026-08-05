@@ -20,6 +20,11 @@ import { Label } from "@/components/ui/label";
 interface Props {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * Whether this viewer may change the bot the company speaks as (issue #403).
+   * Courtesy only — the host answers 403 regardless.
+   */
+  canManage: boolean;
 }
 
 type Load = "loading" | "ready" | "unavailable";
@@ -37,7 +42,7 @@ type Load = "loading" | "ready" | "unavailable";
  * then, rather than handing the operator a `http://127.0.0.1:<port>/hooks/...`
  * URL that Telegram's servers can never deliver to.
  */
-export function ChannelsSection({ client, company }: Props) {
+export function ChannelsSection({ client, company, canManage }: Props) {
   const [load, setLoad] = useState<Load>("loading");
   const [status, setStatus] = useState<TelegramChannelStatus | null>(null);
   const [botToken, setBotToken] = useState("");
@@ -158,38 +163,47 @@ export function ChannelsSection({ client, company }: Props) {
             </p>
           </div>
 
+          {!canManage && (
+            <p className="rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+              This bot token is the identity the company speaks as, so an admin manages it. The
+              status above is the whole picture; ask an admin to change it.
+            </p>
+          )}
+
           {/* The webhook secret sits beside the token only on a host that can
               actually serve a webhook — elsewhere it configures nothing. */}
-          <div className={status?.webhookUrl ? "grid gap-3 sm:grid-cols-2" : "space-y-1"}>
-            <div className="space-y-1">
-              <Label htmlFor="tg-token" className="text-xs">
-                Bot token {status?.tokenSet ? "(stored — leave blank to keep)" : ""}
-              </Label>
-              <Input
-                id="tg-token"
-                type="password"
-                autoComplete="off"
-                placeholder={status?.tokenSet ? "•••••• write-only" : "123456:ABC-DEF…"}
-                value={botToken}
-                onChange={(e) => setBotToken(e.target.value)}
-              />
-            </div>
-            {status?.webhookUrl && (
+          {canManage && (
+            <div className={status?.webhookUrl ? "grid gap-3 sm:grid-cols-2" : "space-y-1"}>
               <div className="space-y-1">
-                <Label htmlFor="tg-secret" className="text-xs">
-                  Webhook secret {status.secretSet ? "(stored — leave blank to keep)" : ""}
+                <Label htmlFor="tg-token" className="text-xs">
+                  Bot token {status?.tokenSet ? "(stored — leave blank to keep)" : ""}
                 </Label>
                 <Input
-                  id="tg-secret"
+                  id="tg-token"
                   type="password"
                   autoComplete="off"
-                  placeholder={status.secretSet ? "•••••• write-only" : "a long random string"}
-                  value={webhookSecret}
-                  onChange={(e) => setWebhookSecret(e.target.value)}
+                  placeholder={status?.tokenSet ? "•••••• write-only" : "123456:ABC-DEF…"}
+                  value={botToken}
+                  onChange={(e) => setBotToken(e.target.value)}
                 />
               </div>
-            )}
-          </div>
+              {status?.webhookUrl && (
+                <div className="space-y-1">
+                  <Label htmlFor="tg-secret" className="text-xs">
+                    Webhook secret {status.secretSet ? "(stored — leave blank to keep)" : ""}
+                  </Label>
+                  <Input
+                    id="tg-secret"
+                    type="password"
+                    autoComplete="off"
+                    placeholder={status.secretSet ? "•••••• write-only" : "a long random string"}
+                    value={webhookSecret}
+                    onChange={(e) => setWebhookSecret(e.target.value)}
+                  />
+                </div>
+              )}
+            </div>
+          )}
 
           {/* How inbound actually arrives, so the operator can tell whether a
               saved token is being used. */}
@@ -205,30 +219,32 @@ export function ChannelsSection({ client, company }: Props) {
             </p>
           )}
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Button disabled={busy !== null} onClick={() => void save()}>
-              {busy === "save" ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-              Save
-            </Button>
-            <Button
-              variant="ghost"
-              disabled={busy !== null || !(status?.tokenSet || status?.secretSet)}
-              onClick={() => void clear()}
-            >
-              {busy === "clear" ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Trash2 className="size-4" />
-              )}
-              Clear
-            </Button>
-          </div>
+          {canManage && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Button disabled={busy !== null} onClick={() => void save()}>
+                {busy === "save" ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+                Save
+              </Button>
+              <Button
+                variant="ghost"
+                disabled={busy !== null || !(status?.tokenSet || status?.secretSet)}
+                onClick={() => void clear()}
+              >
+                {busy === "clear" ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Trash2 className="size-4" />
+                )}
+                Clear
+              </Button>
+            </div>
+          )}
 
           {/* The webhook fast-path. Shown only when the host reports a URL
               Telegram can actually deliver to — otherwise offering it would
               hand the operator a dead loopback endpoint (issue #203), and
               registering it would also block the polling that does work. */}
-          {status?.webhookUrl && (
+          {status?.webhookUrl && canManage && (
             <div className="space-y-3 border-t pt-4">
               <div className="space-y-1">
                 <p className="text-xs font-medium">Webhook (optional)</p>

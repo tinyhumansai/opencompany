@@ -93,9 +93,17 @@ type TestState =
 export function InferenceSection({
   client,
   company,
+  canManage,
 }: {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * Whether this viewer may change where the company's model calls go (issue
+   * #403). Courtesy only — the host answers 403 regardless; this stops the
+   * console offering a form whose Save cannot land. `Test` stays available: it
+   * probes the config as already stored, and the host leaves it open.
+   */
+  canManage: boolean;
 }) {
   const [load, setLoad] = useState<Load>("loading");
   const [status, setStatus] = useState<InferenceStatus | null>(null);
@@ -335,124 +343,129 @@ export function InferenceSection({
             )}
 
             {/* Switch form. */}
-            <div className="space-y-3 border-t border-border pt-3">
-              <div className="grid gap-2 sm:grid-cols-2 sm:items-end">
-                <div className="space-y-1">
-                  <Label htmlFor="inference-provider" className="text-xs">
-                    Provider
-                  </Label>
-                  <Select
-                    value={provider}
-                    onValueChange={(v) => pickProvider(v as InferenceProvider)}
-                    items={PROVIDER_LABELS}
-                  >
-                    <SelectTrigger id="inference-provider" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {(Object.keys(PROVIDER_LABELS) as InferenceProvider[]).map((p) => (
-                        <SelectItem key={p} value={p}>
-                          {PROVIDER_LABELS[p]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                {(provider === "ollama" || provider === "openai_compatible") && (
+            {/* The switch form is an admin's: it decides the base URL every
+                agent's prompts travel to and the key they are billed against
+                (issue #403). */}
+            {canManage && (
+              <div className="space-y-3 border-t border-border pt-3">
+                <div className="grid gap-2 sm:grid-cols-2 sm:items-end">
                   <div className="space-y-1">
-                    <Label htmlFor="inference-base-url" className="text-xs">
-                      Base URL
+                    <Label htmlFor="inference-provider" className="text-xs">
+                      Provider
                     </Label>
-                    <Input
-                      id="inference-base-url"
-                      value={baseUrl}
-                      placeholder="https://host/v1"
-                      onChange={(e) => setBaseUrl(e.target.value)}
-                    />
-                  </div>
-                )}
-              </div>
-
-              {provider === "managed" ? (
-                <div className="space-y-2">
-                  <p className="text-xs text-muted-foreground" data-testid="inference-managed-note">
-                    Managed runs on the platform credential, so there is no key to paste here. To
-                    bring your own key, choose OpenRouter or Custom (OpenAI-compatible).
-                  </p>
-                  {managedWouldDiscardKey && (
-                    <div
-                      className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
-                      data-testid="inference-key-conflict"
+                    <Select
+                      value={provider}
+                      onValueChange={(v) => pickProvider(v as InferenceProvider)}
+                      items={PROVIDER_LABELS}
                     >
-                      <p className="flex items-start gap-1.5">
-                        <AlertTriangle className="mt-px size-3.5 shrink-0" />
-                        <span>
-                          You typed a key, and managed can&apos;t store one — saving now would throw
-                          it away. Choose OpenRouter or Custom (OpenAI-compatible) to save it, or
-                          discard it to stay on managed.
-                        </span>
-                      </p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        data-testid="inference-discard-key"
-                        onClick={() => setKey("")}
-                      >
-                        Discard key
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <>
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    {TIERS.map((tier) => (
-                      <div key={tier} className="space-y-1">
-                        <Label htmlFor={`inference-model-${tier}`} className="text-xs">
-                          {tier}
-                        </Label>
-                        <Input
-                          id={`inference-model-${tier}`}
-                          value={models[tier] ?? ""}
-                          placeholder="provider model id"
-                          onChange={(e) => setModel(tier, e.target.value)}
-                        />
-                      </div>
-                    ))}
+                      <SelectTrigger id="inference-provider" className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(Object.keys(PROVIDER_LABELS) as InferenceProvider[]).map((p) => (
+                          <SelectItem key={p} value={p}>
+                            {PROVIDER_LABELS[p]}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
-                  {provider !== "ollama" && (
+                  {(provider === "ollama" || provider === "openai_compatible") && (
                     <div className="space-y-1">
-                      <Label htmlFor="inference-key" className="text-xs">
-                        API key {status?.keyConfigured ? "(leave blank to keep)" : ""}
+                      <Label htmlFor="inference-base-url" className="text-xs">
+                        Base URL
                       </Label>
                       <Input
-                        id="inference-key"
-                        type="password"
-                        value={key}
-                        placeholder="write-only"
-                        autoComplete="off"
-                        onChange={(e) => setKey(e.target.value)}
+                        id="inference-base-url"
+                        value={baseUrl}
+                        placeholder="https://host/v1"
+                        onChange={(e) => setBaseUrl(e.target.value)}
                       />
                     </div>
                   )}
-                </>
-              )}
+                </div>
 
-              <div className="flex items-center gap-2">
-                <Button
-                  data-testid="inference-save"
-                  disabled={busy !== null || managedWouldDiscardKey}
-                  onClick={() => void save()}
-                >
-                  {busy === "save" ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
-                  Save
-                </Button>
-                <Button variant="outline" disabled={busy !== null} onClick={() => void reset()}>
-                  {busy === "reset" ? <Loader2 className="size-4 animate-spin" /> : <RotateCcw className="size-4" />}
-                  Reset to managed
-                </Button>
+                {provider === "managed" ? (
+                  <div className="space-y-2">
+                    <p className="text-xs text-muted-foreground" data-testid="inference-managed-note">
+                      Managed runs on the platform credential, so there is no key to paste here. To
+                      bring your own key, choose OpenRouter or Custom (OpenAI-compatible).
+                    </p>
+                    {managedWouldDiscardKey && (
+                      <div
+                        className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                        data-testid="inference-key-conflict"
+                      >
+                        <p className="flex items-start gap-1.5">
+                          <AlertTriangle className="mt-px size-3.5 shrink-0" />
+                          <span>
+                            You typed a key, and managed can&apos;t store one — saving now would throw
+                            it away. Choose OpenRouter or Custom (OpenAI-compatible) to save it, or
+                            discard it to stay on managed.
+                          </span>
+                        </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          data-testid="inference-discard-key"
+                          onClick={() => setKey("")}
+                        >
+                          Discard key
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {TIERS.map((tier) => (
+                        <div key={tier} className="space-y-1">
+                          <Label htmlFor={`inference-model-${tier}`} className="text-xs">
+                            {tier}
+                          </Label>
+                          <Input
+                            id={`inference-model-${tier}`}
+                            value={models[tier] ?? ""}
+                            placeholder="provider model id"
+                            onChange={(e) => setModel(tier, e.target.value)}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    {provider !== "ollama" && (
+                      <div className="space-y-1">
+                        <Label htmlFor="inference-key" className="text-xs">
+                          API key {status?.keyConfigured ? "(leave blank to keep)" : ""}
+                        </Label>
+                        <Input
+                          id="inference-key"
+                          type="password"
+                          value={key}
+                          placeholder="write-only"
+                          autoComplete="off"
+                          onChange={(e) => setKey(e.target.value)}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <Button
+                    data-testid="inference-save"
+                    disabled={busy !== null || managedWouldDiscardKey}
+                    onClick={() => void save()}
+                  >
+                    {busy === "save" ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                    Save
+                  </Button>
+                  <Button variant="outline" disabled={busy !== null} onClick={() => void reset()}>
+                    {busy === "reset" ? <Loader2 className="size-4 animate-spin" /> : <RotateCcw className="size-4" />}
+                    Reset to managed
+                  </Button>
+                </div>
               </div>
-            </div>
+            )}
           </CardContent>
         </Card>
       )}
