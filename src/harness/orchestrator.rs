@@ -595,11 +595,17 @@ fn summarize_event(event: &CompanyEvent) -> String {
             scheduled,
             deliveries,
             error,
+            cancelled,
             ..
         } => {
             let how = if *scheduled { "scheduled" } else { "manual" };
             match error {
                 Some(_) => format!("{how} workflow run failed: {workflow_id}"),
+                // Issue #383, same reasoning as the sidecar's projection in
+                // `brain::medulla::effects`: a cancelled run has no error, so it
+                // would otherwise read to the orchestrator as a clean finish and
+                // invite it to act on work an operator deliberately stopped.
+                None if *cancelled => format!("{how} workflow run stopped: {workflow_id}"),
                 None => {
                     let undelivered = deliveries
                         .iter()
@@ -1885,6 +1891,30 @@ mod tests {
         // Still useful: which workflow, and that something did not go out.
         assert!(summary.contains("digest"), "{summary}");
         assert!(summary.contains("1 not delivered"), "{summary}");
+    }
+
+    /// **Issue #383, the twin of the sidecar's pin.** The insight tail is the
+    /// other non-tenant reader of a finished run, and it had the same hole: a
+    /// cancelled run carries no error, so it summarized as a clean finish and
+    /// invited the orchestrator to reason about — or redo — work an operator had
+    /// just stopped.
+    #[test]
+    fn a_cancelled_run_summarizes_as_stopped_rather_than_finished() {
+        let summary = summarize_event(&CompanyEvent::WorkflowRunFinished {
+            workflow_id: "digest".to_string(),
+            scheduled: true,
+            run_id: Some("run-1".to_string()),
+            deliveries: Vec::new(),
+            pending_approvals: Vec::new(),
+            error: None,
+            cancelled: true,
+        });
+
+        assert!(summary.contains("stopped"), "{summary}");
+        assert!(
+            !summary.contains("finished"),
+            "a stopped run must not read as a finished one: {summary}"
+        );
     }
 
     #[test]

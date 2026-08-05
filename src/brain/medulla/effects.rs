@@ -199,11 +199,22 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             deliveries,
             pending_approvals,
             error,
+            cancelled,
             ..
         } => {
             let how = if *scheduled { "Scheduled" } else { "Manual" };
             let body = match error {
                 Some(err) => format!("{how} run of workflow {workflow_id} failed: {err}"),
+                // Issue #383: a stopped run is neither a failure nor a finish,
+                // and it is bound explicitly rather than left to `..` — a
+                // cancelled run carries NO error, so without this arm it fell
+                // through to the success wording below and told the sidecar a
+                // run somebody stopped had "finished". The distinction the whole
+                // issue rests on has to survive at every reader, not only at the
+                // tenant-facing ones.
+                None if *cancelled => {
+                    format!("{how} run of workflow {workflow_id} was stopped by an operator")
+                }
                 None => {
                     let undelivered = deliveries
                         .iter()
@@ -452,6 +463,43 @@ mod test {
         // Still says what happened, in counts.
         assert!(wired.body.contains("digest"), "{}", wired.body);
         assert!(wired.body.contains("1 not delivered"), "{}", wired.body);
+        assert_eq!(wired.kind, "workflow.run");
+    }
+
+    /// **Issue #383: a stopped run must not wire out as a finished one.**
+    ///
+    /// A cancelled run carries `cancelled: true` and **no error**, so the arm
+    /// that only branched on `error` fell straight through to the success
+    /// wording — this consumer was told a run somebody deliberately stopped had
+    /// "finished", with a tidy zero-report tally to prove it.
+    ///
+    /// Asserted as a *negative* on the success word rather than only as a
+    /// positive on the new one: the failure mode is the two readings becoming
+    /// indistinguishable, and only the negative catches that.
+    #[test]
+    fn a_cancelled_run_wires_out_as_stopped_rather_than_finished() {
+        let event = CompanyEvent::WorkflowRunFinished {
+            workflow_id: "digest".to_string(),
+            scheduled: false,
+            run_id: Some("run-1".to_string()),
+            deliveries: Vec::new(),
+            pending_approvals: Vec::new(),
+            error: None,
+            cancelled: true,
+        };
+
+        let wired = wire_event(7, &event);
+
+        assert!(
+            wired.body.contains("stopped by an operator"),
+            "{}",
+            wired.body
+        );
+        assert!(
+            !wired.body.contains("finished"),
+            "a stopped run must not read as a finished one: {}",
+            wired.body
+        );
         assert_eq!(wired.kind, "workflow.run");
     }
 
