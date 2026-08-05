@@ -47,7 +47,7 @@ address check for `{id}`, operator + `sole()` for the alias).
 | `domain` | `PUT …/domain`, `POST …/domain/verify` |
 | `smtp` | `PUT …/smtp`, `POST …/smtp/test` |
 | `connections` (feature `oauth`) | `POST …/connections/{provider}/start\|disconnect`, `GET /api/v1/oauth/callback` |
-| `workflows` | `POST …/workflows`, `GET …/workflows`, `GET …/workflows/runs`, `POST …/workflows/cron/preview`, `GET …/workflows/{wid}`, `PUT …/workflows/{wid}`, `DELETE …/workflows/{wid}`, `POST …/workflows/{wid}/run` |
+| `workflows` | `POST …/workflows`, `GET …/workflows`, `GET …/workflows/runs`, `POST …/workflows/cron/preview`, `GET …/workflows/{wid}`, `PUT …/workflows/{wid}`, `DELETE …/workflows/{wid}`, `POST …/workflows/{wid}/run`, `POST …/workflows/runs/{runId}/cancel` |
 
 ### Exporting a task's record (issue #352)
 

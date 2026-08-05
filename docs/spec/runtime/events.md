@@ -339,6 +339,57 @@ graph, whose real outcome would then land afterwards — two contradictory
 finishes for one run id. The call site is gated on the handover being absent,
 exactly like `reap_orphaned_runs`. Same lesson as #290.
 
+### Stopping a run (issue #383)
+
+A run an operator stops is a **third terminal reading**, not a variant of the
+other two. `WorkflowRunFinished` gained a `cancelled` flag; a cancelled run
+carries that flag and **no `error` at all**.
+
+| Reading | `error` | `cancelled` |
+| --- | --- | --- |
+| finished | absent | absent |
+| failed | the reason, naming the node when the trail names one | absent |
+| interrupted by a host restart | the boot sweep's synthetic reason | absent |
+| stopped by an operator | absent | `true` |
+
+Keeping them apart is the whole point. Folding a stop into `error` would put
+every deliberate cancel in the failure count and make "this run failed" the
+console's answer to a button the operator just pressed; folding it into a clean
+finish — which is what any reader that only checks `error` does — would report
+a stopped run as a success. Both fields are `serde(default)` +
+`skip_serializing_if`, so every line written before #383 decodes as not
+cancelled and every non-cancelled line stays byte-identical.
+
+A cancelled run journals a **real finish**, which is what keeps
+`sweep_interrupted_runs` out of it: there is nothing left open to sweep, so the
+two never write contradictory outcomes for one run id.
+
+**The trail is truthful about how far it got.** The runner drains and joins its
+progress collector on the cancel path exactly as on the completion path, so the
+nodes that finished before the stop are durable ahead of the outcome. The node
+that was *executing* contributes no row — it never finished, and inventing one
+would answer "how far did it get" wrongly.
+
+**How the stop works, and what it costs.** tinyflows has a `CancellationToken`,
+but no public entry point accepts one together with a `RunObserver`:
+`run_cancellable` hardcodes a `NoopObserver`, `run_with_observer` hardcodes a
+fresh token, and `build_and_run` — which takes both — is private. Using the
+engine's token would therefore cost every cancellable run the per-node progress
+above. So the runner instead races the engine call against a host-side signal
+and **drops the engine future**, which stops the run mid-await rather than at a
+node boundary: a node part-way through an external side effect stays part-way
+through it. That is the same class of outcome as a host `SIGKILL`, which the
+boot sweep already handles — only operator-initiated, and so more frequent. Say
+"stopped", not "finished". A `run_cancellable_with_observer` upstream would let
+this become a clean node-boundary stop and is tracked separately.
+
+The engine future must be dropped **before** the observer, because it owns
+observer `Arc` clones inside its per-node handlers; dropping the observer alone
+would leave the progress channel open and stall every cancel until the drain
+timeout. Today the borrow checker enforces that ordering, but only incidentally
+(the engine borrows the observer), so a cancel-latency bound is asserted as
+well.
+
 ### An engine constraint worth knowing
 
 tinyflows' `RunObserver` has `on_step_finish` and **no `on_step_start`**, so

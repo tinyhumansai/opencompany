@@ -48,6 +48,52 @@ gives up mid-turn. `detach` removes the *wait*; it is not what provides the
 drop-safety. See
 [company-brain/approvals.md](../company-brain/approvals.md#settling-the-verdict-is-not-running-the-follow-up).
 
+### Running and stopping a workflow (issue #383)
+
+```text
+POST   …/workflows/{wid}/run                 { "input": {…}, "detach": false }
+POST   …/workflows/runs/{runId}/cancel       stop a run that is still walking its graph
+```
+
+`detach` is the same idea as the approval one and reads the same way. Omitted
+(or `false`) the response is the settled run — `{ output, pendingApprovals,
+deliveries, runId }`, byte-unchanged. Set, the host answers **`202 Accepted`**
+with `{ "runId": "…", "detached": true }` before the engine walks a node; the
+run is then followed through the `workflow_run_started` / `workflow_node_finished`
+/ `workflow_run_finished` frames it already keys by that `runId`, and read back
+from `GET …/workflows/runs`, whose fold reports `running: true` until it settles.
+
+**Clients must discriminate on the response shape, not on what they sent.** A
+host predating this ignores the unknown `detach` field and answers the full
+synchronous `200`, so `output` present means "already settled" and `detached`
+present means "watch the stream". Both directions are compatible: an older
+client never sends the field and is unaffected.
+
+Either way the run survives a dropped connection. It runs on its own task, so a
+closed tab or a proxy giving up no longer cancels it mid-graph — before this it
+did, and because a run journals a start first, the abandoned run then folded as
+`running: true` until the next host restart swept it.
+
+`…/runs/{runId}/cancel` answers `200 { "cancelling": true }` when the run is
+live and `404` when the run is unknown **or has already settled** — one answer,
+because they mean the same thing to the caller: there is nothing to stop. It is
+behind the same `ScopedCompany` guard as every other route here, so any operator
+of the company may stop any of its runs.
+
+`cancelling`, not `cancelled`: the route fires a signal and returns. The run
+settles a moment later with a `WorkflowRunFinished` carrying `cancelled: true`
+and **no error** — a stop somebody asked for is not a failure, and a reader that
+only checks `error` would render it as a clean success.
+
+**Stopping is not finishing.** The executing node is dropped mid-await rather
+than allowed to complete, so an external side effect it had started may be
+half-done — the same class of outcome as the host being killed, only
+operator-initiated. Nodes that already completed keep their journal rows, and
+approvals earlier nodes parked stay valid in the queue: they are journal-backed
+and independent of the run, so they can still be approved or denied afterwards.
+No minted grant is revoked. See
+[events.md](events.md#stopping-a-run-issue-383).
+
 ## Console write plane (`src/server/ops/`)
 
 The console's writes are a REST router family under `src/server/ops/`, each
