@@ -83,6 +83,17 @@ use crate::ports::UsageMeter;
 use crate::ports::types::{CompanyId, Effect, EffectGroup};
 use crate::runtime::grants::{GrantSet, GrantedCall};
 
+/// The name openhuman knows this policy by, and the name it stamps into the
+/// refusal it hands the model when a call is gated
+/// (`"…requires approval under policy 'opencompany-approval'"`).
+///
+/// A constant rather than a literal because issue #411's step classifier keys
+/// on it: that is how a parked call is told apart from every other blocked one
+/// and rendered as *waiting on you* rather than as a crash. Naming it here
+/// means the producer and the reader share one definition instead of two
+/// copies of a string that can silently drift.
+pub const POLICY_NAME: &str = "opencompany-approval";
+
 /// Most approval requests parked out of a single turn. A model that keeps
 /// re-trying a blocked tool (openhuman feeds it a refusal and lets it continue)
 /// must not be able to flood the operator's queue, so the drain is bounded the
@@ -608,7 +619,7 @@ impl ApprovalPolicy {
 #[async_trait]
 impl ToolPolicy for ApprovalPolicy {
     fn name(&self) -> &str {
-        "opencompany-approval"
+        POLICY_NAME
     }
 
     async fn check(&self, request: &ToolPolicyRequest) -> ToolPolicyDecision {
