@@ -50,9 +50,11 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::AppConfig;
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
+use crate::ports::normalize_email;
 use crate::ports::now_millis;
 use crate::ports::types::{CompanyId, SecretValue};
 use crate::server::error::ApiError;
@@ -266,6 +268,33 @@ fn connect_error(state: &AppState, code: &str, provider: Option<&str>) -> Respon
     console_redirect(state, &params)
 }
 
+/// Bounces back on an account mismatch (issue #316: one operator, one
+/// connected account), naming both the account the provider handed back and
+/// the address(es) this company expects, so the console can tell the operator
+/// exactly why the connect was refused.
+///
+/// Built directly on [`console_redirect`] rather than folded into
+/// [`connect_error`]: every other failure code is deliberately detail-free —
+/// the provider's own error text must never ride in the URL (see
+/// `connect_error`'s doc) — but this code's whole point is to name two email
+/// addresses. Only email addresses ever reach this function; token material
+/// never does.
+fn connect_account_mismatch(
+    state: &AppState,
+    provider: &str,
+    connected: &str,
+    expected: &str,
+) -> Response {
+    let params = format!(
+        "connect_error={}&provider={}&connected_account={}&expected_account={}",
+        urlencode("account_mismatch"),
+        urlencode(provider),
+        urlencode(connected),
+        urlencode(expected),
+    );
+    console_redirect(state, &params)
+}
+
 // ---------------------------------------------------------------------------
 // Signed state nonce
 // ---------------------------------------------------------------------------
@@ -449,6 +478,16 @@ async fn callback(State(state): State<AppState>, uri: Uri) -> Response {
     match exchange_code(&state, &config, &code).await {
         Ok(token_json) => {
             let account = extract_account(&token_json);
+            if let Some((connected, expected)) =
+                account_mismatch(state.config(), &runtime, account.as_deref()).await
+            {
+                tracing::warn!(
+                    provider,
+                    connected = %connected,
+                    "oauth callback: connected account does not match this company's operator"
+                );
+                return connect_account_mismatch(&state, &provider, &connected, &expected);
+            }
             let stored = json!({ "token": token_json, "account": account });
             if let Err(err) = runtime
                 .secrets()
@@ -517,6 +556,56 @@ fn extract_account(token: &serde_json::Value) -> Option<String> {
         .and_then(|team| team.get("name"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+/// Whether `account` — the label [`extract_account`] pulled from a token
+/// response — belongs to someone other than this company's operator (issue
+/// #316: one operator, one connected account).
+///
+/// This enforces identity at **connect time only**. It has no way to detect a
+/// live account swap at the provider after the token is already stored, and
+/// it does not drive a reconnect flow — both are out of scope for this slice.
+///
+/// Refuses to guess whenever the comparison would not be meaningful, and only
+/// ever returns a mismatch on a genuine, comparable email mismatch:
+/// - `account` is `None` — e.g. GitHub's token response carries no `login`,
+///   only `access_token`/`scope`/`token_type`, so there is nothing to
+///   compare. Not a mismatch: stored as today.
+/// - `account` is not shaped like an email — Slack hands back a workspace
+///   name (`team.name`), GitHub a login handle; neither is comparable to an
+///   operator's email address, and a naive `!=` here would refuse every Slack
+///   and GitHub connect. Not a mismatch: stored as today.
+/// - the company has no known operator address, or the lookup itself fails —
+///   there is nothing to compare against. Not a mismatch: stored as today.
+///
+/// Only when `account` is itself a normalizable email address AND the company
+/// has at least one known operator address AND it matches none of them does
+/// this return `Some((connected, expected))` for the caller to refuse with.
+async fn account_mismatch(
+    config: &AppConfig,
+    runtime: &CompanyRuntime,
+    account: Option<&str>,
+) -> Option<(String, String)> {
+    let connected = normalize_email(account?);
+    if connected.is_empty() || !connected.contains('@') {
+        // Not an email at all (a Slack workspace name, a GitHub login) — no
+        // comparable operator address exists to check it against.
+        return None;
+    }
+    let admins = match crate::server::users::routes::bootstrap_admins(config, runtime).await {
+        Ok(admins) => admins,
+        Err(err) => {
+            tracing::warn!(
+                "oauth callback: could not load operator addresses to compare a connected \
+                 account against: {err}"
+            );
+            return None;
+        }
+    };
+    if admins.is_empty() || admins.iter().any(|a| normalize_email(a) == connected) {
+        return None;
+    }
+    Some((connected, admins.join(", ")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1133,233 @@ mod test {
                 std::env::remove_var(format!("OPENCOMPANY_OAUTH_{key}_{suffix}"));
             }
         }
+    }
+
+    // ---- account identity at connect time (issue #316) --------------------
+
+    /// Builds an isolated in-memory company runtime whose manifest names
+    /// `admins` as `[users].admins` — the operator addresses a connected
+    /// account is checked against.
+    async fn test_runtime_with_admins(admins: &[&str]) -> (Arc<CompanyRuntime>, tempfile::TempDir) {
+        let home = tempfile::Builder::new()
+            .prefix("oc-acct-")
+            .tempdir()
+            .expect("tempdir");
+        let admins_toml = admins
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest: CompanyManifest = toml::from_str(&format!(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n[users]\nadmins = [{admins_toml}]\n"
+        ))
+        .unwrap();
+        let runtime = RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(CompanyId::new("acme"))
+            .build()
+            .await
+            .unwrap();
+        (Arc::new(runtime), home)
+    }
+
+    /// Spins up a local HTTP server that answers every POST with `body` as
+    /// JSON, standing in for a provider's token endpoint. Returns the address
+    /// to point `OPENCOMPANY_OAUTH_<P>_TOKEN_URL` at.
+    async fn mock_token_endpoint(body: serde_json::Value) -> std::net::SocketAddr {
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// Registers a unique provider's app credentials pointing its token URL at
+    /// `addr`, and returns the provider name + env key so the caller can clean
+    /// up afterwards.
+    fn configure_provider_env(addr: std::net::SocketAddr) -> (String, String) {
+        let provider = unique_provider();
+        let key = provider.to_ascii_uppercase();
+        // SAFETY: unique per-test provider name → no cross-test env collision.
+        unsafe {
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_ID"), "cid");
+            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_SECRET"), "csec");
+            std::env::set_var(
+                format!("OPENCOMPANY_OAUTH_{key}_AUTHORIZE_URL"),
+                "http://x/a",
+            );
+            std::env::set_var(
+                format!("OPENCOMPANY_OAUTH_{key}_TOKEN_URL"),
+                format!("http://{addr}/token"),
+            );
+        }
+        (provider, key)
+    }
+
+    fn clear_provider_env(key: &str) {
+        unsafe {
+            for suffix in ["ID", "SECRET", "AUTHORIZE_URL", "TOKEN_URL"] {
+                std::env::remove_var(format!("OPENCOMPANY_OAUTH_{key}_{suffix}"));
+            }
+        }
+    }
+
+    /// A connected account matching the company's operator address connects
+    /// and stores as before — the baseline this slice must not break.
+    #[tokio::test]
+    async fn callback_matching_account_connects_and_stores() {
+        let (runtime, _home) = test_runtime_with_admins(&["ada@example.com"]).await;
+        let state = AppState::new(AppConfig::default());
+        state
+            .registry()
+            .insert(CompanyId::new("acme"), runtime.clone());
+
+        let addr = mock_token_endpoint(json!({ "email": "ada@example.com" })).await;
+        let (provider, key) = configure_provider_env(addr);
+
+        let nonce = encode_state(
+            &test_state_secret(),
+            "acme",
+            &provider,
+            now_millis() + STATE_TTL_MS,
+        );
+        let resp = call_callback(state, &format!("code=abc&state={}", urlencode(&nonce))).await;
+        let loc = location(&resp);
+        assert!(
+            loc.contains(&format!("connected={provider}")),
+            "expected a matching account to connect: {loc}"
+        );
+        assert!(!loc.contains("connect_error="), "{loc}");
+
+        let stored = runtime
+            .secrets()
+            .get(runtime.id(), &oauth_key(&provider))
+            .await
+            .unwrap()
+            .expect("token stored");
+        assert!(
+            stored.expose().contains("ada@example.com"),
+            "stored secret missing the connected account: {}",
+            stored.expose()
+        );
+
+        clear_provider_env(&key);
+    }
+
+    /// A connected account that is a comparable email but matches none of the
+    /// company's operator addresses is refused: nothing is stored, and the
+    /// redirect names both the connected and expected addresses (issue #316).
+    #[tokio::test]
+    async fn callback_mismatched_email_account_is_refused() {
+        let (runtime, _home) = test_runtime_with_admins(&["ada@example.com"]).await;
+        let state = AppState::new(AppConfig::default());
+        state
+            .registry()
+            .insert(CompanyId::new("acme"), runtime.clone());
+
+        let addr = mock_token_endpoint(json!({ "email": "eve@example.com" })).await;
+        let (provider, key) = configure_provider_env(addr);
+
+        let nonce = encode_state(
+            &test_state_secret(),
+            "acme",
+            &provider,
+            now_millis() + STATE_TTL_MS,
+        );
+        let resp = call_callback(state, &format!("code=abc&state={}", urlencode(&nonce))).await;
+        let loc = location(&resp);
+        assert!(loc.contains("connect_error=account_mismatch"), "{loc}");
+        assert!(loc.contains(&format!("provider={provider}")), "{loc}");
+        assert!(
+            loc.contains(&urlencode("eve@example.com")),
+            "redirect must name the connected account: {loc}"
+        );
+        assert!(
+            loc.contains(&urlencode("ada@example.com")),
+            "redirect must name the expected operator address: {loc}"
+        );
+
+        assert!(
+            is_blanked(&runtime, &provider).await,
+            "a mismatched account must not be stored"
+        );
+
+        clear_provider_env(&key);
+    }
+
+    /// GitHub's token response carries no `login` at all — just
+    /// `access_token`/`scope`/`token_type` — so [`extract_account`] returns
+    /// `None`. With nothing to compare, the connect must still succeed; this
+    /// is the regression guard for the "cannot compare, so do not refuse"
+    /// rule.
+    #[tokio::test]
+    async fn callback_token_without_account_still_connects() {
+        let (runtime, _home) = test_runtime_with_admins(&["ada@example.com"]).await;
+        let state = AppState::new(AppConfig::default());
+        state
+            .registry()
+            .insert(CompanyId::new("acme"), runtime.clone());
+
+        let addr = mock_token_endpoint(json!({
+            "access_token": "gho_mock",
+            "scope": "repo",
+            "token_type": "bearer",
+        }))
+        .await;
+        let (provider, key) = configure_provider_env(addr);
+
+        let nonce = encode_state(
+            &test_state_secret(),
+            "acme",
+            &provider,
+            now_millis() + STATE_TTL_MS,
+        );
+        let resp = call_callback(state, &format!("code=abc&state={}", urlencode(&nonce))).await;
+        let loc = location(&resp);
+        assert!(
+            loc.contains(&format!("connected={provider}")),
+            "an account-less token response must still connect: {loc}"
+        );
+        assert!(!loc.contains("connect_error="), "{loc}");
+
+        clear_provider_env(&key);
+    }
+
+    /// Slack's token response names the workspace under `team.name`, not the
+    /// operator's address. A label that isn't shaped like an email is not
+    /// comparable, so the connect must still succeed — a naive `!=` here
+    /// would break every Slack connect.
+    #[tokio::test]
+    async fn callback_non_email_account_still_connects() {
+        let (runtime, _home) = test_runtime_with_admins(&["ada@example.com"]).await;
+        let state = AppState::new(AppConfig::default());
+        state
+            .registry()
+            .insert(CompanyId::new("acme"), runtime.clone());
+
+        let addr = mock_token_endpoint(json!({ "team": { "name": "Acme Workspace" } })).await;
+        let (provider, key) = configure_provider_env(addr);
+
+        let nonce = encode_state(
+            &test_state_secret(),
+            "acme",
+            &provider,
+            now_millis() + STATE_TTL_MS,
+        );
+        let resp = call_callback(state, &format!("code=abc&state={}", urlencode(&nonce))).await;
+        let loc = location(&resp);
+        assert!(
+            loc.contains(&format!("connected={provider}")),
+            "a non-email account label must still connect: {loc}"
+        );
+        assert!(!loc.contains("connect_error="), "{loc}");
+
+        clear_provider_env(&key);
     }
 
     // ---- disconnect / best-effort revoke ----------------------------------
