@@ -89,24 +89,31 @@ export function LastRunChip({ run }: { run: WorkflowRunOutcome }) {
       className="h-5 gap-1.5 px-2 text-[10px] font-normal"
       data-testid="workflow-last-run-chip"
       title={
-        run.error
-          ? `Last run failed: ${run.error}`
-          : run.cancelled
-            ? "An operator stopped this run before it finished."
-            : `Last ${run.scheduled ? "scheduled" : "manual"} run — ${tone.label}`
+        run.running
+          ? "This run is still going."
+          : run.error
+            ? `Last run failed: ${run.error}`
+            : run.cancelled
+              ? "An operator stopped this run before it finished."
+              : `Last ${run.scheduled ? "scheduled" : "manual"} run — ${tone.label}`
       }
     >
       <span className={`size-1.5 rounded-full ${tone.dot}`} />
       {run.scheduled ? "Scheduled" : "Manual"} run
-      {run.error
-        ? " failed"
-        : run.cancelled
-          ? " stopped"
-          : undelivered > 0
-          ? ` · ${undelivered} not delivered`
-          : pending > 0
-            ? ` · ${pending} awaiting approval`
-            : ""}
+      {/* The in-flight case is worded before the terminal ones for the same
+          reason `runTone` checks it first: a run that has not finished has not
+          failed and has not succeeded, and the counts below are not final. */}
+      {run.running
+        ? " running"
+        : run.error
+          ? " failed"
+          : run.cancelled
+            ? " stopped"
+            : undelivered > 0
+            ? ` · ${undelivered} not delivered`
+            : pending > 0
+              ? ` · ${pending} awaiting approval`
+              : ""}
       <span className="text-muted-foreground">· {relativeTime(run.atMillis)}</span>
     </Badge>
   );

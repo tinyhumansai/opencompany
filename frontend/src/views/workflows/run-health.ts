@@ -46,8 +46,17 @@ export function relativeTime(atMillis: number): string {
 }
 
 /** The status dot for a whole run: red when it failed or lost a report, sky
- * when something is parked for approval, green when everything landed. */
+ * when something is parked for approval, green when everything landed.
+ *
+ * **A run still in flight is checked FIRST**, ahead of every terminal reading.
+ * A running run has no `error`, no `cancelled` and no deliveries yet, so
+ * without this arm it falls all the way through to the green "ok" — and every
+ * caller that trusts this function (the last-run chip, the history rows, the
+ * cards) paints a run that has not finished as one that succeeded. That is a
+ * claim the host has not made.
+ */
 export function runTone(run: WorkflowRunOutcome): { dot: string; label: string } {
+  if (isRunning(run)) return { dot: "animate-pulse bg-sky-500", label: "running" };
   if (run.error) return { dot: "bg-red-500", label: "failed" };
   // Issue #383: checked before the delivery reads, and deliberately NOT red. A
   // stop somebody asked for is not a fault, and a cancelled run has no

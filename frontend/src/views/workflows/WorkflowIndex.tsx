@@ -270,20 +270,14 @@ function HealthLine({ runs, runsLoaded }: { runs: WorkflowRunOutcome[]; runsLoad
 
   return (
     <span className="flex flex-wrap items-center gap-1.5 text-[11px]">
-      {last.running ? (
-        <>
-          <span className="size-1.5 animate-pulse rounded-full bg-sky-500" />
-          <span className="text-muted-foreground">Running now</span>
-        </>
-      ) : (
-        <>
-          <span className={`size-1.5 rounded-full ${tone.dot}`} />
-          <span className="text-muted-foreground">
-            {last.scheduled ? "Scheduled" : "Manual"} run {tone.label}
-            {failedNode ? ` at “${failedNode}”` : ""}
-          </span>
-        </>
-      )}
+      {/* `runTone` owns the running reading too, so this reads the same way as
+          the last-run chip and the history rows rather than being a second
+          opinion that can drift from them. */}
+      <span className={`size-1.5 rounded-full ${tone.dot}`} />
+      <span className="text-muted-foreground">
+        {last.scheduled ? "Scheduled" : "Manual"} run {tone.label}
+        {failedNode ? ` at “${failedNode}”` : ""}
+      </span>
       <span className="text-muted-foreground/70">· {relativeTime(last.atMillis)}</span>
       {undelivered > 0 && (
         <Badge
@@ -320,10 +314,10 @@ function RunStrip({ runs }: { runs: WorkflowRunOutcome[] }) {
         return (
           <span
             key={run.seq}
-            className={`size-1.5 rounded-full ${run.running ? "animate-pulse bg-sky-500" : tone.dot}`}
-            title={`${run.scheduled ? "Scheduled" : "Manual"} run — ${
-              run.running ? "running" : tone.label
-            } · ${relativeTime(run.atMillis)}`}
+            className={`size-1.5 rounded-full ${tone.dot}`}
+            title={`${run.scheduled ? "Scheduled" : "Manual"} run — ${tone.label} · ${relativeTime(
+              run.atMillis,
+            )}`}
           />
         );
       })}
