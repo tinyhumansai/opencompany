@@ -33,10 +33,11 @@ use crate::ports::types::{
     Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, OutboundMessage, OverlayDesk,
     OverlayDeskMember, OverlayDeskOrder, StoredEvent, TurnStep, Verdict,
 };
-use crate::runtime::grants::GrantScope;
+use crate::runtime::grants::{GrantId, GrantScope, MAX_STANDING_GRANT_MILLIS};
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::chat_history::{MessageView, Viewer, history_for_desk};
 use crate::server::error::ApiError;
+use crate::server::graphql::auth::GqlAuth;
 use crate::server::ops::language::{self, DEFAULT_DESK};
 use crate::server::ops::{ScopedCompany, scoped};
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
@@ -83,6 +84,10 @@ pub fn router() -> Router<AppState> {
         // the attention-worthy events already on the company's event log, under
         // both scope forms.
         .merge(scoped("/events", get(company_events)))
+        // Standing permissions (issue #374): what the operator has opened up,
+        // and how to take it back. Registered under both scope forms.
+        .merge(scoped("/grants", get(list_grants)))
+        .merge(scoped("/grants/{gid}", delete(revoke_grant)))
 }
 
 /// One desk (group chat) as the console renders it. Mirrors `DeskDto` in
@@ -1362,6 +1367,180 @@ struct ResolveApproval {
     /// over a decision that was recorded seconds earlier (issue #380).
     #[serde(default)]
     detach: bool,
+    /// What this approval buys (issue #374). Absent is
+    /// [`ResolveScope::Once`] — today's behaviour, so every existing caller is
+    /// unaffected without changing a byte of its body.
+    #[serde(default)]
+    scope: Option<ResolveScope>,
+    /// How long a `tool`-scoped grant lasts, in milliseconds from now.
+    ///
+    /// **Mandatory with `scope: "tool"`, and capped at seven days.** A request
+    /// past the cap is a 400, never a silent clamp: quietly shortening a
+    /// duration the operator chose would leave them believing a permission is
+    /// live when it lapsed days earlier.
+    #[serde(default)]
+    expires_in_millis: Option<u64>,
+}
+
+/// The wire form of [`GrantScope`].
+///
+/// A closed enum rather than a free string, so an unrecognised scope is a
+/// deserialization failure at the edge instead of something that silently
+/// degrades to `once` — an operator who asked for a standing permission and
+/// quietly got a single call would not find out until the next card appeared.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResolveScope {
+    /// One call, argument-exact. The default.
+    Once,
+    /// This tool, for this teammate, until `expires_in_millis` from now.
+    Tool,
+}
+
+/// Validates the requested scope and turns it into a [`GrantScope`] with an
+/// absolute deadline (issue #374).
+///
+/// Every refusal here happens **before** the runtime is touched, so a bad
+/// request leaves the approval parked and journals no verdict. The contradictions
+/// are refused rather than resolved in the caller's favour:
+///
+/// * **with a deny** — a scope describes what an approval grants, and a deny
+///   grants nothing. Honouring one would be inventing consent out of a refusal.
+/// * **with `amended_payload`** — an argument edit is by definition an
+///   exact-call approval ("this, but with my correction"), and a standing grant
+///   admits any arguments. The two say opposite things about the same request.
+/// * **with no duration, or zero** — the expiry is mandatory. A grant with no
+///   deadline is the silent accumulation this issue exists to prevent.
+/// * **past the cap** — 400, never a clamp. See
+///   [`MAX_STANDING_GRANT_MILLIS`].
+///
+/// A duration on `once` is refused too: it would otherwise be dropped on the
+/// floor, leaving the operator believing they had bought a week.
+fn grant_scope(body: &ResolveApproval) -> Result<GrantScope, ApiError> {
+    let bad = |msg: &str| ApiError(OpenCompanyError::InvalidRequest(msg.to_string()));
+    match body.scope.unwrap_or(ResolveScope::Once) {
+        ResolveScope::Once => {
+            if body.expires_in_millis.is_some() {
+                return Err(bad(
+                    "expires_in_millis only applies to scope \"tool\"; a single-use approval \
+                     covers one call and does not last",
+                ));
+            }
+            Ok(GrantScope::Once)
+        }
+        ResolveScope::Tool => {
+            if body.verdict == Verdict::Deny {
+                return Err(bad("a scope cannot accompany a deny verdict"));
+            }
+            if body.amended_payload.is_some() {
+                return Err(bad(
+                    "amended_payload cannot accompany scope \"tool\": editing the arguments \
+                     approves one exact call, while a standing grant admits any arguments",
+                ));
+            }
+            let Some(duration) = body.expires_in_millis.filter(|d| *d > 0) else {
+                return Err(bad(
+                    "scope \"tool\" requires a positive expires_in_millis; a standing \
+                     permission must have a deadline",
+                ));
+            };
+            if duration > MAX_STANDING_GRANT_MILLIS {
+                return Err(bad(&format!(
+                    "expires_in_millis must be at most {MAX_STANDING_GRANT_MILLIS} \
+                     (seven days); asked for {duration}"
+                )));
+            }
+            Ok(GrantScope::Tool {
+                // Absolute, resolved once here. A duration re-based on every
+                // read would drift, and a deadline is what the operator was
+                // shown.
+                expires_at_millis: crate::ports::now_millis().saturating_add(duration),
+            })
+        }
+    }
+}
+
+/// One standing permission, as the console lists it (issue #374).
+///
+/// Carries **no arguments**, because a standing grant has none — so this route
+/// opens no second redaction surface and #372's payload redactor keeps its
+/// single call site.
+#[derive(Debug, Serialize)]
+struct StandingGrantDto {
+    /// The grant id — what `DELETE …/grants/{gid}` addresses.
+    id: String,
+    /// The teammate it was granted to.
+    agent: String,
+    /// The tool it admits.
+    tool: String,
+    /// Who granted it: a signed-in user, or the platform credential.
+    granted_by: Actor,
+    /// Epoch-millis it was granted.
+    at_millis: u64,
+    /// Epoch-millis it stops admitting calls.
+    expires_at_millis: u64,
+}
+
+impl From<crate::runtime::grants::StandingGrant> for StandingGrantDto {
+    fn from(g: crate::runtime::grants::StandingGrant) -> Self {
+        Self {
+            id: g.id.to_string(),
+            agent: g.agent,
+            tool: g.tool,
+            granted_by: g.granted_by,
+            at_millis: g.at_millis,
+            expires_at_millis: g.expires_at_millis,
+        }
+    }
+}
+
+/// `GET {scope}/grants` — the live standing permissions, newest first.
+async fn list_grants(scope: ScopedCompany) -> Json<Vec<StandingGrantDto>> {
+    Json(
+        scope
+            .runtime
+            .standing_grants()
+            .into_iter()
+            .map(StandingGrantDto::from)
+            .collect(),
+    )
+}
+
+/// `DELETE {scope}/grants/{gid}` — take a standing permission back.
+///
+/// Takes effect on the **next** policy check; a call already admitted is not
+/// aborted. 404 when there is nothing to revoke — already revoked, or expired —
+/// rather than reporting success over a no-op.
+async fn revoke_grant(
+    scope: ScopedCompany,
+    Path(params): Path<std::collections::HashMap<String, String>>,
+) -> Result<StatusCode, ApiError> {
+    let gid = params
+        .get("gid")
+        .cloned()
+        .ok_or_else(|| ApiError(OpenCompanyError::InvalidRequest("missing grant id".into())))?;
+    // The machine credential has no person behind it, the same distinction every
+    // other operator write draws.
+    let by = scope.actor.clone().unwrap_or_else(platform_actor);
+    let revoked = scope
+        .runtime
+        .revoke_standing_grant(&GrantId::new(gid.clone()), by)
+        .await?;
+    if revoked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(OpenCompanyError::NotFound(format!(
+            "standing permission {gid}"
+        ))))
+    }
+}
+
+/// The actor for a request carrying a machine credential rather than a person.
+fn platform_actor() -> Actor {
+    Actor {
+        kind: ActorKind::Operator,
+        id: "platform".to_string(),
+    }
 }
 
 /// The answer to a detached resolve: the verdict is durable, that is all this
@@ -1386,12 +1565,12 @@ async fn run_resolve(
     runtime: Arc<CompanyRuntime>,
     approval_id: String,
     body: ResolveApproval,
+    actor: Actor,
 ) -> Result<Response, ApiError> {
     runtime.ensure_running().await?;
-    let actor = Actor {
-        kind: ActorKind::Operator,
-        id: "operator".to_string(),
-    };
+    // Issue #374: validated before the runtime is touched, so a refused scope
+    // leaves the approval parked with no verdict journaled.
+    let scope = grant_scope(&body)?;
     let id = ApprovalId::new(approval_id);
     // The verdict is settled inline; only the follow-up cycle is on the handle.
     // So by the time this returns — in either mode — the decision is journaled
@@ -1409,7 +1588,7 @@ async fn run_resolve(
         }
         (verdict, None) => {
             runtime
-                .resolve_approval_spawned(&id, verdict, actor, GrantScope::Once)
+                .resolve_approval_spawned(&id, verdict, actor, scope)
                 .await?
         }
     };
@@ -1458,9 +1637,29 @@ async fn resolve_approval(
         return Err(resp);
     }
     let runtime = lookup(&state, &id).map_err(IntoResponse::into_response)?;
-    run_resolve(&state, &company, runtime, aid, body)
+    let actor = resolving_actor(auth);
+    run_resolve(&state, &company, runtime, aid, body, actor)
         .await
         .map_err(IntoResponse::into_response)
+}
+
+/// Who is resolving this approval (issue #374).
+///
+/// Both resolve handlers used to hardcode `Actor { kind: Operator, id:
+/// "operator" }` while already holding the authenticated principal — so the
+/// journal recorded every verdict as having come from the same anonymous
+/// "operator", on a multi-user company where several people can decide. That was
+/// tolerable while the record was one verdict; a standing grant is a permission
+/// that outlives the decision and that someone else will later find and have to
+/// account for, so "who opened this up" has to be a real answer.
+fn resolving_actor(auth: GqlAuth) -> Actor {
+    match auth {
+        GqlAuth::User(user) => Actor {
+            kind: ActorKind::User,
+            id: user.user_id,
+        },
+        GqlAuth::Platform(_) => platform_actor(),
+    }
 }
 
 /// `POST /api/v1/company/approvals/{aid}` (single-company alias).
@@ -1478,7 +1677,8 @@ async fn resolve_approval_single(
     if let Some(resp) = refuse_until_password_changed(&auth) {
         return Err(resp);
     }
-    run_resolve(&state, &id, runtime, aid, body)
+    let actor = resolving_actor(auth);
+    run_resolve(&state, &id, runtime, aid, body, actor)
         .await
         .map_err(IntoResponse::into_response)
 }
@@ -3857,5 +4057,247 @@ mod test {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Standing permissions (issue #374)
+    // -----------------------------------------------------------------------
+
+    /// Every contradictory or unbounded scope request is a 400, and none of them
+    /// reaches the runtime.
+    ///
+    /// The approval id is deliberately one that does not exist: each of these
+    /// must be refused at the edge, so the fact that resolving a missing
+    /// approval would otherwise be a harmless no-op never gets a chance to mask
+    /// a body that should not have been accepted.
+    #[tokio::test]
+    async fn a_contradictory_or_unbounded_scope_is_refused() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+
+        let day: u64 = 24 * 60 * 60 * 1000;
+        for (label, body) in [
+            (
+                "a scope cannot ride a deny",
+                format!(r#"{{"verdict":"deny","scope":"tool","expires_in_millis":{day}}}"#),
+            ),
+            (
+                "an argument edit and a standing grant contradict",
+                format!(
+                    r#"{{"verdict":"approve","scope":"tool","expires_in_millis":{day},"amended_payload":{{"to":"x"}}}}"#
+                ),
+            ),
+            (
+                "the deadline is mandatory",
+                r#"{"verdict":"approve","scope":"tool"}"#.to_string(),
+            ),
+            (
+                "zero is not a duration",
+                r#"{"verdict":"approve","scope":"tool","expires_in_millis":0}"#.to_string(),
+            ),
+            (
+                "past the seven-day cap is refused, never clamped",
+                format!(
+                    r#"{{"verdict":"approve","scope":"tool","expires_in_millis":{}}}"#,
+                    MAX_STANDING_GRANT_MILLIS + 1
+                ),
+            ),
+            (
+                "a duration is meaningless on the once scope",
+                format!(r#"{{"verdict":"approve","scope":"once","expires_in_millis":{day}}}"#),
+            ),
+        ] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/company/approvals/appr-missing")
+                        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{label}: must be refused at the edge"
+            );
+        }
+
+        // An unrecognised scope is refused too, one layer earlier: `ResolveScope`
+        // is a closed enum, so axum's JSON extractor rejects it as 422 before
+        // any handler runs. The status differs from the checks above; what
+        // matters is that it is never silently downgraded to `once`, which would
+        // hand an operator a single call when they asked for a standing one.
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/approvals/appr-missing")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"verdict":"approve","scope":"forever"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Exactly at the cap is fine — the boundary is inclusive.
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/approvals/appr-missing")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"verdict":"approve","scope":"tool","expires_in_millis":{MAX_STANDING_GRANT_MILLIS}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The default body — no `scope` key at all — is accepted exactly as before.
+    #[tokio::test]
+    async fn an_omitted_scope_is_the_pre_374_request() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/approvals/appr-missing")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"verdict":"approve"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The grants list is empty on a fresh company, and revoking something that
+    /// is not there is a 404 rather than a cheerful no-op.
+    #[tokio::test]
+    async fn the_grants_list_starts_empty_and_revoking_nothing_is_a_404() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/grants")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 0);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/grants/nope")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A standing grant is listed with the authenticated user's id, is revocable,
+    /// and revoking is idempotent-by-404. Both scope forms answer.
+    #[tokio::test]
+    async fn a_standing_grant_is_listed_under_its_granter_and_can_be_revoked() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+        runtime
+            .grants
+            .grant_standing(crate::runtime::grants::StandingGrant {
+                id: crate::runtime::grants::GrantId::new("g1"),
+                agent: "ops".into(),
+                tool: "workspace_write".into(),
+                granted_by: Actor {
+                    kind: ActorKind::User,
+                    id: "user-7".into(),
+                },
+                approval_id: ApprovalId::new("appr-1"),
+                at_millis: 1_000,
+                expires_at_millis: crate::ports::now_millis() + 60 * 60 * 1000,
+                origin_thread: None,
+            });
+
+        // Both addressing forms list it.
+        for uri in ["/api/v1/company/grants", "/api/v1/companies/acme/grants"] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value[0]["id"], "g1", "{uri}");
+            assert_eq!(value[0]["tool"], "workspace_write");
+            assert_eq!(value[0]["agent"], "ops");
+            assert_eq!(
+                value[0]["granted_by"]["id"], "user-7",
+                "the list names who actually granted it"
+            );
+            assert!(
+                value[0].get("payload").is_none() && value[0].get("args").is_none(),
+                "a standing grant has no arguments, so the list opens no redaction surface"
+            );
+        }
+
+        // Revoke, then it is gone and a second revoke is a 404.
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/grants/g1")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(runtime.standing_grants().len(), 0);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/grants/g1")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
