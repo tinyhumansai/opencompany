@@ -63,7 +63,7 @@ use crate::harness::lifecycle::ReviewDecision;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
 use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, OverlayAgent};
-use crate::ports::{CompanyStore, WorkflowRun, WorkflowRunContext, WorkflowRunner, generate_id};
+use crate::ports::{CompanyStore, WorkflowRun, WorkflowRunner, generate_id};
 
 /// The manifest cognition-tier that marks the orchestrator agent.
 pub const ORCHESTRATOR_TIER: &str = "orchestrator";
@@ -1149,6 +1149,11 @@ impl Tool for AddAgentTool {
 /// holds the graphs; `workflow_runner` is the shared handle the runtime builder
 /// fills once the runner is built. `store` is the company store the `add_agent`
 /// tool writes through.
+// One more dependency than clippy's threshold, and each is a distinct wired
+// port the orchestrator's tools need. Bundling them into a struct would only
+// relocate the surface — the same call is made from exactly one place
+// (`build_agent`), so there is nothing to deduplicate.
+#[allow(clippy::too_many_arguments)]
 pub fn orchestrator_tools(
     company: CompanyId,
     facts: Option<Arc<dyn FactStore>>,
@@ -2595,7 +2600,7 @@ name = "Morning"
             _company: &CompanyId,
             workflow: &WorkflowFile,
             _input: Value,
-            _ctx: &WorkflowRunContext,
+            _ctx: &crate::ports::WorkflowRunContext,
         ) -> crate::Result<WorkflowRun> {
             self.calls.lock().unwrap().push(workflow.id.clone());
             Ok(self.run.clone())
