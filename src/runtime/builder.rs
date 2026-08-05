@@ -1059,6 +1059,37 @@ impl RuntimeBuilder {
                     "could not sweep orphaned run records at boot"
                 ),
             }
+
+            // Issue #337, the planning-side equivalent of the sweep above, and
+            // it exists because that one structurally cannot cover it. A
+            // planning pass mints no attempt row — there is no agent turn, no
+            // tool loop and nothing to steer — so `reap_orphaned_runs` has
+            // nothing to find, and a host that died mid-pass leaves a card
+            // sitting in Planning with nothing anywhere claiming to work it.
+            // The trigger is the *transition* into the column, which already
+            // happened, so nothing would ever re-drive it.
+            //
+            // Gated on the handover for exactly the reason the two sweeps
+            // around it are: at boot nothing from this process can be in
+            // flight, which is what makes "found in Planning ⇒ interrupted" a
+            // proof rather than a guess; during a rebuild that premise is
+            // false and this would yank a live pass out from under itself.
+            match crate::runtime::advance::sweep_stranded_planning(ops.tasks.as_ref(), &id).await {
+                Ok(returned) => {
+                    for task in returned {
+                        tracing::info!(
+                            company = %id,
+                            %task,
+                            "returned a card stranded in Planning by a previous host process"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    company = %id,
+                    error = %err,
+                    "could not sweep cards stranded in Planning at boot"
+                ),
+            }
         }
 
         // Issue #371, the workflow-side equivalent of the sweep above, and it

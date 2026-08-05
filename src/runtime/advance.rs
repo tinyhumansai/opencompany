@@ -43,7 +43,9 @@ use crate::Result;
 use crate::ports::TaskStore;
 use crate::ports::now_millis;
 use crate::ports::runs::RunStatus;
-use crate::ports::tasks::{COLUMN_IN_PROGRESS, column_for_settled_run};
+use crate::ports::tasks::{
+    COLUMN_IN_PROGRESS, COLUMN_PLANNING, COLUMN_TODO, column_for_settled_run,
+};
 use crate::ports::types::CompanyId;
 
 /// The note attribution used when the *runtime* settles a card, as opposed to
@@ -125,10 +127,91 @@ pub async fn advance_settled_card(
     Ok(Some(column))
 }
 
+/// The note a card gets when a planning pass was interrupted by the host going
+/// away underneath it (issue #337).
+///
+/// Its own wording rather than the orphan-run one: nothing *ran*, so "an
+/// attempt was abandoned" would be false. What happened is smaller and the
+/// operator's recovery is a single drag.
+pub const PLANNING_INTERRUPTED: &str = "the host restarted during planning, so the pass never finished — drag the card back into \
+     Planning to try again";
+
+/// Returns every card found sitting in [`COLUMN_PLANNING`] to
+/// [`COLUMN_TODO`], carrying [`PLANNING_INTERRUPTED`] on its note. Returns the
+/// ids it moved.
+///
+/// # Why a planning pass needs its own sweep
+///
+/// The orphan-run reaper cannot see this. A pass mints **no**
+/// [`RunRecord`](crate::ports::runs::RunRecord) — deliberately: there is no
+/// agent turn, no tool loop and nothing to steer, so an attempt row would be a
+/// fiction (see `docs/spec/runtime/planning.md`). But that is exactly what
+/// makes the crash case invisible: a host that dies mid-pass leaves a card in
+/// Planning with nothing anywhere claiming to be working it, and because the
+/// trigger is the *transition* into the column — which already happened —
+/// nothing will ever re-drive it. The card would sit there forever looking
+/// busy.
+///
+/// So the boot sweep reads the board directly. It is safe for the same reason
+/// the run reaper is and for one more of its own:
+///
+///  * **Boot-only.** Nothing from this process can be in flight at boot, so
+///    every Planning card provably belongs to a dead process. Like the run
+///    reaper, this must NOT run on a rebuild ([`RuntimeRebuilder`]), where that
+///    premise is false and a live pass would be yanked out from under itself.
+///  * **Planning is transient by construction.** Every terminating path of a
+///    pass leaves the column — to In Progress on success, to To-do otherwise.
+///    A card resting in Planning is therefore never a state an operator chose
+///    and never a state a healthy pass leaves behind, which is what makes
+///    "found here at boot ⇒ interrupted" a sound inference rather than a guess.
+///
+/// It writes through the plain [`TaskStore::upsert`] port, never
+/// [`CompanyRuntime::upsert_task`], so returning a card cannot fire the
+/// planning edge again and put the company straight back into the pass that was
+/// just interrupted.
+///
+/// Best-effort per card: one card that will not move must not stop the rest and
+/// must not fail boot.
+///
+/// [`RuntimeRebuilder`]: crate::runtime::rebuild::RuntimeRebuilder
+/// [`CompanyRuntime::upsert_task`]: crate::company::runtime::CompanyRuntime
+pub async fn sweep_stranded_planning(
+    tasks: &dyn TaskStore,
+    company: &CompanyId,
+) -> Result<Vec<String>> {
+    let stranded: Vec<_> = tasks
+        .list(company)
+        .await?
+        .into_iter()
+        .filter(|t| t.column == COLUMN_PLANNING)
+        .collect();
+    let mut returned = Vec::with_capacity(stranded.len());
+    for mut card in stranded {
+        card.note = Some(append_result(
+            card.note.as_deref(),
+            SYSTEM_ATTRIBUTION,
+            PLANNING_INTERRUPTED,
+        ));
+        card.column = COLUMN_TODO.to_string();
+        card.updated_at_millis = now_millis();
+        match tasks.upsert(company, &card).await {
+            Ok(()) => returned.push(card.id),
+            Err(err) => tracing::warn!(
+                company = %company,
+                task = %card.id,
+                error = %err,
+                "[planning] could not return a card stranded in Planning by a previous host \
+                 process; it stays there until the next boot"
+            ),
+        }
+    }
+    Ok(returned)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::ports::tasks::{COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_TODO, TaskRecord};
+    use crate::ports::tasks::{COLUMN_IN_REVIEW, COLUMN_PAUSED, TaskRecord};
     use crate::store::FsOps;
     use std::sync::Arc;
 
@@ -316,6 +399,115 @@ mod test {
         .await
         .unwrap();
         assert_eq!(moved, Some(COLUMN_IN_REVIEW));
+    }
+
+    // --- The planning boot sweep (issue #337) -------------------------------
+
+    /// The crash case. A card left in Planning by a dead process comes back to
+    /// To-do saying what happened — because nothing else can recover it: a pass
+    /// mints no run row, so the orphan reaper never sees it, and the trigger is
+    /// the transition into the column, which already happened.
+    #[tokio::test]
+    async fn a_card_stranded_in_planning_comes_back_to_todo() {
+        let (_dir, tasks) = store().await;
+        let company = CompanyId::new("acme");
+        tasks
+            .upsert(&company, &card("t-1", COLUMN_PLANNING))
+            .await
+            .unwrap();
+
+        let returned = sweep_stranded_planning(tasks.as_ref(), &company)
+            .await
+            .unwrap();
+        assert_eq!(returned, vec!["t-1".to_string()]);
+
+        let after = tasks
+            .list(&company)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == "t-1")
+            .unwrap();
+        assert_eq!(after.column, COLUMN_TODO);
+        let note = after.note.expect("the reason is on the card");
+        assert!(note.starts_with("[system] "), "{note}");
+        assert!(
+            note.contains("host restarted during planning"),
+            "an operator must be able to tell this from a plan that failed: {note}"
+        );
+        // Idempotent: a second boot finds nothing left to move.
+        assert!(
+            sweep_stranded_planning(tasks.as_ref(), &company)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The sweep is scoped to Planning and nothing else. A board full of cards
+    /// in every other column is untouched — this must never become a
+    /// general-purpose "reset the board" pass.
+    #[tokio::test]
+    async fn the_planning_sweep_touches_no_other_column() {
+        let (_dir, tasks) = store().await;
+        let company = CompanyId::new("acme");
+        let others = [
+            ("t-todo", COLUMN_TODO),
+            ("t-progress", COLUMN_IN_PROGRESS),
+            ("t-paused", COLUMN_PAUSED),
+            ("t-review", COLUMN_IN_REVIEW),
+            ("t-done", crate::ports::tasks::COLUMN_DONE),
+        ];
+        for (id, column) in others {
+            tasks.upsert(&company, &card(id, column)).await.unwrap();
+        }
+        tasks
+            .upsert(&company, &card("t-planning", COLUMN_PLANNING))
+            .await
+            .unwrap();
+
+        let returned = sweep_stranded_planning(tasks.as_ref(), &company)
+            .await
+            .unwrap();
+        assert_eq!(returned, vec!["t-planning".to_string()]);
+
+        for (id, column) in others {
+            assert_eq!(column_of(&tasks, &company, id).await, column, "{id} moved");
+            let note = tasks
+                .list(&company)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == id)
+                .unwrap()
+                .note;
+            assert_eq!(note, None, "{id} was annotated by a sweep that skipped it");
+        }
+    }
+
+    /// Per-company, like every other sweep. One tenant's interrupted pass must
+    /// not move another tenant's card.
+    #[tokio::test]
+    async fn the_planning_sweep_is_scoped_to_one_company() {
+        let (_dir, tasks) = store().await;
+        let alpha = CompanyId::new("alpha");
+        let beta = CompanyId::new("beta");
+        tasks
+            .upsert(&alpha, &card("a-1", COLUMN_PLANNING))
+            .await
+            .unwrap();
+        tasks
+            .upsert(&beta, &card("b-1", COLUMN_PLANNING))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sweep_stranded_planning(tasks.as_ref(), &alpha)
+                .await
+                .unwrap(),
+            vec!["a-1".to_string()]
+        );
+        assert_eq!(column_of(&tasks, &beta, "b-1").await, COLUMN_PLANNING);
     }
 
     /// The note is append-only: a second block never eats the first.
