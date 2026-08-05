@@ -535,7 +535,7 @@ impl<'a> DelegationRunner<'a> {
                 instruction => format!("delegated to {member}: {instruction}"),
             },
         ));
-        card.column = lifecycle::landing_column(TaskRunEnd::Delegated, card).to_string();
+        card.column = lifecycle::landing_column(TaskRunEnd::Delegated).to_string();
         card.updated_at_millis = now_millis();
         tracing::debug!(
             task_id = %card.id,

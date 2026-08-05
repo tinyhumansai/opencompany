@@ -22,17 +22,24 @@
 //!
 //! # Relationship to neighbouring issues
 //!
-//! * **#171 (`in_review` → `done`, PR #179) — landed, and folded in here.**
-//!   #179 shipped the done-write as a `success_terminal_column` helper inside
-//!   `brain.rs`. That is exactly the decision this module exists to own, so the
-//!   helper moved here and [`landing_column`] now consumes it. A card reaches
-//!   [`COLUMN_DONE`] by one of two routes, and never both: a *delegated* card
-//!   (one carrying an `origin_chat_id`) completes straight to `done`, because
-//!   its answer is relayed into the conversation it came from and no operator
-//!   is watching the board for it; a *board-created* card lands in
-//!   [`COLUMN_IN_REVIEW`] and reaches `done` only through an approving
-//!   orchestrator verdict ([`review_landing_column`]). Between them every
-//!   card has a terminal, which is what #171 was about.
+//! * **#171 (`in_review` → `done`, PR #179) — landed here, then narrowed by
+//!   #337.** #179 shipped a `success_terminal_column` helper that sent a
+//!   *delegated* card (one carrying an `origin_chat_id`) straight to
+//!   [`COLUMN_DONE`], on the argument that its answer was relayed into the
+//!   conversation it came from and nobody was watching the board for it.
+//!
+//!   The operator decision of 2026-08-05 removed that route: **[`COLUMN_DONE`]
+//!   is reached only by a person**, through an approving orchestrator verdict
+//!   ([`review_landing_column`]). Every card — delegated or board-created —
+//!   now stops in [`COLUMN_IN_REVIEW`] first. So there is still exactly one
+//!   terminal, which is what #171 was about; there is now exactly one route to
+//!   it, and it runs through a human.
+//! * **#337 (a settled run advances its card) — where the column table went.**
+//!   [`landing_column`] is no longer its own mapping. It adapts a
+//!   [`TaskRunEnd`] onto [`crate::ports::tasks::column_for_settled_run`], which
+//!   is keyed on the settled [`RunStatus`] and lives on the **port** because
+//!   two of its three callers (the cycle's terminality backstop and the boot
+//!   reaper's card sweep) are ungated and cannot see this module.
 //! * **#185 (per-task event correlation, PR #190, still open).** #190 journals
 //!   `CompanyEvent::DeskTaskCompleted { column, .. }` from the tail of
 //!   `run_task`. That `column` is exactly what [`landing_column`] decides, so
@@ -57,9 +64,10 @@ use crate::ports::types::{OutboundMessage, ReplyTo};
 /// to return to a separate `backlog` pool, which epic #183 §3 collapsed into
 /// To-do), `COLUMN_PAUSED` where a paused run parks it (resume is a plain
 /// `column → in_progress` PATCH, which re-triggers dispatch), `COLUMN_PLANNING`
-/// which nothing here writes yet (§4's auto-advance owns it), and `COLUMN_DONE`
-/// the terminal — reached by [`landing_column`] for a delegated card and by
-/// [`review_landing_column`] for an approved board card (issue #171 / PR #179).
+/// which nothing here writes yet (§4's planning pass owns it), and `COLUMN_DONE`
+/// the terminal — since issue #337 reached **only** through
+/// [`review_landing_column`], because Done is a person's decision and no run
+/// ending writes it.
 pub use crate::ports::tasks::{
     COLUMN_DONE, COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_PLANNING, COLUMN_TODO,
 };
@@ -132,11 +140,13 @@ impl ReviewDecision {
 ///
 /// **`Approve` writes [`COLUMN_DONE`].** This is the `in_review → done`
 /// transition issue #171 asked for, in the place #186 built for it: the
-/// orchestrator's verdict *is* the review a board-created card was parked
-/// waiting for, so approving it finishes it. It cannot duplicate #179's
-/// origin-based done-write, because only a card with **no** `origin_chat_id`
-/// ever reaches `in_review` in the first place (see [`landing_column`]).
-/// `Revise` sends the card back to be re-dispatched.
+/// verdict *is* the review the card was parked waiting for, so approving it
+/// finishes it. `Revise` sends the card back to be re-dispatched.
+///
+/// Since issue #337 this is the **only** write of [`COLUMN_DONE`] anywhere —
+/// #179's origin-based shortcut is gone and no run ending lands there — so
+/// "Done means a person accepted it" is now true by construction rather than
+/// by convention.
 pub fn review_landing_column(decision: ReviewDecision) -> &'static str {
     match decision {
         ReviewDecision::Approve => COLUMN_DONE,
@@ -156,45 +166,53 @@ pub fn review_note(decision: ReviewDecision, note: Option<&str>) -> String {
     }
 }
 
-/// Where a run that produced a result lands its card (issue #171, PR #179).
-///
-/// `in_review` is a naming convention, not a mechanism: nothing consumes it
-/// automatically. `task_enters_in_progress` only edge-fires a dispatch when a
-/// card enters `in_progress`, so an `in_review` card triggers no further cycle.
-///
-/// That is right for a card an operator made themselves — they are the
-/// reviewer, and the card is sitting in front of them (and the orchestrator can
-/// close it out with [`ReviewDecision::Approve`]). It strands a card stamped
-/// with `origin_chat_id`: that card came from `spawn_task` during an
-/// agent-to-agent handoff, its result is relayed straight back into the
-/// originating thread, and nobody is watching the board for it. So a card that
-/// remembers an origin completes to `done`.
-pub fn success_terminal_column(card: &TaskRecord) -> &'static str {
-    if card.origin_chat_id.is_some() {
-        COLUMN_DONE
-    } else {
-        COLUMN_IN_REVIEW
-    }
-}
-
 /// The board column a run ending this way lands its card in.
 ///
-/// The single authority for that mapping. A failed or cancelled run goes back
-/// to `todo` (it is not reviewable work) with its reason on the note — issue
-/// #301 rerouted this from the removed `backlog` pool; a paused one parks; a hand-off
-/// stays in `in_progress` because the work has only changed hands; everything
-/// that produced a result goes to its [`success_terminal_column`] — `done` for
-/// a delegated card, `in_review` for a board-created one.
-pub fn landing_column(end: TaskRunEnd, card: &TaskRecord) -> &'static str {
-    match end {
-        TaskRunEnd::Completed | TaskRunEnd::RedirectsExhausted => success_terminal_column(card),
-        TaskRunEnd::Failed | TaskRunEnd::Cancelled => COLUMN_TODO,
-        TaskRunEnd::Paused => COLUMN_PAUSED,
-        // A hand-off is explicitly NOT a terminal: the delegate is running, so
-        // the card keeps the column it was dispatched in and only settles once
-        // they come back with something (issue #204).
-        TaskRunEnd::Delegated => COLUMN_IN_PROGRESS,
+/// **Issue #337 collapsed this onto [`column_for_settled_run`].** It used to be
+/// its own table over [`TaskRunEnd`], which meant the landing was derived from
+/// *how the turn ended* while the attempt row was derived from *what the run
+/// settled into* — two tables that had already drifted apart. The visible
+/// symptom: a run that finished its work but parked an approval settled
+/// [`RunStatus::WaitingApproval`] and still landed in whatever its ending said,
+/// which for a delegated card was `done`. A card filed as finished while a
+/// person still had to authorise the call it was waiting on.
+///
+/// Now there is one table, keyed on the settled status, and this function is
+/// the thin adapter that reaches it: `end` → [`run_status_for`] →
+/// [`column_for_settled_run`]. The parked-approval overlay is applied by the
+/// caller through [`settled_run_status`], because only `run_task` knows how
+/// many approvals *this* attempt parked.
+///
+/// # Two deliberate losses, both wanted
+///
+/// * **`Succeeded` lands in `in_review`, never `done`.** Operator decision,
+///   2026-08-05: Done is reached only by a person. This supersedes the
+///   `Succeeded → Done` row in epic #183 §4.
+/// * **`success_terminal_column` is gone with it.** It sent a card carrying an
+///   `origin_chat_id` — one spawned during an agent-to-agent handoff — straight
+///   to `done` on the argument that nobody was watching the board for it (#171
+///   / PR #179). Under the decision above there is no automatic route to `done`
+///   for *any* card, so that shortcut cannot survive; a delegated card now stops
+///   in `in_review` like every other. Nothing is lost from the handoff itself —
+///   the delegate's answer is still relayed straight into the originating thread
+///   by [`relay_reply`], which is what that conversation was actually waiting
+///   on. What changes is that the card stays visible until a person accepts it,
+///   which is the point of the review stop.
+///
+/// [`column_for_settled_run`]: crate::ports::tasks::column_for_settled_run
+pub fn landing_column(end: TaskRunEnd) -> &'static str {
+    // A hand-off is explicitly NOT a settle: the delegate is running, so the
+    // card keeps the column it was dispatched in and only lands once they come
+    // back with something (issue #204). Handled here rather than in the mapping
+    // because `run_status_for(Delegated)` is `Paused` — right for the attempt
+    // row (it is waiting on something other than a person) and wrong for the
+    // board (the work has changed hands, not stopped).
+    if matches!(end, TaskRunEnd::Delegated) {
+        return COLUMN_IN_PROGRESS;
     }
+    // Every other ending settles, so the mapping always answers. The fallback
+    // is unreachable and exists only so this stays total without an `expect`.
+    crate::ports::tasks::column_for_settled_run(run_status_for(end)).unwrap_or(COLUMN_IN_PROGRESS)
 }
 
 /// The [`RunStatus`] a run ending this way settles into (issue #242).
@@ -362,114 +380,120 @@ mod test {
         c
     }
 
-    /// The mapping every break point in `run_task`'s steer loop now defers to.
+    /// The mapping every break point in `run_task`'s steer loop defers to.
     /// Pinned exhaustively so a new `TaskRunEnd` cannot be added without a
     /// deliberate decision about where its card lands.
+    ///
+    /// **Rewritten by issue #337** — it previously pinned `Completed →
+    /// in_review` *for a board card* while a delegated one went to `done`. The
+    /// landing no longer depends on the card at all.
     #[test]
     fn landing_column_is_the_single_authority_for_a_cards_fate() {
-        let board = card(COLUMN_IN_REVIEW, None);
+        assert_eq!(landing_column(TaskRunEnd::Completed), COLUMN_IN_REVIEW);
         assert_eq!(
-            landing_column(TaskRunEnd::Completed, &board),
+            landing_column(TaskRunEnd::RedirectsExhausted),
             COLUMN_IN_REVIEW
         );
-        assert_eq!(
-            landing_column(TaskRunEnd::RedirectsExhausted, &board),
-            COLUMN_IN_REVIEW
-        );
-        assert_eq!(landing_column(TaskRunEnd::Failed, &board), COLUMN_TODO);
-        assert_eq!(landing_column(TaskRunEnd::Cancelled, &board), COLUMN_TODO);
-        assert_eq!(landing_column(TaskRunEnd::Paused, &board), COLUMN_PAUSED);
-        assert_eq!(
-            landing_column(TaskRunEnd::Delegated, &board),
-            COLUMN_IN_PROGRESS
-        );
+        assert_eq!(landing_column(TaskRunEnd::Failed), COLUMN_TODO);
+        assert_eq!(landing_column(TaskRunEnd::Cancelled), COLUMN_TODO);
+        assert_eq!(landing_column(TaskRunEnd::Paused), COLUMN_PAUSED);
+        assert_eq!(landing_column(TaskRunEnd::Delegated), COLUMN_IN_PROGRESS);
     }
 
     /// Issue #204: handing the work off is not finishing it. A delegating turn
-    /// used to settle as `Completed`, which parked the card in its success
-    /// terminal under the *delegator* while the delegate had not even run — so
-    /// the hand-off keeps the card in progress instead, whatever its origin.
+    /// used to settle as `Completed`, which parked the card under the
+    /// *delegator* while the delegate had not even run — so the hand-off keeps
+    /// the card in progress instead.
+    ///
+    /// It is the one ending that does **not** go through
+    /// [`column_for_settled_run`], and this pins why: `run_status_for` calls a
+    /// hand-off `Paused`, which is right for the attempt row and would park the
+    /// card while its delegate is actively working.
     #[test]
     fn a_hand_off_keeps_the_card_in_progress_rather_than_finishing_it() {
-        for card in [
-            card(COLUMN_IN_PROGRESS, None),
-            delegated_card(COLUMN_IN_PROGRESS),
-        ] {
-            let landed = landing_column(TaskRunEnd::Delegated, &card);
-            assert_eq!(landed, COLUMN_IN_PROGRESS);
-            assert_ne!(
-                landed,
-                success_terminal_column(&card),
-                "a hand-off must never reach a terminal column — the delegate has not run yet"
-            );
-        }
+        assert_eq!(landing_column(TaskRunEnd::Delegated), COLUMN_IN_PROGRESS);
+        assert_eq!(run_status_for(TaskRunEnd::Delegated), RunStatus::Paused);
+        assert_ne!(
+            landing_column(TaskRunEnd::Delegated),
+            crate::ports::tasks::column_for_settled_run(RunStatus::Paused).unwrap(),
+            "a hand-off must not park the card its delegate is still working"
+        );
     }
 
-    /// #171 (PR #179): a delegated card completes to `done` instead of
-    /// stranding in `in_review` that nobody is watching. Both success
-    /// terminals — a clean finish and the redirect cap — must agree, or a
-    /// steered handoff still strands.
+    /// **The #337 edit, stated as a test.** A card carrying an
+    /// `origin_chat_id` — one spawned during an agent-to-agent handoff — used
+    /// to complete straight to `done` (#171 / PR #179). It now stops in
+    /// `in_review` like every other card, because the operator decision of
+    /// 2026-08-05 leaves no automatic route to `done` at all.
+    ///
+    /// Nothing about the handoff is lost: [`relay_reply`] still answers in the
+    /// thread the card came from. What changes is that the card stays visible
+    /// until a person accepts it.
     #[test]
-    fn a_delegated_card_completes_to_done_but_a_stopped_one_still_does_not() {
-        let delegated = delegated_card(COLUMN_IN_REVIEW);
+    fn a_delegated_card_now_stops_in_review_like_every_other_card() {
+        // Both success endings agree, or a steered handoff would diverge.
+        assert_eq!(landing_column(TaskRunEnd::Completed), COLUMN_IN_REVIEW);
         assert_eq!(
-            landing_column(TaskRunEnd::Completed, &delegated),
-            COLUMN_DONE
+            landing_column(TaskRunEnd::RedirectsExhausted),
+            COLUMN_IN_REVIEW
+        );
+        // A delegated card still relays its answer into the originating thread,
+        // which is what that conversation was waiting on.
+        let relayed = relay_reply(
+            &delegated_card(COLUMN_IN_REVIEW),
+            "maya",
+            "ceo",
+            "strategy".to_string(),
         );
         assert_eq!(
-            landing_column(TaskRunEnd::RedirectsExhausted, &delegated),
-            COLUMN_DONE
+            relayed.reply_to.as_ref().map(|r| r.chat_id.as_str()),
+            Some("strategy")
         );
+        assert!(
+            relayed.text.contains("is ready for review"),
+            "{}",
+            relayed.text
+        );
+    }
 
-        // A run that produced no result is not finished work, whatever the
-        // card's origin: it goes back or parks, never to the terminal column.
+    /// **Done is reached only by a person.** No ending, on any card, may write
+    /// the terminal column — the only route there is an approving review.
+    #[test]
+    fn no_run_ending_ever_writes_done() {
         for end in [
+            TaskRunEnd::Completed,
+            TaskRunEnd::RedirectsExhausted,
             TaskRunEnd::Failed,
             TaskRunEnd::Cancelled,
             TaskRunEnd::Paused,
+            TaskRunEnd::Delegated,
         ] {
             assert_ne!(
-                landing_column(end, &delegated),
+                landing_column(end),
                 COLUMN_DONE,
-                "an unfinished run must not reach the terminal column"
+                "{end:?} auto-advanced a card to Done"
             );
         }
     }
 
-    /// The success terminal is chosen by origin, not by outcome: a
-    /// board-created card keeps its `in_review` review gate.
-    #[test]
-    fn success_terminal_column_is_done_only_for_a_card_with_an_origin() {
-        assert_eq!(
-            success_terminal_column(&card(COLUMN_IN_REVIEW, None)),
-            COLUMN_IN_REVIEW
-        );
-        assert_eq!(
-            success_terminal_column(&delegated_card(COLUMN_IN_REVIEW)),
-            COLUMN_DONE
-        );
-    }
-
-    /// #186 part b: the orchestrator's review verdict finishes a board card.
-    /// This is #171's `in_review → done` write for the one card shape #179's
-    /// origin rule cannot reach — a card with no origin never completes to
-    /// `done` on its own, so without this it would sit in review forever.
+    /// #186 part b: the orchestrator's review verdict finishes a card. Since
+    /// #337 this is the **only** way any card reaches `done` — a person accepts
+    /// the result, or it stays in review.
     #[test]
     fn an_approving_review_finishes_the_card_and_revise_sends_it_back() {
         assert_eq!(review_landing_column(ReviewDecision::Approve), COLUMN_DONE);
         assert_eq!(review_landing_column(ReviewDecision::Revise), COLUMN_TODO);
     }
 
-    /// The two done-writes are disjoint: review only ever sees a card that
-    /// reached `in_review`, and #179's rule sends every card with an origin
-    /// straight to `done` instead. So no card is finished twice.
+    /// Every card that produces a result reaches the column review consumes —
+    /// including a delegated one, which #179 used to route around. So no
+    /// finished card is unreachable by a reviewer.
     #[test]
-    fn only_a_card_without_an_origin_can_reach_review() {
-        assert_ne!(
-            landing_column(TaskRunEnd::Completed, &delegated_card(COLUMN_IN_REVIEW)),
-            COLUMN_IN_REVIEW,
-            "a delegated card must never park in the column review consumes"
-        );
+    fn every_finished_card_reaches_the_column_review_consumes() {
+        assert_eq!(landing_column(TaskRunEnd::Completed), COLUMN_IN_REVIEW);
+        // The review verdict is defined on exactly that column, so the two
+        // halves of the lifecycle meet.
+        assert_eq!(review_landing_column(ReviewDecision::Approve), COLUMN_DONE);
     }
 
     #[test]
@@ -527,12 +551,13 @@ mod test {
         assert_eq!(run_status_for(TaskRunEnd::Paused), RunStatus::Paused);
         assert_eq!(run_status_for(TaskRunEnd::Delegated), RunStatus::Paused);
 
-        // The reason this cannot be derived from `landing_column`: two endings
-        // share a column and are emphatically not the same outcome.
-        let board = card(COLUMN_IN_REVIEW, None);
+        // The reason the status cannot be derived *from* the column, even now
+        // that the column is derived from the status: the arrow only points one
+        // way. Two endings share a column and are emphatically not the same
+        // outcome.
         assert_eq!(
-            landing_column(TaskRunEnd::Failed, &board),
-            landing_column(TaskRunEnd::Cancelled, &board)
+            landing_column(TaskRunEnd::Failed),
+            landing_column(TaskRunEnd::Cancelled)
         );
         assert_ne!(
             run_status_for(TaskRunEnd::Failed),
