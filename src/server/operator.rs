@@ -784,6 +784,7 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             deliveries,
             pending_approvals,
             error,
+            cancelled,
         } => {
             let mut o = envelope("workflow_run_finished");
             o["workflowId"] = json!(workflow_id);
@@ -797,6 +798,13 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             // "did this fail?" check is a presence check.
             if let Some(error) = error {
                 o["error"] = json!(error);
+            }
+            // Issue #383: same presence-check discipline. A run stopped by an
+            // operator carries no `error`, so without this frame the console
+            // could only render it as an ordinary clean finish — and the
+            // operator who just pressed Cancel would get "ran successfully".
+            if *cancelled {
+                o["cancelled"] = json!(true);
             }
             o
         }
@@ -1635,6 +1643,7 @@ mod test {
             .unwrap();
 
         let deps = HarnessDeps {
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             provider: Arc::new(MockProvider::new("mock: ")),
             provider_slug: "mock".to_string(),
             context: Arc::new(FsContextStore::new(home.to_path_buf())),
@@ -3543,6 +3552,7 @@ mod test {
             ],
             pending_approvals: vec!["review".into()],
             error: None,
+            cancelled: false,
         }))
         .expect("workflow_run_finished is an attention signal");
         assert_eq!(v["type"], "workflow_run_finished");
@@ -3584,6 +3594,7 @@ mod test {
             deliveries: Vec::new(),
             pending_approvals: Vec::new(),
             error: Some("no inference source for agent node `worker`".into()),
+            cancelled: false,
         }))
         .expect("workflow_run_finished is an attention signal");
         assert_eq!(v["error"], "no inference source for agent node `worker`");
@@ -3659,6 +3670,7 @@ mod test {
             deliveries: Vec::new(),
             pending_approvals: Vec::new(),
             error: None,
+            cancelled: false,
         }))
         .expect("projected");
         assert_eq!(with_id["runId"], "run-9");
@@ -3670,6 +3682,7 @@ mod test {
             deliveries: Vec::new(),
             pending_approvals: Vec::new(),
             error: None,
+            cancelled: false,
         }))
         .expect("projected");
         assert!(legacy.get("runId").is_none(), "{legacy}");

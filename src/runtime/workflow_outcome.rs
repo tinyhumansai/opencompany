@@ -31,6 +31,13 @@
 //! mints and hands to [`record_run_finished`]. That correlation is what lets the
 //! read side group a run's nodes with its outcome — and it is why a start with
 //! no finish is meaningful, which [`sweep_interrupted_runs`] settles at boot.
+//!
+//! **Issue #383** added a third terminal reading. A run can now be *stopped by
+//! an operator*, which is neither a failure nor a host restart, so it lands as
+//! `cancelled: true` with **no error at all** rather than as an error string. A
+//! cancelled run journals a real finish through this same helper, which is what
+//! keeps [`sweep_interrupted_runs`] out of it: there is nothing left open to
+//! sweep.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,11 +82,25 @@ pub async fn record_run_finished(
     run_id: &str,
     outcome: Result<&WorkflowRun, &str>,
 ) {
-    let (deliveries, pending_approvals, error): (Vec<DeliveryReport>, Vec<String>, Option<String>) =
-        match outcome {
-            Ok(run) => (run.deliveries.clone(), run.pending_approvals.clone(), None),
-            Err(err) => (Vec::new(), Vec::new(), Some(err.to_string())),
-        };
+    // Issue #383: `cancelled` rides the Ok arm only, and that is not an
+    // oversight. A run the runner never returned from cannot have been stopped
+    // by an operator — the stop signal resolves *into* an `Ok(cancelled)`, never
+    // into an `Err` — so the error arm is unambiguously a failure or the boot
+    // sweep's synthetic one.
+    let (deliveries, pending_approvals, error, cancelled): (
+        Vec<DeliveryReport>,
+        Vec<String>,
+        Option<String>,
+        bool,
+    ) = match outcome {
+        Ok(run) => (
+            run.deliveries.clone(),
+            run.pending_approvals.clone(),
+            None,
+            run.cancelled,
+        ),
+        Err(err) => (Vec::new(), Vec::new(), Some(err.to_string()), false),
+    };
 
     let event = CompanyEvent::WorkflowRunFinished {
         workflow_id: workflow_id.to_string(),
@@ -91,6 +112,7 @@ pub async fn record_run_finished(
         deliveries,
         pending_approvals,
         error,
+        cancelled,
     };
 
     if let Err(err) = events.append(company, event).await {
@@ -237,6 +259,7 @@ mod test {
             output: Value::Null,
             pending_approvals: pending,
             deliveries,
+            cancelled: false,
         }
     }
 
@@ -466,6 +489,7 @@ mod test {
                     deliveries: Vec::new(),
                     pending_approvals: Vec::new(),
                     error: None,
+                    cancelled: false,
                 },
             )
             .await
