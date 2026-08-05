@@ -90,6 +90,39 @@ break the byte-identical round-trip, so the claim is incomplete but never wrong.
 Both `chat/history` surfaces (REST and GraphQL) project it from the shared
 `MessageView`, so the chip survives a transcript reload on either.
 
+### Threads and reactions (issue #364)
+
+A transcript survived a reload; the structure *on* it did not.
+
+**A thread is a parent id, not an object.** `OperatorMessage` and `AgentReply`
+each gain `parent: Option<EventSeq>` — the position of the message replied to. A
+thread object would need a lifecycle, a membership, and a second addressing
+scheme beside `chat`, for zero rendering benefit: the console already folds a
+transcript by parent, so a thread *is* "the messages pointing at this one". The
+answer to a threaded question takes the **same parent as the question** — both
+halves belong under the row the thread hangs off, and pointing the answer at the
+question would nest a thread inside a thread.
+
+**A reaction is a per-person row, event-sourced.** `ReactionToggled
+{ message_seq, emoji, on, by }`. A count answers neither question the console
+asks — *who* reacted, and *have I* — and a mutable tally cannot live on an
+append-only log. Reads fold the last event per `(message, actor, emoji)`; a row
+that ends `off` is dropped, not kept as a zero. `on` is explicit, which is what
+makes the route idempotent under a retry or two consoles racing.
+
+`OutboundMessage` gains `message_id`, stamped by the chat route **after**
+journaling — a brain emits an answer, it does not know where it will land in the
+log. It is the enabler for both: before it, a sent bubble had only a
+browser-minted counter, so anything durable naming it named nothing.
+
+All three are additive on the terms above, and **nothing is migrated or
+backfilled**: a pre-#364 message loads unparented, which is the truth about it.
+`ReactionToggled` is **deliberately not projected** onto `/events` — the frame
+would have to carry the reacting person and that stream has no per-viewer
+projection to resolve an actor into a label. Pinned by a test rather than left
+to the deny-by-default fall-through, so a later decision to stream reactions is
+made out loud.
+
 ### Per-task approval correlation (issue #333)
 
 `ApprovalResolved` carries an id, a verdict and an actor — never a task — so

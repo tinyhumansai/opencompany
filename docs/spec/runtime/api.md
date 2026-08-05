@@ -19,6 +19,9 @@ POST   /api/v1/companies                       boot from an uploaded manifest (p
 GET    /api/v1/companies/{id}                  status: charter, roster, budget burn,
                                                lifecycle state, tiny.place state
 POST   /api/v1/companies/{id}/chat             operator message → event; SSE reply stream
+GET    /api/v1/companies/{id}/chat/history     one desk's transcript (?desk=<thread>)
+POST   /api/v1/companies/{id}/chat/messages/{seq}/reactions
+                                               { "emoji": "👍", "on": true } → 204
 GET    /api/v1/companies/{id}/events?since=SEQ SSE stream of events/effects (work feed)
 GET    /api/v1/companies/{id}/approvals        pending approvals
 POST   /api/v1/companies/{id}/approvals/{aid}  { "verdict": "approve"|"deny", "note": "…",
@@ -277,6 +280,29 @@ scope; SSE (`/chat` streaming, the `/events` work feed) is not yet wired.
      catch-all applies only when General is the desk being *read*. So an
      addressed thread is isolated from the team's chat in both directions.
   3. `GET /chat/history?desk=<thread>` therefore replays exactly that thread.
+
+- **A message has a durable id, and things can refer to it (issue #364).**
+  `POST /chat` answers with `messageId` — the sequence position the operator's
+  own message was journaled under — and stamps the same on each reply bubble.
+  Two things name a message by that id:
+
+  - The `parent` field on the `/chat` body makes the send a **thread reply**.
+    It is journaled onto both the `OperatorMessage` and the replies it draws,
+    so the whole exchange comes back under the same row on the next read. A
+    `parent` that is not a message id is a `400`, never a silently-flattened
+    thread — a reply that quietly lands in the channel reads as a lost reply.
+  - `POST /chat/messages/{seq}/reactions` sets or clears **one person's** one
+    reaction. `on` is explicit rather than a toggle, which is what makes a
+    retry or a double tap idempotent. The target must be a chat message —
+    anything else is a `404`, so the log can never hold a reaction no reader
+    could render — and the emoji is bounded and refused if it carries control
+    characters. Authorized through the same gate a send passes: reacting is
+    writing into a transcript, so it can be neither easier nor harder than
+    saying something in it.
+
+  Both project through the shared `MessageView`, so REST and GraphQL cannot
+  disagree about the shape of a thread or who reacted. Reactions are
+  deliberately absent from the `/events` stream — see [events.md](events.md).
 
   The copilot addresses `workflow-copilot:<workflowId>` (a `:` cannot occur in
   a manifest desk id, so it can never collide with a real desk, and it does not
