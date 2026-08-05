@@ -58,6 +58,12 @@ pub mod provider;
 /// scan that detects unpublished work, and the follow-up nudge's prompt. See
 /// [`publish`].
 pub mod publish;
+/// End-to-end proof that #244's `publish_artifact` is reachable from a real
+/// dispatch, that a re-run extends by identity, and — the part nothing shorter
+/// than a real turn loop can show — that the follow-up nudge fires **once**,
+/// records a decline, and can never fail the run it follows. Test-only.
+#[cfg(test)]
+mod publish_turn_test;
 pub mod run_trace;
 pub mod run_turn;
 pub mod search;
