@@ -113,9 +113,35 @@ the `Console` job of `.github/workflows/ci.yml`.
 `typecheck` covers `src/` and nothing else — `tsconfig.app.json` is
 `include: ["src"]`. The end-to-end suite is a separate TypeScript project
 ([`tsconfig.e2e.json`](tsconfig.e2e.json)) with its own script, so a broken spec
-fails on its own rather than blocking `npm run build`. Type-checking the specs
-is not the same as running them — `npm run e2e` drives a live host and stays out
-of CI, so `typecheck:e2e` is all the automated coverage `test/e2e/` gets.
+fails on its own rather than blocking `npm run build`.
+
+## End-to-end suite
+
+```sh
+cargo build --locked --bin opencompany   # once, from the repository root
+npm run e2e                              # boots a host, signs in, runs test/e2e/
+npm run e2e -- workflow-edit-delete.spec.ts   # one file
+npm run e2e:headed                       # watch it drive the browser
+```
+
+The specs drive a **real** host — the Rust binary serving this app's `dist/` —
+so one has to exist. With `PW_BASE_URL` unset,
+[`playwright.config.ts`](playwright.config.ts) starts one itself through
+[`test/e2e/host.sh`](test/e2e/host.sh): the `e2e_harness` company, a freshly
+built console bundle, and an isolated data root under `../target/e2e/`, wiped
+each run. It does not build the binary — that is minutes of silence, and a test
+harness that looks like it has hung is worse than one that tells you what to
+run.
+
+Set `PW_BASE_URL` to drive a host you brought up yourself and the config stays
+out of the way entirely: no `webServer`, and `PW_STORAGE_STATE` decides whether
+the suite signs in.
+
+**CI type-checks these specs and runs none of them** (`typecheck:e2e` is all the
+automated coverage `test/e2e/` gets). Type-checking proves a spec compiles, not
+that it holds: `workflow-edit-delete.spec.ts` spent months red against a fixture
+that was never committed, and nothing reported it. Run the suite before touching
+a view it covers.
 
 The `dist/` can be served as static files by any web server (or mounted by the
 OpenCompany host); use `window.OPENCOMPANY_CONFIG` to point it at the API.
