@@ -220,6 +220,22 @@ pub struct StandingGrant {
     /// a duration: an absolute deadline survives a restart without arithmetic,
     /// and a required field cannot be omitted into immortality.
     pub expires_at_millis: u64,
+    /// The chat thread the approval was raised in (issue #379), carried for the
+    /// same reason [`GrantedCall::origin_thread`] is: so the re-dispatched
+    /// turn's reply is journaled back into the conversation that asked for it.
+    ///
+    /// **Routing only, never part of the match** — matching is `(agent, tool,
+    /// unexpired)` and nothing else. A desk channel and a direct message to that
+    /// channel's lead are answered by the same teammate, so without this the
+    /// continuation of a channel's request would land in the lead's private
+    /// line: the operator approves in one place and the work resumes in another
+    /// they are not looking at.
+    ///
+    /// `None` for an approval with no conversation behind it, and on a grant
+    /// replayed from a line written before this field existed. Both fall back to
+    /// [`agent`](Self::agent), which is right for a DM.
+    #[serde(default)]
+    pub origin_thread: Option<String>,
 }
 
 impl StandingGrant {
@@ -628,6 +644,7 @@ mod test {
             approval_id: ApprovalId::new(format!("approval-{id}")),
             at_millis: 1_000,
             expires_at_millis,
+            origin_thread: None,
         }
     }
 

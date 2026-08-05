@@ -2004,6 +2004,7 @@ mod test {
             approval_id: ApprovalId::new(format!("appr-{id}")),
             at_millis: 1_000,
             expires_at_millis,
+            origin_thread: None,
         }
     }
 

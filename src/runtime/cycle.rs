@@ -711,6 +711,10 @@ working on):\n{}\n]",
             approval_id: id.clone(),
             at_millis: now_millis(),
             expires_at_millis,
+            // Issue #379: where the operator asked, so the re-dispatched turn's
+            // reply lands back in that conversation. Read off the retained
+            // origin, exactly as `mint_grant` does.
+            origin_thread: self.rt.journal.approval_thread(id).flatten(),
         };
         self.rt.journal.record_standing_granted(&grant).await?;
         tracing::debug!(
