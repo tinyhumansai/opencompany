@@ -12,6 +12,7 @@ import {
   useMemo,
   useState,
   type ReactElement,
+  type ReactNode,
 } from "react";
 import {
   AlertCircle,
@@ -69,7 +70,11 @@ import {
   type RunStatus,
   type RunSummary,
 } from "@/api/runs";
-import { ApiError } from "@/api/types";
+import {
+  AWAITING_APPROVAL_LABEL,
+  ApiError,
+  STEP_FAILURE_LABEL,
+} from "@/api/types";
 import type { OpenCompanyClient } from "@/api/client";
 import {
   AlertDialog,
@@ -1058,6 +1063,10 @@ const KIND_ICON: Record<TimelineKind, ReactElement> = {
 function rowIcon(kind: TimelineKind, status?: StepStatus): ReactElement {
   if (status === "running")
     return <Loader2 className="size-3.5 animate-spin" />;
+  // A parked step is waiting on a person, not broken — it takes the hourglass
+  // the waiting band already uses, never the failure icon (#411).
+  if (status === "awaiting_approval")
+    return <Hourglass className="size-3.5" />;
   if (status === "error") return <AlertCircle className="size-3.5" />;
   return KIND_ICON[kind];
 }
@@ -1065,6 +1074,8 @@ function rowIcon(kind: TimelineKind, status?: StepStatus): ReactElement {
 function kindTone(kind: TimelineKind, status?: StepStatus): string {
   // Outcome first, for the same reason `rowIcon` reads it first.
   if (status === "running") return "text-sky-600 dark:text-sky-400";
+  if (status === "awaiting_approval")
+    return "text-amber-600 dark:text-amber-400";
   if (status === "error") return "text-rose-600 dark:text-rose-400";
   switch (kind) {
     case "completed":
@@ -1157,9 +1168,72 @@ function WaitingBand({ millis, live }: { millis: number; live: boolean }) {
   );
 }
 
+/**
+ * A step's expanded body: **what it was doing** above **what came back** (#411).
+ *
+ * Labelled, because the two used to be one anonymous string and an operator had
+ * no way to tell an argument from an answer. `detail` on a journal entry has no
+ * second half, so it renders alone exactly as it did before.
+ */
+function StepBody({ entry }: { entry: TimelineEntry }) {
+  return (
+    <div className="space-y-1">
+      {entry.detail && (
+        <div>
+          {entry.result && (
+            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+              Called with
+            </div>
+          )}
+          <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">
+            {entry.detail}
+          </pre>
+        </div>
+      )}
+      {entry.result && (
+        <div>
+          {entry.detail && (
+            <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+              Result
+            </div>
+          )}
+          <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">
+            {entry.result}
+            {entry.truncated && " (cut short)"}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A small state chip on a timeline row. Mirrors the chat timeline's. */
+function StepStateChip({
+  tone,
+  children,
+}: {
+  tone: "amber" | "rose";
+  children: ReactNode;
+}) {
+  return (
+    <span
+      className={cn(
+        "shrink-0 rounded px-1 py-px text-[10px] font-medium",
+        tone === "amber"
+          ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+          : "bg-rose-500/15 text-rose-700 dark:text-rose-400",
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
 function TimelineRow({ group }: { group: TimelineGroup }) {
   const [open, setOpen] = useState(false);
-  const details = group.entries.filter((e) => e.detail);
+  // A step that only reports what came back is still worth expanding — "how far
+  // did it get" lives in `result`, not just in `detail` (#411).
+  const details = group.entries.filter((e) => e.detail || e.result);
   const expandable = details.length > 0 || group.count > 1;
   const first = group.entries[0];
 
@@ -1179,18 +1253,41 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
         <span className="min-w-0 flex-1 truncate font-medium">
           {group.label}
         </span>
+        {/* The typed state a step reached, by lookup rather than by reading its
+            prose (#411). Only on a single row — a ×N group's entries can differ
+            and one chip would have to speak for all of them. */}
+        {group.count === 1 && first.status === "awaiting_approval" && (
+          <StepStateChip tone="amber">{AWAITING_APPROVAL_LABEL}</StepStateChip>
+        )}
+        {group.count === 1 && first.failure && (
+          <StepStateChip tone="rose">
+            {STEP_FAILURE_LABEL[first.failure]}
+          </StepStateChip>
+        )}
+        {group.count === 1 && first.truncated && (
+          <StepStateChip tone="amber">Result cut</StepStateChip>
+        )}
         {group.count > 1 && (
           <Badge variant="outline" className="shrink-0 font-normal">
             ×{group.count}
           </Badge>
         )}
-        {/* A run step's own duration (#242); journal entries carry none. */}
-        {group.count === 1 && first.elapsedMs !== undefined && (
-          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-            {first.elapsedMs < 1000
-              ? `${first.elapsedMs}ms`
-              : formatDuration(first.elapsedMs)}
+        {/* A run step's own duration (#242); journal entries carry none. A
+            gated call never ran, so its 0ms is the absence of a measurement
+            rather than a fast one (#411). */}
+        {group.count === 1 && first.status === "awaiting_approval" ? (
+          <span className="shrink-0 text-[11px] text-muted-foreground">
+            didn't run
           </span>
+        ) : (
+          group.count === 1 &&
+          first.elapsedMs !== undefined && (
+            <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+              {first.elapsedMs < 1000
+                ? `${first.elapsedMs}ms`
+                : formatDuration(first.elapsedMs)}
+            </span>
+          )
         )}
         <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
           {timeOf(first.atMillis)}
@@ -1210,21 +1307,10 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
                   <div className="mb-0.5 text-muted-foreground">
                     {timeOf(e.atMillis)}
                   </div>
-                  {e.detail && (
-                    <pre className="whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">
-                      {e.detail}
-                    </pre>
-                  )}
+                  <StepBody entry={e} />
                 </div>
               ))
-            : details.map((e) => (
-                <pre
-                  key={e.seq}
-                  className="whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground"
-                >
-                  {e.detail}
-                </pre>
-              ))}
+            : details.map((e) => <StepBody key={e.seq} entry={e} />)}
         </div>
       )}
     </li>
