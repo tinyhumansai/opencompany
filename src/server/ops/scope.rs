@@ -9,6 +9,16 @@
 //! - `…/companies/{id}` → [`CompanyAuth`] + `authorize_address`
 //!   (a tenant token may only address a company it owns).
 //! - `…/company` → [`OperatorAuth`] + [`CompanyRegistry::sole`].
+//!
+//! ## Addressing is not authority
+//!
+//! [`ScopedCompany`] answers "may this principal talk to this company at all",
+//! and nothing more. It is the right guard for the many writes this product
+//! deliberately leaves open to **any** member — sending a chat message, opening
+//! a task, adding a teammate. It is the wrong guard, on its own, for a write
+//! that decides something *on behalf of* the company. For those,
+//! [`AdminScopedCompany`] puts the role check in the handler's signature rather
+//! than leaving it to a call the handler has to remember to make (issue #403).
 
 use std::sync::Arc;
 
@@ -23,8 +33,9 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::{Actor, ActorKind, CompanyId};
 use crate::server::error::ApiError;
-use crate::server::graphql::auth::GqlAuth;
+use crate::server::graphql::auth::{GqlAuth, UserPrincipal};
 use crate::server::platform_auth::{CompanyAuth, authorize_address, refuse_until_password_changed};
+use crate::server::users::admin::require_admin;
 
 /// Registers `mr` under both the `{id}` platform form and the single-company
 /// alias. `suffix` is the path after the scope prefix (e.g. `"/tasks"` or
@@ -112,5 +123,56 @@ impl FromRequestParts<AppState> for ScopedCompany {
             GqlAuth::Platform(_) => None,
         };
         Ok(ScopedCompany { runtime, actor })
+    }
+}
+
+/// The company a write targets, resolved exactly as [`ScopedCompany`] does and
+/// then narrowed to a principal who **administers** that company (issue #403).
+///
+/// Use this for a write that settles something on the company's behalf — what
+/// credential its agents present, which third-party account they act through —
+/// as opposed to a write a member makes for themselves. Stating the requirement
+/// in the extractor is the point: a route declares its authority in its
+/// signature, so the guard cannot be lost by editing a handler body, and a new
+/// route cannot acquire this class of gap by simply forgetting a call.
+///
+/// It composes with [`require_admin`] rather than restating it, so "who may
+/// administer this company" stays decided in exactly one place. Note what that
+/// inherits: [`require_admin`] resolves through a **human** session only, so a
+/// machine credential (the platform scope) is refused here as unauthenticated.
+/// That is deliberate — this extractor's whole purpose is to name the person
+/// accountable for the change, and a token names nobody.
+pub(crate) struct AdminScopedCompany {
+    /// The resolved runtime for the addressed company.
+    pub(crate) runtime: Arc<CompanyRuntime>,
+    /// The admin behind the request. Always a real person — see the type docs.
+    pub(crate) admin: UserPrincipal,
+}
+
+impl AdminScopedCompany {
+    /// The addressed company's id.
+    pub(crate) fn id(&self) -> &CompanyId {
+        self.runtime.id()
+    }
+
+    /// The admin as a journal [`Actor`], for attributing the write they made.
+    pub(crate) fn actor(&self) -> Actor {
+        Actor {
+            kind: ActorKind::User,
+            id: self.admin.user_id.clone(),
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for AdminScopedCompany {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let ScopedCompany { runtime, .. } = ScopedCompany::from_request_parts(parts, state).await?;
+        let admin = require_admin(&parts.headers, state, &runtime).await?;
+        Ok(AdminScopedCompany { runtime, admin })
     }
 }

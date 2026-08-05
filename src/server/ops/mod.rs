@@ -44,7 +44,7 @@ pub mod workspace;
 #[cfg(feature = "oauth")]
 pub mod connections;
 
-pub(crate) use scope::{ScopedCompany, scoped};
+pub(crate) use scope::{AdminScopedCompany, ScopedCompany, scoped};
 
 #[cfg(test)]
 mod test;
