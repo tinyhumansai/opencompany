@@ -62,9 +62,10 @@
 //!   forever. The issue forbids silent accumulation, and a type that cannot
 //!   express "no expiry" cannot regress into it.
 //!
-//! What it never covers is decided elsewhere, once: `broadly_grantable` in
-//! `crate::harness::policy` delegates to the existing consequence taxonomy, so
-//! only `EffectGroup::Other` tools can be granted this way — never Spend, Send,
+//! What it never covers is decided elsewhere, once:
+//! [`EffectGroup::is_broadly_grantable`](crate::ports::types::EffectGroup::is_broadly_grantable)
+//! applied to the group already recorded on the parked effect, so only
+//! `EffectGroup::Other` tools can be granted this way — never Spend, Send,
 //! Sign, Publish, Hire or Identity.
 //!
 //! ## Durability

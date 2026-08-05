@@ -931,31 +931,20 @@ fn top_level_keys(args: &serde_json::Value) -> Vec<&str> {
     }
 }
 
-/// May this tool be granted **broadly** — one standing permission covering any
-/// arguments until a deadline (issue #374)?
-///
-/// One predicate, delegating to [`classify_group`], because a second hand-kept
-/// list of "safe tools" is precisely the drift the issue forbids: it would be
-/// written once, and then every new tool would default into it by omission.
-/// Instead the answer falls out of the consequence taxonomy the codebase
-/// already maintains — anything the classifier calls Spend, Send, Sign,
-/// Publish, Hire or Identity stays a per-call decision, forever, without anyone
-/// remembering to add it here.
-///
-/// **The console hiding the control is UX; this is the enforcement.** It is
-/// checked host-side at mint time, so a hand-rolled request for a standing
-/// grant on `composio_execute` is a 400 rather than a permission.
-///
-/// A known and deliberate consequence: `shell` classifies as `Other` and is
-/// therefore grantable. Narrowing it belongs in [`classify_group`] — giving
-/// shell a consequence class — not in a second ad-hoc exclusion list here. It
-/// is operator opt-in, time-boxed, revocable, and both the `never_do` slot and
-/// the `readonly` brake outrank it.
-pub(crate) fn broadly_grantable(tool_name: &str) -> bool {
-    classify_group(tool_name).is_broadly_grantable()
-}
-
 /// Map a tool name onto the supervised [`EffectGroup`] taxonomy.
+///
+/// Since issue #374 this classification decides one more thing: whether a tool
+/// can be given a **standing** grant. The rule is
+/// [`EffectGroup::is_broadly_grantable`] — only the catch-all `Other` — and it
+/// is applied to the group recorded on the *parked effect*, which is the value
+/// this function produced at projection time. So there is one classifier and
+/// one rule, and the operator is checked against the same classification their
+/// card was showing.
+///
+/// That also means a tool landing in `Other` by omission now grants more than
+/// it used to. The `deploy` and `filing` arms below exist because of exactly
+/// that; a misclassification *toward* a consequence group is the safe
+/// direction, and the tests pin both.
 fn classify_group(tool_name: &str) -> EffectGroup {
     let name = tool_name.to_ascii_lowercase();
     if name == "mcp_registry_tool_call" {
@@ -2528,7 +2517,7 @@ mod tests {
     /// What may be granted broadly is exactly `EffectGroup::Other`, derived —
     /// never listed. A second hand-kept list is the drift the issue forbids.
     #[test]
-    fn broadly_grantable_is_exactly_the_other_group() {
+    fn what_may_be_granted_broadly_is_exactly_the_other_group() {
         for tool in [
             "workspace_write",
             "workspace_read",
@@ -2537,7 +2526,7 @@ mod tests {
             "web_fetch",
         ] {
             assert!(
-                broadly_grantable(tool),
+                classify_group(tool).is_broadly_grantable(),
                 "{tool} classifies as Other and is grantable"
             );
         }
@@ -2547,7 +2536,7 @@ mod tests {
         // misclassified tool loses the broader scope and keeps asking, rather
         // than gaining a scope it should not have. Pinned so the asymmetry is
         // deliberate rather than discovered.
-        assert!(!broadly_grantable("read_file"));
+        assert!(!classify_group("read_file").is_broadly_grantable());
         for tool in [
             "composio_execute",
             "composio_authorize",
@@ -2563,7 +2552,7 @@ mod tests {
             "deploy_site",
         ] {
             assert!(
-                !broadly_grantable(tool),
+                !classify_group(tool).is_broadly_grantable(),
                 "{tool} carries a consequence group and must stay a per-call decision"
             );
         }
