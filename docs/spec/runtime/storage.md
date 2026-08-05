@@ -55,6 +55,7 @@ locations instead of ad-hoc paths:
   files/       ← instance-shared files (exports, attachments)
   logs/        ← instance logs
   tmp/         ← ephemeral scratch, cleared on startup by default
+  harness/     ← agent + workflow sandboxes (see below; minted on demand)
 ```
 
 Per-company state (each bundle's own `memory/`/`context/`) lives under
@@ -64,6 +65,39 @@ the shared subdirectories and — unless `[workspace].clear_tmp_on_startup` is
 `false` — empties `tmp/` so no stale scratch survives a restart. Because the hosting model runs **one container per tenant** with its
 own `OPENCOMPANY_DATA_DIR`, this root *is* the per-tenant workspace — no separate
 per-tenant path prefix is needed.
+
+### Agent sandboxes (`<home>/harness`)
+
+The tree an agent's file tools actually act in hangs off the **home**, not off a
+bundle, and is deliberately **not** pre-created by `DataLayout::ensure` — the
+same rule `companies/` follows: whoever owns a subtree mints it on demand.
+
+```text
+<home>/harness/<company>/
+  <agent>/workspace/                      ← one agent's sandbox
+  <agent>/skill-catalog/                  ← its materialized skill bundles
+  _workflow/<workflow>/<run>/workspace/   ← one workflow run's sandbox
+```
+
+An agent's sandbox is named by `harness::build::agent_workspace` and created by
+`harness::build::ensure_agent_workspace`; a workflow run's is named and created
+by `workflows::caps`. It must exist **before** the agent acts, not merely by the
+time it finishes. OpenHuman's `validate_parent_path` resolves a relative write
+against the sandbox, then walks up to the deepest *existing* ancestor to
+canonicalize it; with the sandbox absent that walk climbs past it and lands
+outside, so the write is refused as `Resolved parent path escapes workspace` for
+a path that is plainly inside. The runtime writes its own bookkeeping there
+(session transcripts, the TinyAgents journal), creating the directory as a side
+effect — but only at the *end* of a turn, so it never helps the turn that needed
+it. An agent holding `shell` never saw this: its first command creates the
+directory before anything validates a path (issue #409).
+
+Hence two creation points, not one. `build_agent` mints the sandbox before any
+`SecurityPolicy` is constructed over it; the dispatch path re-ensures it every
+turn. The second is not redundant — a roster is built once, cached behind
+fingerprints and handed across an in-place rebuild, so a sandbox removed under a
+live host (a restored data dir, a boot that raced an unmounted volume) would
+otherwise stay missing for the life of the process.
 
 ### Choosing the root (`src/store/paths.rs`)
 
