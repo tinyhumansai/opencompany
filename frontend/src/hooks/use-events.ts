@@ -36,6 +36,27 @@ export type CompanyStreamEvent =
       status: string;
       message: string;
     }
+  // A request just parked (issue #379), so a console watching the conversation
+  // it came from can raise the card live instead of waiting for its next
+  // approvals poll.
+  //
+  // Deliberately thin, and mirrored from the host: an id, the effect's dotted
+  // kind, and the chat thread it was raised in. There is **no payload and no
+  // asker** here on purpose — the effect's arguments are redacted in exactly one
+  // place (`GET …/approvals`), so the console reacts to this frame by refreshing
+  // that feed and renders the card from the redacted summary.
+  //
+  // `chatId` is absent when no conversation produced the approval (a workflow
+  // delivery, a scheduler tick, anything parked before #379). Such an approval
+  // matches no channel and stays on the Approvals page, exactly as before.
+  | {
+      type: "approval_parked";
+      seq: number;
+      atMillis: number;
+      approvalId: string;
+      kind: string;
+      chatId?: string;
+    }
   | { type: "approval_resolved"; seq: number; atMillis: number; approvalId: string; verdict: string }
   | { type: "lifecycle_changed"; seq: number; atMillis: number; from: string; to: string }
   | { type: "payment_received"; seq: number; atMillis: number; amountUsd: number; memo: string }
@@ -156,6 +177,18 @@ interface Options {
    * new outcome exists.
    */
   onWorkflowRunEvent?: (event: CompanyStreamEvent) => void;
+  /**
+   * Called for each approval-lifecycle frame (`approval_parked`,
+   * `approval_resolved`) so the shell can refresh the approvals feed live
+   * (issue #379).
+   *
+   * Both directions matter and for opposite reasons. A **park** is what puts a
+   * card into the conversation as it happens — the whole point of the issue.
+   * A **resolution** is what settles a card decided from the *other* surface:
+   * approve on the Approvals page and the inline copy has to stop offering
+   * buttons for a decision that is already made.
+   */
+  onApprovalEvent?: (event: CompanyStreamEvent) => void;
 }
 
 /**
@@ -176,6 +209,7 @@ export function useEvents(
     onTaskEvent,
     onTurnEvent,
     onWorkflowRunEvent,
+    onApprovalEvent,
   }: Options,
 ): void {
   // Keep the latest callbacks without re-opening the stream when they change.
@@ -195,6 +229,10 @@ export function useEvents(
   useEffect(() => {
     onWorkflowRunEventRef.current = onWorkflowRunEvent;
   }, [onWorkflowRunEvent]);
+  const onApprovalEventRef = useRef(onApprovalEvent);
+  useEffect(() => {
+    onApprovalEventRef.current = onApprovalEvent;
+  }, [onApprovalEvent]);
 
   // The rising-edge detector for pending approvals. Seeded with the current
   // value so we only toast on an *increase* observed while mounted, never on the
@@ -247,6 +285,7 @@ export function useEvents(
         onTaskEventRef.current,
         onTurnEventRef.current,
         onWorkflowRunEventRef.current,
+        onApprovalEventRef.current,
       );
     };
 
@@ -276,6 +315,7 @@ function handleEvent(
   onTaskEvent?: (e: CompanyStreamEvent) => void,
   onTurnEvent?: (e: CompanyStreamEvent) => void,
   onWorkflowRunEvent?: (e: CompanyStreamEvent) => void,
+  onApprovalEvent?: (e: CompanyStreamEvent) => void,
 ): void {
   switch (event.type) {
     // Live turn frames drive the in-flight tool timeline — no toast, they render
@@ -313,7 +353,17 @@ function handleEvent(
         taskId: event.taskId,
       });
       break;
+    // Issue #379. No toast: the rising-edge "needs a sign-off" toast off the
+    // poll already covers the attention half, and the card appearing in the
+    // channel IS the notification. Two of them for one request would be the
+    // noise this issue exists to remove.
+    case "approval_parked":
+      onApprovalEvent?.(event);
+      break;
     case "approval_resolved":
+      // Refresh first, then say so. The refresh is what settles an inline card
+      // whose decision was made on the Approvals page (or in another tab).
+      onApprovalEvent?.(event);
       toast(event.verdict === "approve" ? "Approval granted" : "Approval denied", {
         description: "An approval was just resolved.",
       });
