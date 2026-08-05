@@ -159,11 +159,7 @@ pub fn build_agent(
         deps.context.clone(),
     ));
 
-    let workspace = deps
-        .workspace_root
-        .join(company.as_ref())
-        .join(&manifest_agent.id)
-        .join("workspace");
+    let workspace = agent_workspace(&deps.workspace_root, company, &manifest_agent.id);
 
     // Intrinsic memory tools: every agent can deliberately store and recall over
     // its own company memory, complementing the automatic retrieve→inject→store
@@ -597,6 +593,17 @@ pub(crate) fn grants_cover(grants: &[String], namespace: &str) -> bool {
     grants.iter().any(|grant| {
         grant == "*" || grant == namespace || grant.starts_with(&format!("{namespace}."))
     })
+}
+
+/// One agent's sandbox directory: `{root}/{company}/{agent}/workspace`.
+///
+/// A named function rather than a repeated `join` chain because two callers now
+/// need to agree on it exactly: [`build_agent`], which sandboxes the file tools
+/// to it, and the brain's #244 unpublished-file scan, which snapshots it. A
+/// second transcription of the layout would make the scan silently look at the
+/// wrong directory — reporting nothing, forever, with no error anywhere.
+pub fn agent_workspace(root: &Path, company: &CompanyId, agent_id: &str) -> PathBuf {
+    root.join(company.as_ref()).join(agent_id).join("workspace")
 }
 
 /// A [`SecurityPolicy`] that sandboxes an agent's file tools to `workspace` and
