@@ -91,6 +91,18 @@ export interface ArtifactView {
   /** Epoch-millis of the newest revision. */
   updatedAtMillis: number;
   /**
+   * The workspace-relative path the agent published this from (#244), e.g.
+   * `specs/launch.md`. Together with the task id it is the artifact's identity:
+   * republishing the same path adds a version rather than a second record.
+   *
+   * Absent means **legacy**. Before #244 a completed dispatch captured its chat
+   * reply as an artifact — including refusals and blocker messages — so a
+   * record with no source is that capture, not a deliverable somebody produced.
+   * Those records are kept and labelled rather than deleted; see
+   * {@link ArtifactRow}.
+   */
+  source?: string;
+  /**
    * The last-agent-version → last-operator-version diff, present only once a
    * human has edited. Inlined by the host so the tab renders the edit story
    * without a second call.
