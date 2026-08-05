@@ -27,7 +27,7 @@ use super::{
 use crate::company::runtime::CompanyRuntime;
 use crate::ports::types::CompanyId;
 use crate::ports::types::TurnStep;
-use crate::server::chat_history::{self, MessageView, Viewer};
+use crate::server::chat_history::{self, MessageView, ReactionView, Viewer};
 
 /// The aggregation-root handle over one company. See the module docs.
 pub struct CompanyGql {
@@ -481,6 +481,38 @@ pub struct MessageGql {
     /// agree on which messages carry a card. Null on operator messages and on
     /// every reply journaled before the field existed.
     pub task_id: Option<ID>,
+    /// The message this one replies to (issue #364) — a thread reply rather
+    /// than a new line in the channel. Null for a message posted straight into
+    /// the channel, which is every message journaled before threads were
+    /// persisted. Same [`MessageView`] field the REST route reads, so the two
+    /// surfaces cannot disagree about the shape of a thread.
+    pub parent_id: Option<ID>,
+    /// Who reacted to this message with what (issue #364), one row per person
+    /// per emoji. Empty when nobody has.
+    pub reactions: Vec<MessageReactionGql>,
+}
+
+/// One person's reaction on a history message (issue #364). GraphQL mirror of
+/// the REST `reactions` array, so the two surfaces carry the same rows.
+#[derive(SimpleObject)]
+#[graphql(name = "MessageReaction")]
+pub struct MessageReactionGql {
+    /// The emoji.
+    pub emoji: String,
+    /// Who reacted, as a display label — never a raw user id.
+    pub by: String,
+    /// Whether the reading viewer is the one who reacted.
+    pub mine: bool,
+}
+
+impl From<ReactionView> for MessageReactionGql {
+    fn from(view: ReactionView) -> Self {
+        MessageReactionGql {
+            emoji: view.emoji,
+            by: view.by_label,
+            mine: view.mine,
+        }
+    }
 }
 
 /// One scrubbed step in a reply's processing timeline. GraphQL mirror of the
@@ -528,6 +560,12 @@ impl From<MessageView> for MessageGql {
             mine: view.mine,
             steps: view.steps.into_iter().map(MessageStepGql::from).collect(),
             task_id: view.task_id.map(ID),
+            parent_id: view.parent_id.map(ID),
+            reactions: view
+                .reactions
+                .into_iter()
+                .map(MessageReactionGql::from)
+                .collect(),
         }
     }
 }

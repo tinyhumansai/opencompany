@@ -494,6 +494,19 @@ type Message {
 	every reply journaled before the field existed.
 	"""
 	taskId: ID
+	"""
+	The message this one replies to (issue #364) — a thread reply rather
+	than a new line in the channel. Null for a message posted straight into
+	the channel, which is every message journaled before threads were
+	persisted. Same [`MessageView`] field the REST route reads, so the two
+	surfaces cannot disagree about the shape of a thread.
+	"""
+	parentId: ID
+	"""
+	Who reacted to this message with what (issue #364), one row per person
+	per emoji. Empty when nobody has.
+	"""
+	reactions: [MessageReaction!]!
 }
 
 """
@@ -508,6 +521,25 @@ type MessagePage {
 	The total number of items across all pages (before offset/limit).
 	"""
 	total: Int!
+}
+
+"""
+One person's reaction on a history message (issue #364). GraphQL mirror of
+the REST `reactions` array, so the two surfaces carry the same rows.
+"""
+type MessageReaction {
+	"""
+	The emoji.
+	"""
+	emoji: String!
+	"""
+	Who reacted, as a display label — never a raw user id.
+	"""
+	by: String!
+	"""
+	Whether the reading viewer is the one who reacted.
+	"""
+	mine: Boolean!
 }
 
 """

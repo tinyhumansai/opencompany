@@ -443,6 +443,7 @@ async fn chat_history_finds_agent_replies_under_general_and_main() {
         .append(
             runtime.id(),
             crate::ports::types::CompanyEvent::AgentReply {
+                parent: None,
                 task_id: None,
                 chat_id: "General".to_string(),
                 agent_id: "maya".to_string(),
@@ -457,6 +458,7 @@ async fn chat_history_finds_agent_replies_under_general_and_main() {
         .append(
             runtime.id(),
             crate::ports::types::CompanyEvent::AgentReply {
+                parent: None,
                 task_id: None,
                 chat_id: "main".to_string(),
                 agent_id: "maya".to_string(),
@@ -506,6 +508,7 @@ async fn chat_history_projects_the_card_a_reply_opened() {
             .append(
                 runtime.id(),
                 crate::ports::types::CompanyEvent::AgentReply {
+                    parent: None,
                     task_id,
                     chat_id: "General".to_string(),
                     agent_id: "maya".to_string(),
@@ -538,6 +541,93 @@ async fn chat_history_projects_the_card_a_reply_opened() {
     assert!(
         plain["taskId"].is_null(),
         "an ordinary reply carries no card: {plain}"
+    );
+}
+
+/// Issue #364 + #65: a thread parent and a message's reactions are projected on
+/// **both** history surfaces, from the one shared `MessageView`.
+///
+/// The same parity rule #246 is held to one test up. A console that hydrates a
+/// transcript over GraphQL must see the same threads and the same reactions the
+/// REST route returns, or the two doors show different conversations.
+#[tokio::test]
+async fn chat_history_projects_threads_and_reactions() {
+    use crate::ports::types::CompanyEvent;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_rich_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    let root = runtime
+        .events()
+        .append(
+            runtime.id(),
+            CompanyEvent::AgentReply {
+                parent: None,
+                task_id: None,
+                chat_id: "General".to_string(),
+                agent_id: "maya".to_string(),
+                text: "the root".to_string(),
+                steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .events()
+        .append(
+            runtime.id(),
+            CompanyEvent::AgentReply {
+                parent: Some(root),
+                task_id: None,
+                chat_id: "General".to_string(),
+                agent_id: "maya".to_string(),
+                text: "in the thread".to_string(),
+                steps: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .events()
+        .append(
+            runtime.id(),
+            CompanyEvent::ReactionToggled {
+                message_seq: root,
+                emoji: "👍".to_string(),
+                on: true,
+                by: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = router(state);
+    let value = query(
+        app,
+        r#"{"query":"{ company(id:\"acme\"){ chat(id:\"general\"){ history(first: 10) { items { id text parentId reactions { emoji by mine } } } } } }"}"#,
+    )
+    .await;
+    let items = value["data"]["company"]["chat"]["history"]["items"]
+        .as_array()
+        .unwrap();
+    let root_id = root.value().to_string();
+    let parent = items
+        .iter()
+        .find(|m| m["text"] == "the root")
+        .expect("the root is in history");
+    assert!(parent["parentId"].is_null(), "the root is not a reply");
+    assert_eq!(parent["reactions"][0]["emoji"], "👍");
+    assert_eq!(parent["reactions"][0]["by"], "operator");
+    let threaded = items
+        .iter()
+        .find(|m| m["text"] == "in the thread")
+        .expect("the threaded reply is in history");
+    assert_eq!(threaded["parentId"], root_id);
+    assert_eq!(
+        threaded["reactions"].as_array().unwrap().len(),
+        0,
+        "an un-reacted message carries no rows: {threaded}"
     );
 }
 
