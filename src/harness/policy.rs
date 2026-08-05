@@ -205,6 +205,38 @@ impl ApprovalRequestQueue {
         drained
     }
 
+    /// Splits off every request queued **at or after** `from`, leaving the ones
+    /// below it in place (issue #395).
+    ///
+    /// # Why this exists next to [`drain`](Self::drain)
+    ///
+    /// `drain` is a *cycle-end* verb: it takes the front of the queue and
+    /// **clears whatever is left**, which is correct when the cycle owns the
+    /// whole queue and is about to finish with it. A workflow agent node owns
+    /// no such thing. It runs on the same shared
+    /// [`HarnessDeps`](crate::harness::HarnessDeps) as the chat cycles, and a
+    /// cycle may be part-way through its own turn when the node's turn parks a
+    /// request. Calling `drain` there would steal that cycle's entries and then
+    /// wipe the rest — one workflow node silently swallowing another
+    /// conversation's pending approvals.
+    ///
+    /// So this takes only the tail the caller is entitled to. The boundary is
+    /// valid for exactly the reason [`queued`](Self::queued) is documented to
+    /// be one: [`push`](Self::push) only ever appends, so a position taken
+    /// before the turn stays the line between "somebody else parked that" and
+    /// "this turn did".
+    ///
+    /// A `from` past the end yields nothing rather than panicking, so a caller
+    /// that raced a [`clear`](Self::clear) degrades to parking nothing instead
+    /// of aborting the run.
+    pub fn take_from(&self, from: usize) -> Vec<ApprovalRequest> {
+        let mut guard = self.inner.lock().expect("approval request queue");
+        if from >= guard.len() {
+            return Vec::new();
+        }
+        guard.split_off(from)
+    }
+
     /// Builds a queue whose grant set is one the caller already holds.
     ///
     /// The runtime mints and sweeps grants and the policy redeems them, so both
@@ -1852,6 +1884,98 @@ mod tests {
     fn a_dispatch_that_parked_nothing_claims_nothing() {
         let queue = ApprovalRequestQueue::default();
         assert_eq!(queue.stamp_run(queue.queued(), "run-1"), 0);
+    }
+
+    // --- `take_from`: a workflow node's own tail, and nobody else's (#395) ----
+
+    /// The regression this method exists for. A workflow agent node parks its
+    /// gated calls while a chat cycle is part-way through its own turn; taking
+    /// the tail must leave that cycle's entries exactly where they were, and
+    /// `drain` would not — it takes from the front and clears the rest.
+    #[test]
+    fn taking_from_a_boundary_leaves_everything_below_it_untouched() {
+        let queue = ApprovalRequestQueue::default();
+        let queued = |kind: &str| ApprovalRequest {
+            tool: kind.to_string(),
+            reason: "gated".to_string(),
+            effect: Effect {
+                kind: kind.to_string(),
+                group: EffectGroup::Other,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "kind": kind }),
+                agent: Some("ceo".to_string()),
+                run_id: None,
+            },
+        };
+
+        // A chat cycle's own turn parked this one and has not drained yet.
+        queue.push(queued("chat.thing"));
+        let boundary = queue.queued();
+        // The workflow node's turn parks two.
+        queue.push(queued("node.thing"));
+        queue.push(queued("node.other"));
+
+        let taken = queue.take_from(boundary);
+        assert_eq!(
+            taken.iter().map(|r| r.tool.as_str()).collect::<Vec<_>>(),
+            vec!["node.thing", "node.other"],
+            "only the node's own tail comes back"
+        );
+        assert_eq!(
+            queue.queued(),
+            1,
+            "the chat cycle's entry is still queued for its own drain"
+        );
+        assert_eq!(
+            queue.drain(10)[0].tool,
+            "chat.thing",
+            "…and it is the same entry, not a survivor of a clear-and-rebuild"
+        );
+    }
+
+    /// A node whose turn parked nothing takes nothing — and a boundary past the
+    /// end (a `clear` raced in between) yields nothing rather than panicking.
+    #[test]
+    fn taking_from_the_end_or_past_it_yields_nothing() {
+        let queue = ApprovalRequestQueue::default();
+        assert!(queue.take_from(queue.queued()).is_empty());
+        assert!(queue.take_from(0).is_empty());
+        assert!(
+            queue.take_from(9_000).is_empty(),
+            "a boundary past the end must not panic — a raced clear degrades to \
+             parking nothing"
+        );
+    }
+
+    /// The append-only property the boundary rests on: a push while the node's
+    /// turn is running lands *after* the boundary, never before it, so the
+    /// entitlement split can never mis-attribute an entry downward.
+    #[test]
+    fn pushes_only_ever_append_so_a_boundary_stays_valid() {
+        let queue = ApprovalRequestQueue::default();
+        let queued = |kind: &str| ApprovalRequest {
+            tool: kind.to_string(),
+            reason: "gated".to_string(),
+            effect: Effect {
+                kind: kind.to_string(),
+                group: EffectGroup::Other,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({ "kind": kind }),
+                agent: None,
+                run_id: None,
+            },
+        };
+        queue.push(queued("a"));
+        let boundary = queue.queued();
+        for kind in ["b", "c", "d"] {
+            queue.push(queued(kind));
+        }
+        assert_eq!(queue.take_from(boundary).len(), 3);
+        assert_eq!(queue.queued(), 1);
     }
 
     /// A queue nobody installed stays inert — the default policy behaves exactly
