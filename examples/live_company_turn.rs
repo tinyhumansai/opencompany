@@ -125,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         media: None,
         composio: None,
         steer: opencompany::company::steer::InflightRegistry::default(),
+        run_supervisor: opencompany::runtime::RunSupervisor::default(),
         delivery: None,
         search: None,
         workspace: None,

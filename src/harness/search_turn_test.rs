@@ -293,6 +293,7 @@ async fn harness(
         media: None,
         composio: None,
         steer: crate::company::steer::InflightRegistry::default(),
+        run_supervisor: crate::runtime::RunSupervisor::default(),
         delivery: None,
         // The managed platform credential, exactly as the runtime builder
         // resolves it — a stub *platform* token, never a search-provider key.

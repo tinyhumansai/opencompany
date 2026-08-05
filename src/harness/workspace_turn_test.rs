@@ -282,6 +282,7 @@ async fn harness(
         media: None,
         composio: None,
         steer: crate::company::steer::InflightRegistry::default(),
+        run_supervisor: crate::runtime::RunSupervisor::default(),
         delivery: None,
         workspace: Some(store.clone()),
         // Issue #238's metered search is off in this fixture: the turn under

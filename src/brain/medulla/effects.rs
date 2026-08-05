@@ -436,6 +436,7 @@ mod test {
             }],
             pending_approvals: Vec::new(),
             error: None,
+            cancelled: false,
         };
 
         let wired = wire_event(7, &event);
