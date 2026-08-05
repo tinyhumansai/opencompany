@@ -1,15 +1,21 @@
 import { useEffect, useRef } from "react";
 
-import type { TurnStep } from "@/api/types";
+import type { ApprovalSummary, TurnStep, Verdict } from "@/api/types";
 import { cn } from "@/lib/utils";
+import { ApprovalRow } from "./ApprovalRow";
 import { Avatar } from "./Avatar";
 import { MessageRow } from "./MessageRow";
 import { StepTimeline } from "./StepTimeline";
-import { channelTitle, type Channel, type TimelineEntry } from "./model";
+import { channelTitle, type Channel, type TimelineItem } from "./model";
 
 interface Props {
   channel: Channel;
-  entries: TimelineEntry[];
+  /**
+   * The channel's rows: messages, and the approvals raised in this channel
+   * interleaved among them by time (#379). A card is its own kind rather than a
+   * message — see {@link TimelineItem}.
+   */
+  items: TimelineItem[];
   /** The message whose thread is open, if any — that row stays highlighted. */
   openThreadId: string | null;
   /** Someone on the company side is composing a reply. */
@@ -23,6 +29,13 @@ interface Props {
   liveSteps?: TurnStep[];
   onOpenThread: (messageId: string) => void;
   onReact: (messageId: string, emoji: string) => void;
+  /** Now, for the cards' "waiting N minutes" line. Owned by the shell's feed. */
+  now?: number;
+  /** Agent id → display name, for a card's "Asked by" line. */
+  askerNames?: Map<string, string>;
+  /** The verdict each inline card is currently waiting on. */
+  decidingApprovals?: ReadonlyMap<string, Verdict>;
+  onDecideApproval?: (approval: ApprovalSummary, verdict: Verdict) => void;
 }
 
 /**
@@ -35,12 +48,16 @@ interface Props {
  */
 export function MessageTimeline({
   channel,
-  entries,
+  items,
   openThreadId,
   typing,
   liveSteps,
   onOpenThread,
   onReact,
+  now,
+  askerNames,
+  decidingApprovals,
+  onDecideApproval,
 }: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const liveStepCount = liveSteps?.length ?? 0;
@@ -50,24 +67,37 @@ export function MessageTimeline({
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     // Each new tool row grows the block at the bottom, so the scroll has to
-    // follow it as the turn works, not only when the reply lands.
-  }, [entries.length, typing, liveStepCount]);
+    // follow it as the turn works, not only when the reply lands. A card
+    // arriving counts too — it is the thing the operator has to act on.
+  }, [items.length, typing, liveStepCount]);
 
   return (
     <div ref={scroller} className="flex-1 overflow-y-auto">
       <div className="flex min-h-full flex-col justify-end pb-4">
-        <ChannelIntro channel={channel} empty={entries.length === 0} />
-        {entries.map((entry) => (
-          <div key={entry.message.id}>
-            {entry.dayLabel && <DayDivider label={entry.dayLabel} />}
-            <MessageRow
-              entry={entry}
-              threadOpen={entry.message.id === openThreadId}
-              onOpenThread={onOpenThread}
-              onReact={onReact}
+        <ChannelIntro channel={channel} empty={items.length === 0} />
+        {items.map((item) =>
+          item.kind === "message" ? (
+            <div key={item.key}>
+              {item.entry.dayLabel && <DayDivider label={item.entry.dayLabel} />}
+              <MessageRow
+                entry={item.entry}
+                threadOpen={item.entry.message.id === openThreadId}
+                onOpenThread={onOpenThread}
+                onReact={onReact}
+              />
+            </div>
+          ) : (
+            <ApprovalRow
+              key={item.key}
+              approval={item.approval}
+              now={now ?? Date.now()}
+              askerNames={askerNames ?? EMPTY_NAMES}
+              deciding={decidingApprovals?.get(item.approval.id) ?? null}
+              decided={item.decided}
+              onDecide={(verdict) => onDecideApproval?.(item.approval, verdict)}
             />
-          </div>
-        ))}
+          ),
+        )}
         {liveStepCount > 0 ? (
           <LiveTurnRow channel={channel} steps={liveSteps ?? []} />
         ) : (
@@ -77,6 +107,9 @@ export function MessageTimeline({
     </div>
   );
 }
+
+/** Stable identity so a missing `askerNames` cannot churn the card's props. */
+const EMPTY_NAMES: Map<string, string> = new Map();
 
 function DayDivider({ label }: { label: string }) {
   return (

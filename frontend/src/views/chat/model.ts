@@ -1,7 +1,7 @@
 // The chat workspace's data model: channels, direct messages, and the grouping
 // rules the timeline reads. Everything here is pure — the view owns the state.
 
-import type { DeskDto } from "@/api/types";
+import type { ApprovalSummary, DeskDto, Verdict } from "@/api/types";
 import type { ChatMessage } from "@/lib/chat";
 import { defaultDesks, type Desk } from "@/lib/desks";
 import { initials as nameInitials, type TeamMember } from "@/lib/team";
@@ -325,6 +325,75 @@ export function buildTimeline(messages: ChatMessage[], channel: Channel): Timeli
   }
 
   return entries;
+}
+
+/**
+ * One row of a channel, which is no longer only a message (#379).
+ *
+ * A parked approval is a **distinct kind**, not a synthetic `ChatMessage`. It
+ * has to be: a card is decidable, carries live server state, and settles into a
+ * terminal state — none of which a message row can represent, and faking one
+ * would mean inventing an id, a sender and a body for something that is not an
+ * utterance. Keeping it separate is also what lets the card *derive* from
+ * `feed.approvals` rather than being appended once and then going stale.
+ *
+ * Both kinds carry `at` so the two streams interleave on real time, which is
+ * the only ordering that reads correctly: the request appears where the
+ * conversation was when it was raised.
+ */
+export type TimelineItem =
+  | { kind: "message"; key: string; at: number; entry: TimelineEntry }
+  | {
+      kind: "approval";
+      key: string;
+      at: number;
+      approval: ApprovalSummary;
+      /**
+       * The verdict this console has witnessed for the card, if any.
+       *
+       * A decided approval leaves `feed.approvals` on the next refresh, so
+       * without this the card would simply vanish mid-glance — an abrupt
+       * unmount that reads as the request having been lost. Holding the
+       * witnessed verdict lets it settle into a terminal state instead.
+       */
+      decided: Verdict | null;
+    };
+
+/**
+ * Interleave a channel's messages and the approvals raised in it, oldest first.
+ *
+ * `approvals` is expected to be pre-filtered to this channel by the caller —
+ * the thread→channel mapping lives in the shell, which owns the desk list and
+ * the roster, and this module stays pure.
+ *
+ * A `decided` card is kept even once the feed has dropped it, so the operator
+ * sees their own decision land rather than the card disappearing.
+ */
+export function buildTimelineItems(
+  entries: TimelineEntry[],
+  approvals: ApprovalSummary[],
+  decided: Record<string, Verdict> = {},
+): TimelineItem[] {
+  const items: TimelineItem[] = entries.map((entry) => ({
+    kind: "message" as const,
+    key: entry.message.id,
+    at: entry.message.at,
+    entry,
+  }));
+  for (const approval of approvals) {
+    items.push({
+      kind: "approval",
+      key: `approval:${approval.id}`,
+      at: approval.at_millis,
+      approval,
+      decided: decided[approval.id] ?? null,
+    });
+  }
+  // Stable within a millisecond: a card raised by the very turn whose reply
+  // shares its timestamp should sit after that reply, not shuffle between
+  // renders. `sort` is stable in every engine this ships to, so equal `at`
+  // keeps insertion order — messages first, then cards.
+  return items.sort((a, b) => a.at - b.at);
 }
 
 /* ---- formatting ---- */
