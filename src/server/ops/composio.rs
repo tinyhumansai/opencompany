@@ -94,7 +94,10 @@ fn effective_toolkits(manifest: &[String]) -> (bool, Vec<String>) {
     if manifest.is_empty() {
         (
             true,
-            OPEN_MODE_TOOLKITS.iter().map(|s| (*s).to_string()).collect(),
+            OPEN_MODE_TOOLKITS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         )
     } else {
         (false, manifest.to_vec())
@@ -310,7 +313,7 @@ async fn connections(company: ScopedCompany) -> Result<Json<Vec<ConnectionDto>>,
 /// token nor a platform identity — in which case the operator must paste a token
 /// before OAuth.
 #[cfg(feature = "composio")]
-async fn resolve_tenant(
+pub(crate) async fn resolve_tenant(
     runtime: &CompanyRuntime,
 ) -> Result<crate::harness::composio::TenantComposio, ApiError> {
     use crate::app::config::EnvSource;

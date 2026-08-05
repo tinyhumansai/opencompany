@@ -8,7 +8,6 @@ use async_graphql::SimpleObject;
 
 use crate::company::dns::DomainStatus;
 use crate::company::runtime::CompanyRuntime;
-use crate::server::ops::connections_read::HostConnectRoutes;
 use crate::server::ops::smtp::{SmtpCredentials, SmtpStatus};
 
 /// The reserved SecretStore key holding the JSON domain status.
@@ -109,42 +108,29 @@ impl From<SmtpStatus> for SmtpStatusGql {
 }
 
 /// Resolves `Company.connections`: manifest intent merged with OAuth status.
+///
+/// Delegates the whole decision to
+/// [`project_connections`](crate::server::ops::connections_read::project_connections),
+/// the same function the REST plane serves, and only maps the result into the
+/// GraphQL type. The two planes previously ran duplicate copies of the loop —
+/// which is how they were free to drift, and why a provider could answer one
+/// thing over REST and another over GraphQL (issue #316).
 pub(crate) async fn resolve_connections(
     runtime: &Arc<CompanyRuntime>,
 ) -> async_graphql::Result<Vec<ConnectionStateGql>> {
-    let Some(record) = runtime.store().load(runtime.id()).await? else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(record.manifest.connections.len());
-    // Host-level, so resolved once rather than per connection below.
-    let host = HostConnectRoutes::from_env();
-    for connection in &record.manifest.connections {
-        let key = format!("oauth/{}", connection.provider);
-        let (connected, account) = match runtime.secrets().get(runtime.id(), &key).await? {
-            Some(value) if !value.expose().trim().is_empty() => {
-                let account = serde_json::from_str::<serde_json::Value>(value.expose())
-                    .ok()
-                    .and_then(|json| {
-                        json.get("account")
-                            .and_then(|a| a.as_str())
-                            .map(str::to_string)
-                    });
-                (true, account)
-            }
-            _ => (false, None),
-        };
-        out.push(ConnectionStateGql {
-            credential_source: host
-                .route_from_env(&connection.provider, connected)
-                .as_str()
-                .to_string(),
-            provider: connection.provider.clone(),
-            connected,
-            account,
-            reason: connection.reason.clone(),
-        });
-    }
-    Ok(out)
+    Ok(
+        crate::server::ops::connections_read::project_connections(runtime.as_ref())
+            .await?
+            .into_iter()
+            .map(|row| ConnectionStateGql {
+                credential_source: row.credential_source.as_str().to_string(),
+                provider: row.provider,
+                connected: row.connected,
+                account: row.account,
+                reason: row.reason,
+            })
+            .collect(),
+    )
 }
 
 /// Resolves `Company.domain`, returning null when no domain is configured.

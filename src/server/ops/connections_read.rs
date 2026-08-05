@@ -77,6 +77,15 @@ struct ConnectionStateDto {
     /// when not connected or when the stored blob carries no account.
     #[serde(skip_serializing_if = "Option::is_none")]
     account: Option<String>,
+    /// Which namespace(s) report this provider connected — `native` for the
+    /// `oauth/{provider}` catalog, `composio` for a Composio connection. Empty
+    /// when not connected. `github` and `gmail` exist in both, so this is what
+    /// turns two disagreeing surfaces into one answer (issue #316).
+    via: Vec<&'static str>,
+    /// A Composio path exists for this company but could not be read, so
+    /// `connected: false` means "unknown", not "no". The console must not render
+    /// a confident disconnected state over an unanswered probe.
+    unverified: bool,
 }
 
 /// Can a Connect click for `provider` possibly succeed on this host, and by
@@ -191,28 +200,140 @@ pub fn router() -> Router<AppState> {
     scoped("/connections", get(list))
 }
 
-/// Projects each manifest connection into its non-secret status by reading the
-/// `oauth/{provider}` secret. Mirrors
-/// [`resolve_connections`](crate::server::graphql::connections::resolve_connections):
-/// only `provider` / `connected` / `credentialSource` / `account` ever leave
-/// this function — the token blob stays in the
-/// [`SecretStore`](crate::ports::SecretStore), and `credentialSource` is a tier
-/// name, never a credential and never a path.
-async fn project(runtime: &CompanyRuntime) -> Result<Vec<ConnectionStateDto>, ApiError> {
-    let Some(record) = runtime.store().load(runtime.id()).await.map_err(ApiError)? else {
+// ---------------------------------------------------------------------------
+// Reconciliation across connection namespaces (issue #316)
+// ---------------------------------------------------------------------------
+
+/// What Composio says about this company's connections.
+///
+/// Three states, not two, because "we could not ask" and "it said no" are
+/// different answers and collapsing them is the bug: reporting a failed probe as
+/// *not connected* is precisely the contradictory display #316 is about.
+///
+/// Without the `composio` feature only [`NotApplicable`](Self::NotApplicable) is
+/// ever constructed — there is no second namespace in that build — so the other
+/// two are genuinely dead there. The allow is scoped to exactly that build
+/// rather than blanket, so if a live variant stops being constructed in the
+/// `composio` build the compiler still says so.
+#[cfg_attr(not(feature = "composio"), allow(dead_code))]
+enum ComposioView {
+    /// There is no Composio path to reconcile against — the feature is not in
+    /// this build, the company does not grant `composio`, or no credential of
+    /// any tier resolves. Silence here is correct, not missing information.
+    NotApplicable,
+    /// A Composio path exists but could not be read (network, backend error).
+    /// Providers it might have covered are reported as *unverified* rather than
+    /// disconnected.
+    Unavailable,
+    /// Composio answered: toolkit slug → connected.
+    Known(std::collections::BTreeMap<String, bool>),
+}
+
+/// The Composio toolkit slug a catalog/manifest provider id corresponds to.
+///
+/// Composio slugs are lowercase and unpunctuated (`googlecalendar`), while this
+/// console's provider ids are hyphenated (`google-calendar`). Normalizing both
+/// sides through one rule is what lets `github` and `gmail` — which exist in
+/// **both** namespaces — resolve to a single row instead of two surfaces
+/// disagreeing on screen.
+fn toolkit_slug(provider: &str) -> String {
+    provider
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// One provider's reconciled state — the single answer both read planes serve.
+///
+/// Built once, in one place, so the REST projection and the GraphQL resolver
+/// cannot drift apart: they map this into their own wire types and add nothing
+/// of their own to the decision.
+pub(crate) struct ProviderConnection {
+    /// The provider id, as the manifest and console catalog spell it.
+    pub(crate) provider: String,
+    /// Connected through **any** namespace — the one coherent answer.
+    pub(crate) connected: bool,
+    /// Which route a Connect would take on this host.
+    pub(crate) credential_source: CredentialSource,
+    /// The connected account label, when known. Never token material.
+    pub(crate) account: Option<String>,
+    /// The namespaces that report this provider connected: `native` (the
+    /// `oauth/{provider}` catalog) and/or `composio`. Empty when not connected.
+    pub(crate) via: Vec<&'static str>,
+    /// A Composio path exists but could not be read, so `connected: false` here
+    /// means "we do not know", not "no". The console must say so rather than
+    /// showing a confident disconnected state.
+    pub(crate) unverified: bool,
+    /// The manifest's stated reason for wanting this connection, when declared.
+    pub(crate) reason: Option<String>,
+}
+
+/// Ask Composio which toolkits this company has connected.
+///
+/// Best-effort by construction: a company that does not grant `composio`, a
+/// build without the feature, or a missing credential all yield
+/// [`ComposioView::NotApplicable`], and a live probe that errors yields
+/// [`ComposioView::Unavailable`]. Nothing here can fail the connections page.
+#[cfg(feature = "composio")]
+async fn composio_view(runtime: &CompanyRuntime) -> ComposioView {
+    let granted = match runtime.store().load(runtime.id()).await {
+        Ok(Some(record)) => crate::company::grants_composio_explicit(&record.manifest.tools.allow),
+        _ => false,
+    };
+    if !granted {
+        return ComposioView::NotApplicable;
+    }
+    let Ok(config) = super::composio::resolve_tenant(runtime).await else {
+        // No credential of any tier resolves, so there is no Composio path to
+        // reconcile against — not a failure to report.
+        return ComposioView::NotApplicable;
+    };
+    match crate::harness::composio::list_connection_states(&config).await {
+        Ok(states) => ComposioView::Known(
+            states
+                .into_iter()
+                .map(|(toolkit, connected)| (toolkit_slug(&toolkit), connected))
+                .collect(),
+        ),
+        Err(err) => {
+            // The message is already scrubbed of the tenant credential by
+            // `list_connection_states`; log at debug and degrade.
+            tracing::debug!("[connections] composio probe failed: {err}");
+            ComposioView::Unavailable
+        }
+    }
+}
+
+/// Without the `composio` feature there is no second namespace to reconcile
+/// against, so every provider's answer is the native one alone.
+#[cfg(not(feature = "composio"))]
+async fn composio_view(_runtime: &CompanyRuntime) -> ComposioView {
+    ComposioView::NotApplicable
+}
+
+/// Projects a company's connections into one reconciled row per provider.
+///
+/// The union of two namespaces: the manifest's declared connections (whose
+/// state is the `oauth/{provider}` secret) and any provider Composio reports
+/// connected. `github` and `gmail` live in both, which is why they used to be
+/// shown twice with different answers.
+pub(crate) async fn project_connections(
+    runtime: &CompanyRuntime,
+) -> Result<Vec<ProviderConnection>, crate::error::OpenCompanyError> {
+    let Some(record) = runtime.store().load(runtime.id()).await? else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::with_capacity(record.manifest.connections.len());
+    let composio = composio_view(runtime).await;
     // Host-level, so resolved once rather than per connection below.
     let host = HostConnectRoutes::from_env();
+
+    let mut out: Vec<ProviderConnection> = Vec::with_capacity(record.manifest.connections.len());
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     for connection in &record.manifest.connections {
         let key = format!("oauth/{}", connection.provider);
-        let (connected, account) = match runtime
-            .secrets()
-            .get(runtime.id(), &key)
-            .await
-            .map_err(ApiError)?
-        {
+        let (native, account) = match runtime.secrets().get(runtime.id(), &key).await? {
             Some(value) if !value.expose().trim().is_empty() => {
                 // Read only the `account` label out of the stored blob; the
                 // `token` field is intentionally never touched.
@@ -227,14 +348,80 @@ async fn project(runtime: &CompanyRuntime) -> Result<Vec<ConnectionStateDto>, Ap
             }
             _ => (false, None),
         };
-        out.push(ConnectionStateDto {
-            credential_source: host.route_from_env(&connection.provider, connected),
+
+        let slug = toolkit_slug(&connection.provider);
+        seen.insert(slug.clone());
+        let (composio_connected, unverified) = match &composio {
+            ComposioView::Known(states) => (states.get(&slug).copied().unwrap_or(false), false),
+            // Only unverified if the native side didn't already answer yes: a
+            // provider we know is connected needs no second opinion.
+            ComposioView::Unavailable => (false, !native),
+            ComposioView::NotApplicable => (false, false),
+        };
+
+        let mut via = Vec::new();
+        if native {
+            via.push("native");
+        }
+        if composio_connected {
+            via.push("composio");
+        }
+        out.push(ProviderConnection {
+            credential_source: host.route_from_env(&connection.provider, native),
             provider: connection.provider.clone(),
-            connected,
+            connected: native || composio_connected,
             account,
+            via,
+            unverified,
+            reason: connection.reason.clone(),
         });
     }
+
+    // A provider Composio has connected but the manifest never declared is still
+    // a live capability this company has. Showing it is the difference between a
+    // page that reconciles and a page that reports one namespace and hides the
+    // other.
+    if let ComposioView::Known(states) = &composio {
+        for (slug, connected) in states {
+            if !*connected || seen.contains(slug) {
+                continue;
+            }
+            out.push(ProviderConnection {
+                credential_source: host.route_from_env(slug, false),
+                provider: slug.clone(),
+                connected: true,
+                account: None,
+                via: vec!["composio"],
+                unverified: false,
+                reason: None,
+            });
+        }
+    }
+
     Ok(out)
+}
+
+/// Projects each manifest connection into its non-secret status by reading the
+/// `oauth/{provider}` secret. Mirrors
+/// [`resolve_connections`](crate::server::graphql::connections::resolve_connections):
+/// only `provider` / `connected` / `credentialSource` / `account` ever leave
+/// this function — the token blob stays in the
+/// [`SecretStore`](crate::ports::SecretStore), and `credentialSource` is a tier
+/// name, never a credential and never a path.
+async fn project(runtime: &CompanyRuntime) -> Result<Vec<ConnectionStateDto>, ApiError> {
+    Ok(project_connections(runtime)
+        .await
+        .map_err(ApiError)?
+        .into_iter()
+        .map(|row| ConnectionStateDto {
+            provider: row.provider,
+            connected: row.connected,
+            credential_source: row.credential_source,
+            account: row.account,
+            via: row.via,
+            unverified: row.unverified,
+        })
+        .collect())
 }
 
 /// `GET …/connections` — the company's non-secret connection status list.
@@ -594,15 +781,108 @@ mod tests {
             connected: true,
             credential_source: CredentialSource::Attested,
             account: Some("octocat".to_string()),
+            via: vec!["native"],
+            unverified: false,
         };
         let json = serde_json::to_value(&dto).unwrap();
         assert_eq!(json["credentialSource"], "attested");
         let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
         assert_eq!(
             keys,
-            vec!["provider", "connected", "credentialSource", "account"],
+            vec![
+                "provider",
+                "connected",
+                "credentialSource",
+                "account",
+                "via",
+                "unverified"
+            ],
             "the read shape must stay exactly this: {keys:?}"
         );
+    }
+
+    /// Issue #316: one coherent answer per provider.
+    ///
+    /// Without the `composio` feature there is no second namespace, so every
+    /// row's answer is the native one — and, critically, `unverified` is
+    /// **false**: "there is no Composio path here" must not be reported as "we
+    /// could not check". The `composio` build's live probe is exercised against
+    /// the real backend, not here; what this pins is the reconciliation shape
+    /// both read planes now serve.
+    #[tokio::test]
+    async fn a_provider_in_neither_namespace_reads_disconnected_not_unknown() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(
+            &home,
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[connection]]\nprovider = \"github\"\n\
+             [[connection]]\nprovider = \"slack\"\n",
+        )
+        .await;
+
+        // github connected natively; slack in neither namespace.
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+        runtime
+            .secrets()
+            .set(
+                &id,
+                "oauth/github",
+                SecretValue(
+                    serde_json::json!({
+                        "token": { "access_token": "gho_fake_never_a_real_token" },
+                        "account": "octocat"
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = get_connections(&state).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body.as_array().expect("array body");
+
+        // Exactly one row per provider — never one per namespace.
+        assert_eq!(list.len(), 2, "one row per provider: {body}");
+
+        let github = list
+            .iter()
+            .find(|row| row["provider"] == "github")
+            .expect("a github row");
+        assert_eq!(github["connected"], true);
+        assert_eq!(github["via"], serde_json::json!(["native"]));
+        assert_eq!(github["unverified"], false);
+
+        let slack = list
+            .iter()
+            .find(|row| row["provider"] == "slack")
+            .expect("a slack row");
+        assert_eq!(slack["connected"], false);
+        assert_eq!(
+            slack["via"],
+            serde_json::json!([]),
+            "no namespace claims it"
+        );
+        assert_eq!(
+            slack["unverified"], false,
+            "no Composio path is a known answer, not an unknown one"
+        );
+    }
+
+    /// The provider-id → Composio-slug normalization that lets one provider
+    /// resolve to one row across both namespaces. The console spells ids
+    /// hyphenated (`google-calendar`); Composio spells slugs unpunctuated
+    /// (`googlecalendar`). Without a shared rule these are two providers, and the
+    /// page reports both — which is the #316 symptom.
+    #[test]
+    fn provider_ids_and_composio_slugs_normalize_to_one_key() {
+        use super::toolkit_slug;
+        assert_eq!(toolkit_slug("google-calendar"), "googlecalendar");
+        assert_eq!(toolkit_slug("google-drive"), "googledrive");
+        assert_eq!(toolkit_slug("GitHub"), "github");
+        assert_eq!(toolkit_slug("gmail"), "gmail");
     }
 
     /// A company with no `[[connection]]` entries returns an empty list (200),
