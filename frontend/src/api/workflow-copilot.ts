@@ -21,6 +21,16 @@
 //    and one workflow's copilot never sees another's. That is the issue's
 //    "no cross-workflow leakage" criterion, enforced server-side rather than by
 //    this file remembering to filter.
+//
+//    **Read that precisely: it isolates TRANSCRIPTS, not authority.** The
+//    thread id picks the responder and the journal; it does not narrow the
+//    orchestrator's context or tools, which stay company-wide. Asking this
+//    copilot about another workflow is not prevented by the transport — only
+//    by the instruction in the composed prompt, which is advisory. That is a
+//    deliberate limit of reusing the chat seam rather than building a scoped
+//    agent, and it costs nothing in privilege: the operator is already
+//    authenticated to the company and can reach the same orchestrator from the
+//    Chat tab and every workflow route. See `docs/spec/runtime/api.md`.
 // 3. **It rehydrates for free.** Because the exchange is journaled under that
 //    thread, `GET {scope}/chat/history?desk=<thread>` replays it after a reload,
 //    with no new storage and no new route.
@@ -226,13 +236,19 @@ function describeRun(run: WorkflowRunOutcome): string {
 /**
  * The operator-visible half of a composed message.
  *
- * Uses the LAST occurrence of the marker, so an operator who types the marker
- * text themselves still gets their own question back rather than a truncated
- * one. A message with no marker is returned whole — that is either a plain chat
+ * Uses the **FIRST** occurrence of the marker, because that is the one
+ * {@link composeCopilotMessage} inserted: everything before it is context this
+ * file wrote, and the question is everything after. Scanning from the end
+ * instead — as this did originally — finds a marker the operator typed inside
+ * their own question and returns only the tail, silently dropping the start of
+ * what they asked. The comment there claimed the opposite of what the code
+ * did.
+ *
+ * A message with no marker is returned whole — that is either a plain chat
  * message journaled on this thread by something else, or a pre-#303 row.
  */
 export function questionOf(text: string): string {
-  const at = text.lastIndexOf(QUESTION_MARKER);
+  const at = text.indexOf(QUESTION_MARKER);
   return at === -1 ? text : text.slice(at + QUESTION_MARKER.length);
 }
 
