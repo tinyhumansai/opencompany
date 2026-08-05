@@ -567,24 +567,21 @@ impl HarnessBrain {
             }
         };
 
-        card.updated_at_millis = now_millis();
-        tasks.upsert(&self.record.id, &card).await?;
-        // `guard` drops here → the run leaves the in-flight strip.
-        drop(guard);
-
-        // Issue #242: settle the attempt row from how the run actually ended.
+        // Issue #337: the attempt's **settled status** decides where the card
+        // lands, so it has to be known before the card is written.
         //
-        // Here, right after the card is persisted and before any of the
-        // best-effort journal writes below, so the run record and the board
-        // agree the moment either is readable. It also means the cycle's
-        // terminality backstop finds this row already settled and no-ops — the
-        // rich settle always wins the race, because `run_task` returns before
-        // `run_locked` reaches the backstop.
+        // This ordering is the fix. The parked-approval count used to be taken
+        // *after* the upsert above, which made `waiting_approval → in_review`
+        // literally inexpressible: by the time the brain knew a person had been
+        // left something to act on, the card was already persisted wherever the
+        // turn's ending had put it. A run that parked an approval on a delegated
+        // card therefore landed in **Done** — filed as finished while a human
+        // still had to authorise the call it was blocked on.
         //
-        // First (#333's unblocking move): tag every approval this attempt's own
-        // turns parked with the run that produced it, and count them. A run that
-        // finished its work but left a person something to act on has not
-        // succeeded — it is in review.
+        // So: stamp and count first (#333's unblocking move — tag every
+        // approval this attempt's own turns parked with the run that produced
+        // it), fold that into the settled status, then land the card from the
+        // one mapping, then persist.
         let parked = match sink.as_ref() {
             Some(sink) => self
                 .deps
@@ -592,31 +589,55 @@ impl HarnessBrain {
                 .stamp_run(approvals_before, sink.run_id()),
             None => 0,
         };
-        self.settle_run_end(sink.as_deref(), run_end, &result_text, parked)
-            .await;
+        let settled = lifecycle::settled_run_status(run_end, parked);
+        // `settle()` already wrote a landing at the break point; this is the
+        // authoritative overwrite now that the parked count is known. `None`
+        // only for a status that is not settled at all, which no ending
+        // produces — a hand-off never breaks the loop.
+        if let Some(column) = crate::ports::tasks::column_for_settled_run(settled) {
+            card.column = column.to_string();
+        }
+        card.updated_at_millis = now_millis();
+        tasks.upsert(&self.record.id, &card).await?;
+        // `guard` drops here → the run leaves the in-flight strip.
+        drop(guard);
 
-        // Issue #187: record the run's output as a versioned artifact so the
-        // Task Detail Artifacts tab has something behind it, and so a later
-        // operator edit can be diffed against what the agent actually wrote.
+        // Issue #242: settle the attempt row from the same status the card was
+        // just landed from, so the run record and the board cannot disagree.
         //
-        // Only a card that landed in its **success terminal** produces one:
-        // that is the state meaning "the agent produced something reviewable".
-        // A failure, a cancellation, or a pause writes its line to the note as
-        // before but is NOT an artifact — versioning `dispatch failed: …`
-        // strings would bury the real drafts and make the churn metric
-        // meaningless.
+        // Here, right after the card is persisted and before any of the
+        // best-effort journal writes below, so both are readable together. It
+        // also means the cycle's terminality backstop finds this row already
+        // settled and no-ops — the rich settle always wins the race, because
+        // `run_task` returns before `run_locked` reaches the backstop.
+        self.settle_run(
+            sink.as_deref(),
+            settled,
+            // Only a failure carries a reason: `error` is "why this went
+            // wrong", not "what the agent said". Stamping a success's reply
+            // here would put the deliverable in a field every reader renders
+            // as a fault.
+            matches!(settled, RunStatus::Failed).then_some(result_text.as_str()),
+        )
+        .await;
+
+        // Issue #187 / #244: record what the run actually produced.
         //
-        // The success terminal is two columns, not one (#179): a board-created
-        // card parks in `in_review` for its operator reviewer, while a card
-        // carrying an `origin_chat_id` — a delegated handoff nobody is watching
-        // the board for — completes straight to `done`. Both ran a turn and
-        // both produced a deliverable, so testing the column against
-        // `success_terminal_column` keeps the artifact tied to "the run
-        // succeeded" rather than to one particular landing column.
+        // Gated on the run reaching its **success terminal** —
+        // `run_status_for(run_end) == Succeeded`, i.e. the turn finished or
+        // spent its redirect budget. Deliberately read off the *ending* rather
+        // than off `settled`: parking an approval relabels who acts next, not
+        // whether the agent produced a deliverable, so a run that wrote a spec
+        // and also asked for an authorisation must not lose the spec.
+        //
+        // A failure, a cancellation or a pause records nothing. It still drains
+        // the publish queue, so nothing an abandoned turn staged leaks into the
+        // next run.
         //
         // Recorded before the #185 journal writes below because those move
-        // `result_text` into the completion event; the artifact only borrows it.
-        if card.column == lifecycle::success_terminal_column(&card) {
+        // `result_text` into the completion event; this only borrows it.
+        let produced_a_deliverable = lifecycle::run_status_for(run_end) == RunStatus::Succeeded;
+        if produced_a_deliverable {
             self.record_task_artifact(
                 &card,
                 &responder,
@@ -1204,7 +1225,7 @@ fn settle(card: &mut TaskRecord, end: TaskRunEnd, responder: &str, body: &str) {
         &lifecycle::note_attribution(end, responder),
         body,
     ));
-    card.column = lifecycle::landing_column(end, card).to_string();
+    card.column = lifecycle::landing_column(end).to_string();
 }
 
 /// Appends a responder-attributed result block to a card's note, preserving any
@@ -1364,7 +1385,7 @@ mod tests {
     use crate::ports::brain::CycleHost;
     // Issue #301: every lifecycle return now lands in To-do (the `backlog` pool
     // is gone), so these assertions read the const rather than a literal.
-    use crate::ports::tasks::COLUMN_TODO;
+    use crate::ports::tasks::{COLUMN_IN_REVIEW, COLUMN_TODO};
     use crate::ports::types::{
         ApprovalId, CompanyId, ContextOp, ContextOpResult, Effect, EffectDisposition, OverlayAgent,
         ToolCall, ToolResult,
@@ -1863,13 +1884,20 @@ members = ["engineer"]
         assert!(note.contains("Ship the thing"), "{note:?}");
     }
 
-    // ── Issue #171: a delegated handoff reaches `done` on its own ─────────
+    // ── Issue #337: every finished card stops for a person ────────────────
 
-    /// The regression: a card spawned by a delegating turn (so it carries an
-    /// `origin_chat_id`) has no operator watching the board, so leaving it in
-    /// `in_review` stranded it forever. It must complete to `done`.
+    /// **Rewritten by #337.** This used to pin the opposite: a card spawned by
+    /// a delegating turn (so it carries an `origin_chat_id`) completed straight
+    /// to `done`, on #171's argument that nobody was watching the board for it.
+    ///
+    /// The operator decision of 2026-08-05 removed every automatic route to
+    /// Done, so it now stops in `in_review` like any other card. The thing #171
+    /// actually cared about — that the originating conversation gets its answer
+    /// rather than waiting on a board nobody is reading — is unaffected and is
+    /// asserted here: the post-back still fires, and it now says the card is
+    /// ready for review instead of claiming it is finished.
     #[tokio::test]
-    async fn dispatched_card_with_an_origin_completes_to_done() {
+    async fn dispatched_card_with_an_origin_stops_in_review_and_still_posts_back() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, tasks) = brain_with_tasks(dir.path());
         // A roster assignee: since #205 an off-roster one never runs a turn, so
@@ -1899,26 +1927,27 @@ members = ["engineer"]
 
         let moved = only_card(&tasks).await;
         assert_eq!(
-            moved.column, "done",
-            "a delegated handoff must reach the terminal column, not park in in_review"
+            moved.column, COLUMN_IN_REVIEW,
+            "Done is a person's decision; no dispatch may reach it on its own"
         );
         // The note stays the durable record of what came back.
         assert!(moved.note.expect("note").contains("Ship the thing"));
-        // …and the bubble says so rather than asking for a review nobody will do.
-        assert!(posted.text.contains("is done"), "{}", posted.text);
-        assert!(!posted.text.contains("ready for review"), "{}", posted.text);
+        // …and the bubble answers in the originating thread either way, which
+        // is what the handoff was actually waiting on.
+        assert!(posted.text.contains("ready for review"), "{}", posted.text);
+        assert!(!posted.text.contains("is done"), "{}", posted.text);
     }
 
-    /// Issue #179 split the success terminal in two, and artifact capture (#187)
-    /// keys off it: a delegated card completes to `done` rather than parking in
-    /// `in_review`, and its deliverable must still be versioned.
+    /// Artifact capture keys off the run's **ending**, not off the card's
+    /// column — so a delegated card, which no longer gets its own terminal,
+    /// still has its deliverable versioned.
     ///
-    /// Gating capture on the literal `in_review` would silently stop versioning
-    /// exactly the cards nobody is watching the board for — the run succeeded
-    /// and produced output either way, so the guard has to track "landed on the
-    /// success terminal", not one particular column name.
+    /// This is the guard that used to be `card.column == success_terminal_column`.
+    /// Reading the ending instead is what keeps capture correct now that every
+    /// success shares one landing: a column comparison would have to be re-taught
+    /// every time the board's vocabulary moves.
     #[tokio::test]
-    async fn a_delegated_card_completing_to_done_still_records_an_artifact() {
+    async fn a_delegated_card_stopping_in_review_still_records_an_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, ops) = brain_with_artifacts(dir.path());
         // Empty assignee → the default responder, so the turn actually runs.
@@ -1939,8 +1968,8 @@ members = ["engineer"]
 
         let moved = only_card(&ops).await;
         assert_eq!(
-            moved.column, "done",
-            "a delegated card lands on the `done` success terminal (#179)"
+            moved.column, COLUMN_IN_REVIEW,
+            "since #337 every finished card stops for a person"
         );
         let artifacts = crate::ports::artifacts::ArtifactStore::list(
             &*ops,
@@ -1994,26 +2023,32 @@ members = ["engineer"]
         );
     }
 
-    /// The success terminal is chosen by origin, not by outcome: a board-created
-    /// card keeps its `in_review` review gate. The decision itself now lives in
-    /// [`lifecycle`] (and is unit-tested there); this pins that `settle` — every
-    /// run-ending path in this file — actually consults it.
+    /// **Rewritten by #337.** The landing no longer depends on the card at
+    /// all: a card's origin used to pick between two success terminals, and now
+    /// there is one. The decision itself lives in
+    /// [`crate::ports::tasks::column_for_settled_run`] (and is unit-tested
+    /// there); this pins that `settle` — every run-ending path in this file —
+    /// actually consults it, for both card shapes.
     #[test]
-    fn success_terminal_column_is_done_only_for_a_card_with_an_origin() {
+    fn settle_lands_every_finished_card_in_review_whatever_its_origin() {
         let mut board_card = card("t1", "maya");
         settle(&mut board_card, TaskRunEnd::Completed, "maya", "shipped");
-        assert_eq!(board_card.column, "in_review");
+        assert_eq!(board_card.column, COLUMN_IN_REVIEW);
 
         let mut delegated = card("t2", "maya");
         delegated.origin_chat_id = Some("strategy".to_string());
         settle(&mut delegated, TaskRunEnd::Completed, "maya", "shipped");
-        assert_eq!(delegated.column, "done");
+        assert_eq!(
+            delegated.column, COLUMN_IN_REVIEW,
+            "an origin no longer buys a card its own terminal"
+        );
     }
 
-    /// The redirect-cap finalize branch is the other success terminal, so it has
-    /// to make the same choice — otherwise a steered handoff still strands.
+    /// The redirect-cap finalize branch is the other success ending, so it has
+    /// to make the same choice — otherwise a steered handoff diverges from an
+    /// unsteered one.
     #[tokio::test]
-    async fn redirect_cap_finalizes_a_card_with_an_origin_to_done() {
+    async fn redirect_cap_finalizes_a_card_with_an_origin_to_review() {
         let dir = tempfile::tempdir().unwrap();
         let redirect = || SteerAction::Redirect {
             instruction: "focus on the API".to_string(),
@@ -2038,7 +2073,7 @@ members = ["engineer"]
             .await
             .expect("cycle runs");
 
-        assert_eq!(only_card(&tasks).await.column, "done");
+        assert_eq!(only_card(&tasks).await.column, COLUMN_IN_REVIEW);
     }
 
     /// The relay has to have wording for the `done` landing column — without it
