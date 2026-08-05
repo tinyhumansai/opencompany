@@ -534,6 +534,10 @@ pub fn build_agent(
             // The company store, for the `add_agent` tool to persist overlay
             // teammates through the same path the console `POST .../team` uses.
             deps.store.clone(),
+            // Issue #339: the shared queue `run_workflow` / `create_workflow`
+            // stage onto, so a dispatched card can link to the workflow its
+            // attempt built or ran. Orchestrator-only, like the tools.
+            deps.workflow_refs.clone(),
         ));
     }
 
@@ -1097,6 +1101,7 @@ mod tests {
             workflow_runner: WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),

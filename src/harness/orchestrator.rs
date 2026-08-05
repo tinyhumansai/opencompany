@@ -60,8 +60,10 @@ use crate::company::{
 };
 use crate::error::OpenCompanyError;
 use crate::harness::lifecycle::ReviewDecision;
+use crate::harness::workflow_refs::WorkflowRefQueue;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
+use crate::ports::tasks::{TaskOutputAction, TaskOutputWorkflow};
 use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, OverlayAgent};
 use crate::ports::{CompanyStore, WorkflowRun, WorkflowRunner, generate_id};
 
@@ -1202,6 +1204,7 @@ pub fn orchestrator_tools(
     workflow_runner: WorkflowRunnerHandle,
     run_supervisor: crate::runtime::RunSupervisor,
     store: Arc<dyn CompanyStore>,
+    workflow_refs: WorkflowRefQueue,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(QueryCompanyTool::new(
         company.clone(),
@@ -1218,6 +1221,7 @@ pub fn orchestrator_tools(
         workflow_runner,
         run_supervisor,
         events.clone(),
+        workflow_refs.clone(),
     )));
     // `create_workflow` (issue #112) shares the same source dir the run tool
     // reads graphs from, plus the store it enables the new id on and the event
@@ -1227,6 +1231,7 @@ pub fn orchestrator_tools(
         workflow_source_dir,
         store.clone(),
         events,
+        workflow_refs,
     )));
     tools.push(Box::new(AddAgentTool::new(company, store)));
     tools
@@ -1313,13 +1318,22 @@ pub struct RunWorkflowTool {
     /// record, exactly as the runner skips the progress events — the two degrade
     /// together, so the pair can never be half-present.
     events: Option<Arc<dyn EventLog>>,
+    /// Issue #339: where a run this tool started is staged, so the dispatched
+    /// card that started it can link to the workflow.
+    ///
+    /// The tool cannot write the card itself — it is built once per agent while
+    /// the card varies per dispatch — so it stages and the brain drains. Pushed
+    /// only after the runner actually returned a run: a refused, unknown or
+    /// failed invocation produced nothing to point at.
+    workflow_refs: WorkflowRefQueue,
 }
 
 impl RunWorkflowTool {
     /// Builds the tool over the company id, its on-disk source directory
     /// (`companies/<name>`, whose `workflows/` subtree holds the seed graphs),
     /// the company store (holding the runtime-authored graph bodies), the
-    /// shared runner handle, and the company's journal.
+    /// shared runner handle, the company's journal, and the shared queue a
+    /// dispatched card's output link is staged on (issue #339).
     pub fn new(
         company: CompanyId,
         source_dir: Option<PathBuf>,
@@ -1327,6 +1341,7 @@ impl RunWorkflowTool {
         runner: WorkflowRunnerHandle,
         run_supervisor: crate::runtime::RunSupervisor,
         events: Option<Arc<dyn EventLog>>,
+        workflow_refs: WorkflowRefQueue,
     ) -> Self {
         Self {
             company,
@@ -1335,6 +1350,7 @@ impl RunWorkflowTool {
             runner,
             run_supervisor,
             events,
+            workflow_refs,
         }
     }
 }
@@ -1492,6 +1508,19 @@ impl Tool for RunWorkflowTool {
                          you're asked to — someone chose to stop it."
                     )));
                 }
+                // Issue #339: this run is something the turn produced, so a
+                // dispatched card that reached here can link to it. Staged
+                // here — *after* the cancelled arm above — because a run an
+                // operator stopped is not a deliverable to advertise on a
+                // card; its partial steps are in the run history either way.
+                // Off a dispatch (an ordinary operator chat turn) nothing ever
+                // drains this and the brain clears it before the next card, so
+                // staging unconditionally cannot mis-attribute.
+                self.workflow_refs.push(TaskOutputWorkflow {
+                    workflow_id: file.id.clone(),
+                    run_id: Some(ctx.run_id.clone()),
+                    action: TaskOutputAction::Ran,
+                });
                 let md = summarize_run(&file, &run);
                 Ok(ToolResult::success_with_markdown(
                     json!({
@@ -1720,24 +1749,35 @@ pub struct CreateWorkflowTool {
     source_dir: Option<PathBuf>,
     store: Arc<dyn CompanyStore>,
     events: Option<Arc<dyn EventLog>>,
+    /// Issue #339: where a graph this tool authored is staged, so a dispatched
+    /// card whose whole job was *"build us a process for this"* links to the
+    /// process rather than to the sentence describing it.
+    ///
+    /// Carries no run id — nothing has executed yet. If the same turn goes on
+    /// to run it, the queue collapses the pair to the run
+    /// ([`WorkflowRefQueue::drain`](crate::harness::workflow_refs::WorkflowRefQueue::drain)).
+    workflow_refs: WorkflowRefQueue,
 }
 
 impl CreateWorkflowTool {
     /// Builds the tool over the company id, its on-disk source directory
     /// (`companies/<name>`, whose `workflows/` subtree the graph lands in), the
-    /// company store (to enable the new id), and the event log (to journal the
-    /// audit event).
+    /// company store (to enable the new id), the event log (to journal the
+    /// audit event), and the shared queue a dispatched card's output link is
+    /// staged on (issue #339).
     pub fn new(
         company: CompanyId,
         source_dir: Option<PathBuf>,
         store: Arc<dyn CompanyStore>,
         events: Option<Arc<dyn EventLog>>,
+        workflow_refs: WorkflowRefQueue,
     ) -> Self {
         Self {
             company,
             source_dir,
             store,
             events,
+            workflow_refs,
         }
     }
 }
@@ -1842,6 +1882,14 @@ impl Tool for CreateWorkflowTool {
         {
             Ok(file) => {
                 tracing::debug!(company = %self.company, workflow = %file.id, "create_workflow: created");
+                // Issue #339: the graph is saved, so it is a real thing this
+                // turn produced and a dispatched card can point at it. Only on
+                // the `Ok` arm — a rejected draft persisted nothing.
+                self.workflow_refs.push(TaskOutputWorkflow {
+                    workflow_id: file.id.clone(),
+                    run_id: None,
+                    action: TaskOutputAction::Created,
+                });
                 let md = format!(
                     "Created workflow **{}** (`{}`). It's enabled and ready to run — use `run_workflow` with id `{}` to execute it.",
                     file.name.trim(),
@@ -2778,6 +2826,7 @@ name = "Morning"
             WorkflowRunnerHandle::default(),
             crate::runtime::RunSupervisor::default(),
             Arc::new(MemStore::default()),
+            WorkflowRefQueue::default(),
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         // Six before #186; `assign_task` + `review_task` make eight.
@@ -2818,6 +2867,7 @@ name = "Morning"
             handle,
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = tool
             .execute(json!({ "id": "demo", "input": { "seed": 1 } }))
@@ -2830,6 +2880,135 @@ name = "Morning"
         assert!(out.contains("Demo flow"), "{out}");
         assert!(out.contains("did the thing"), "{out}");
         assert!(out.contains("without pausing for approval"), "{out}");
+    }
+
+    /// Issue #339: a run this tool started is staged for the dispatched card
+    /// that started it, carrying the run id so the card's link can open the
+    /// overlay showing what actually executed.
+    #[tokio::test]
+    async fn a_successful_run_stages_a_workflow_reference_for_the_card() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": { "worker": { "items": ["did the thing"] } } }),
+            pending_approvals: Vec::new(),
+            deliveries: Vec::new(),
+            cancelled: false,
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let refs = WorkflowRefQueue::default();
+
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            refs.clone(),
+        );
+        let result = tool
+            .execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+        assert!(!result.is_error, "{result:?}");
+
+        let staged = refs.drain();
+        assert_eq!(staged.len(), 1, "got {staged:?}");
+        assert_eq!(staged[0].workflow_id, "demo");
+        assert_eq!(staged[0].action, TaskOutputAction::Ran);
+        assert!(
+            staged[0].run_id.is_some(),
+            "a run the card links to must name the run that happened"
+        );
+    }
+
+    /// The other half, and the one worth pinning: a run that never happened
+    /// stages nothing. An unknown id, an unwired runner and a failed run all
+    /// produced no deliverable, so a card must not advertise one.
+    #[tokio::test]
+    async fn a_run_that_did_not_happen_stages_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+        let refs = WorkflowRefQueue::default();
+
+        // No runner wired.
+        let unwired = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            WorkflowRunnerHandle::default(),
+            crate::runtime::RunSupervisor::default(),
+            None,
+            refs.clone(),
+        );
+        assert!(
+            unwired
+                .execute(json!({ "id": "demo" }))
+                .await
+                .expect("execute")
+                .is_error
+        );
+
+        // A wired runner, but an id neither source has.
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::empty());
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let unknown = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            refs.clone(),
+        );
+        assert!(
+            unknown
+                .execute(json!({ "id": "nope" }))
+                .await
+                .expect("execute")
+                .is_error
+        );
+
+        assert_eq!(refs.queued(), 0, "nothing ran, so nothing may be linked");
+    }
+
+    /// A run an operator stopped is not a deliverable to put on a card. Its
+    /// partial steps stay in the run history either way, so nothing is lost —
+    /// what is avoided is a card advertising work somebody deliberately halted.
+    #[tokio::test]
+    async fn a_cancelled_run_stages_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": {} }),
+            pending_approvals: Vec::new(),
+            deliveries: Vec::new(),
+            cancelled: true,
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let refs = WorkflowRefQueue::default();
+
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            refs.clone(),
+        );
+        let result = tool
+            .execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+        assert!(result.is_error, "a cancelled run reports as a stop");
+        assert_eq!(refs.queued(), 0);
     }
 
     #[tokio::test]
@@ -2853,6 +3032,7 @@ name = "Morning"
             handle,
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -2876,6 +3056,7 @@ name = "Morning"
             WorkflowRunnerHandle::default(),
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -2900,6 +3081,7 @@ name = "Morning"
             handle,
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = tool
             .execute(json!({ "id": "nope" }))
@@ -2921,6 +3103,7 @@ name = "Morning"
             WorkflowRunnerHandle::default(),
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = tool.execute(json!({})).await.expect("execute");
         assert!(result.is_error);
@@ -2942,6 +3125,7 @@ name = "Morning"
             handle,
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = tool
             .execute(json!({ "id": "../secrets" }))
@@ -3005,6 +3189,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             store.clone(),
             None,
+            WorkflowRefQueue::default(),
         );
         let created = create.execute(greeter_body()).await.expect("execute");
         assert!(!created.is_error, "create should succeed: {created:?}");
@@ -3039,6 +3224,7 @@ name = "Morning"
             handle,
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = run
             .execute(json!({ "id": "greeter" }))
@@ -3051,13 +3237,88 @@ name = "Morning"
         );
     }
 
+    /// Issue #339: the *"build us a process for this"* card. The graph is the
+    /// deliverable, so authoring it stages a link even though nothing has run —
+    /// and when the same turn goes on to run it, the pair collapses to the run,
+    /// which is the stronger link because it can show what executed.
+    #[tokio::test]
+    async fn authoring_a_workflow_stages_a_link_and_running_it_upgrades_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let company = CompanyId::new("acme");
+        let store: Arc<dyn CompanyStore> =
+            Arc::new(MemStore::seeded(record_with_assistant(&company)));
+        let refs = WorkflowRefQueue::default();
+
+        let create = CreateWorkflowTool::new(
+            company.clone(),
+            Some(dir.path().to_path_buf()),
+            store.clone(),
+            None,
+            refs.clone(),
+        );
+        assert!(
+            !create
+                .execute(greeter_body())
+                .await
+                .expect("execute")
+                .is_error
+        );
+        assert_eq!(refs.queued(), 1, "the saved graph is a deliverable");
+
+        // A rejected draft persists nothing, so it must stage nothing either.
+        assert!(
+            create
+                .execute(json!({ "id": "greeter", "name": "Greeter", "nodes": [] }))
+                .await
+                .expect("execute")
+                .is_error
+        );
+        assert_eq!(refs.queued(), 1, "a rejected draft is not a deliverable");
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": { "worker": { "items": ["hi"] } } }),
+            pending_approvals: Vec::new(),
+            deliveries: Vec::new(),
+            cancelled: false,
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let run = RunWorkflowTool::new(
+            company.clone(),
+            Some(dir.path().to_path_buf()),
+            store.clone(),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            refs.clone(),
+        );
+        assert!(
+            !run.execute(json!({ "id": "greeter" }))
+                .await
+                .expect("execute")
+                .is_error
+        );
+
+        let staged = refs.drain();
+        assert_eq!(staged.len(), 1, "one workflow, one link: {staged:?}");
+        assert_eq!(staged[0].workflow_id, "greeter");
+        assert_eq!(staged[0].action, TaskOutputAction::Ran);
+        assert!(staged[0].run_id.is_some());
+    }
+
     #[tokio::test]
     async fn create_workflow_tool_guardrail_failure_is_error_result() {
         let dir = tempfile::tempdir().unwrap();
         let company = CompanyId::new("acme");
         let store: Arc<dyn CompanyStore> =
             Arc::new(MemStore::seeded(record_with_assistant(&company)));
-        let tool = CreateWorkflowTool::new(company, Some(dir.path().to_path_buf()), store, None);
+        let tool = CreateWorkflowTool::new(
+            company,
+            Some(dir.path().to_path_buf()),
+            store,
+            None,
+            WorkflowRefQueue::default(),
+        );
         // Zero triggers — a guardrail failure must be an is_error ToolResult, not
         // a raised anyhow error.
         let result = tool
@@ -3084,7 +3345,13 @@ name = "Morning"
         let company = CompanyId::new("acme");
         let store: Arc<dyn CompanyStore> =
             Arc::new(MemStore::seeded(record_with_assistant(&company)));
-        let tool = CreateWorkflowTool::new(company.clone(), None, store.clone(), None);
+        let tool = CreateWorkflowTool::new(
+            company.clone(),
+            None,
+            store.clone(),
+            None,
+            WorkflowRefQueue::default(),
+        );
         let result = tool
             .execute(json!({
                 "id": "hosted",
@@ -3119,6 +3386,7 @@ name = "Morning"
             handle,
             crate::runtime::RunSupervisor::default(),
             None,
+            WorkflowRefQueue::default(),
         );
         let result = run
             .execute(json!({ "id": "hosted" }))
@@ -3137,6 +3405,7 @@ name = "Morning"
             Some(dir.path().to_path_buf()),
             store,
             None,
+            WorkflowRefQueue::default(),
         );
         // A non-object payload can't deserialize into the create body.
         let result = tool.execute(json!(42)).await.expect("execute");
