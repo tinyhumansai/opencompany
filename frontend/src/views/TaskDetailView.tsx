@@ -1241,7 +1241,7 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
     <li className="rounded-lg border bg-card">
       <button
         className={cn(
-          "flex w-full items-center gap-2 px-3 py-2 text-left text-xs",
+          "flex w-full flex-wrap items-center gap-2 px-3 py-2 text-left text-xs",
           expandable ? "cursor-pointer" : "cursor-default",
         )}
         disabled={!expandable}
@@ -1250,7 +1250,10 @@ function TimelineRow({ group }: { group: TimelineGroup }) {
         <span className={cn("shrink-0", kindTone(group.kind, group.status))}>
           {rowIcon(group.kind, group.status)}
         </span>
-        <span className="min-w-0 flex-1 truncate font-medium">
+        {/* A floor, not just `min-w-0`: a row carrying a state chip AND a
+            duration would otherwise squeeze the label to "Workspa…", hiding
+            the one thing that says which step this is. */}
+        <span className="min-w-[7rem] flex-1 truncate font-medium">
           {group.label}
         </span>
         {/* The typed state a step reached, by lookup rather than by reading its
