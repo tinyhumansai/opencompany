@@ -126,6 +126,24 @@ impl RunSupervisor {
             .remove(run_id);
     }
 
+    /// The runs currently registered, as `(run_id, workflow_id)` pairs.
+    ///
+    /// Order is unspecified — a `HashMap`'s, so callers that care must sort.
+    /// Mirrors [`InflightRegistry::list`](crate::company::steer::InflightRegistry::list),
+    /// and exists for the same two reasons: it is the read a "what is running
+    /// right now" surface would need, and without it a test cannot discover the
+    /// id of a run it did not start itself — which is exactly the position the
+    /// cron scheduler's tests are in, since the scheduler mints the id inside a
+    /// spawned task.
+    pub fn live(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .expect("run supervisor poisoned")
+            .iter()
+            .map(|(run_id, slot)| (run_id.clone(), slot.workflow_id.clone()))
+            .collect()
+    }
+
     /// How many runs are currently registered. For tests and diagnostics.
     pub fn len(&self) -> usize {
         self.inner.lock().expect("run supervisor poisoned").len()
@@ -177,6 +195,12 @@ mod test {
         assert_eq!(supervisor.len(), 1);
         assert_eq!(guard.run_id(), ctx.run_id);
         assert!(!ctx.cancel.is_cancelled());
+
+        assert_eq!(
+            supervisor.live(),
+            vec![(ctx.run_id.clone(), "digest".to_string())],
+            "a registered run is discoverable by a caller that did not start it"
+        );
 
         assert!(supervisor.cancel(&ctx.run_id), "a live run cancels");
         assert!(
