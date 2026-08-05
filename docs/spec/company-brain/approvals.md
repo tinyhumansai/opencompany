@@ -136,6 +136,38 @@ Note this is the *tool* gate (`ApprovalPolicy`), which is a different path from
 the *effect* gate (`ManifestApprovalGate::evaluate`) the taxonomy above
 describes. A harness tool call parks directly and never reaches `evaluate`.
 
+## Where the request is raised (issue #379)
+
+An approval is not only a queue entry; it is an interruption of a conversation.
+So a park records **which conversation** — `ApprovalParked.thread`, stamped by
+the cycle from its own trigger events, surfaced on `ApprovalSummary.thread`, and
+carried onto `GrantedCall.origin_thread` when the approval mints a grant.
+
+The id is `OperatorMessage.chat`: a desk id for a channel, a roster agent id for
+a direct message. `Effect.agent` cannot stand in for it, and that is the whole
+reason the field exists — a desk channel and a direct message to that desk's
+lead are answered by the same teammate, so a request placed by asker would be
+raised inside the wrong one of the two.
+
+It follows the work rather than the queue entry. A resolution inherits the
+thread of the approval it settles, so a follow-up turn that needs a **second**
+sign-off re-parks in the channel the first was asked in instead of falling out
+of the conversation. And the redeemed grant's continuation is journaled into
+that thread too — approving something visibly causes the next thing to happen,
+in the place the operator was already reading.
+
+The stamp is refused rather than guessed. A cycle batching two conversations,
+or an addressed turn beside an unaddressed one, or beside a task dispatch,
+stamps nothing. An approval with no thread — a workflow delivery, a scheduler
+tick, anything parked before this shipped — belongs to no conversation and is
+shown on the Approvals page alone, which is where every approval was shown
+before. The page always lists everything; the in-conversation card is additive.
+
+The event log carries the park itself (`CompanyEvent::ApprovalParked`) so the
+card can appear live. It is deliberately thin — an id, a dotted kind, a thread —
+because the effect's payload is redacted in exactly one place and must not
+acquire a second. A reader re-reads the approvals feed for the rest.
+
 ## Delegation levels (standing rules)
 
 Prosumers adjust the fence in plain language, which compiles to policy:

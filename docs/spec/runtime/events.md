@@ -33,7 +33,10 @@ Two properties are load-bearing everywhere below:
 ## Variants
 
 `CompanyEvent` variants: `OperatorMessage`, `WebhookReceived`,
-`ScheduleFired`, `A2aTaskReceived`, `ApprovalResolved`, `FeedbackFiled`,
+`ScheduleFired`, `A2aTaskReceived`, `ApprovalParked` (issue #379 — an effect
+is now waiting on the operator; see [In-conversation
+approvals](#in-conversation-approvals-issue-379)), `ApprovalResolved`,
+`FeedbackFiled`,
 `PaymentReceived`, `LifecycleChanged`, `AgentReply`, `MemoryFactDeleted`,
 `TaskDispatched`, `McpCallFailed`, `WorkflowCreated` (a new saved workflow
 graph was authored + enabled via the console `POST …/workflows` route or the
@@ -172,6 +175,71 @@ rotated-away park line silently makes its approval unreadable.
 The field is additive on the same contract as the rest — a pre-#333 line
 replays with no link and keeps the old run-window correlation, so existing
 history still renders.
+
+### In-conversation approvals (issue #379)
+
+A parked approval had no event at all — parking was journal-only — so a console
+learned about a new request when its approvals feed next polled. That is far too
+late to raise the request *inside the conversation that produced it*, which is
+where an operator is actually looking when their agent stops to ask.
+
+Two additions, both on the pattern above.
+
+**`CompanyEvent::ApprovalParked`**, appended best-effort at the single park
+choke point (`CycleHostImpl::park`) immediately after the journal write
+succeeds. The journal is the binding record of what is parked; the event is an
+advisory nudge, so a failed log write never undoes a park that already
+happened — the same division `sweep_expired_approvals` draws for expiry.
+
+It carries **an id, a dotted kind, and a thread — nothing else**. No payload and
+no asker, deliberately: the parked effect's arguments are redacted and bounded
+in exactly one place (`pending_approvals`, issue #372), and a payload-bearing
+durable event would open a second surface that has to redact, and eventually
+will not. A reader reacts by re-reading the approvals feed and renders from the
+redacted `ApprovalSummary`. That costs one round trip between the frame and the
+card, and buys one redaction surface instead of two.
+
+**`ApprovalParked.thread` on the journal record**, stamped at park time from the
+cycle's own trigger events by `cycle_thread_id` — the sibling of #333's
+`cycle_task_id`, same exhaustive-match discipline, same refusal to guess. It
+also surfaces on `PendingApproval`, `ApprovalOrigin` and `ApprovalSummary`, and
+is copied onto `GrantedCall.origin_thread` when an approval mints a grant.
+
+The id is read off `OperatorMessage.chat`, which is the only field that can do
+this job. `Effect.agent` cannot: a desk channel and a direct message to that
+desk's lead are answered by the same teammate, so placing a card by asker raises
+one conversation's request inside the other. `chat` carries a desk id for a
+channel and a roster agent id for a DM — **different strings even when the same
+agent answers both**.
+
+It inherits through a resolution, exactly as the task link does: an
+`ApprovalResolved` whose approval was itself raised in a thread keeps that
+thread, so a follow-up turn that needs a *second* sign-off re-parks in the
+channel the first one was asked in rather than falling out of the conversation.
+
+A plain `Option<String>`, not a two-armed link like `task`, and for a precise
+reason: nothing downstream falls back to a heuristic when it is absent. An
+approval with no thread matches no channel filter and stays Approvals-page-only,
+which is exactly today's behaviour. So "no conversation produced this" and
+"written before #379" need not be told apart — both are correct as the same
+answer, which is the condition #333's enum exists to handle and this does not
+have.
+
+A batch is ambiguous — and stamps nothing — when it names two different threads,
+or when it carries an addressed chat turn alongside work that is its own (a task
+dispatch, a webhook, a schedule tick, an inbound A2A task). An **unaddressed**
+operator message (`chat: None`) is itself a rival rather than a neutral
+pass-through: it went to the orchestrator with no conversation of its own, so a
+batch holding one cannot say which conversation a parked effect came from.
+
+**The redemption reply is routed by this thread too**, and that is a bug fix
+rather than a new capability. `redispatch_granted_call` journaled the
+continuation `AgentReply` with `chat_id: grant.agent` — correct for a DM by
+coincidence, and wrong for a desk channel, where the agent's continuation landed
+in the desk lead's private line instead of the channel the operator asked in. It
+now uses `grant.origin_thread`, falling back to the agent when there is none,
+which is the previous behaviour kept for exactly the cases it was already right
+for.
 
 ### What a retry would repeat (issue #351)
 
