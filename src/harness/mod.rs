@@ -288,6 +288,14 @@ pub struct HarnessDeps {
     /// [`delegations`](Self::delegations)); the default is an empty registry,
     /// which simply lists nothing and rejects every steer as `not in flight`.
     pub steer: crate::company::steer::InflightRegistry,
+    /// Issue #383 — the shared set of cancellable workflow runs. The
+    /// orchestrator's `run_workflow` tool mints its run context through this, so
+    /// an agent-initiated run appears in the same map the console's cancel route
+    /// reads and is stoppable like any other. The runtime builder threads in the
+    /// same handle it puts on the [`CompanyRuntime`](crate::company::CompanyRuntime);
+    /// the default is a private map nothing else can see, which simply means the
+    /// tool's runs are not cancellable.
+    pub run_supervisor: crate::runtime::RunSupervisor,
     /// Issue #170 — the ports an `output` node's `destination` needs to route a
     /// finished workflow's report to a person or a channel (mail handle, inbox,
     /// user directory, wired channels), bundled so this struct grows one field
@@ -1902,6 +1910,7 @@ description = "Builds the product."
                 media: None,
                 composio: None,
                 steer: crate::company::steer::InflightRegistry::default(),
+                run_supervisor: crate::runtime::RunSupervisor::default(),
                 delivery: None,
                 search: None,
                 workspace: None,
@@ -1965,6 +1974,7 @@ description = "Builds the product."
             media: None,
             composio: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             search: None,
             workspace: None,
@@ -2253,6 +2263,7 @@ description = "Builds the product."
             media: None,
             composio: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             search: None,
             workspace: None,
@@ -2413,6 +2424,7 @@ description = "Builds the product."
             media: None,
             composio: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             search: None,
             workspace: None,
@@ -2725,6 +2737,7 @@ description = "Builds the product."
             media: None,
             composio: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             search: None,
             workspace: None,
@@ -2882,6 +2895,7 @@ description = "Sets direction."
             media: None,
             composio: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             search: None,
             workspace: None,
@@ -3024,6 +3038,7 @@ description = "Sets direction."
             composio: None,
             artifacts: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             search: None,
             workspace: None,

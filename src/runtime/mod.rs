@@ -58,6 +58,11 @@ pub mod mailbox_poller;
 /// BYOK setup takes effect without a process restart. See [`rebuild`].
 pub mod rebuild;
 pub mod registry;
+/// Issue #383: [`RunSupervisor`] — the live set of workflow runs an operator can
+/// still stop, so `POST …/workflows/runs/{runId}/cancel` has something to reach.
+/// Compiled in every build: it is a plain map of stop signals and touches no
+/// engine. See [`run_supervisor`].
+pub mod run_supervisor;
 pub mod scheduler;
 /// Issue #203: the Telegram `getUpdates` long-polling listener — the inbound
 /// path that needs no public URL, mirroring OpenHuman. See [`telegram_poller`].
@@ -77,6 +82,7 @@ pub use cycle::CycleRunner;
 pub use handover::RuntimeHandover;
 pub use rebuild::{BootInputs, RebuildRequest, RuntimeRebuilder, rebuild_company};
 pub use registry::CompanyRegistry;
+pub use run_supervisor::{RunGuard, RunSupervisor};
 pub use scheduler::{Clock, CompanyScheduler, FakeClock, SystemClock};
 pub use tools::StubToolProvider;
 pub use types::{ApprovalSummary, CompanyStatus, CycleReport};

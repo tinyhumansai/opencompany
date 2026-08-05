@@ -1104,6 +1104,12 @@ impl RuntimeBuilder {
         // harness arm so `CompanyRuntime::set_steer` can be wired downstream.
         #[cfg(feature = "openhuman")]
         let mut steer_registry: Option<crate::company::steer::InflightRegistry> = None;
+        // Issue #383: likewise one run supervisor per company, shared between the
+        // harness deps (whose orchestrator `run_workflow` tool registers its runs)
+        // and the runtime (which the console's cancel route reaches). Captured
+        // from the harness arm for `CompanyRuntime::set_run_supervisor` below.
+        #[cfg(feature = "openhuman")]
+        let mut run_supervisor: Option<crate::runtime::RunSupervisor> = None;
 
         // Load the persisted record BEFORE constructing the brain so the brain's
         // in-memory record carries the operator overlays (team, desk memberships,
@@ -1239,6 +1245,9 @@ impl RuntimeBuilder {
                             // onto the runtime below.
                             let steer = crate::company::steer::InflightRegistry::new();
                             steer_registry = Some(steer.clone());
+                            // Same shape, same reason (issue #383).
+                            let supervisor = crate::runtime::RunSupervisor::new();
+                            run_supervisor = Some(supervisor.clone());
                             // Resolve the company's effective MCP servers to data
                             // (manifest ∪ runtime index, credentials materialized)
                             // before building sync deps. A corrupt index degrades
@@ -1404,6 +1413,7 @@ impl RuntimeBuilder {
                                 // never an env/platform key). `None` fails closed.
                                 composio: composio_config,
                                 steer,
+                                run_supervisor: supervisor,
                                 // Issue #170: the ports an `output` node's
                                 // `destination` needs. This is the ONLY site
                                 // that wires them — every other `HarnessDeps`
@@ -1674,6 +1684,16 @@ impl RuntimeBuilder {
         #[cfg(feature = "openhuman")]
         if let Some(registry) = steer_registry {
             runtime.set_steer(registry);
+        }
+
+        // Issue #383: attach the same run supervisor the harness deps hold, so a
+        // run started by the orchestrator's `run_workflow` tool lands in the map
+        // the console's cancel route reads. On the default build the runtime keeps
+        // the empty one it was constructed with — nothing can start a run there,
+        // so every cancel is a clean 404.
+        #[cfg(feature = "openhuman")]
+        if let Some(supervisor) = run_supervisor {
+            runtime.set_run_supervisor(supervisor);
         }
 
         // #29: install the workflow runner captured from the harness arm so

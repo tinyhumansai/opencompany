@@ -157,6 +157,18 @@ pub struct CompanyRuntime {
     /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) wires in the same handle
     /// the harness deps hold via [`set_steer`](Self::set_steer).
     pub(crate) steer: crate::company::steer::InflightRegistry,
+    /// Issue #383: the live set of workflow runs an operator can still stop.
+    ///
+    /// Always present and always compiled, like [`steer`](Self::steer) — a
+    /// [`RunSupervisor`](crate::runtime::RunSupervisor) is a map of stop signals
+    /// and touches no engine. The default build wires no runner, so nothing ever
+    /// registers and every cancel is a clean `404`.
+    ///
+    /// Every entry point that can start a run mints its context here rather than
+    /// through [`WorkflowRunContext::new`](crate::ports::WorkflowRunContext::new),
+    /// which is what makes a wedged cron fire and an agent-initiated run as
+    /// stoppable from the console as a Run-button one.
+    pub(crate) run_supervisor: crate::runtime::RunSupervisor,
     /// Issue #243: the live single-use grants minted when an operator approves a
     /// tool call an agent was blocked from making.
     ///
@@ -256,6 +268,7 @@ impl CompanyRuntime {
             source_dir: None,
             workflow_runner: None,
             steer: crate::company::steer::InflightRegistry::new(),
+            run_supervisor: crate::runtime::RunSupervisor::new(),
             grants,
             serial: Arc::new(TokioMutex::new(())),
             task_writes: Arc::new(TokioMutex::new(())),
@@ -331,6 +344,19 @@ impl CompanyRuntime {
     /// pausing / cancelling / redirecting live runs.
     pub fn steer(&self) -> &crate::company::steer::InflightRegistry {
         &self.steer
+    }
+
+    /// Issue #383: replaces this runtime's run supervisor with a shared handle
+    /// (wired by the [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) to the one
+    /// the harness deps hold, so the orchestrator's `run_workflow` tool registers
+    /// into the map the cancel route reads).
+    pub fn set_run_supervisor(&mut self, supervisor: crate::runtime::RunSupervisor) {
+        self.run_supervisor = supervisor;
+    }
+
+    /// This company's live set of cancellable workflow runs (issue #383).
+    pub fn run_supervisor(&self) -> &crate::runtime::RunSupervisor {
+        &self.run_supervisor
     }
 
     /// This company's id.

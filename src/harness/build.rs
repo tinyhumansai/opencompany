@@ -468,6 +468,9 @@ pub fn build_agent(
             // which the `run_workflow` tool loads graphs from.
             deps.skills_source_dir.clone(),
             deps.workflow_runner.clone(),
+            // Issue #383: the same supervisor the console's cancel route reads,
+            // so a run this agent starts is stoppable by an operator too.
+            deps.run_supervisor.clone(),
             // The company store, for the `add_agent` tool to persist overlay
             // teammates through the same path the console `POST .../team` uses.
             deps.store.clone(),
@@ -805,6 +808,7 @@ mod tests {
             media: None,
             composio: None,
             steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
             delivery: None,
             // Fail-closed default: with no managed search backend wired, the
             // #238 tool is never built and the pinned belt below is the
