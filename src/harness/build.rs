@@ -184,8 +184,40 @@ pub fn build_agent(
     // namespace (`docs.*`, `files.*`, or `*`). The security policy is
     // `workspace_only`, so a granted agent can read and write within its
     // workspace and nowhere else on the host.
-    if grants_cover(grants, "files") || grants_cover(grants, "docs") {
+    let wants_files = grants_cover(grants, "files") || grants_cover(grants, "docs");
+    if wants_files {
         tools.extend(file_tools(&workspace));
+    }
+
+    // `publish_artifact` (issue #244) — the only way a file the agent wrote
+    // becomes a deliverable. Two gates, and it is wired only when both hold:
+    //
+    //  1. the **same** `files`/`docs` grant the file tools ride on. An agent
+    //     that cannot write a file has nothing to publish, and offering it the
+    //     tool would only buy a confusing refusal mid-turn.
+    //  2. a configured **artifact store** (`deps.artifacts`). This is the
+    //     fail-closed half, following the `media` precedent: a tool that stages
+    //     into a queue nothing will ever drain looks like it worked, tells the
+    //     agent its deliverable is safe, and drops it. Better to not offer it
+    //     and say why in the log.
+    //
+    // Unlike `media` the grant is the ordinary namespace rule (a bare `*`
+    // confers it): publishing spends nothing and reaches nothing outside the
+    // company's own board.
+    let publishing = wants_files && deps.artifacts.is_some();
+    if publishing {
+        tools.push(Box::new(crate::harness::publish::PublishArtifactTool::new(
+            workspace.clone(),
+            deps.pending_publishes.clone(),
+        )));
+    } else if wants_files {
+        tracing::warn!(
+            company = %company,
+            agent = %manifest_agent.id,
+            "[build] agent is granted file tools but no artifact store is configured; \
+             `publish_artifact` NOT wired (fail-closed) — this agent's files cannot become \
+             deliverables"
+        );
     }
 
     // Exec-grade coding + web tools (Cell A), each behind its own grant
@@ -393,6 +425,13 @@ pub fn build_agent(
         persona.push_str(&crate::harness::workspace_tools::workspace_brief(
             workspace_writes,
         ));
+    }
+
+    // Issue #244: what a deliverable is, and how to hand one over. Only when
+    // the tool was actually wired above — describing a tool the agent does not
+    // have is how you get a turn spent calling something that does not exist.
+    if publishing {
+        persona.push_str(&crate::harness::publish::publish_brief());
     }
 
     // Skill read surface (read-only catalogue slice). Only materializes when the
@@ -799,6 +838,7 @@ mod tests {
             delegations: DelegationQueue::default(),
             workflow_runner: WorkflowRunnerHandle::default(),
             mcp_failures: McpFailureQueue::default(),
+            pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
             approval_requests: ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -922,6 +962,82 @@ mod tests {
         let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
         names.sort();
         names
+    }
+
+    /// Build one agent with an artifact store wired, so the #244 publish gate
+    /// can be exercised in both its states.
+    fn built_tool_names_with_artifacts(grants: &[&str]) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut deps = pin_deps(dir.path().to_path_buf());
+        deps.artifacts = Some(Arc::new(crate::store::FsOps::new(dir.path())));
+        let manifest_agent = ManifestAgent {
+            id: "desk".to_string(),
+            role: "Desk Lead".to_string(),
+            description: None,
+            tier: None,
+            tools: Vec::new(),
+            budget_usd_daily: None,
+        };
+        let policy = ApprovalPolicy::new(&Policy::default(), None);
+        let grants: Vec<String> = grants.iter().map(|g| g.to_string()).collect();
+        let agent = build_agent(
+            &CompanyId::new("acme"),
+            "Acme",
+            &manifest_agent,
+            policy,
+            &deps,
+            &grants,
+            &[],
+            false,
+        )
+        .expect("agent builds");
+        let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// Issue #244's two gates, in one table.
+    ///
+    /// The fail-closed row is the load-bearing one: an agent granted file tools
+    /// with **no artifact store** must not be offered `publish_artifact`. The
+    /// tool stages into a queue; with nothing to drain it, a call would report
+    /// success, tell the agent its deliverable was safe, and drop it. Not
+    /// offering it is the only honest option.
+    #[test]
+    fn publish_artifact_needs_both_a_file_grant_and_a_store() {
+        let tool = crate::harness::publish::PUBLISH_ARTIFACT_TOOL.to_string();
+
+        // `files` (and its aliases and the wildcard) + a store → present.
+        // Publishing spends nothing and reaches nothing outside the company, so
+        // unlike `media`/`search` it rides the ordinary namespace rule.
+        for grant in ["files", "docs", "files.write", "*"] {
+            let names = built_tool_names_with_artifacts(&[grant]);
+            assert!(
+                names.contains(&tool),
+                "`{grant}` + a store must wire publish_artifact: {names:?}"
+            );
+        }
+
+        // No file grant → absent. An agent that cannot write a file has nothing
+        // to publish.
+        let unfiled = built_tool_names_with_artifacts(&["web"]);
+        assert!(
+            !unfiled.contains(&tool),
+            "an agent with no file tools must not be offered publish_artifact: {unfiled:?}"
+        );
+
+        // File grant, NO store → absent, fail-closed.
+        let storeless = built_tool_names(&["files"], false);
+        assert!(
+            !storeless.contains(&tool),
+            "without an artifact store the tool would stage into a void: {storeless:?}"
+        );
+        // …and the rest of the file belt is untouched, so the gate withholds one
+        // tool rather than breaking the agent.
+        assert!(
+            storeless.contains(&"file_write".to_string()),
+            "{storeless:?}"
+        );
     }
 
     /// The three gate states of the metered `web_search` surface (issue #238),
