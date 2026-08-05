@@ -135,6 +135,49 @@ pub struct ArtifactRecord {
     pub created_at_millis: u64,
     /// Epoch-millis of the newest revision.
     pub updated_at_millis: u64,
+    /// **What this artifact is an artifact _of_** (issue #244): the normalized
+    /// workspace-relative path the agent published, e.g. `specs/launch.md`.
+    ///
+    /// # The identity contract
+    ///
+    /// `(task_id, source)` is the artifact's identity. Republishing the same
+    /// path on a later attempt appends a **version to this record**; publishing
+    /// a different path opens a new one. Nothing else may decide which record a
+    /// revision extends.
+    ///
+    /// That is a correction, not a refinement. The extend target used to be
+    /// chosen by *recency* — the most recently `updated_at_millis` artifact on
+    /// the card — which meant an operator editing artifact B made B the target
+    /// for the next agent write to A. The agent's v3 of the spec would land as
+    /// v4 of the invoice, and `human_edit_diff` would report a rewrite that
+    /// never happened. Since that diff is the entire reason this port exists,
+    /// recency selection did not merely mis-file a record; it corrupted the one
+    /// number the product is trying to produce.
+    ///
+    /// # `None` means "not published from a file"
+    ///
+    /// Every record minted after #244 carries a `source`, because the only way
+    /// to mint one is `publish_artifact` on a workspace file. So `None` marks a
+    /// **legacy** record from the era when a completed dispatch's chat reply was
+    /// captured automatically — including the refusals and blocker messages that
+    /// made the Artifacts tab claim deliverables it did not have. Those records
+    /// are kept (nothing deletes the past) and the console labels them as what
+    /// they are.
+    ///
+    /// # Limits, named rather than hidden
+    ///
+    /// Identity is the path, so **renaming a file starts a new lineage**. The
+    /// alternative — tracking moves — needs either content hashing or a rename
+    /// hook the file tools do not have, and would guess wrong exactly when two
+    /// drafts are similar. A new record for a renamed file is honest; a wrong
+    /// merge is not.
+    ///
+    /// Additive on the wire: artifacts persist as an opaque JSON blob on all
+    /// three backends (`artifact_json` on sqlite, a document on MongoDB, a file
+    /// on the filesystem), so this needs **no migration** and a pre-#244 record
+    /// loads with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl ArtifactRecord {
@@ -166,7 +209,21 @@ impl ArtifactRecord {
             }],
             created_at_millis: at_millis,
             updated_at_millis: at_millis,
+            source: None,
         }
+    }
+
+    /// Stamps the workspace-relative path this artifact was published from
+    /// (issue #244), giving it the second half of its `(task_id, source)`
+    /// identity.
+    ///
+    /// A builder rather than an eighth parameter on [`new`](Self::new): every
+    /// existing call site — the REST create route, the conformance suite, the
+    /// tests — has no path to name, and widening the signature would make them
+    /// all pass a `None` that means nothing to them.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     /// The newest revision, or `None` on an empty record.
@@ -638,5 +695,73 @@ mod test {
         assert!(!json.contains("stepSeq"));
         let back: ArtifactRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.latest().unwrap().step_seq, None);
+    }
+
+    /// Issue #244: `source` round-trips as camelCase and is omitted entirely
+    /// when absent, so a record with no path carries no empty scaffolding.
+    #[test]
+    fn source_round_trips_and_is_omitted_when_absent() {
+        let published = ArtifactRecord::new(
+            "a1",
+            "t-1",
+            "Launch spec",
+            ArtifactKind::Markdown,
+            "# Spec",
+            "ceo",
+            1,
+        )
+        .with_source("specs/launch.md");
+        let json = serde_json::to_string(&published).unwrap();
+        assert!(json.contains(r#""source":"specs/launch.md""#), "{json}");
+        let back: ArtifactRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, published);
+        assert_eq!(back.source.as_deref(), Some("specs/launch.md"));
+
+        let unsourced = ArtifactRecord::new("a2", "t-1", "D", ArtifactKind::Text, "b", "ceo", 1);
+        let json = serde_json::to_string(&unsourced).unwrap();
+        assert!(!json.contains("source"), "{json}");
+    }
+
+    /// The legacy case, pinned against a literal blob in exactly the shape
+    /// already on disk: an artifact written before #244 — a captured chat
+    /// reply, possibly a refusal — must still load, list and diff. `None` is
+    /// what marks it as legacy, so nothing may invent a value for it.
+    ///
+    /// Mirrors [`a_pre_run_id_record_still_loads`]-style coverage for the
+    /// `run_id` field, for the same reason: all three backends store this
+    /// record as an opaque JSON blob, so a `#[serde(default)]` field is the
+    /// whole migration.
+    #[test]
+    fn a_pre_publish_record_loads_with_no_source() {
+        let legacy = r#"{
+            "id": "a1",
+            "taskId": "t-1",
+            "title": "Draft the spec",
+            "kind": "text",
+            "versions": [
+                {
+                    "version": 1,
+                    "body": "I can't do this, I'm blocked on the API key.",
+                    "author": "agent",
+                    "authorId": "maya",
+                    "createdAtMillis": 5
+                }
+            ],
+            "createdAtMillis": 5,
+            "updatedAtMillis": 5
+        }"#;
+        let loaded: ArtifactRecord = serde_json::from_str(legacy).expect("a legacy record parses");
+        assert_eq!(
+            loaded.source, None,
+            "absence of a source is what marks a record as legacy capture"
+        );
+        // It still behaves as an artifact: readable, versionable, diffable.
+        assert_eq!(loaded.latest().unwrap().version, 1);
+        let mut edited = loaded;
+        edited.push_version("The spec.", ArtifactAuthor::Operator, "operator", 6, None);
+        assert!(edited.human_edit_diff().is_some());
+        // Round-tripping a legacy record must not mint a `source` for it.
+        let json = serde_json::to_string(&edited).unwrap();
+        assert!(!json.contains("source"), "{json}");
     }
 }
