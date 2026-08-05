@@ -275,12 +275,14 @@ pub(crate) struct ProviderConnection {
 /// build without the feature, or a missing credential all yield
 /// [`ComposioView::NotApplicable`], and a live probe that errors yields
 /// [`ComposioView::Unavailable`]. Nothing here can fail the connections page.
+///
+/// **Bounded on purpose.** This is a network call on a page-load path, so a
+/// backend that stops answering must degrade the Composio half of one row — not
+/// hang the whole Connections page behind a socket with no deadline. The timeout
+/// lands in [`ComposioView::Unavailable`], which the console renders as "could
+/// not check" rather than as a confident disconnected state.
 #[cfg(feature = "composio")]
-async fn composio_view(runtime: &CompanyRuntime) -> ComposioView {
-    let granted = match runtime.store().load(runtime.id()).await {
-        Ok(Some(record)) => crate::company::grants_composio_explicit(&record.manifest.tools.allow),
-        _ => false,
-    };
+async fn composio_view(runtime: &CompanyRuntime, granted: bool) -> ComposioView {
     if !granted {
         return ComposioView::NotApplicable;
     }
@@ -289,26 +291,38 @@ async fn composio_view(runtime: &CompanyRuntime) -> ComposioView {
         // reconcile against — not a failure to report.
         return ComposioView::NotApplicable;
     };
-    match crate::harness::composio::list_connection_states(&config).await {
-        Ok(states) => ComposioView::Known(
+    let probe = crate::harness::composio::list_connection_states(&config);
+    match tokio::time::timeout(COMPOSIO_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(states)) => ComposioView::Known(
             states
                 .into_iter()
                 .map(|(toolkit, connected)| (toolkit_slug(&toolkit), connected))
                 .collect(),
         ),
-        Err(err) => {
+        Ok(Err(err)) => {
             // The message is already scrubbed of the tenant credential by
             // `list_connection_states`; log at debug and degrade.
             tracing::debug!("[connections] composio probe failed: {err}");
             ComposioView::Unavailable
         }
+        Err(_elapsed) => {
+            tracing::debug!("[connections] composio probe timed out");
+            ComposioView::Unavailable
+        }
     }
 }
+
+/// How long the Composio reconciliation probe may take before the page gives up
+/// on it. Chosen to be well inside a human's tolerance for a settings page: the
+/// answer it contributes is one badge per row, and a stale-but-honest "could not
+/// check" beats a page that never paints.
+#[cfg(feature = "composio")]
+const COMPOSIO_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Without the `composio` feature there is no second namespace to reconcile
 /// against, so every provider's answer is the native one alone.
 #[cfg(not(feature = "composio"))]
-async fn composio_view(_runtime: &CompanyRuntime) -> ComposioView {
+async fn composio_view(_runtime: &CompanyRuntime, _granted: bool) -> ComposioView {
     ComposioView::NotApplicable
 }
 
@@ -324,7 +338,11 @@ pub(crate) async fn project_connections(
     let Some(record) = runtime.store().load(runtime.id()).await? else {
         return Ok(Vec::new());
     };
-    let composio = composio_view(runtime).await;
+    let composio = composio_view(
+        runtime,
+        crate::company::grants_composio_explicit(&record.manifest.tools.allow),
+    )
+    .await;
     // Host-level, so resolved once rather than per connection below.
     let host = HostConnectRoutes::from_env();
 
