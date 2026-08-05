@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { type ChatMessage, makeMessage } from "@/lib/chat";
 import { defaultDesks, type Desk } from "@/lib/desks";
+import { readLastChannel } from "@/lib/last-channel";
 import { fromDto, newMember, starterTeam, type TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { useAskerNames } from "@/components/approval-card";
@@ -313,6 +314,40 @@ export function ChatView({
   useEffect(() => {
     void loadDesks();
   }, [loadDesks]);
+
+  /**
+   * Re-entering Chat with no channel in the hash returns the operator to the
+   * one they were last reading (issue #412).
+   *
+   * Leaving Chat drops the hash's second segment, so coming back used to fall
+   * straight through to `firstChannel` — which is not memory, it is whichever
+   * channel sorts first, and it cost a re-navigation on every trip.
+   *
+   * The remembered id is written into the **hash**, not held here, for three
+   * reasons: the channel on screen stays shareable, it survives a reload, and a
+   * remembered channel that has since been removed then falls through the exact
+   * same stale-id path as a bad deep link — so it raises the unknown-channel
+   * notice from issue #370 rather than needing a second one, and lands on the
+   * fallback visibly rather than silently. The `onChannelViewed` report for
+   * whatever it fell back to re-remembers that instead, so a vanished channel
+   * corrects itself after one visit.
+   *
+   * A hash that already names a channel is a deep link and always outranks
+   * memory; this only runs when there is nothing to override. The ref makes it
+   * one attempt per bare-hash entry, so it can never fight a navigation.
+   */
+  const restoredFor = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (sub) {
+      // A channel is named, so the next bare `#/chat` is a fresh re-entry.
+      restoredFor.current = undefined;
+      return;
+    }
+    if (restoredFor.current === company) return;
+    restoredFor.current = company;
+    const remembered = readLastChannel(company);
+    if (remembered) onNavigate(remembered);
+  }, [company, sub, onNavigate]);
 
   // No channels exist until the host has answered. Resolving against a
   // half-built list is exactly the first-paint swap issue #370 describes.
