@@ -30,7 +30,12 @@ use crate::company::mcp::{McpHealth, McpServerDecl, McpStatus};
 use crate::harness::mcp::registry_from_decls;
 use crate::ports::now_millis;
 
-/// The maximum byte length of any scrubbed, surfaced message.
+/// The maximum byte length of any scrubbed, surfaced **message**.
+///
+/// Sized for a one-line operator/agent-facing sentence — an MCP failure
+/// summary, a health string. It is **not** a size for a tool *body*: see
+/// [`redact`] for why passing a successful tool result through [`scrub`] is a
+/// bug rather than a conservative choice.
 pub const SCRUB_MAX_BYTES: usize = 300;
 
 /// The shape of an MCP failure, driving both the status tier and the operator
@@ -376,14 +381,39 @@ pub async fn probe_server(decl: &McpServerDecl) -> McpHealth {
 ///    query parameter.
 /// 3. UTF-8-safely truncate to [`SCRUB_MAX_BYTES`].
 pub fn scrub(text: &str, secrets: &[String]) -> String {
+    utf8_truncate(&redact(text, secrets), SCRUB_MAX_BYTES)
+}
+
+/// The **security** half of [`scrub`] — passes 1 and 2 only, with no length
+/// cap. For tool *bodies*, which the caller must bound itself.
+///
+/// # Why this is separate (issue #410)
+///
+/// [`scrub`]'s third pass is a 300-byte message cap, and 300 bytes is right for
+/// the sentence an MCP failure renders to. It is catastrophic for a successful
+/// tool result: `composio_list_tools` routed its whole response through
+/// [`scrub`], so an agent asking what a connected provider could do received the
+/// first ~300 bytes of pretty-printed JSON — the first action and half of its
+/// schema — ending in a bare `…` that says nothing about what was lost or how
+/// to ask for less. The agent could tell actions existed but could not read the
+/// name or parameters of the one it needed, so it reissued the identical call
+/// until the repetition guard halted the run. Every Composio tool was affected,
+/// including `composio_execute`, whose provider output was capped at 300 bytes
+/// too.
+///
+/// Redaction is not the part that was wrong and must never be optional: this
+/// still replaces every known credential with `•••` and strips the query string
+/// off every embedded URL. Only the length decision moves to the caller, which
+/// is the only place that knows what a sensible bound for *that* payload is and
+/// how the agent could ask for a smaller one.
+pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_string();
     for secret in secrets {
         if !secret.is_empty() {
             out = out.replace(secret.as_str(), "•••");
         }
     }
-    out = strip_url_queries(&out);
-    utf8_truncate(&out, SCRUB_MAX_BYTES)
+    strip_url_queries(&out)
 }
 
 /// Remove the entire endpoint credential surface from an agent-visible endpoint
