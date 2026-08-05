@@ -587,6 +587,7 @@ async fn steer_task_validates_statuses_and_journals_acceptance() {
                 updated_at_millis: 1,
                 origin_chat_id: None,
                 parent_task_id: None,
+                output: None,
             },
         )
         .await
@@ -3175,6 +3176,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
         updated_at_millis: 1,
         origin_chat_id: None,
         parent_task_id: parent.map(str::to_string),
+        output: None,
     };
     for t in [
         card("t-parent", "Parent", None),
@@ -3354,6 +3356,7 @@ fn discussion_card(id: &str, title: &str) -> TaskRecord {
         updated_at_millis: 1,
         origin_chat_id: None,
         parent_task_id: None,
+        output: None,
     }
 }
 
@@ -3755,6 +3758,7 @@ async fn task_export_serves_a_readable_document_and_alters_nothing() {
                 updated_at_millis: 1,
                 origin_chat_id: None,
                 parent_task_id: None,
+                output: None,
             },
         )
         .await
@@ -3867,6 +3871,7 @@ async fn task_timeline_scopes_approvals_to_the_run_window() {
                 updated_at_millis: 1,
                 origin_chat_id: None,
                 parent_task_id: None,
+                output: None,
             },
         )
         .await
@@ -3965,6 +3970,7 @@ async fn dispatched_task(
                 updated_at_millis: 1,
                 origin_chat_id: None,
                 parent_task_id: None,
+                output: None,
             },
         )
         .await
@@ -4408,6 +4414,7 @@ async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals(
                 updated_at_millis: 1,
                 origin_chat_id: None,
                 parent_task_id: None,
+                output: None,
             },
         )
         .await

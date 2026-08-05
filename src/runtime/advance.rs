@@ -143,6 +143,7 @@ mod test {
             updated_at_millis: 1,
             origin_chat_id: None,
             parent_task_id: None,
+            output: None,
         }
     }
 

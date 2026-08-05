@@ -1008,6 +1008,9 @@ async fn run_chat(
             updated_at_millis: crate::ports::now_millis(),
             origin_chat_id: None,
             parent_task_id: None,
+            // Nothing has run yet, so there is no deliverable to point at
+            // (issue #339). The first successful settle stamps it.
+            output: None,
         };
         if let Err(err) = runtime.upsert_task(&record).await {
             tracing::warn!(error = %err, "failed to open task card for chat request");

@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::ports::artifacts::ArtifactKind;
 use crate::ports::runs::RunStatus;
 use crate::ports::types::CompanyId;
 
@@ -235,6 +236,160 @@ where
     Ok(migrate_column(String::deserialize(deserializer)?))
 }
 
+// ---------------------------------------------------------------------------
+// What the card produced (issue #339, epic #183 §6)
+// ---------------------------------------------------------------------------
+
+/// What one attempt at a card produced — the card's link to its deliverable.
+///
+/// # Why the card carries this at all
+///
+/// Every ingredient already existed and nothing tied them to the card. Attempts
+/// are first-class ([`RunRecord`](crate::ports::runs::RunRecord)); a published
+/// file is a versioned [`ArtifactRecord`](crate::ports::artifacts::ArtifactRecord)
+/// whose versions carry the producing
+/// [`run_id`](crate::ports::artifacts::ArtifactVersion::run_id); the completion
+/// event carries the artifact ids. But a *card* had no output field, so the end
+/// of a task was a chat message: prose in a conversation, with no durable thing
+/// to open, share, or hand to somebody else. This is that thing.
+///
+/// # `run_id` is unconditional, and that is the whole design
+///
+/// An output with **no** artifacts and **no** workflows is not an absence — it
+/// is the *trace case*, and it is the common one. Plenty of tasks produce no
+/// file (a message sent, a record updated, a question answered), and for those
+/// the attempt's trace **is** the deliverable. Making `run_id` mandatory is what
+/// stops "no artifact" degrading into "no link", which is the failure epic #183
+/// §6 exists to close. It is also the fallback when an artifact is later
+/// deleted: the pinned artifact link dangles, the trace does not.
+///
+/// # Which attempt, and why nothing has to choose
+///
+/// The latest **successful** one, by construction rather than by query: only a
+/// settle that reached its success terminal writes this, and a later success
+/// overwrites it wholesale. So a retried task links to the success, a failed
+/// retry after a success never erases the link to that success, and earlier
+/// attempts stay reachable through the card's own attempt list. No read-time
+/// join decides it, so there is nothing for two readers to disagree about.
+///
+/// # One primary link, derived and never stored
+///
+/// The card shows a single link; the precedence is **artifact > workflow >
+/// trace**, and anything beyond the first is reached through the task detail.
+/// That primary is computed from this record at render time and deliberately
+/// *not* persisted as a field, so it can never contradict the list it was
+/// derived from. The console owns that derivation
+/// (`frontend/src/api/tasks.ts`); this record owns the facts it derives from.
+///
+/// Additive on the wire, like [`TaskRecord::origin_chat_id`] and
+/// [`TaskRecord::parent_task_id`]: every backend stores a card as a JSON blob
+/// (`task_json` on sqlite, a document on MongoDB, a JSON array in the fs
+/// bundle), so this needs **no migration** and a card written before it existed
+/// loads with `None`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOutput {
+    /// The attempt that produced it — always present, and the link of last
+    /// resort (see the type's docs).
+    pub run_id: String,
+    /// That attempt's 1-based ordinal, for the operator-facing label
+    /// (*"attempt 2"*).
+    ///
+    /// `None` when the run row could not be read at stamp time. The ordinal is
+    /// a label, never an identity: `run_id` addresses the attempt either way, so
+    /// a failed read costs a nicety and never a link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Epoch-millis the stamp was written (the moment the attempt settled).
+    pub at_millis: u64,
+    /// Every artifact the attempt published, pinned at the version it wrote.
+    ///
+    /// Bounded by what the agent explicitly published — one entry per
+    /// `publish_artifact` call, typically one to three. Empty is the trace case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<TaskOutputArtifact>,
+    /// Every workflow the attempt ran or authored.
+    ///
+    /// Only ever non-empty for an orchestrator-desk card: `run_workflow` and
+    /// `create_workflow` are orchestrator-only tools, so a card worked by any
+    /// other teammate cannot produce one. That is a real limit of the
+    /// correlation, not of the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<TaskOutputWorkflow>,
+}
+
+/// One published deliverable, pinned to the exact revision this attempt wrote.
+///
+/// # Why the version is part of the link
+///
+/// Artifact versions are append-only and an operator edit is *a new version by
+/// a different author* ([`ArtifactRecord`](crate::ports::artifacts::ArtifactRecord)),
+/// so a `(artifact_id, version)` pair can never dangle and never silently start
+/// meaning something else. A link to the record alone would quietly re-point at
+/// whatever a human last wrote, which is exactly the case epic #183 §6 asks to
+/// keep truthful: *a task whose output was later edited by a human still
+/// resolves, and says so.* Pinning is what makes the "says so" possible — the
+/// console can compare the pinned version against the latest and name the
+/// difference.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOutputArtifact {
+    /// The artifact record's id.
+    pub artifact_id: String,
+    /// The 1-based revision this attempt wrote.
+    pub version: u32,
+    /// The artifact's display title, copied so the card can label its link
+    /// without a second read on every board poll.
+    pub title: String,
+    /// What it holds, so the console picks a renderer without opening it.
+    pub kind: ArtifactKind,
+}
+
+/// What an attempt did with a workflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskOutputAction {
+    /// It executed the graph.
+    Ran,
+    /// It authored and saved the graph.
+    Created,
+}
+
+impl TaskOutputAction {
+    /// The stable wire word, for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskOutputAction::Ran => "ran",
+            TaskOutputAction::Created => "created",
+        }
+    }
+}
+
+/// A workflow the attempt ran or built.
+///
+/// # Deliberately **not** pinned to a graph revision
+///
+/// Unlike an artifact, a workflow graph mutates in place — there is no version
+/// history to pin to, and inventing one would mean snapshotting graphs on every
+/// edit, which this codebase does not do. So the link opens the workflow *as it
+/// is now*, and when the attempt actually executed it, [`Self::run_id`] opens
+/// the run overlay showing what really ran. That is the honest limit: a graph
+/// edited after the fact will not match the run, and the run record is what
+/// says what happened. Naming that beats hiding it behind a link that pretends
+/// to be pinned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOutputWorkflow {
+    /// The workflow's id (its `workflows/<id>.toml` stem).
+    pub workflow_id: String,
+    /// The workflow run this attempt started, when it ran one. `None` for a
+    /// workflow the attempt only authored — nothing has executed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Whether the attempt ran it or created it.
+    pub action: TaskOutputAction,
+}
+
 /// One card on the company's task board.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -293,6 +448,22 @@ pub struct TaskRecord {
     /// board needs migrating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// What the card's latest **successful** attempt produced (issue #339) —
+    /// the link that turns a finished card into something you can open.
+    ///
+    /// Written by the dispatch settle and only when the attempt reached its
+    /// success terminal; a failed or cancelled settle leaves the previous stamp
+    /// alone, so a retry that fails never erases the link to the success before
+    /// it. See [`TaskOutput`] for which attempt wins and why nothing has to
+    /// choose at read time.
+    ///
+    /// `None` for a card that has never succeeded, for one moved to Done by
+    /// hand, and for every card settled before this field existed. Those degrade
+    /// to a link to the card itself rather than to a synthesized output —
+    /// fabricating an attempt id for a card that never recorded one would be a
+    /// lie about identity, which is the one thing the epic's link must not be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<TaskOutput>,
 }
 
 /// Durable per-company task board. Company A's tasks MUST be invisible to
@@ -524,5 +695,115 @@ mod test {
         for column in BOARD_COLUMNS {
             assert_eq!(migrate_column(column.to_string()), column);
         }
+    }
+
+    fn plain_card() -> TaskRecord {
+        TaskRecord {
+            id: "t-1".to_string(),
+            title: "Draft the spec".to_string(),
+            note: None,
+            column: COLUMN_IN_REVIEW.to_string(),
+            priority: "medium".to_string(),
+            assignee: "maya".to_string(),
+            updated_at_millis: 7,
+            origin_chat_id: None,
+            parent_task_id: None,
+            output: None,
+        }
+    }
+
+    /// Issue #339: the whole stamp round-trips as camelCase, and — the part
+    /// that matters — a card written before it existed still loads, with
+    /// `None`. All three backends persist a card as an opaque JSON blob, so a
+    /// `#[serde(default)]` field is the entire migration.
+    #[test]
+    fn an_output_stamp_round_trips_and_is_absent_on_a_legacy_card() {
+        let mut card = plain_card();
+        card.output = Some(TaskOutput {
+            run_id: "run-2".to_string(),
+            attempt: Some(2),
+            at_millis: 99,
+            artifacts: vec![TaskOutputArtifact {
+                artifact_id: "a-1".to_string(),
+                version: 3,
+                title: "Launch spec".to_string(),
+                kind: ArtifactKind::Markdown,
+            }],
+            workflows: vec![TaskOutputWorkflow {
+                workflow_id: "digest".to_string(),
+                run_id: Some("wf-run-1".to_string()),
+                action: TaskOutputAction::Ran,
+            }],
+        });
+
+        let json = serde_json::to_string(&card).expect("serialize");
+        assert!(json.contains(r#""runId":"run-2""#), "{json}");
+        assert!(json.contains(r#""artifactId":"a-1""#), "{json}");
+        assert!(json.contains(r#""action":"ran""#), "{json}");
+        assert_eq!(card, serde_json::from_str(&json).expect("round trip"));
+
+        // Exactly the blob a pre-#339 build persisted: no `output` key at all.
+        let legacy = r#"{
+            "id": "t-1",
+            "title": "Draft the spec",
+            "column": "done",
+            "priority": "medium",
+            "assignee": "maya",
+            "updatedAtMillis": 7
+        }"#;
+        let loaded: TaskRecord = serde_json::from_str(legacy).expect("a legacy card parses");
+        assert_eq!(
+            loaded.output, None,
+            "a card that never recorded an attempt must not be given a synthesized one"
+        );
+        // And an unstamped card carries no empty scaffolding on the wire.
+        let round_tripped = serde_json::to_string(&loaded).expect("serialize");
+        assert!(!round_tripped.contains("output"), "{round_tripped}");
+    }
+
+    /// The trace case, pinned as its own test because it is the acceptance
+    /// criterion most easily lost: *"every card has a link including tasks that
+    /// produced no file."* An output with neither artifacts nor workflows is a
+    /// complete, valid stamp — the attempt is the deliverable — so `runId` must
+    /// survive a round trip on its own, with both lists omitted entirely.
+    #[test]
+    fn a_task_that_produced_no_file_still_carries_a_link() {
+        let mut card = plain_card();
+        card.output = Some(TaskOutput {
+            run_id: "run-1".to_string(),
+            attempt: Some(1),
+            at_millis: 5,
+            artifacts: Vec::new(),
+            workflows: Vec::new(),
+        });
+
+        let json = serde_json::to_string(&card).expect("serialize");
+        assert!(json.contains(r#""runId":"run-1""#), "{json}");
+        assert!(!json.contains("artifacts"), "{json}");
+        assert!(!json.contains("workflows"), "{json}");
+
+        let back: TaskRecord = serde_json::from_str(&json).expect("round trip");
+        let output = back.output.expect("the stamp survives with no deliverable");
+        assert_eq!(output.run_id, "run-1");
+        assert!(output.artifacts.is_empty());
+        assert!(output.workflows.is_empty());
+    }
+
+    /// The attempt ordinal is a label, not an identity: a stamp written when
+    /// the run row could not be read still addresses its attempt.
+    #[test]
+    fn an_unknown_attempt_ordinal_still_leaves_an_addressable_link() {
+        let output = TaskOutput {
+            run_id: "run-9".to_string(),
+            attempt: None,
+            at_millis: 5,
+            artifacts: Vec::new(),
+            workflows: Vec::new(),
+        };
+        let json = serde_json::to_string(&output).expect("serialize");
+        assert!(!json.contains("attempt"), "{json}");
+        let back: TaskOutput = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back.run_id, "run-9");
+        assert_eq!(back.attempt, None);
     }
 }

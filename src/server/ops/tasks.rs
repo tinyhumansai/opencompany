@@ -312,6 +312,9 @@ async fn create_task(
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty()),
         parent_task_id: body.parent_task_id,
+        // Nothing has run yet, so there is no deliverable to point at
+        // (issue #339). The first successful settle stamps it.
+        output: None,
     };
     company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))

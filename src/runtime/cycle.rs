@@ -1566,6 +1566,9 @@ impl<'a> CycleHostImpl<'a> {
             // is a chat-turn delegation, so no task is in scope to be the
             // parent. Lineage is set through the task API's `parentTaskId`.
             parent_task_id: None,
+            // Nothing has run yet, so there is no deliverable to point at
+            // (issue #339). The first successful settle stamps it.
+            output: None,
         };
         self.rt.tasks().upsert(&self.company, &card).await?;
         Ok(ToolResult {
@@ -1654,6 +1657,9 @@ impl<'a> CycleHostImpl<'a> {
             // is a chat-turn delegation, so no task is in scope to be the
             // parent. Lineage is set through the task API's `parentTaskId`.
             parent_task_id: None,
+            // Nothing has run yet, so there is no deliverable to point at
+            // (issue #339). The first successful settle stamps it.
+            output: None,
         };
         self.rt.tasks().upsert(&self.company, &card).await?;
         Ok(ToolResult {
@@ -2145,6 +2151,9 @@ mod test {
                     updated_at_millis: 1,
                     origin_chat_id: None,
                     parent_task_id: None,
+                    // Nothing has run yet, so there is no deliverable to point at
+                    // (issue #339). The first successful settle stamps it.
+                    output: None,
                 },
             )
             .await
@@ -2198,6 +2207,9 @@ mod test {
                     updated_at_millis: 1,
                     origin_chat_id: None,
                     parent_task_id: None,
+                    // Nothing has run yet, so there is no deliverable to point at
+                    // (issue #339). The first successful settle stamps it.
+                    output: None,
                 },
             )
             .await
@@ -4751,6 +4763,9 @@ mod test {
                     updated_at_millis: 0,
                     origin_chat_id: None,
                     parent_task_id: None,
+                    // Nothing has run yet, so there is no deliverable to point at
+                    // (issue #339). The first successful settle stamps it.
+                    output: None,
                 },
             )
             .await
@@ -4813,6 +4828,9 @@ mod test {
                     updated_at_millis: 0,
                     origin_chat_id: None,
                     parent_task_id: None,
+                    // Nothing has run yet, so there is no deliverable to point at
+                    // (issue #339). The first successful settle stamps it.
+                    output: None,
                 },
             )
             .await

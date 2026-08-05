@@ -646,6 +646,7 @@ async fn tasks_page_reflects_upserts_and_column_filter() {
                 updated_at_millis: 1_700_000_000_000,
                 origin_chat_id: None,
                 parent_task_id: None,
+                output: None,
             },
         )
         .await
