@@ -480,6 +480,7 @@ fn the_scan_ignores_what_the_runtime_itself_writes() {
         "session_raw/1785952277_chief.jsonl",
         "artifacts/some-id/content",
         "checkpoints/state.json",
+        "tinyagents_store/journal/session.1785953147_ceo.messages.jsonl",
         ".openhuman/subagent_checkpoints/a.json",
         ".runs/run-1.json",
         "audit.log",

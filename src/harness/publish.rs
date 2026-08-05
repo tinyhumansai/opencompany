@@ -90,21 +90,24 @@ pub const MAX_ARTIFACT_BODY_BYTES: usize = 256 * 1024;
 /// thousands of entries under it.
 ///
 /// **The runtime's own bookkeeping** — `sessions`, `session_raw`, `artifacts`,
-/// `checkpoints`. The agent's `workspace_dir` is *also* where OpenHuman writes
-/// its session transcripts (`sessions/<date>/*.md`, `session_raw/*.jsonl`), its
-/// own artifact store and its subagent checkpoints. Those are written on **every
-/// single run**, by the harness rather than by the agent, so without this the
+/// `checkpoints`, `tinyagents_store`. The agent's `workspace_dir` is *also*
+/// where OpenHuman writes its session transcripts (`sessions/<date>/*.md`,
+/// `session_raw/*.jsonl`), its own artifact store and its subagent checkpoints,
+/// and where TinyAgents writes its message journal
+/// (`tinyagents_store/journal/session.*.messages.jsonl`). Those are written on
+/// **every single run**, by the harness rather than by the agent, so without this the
 /// scan would report unpublished changes after every dispatch and the nudge
 /// would fire every time — asking an agent whether its own transcript is a
 /// deliverable. That is not a tuning detail; it is the difference between a
 /// feature and a permanent false positive.
-const SCAN_SKIP_DIRS: [&str; 6] = [
+const SCAN_SKIP_DIRS: [&str; 7] = [
     "node_modules",
     "target",
     "sessions",
     "session_raw",
     "artifacts",
     "checkpoints",
+    "tinyagents_store",
 ];
 
 /// File names the scan ignores wherever they appear.
