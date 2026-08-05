@@ -83,7 +83,6 @@ use crate::company::{
     workflow_version,
 };
 use crate::error::OpenCompanyError;
-use crate::ports::WorkflowRunContext;
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, EventSeq, OverlayWorkflow, WorkflowNodeStatus,
 };
@@ -110,6 +109,18 @@ pub fn router() -> Router<AppState> {
         // Same static-before-dynamic ordering as `/workflows/runs` above, for
         // the same reason: `cron` is a syntactically valid `wid`.
         .merge(scoped("/workflows/cron/preview", post(preview_cron)))
+        // Issue #383: stop a run that is still walking its graph. Registered
+        // here, with the other static `/workflows/...` prefixes and BEFORE the
+        // dynamic `/workflows/{wid}` below, for the reason the comment above
+        // gives — `runs` is a syntactically valid `wid`. This particular path is
+        // four segments deep so it could not actually collide with the two- and
+        // three-segment dynamic routes, but keeping the registration order
+        // uniform is what stops the next four-segment static route from being
+        // the one that silently loses.
+        .merge(scoped(
+            "/workflows/runs/{rid}/cancel",
+            post(cancel_workflow_run),
+        ))
         // Issue #259: read, replace, remove — all on the same id. `PUT` is a
         // full replace rather than a `PATCH` merge because a workflow *is* its
         // graph: a partial node/edge merge has no well-defined meaning (which
@@ -733,6 +744,17 @@ struct WorkflowPath {
 struct RunWorkflowBody {
     #[serde(default)]
     input: Value,
+    /// Return as soon as the run has an id, instead of holding the request open
+    /// for the whole run (issue #383).
+    ///
+    /// **Opt-in, and compatible in both directions.** A caller that omits it
+    /// gets today's synchronous response byte-for-byte. A newer console talking
+    /// to an *older* host sends it and the old host ignores the unknown field
+    /// (this struct has no `deny_unknown_fields`) and answers the full
+    /// synchronous 200 — which is exactly why the console must decide what
+    /// happened from the response's **shape**, not from what it asked for.
+    #[serde(default)]
+    detach: bool,
 }
 
 /// The run response: the engine's final state plus any nodes left pending
@@ -757,12 +779,127 @@ struct RunWorkflowResponse {
     run_id: String,
 }
 
+/// The `detach: true` response (issue #383): the run's id, handed back before
+/// the engine has walked a single node.
+///
+/// **`detached` is the discriminator, and it is a constant `true` on purpose.**
+/// A newer console pointed at an older host sends `detach` and gets the *full
+/// synchronous* body back, because the old host ignores the unknown field. So
+/// the console cannot tell the two apart by what it asked for — only by what
+/// came back. `output` present means the run already settled; `detached`
+/// present means watch the stream. A field that is only ever `true` is what
+/// makes that a presence check rather than a guess.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DetachedRunResponse {
+    run_id: String,
+    detached: bool,
+}
+
+/// The two shapes `POST …/workflows/{wid}/run` can answer with.
+///
+/// An enum rather than a bare [`Response`] so the two bodies stay typed and the
+/// status codes live in one place: `200` for the settled run the route has
+/// always returned, `202 Accepted` for a run that has been accepted and started
+/// but has not finished — which is precisely what `202` means.
+enum RunWorkflowOk {
+    Settled(RunWorkflowResponse),
+    Detached(DetachedRunResponse),
+}
+
+impl IntoResponse for RunWorkflowOk {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Settled(body) => Json(body).into_response(),
+            Self::Detached(body) => (StatusCode::ACCEPTED, Json(body)).into_response(),
+        }
+    }
+}
+
+/// Registers a run with the company's [`RunSupervisor`] and drives it on its own
+/// task (issue #383).
+///
+/// # Why both modes go through here
+///
+/// The detached mode obviously needs a spawned task — there is no request left
+/// to hold it. The *synchronous* mode does not, and routes it through anyway,
+/// which buys something the old inline `await` did not have: the run no longer
+/// dies with the connection. Axum drops a handler future when the client goes
+/// away, so before this, a `curl` killed mid-run took the run's remaining nodes
+/// with it — leaving a `WorkflowRunStarted` with no finish, which the boot sweep
+/// then stamped "interrupted by a host restart" even though no restart happened.
+/// A spawned task outlives the handler, so the sync path now journals its
+/// outcome whether or not anyone is still listening.
+///
+/// The [`RunGuard`](crate::runtime::RunGuard) is moved into the task and held
+/// across the `record_run_finished`, so a run stays cancellable right up to the
+/// moment it settles and not one moment after.
+///
+/// A **fresh task is correct here** for the same reason the cron scheduler's is
+/// (see `workflow_scheduler`): the `WORKFLOW_DEPTH` re-entry guard counts one
+/// causal chain, and an operator pressing Run is a new root at depth 0. What
+/// would break the guard is spawning *inside* an existing run's chain — which is
+/// why the orchestrator's `run_workflow` tool deliberately does NOT use this.
+fn spawn_workflow_run(
+    runtime: std::sync::Arc<crate::company::runtime::CompanyRuntime>,
+    runner: std::sync::Arc<dyn crate::ports::WorkflowRunner>,
+    workflow: WorkflowFile,
+    input: Value,
+) -> (
+    String,
+    tokio::task::JoinHandle<crate::Result<crate::ports::WorkflowRun>>,
+) {
+    // Issue #371 mints the id above the runner so the error arm can still
+    // correlate; issue #383 mints it HERE, through the supervisor, so the same
+    // id is also an address an operator can send "stop" to. Deliberately not a
+    // second identifier — the run id the console already correlates SSE frames
+    // on IS the cancellation handle.
+    let (ctx, guard) = runtime.run_supervisor().begin(&workflow.id, false);
+    let run_id = ctx.run_id.clone();
+    let handle = tokio::spawn(async move {
+        // Held for the whole run INCLUDING the journal write below, so the
+        // window in which a cancel is accepted matches the window in which it
+        // can still do anything. Dropping on every exit path, unwind included,
+        // is why this is a guard rather than a call at the end.
+        let _guard = guard;
+        let result = runner.run(runtime.id(), &workflow, input, &ctx).await;
+        // Issue #228: journaled on BOTH arms. The caller may well have closed
+        // the tab; the record is what is still there tomorrow.
+        match result.as_ref() {
+            Ok(run) => {
+                record_run_finished(
+                    runtime.events(),
+                    runtime.id(),
+                    &workflow.id,
+                    false,
+                    &ctx.run_id,
+                    Ok(run),
+                )
+                .await;
+            }
+            Err(err) => {
+                record_run_finished(
+                    runtime.events(),
+                    runtime.id(),
+                    &workflow.id,
+                    false,
+                    &ctx.run_id,
+                    Err(err.to_string().as_str()),
+                )
+                .await;
+            }
+        }
+        result
+    });
+    (run_id, handle)
+}
+
 /// `POST …/workflows/{wid}/run` (both scope forms).
 async fn run_workflow(
     company: ScopedCompany,
     Path(WorkflowPath { wid }): Path<WorkflowPath>,
     body: Option<Json<RunWorkflowBody>>,
-) -> Result<Json<RunWorkflowResponse>, Response> {
+) -> Result<RunWorkflowOk, Response> {
     // No runner wired. Two very different causes look identical from here, and
     // `not_wired` only describes the first (issue #266):
     //   1. this build/deployment has no workflow execution at all — nothing the
@@ -797,56 +934,114 @@ async fn run_workflow(
             ApiError(OpenCompanyError::CompanyNotFound(format!("workflow {wid}"))).into_response()
         })?;
 
-    let input = body.map(|Json(b)| b.input).unwrap_or(Value::Null);
-    // Issue #371: minted HERE, above the call, not inside the runner. The error
-    // arm below journals an outcome for a run that returned nothing at all, and
-    // that outcome has to carry the same id as the progress events the run
-    // already emitted — otherwise a failed run's nodes would be orphaned from
-    // the record that says why it failed, which is the exact case the issue is
-    // about ("a run that fails at the fourth of six nodes reports only that it
-    // failed").
-    let ctx = WorkflowRunContext::new(false);
-    let run = match runner.run(company.id(), &file, input, &ctx).await {
-        Ok(run) => run,
-        Err(err) => {
-            // Issue #228: a manual run that dies is journaled too, before the
-            // error goes back. The caller sees the 5xx and may well close the
-            // tab; the record is what is still there tomorrow.
-            record_run_finished(
-                company.runtime.events(),
-                company.id(),
-                &wid,
-                false,
-                &ctx.run_id,
-                Err(err.to_string().as_str()),
-            )
-            .await;
-            return Err(ApiError(err).into_response());
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let detach = body.detach;
+
+    // Issue #383: registered and spawned before either mode branches, so the two
+    // modes cannot drift in what they start. Issue #228's journalling now lives
+    // inside the task rather than around this await.
+    let (run_id, handle) =
+        spawn_workflow_run(company.runtime.clone(), runner.clone(), file, body.input);
+
+    if detach {
+        // Returned before the engine has walked a node. From here the client
+        // follows the run through the SSE frames issue #371 already keys by this
+        // id, and reads its outcome back from `GET …/workflows/runs`, whose fold
+        // already reports `running: true` for a run in flight.
+        //
+        // The task is deliberately NOT joined and its handle is dropped: it
+        // settles itself, journals its own outcome, and its guard deregisters
+        // it. Detaching is the entire point.
+        return Ok(RunWorkflowOk::Detached(DetachedRunResponse {
+            run_id,
+            detached: true,
+        }));
+    }
+
+    // The synchronous mode, whose response is unchanged: await the task rather
+    // than the runner. A `JoinError` here means the run task panicked or was
+    // aborted — the run's outcome was never journaled, so there is nothing
+    // truthful to hand back and this is a genuine 500 rather than a run result.
+    match handle.await {
+        Ok(Ok(run)) => Ok(RunWorkflowOk::Settled(RunWorkflowResponse {
+            output: run.output,
+            pending_approvals: run.pending_approvals,
+            deliveries: run.deliveries,
+            run_id,
+        })),
+        Ok(Err(err)) => Err(ApiError(err).into_response()),
+        Err(join) => {
+            tracing::error!(
+                company = %company.id(),
+                workflow = %wid,
+                %run_id,
+                %join,
+                "workflow run task did not complete; no outcome was journaled for it"
+            );
+            // `BackgroundTask`, not a harness error: the distinction it draws —
+            // "the work's outcome is unknown", as opposed to "the work failed" —
+            // is exactly right here. The run may even have done most of its
+            // nodes; what is missing is an answer.
+            Err(ApiError(OpenCompanyError::BackgroundTask(
+                "the workflow run task did not complete".to_string(),
+            ))
+            .into_response())
         }
-    };
+    }
+}
 
-    // Issue #228: journal the outcome so a manual run's delivery rows stop being
-    // drawer-transient. Until now they lived in the console's run panel until it
-    // was dismissed and then existed nowhere — the operator could not answer
-    // "did that report actually go out?" an hour later. Recorded through the
-    // same helper the scheduler uses, so history is uniform whatever started the
-    // run. Best-effort: the response below is returned either way.
-    record_run_finished(
-        company.runtime.events(),
-        company.id(),
-        &wid,
-        false,
-        &ctx.run_id,
-        Ok(&run),
-    )
-    .await;
+/// The sub-resource path on the cancel route: the run id.
+#[derive(Debug, Deserialize)]
+struct RunPath {
+    rid: String,
+}
 
-    Ok(Json(RunWorkflowResponse {
-        output: run.output,
-        pending_approvals: run.pending_approvals,
-        deliveries: run.deliveries,
-        run_id: ctx.run_id,
-    }))
+/// The cancel acknowledgement (issue #383).
+///
+/// `cancelling`, not `cancelled`: this route fires a signal and returns. The run
+/// is stopped at the engine future's next suspension point and settles itself a
+/// moment later with a `WorkflowRunFinished{cancelled: true}` — which is the
+/// event the console should believe, not this body.
+#[derive(Debug, Serialize)]
+struct CancelRunResponse {
+    cancelling: bool,
+}
+
+/// `POST …/workflows/runs/{rid}/cancel` (both scope forms) — stop a run that is
+/// still walking its graph (issue #383).
+///
+/// # Who may cancel
+///
+/// Anyone who passes this route's [`ScopedCompany`] guard, i.e. any operator of
+/// the company. There is deliberately no "only the operator who started it"
+/// rule: a run is a company-level activity, the console shows it to every
+/// operator, and the case this exists for — a run wedged on a slow agent node —
+/// is exactly the one where whoever started it may have gone home.
+///
+/// # 404 covers two cases, and means one thing
+///
+/// An unknown run id and an already-settled run both answer `404`. They are the
+/// same answer to the operator: there is nothing here to stop. Keeping a
+/// tombstone to tell them apart would mean picking an expiry for it, and the run
+/// history already says what became of a settled run.
+///
+/// # What a cancelled run leaves behind
+///
+/// Journaled node rows for the nodes that completed, a `WorkflowRunFinished`
+/// carrying `cancelled: true` and no error, and **any approvals earlier nodes
+/// parked stay valid in the queue** — those are journal-backed and independent
+/// of the run, so an operator may still approve or deny them afterwards. No
+/// grant minted during the run is revoked.
+async fn cancel_workflow_run(
+    company: ScopedCompany,
+    Path(RunPath { rid }): Path<RunPath>,
+) -> Result<Json<CancelRunResponse>, ApiError> {
+    if company.runtime.run_supervisor().cancel(&rid) {
+        return Ok(Json(CancelRunResponse { cancelling: true }));
+    }
+    Err(ApiError(OpenCompanyError::CompanyNotFound(format!(
+        "workflow run {rid}"
+    ))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +1204,16 @@ struct WorkflowRunOutcome {
     /// keeps every settled row's wire shape as short as it was.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     running: bool,
+    /// `true` for a run an operator stopped (issue #383).
+    ///
+    /// Separate from [`error`](Self::error) because it is a separate outcome: a
+    /// cancelled run carries no error, so a console reading only `error` would
+    /// render a deliberate stop as a clean success. Together with `error` these
+    /// give the three terminal readings the history panel distinguishes —
+    /// failed, interrupted by a host restart, stopped by an operator. Omitted
+    /// when false, like `running`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cancelled: bool,
 }
 
 /// One node's outcome inside a run (issue #371).
@@ -1107,6 +1312,11 @@ async fn list_runs(
                     // Flipped off by the finish. A start that never gets one is
                     // a run in flight — or one the boot sweep has yet to settle.
                     running: true,
+                    // Only a finish can say this, so a run still in flight is
+                    // never cancelled from the fold's point of view — even one
+                    // whose signal has already been fired, because it has not
+                    // wound down yet.
+                    cancelled: false,
                 });
             }
             CompanyEvent::WorkflowNodeFinished {
@@ -1137,6 +1347,7 @@ async fn list_runs(
                 deliveries,
                 pending_approvals,
                 error,
+                cancelled,
             } => {
                 if !matches(&workflow_id) {
                     continue;
@@ -1153,6 +1364,7 @@ async fn list_runs(
                     entry.pending_approvals = pending_approvals;
                     entry.error = error;
                     entry.running = false;
+                    entry.cancelled = cancelled;
                     continue;
                 }
                 // …else stand alone. Two ways to get here, both legitimate: a
@@ -1172,6 +1384,7 @@ async fn list_runs(
                     nodes: Vec::new(),
                     started_at_millis: None,
                     running: false,
+                    cancelled,
                 });
             }
             _ => {}
@@ -2125,6 +2338,7 @@ mod tests {
                         deliveries,
                         pending_approvals: Vec::new(),
                         error: error.map(str::to_string),
+                        cancelled: false,
                     },
                 )
                 .await
@@ -2299,6 +2513,7 @@ mod tests {
                         deliveries: Vec::new(),
                         pending_approvals: Vec::new(),
                         error: error.map(str::to_string),
+                        cancelled: false,
                     },
                 )
                 .await
