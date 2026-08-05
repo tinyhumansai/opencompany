@@ -23,6 +23,34 @@
 //!   product — it is a hatch, not a deployment mode, and nothing else about
 //!   standalone operation is supported this milestone.
 //!
+//! ## Who a connection belongs to (issue #403)
+//!
+//! **A connection belongs to the company, and is admin-managed.** The account
+//! reached through it is the account the company's *agents* act through, so it
+//! is company property in the same sense the roster and the manifest are — not
+//! the personal property of whichever member happened to click Connect.
+//!
+//! This is not a new position; it is the one the code already took and did not
+//! enforce. The native OAuth plane's connect-time identity check
+//! ([`account_mismatch`](super::connections)) compares the connected account
+//! against `bootstrap_admins` — the company's *admin* addresses — which only
+//! makes sense if a connection is the company's. Issue #316 settled "one
+//! operator, one connected account"; this is the layer above it, and it
+//! resolves the same way.
+//!
+//! Two consequences, both deliberate:
+//!
+//! * **Writes require an admin.** `PUT …/composio/token` and
+//!   `POST …/composio/authorize` take [`AdminScopedCompany`]. A member is
+//!   refused with a message that says why.
+//! * **Reads stay open to any member.** `GET …/composio` and
+//!   `GET …/composio/connections` carry no credential — only a tier name,
+//!   non-secret routing, and which providers are connected. Knowing *that*
+//!   Gmail is connected is what lets a member understand why an agent can read
+//!   mail; being able to change it is the part that needed an owner. The split
+//!   mirrors the roster, where `GET …/team` is open and the budget writes are
+//!   not.
+//!
 //! Either way the token is **write-only** over the API: set through the `token`
 //! field, stored in the secret store under
 //! [`TOKEN_KEY`](crate::company::composio::TOKEN_KEY), and **never** echoed. The
@@ -41,8 +69,9 @@ use crate::AppState;
 use crate::company::composio::{backend_url_or_default, store_token, token_configured};
 use crate::company::credentials::{CredentialSource, TinyhumansTokenSource};
 use crate::company::runtime::CompanyRuntime;
+use crate::ports::types::CompanyEvent;
 use crate::server::error::ApiError;
-use crate::server::ops::{ScopedCompany, scoped};
+use crate::server::ops::{AdminScopedCompany, ScopedCompany, scoped};
 
 /// The reminder attached to every mutating response.
 const SWITCH_NOTE: &str =
@@ -269,18 +298,62 @@ async fn get_status(company: ScopedCompany) -> Result<Json<ComposioStatusDto>, A
 /// `PUT …/composio/token` — set / rotate / clear this company's BYO token. See
 /// the module docs: the hosted path needs no token, and standalone operation
 /// (where this is the only option) is unsupported.
+///
+/// **Admin-only** (issue #403). This is the sharpest write in the module: the
+/// token it stores is the identity every one of the company's agents presents
+/// to Composio, so whoever sets it decides which account those agents act
+/// through. That is a decision made *for* the company, not a member's own, and
+/// [`AdminScopedCompany`] is what says so in the signature.
 async fn set_token(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Json(body): Json<SetToken>,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let runtime = company.runtime.as_ref();
     store_token(runtime.id(), runtime.secrets().as_ref(), &body.token)
         .await
         .map_err(ApiError)?;
+    // After the store, so the journal records a completed change. An empty
+    // value is a clear, not a set — the two are worth telling apart in an
+    // audit trail, since one grants access and the other withdraws it.
+    let change = if body.token.trim().is_empty() {
+        "credential_cleared"
+    } else {
+        "credential_set"
+    };
+    journal(&company, change, None).await?;
     Ok(Json(MutationResponse {
         status: effective_status(runtime).await?,
         note: SWITCH_NOTE.to_string(),
     }))
+}
+
+/// Records who changed the company's tool access (issue #403).
+///
+/// Propagates a journal failure rather than swallowing it, unlike the
+/// best-effort workflow journaling. The point of this record is that a change
+/// to what the company's agents connect through is never invisible; an audit
+/// line that quietly fails to be written is the one failure mode that would
+/// defeat it. `MemoryFactDeleted` — the other write journaled *for* the audit
+/// trail — propagates for the same reason.
+async fn journal(
+    company: &AdminScopedCompany,
+    change: &str,
+    toolkit: Option<String>,
+) -> Result<(), ApiError> {
+    company
+        .runtime
+        .events()
+        .append(
+            company.id(),
+            CompanyEvent::ToolAccessChanged {
+                change: change.to_string(),
+                toolkit,
+                by: Some(company.actor()),
+            },
+        )
+        .await
+        .map_err(ApiError)?;
+    Ok(())
 }
 
 /// `POST …/composio/authorize` — begin a per-provider OAuth handoff and return
@@ -290,11 +363,29 @@ async fn set_token(
 /// The console opens the URL and polls [`connections`] until the toolkit
 /// reports connected. Under a non-`composio` build this answers `409 Conflict`
 /// (see [`router`]).
+///
+/// **Admin-only** (issue #403). The connection this begins belongs to the
+/// company — it is the account its agents will act through from then on — so
+/// the person who chooses it has to be someone entitled to choose on the
+/// company's behalf. Note that nothing downstream can re-check this: Composio
+/// runs its own OAuth with no callback here, so unlike the native connections
+/// plane there is no later point at which the connecting identity could be
+/// compared against the company's operators. Connect time is the only boundary
+/// there is.
 async fn authorize(
-    company: ScopedCompany,
+    company: AdminScopedCompany,
     Json(body): Json<AuthorizeBody>,
 ) -> Result<Json<AuthorizeDto>, ApiError> {
-    authorize_impl(company.runtime.as_ref(), body.toolkit).await
+    let dto = authorize_impl(company.runtime.as_ref(), body.toolkit.clone()).await?;
+    // Only once a connect URL was actually minted — a refused or unbuildable
+    // authorize changed nothing and does not belong in the trail.
+    journal(
+        &company,
+        "provider_authorization_started",
+        Some(body.toolkit),
+    )
+    .await?;
+    Ok(dto)
 }
 
 /// `GET …/composio/connections` — the company's per-toolkit connected state,
@@ -465,10 +556,35 @@ mod tests {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value, String) {
-        let request = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("cookie", crate::server::test_support::fixed_cookie("acme"));
+        send_as(
+            state,
+            method,
+            uri,
+            body,
+            Auth::Cookie(crate::server::test_support::fixed_cookie("acme")),
+        )
+        .await
+    }
+
+    /// How a request presents itself, so the role boundary can be driven with
+    /// an admin session, a member session, or a machine credential.
+    enum Auth {
+        Cookie(String),
+        Bearer(String),
+    }
+
+    async fn send_as(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        auth: Auth,
+    ) -> (StatusCode, Value, String) {
+        let request = Request::builder().method(method).uri(uri);
+        let request = match auth {
+            Auth::Cookie(cookie) => request.header("cookie", cookie),
+            Auth::Bearer(token) => request.header("authorization", format!("Bearer {token}")),
+        };
         let request = match body {
             Some(body) => request
                 .header("content-type", "application/json")
@@ -718,6 +834,243 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{raw}");
         assert_eq!(body["code"], "conflict", "{body}");
+    }
+
+    // --- Who may change what the company connects through (issue #403) -------
+
+    /// A company granting composio with one provider — the shape every
+    /// authorization test below drives.
+    const GRANTED: &str = "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+         [tools]\nallow = [\"composio\"]\n[tools.composio]\ntoolkits = [\"gmail\"]\n";
+
+    /// The regression this issue is about: a signed-in member who is not an
+    /// admin cannot change what the company's agents connect through — neither
+    /// by replacing the credential they present, nor by starting an OAuth
+    /// handoff that would make their own account the company's connection.
+    ///
+    /// Both halves matter. The reported symptom was the connect flow, but the
+    /// token route is the sharper one: it repoints the company's entire tool
+    /// surface at whatever account the caller controls.
+    #[tokio::test]
+    async fn a_member_cannot_change_what_the_company_connects_through() {
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), GRANTED).await;
+        let member = crate::server::test_support::seed_session(
+            &state,
+            "acme",
+            crate::ports::UserRole::Member,
+        )
+        .await;
+
+        let (status, body, raw) = send_as(
+            &state,
+            "PUT",
+            "/api/v1/company/composio/token",
+            Some(json!({ "token": TOKEN })),
+            Auth::Cookie(member.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
+        assert_eq!(body["code"], "forbidden", "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("admin"),
+            "the refusal has to say why it was refused: {body}"
+        );
+
+        let (status, body, raw) = send_as(
+            &state,
+            "POST",
+            "/api/v1/company/composio/authorize",
+            Some(json!({ "toolkit": "gmail" })),
+            Auth::Cookie(member.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{raw}");
+        assert_eq!(body["code"], "forbidden", "{body}");
+
+        // And the refusal is real, not merely a different status: the token
+        // never landed, so the company's credential is untouched.
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/composio", None).await;
+        assert_eq!(
+            dto["credentialSource"], "none",
+            "a refused write must not have stored anything: {dto}"
+        );
+    }
+
+    /// The other side of the boundary, and the reason this is a role check
+    /// rather than a removal: an admin still does both things. `authorize`
+    /// answering `409` here is the *build* refusing (no `composio` feature),
+    /// which is exactly the point — it got past the guard and failed later, on
+    /// a different axis than the member's `403`.
+    #[tokio::test]
+    async fn an_admin_is_unaffected() {
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), GRANTED).await;
+
+        let (status, resp, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/composio/token",
+            Some(json!({ "token": TOKEN })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(resp["status"]["credentialSource"], "static");
+
+        let (status, _, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/composio/authorize",
+            Some(json!({ "toolkit": "gmail" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an admin reaches the build check, not the role check: {raw}"
+        );
+    }
+
+    /// Reads stay open to any member, and this pins that decision either way.
+    ///
+    /// Knowing *that* Gmail is connected is what lets a member understand why
+    /// an agent can read mail; it carries no credential. Only the ability to
+    /// change it needed an owner. If a future change decides reads are
+    /// sensitive too, this test is the thing that has to be edited on purpose.
+    #[tokio::test]
+    async fn a_member_may_still_read_the_composio_status_and_connections() {
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), GRANTED).await;
+        let member = crate::server::test_support::seed_session(
+            &state,
+            "acme",
+            crate::ports::UserRole::Member,
+        )
+        .await;
+
+        let (status, dto, raw) = send_as(
+            &state,
+            "GET",
+            "/api/v1/company/composio",
+            None,
+            Auth::Cookie(member.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(dto["granted"], true);
+        assert!(
+            dto.get("token").is_none(),
+            "a member's read must not carry a credential either: {dto}"
+        );
+
+        // 409 (no client in this build), NOT 403 — the read is not role-gated.
+        let (status, _, raw) = send_as(
+            &state,
+            "GET",
+            "/api/v1/company/composio/connections",
+            None,
+            Auth::Cookie(member),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{raw}");
+    }
+
+    /// A machine credential cannot set the company's Composio token.
+    ///
+    /// It is a *verified platform* principal, so it clears the addressing
+    /// check that [`ScopedCompany`] applies — and is then refused anyway,
+    /// because a token names no person and this write must be attributable to
+    /// one. The status is `401`, not `403`: the guard resolves a human session
+    /// and there is none.
+    #[tokio::test]
+    async fn a_machine_credential_cannot_set_the_token() {
+        use crate::server::platform_auth::{
+            PlatformAuthConfig, PlatformClaims, UnsignedTenantVerifier,
+        };
+
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), GRANTED)
+            .await
+            .with_platform_auth(PlatformAuthConfig::new(std::sync::Arc::new(
+                UnsignedTenantVerifier::new("test-platform-secret"),
+            )));
+        let token = UnsignedTenantVerifier::tenant_token(&PlatformClaims {
+            tenant: "tenant:platform".to_string(),
+            scopes: std::collections::HashSet::from(["platform".to_string()]),
+            companies: None,
+        });
+
+        let (status, body, raw) = send_as(
+            &state,
+            "PUT",
+            "/api/v1/company/composio/token",
+            Some(json!({ "token": TOKEN })),
+            Auth::Bearer(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{raw}");
+        assert_eq!(body["code"], "unauthorized", "{body}");
+    }
+
+    /// Every accepted change to the company's tool access names the person who
+    /// made it, so "how did we come to be connected through that account" is
+    /// answerable afterwards.
+    ///
+    /// Set and clear are journaled as distinct words — one grants access and
+    /// the other withdraws it, and an audit trail that conflated them would be
+    /// worth little.
+    #[tokio::test]
+    async fn a_credential_change_records_who_made_it() {
+        use crate::ports::types::{ActorKind, CompanyEvent, EventSeq};
+
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), GRANTED).await;
+
+        for token in [TOKEN, ""] {
+            let (status, _, raw) = send(
+                &state,
+                "PUT",
+                "/api/v1/company/composio/token",
+                Some(json!({ "token": token })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{raw}");
+        }
+
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+        let events = runtime
+            .events()
+            .read_from(runtime.id(), EventSeq::new(0), 100)
+            .await
+            .unwrap();
+        let changes: Vec<(String, Option<String>)> = events
+            .iter()
+            .filter_map(|stored| match &stored.event {
+                CompanyEvent::ToolAccessChanged {
+                    change,
+                    toolkit,
+                    by,
+                } => {
+                    let by = by.as_ref().expect("an admin write is always attributed");
+                    assert_eq!(by.kind, ActorKind::User, "attributed to a person");
+                    assert!(!by.id.is_empty(), "the person is named");
+                    Some((change.clone(), toolkit.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("credential_set".to_string(), None),
+                ("credential_cleared".to_string(), None),
+            ],
+            "a set and a clear are distinct entries in the trail"
+        );
+
+        // The trail is an audit record, not a second place a secret lives.
+        let raw = serde_json::to_string(&events).unwrap();
+        assert!(!raw.contains(TOKEN), "the journal leaked the token: {raw}");
     }
 
     /// `GET …/composio/connections` is likewise always wired and conflicts
