@@ -980,9 +980,11 @@ mod test {
         let card: TaskRecord = serde_json::from_str(legacy).expect("a pre-#337 card parses");
         assert!(card.plan.is_none());
 
+        // Matched on the key, not the substring: the fixture's title contains
+        // the word "unplanned", and a looser check passes for the wrong reason.
         let round_tripped = serde_json::to_string(&card).unwrap();
         assert!(
-            !round_tripped.contains("plan"),
+            !round_tripped.contains("\"plan\":"),
             "an unplanned card must not grow a key: {round_tripped}"
         );
 

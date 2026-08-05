@@ -385,7 +385,7 @@ mod tests {
             agent: crate::metering::UNATTRIBUTED_AGENT.into(),
             ..inference_sample(300, 100)
         };
-        assert_eq!(tokens_in(&[planning.clone()]), 400);
+        assert_eq!(tokens_in(std::slice::from_ref(&planning)), 400);
         // And it adds to a teammate's, rather than replacing or shadowing it.
         assert_eq!(
             tokens_in(&[inference_sample(100, 50), planning, oauth_sample()]),

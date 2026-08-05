@@ -1397,19 +1397,14 @@ fn verify_file(e: &Evidence, name: &str) -> (PrereqStatus, String) {
             ),
         );
     }
-    let wanted = name
-        .trim_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(name)
-        .to_ascii_lowercase();
+    let full = name.trim_matches('/');
+    let wanted = full.rsplit('/').next().unwrap_or(name);
     let found = e.workspace.iter().any(|path| {
-        path.to_ascii_lowercase() == name.trim_matches('/').to_ascii_lowercase()
+        path.eq_ignore_ascii_case(full)
             || path
                 .rsplit('/')
                 .next()
-                .map(|segment| segment.to_ascii_lowercase() == wanted)
-                .unwrap_or(false)
+                .is_some_and(|segment| segment.eq_ignore_ascii_case(wanted))
     });
     if found {
         (
