@@ -9,7 +9,17 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useTheme } from "next-themes";
-import { History, Loader2, Pencil, Play, Plus, RotateCw, Square, Trash2 } from "lucide-react";
+import {
+  History,
+  LayoutGrid,
+  Loader2,
+  Pencil,
+  Play,
+  Plus,
+  RotateCw,
+  Square,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -66,6 +76,7 @@ import {
   statesFromRun,
 } from "@/views/workflows/graph";
 import { LastRunChip, RunHistoryPanel } from "@/views/workflows/RunHistoryPanel";
+import { WorkflowIndex, type IndexMode } from "@/views/workflows/WorkflowIndex";
 import { RunResultPanel } from "@/views/workflows/RunResultPanel";
 import { NodeDetailPanel } from "@/views/workflows/NodeDetailPanel";
 
@@ -200,6 +211,25 @@ export function WorkflowsView({
   // already over.
   const [cancelUnsupportedFor, setCancelUnsupportedFor] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  // Issue #303: the browse index (cards or list) is up instead of the canvas.
+  //
+  // Closed by default, and that is deliberate rather than timid: the toolbar
+  // picker, the Run button and the Edit/Delete affordances are what this tab
+  // opens onto today, and moving the canvas behind a landing screen would
+  // change the first thing every operator sees for the sake of a browse
+  // surface most of them reach for occasionally.
+  const [indexOpen, setIndexOpen] = useState(false);
+  // Which rendering the index uses, remembered across sessions — an operator
+  // who prefers one has no reason to re-pick it every visit.
+  const [indexMode, setIndexMode] = useState<IndexMode>(readIndexMode);
+  // Issue #303: the company-wide run page behind the index's health readings.
+  //
+  // Deliberately SEPARATE from `runs`, which is the selected workflow's history
+  // and is scoped server-side by `?workflow=`. This one is unscoped on purpose —
+  // one request has to cover every card — and that is exactly why the cards say
+  // "No recent runs" rather than "never run": see `WorkflowIndex`.
+  const [indexRuns, setIndexRuns] = useState<WorkflowRunOutcome[]>([]);
+  const [indexRunsLoaded, setIndexRunsLoaded] = useState(false);
   // Run ids the live fold has actually seen frames for. The fallback above
   // consults it so a console WITH a working stream never double-paints a run it
   // already watched, and one without it still gets the journaled answer.
@@ -326,6 +356,64 @@ export function WorkflowsView({
     // inside, and listing it would re-run this fetch on that clear.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, company, selectedId, runsTick, runEventTick]);
+
+  // Issue #303: the run page the index's health readings are folded from.
+  //
+  // Fetched only while the index is open — every card reads from one request,
+  // and a company that never opens the browse panel should not pay for it. It
+  // refreshes on `runEventTick` so a run finishing with the index up updates
+  // the card that owns it, and on `runsTick` so a run started from here shows
+  // as running.
+  //
+  // UNSCOPED, unlike the selected workflow's history above: `?workflow=` covers
+  // exactly one graph, and the index needs every graph. The cost of that is a
+  // page cut by `limit` across all workflows, which is precisely why the cards
+  // are worded "No recent runs" — see `WorkflowIndex`'s `HealthLine`.
+  useEffect(() => {
+    if (!indexOpen) return;
+    let live = true;
+    (async () => {
+      try {
+        const rows = await listWorkflowRuns(client, company, { limit: 200 });
+        if (!live) return;
+        setIndexRuns(rows);
+        setIndexRunsLoaded(true);
+      } catch (e) {
+        if (!live) return;
+        // Same degradation as the scoped read: a host predating the runs route
+        // answers 404, and the index is still worth showing without health.
+        console.debug("[WorkflowsView] company-wide run page unavailable", e);
+        setIndexRuns([]);
+        setIndexRunsLoaded(true);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company, indexOpen, runsTick, runEventTick]);
+
+  // A company switch invalidates the whole page — another company's runs must
+  // never be folded onto this one's cards, and `indexRunsLoaded` has to go back
+  // to false so the cards say "Loading runs…" rather than "No recent runs"
+  // about a company we have not asked about yet.
+  useEffect(() => {
+    setIndexRuns([]);
+    setIndexRunsLoaded(false);
+  }, [company]);
+
+  // The run page grouped by workflow, newest first.
+  //
+  // The host already returns the page newest-first, so this preserves order
+  // rather than re-sorting — one ordering, decided server-side.
+  const runsByWorkflow = useMemo(() => {
+    const byId = new Map<string, WorkflowRunOutcome[]>();
+    for (const row of indexRuns) {
+      const list = byId.get(row.workflowId);
+      if (list) list.push(row);
+      else byId.set(row.workflowId, [row]);
+    }
+    return byId;
+  }, [indexRuns]);
 
   const run = useCallback(async () => {
     if (!selectedId) return;
@@ -698,6 +786,21 @@ export function WorkflowsView({
               Stop
             </Button>
           )}
+          {/* Issue #303. Deliberately placed AFTER the picker and Run: this
+              toggles what fills the body, and grouping it with the other
+              body-level toggle (History) reads better than sitting beside the
+              selection controls it does not change. */}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setIndexOpen((open) => !open)}
+            aria-pressed={indexOpen}
+            data-testid="workflow-browse-toggle"
+            title="Browse every workflow as cards or as a list."
+          >
+            <LayoutGrid className="mr-1.5 size-4" />
+            Browse
+          </Button>
           {historySupported && (
             <Button
               size="sm"
@@ -844,7 +947,28 @@ export function WorkflowsView({
       )}
 
       <div className="relative flex-1">
-        {loadingList || loadingGraph ? (
+        {/* Issue #303: browsing REPLACES the canvas rather than squeezing in
+            above it. A card grid needs the width, and the canvas is meaningless
+            while the operator is deciding which workflow they want. Picking one
+            drops straight back to that workflow's canvas. */}
+        {indexOpen ? (
+          <WorkflowIndex
+            workflows={workflows}
+            runsByWorkflow={runsByWorkflow}
+            selectedId={selectedId}
+            onSelect={(id) => {
+              setSelectedId(id);
+              setIndexOpen(false);
+            }}
+            mode={indexMode}
+            onModeChange={(mode) => {
+              setIndexMode(mode);
+              writeIndexMode(mode);
+            }}
+            loading={loadingList}
+            runsLoaded={indexRunsLoaded}
+          />
+        ) : loadingList || loadingGraph ? (
           <div className="absolute inset-0 p-4">
             <Skeleton className="h-full w-full rounded-xl" />
           </div>
@@ -934,4 +1058,29 @@ export function WorkflowsView({
       />
     </div>
   );
+}
+
+/** Where the index's cards-or-list preference is remembered. */
+const INDEX_MODE_KEY = "oc.workflows.indexMode";
+
+/** The remembered index rendering, defaulting to cards.
+ *
+ * Every access is guarded: `localStorage` throws outright in a browser with
+ * site data blocked, and a preference is never worth failing a render over.
+ */
+function readIndexMode(): IndexMode {
+  try {
+    return window.localStorage.getItem(INDEX_MODE_KEY) === "list" ? "list" : "cards";
+  } catch {
+    return "cards";
+  }
+}
+
+/** Remembers the index rendering. Best-effort, for the same reason. */
+function writeIndexMode(mode: IndexMode): void {
+  try {
+    window.localStorage.setItem(INDEX_MODE_KEY, mode);
+  } catch {
+    // A preference that cannot be saved is not an error worth surfacing.
+  }
 }
