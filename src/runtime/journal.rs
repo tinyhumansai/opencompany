@@ -25,8 +25,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::Result;
 use crate::error::OpenCompanyError;
-use crate::ports::types::{ApprovalId, Effect};
-use crate::runtime::grants::GrantedCall;
+use crate::ports::types::{Actor, ApprovalId, Effect};
+use crate::runtime::grants::{GrantId, GrantedCall, StandingGrant};
 pub use crate::runtime::types::TaskLink;
 use crate::store::fs::{PathLocks, append_line};
 
@@ -178,6 +178,42 @@ enum JournalRecord {
     GrantExpired {
         /// The expired grant's approval id.
         id: ApprovalId,
+        /// Epoch-millis the expiry was recorded.
+        at_millis: u64,
+    },
+    /// A **standing** grant minted because the operator chose the broader scope
+    /// on an approval: this tool, for this teammate, until a deadline (#374).
+    ///
+    /// Carries the grant whole, like
+    /// [`ApprovalGranted`](Self::ApprovalGranted), because this line is the only
+    /// durable answer to "who opened this tool up, when, off which card, and
+    /// until when". `StandingGrant::granted_by` is the operator's real identity,
+    /// not the placeholder the resolve route used to hardcode.
+    ///
+    /// Written *before* the grant reaches the live set, the same crash direction
+    /// `ApprovalGranted` takes.
+    StandingGrantMinted {
+        /// The standing grant, whole.
+        grant: StandingGrant,
+    },
+    /// A standing grant the operator took back (#374).
+    ///
+    /// Takes effect on the **next** policy check — an already-admitted call is
+    /// not aborted, because there is no abort lever inside an agent's turn and
+    /// killing one mid-call is the lifecycle anti-pattern this codebase avoids
+    /// elsewhere. The next check finds nothing and re-parks.
+    StandingGrantRevoked {
+        /// The revoked grant's id.
+        id: GrantId,
+        /// Who revoked it.
+        by: Actor,
+        /// Epoch-millis the revocation was recorded.
+        at_millis: u64,
+    },
+    /// A standing grant that reached its deadline (#374).
+    StandingGrantExpired {
+        /// The expired grant's id.
+        id: GrantId,
         /// Epoch-millis the expiry was recorded.
         at_millis: u64,
     },
@@ -394,6 +430,13 @@ struct State {
     /// consumed or expired entry here would re-arm a tool call that already ran
     /// (or that the operator was already told had lapsed) on every restart.
     grants: HashMap<ApprovalId, GrantedCall>,
+    /// Standing grants minted and not yet revoked or expired (issue #374).
+    ///
+    /// Removed from on both terminal records for the same reason as
+    /// [`grants`](Self::grants): a replayed entry is handed straight back to the
+    /// live set, so retaining a revoked one would hand back a permission the
+    /// operator explicitly took away — on every restart, silently.
+    standing_grants: HashMap<GrantId, StandingGrant>,
 }
 
 impl State {
@@ -627,6 +670,15 @@ impl RuntimeJournal {
             }
             JournalRecord::GrantExpired { id, .. } => {
                 state.grants.remove(&id);
+            }
+            JournalRecord::StandingGrantMinted { grant } => {
+                state.standing_grants.insert(grant.id.clone(), grant);
+            }
+            JournalRecord::StandingGrantRevoked { id, .. } => {
+                state.standing_grants.remove(&id);
+            }
+            JournalRecord::StandingGrantExpired { id, .. } => {
+                state.standing_grants.remove(&id);
             }
         }
     }
@@ -970,6 +1022,77 @@ impl RuntimeJournal {
             .expect("journal state poisoned")
             .grants
             .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Records a minted standing grant (issue #374).
+    ///
+    /// Called *before* the grant enters the live set, so the ordering failure
+    /// mode is "recorded but not live" — which replay fixes — rather than "live
+    /// but not recorded", which would leave a permission nobody can see or
+    /// revoke.
+    pub async fn record_standing_granted(&self, grant: &StandingGrant) -> Result<()> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .standing_grants
+            .insert(grant.id.clone(), grant.clone());
+        self.append(&JournalRecord::StandingGrantMinted {
+            grant: grant.clone(),
+        })
+        .await
+    }
+
+    /// Records that the operator revoked a standing grant (issue #374).
+    pub async fn record_standing_revoked(
+        &self,
+        id: &GrantId,
+        by: Actor,
+        at_millis: u64,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .standing_grants
+            .remove(id);
+        self.append(&JournalRecord::StandingGrantRevoked {
+            id: id.clone(),
+            by,
+            at_millis,
+        })
+        .await
+    }
+
+    /// Records that a standing grant reached its deadline (issue #374).
+    pub async fn record_standing_expired(&self, id: &GrantId, at_millis: u64) -> Result<()> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .standing_grants
+            .remove(id);
+        self.append(&JournalRecord::StandingGrantExpired {
+            id: id.clone(),
+            at_millis,
+        })
+        .await
+    }
+
+    /// Every standing grant still live according to the journal, with anything
+    /// already past its deadline folded out (issue #374).
+    ///
+    /// The expiry filter matters beyond tidiness: the sweep only runs while the
+    /// process is up, so a host that was down across a grant's deadline has no
+    /// `StandingGrantExpired` line for it. Replaying on `at_millis` alone would
+    /// hand a lapsed permission back to the live set, and a restart would be a
+    /// way to resurrect one — the exact silent accumulation this issue forbids.
+    pub fn replayed_standing_grants(&self, now_millis: u64) -> Vec<StandingGrant> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .standing_grants
+            .values()
+            .filter(|g| g.is_live_at(now_millis))
             .cloned()
             .collect()
     }
@@ -1867,6 +1990,132 @@ mod test {
         assert!(raw.contains("ApprovalGranted"));
         assert!(raw.contains("GrantConsumed"));
         assert!(raw.contains("GrantExpired"));
+    }
+
+    fn standing(id: &str, tool: &str, expires_at_millis: u64) -> StandingGrant {
+        StandingGrant {
+            id: GrantId::new(id),
+            agent: "ops".into(),
+            tool: tool.into(),
+            granted_by: Actor {
+                kind: crate::ports::types::ActorKind::User,
+                id: "user-42".into(),
+            },
+            approval_id: ApprovalId::new(format!("appr-{id}")),
+            at_millis: 1_000,
+            expires_at_millis,
+        }
+    }
+
+    /// Issue #374: a standing grant survives a restart, with its expiry and the
+    /// operator who granted it intact.
+    #[tokio::test]
+    async fn a_standing_grant_replays_across_a_restart() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        let journal = RuntimeJournal::new(&path);
+
+        journal
+            .record_standing_granted(&standing("g1", "shell", 100_000))
+            .await
+            .unwrap();
+
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        let replayed = reloaded.replayed_standing_grants(2_000);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].id, GrantId::new("g1"));
+        assert_eq!(replayed[0].tool, "shell");
+        assert_eq!(replayed[0].expires_at_millis, 100_000);
+        assert_eq!(
+            replayed[0].granted_by.id, "user-42",
+            "who opened this tool up is the point of the record"
+        );
+    }
+
+    /// Revoked, expired, and *silently lapsed* standing grants all stay gone.
+    ///
+    /// The third case is the one only replay can catch: the sweep runs while the
+    /// process is up, so a host that was down across a deadline never wrote a
+    /// `StandingGrantExpired` line. Replaying on the record alone would hand the
+    /// permission back, making a restart a way to resurrect one.
+    #[tokio::test]
+    async fn revoked_expired_and_lapsed_standing_grants_are_not_rehydrated() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        let journal = RuntimeJournal::new(&path);
+
+        for g in [
+            standing("revoked", "shell", 100_000),
+            standing("expired", "workspace_write", 100_000),
+            standing("lapsed", "web_fetch", 3_000),
+            standing("live", "shell", 100_000),
+        ] {
+            journal.record_standing_granted(&g).await.unwrap();
+        }
+
+        journal
+            .record_standing_revoked(
+                &GrantId::new("revoked"),
+                Actor {
+                    kind: crate::ports::types::ActorKind::User,
+                    id: "user-42".into(),
+                },
+                5_000,
+            )
+            .await
+            .unwrap();
+        journal
+            .record_standing_expired(&GrantId::new("expired"), 5_000)
+            .await
+            .unwrap();
+
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        // `lapsed` has no terminal record at all — only its deadline stops it.
+        let replayed = reloaded.replayed_standing_grants(10_000);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].id, GrantId::new("live"));
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("StandingGrantMinted"));
+        assert!(raw.contains("StandingGrantRevoked"));
+        assert!(raw.contains("StandingGrantExpired"));
+    }
+
+    /// A journal written before #374 decodes unchanged, and replays no standing
+    /// grants. The forward-only half — an old binary cannot read a new journal —
+    /// is the same contract every prior variant addition made.
+    #[tokio::test]
+    async fn a_pre_374_journal_decodes_and_yields_no_standing_grants() {
+        let dir = tmp_dir();
+        let path = dir.path().join("journal.jsonl");
+        let journal = RuntimeJournal::new(&path);
+
+        journal
+            .record_parked(
+                &ApprovalId::new("appr-old"),
+                &effect(),
+                500,
+                TaskLink::Unlinked,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .record_granted(&grant("appr-old", 1_000))
+            .await
+            .unwrap();
+
+        let reloaded = RuntimeJournal::new(&path);
+        reloaded.load().await.unwrap();
+        assert_eq!(reloaded.pending().len(), 1);
+        assert_eq!(
+            reloaded.replayed_grants().len(),
+            1,
+            "the single-use path replays byte-identically"
+        );
+        assert!(reloaded.replayed_standing_grants(2_000).is_empty());
     }
 
     /// The grant records must not disturb the approval-queue fold they share a
