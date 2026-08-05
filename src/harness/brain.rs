@@ -61,6 +61,7 @@ use crate::harness::run_trace::RunTraceSink;
 use crate::ports::artifacts::{ArtifactAuthor, ArtifactRecord};
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::runs::{RunOutcome, RunStatus};
+use crate::ports::tasks::{TaskOutput, TaskOutputArtifact};
 use crate::ports::types::{
     CompanyEvent, CompanyRecord, CompressedTrace, CycleRequest, CycleResult, OutboundMessage,
     TokenUsage, TurnStep, TurnStepKind, TurnStepStatus, Verdict,
@@ -397,6 +398,11 @@ impl HarnessBrain {
         // queue is cleared per turn: a chat turn earlier in this cycle shares
         // these deps, and its staged file must never be attributed to this card.
         self.deps.pending_publishes.clear();
+        // Issue #339, same argument for staged workflow references: an operator
+        // chat turn earlier in this cycle may have run a workflow through the
+        // orchestrator's tool, and that run belongs to the conversation, not to
+        // this card.
+        self.deps.workflow_refs.clear();
 
         // Register the run so an operator can steer it mid-flight. The guard's
         // RAII `Drop` deregisters on every exit path (success, error, redirect
@@ -450,6 +456,10 @@ impl HarnessBrain {
             // part of the loop and never clears, so a nudge cannot discard what
             // the turn it is asking about published.
             self.deps.pending_publishes.clear();
+            // Issue #339: an abandoned redirect's workflow run is abandoned with
+            // it, for the same reason — the card's link must name what the turn
+            // that actually settled produced, not what a discarded one did.
+            self.deps.workflow_refs.clear();
             let outcome = run_turn
                 // A dispatched task card carries no chat bubble (its steps are
                 // discarded into the note), so its live turn frames must not leak
@@ -743,6 +753,105 @@ impl HarnessBrain {
             None => 0,
         };
         let settled = lifecycle::settled_run_status(run_end, parked);
+
+        // ── Issues #244 + #339: record what the run produced, then say so on
+        //    the card — both **before** the one card write ────────────────────
+        //
+        // The queues are drained **unconditionally** so nothing an abandoned
+        // turn staged can leak into the next run, and the drained sets are
+        // recorded only when the run reached its success terminal.
+        //
+        // "Success terminal" is read off the *ending* —
+        // `run_status_for(run_end) == Succeeded`, i.e. the turn finished or
+        // spent its redirect budget — not off `settled`. Parking an approval
+        // relabels who acts next, not whether the agent produced a deliverable,
+        // so a run that wrote a spec and also asked for an authorisation must
+        // not lose the spec.
+        //
+        // **Why this moved above the upsert (issue #339).** The card now
+        // carries a link to what it produced, and that link names artifact
+        // versions that do not exist until they are written — so the artifacts
+        // have to land before the card is persisted, or the single card write
+        // would have to become two.
+        //
+        // **And why recording became best-effort with it.** #244 made a failed
+        // artifact write propagate, on the argument that an explicit publish
+        // that could not be stored is a real failure of the run. That argument
+        // held while this ran *after* the card was persisted. Above the upsert
+        // a `?` would skip the card write entirely and strand the card in
+        // `in_progress` with nothing to re-dispatch it — the exact stranded
+        // state the hand-off arm above exists to prevent, and a far worse
+        // outcome than a missing deliverable record. So the failure is now
+        // logged at `error` (loudly: an operator whose published file did not
+        // store needs to know) and the settle continues.
+        let published = self.deps.pending_publishes.drain();
+        let staged_workflows = self.deps.workflow_refs.drain();
+        let succeeded = lifecycle::run_status_for(run_end) == RunStatus::Succeeded;
+        let recorded: Vec<TaskOutputArtifact> = if succeeded {
+            match self
+                .record_published_artifacts(
+                    &card,
+                    &responder,
+                    published,
+                    sink.as_ref().map(|s| s.run_id()),
+                )
+                .await
+            {
+                Ok(recorded) => recorded,
+                Err(err) => {
+                    tracing::error!(
+                        task_id = %card.id,
+                        agent = %responder,
+                        error = %err,
+                        "[publish] could not record what this run published; the dispatch itself \
+                         still lands"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            if !published.is_empty() || !staged_workflows.is_empty() {
+                tracing::info!(
+                    task_id = %card.id,
+                    staged = published.len(),
+                    workflows = staged_workflows.len(),
+                    ending = ?run_end,
+                    "[publish] the run did not reach its success terminal; staged output is \
+                     discarded rather than recorded"
+                );
+            }
+            Vec::new()
+        };
+        // The completion event (#185) carries the ids, the card (#339) carries
+        // the pinned versions — one recording, two readers, so they cannot
+        // disagree about what the run produced.
+        let artifact_ids: Vec<String> = recorded
+            .iter()
+            .map(|artifact| artifact.artifact_id.clone())
+            .collect();
+
+        // Issue #339: the card's link to its deliverable.
+        //
+        // Only on success, and only when there is an attempt to name: without a
+        // trace sink the run store is unwired or the dispatch minted no row, so
+        // there is no addressable attempt and a stamp would point at nothing.
+        // That degrades to exactly the pre-#339 card, which is the same
+        // fail-silent-not-closed direction `runs: None` already takes.
+        //
+        // Written **wholesale**, overwriting any earlier stamp: this is what
+        // makes "the latest successful attempt" true by construction rather
+        // than by a read-time query. A later failure never reaches here, so a
+        // failed retry cannot erase the link to the success before it.
+        if succeeded && let Some(sink) = sink.as_ref() {
+            card.output = Some(TaskOutput {
+                run_id: sink.run_id().to_string(),
+                attempt: self.attempt_ordinal(sink.run_id()).await,
+                at_millis: now_millis(),
+                artifacts: recorded,
+                workflows: staged_workflows,
+            });
+        }
+
         // `settle()` already wrote a landing at the break point; this is the
         // authoritative overwrite now that the parked count is known. `None`
         // only for a status that is not settled at all, which no ending
@@ -773,43 +882,6 @@ impl HarnessBrain {
             matches!(settled, RunStatus::Failed).then_some(result_text.as_str()),
         )
         .await;
-
-        // Issue #244: record what the agent actually published.
-        //
-        // The queue is drained **unconditionally** so nothing an abandoned turn
-        // staged can leak into the next run, and the drained set is recorded
-        // only when the run reached its success terminal.
-        //
-        // "Success terminal" is read off the *ending* —
-        // `run_status_for(run_end) == Succeeded`, i.e. the turn finished or
-        // spent its redirect budget — not off `settled`. Parking an approval
-        // relabels who acts next, not whether the agent produced a deliverable,
-        // so a run that wrote a spec and also asked for an authorisation must
-        // not lose the spec.
-        //
-        // Recorded before the #185 journal writes below, because the completion
-        // event carries the ids this returns.
-        let published = self.deps.pending_publishes.drain();
-        let artifact_ids = if lifecycle::run_status_for(run_end) == RunStatus::Succeeded {
-            self.record_published_artifacts(
-                &card,
-                &responder,
-                published,
-                sink.as_ref().map(|s| s.run_id()),
-            )
-            .await?
-        } else {
-            if !published.is_empty() {
-                tracing::info!(
-                    task_id = %card.id,
-                    staged = published.len(),
-                    ending = ?run_end,
-                    "[publish] the run did not reach its success terminal; staged files are \
-                     discarded rather than recorded"
-                );
-            }
-            Vec::new()
-        };
 
         // Issue #185: correlate this dispatch's journal trail to its card.
         //
@@ -1175,8 +1247,48 @@ impl HarnessBrain {
             .unwrap_or_else(|| self.responder.clone())
     }
 
+    /// This attempt's 1-based ordinal, for the card's operator-facing link
+    /// label (issue #339) — *"attempt 2"*.
+    ///
+    /// One extra read on a successful settle, and deliberately not free-ridden
+    /// off the `finish_run` that settles the attempt row: that runs *after* the
+    /// card is written, and the card is what needs this. Reordering the settle
+    /// to harvest it would put the run row's terminal status ahead of the
+    /// board's, contradicting the ordering #242 chose on purpose.
+    ///
+    /// Best-effort: `None` on an unwired store, a missing row or a read fault.
+    /// The ordinal is a **label**, never an identity —
+    /// [`TaskOutput::run_id`](crate::ports::tasks::TaskOutput::run_id) still
+    /// addresses the attempt — so a failure here costs a nicety in the link
+    /// text and never the link.
+    async fn attempt_ordinal(&self, run_id: &str) -> Option<u32> {
+        let runs = self.runs.as_ref()?;
+        match runs.get_run(&self.record.id, run_id).await {
+            Ok(run) => run.map(|run| run.attempt),
+            Err(err) => {
+                tracing::warn!(
+                    company = %self.record.id,
+                    run = %run_id,
+                    error = %err,
+                    "[runs] could not read an attempt's ordinal for the card's link; the link \
+                     still names the run"
+                );
+                None
+            }
+        }
+    }
+
     /// Records everything the run published as versioned artifacts, returning
-    /// their ids (issue #244).
+    /// one reference per artifact **pinned at the version this run wrote**
+    /// (issues #244, #339).
+    ///
+    /// # Why the version comes back
+    ///
+    /// The caller stamps these onto the card, and a card link that named only
+    /// the artifact would re-point at whatever a human last edited — silently
+    /// turning "what this task produced" into "what the artifact says now".
+    /// `push_version` already computes the number; before #339 it was
+    /// discarded.
     ///
     /// # Extend by identity, never by recency
     ///
@@ -1197,13 +1309,20 @@ impl HarnessBrain {
     /// [`ArtifactRecord::source`](crate::ports::artifacts::ArtifactRecord::source)
     /// rather than papered over with a guess.
     ///
-    /// # Errors propagate
+    /// # Errors propagate — to the caller, which now contains them
     ///
-    /// Deliberately, and this is a change. The old path returned a silent
-    /// `Ok(())` when the store was missing and swallowed nothing else, which
-    /// meant a failed write to a deliverable an agent had explicitly published
-    /// was indistinguishable from success. An explicit publish that could not be
-    /// stored is a real failure of the run and the operator needs to see it.
+    /// Deliberately, and this was a change in #244. The pre-#244 path returned
+    /// a silent `Ok(())` when the store was missing and swallowed nothing else,
+    /// which meant a failed write to a deliverable an agent had explicitly
+    /// published was indistinguishable from success. An explicit publish that
+    /// could not be stored is a real failure of the run and the operator needs
+    /// to see it, so this still surfaces one.
+    ///
+    /// What changed in #339 is where that failure stops. This now runs
+    /// **before** the card's single write, so `run_task` logs the error at
+    /// `error` and settles the card anyway rather than propagating — a
+    /// bookkeeping fault must not strand a finished card in `in_progress`. The
+    /// error is still raised here; it is simply no longer fatal there.
     ///
     /// A **missing store** is different: `publish_artifact` is not wired at all
     /// without one (see `build.rs`), so a non-empty queue here means something
@@ -1219,7 +1338,7 @@ impl HarnessBrain {
         responder: &str,
         published: Vec<publish::PendingPublish>,
         run_id: Option<&str>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<TaskOutputArtifact>> {
         if published.is_empty() {
             // The honest, common case: this run produced no file. There is no
             // artifact, and the run trace is the addressable record of what
@@ -1237,7 +1356,7 @@ impl HarnessBrain {
         };
 
         let mut on_card = artifacts.list(&self.record.id, Some(&card.id)).await?;
-        let mut ids = Vec::with_capacity(published.len());
+        let mut written = Vec::with_capacity(published.len());
         for pending in published {
             let at = now_millis();
             // Identity, not recency: the record whose `source` is this exact
@@ -1245,10 +1364,13 @@ impl HarnessBrain {
             let existing = on_card
                 .iter()
                 .position(|a| a.source.as_deref() == Some(pending.source.as_str()));
+            // The revision THIS run wrote (#339). A fresh record is always its
+            // own v1; an extended one takes whatever `push_version` numbered.
+            let mut version = 1;
             let mut record = match existing {
                 Some(index) => {
                     let mut found = on_card.remove(index);
-                    found.push_version(
+                    version = found.push_version(
                         &pending.body,
                         ArtifactAuthor::Agent,
                         responder,
@@ -1286,12 +1408,17 @@ impl HarnessBrain {
                 record.stamp_run(run_id);
             }
             artifacts.upsert(&self.record.id, &record).await?;
-            ids.push(record.id.clone());
+            written.push(TaskOutputArtifact {
+                artifact_id: record.id.clone(),
+                version,
+                title: record.title.clone(),
+                kind: record.kind,
+            });
             // Keep the working set current so two publishes of the same path in
             // one run extend one record rather than opening two.
             on_card.push(record);
         }
-        Ok(ids)
+        Ok(written)
     }
 
     /// Resolves which agent answers an operator message.
@@ -1811,6 +1938,7 @@ description = "Runs Acme."
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -1964,6 +2092,7 @@ description = "Builds it."
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -2034,6 +2163,7 @@ members = ["engineer"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -2065,6 +2195,7 @@ members = ["engineer"]
             updated_at_millis: 0,
             origin_chat_id: None,
             parent_task_id: None,
+            output: None,
         }
     }
 
@@ -3083,6 +3214,7 @@ members = ["engineer"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -3826,6 +3958,7 @@ members = ["eng1", "eng2"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: failures.clone(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -3957,6 +4090,7 @@ members = ["eng1", "eng2"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: failures.clone(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -4034,6 +4168,7 @@ members = ["eng1", "eng2"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: requests,
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -4258,6 +4393,7 @@ members = ["eng1", "eng2"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: requests,
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -4766,6 +4902,7 @@ members = ["eng1", "eng2"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
@@ -5090,6 +5227,7 @@ members = ["eng1", "eng2"]
             workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
             mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
             pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
             approval_requests: crate::harness::policy::ApprovalRequestQueue::default(),
             secrets: None,
             web_allowed_domains: Vec::new(),
