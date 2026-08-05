@@ -159,29 +159,32 @@ pub fn build_agent(
         deps.context.clone(),
     ));
 
-    let workspace = agent_workspace(&deps.workspace_root, company, &manifest_agent.id);
-    // Create it now, before any tool is bound to it.
-    //
-    // Not a convenience — the file tools do not work without it. OpenHuman's
-    // `validate_parent_path` resolves a relative write against `action_dir`,
-    // then walks up to the deepest **existing** ancestor to canonicalize. With
-    // the workspace absent, that walk climbs past it to `workspace_root`, which
-    // is outside the sandbox, and the write is refused as *"Resolved parent
-    // path escapes workspace"*. So an agent granted `files` but not `shell`
-    // could not write a relative path at all until its first shell call
-    // happened to create the directory as a side effect.
+    // Create the sandbox now, before any tool — or any `SecurityPolicy` — is
+    // bound to it. See [`ensure_agent_workspace`] for why an absent directory
+    // breaks relative writes outright, and why creating it late is not the same
+    // as creating it here.
     //
     // Best-effort: a failure here is logged, not fatal. The tools then behave
-    // exactly as they did before, and the agent is still perfectly able to run
-    // a turn that touches no files.
-    if let Err(err) = std::fs::create_dir_all(&workspace) {
-        tracing::warn!(
-            company = %company,
-            agent = %manifest_agent.id,
-            error = %err,
-            "[build] could not create the agent workspace; file tools will refuse relative paths"
-        );
-    }
+    // exactly as they did before, the dispatch path gets a second attempt just
+    // before the agent acts, and the agent is still perfectly able to run a turn
+    // that touches no files. The message names the real condition — a directory
+    // that could not be created — rather than leaving the operator with the
+    // guard's traversal wording as the only clue.
+    let workspace = match ensure_agent_workspace(&deps.workspace_root, company, &manifest_agent.id)
+    {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            let workspace = agent_workspace(&deps.workspace_root, company, &manifest_agent.id);
+            tracing::warn!(
+                company = %company,
+                agent = %manifest_agent.id,
+                workspace = %workspace.display(),
+                error = %err,
+                "[build] could not create the agent workspace; file tools will refuse relative paths"
+            );
+            workspace
+        }
+    };
 
     // Intrinsic memory tools: every agent can deliberately store and recall over
     // its own company memory, complementing the automatic retrieve→inject→store
@@ -619,13 +622,62 @@ pub(crate) fn grants_cover(grants: &[String], namespace: &str) -> bool {
 
 /// One agent's sandbox directory: `{root}/{company}/{agent}/workspace`.
 ///
-/// A named function rather than a repeated `join` chain because two callers now
-/// need to agree on it exactly: [`build_agent`], which sandboxes the file tools
-/// to it, and the brain's #244 unpublished-file scan, which snapshots it. A
-/// second transcription of the layout would make the scan silently look at the
-/// wrong directory — reporting nothing, forever, with no error anywhere.
+/// A named function rather than a repeated `join` chain because three callers
+/// now need to agree on it exactly: [`build_agent`], which sandboxes the file
+/// tools to it; the brain's #244 unpublished-file scan, which snapshots it; and
+/// [`ensure_agent_workspace`], which creates it. A second transcription of the
+/// layout would make the scan silently look at the wrong directory — reporting
+/// nothing, forever, with no error anywhere.
+///
+/// Naming only — this never touches the disk. Anything that needs the directory
+/// to *exist* goes through [`ensure_agent_workspace`].
 pub fn agent_workspace(root: &Path, company: &CompanyId, agent_id: &str) -> PathBuf {
     root.join(company.as_ref()).join(agent_id).join("workspace")
+}
+
+/// Create one agent's sandbox directory, returning the path
+/// [`agent_workspace`] names. Idempotent.
+///
+/// The single **creation** site for the agent-workspace layout, and not a
+/// convenience: the file tools do not work without the directory. OpenHuman's
+/// `validate_parent_path` resolves a relative write against `action_dir`, then
+/// walks up to the deepest *existing* ancestor to canonicalize it. With the
+/// workspace absent that walk climbs straight past it — through `{agent}/` and
+/// `{company}/` to the workspace root — and the ancestor it lands on is,
+/// correctly, outside the agent's own sandbox. The write is then refused as
+/// *"Resolved parent path escapes workspace"* for a path that is plainly inside
+/// it (issue #409).
+///
+/// Nothing else mints this directory. `<home>/harness` is deliberately absent
+/// from [`DataLayout::ensure`](crate::store::DataLayout::ensure), which
+/// pre-creates only the instance-shared trees; per-company and per-agent trees
+/// are minted on demand by whoever owns them, the same rule `companies/`
+/// follows. The near miss is
+/// [`EffectiveSkills::materialize`](crate::harness::skills::EffectiveSkills),
+/// which creates `{agent}/skill-catalog/` — a *sibling* of `workspace`, so it
+/// makes the walk stop one level higher and refuse just the same.
+///
+/// Called from two places, because one is not enough:
+///
+///  * [`build_agent`], before any [`SecurityPolicy`] is constructed over the
+///    path. Ordering matters beyond the guard: the per-workspace audit logger
+///    keys its process-global registry on the *canonicalized* workspace path and
+///    falls back to the raw one when the directory is missing, so a workspace
+///    created late can be registered twice under one physical directory.
+///  * the dispatch path ([`HarnessPool::run`](crate::harness::HarnessPool::run)
+///    and friends), because a roster is built once and then cached behind
+///    fingerprints and handed across an in-place rebuild — so a workspace that
+///    disappears after the roster was built (a restored/wiped data dir, an
+///    operator clearing the tree, a boot that raced a not-yet-mounted volume)
+///    would otherwise stay missing for the life of the process.
+pub fn ensure_agent_workspace(
+    root: &Path,
+    company: &CompanyId,
+    agent_id: &str,
+) -> std::io::Result<PathBuf> {
+    let workspace = agent_workspace(root, company, agent_id);
+    std::fs::create_dir_all(&workspace)?;
+    Ok(workspace)
 }
 
 /// A [`SecurityPolicy`] that sandboxes an agent's file tools to `workspace` and
@@ -730,6 +782,183 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"file_read"), "got {names:?}");
         assert!(names.contains(&"file_write"), "got {names:?}");
+    }
+
+    // --- Agent-workspace provisioning (issue #409) --------------------------
+
+    #[test]
+    fn ensure_agent_workspace_mints_the_whole_chain_and_is_idempotent() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let company = CompanyId::new("acme");
+
+        // Nothing under the root exists yet — not the company segment, not the
+        // agent segment. This is a company that has never run.
+        let named = agent_workspace(root.path(), &company, "ceo");
+        assert!(!named.exists(), "precondition: nothing minted yet");
+
+        let made = ensure_agent_workspace(root.path(), &company, "ceo").expect("first ensure");
+        assert_eq!(made, named, "creation and naming must agree exactly");
+        assert!(made.is_dir());
+
+        // Idempotent: a second call on an existing tree is a success, not an
+        // `AlreadyExists` error — the dispatch path calls this on every turn.
+        let again = ensure_agent_workspace(root.path(), &company, "ceo").expect("second ensure");
+        assert_eq!(again, made);
+        assert!(again.is_dir());
+    }
+
+    /// The bug, pinned. With the workspace absent, `validate_parent_path` walks
+    /// up past it to an ancestor that really *is* outside the sandbox and
+    /// refuses a plainly-inside relative path — the refusal an agent granted
+    /// `files` but not `shell` used to hit on every write.
+    #[tokio::test]
+    async fn a_missing_workspace_makes_a_plain_relative_write_look_like_an_escape() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = agent_workspace(root.path(), &CompanyId::new("acme"), "ceo");
+        assert!(!workspace.exists(), "precondition: never provisioned");
+
+        let policy = workspace_security(&workspace);
+        let err = policy
+            .validate_parent_path("notes.md")
+            .await
+            .expect_err("a missing workspace refuses the write");
+        assert!(
+            err.contains("escapes workspace"),
+            "the guard blames traversal for a missing directory: {err}"
+        );
+    }
+
+    /// The fix. The same policy over an *ensured* workspace resolves the same
+    /// relative path, inside the sandbox.
+    #[tokio::test]
+    async fn an_ensured_workspace_resolves_a_relative_write_inside_the_sandbox() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace =
+            ensure_agent_workspace(root.path(), &CompanyId::new("acme"), "ceo").expect("ensure");
+
+        let policy = workspace_security(&workspace);
+        let resolved = policy
+            .validate_parent_path("notes.md")
+            .await
+            .expect("an existing workspace accepts a relative write");
+
+        let canonical = workspace.canonicalize().expect("canonicalize");
+        assert!(
+            resolved.starts_with(&canonical),
+            "{} is not inside {}",
+            resolved.display(),
+            canonical.display()
+        );
+        assert_eq!(
+            resolved.file_name().and_then(|n| n.to_str()),
+            Some("notes.md")
+        );
+
+        // A nested path whose parent does not exist yet still resolves — the
+        // guard only ever needed *some* existing ancestor inside the sandbox.
+        let nested = policy
+            .validate_parent_path("reports/q3/summary.md")
+            .await
+            .expect("a not-yet-created subdirectory still resolves");
+        assert!(nested.starts_with(&canonical));
+    }
+
+    /// Provisioning does not loosen the guard: a genuine escape is still
+    /// refused — and it comes back **word for word** the same as the
+    /// missing-workspace refusal above. That is why #409 was filed rather than
+    /// closed by the one-line create.
+    ///
+    /// Reaching the resolved-parent arm with a real escape takes some care,
+    /// which is itself part of the finding. A symlink whose *immediate* parent
+    /// resolves (`escape/loot.txt`) is caught earlier, by the string-level
+    /// symlink check, with a different and perfectly clear message. The arm
+    /// under test is reached only when no existing ancestor can be canonicalized
+    /// up front: a symlink out of the sandbox plus a not-yet-created
+    /// subdirectory under it. So in a `workspace_only` agent sandbox this
+    /// wording fires for exactly two conditions — a hostile symlink and a
+    /// workspace that was never created — and says "escapes workspace" for both.
+    ///
+    /// Pinned here so a wording change upstream surfaces in this repo instead of
+    /// drifting silently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_escape_and_a_missing_workspace_are_refused_in_identical_words() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let workspace =
+            ensure_agent_workspace(root.path(), &CompanyId::new("acme"), "ceo").expect("ensure");
+        std::os::unix::fs::symlink(outside.path(), workspace.join("escape")).expect("symlink");
+
+        let policy = workspace_security(&workspace);
+
+        // The easy half: the immediate parent resolves, so the string-level
+        // symlink check refuses it first — clearly, and distinguishably.
+        let shallow = policy
+            .validate_parent_path("escape/loot.txt")
+            .await
+            .expect_err("a symlink out of the sandbox is refused");
+        assert!(
+            shallow.contains("Path not allowed by security policy"),
+            "expected the string-level refusal: {shallow}"
+        );
+
+        // The arm this issue is about: nothing up front can be canonicalized,
+        // so the ancestor walk runs and lands outside the sandbox.
+        let deep = policy
+            .validate_parent_path("escape/nested/loot.txt")
+            .await
+            .expect_err("a real escape must still be refused");
+        assert!(
+            deep.contains("Resolved parent path escapes workspace"),
+            "expected the resolved-parent refusal: {deep}"
+        );
+
+        // The same arm, reached instead by a workspace nobody ever created.
+        let absent = agent_workspace(root.path(), &CompanyId::new("acme"), "nobody");
+        let missing = workspace_security(&absent)
+            .validate_parent_path("notes.md")
+            .await
+            .expect_err("a missing workspace refuses too");
+        assert!(
+            missing.contains("Resolved parent path escapes workspace"),
+            "{missing}"
+        );
+
+        // Verbatim identical up to the path each names. A reader given either
+        // one goes looking for a traversal attempt; only one of them is.
+        let strip = |m: &str| {
+            m.split_once("escapes workspace: ")
+                .map(|(head, _)| head.to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            strip(&deep),
+            strip(&missing),
+            "an attack and an unprovisioned directory should not read alike"
+        );
+    }
+
+    /// A `..` traversal is refused earlier, by the string-level check, and
+    /// *does* read differently — so the ambiguity above is specifically about
+    /// the resolved-parent arm, not about every refusal.
+    #[tokio::test]
+    async fn a_dot_dot_traversal_is_refused_with_a_distinguishable_message() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace =
+            ensure_agent_workspace(root.path(), &CompanyId::new("acme"), "ceo").expect("ensure");
+
+        let err = workspace_security(&workspace)
+            .validate_parent_path("../../loot.txt")
+            .await
+            .expect_err("a traversal is refused");
+        assert!(
+            err.contains("Path not allowed by security policy"),
+            "expected the string-level refusal: {err}"
+        );
+        assert!(
+            !err.contains("escapes workspace"),
+            "this arm is already distinguishable: {err}"
+        );
     }
 
     #[test]
