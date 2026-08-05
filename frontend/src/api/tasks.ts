@@ -3,8 +3,74 @@
 // the client-side `tasks-sample` illustrative data.
 
 import type { OpenCompanyClient } from "./client";
+import type { ArtifactKind } from "./artifacts";
 import type { RunSummary } from "./runs";
 import type { TurnStepFailure } from "./types";
+
+/**
+ * One deliverable a run published, pinned at the revision **that run** wrote
+ * (issue #339).
+ *
+ * The version is part of the link on purpose. Artifact versions are
+ * append-only and an operator edit appends a new one, so a link naming only the
+ * record would quietly re-point at whatever a human last wrote — turning "what
+ * this task produced" into "what the artifact says now". Pinned, it can never
+ * dangle, and the console can compare it against the latest to say a human has
+ * edited it since.
+ */
+export interface TaskOutputArtifact {
+  artifactId: string;
+  /** The 1-based revision this attempt wrote. */
+  version: number;
+  /** Display title, copied so the card can label its link without a read. */
+  title: string;
+  kind: ArtifactKind;
+}
+
+/** Whether the attempt executed a workflow or authored one. */
+export type TaskOutputAction = "ran" | "created";
+
+/**
+ * A workflow the attempt ran or built (issue #339).
+ *
+ * Deliberately **not** pinned to a graph revision, unlike an artifact: workflow
+ * graphs mutate in place and there is no version history to pin to. The link
+ * opens the workflow as it is now, and `runId` — present only when the attempt
+ * actually executed it — opens the overlay showing what really ran.
+ *
+ * Only ever present on an orchestrator-desk card: `run_workflow` and
+ * `create_workflow` are orchestrator-only tools.
+ */
+export interface TaskOutputWorkflow {
+  workflowId: string;
+  runId?: string;
+  action: TaskOutputAction;
+}
+
+/**
+ * What a card's latest **successful** attempt produced (issue #339, epic #183
+ * §6) — the link that turns a finished card into something you can open.
+ *
+ * `runId` is unconditional, and that is the whole design: an output with no
+ * artifacts and no workflows is not an absence, it is the *trace case*. Plenty
+ * of tasks produce no file — a message sent, a record updated, a question
+ * answered — and for those the attempt's trace **is** the deliverable. It is
+ * also the fallback when an artifact is later deleted.
+ *
+ * Absent entirely on a card that has never succeeded, one moved to Done by
+ * hand, and every card settled before this shipped. Those link to the card
+ * itself rather than to a synthesized output.
+ */
+export interface TaskOutput {
+  /** The attempt that produced it — always present. */
+  runId: string;
+  /** That attempt's 1-based ordinal, for the label. Absent if unreadable. */
+  attempt?: number;
+  /** Epoch-millis the stamp was written. */
+  atMillis: number;
+  artifacts?: TaskOutputArtifact[];
+  workflows?: TaskOutputWorkflow[];
+}
 
 /** A board card as the host returns it. */
 export interface Task {
@@ -28,6 +94,14 @@ export interface Task {
    * is every card created before this shipped.
    */
   originChatId?: string;
+  /**
+   * What this card's latest successful attempt produced (issue #339).
+   *
+   * Carried on the **board** read, not just task detail, because the link is
+   * rendered on the card itself — a board that had to open every card to
+   * discover what it produced would cost one read per card per poll.
+   */
+  output?: TaskOutput;
 }
 
 /** The create body; the host defaults column→`todo`, priority→`medium`. */
