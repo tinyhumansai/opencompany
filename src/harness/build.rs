@@ -160,6 +160,28 @@ pub fn build_agent(
     ));
 
     let workspace = agent_workspace(&deps.workspace_root, company, &manifest_agent.id);
+    // Create it now, before any tool is bound to it.
+    //
+    // Not a convenience — the file tools do not work without it. OpenHuman's
+    // `validate_parent_path` resolves a relative write against `action_dir`,
+    // then walks up to the deepest **existing** ancestor to canonicalize. With
+    // the workspace absent, that walk climbs past it to `workspace_root`, which
+    // is outside the sandbox, and the write is refused as *"Resolved parent
+    // path escapes workspace"*. So an agent granted `files` but not `shell`
+    // could not write a relative path at all until its first shell call
+    // happened to create the directory as a side effect.
+    //
+    // Best-effort: a failure here is logged, not fatal. The tools then behave
+    // exactly as they did before, and the agent is still perfectly able to run
+    // a turn that touches no files.
+    if let Err(err) = std::fs::create_dir_all(&workspace) {
+        tracing::warn!(
+            company = %company,
+            agent = %manifest_agent.id,
+            error = %err,
+            "[build] could not create the agent workspace; file tools will refuse relative paths"
+        );
+    }
 
     // Intrinsic memory tools: every agent can deliberately store and recall over
     // its own company memory, complementing the automatic retrieve→inject→store
