@@ -37,10 +37,20 @@
 //!
 //! ## Write-only credential
 //!
-//! The token is write-only. Whatever value a call resolves is fed to [`scrub`] as
-//! a known secret, so it cannot survive into **any** `ToolResult` (success or
-//! error); it is absent from every tracing line and from the [`Debug`] impl. Only
-//! non-secret status (backend URL, toolkit allowlist) is ever surfaced.
+//! The token is write-only. Whatever value a call resolves is fed to
+//! [`redact`](crate::harness::mcp_probe::redact) (successes) or
+//! [`scrub`](crate::harness::mcp_probe::scrub) (errors) as a known secret, so it
+//! cannot survive into **any** `ToolResult`; it is absent from every tracing
+//! line and from the [`Debug`] impl. Only non-secret status (backend URL,
+//! toolkit allowlist) is ever surfaced.
+//!
+//! ## Result sizing (issue #410)
+//!
+//! Successes go through `redact` + a **body** budget, never through `scrub`.
+//! `scrub` caps at 300 bytes — correct for the one-line MCP failure sentence it
+//! was built for, and the reason every Composio result used to arrive as a
+//! silent fragment. See `scrubbed_ok` below and
+//! [`composio_catalog`](crate::harness::composio_catalog).
 
 use std::sync::Arc;
 
@@ -215,7 +225,8 @@ mod live {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
-    use crate::harness::mcp_probe::scrub;
+    use crate::harness::composio_catalog as catalog;
+    use crate::harness::mcp_probe::{redact, scrub};
     use crate::metering::record_oauth_call;
     use crate::ports::UsageMeter;
     use crate::ports::now_millis;
@@ -316,13 +327,29 @@ mod live {
         Ok((client, vec![token]))
     }
 
-    /// Serialize a successful response to JSON, then scrub it against the tenant
-    /// token before it can reach the agent. Text-only output — the structured
-    /// value is dropped so a credential the backend might reflect can never ride
-    /// out in a JSON field.
-    fn scrubbed_ok(value: Value, secrets: &[String]) -> ToolResult {
+    /// Serialize a successful response to JSON, redact the tenant token out of
+    /// it, and bound it to a *body* budget before it reaches the agent.
+    /// Text-only output — the structured value is dropped so a credential the
+    /// backend might reflect can never ride out in a JSON field.
+    ///
+    /// # Why not `scrub` (issue #410)
+    ///
+    /// This used to call [`scrub`], whose third pass caps its output at
+    /// [`SCRUB_MAX_BYTES`](crate::harness::mcp_probe::SCRUB_MAX_BYTES) — 300
+    /// bytes, the right size for the one-line MCP failure sentence it was built
+    /// for and a catastrophe for a tool body. Every Composio result was cut to
+    /// 300 bytes and terminated with a bare `…`: an action listing became the
+    /// first action and half of its schema, and `composio_execute` returned 300
+    /// bytes of whatever the provider actually said. Nothing in the result said
+    /// it was a fragment, so the agent had no reason to ask differently and
+    /// reissued the identical call until the repetition guard stopped the run.
+    ///
+    /// [`redact`] keeps the security half — the token replacement and the URL
+    /// query strip — verbatim and unconditional; only the length decision moves
+    /// here, where it can be sized for a body and describe its own cut.
+    fn scrubbed_ok(value: Value, secrets: &[String], what: &str) -> ToolResult {
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-        ToolResult::success(scrub(&text, secrets))
+        ToolResult::success(catalog::bound_body(redact(&text, secrets), what))
     }
 
     /// A scrubbed error result — the tenant token is stripped from any error
@@ -415,24 +442,23 @@ mod live {
         }
 
         fn description(&self) -> &str {
-            "List the Composio toolkits (integrations such as Gmail, Slack, GitHub) available to this company. Read-only."
+            catalog::list_toolkits_description()
         }
 
         fn parameters_schema(&self) -> Value {
-            json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            })
+            catalog::list_toolkits_parameters_schema()
         }
 
         fn permission_level(&self) -> PermissionLevel {
             PermissionLevel::ReadOnly
         }
 
-        async fn execute(&self, _args: Value) -> Result<ToolResult> {
+        async fn execute(&self, args: Value) -> Result<ToolResult> {
+            let request = catalog::ToolkitListRequest::parse(&args);
             tracing::debug!(
                 allowlist = ?self.toolkits,
+                search = ?request.search,
+                limit = request.limit,
                 "[composio] list_toolkits"
             );
             let (client, secrets) = match live_call(&self.config).await {
@@ -451,10 +477,38 @@ mod live {
                         resp.catalog
                             .retain(|entry| toolkit_allowed(&self.toolkits, &entry.slug));
                     }
-                    Ok(scrubbed_ok(
-                        serde_json::to_value(&resp).unwrap_or(Value::Null),
-                        &secrets,
-                    ))
+                    // Issue #410: bounded, self-describing rendering rather than
+                    // the whole catalogue as pretty JSON. Composio publishes
+                    // several hundred toolkits, each with prose and a categories
+                    // array, so this listing is the same silent-cut class as the
+                    // action listing one level down.
+                    let catalogued: Vec<catalog::CatalogToolkit> = resp
+                        .catalog
+                        .iter()
+                        .map(|entry| catalog::CatalogToolkit {
+                            slug: entry.slug.clone(),
+                            name: entry.name.clone(),
+                            description: entry.description.clone().unwrap_or_default(),
+                            connected: entry.enabled,
+                        })
+                        .collect();
+                    // Backends predating the dynamic catalogue send only the
+                    // slug allowlist; render those slugs rather than nothing.
+                    let toolkits: Vec<catalog::CatalogToolkit> = if catalogued.is_empty() {
+                        resp.toolkits
+                            .iter()
+                            .map(|slug| catalog::CatalogToolkit {
+                                slug: slug.clone(),
+                                name: String::new(),
+                                description: String::new(),
+                                connected: None,
+                            })
+                            .collect()
+                    } else {
+                        catalogued
+                    };
+                    let rendered = catalog::render_toolkits(&toolkits, &request);
+                    Ok(ToolResult::success(redact(&rendered, &secrets)))
                 }
                 Err(err) => Ok(scrubbed_err(
                     "composio_list_toolkits failed",
@@ -517,6 +571,7 @@ mod live {
                     Ok(scrubbed_ok(
                         serde_json::to_value(&resp).unwrap_or(Value::Null),
                         &secrets,
+                        "connections list",
                     ))
                 }
                 Err(err) => Ok(scrubbed_err(
@@ -542,21 +597,11 @@ mod live {
         }
 
         fn description(&self) -> &str {
-            "List the callable Composio actions (function schemas) for one or more toolkits. Pass `toolkits` (array of slugs) to narrow; omit to list every allowed toolkit's actions. Read-only."
+            catalog::list_tools_description()
         }
 
         fn parameters_schema(&self) -> Value {
-            json!({
-                "type": "object",
-                "properties": {
-                    "toolkits": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Toolkit slugs to list actions for (e.g. `gmail`, `slack`, `github`)."
-                    }
-                },
-                "additionalProperties": false
-            })
+            catalog::list_tools_parameters_schema()
         }
 
         fn permission_level(&self) -> PermissionLevel {
@@ -591,9 +636,17 @@ mod live {
                     .filter(|t| toolkit_allowed(&self.toolkits, t))
                     .collect()
             };
+            // The narrowing + rendering request (issue #410). Toolkit resolution
+            // above is a security decision (allowlist intersection) and stays
+            // here; `search` / `detail` / `limit` are presentation and live in
+            // the pure catalogue module.
+            let request = catalog::ListRequest::parse(&args, effective.clone());
             tracing::debug!(
                 effective = ?effective,
                 allowlist = ?self.toolkits,
+                search = ?request.search,
+                detail = ?request.detail,
+                limit = request.limit,
                 "[composio] list_tools"
             );
 
@@ -617,10 +670,24 @@ mod live {
                             toolkit_allowed(&self.toolkits, &slug_toolkit(&schema.function.name))
                         });
                     }
-                    Ok(scrubbed_ok(
-                        serde_json::to_value(&resp).unwrap_or(Value::Null),
-                        &secrets,
-                    ))
+                    // Issue #410: render through the bounded, self-describing
+                    // catalogue view rather than dumping the whole response as
+                    // pretty JSON. A hundred-action toolkit serialized whole is
+                    // hundreds of kilobytes; the harness's shared tool-result
+                    // budget then cut it on a byte boundary, leaving the agent a
+                    // fragment with nothing in it saying so.
+                    let actions: Vec<catalog::CatalogAction> = resp
+                        .tools
+                        .iter()
+                        .map(|schema| catalog::CatalogAction {
+                            toolkit: slug_toolkit(&schema.function.name),
+                            slug: schema.function.name.clone(),
+                            description: schema.function.description.clone().unwrap_or_default(),
+                            parameters: schema.function.parameters.clone(),
+                        })
+                        .collect();
+                    let rendered = catalog::render(&actions, &request);
+                    Ok(ToolResult::success(redact(&rendered, &secrets)))
                 }
                 Err(err) => Ok(scrubbed_err("composio_list_tools failed", &err, &secrets)),
             }
@@ -692,6 +759,7 @@ mod live {
                 Ok(resp) => Ok(scrubbed_ok(
                     serde_json::to_value(&resp).unwrap_or(Value::Null),
                     &secrets,
+                    "authorization response",
                 )),
                 Err(err) => Ok(scrubbed_err("composio_authorize failed", &err, &secrets)),
             }
@@ -713,7 +781,7 @@ mod live {
         }
 
         fn description(&self) -> &str {
-            "Run a Composio action by its slug (e.g. `GMAIL_SEND_EMAIL`) with a JSON `arguments` object. Use `composio_list_tools` first to discover the slug and its parameters."
+            "Run a Composio action by its slug (e.g. `GMAIL_SEND_EMAIL`) with a JSON `arguments` object. Discover the slug first with `composio_list_tools({\"search\": \"<words>\"})`, then read its parameters with `composio_list_tools({\"search\": \"<SLUG>\", \"detail\": \"schemas\"})`. Never guess a slug that was not listed."
         }
 
         fn parameters_schema(&self) -> Value {
@@ -781,6 +849,7 @@ mod live {
                     Ok(scrubbed_ok(
                         serde_json::to_value(&resp).unwrap_or(Value::Null),
                         &secrets,
+                        &format!("`{tool}` output"),
                     ))
                 }
                 Err(err) => Ok(scrubbed_err("composio_execute failed", &err, &secrets)),
