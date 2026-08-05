@@ -48,6 +48,7 @@ import { toast } from "sonner";
 import { type ChatMessage, fromHistory, makeMessage } from "@/lib/chat";
 import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { defaultDesks, type Desk } from "@/lib/desks";
+import { writeLastChannel } from "@/lib/last-channel";
 import { fromDto, type TeamMember } from "@/lib/team";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
@@ -498,10 +499,18 @@ export function AppShell({
    * again as the open channel's transcript grows so a line read as it lands
    * doesn't leave a badge behind.
    */
-  const onChannelViewed = useCallback((channelId: string) => {
-    activeChatChannelRef.current = channelId;
-    setLastViewedChannel((v) => ({ ...v, [channelId]: Date.now() }));
-  }, []);
+  const onChannelViewed = useCallback(
+    (channelId: string) => {
+      activeChatChannelRef.current = channelId;
+      setLastViewedChannel((v) => ({ ...v, [channelId]: Date.now() }));
+      // The same fact, persisted, so re-entering Chat returns to the channel
+      // the operator was reading instead of whichever sorts first (issue #412).
+      // The ref above cannot do it: it dies with this mount, and a reload is
+      // exactly one of the trips that has to survive.
+      writeLastChannel(company, channelId);
+    },
+    [company],
+  );
 
   const setThreadMessages = (
     threadId: string,
