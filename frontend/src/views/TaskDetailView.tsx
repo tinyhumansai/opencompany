@@ -110,7 +110,7 @@ import { effectDone } from "@/lib/language";
 import { PRIORITY_STYLES, TASK_COLUMNS } from "@/lib/tasks-sample";
 import { toast } from "sonner";
 import { ArtifactsTab } from "./ArtifactsTab";
-import { TaskPlanBrief } from "./TaskPlanBrief";
+import { TaskPlanBrief, tallyPrerequisites } from "./TaskPlanBrief";
 import { AssigneeSelect } from "./AssigneeSelect";
 import { TaskEditDialog } from "./TaskEditDialog";
 
@@ -203,14 +203,26 @@ function tabForFocus(focus?: TaskFocus): string {
 }
 
 /**
- * How many of a plan's prerequisites are actually stopping the card (#337).
+ * The count that rides the Plan tab's trigger, and the colour it wears (#337).
  *
- * Only `missing` blocks. `needsApproval` and `unknown` ride on the brief as
- * warnings — the host does not treat either as a reason to hold the work, so
- * neither may show up as a count that reads like one.
+ * Two different signals, never merged into one number. Red is *blocking*: only
+ * `missing` earns it, because only `missing` stopped the card. Amber is
+ * *unresolved but not blocking* — a prerequisite that will stop for an operator
+ * approval, or one the host could not check at all. Showing a single total
+ * would either send someone to fix a non-problem or hide a real one behind a
+ * colour that says it is fine.
+ *
+ * Returns `null` for a plan with nothing to report, so the trigger stays a
+ * plain word.
  */
-function blockerCount(plan: TaskPlan): number {
-  return plan.prerequisites.filter((p) => p.status === "missing").length;
+function planTabCount(plan: TaskPlan): { count: number; tone: string } | null {
+  const { blocking, approval, unchecked } = tallyPrerequisites(plan);
+  if (blocking > 0) return { count: blocking, tone: "text-destructive" };
+  const unresolved = approval + unchecked;
+  if (unresolved > 0) {
+    return { count: unresolved, tone: "text-amber-600 dark:text-amber-400" };
+  }
+  return null;
 }
 
 export function TaskDetailView({
@@ -481,11 +493,14 @@ export function TaskDetailView({
                 {detail.task.plan && (
                   <TabsTrigger value="plan">
                     Plan
-                    {blockerCount(detail.task.plan) > 0 && (
-                      <span className="ml-1.5 tabular-nums text-destructive">
-                        {blockerCount(detail.task.plan)}
-                      </span>
-                    )}
+                    {(() => {
+                      const badge = planTabCount(detail.task.plan!);
+                      return badge ? (
+                        <span className={cn("ml-1.5 tabular-nums", badge.tone)}>
+                          {badge.count}
+                        </span>
+                      ) : null;
+                    })()}
                   </TabsTrigger>
                 )}
                 <TabsTrigger value="approvals">Approvals</TabsTrigger>

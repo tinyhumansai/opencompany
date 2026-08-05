@@ -68,13 +68,32 @@ const VERDICT: Record<
   },
 };
 
+/**
+ * How a plan's prerequisites actually came out, counted once.
+ *
+ * Three separate facts, deliberately not collapsed into two. The host is
+ * careful to keep them apart — an unreachable inventory yields `unknown` rather
+ * than `missing`, precisely so a provider outage cannot fabricate a blocker —
+ * and any surface that folds `unknown` back into "fine" throws that care away
+ * at the last step, telling an operator something the host never established.
+ */
+export function tallyPrerequisites(plan: TaskPlan): {
+  blocking: number;
+  approval: number;
+  unchecked: number;
+} {
+  return {
+    blocking: plan.prerequisites.filter((p) => p.status === "missing").length,
+    approval: plan.prerequisites.filter((p) => p.status === "needsApproval").length,
+    unchecked: plan.prerequisites.filter((p) => p.status === "unknown").length,
+  };
+}
+
 /** The whole brief: what the plan is, what it needs, and how it will be judged. */
 export function TaskPlanBrief({ plan }: { plan: TaskPlan }) {
-  const blockers = plan.prerequisites.filter((p) => p.status === "missing");
-
   return (
     <div className="flex flex-col gap-5" data-testid="task-plan-brief">
-      <Headline plan={plan} blockers={blockers.length} />
+      <Headline plan={plan} />
 
       {plan.description && (
         <p className="text-sm leading-relaxed text-foreground/90">{plan.description}</p>
@@ -155,34 +174,66 @@ export function TaskPlanBrief({ plan }: { plan: TaskPlan }) {
 /**
  * The verdict in one line, before any detail.
  *
- * Blockers are counted rather than listed here: the list is right below, and a
- * headline that tried to name them would truncate exactly when there were most
- * of them.
+ * **Three states, not two**, and the middle one is the point. Saying
+ * "everything it needs is in place" whenever nothing is `missing` would claim a
+ * verification that did not happen: an `unknown` prerequisite is one the host
+ * could not check, and a `needsApproval` one *will* stop and ask a person. Both
+ * are true things the operator is about to run into, and a green headline is
+ * how they find out the hard way instead.
+ *
+ * So the all-clear is reserved for a plan where every prerequisite was actually
+ * checked and actually passed. Anything less says what is unresolved and how
+ * many, in words that name which kind — "couldn't be checked" and "needs
+ * approval" call for different responses, and lumping them would leave the
+ * operator unable to tell whether to go fix something or just expect a prompt.
+ *
+ * Counts rather than names: the list is right below, and a headline that tried
+ * to name them would truncate exactly when there were most of them.
  */
-function Headline({ plan, blockers }: { plan: TaskPlan; blockers: number }) {
-  const blocked = blockers > 0;
-  const Icon = blocked ? AlertTriangle : CheckCircle2;
+function Headline({ plan }: { plan: TaskPlan }) {
+  const { blocking, approval, unchecked } = tallyPrerequisites(plan);
+
+  // What is unresolved but not blocking, phrased so each kind keeps its own
+  // meaning.
+  const caveats: string[] = [];
+  if (approval > 0) {
+    caveats.push(`${approval} will stop for your approval`);
+  }
+  if (unchecked > 0) {
+    caveats.push(`${unchecked} couldn't be checked`);
+  }
+
+  const tone =
+    blocking > 0 ? "blocked" : caveats.length > 0 ? "caveat" : "clear";
+  const Icon =
+    tone === "blocked" ? AlertTriangle : tone === "caveat" ? CircleHelp : CheckCircle2;
+
+  const headline =
+    tone === "blocked"
+      ? `Planned, but it can't start yet — ${blocking} thing${blocking === 1 ? "" : "s"} missing`
+      : tone === "caveat"
+        ? `Planned — nothing is blocking it, but ${caveats.join(" and ")}`
+        : "Planned, and everything it needs was checked and is in place";
+
   return (
     <div
       className={cn(
         "flex items-start gap-2 rounded-lg border px-3 py-2",
-        blocked
-          ? "border-destructive/30 bg-destructive/5"
-          : "border-emerald-500/30 bg-emerald-500/5",
+        tone === "blocked" && "border-destructive/30 bg-destructive/5",
+        tone === "caveat" && "border-amber-500/30 bg-amber-500/5",
+        tone === "clear" && "border-emerald-500/30 bg-emerald-500/5",
       )}
     >
       <Icon
         className={cn(
           "mt-0.5 size-4 shrink-0",
-          blocked ? "text-destructive" : "text-emerald-600 dark:text-emerald-400",
+          tone === "blocked" && "text-destructive",
+          tone === "caveat" && "text-amber-600 dark:text-amber-400",
+          tone === "clear" && "text-emerald-600 dark:text-emerald-400",
         )}
       />
       <div className="min-w-0 text-sm leading-relaxed">
-        <span className="font-medium">
-          {blocked
-            ? `Planned, but it can't start yet — ${blockers} thing${blockers === 1 ? "" : "s"} missing`
-            : "Planned, and everything it needs is in place"}
-        </span>
+        <span className="font-medium">{headline}</span>
         {plan.proposedAssignee && (
           <span className="text-muted-foreground">
             {" · suggested for "}

@@ -1,6 +1,7 @@
 import { type DragEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
+  CircleHelp,
   ClipboardList,
   FileText,
   ListTree,
@@ -44,6 +45,7 @@ import {
 } from "@/lib/task-output";
 import { toast } from "sonner";
 import { TaskDetailView } from "./TaskDetailView";
+import { tallyPrerequisites } from "./TaskPlanBrief";
 
 /**
  * Reads the `#/tasks/<id>` sub-hash, or null on the bare board. The app shell's
@@ -613,13 +615,28 @@ const SHOWS_OUTPUT_LINK = new Set(["in_review", "done"]);
  * operator to go fix something that is not blocking anything.
  */
 function PlanBadgeRow({ plan }: { plan: TaskPlan }) {
-  const blocking = plan.prerequisites.filter((p) => p.status === "missing").length;
+  const { blocking, approval, unchecked } = tallyPrerequisites(plan);
   if (blocking > 0) {
     return (
       <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-destructive">
         <AlertTriangle className="size-3 shrink-0" />
         <span>
           Planned — needs {blocking} thing{blocking === 1 ? "" : "s"}
+        </span>
+      </div>
+    );
+  }
+  // Nothing blocking, but not necessarily all-clear either — the same three-way
+  // distinction the brief's headline makes, kept in step with it so the board
+  // and the card can never disagree about whether a plan is settled. A count
+  // here is a prompt to open the card, where the rows say which is which.
+  const unresolved = approval + unchecked;
+  if (unresolved > 0) {
+    return (
+      <div className="mt-2 flex items-center gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+        <CircleHelp className="size-3 shrink-0" />
+        <span>
+          Planned — {unresolved} to be aware of
         </span>
       </div>
     );
