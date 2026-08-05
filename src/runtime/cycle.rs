@@ -1070,6 +1070,16 @@ async fn perform_effect(rt: &CompanyRuntime, effect: &Effect) -> Result<()> {
             .unwrap_or_default();
         send_company_email(rt, to, subject, body).await?;
     }
+    // Issue #395: an approved workflow gate. The paused run is long settled —
+    // the engine returns rather than suspending — so "continue" means starting a
+    // fresh supervised run with the gate id in the trigger input's `approvals`.
+    // At-most-once comes free from the `approval:<id>` key above; deny and TTL
+    // expiry never reach here, and since nothing was held open, nothing running
+    // is the complete outcome. See `workflow_resume` for why this is a re-run
+    // and what that costs.
+    if effect.kind == crate::runtime::WORKFLOW_APPROVE_KIND {
+        crate::runtime::workflow_resume::resume_from_effect(rt, effect).await?;
+    }
     Ok(())
 }
 
