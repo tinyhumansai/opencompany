@@ -739,6 +739,100 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
     assert!(tasks.delete(&alpha, "t1").await.unwrap());
     assert!(!tasks.delete(&alpha, "t1").await.unwrap());
     assert_eq!(tasks.list(&alpha).await.unwrap().len(), 1);
+
+    // Issue #337: a card carrying a full plan round-trips **byte-identically**
+    // on every backend.
+    //
+    // Worth its own leg rather than folding a plan into the fixture above,
+    // because the failure it guards is quiet and backend-specific: the fs
+    // bundle stores the board as a JSON array while sqlite and mongodb store
+    // each card as a `task_json` string, so a nested structure that survives
+    // one can be flattened, reordered or dropped by another — and a plan whose
+    // `prerequisites` came back empty would read as "this card needs nothing",
+    // which is the one wrong answer that lets a card dispatch into work it
+    // cannot do. Comparing the whole record rather than spot-checking fields is
+    // what makes a silently-dropped field fail here.
+    let planned = TaskRecord {
+        plan: Some(crate::ports::tasks::TaskPlan {
+            description: "Publish the release notes".to_string(),
+            steps: vec![
+                crate::ports::tasks::PlanStep {
+                    title: "Draft".to_string(),
+                    detail: "against the tagged version".to_string(),
+                    estimated_cost_usd: Some(0.25),
+                    estimated_minutes: Some(30),
+                },
+                // A step with no estimates at all — the skip-if-none half.
+                crate::ports::tasks::PlanStep {
+                    title: "Publish".to_string(),
+                    detail: "once review signs off".to_string(),
+                    estimated_cost_usd: None,
+                    estimated_minutes: None,
+                },
+            ],
+            // One of every verdict, so a backend that mangled the enum
+            // encoding fails rather than happening to round-trip the one
+            // value the fixture used.
+            prerequisites: vec![
+                crate::ports::tasks::Prerequisite {
+                    kind: crate::ports::tasks::PrereqKind::Connection,
+                    name: "github".to_string(),
+                    status: crate::ports::tasks::PrereqStatus::Satisfied,
+                    note: "github is connected".to_string(),
+                },
+                crate::ports::tasks::Prerequisite {
+                    kind: crate::ports::tasks::PrereqKind::Mcp,
+                    name: "search".to_string(),
+                    status: crate::ports::tasks::PrereqStatus::Missing,
+                    note: "no MCP server called `search` is configured".to_string(),
+                },
+                crate::ports::tasks::Prerequisite {
+                    kind: crate::ports::tasks::PrereqKind::Permission,
+                    name: "web".to_string(),
+                    status: crate::ports::tasks::PrereqStatus::NeedsApproval,
+                    note: "policy stops it for a person".to_string(),
+                },
+                crate::ports::tasks::Prerequisite {
+                    kind: crate::ports::tasks::PrereqKind::Other,
+                    name: "something odd".to_string(),
+                    status: crate::ports::tasks::PrereqStatus::Unknown,
+                    note: "not checked".to_string(),
+                },
+            ],
+            risks: vec!["the tag may not exist yet".to_string()],
+            verification: "the notes are live".to_string(),
+            scope: "the notes only".to_string(),
+            proposed_assignee: Some("maya".to_string()),
+            planned_at_millis: 1_234,
+        }),
+        ..task("t-planned", "planning", 9)
+    };
+    tasks.upsert(&alpha, &planned).await.unwrap();
+    let read_back = tasks
+        .list(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == "t-planned")
+        .expect("the planned card persists");
+    assert_eq!(
+        read_back, planned,
+        "a plan must survive the round trip whole"
+    );
+
+    // And a card with no plan reads back with none — the additive-wire
+    // contract, checked on the backend rather than only on the serde shape.
+    assert!(
+        tasks
+            .list(&alpha)
+            .await
+            .unwrap()
+            .iter()
+            .find(|t| t.id == "t2")
+            .expect("t2")
+            .plan
+            .is_none()
+    );
 }
 
 /// Asserts the [`UserStore`] contract: per-company isolation, email uniqueness,
@@ -1468,6 +1562,38 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].at_millis, 200);
     assert_eq!(recent[0].kind, SampleKind::Inference);
+
+    // Issue #337: a `PlanningCall` sample round-trips on every backend, kind
+    // and attribution intact.
+    //
+    // The kind is what the Usage view will one day separate planning spend by,
+    // and the agent is the whole cost decision — a backend that dropped either
+    // would silently re-attribute planning to whatever bucket the reader
+    // defaulted to. `agent: "company"` is asserted against the literal rather
+    // than the constant on purpose: it is a *stored* value, so a rename of the
+    // constant must not silently re-file every historical sample.
+    let planning = UsageSample {
+        at_millis: 300,
+        agent: crate::metering::UNATTRIBUTED_AGENT.to_string(),
+        provider: "managed".to_string(),
+        input_tokens: 900,
+        output_tokens: 300,
+        cached_input_tokens: 100,
+        cost_usd: 0.03,
+        kind: SampleKind::PlanningCall,
+        run_id: None,
+    };
+    usage.record(&alpha, &planning).await.unwrap();
+    let back = usage
+        .query(&alpha, 300)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SampleKind::PlanningCall)
+        .expect("the planning sample persists");
+    assert_eq!(back, planning);
+    assert_eq!(back.agent, "company");
+    assert!(back.run_id.is_none(), "a planning pass has no attempt row");
 }
 
 /// Asserts the [`UsageMeter`] retention contract: samples older than the 90-day
