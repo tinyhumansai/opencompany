@@ -22,13 +22,15 @@
 //! ## Security
 //!
 //! The bus carries only the **already-scrubbed** projection produced by
-//! [`crate::harness::steps`] — a label, an optional whitelisted detail, an
-//! elapsed time, a status. It never carries raw tool arguments, raw tool
-//! output, or an MCP call's nested remote payload, exactly like `fold_steps`.
-//! The mapping that enforces that lives next to `fold_steps` (same helpers, same
-//! rules); this module is a dumb transport and models no openhuman types, so it
-//! stays compiled in the default (non-`openhuman`) build where it simply has no
-//! publishers and every subscription is an empty stream.
+//! [`crate::harness::steps`] — a label, a redacted argument line, a result
+//! *summary*, a typed failure, an elapsed time, a status. It never carries raw
+//! tool output, exactly like `fold_steps`; arguments reach it only through
+//! issue #372's host-side redactor, and a remote body reaches it only as a
+//! shape (issue #411). The mapping that enforces all of that lives next to
+//! `fold_steps` (same helpers, same rules); this module is a dumb transport and
+//! models no openhuman types, so it stays compiled in the default
+//! (non-`openhuman`) build where it simply has no publishers and every
+//! subscription is an empty stream.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -37,7 +39,7 @@ use futures::stream::BoxStream;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::ports::types::CompanyId;
+use crate::ports::types::{CompanyId, TurnStepFailure};
 
 /// Per-company broadcast senders. Created lazily on first publish/subscribe for
 /// a company and kept for the process lifetime (companies are few and long
@@ -87,16 +89,55 @@ pub struct TurnStreamEvent {
     /// name). Never derived from arguments or output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Scrubbed structural detail (whitelisted success enrichment, or the
-    /// classifier's plain-language failure cause). Never raw remote text.
+    /// **What the call was doing** — its arguments, put through issue #372's
+    /// host-side redactor and bounded (issue #411). Never raw remote text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// `"running"` on a start, `"ok"`/`"error"` on a completion.
+    /// **What came back** — a success's shape summary or an intrinsic tool's
+    /// own message, or a failure's plain-language cause (issue #411). Never a
+    /// remote body's content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// The typed reason a call did not succeed (issue #411), so a live row
+    /// renders the same known state the final folded step does. `None` on a
+    /// success and on a parked call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TurnStepFailure>,
+    /// The result was cut before the agent could read all of it (issue #410).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// `"running"` on a start; `"ok"` / `"error"` / `"awaiting_approval"` on a
+    /// completion. Sourced from
+    /// [`TurnStepStatus::wire_word`](crate::ports::types::TurnStepStatus::wire_word)
+    /// so the live word and the persisted one cannot drift.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'static str>,
     /// Wall-clock the completed call took, on `tool_result` only.
     #[serde(rename = "elapsedMs", skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+}
+
+impl Default for TurnStreamEvent {
+    /// An empty `tool_call` frame, so the mapping in
+    /// [`crate::harness::steps`] can fill only the fields a given event kind
+    /// actually carries via `..Default::default()`. `kind` is a placeholder
+    /// every caller overrides.
+    fn default() -> Self {
+        Self {
+            kind: "tool_call",
+            seq: 0,
+            agent_id: None,
+            chat_id: None,
+            tool_call_id: None,
+            label: None,
+            detail: None,
+            result: None,
+            failure: None,
+            truncated: false,
+            status: None,
+            elapsed_ms: None,
+        }
+    }
 }
 
 impl TurnStreamEvent {
@@ -181,9 +222,8 @@ mod tests {
             chat_id: None,
             tool_call_id: Some("c1".to_string()),
             label: Some("Searching".to_string()),
-            detail: None,
             status: Some("running"),
-            elapsed_ms: None,
+            ..TurnStreamEvent::default()
         }
     }
 
@@ -259,6 +299,9 @@ mod tests {
             tool_call_id: Some("c1".to_string()),
             label: Some("Search".to_string()),
             detail: Some("brave · search".to_string()),
+            result: Some("12 items".to_string()),
+            failure: None,
+            truncated: false,
             status: Some("ok"),
             elapsed_ms: Some(12),
         };
