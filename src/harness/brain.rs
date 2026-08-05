@@ -23,8 +23,10 @@ use async_trait::async_trait;
 
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
+use crate::harness::build::agent_workspace;
 use crate::harness::lifecycle::{self, TaskRunEnd};
 use crate::harness::orchestrator;
+use crate::harness::publish::{self, WorkspaceSnapshot};
 // `Delegation` is only named by the test-only `run_delegation` wrapper and the
 // delegation tests (via `use super::*`); the cycle path drives the runner's
 // `handle_operator_message` and never spells the type out.
@@ -51,7 +53,7 @@ const NO_TASK_STORE: &str = "this company has no task board wired, so the card c
 const CARD_VANISHED: &str = "the card was gone by the time its dispatch ran";
 
 use crate::harness::run_trace::RunTraceSink;
-use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord};
+use crate::ports::artifacts::{ArtifactAuthor, ArtifactRecord};
 use crate::ports::brain::{Brain, CycleHost};
 use crate::ports::runs::{RunOutcome, RunStatus};
 use crate::ports::types::{
@@ -336,6 +338,23 @@ impl HarnessBrain {
             tasks.upsert(&self.record.id, &card).await?;
         }
 
+        // Issue #244: the dispatch-start baseline for "did this agent write
+        // anything it did not publish?".
+        //
+        // Taken **after** responder resolution, because the workspace is the
+        // responder's — a snapshot taken before we knew who was running would
+        // be of the wrong directory. `dispatched_responder` remembers who that
+        // was, so a hand-off (which reassigns the card mid-run) can be detected
+        // and the whole detection path skipped rather than diffed against a
+        // workspace nobody touched.
+        let dispatched_responder = responder.clone();
+        let workspace = agent_workspace(&self.deps.workspace_root, &self.record.id, &responder);
+        let workspace_at_dispatch = WorkspaceSnapshot::take(&workspace);
+        // Start from an empty publish queue for the same reason the delegation
+        // queue is cleared per turn: a chat turn earlier in this cycle shares
+        // these deps, and its staged file must never be attributed to this card.
+        self.deps.pending_publishes.clear();
+
         // Register the run so an operator can steer it mid-flight. The guard's
         // RAII `Drop` deregisters on every exit path (success, error, redirect
         // exhaustion), so a crashed turn never leaves a ghost row in the strip.
@@ -381,6 +400,13 @@ impl HarnessBrain {
             // behind can hijack this card — the same guard
             // `handle_operator_message` opens with.
             self.deps.delegations.clear();
+            // Issue #244, same argument for staged publishes: a redirect
+            // re-runs from the original brief and *abandons* the previous
+            // turn's work, so a file that turn offered must be abandoned with
+            // it. This is inside the loop deliberately; the nudge below is not
+            // part of the loop and never clears, so a nudge cannot discard what
+            // the turn it is asking about published.
+            self.deps.pending_publishes.clear();
             let outcome = run_turn
                 // A dispatched task card carries no chat bubble (its steps are
                 // discarded into the note), so its live turn frames must not leak
@@ -567,6 +593,90 @@ impl HarnessBrain {
             }
         };
 
+        // ── Issue #244: the deliverable gate, and the one nudge ─────────────
+        //
+        // This sits between the primary turn and the completion bookkeeping —
+        // after the run ended and delegation settled, before the card is
+        // persisted and the queue drained — because a nudge that ran after the
+        // card landed would be asking about a task the board already calls
+        // finished.
+        //
+        // It cannot be mid-turn: OpenHuman's session loop is not injectable. But
+        // `run_task` already runs several turns per run (the redirect loop and
+        // the delegation runner both do exactly this), so a follow-up turn is
+        // the acting surface available.
+        //
+        // Gated on `Completed` alone. A failure, a cancellation, a pause or a
+        // spent redirect budget is not a moment to ask an agent about its files.
+        let mut declined: Option<String> = None;
+        let mut unpublished_before_nudge: Vec<String> = Vec::new();
+        if run_end == TaskRunEnd::Completed {
+            if responder == dispatched_responder {
+                let changed = workspace_at_dispatch.changed_since(&workspace);
+                unpublished_before_nudge =
+                    publish::unpublished(&changed, &self.deps.pending_publishes.sources());
+            } else {
+                // A hand-off reassigned the card, so the snapshot above is of
+                // the delegator's workspace and the work happened in the
+                // delegate's. Diffing them would name files nobody wrote this
+                // run. Degrade silently: no nudge, no warning, and whatever the
+                // delegate published is still drained and recorded below.
+                tracing::debug!(
+                    task_id = %card.id,
+                    from = %dispatched_responder,
+                    to = %responder,
+                    "[publish] responder was reassigned mid-run; skipping the unpublished scan"
+                );
+            }
+        }
+
+        // **Exactly one nudge, by construction.** Straight-line code guarded by
+        // a local — not a loop, not a counter, not inside the redirect loop. A
+        // second nudge is not merely absent, there is nowhere to write one.
+        if !unpublished_before_nudge.is_empty() {
+            declined = self
+                .nudge_for_unpublished(
+                    &run_turn,
+                    &responder,
+                    &base_instruction,
+                    &result_text,
+                    &unpublished_before_nudge,
+                    &control,
+                    sink.clone(),
+                )
+                .await;
+        }
+
+        // The fallback's file list is the **pre-nudge** diff minus whatever is
+        // staged now. Deliberately not a fresh scan: a scratch file the agent
+        // wrote *while answering the nudge* is an artifact of being asked, and
+        // naming it in the warning would make the nudge generate its own noise.
+        let still_unpublished = publish::unpublished(
+            &unpublished_before_nudge,
+            &self.deps.pending_publishes.sources(),
+        );
+        if !still_unpublished.is_empty() {
+            // A decline is a clean outcome, not an error: the reason goes on the
+            // card where it is addressable, the warning names the files for
+            // whoever is watching logs, and nothing else happens. No retry, no
+            // failure, no artifact.
+            if let Some(reply) = declined.as_deref() {
+                card.note = Some(append_result(
+                    card.note.as_deref(),
+                    &responder,
+                    &publish::declined_note(&still_unpublished, reply),
+                ));
+            }
+            tracing::warn!(
+                task_id = %card.id,
+                agent = %responder,
+                files = %publish::name_files(&still_unpublished),
+                declined = declined.is_some(),
+                "[publish] the run changed workspace files and published none of them; no \
+                 artifact was recorded"
+            );
+        }
+
         // Issue #337: the attempt's **settled status** decides where the card
         // lands, so it has to be known before the card is written.
         //
@@ -621,31 +731,42 @@ impl HarnessBrain {
         )
         .await;
 
-        // Issue #187 / #244: record what the run actually produced.
+        // Issue #244: record what the agent actually published.
         //
-        // Gated on the run reaching its **success terminal** —
+        // The queue is drained **unconditionally** so nothing an abandoned turn
+        // staged can leak into the next run, and the drained set is recorded
+        // only when the run reached its success terminal.
+        //
+        // "Success terminal" is read off the *ending* —
         // `run_status_for(run_end) == Succeeded`, i.e. the turn finished or
-        // spent its redirect budget. Deliberately read off the *ending* rather
-        // than off `settled`: parking an approval relabels who acts next, not
-        // whether the agent produced a deliverable, so a run that wrote a spec
-        // and also asked for an authorisation must not lose the spec.
+        // spent its redirect budget — not off `settled`. Parking an approval
+        // relabels who acts next, not whether the agent produced a deliverable,
+        // so a run that wrote a spec and also asked for an authorisation must
+        // not lose the spec.
         //
-        // A failure, a cancellation or a pause records nothing. It still drains
-        // the publish queue, so nothing an abandoned turn staged leaks into the
-        // next run.
-        //
-        // Recorded before the #185 journal writes below because those move
-        // `result_text` into the completion event; this only borrows it.
-        let produced_a_deliverable = lifecycle::run_status_for(run_end) == RunStatus::Succeeded;
-        if produced_a_deliverable {
-            self.record_task_artifact(
+        // Recorded before the #185 journal writes below, because the completion
+        // event carries the ids this returns.
+        let published = self.deps.pending_publishes.drain();
+        let artifact_ids = if lifecycle::run_status_for(run_end) == RunStatus::Succeeded {
+            self.record_published_artifacts(
                 &card,
                 &responder,
-                &result_text,
+                published,
                 sink.as_ref().map(|s| s.run_id()),
             )
-            .await?;
-        }
+            .await?
+        } else {
+            if !published.is_empty() {
+                tracing::info!(
+                    task_id = %card.id,
+                    staged = published.len(),
+                    ending = ?run_end,
+                    "[publish] the run did not reach its success terminal; staged files are \
+                     discarded rather than recorded"
+                );
+            }
+            Vec::new()
+        };
 
         // Issue #185: correlate this dispatch's journal trail to its card.
         //
@@ -678,7 +799,7 @@ impl HarnessBrain {
             );
         }
 
-        self.journal_task_outcome(&card, &responder, result_text)
+        self.journal_task_outcome(&card, &responder, result_text, artifact_ids)
             .await;
 
         // Issue #151 §3.2: answer in the conversation the card was spawned
@@ -741,7 +862,9 @@ impl HarnessBrain {
         self.settle_run_end(sink, TaskRunEnd::Failed, &text, 0)
             .await;
 
-        self.journal_task_outcome(&card, &orchestrator, text).await;
+        // A refusal ran no turn, so it published nothing.
+        self.journal_task_outcome(&card, &orchestrator, text, Vec::new())
+            .await;
 
         let Some(origin) = card.origin_chat_id.clone() else {
             return Ok(None);
@@ -839,6 +962,77 @@ impl HarnessBrain {
         }
     }
 
+    /// Runs the **one** follow-up turn that asks about unpublished files
+    /// (issue #244), returning the agent's reply when it still published
+    /// nothing.
+    ///
+    /// # Why it is a method with no loop in it
+    ///
+    /// The bound on nudges is structural. This runs exactly one turn, there is
+    /// no iteration anywhere in it, and its single call site is straight-line
+    /// code guarded by a local. A second nudge is not prevented by a counter
+    /// that could be miscounted — there is nowhere to write one.
+    ///
+    /// # What it costs, and where that shows up
+    ///
+    /// One extra model turn on the same path, so its spend lands in the same
+    /// usage ledger and counts against this agent's daily budget like any other
+    /// turn. It is **distinguishable in the run trace** — its steps append to
+    /// the same attempt after the primary reply — but it is **not separately
+    /// labelled in the usage ledger**. Adding a provenance field to
+    /// `UsageSample` is a real change to the metering surface and is out of
+    /// scope here; saying so is better than half-doing it.
+    ///
+    /// # Failure is contained
+    ///
+    /// A provider fault, or the per-agent daily cap refusing the turn, logs a
+    /// warning and returns `None`. The run already completed its work and its
+    /// reply has already been decided; a bookkeeping turn must never fail or
+    /// delay it.
+    ///
+    /// An operator steer during the nudge discards the nudge's *reply* (no note
+    /// line, no decline recorded) but keeps anything it published — losing a
+    /// real deliverable to a cancelled bookkeeping turn would be the worse
+    /// failure by a wide margin.
+    #[allow(clippy::too_many_arguments)]
+    async fn nudge_for_unpublished(
+        &self,
+        run_turn: &HarnessRunTurn<'_>,
+        responder: &str,
+        brief: &str,
+        reply: &str,
+        unpublished: &[String],
+        control: &crate::company::steer::SteerControl,
+        sink: Option<Arc<RunTraceSink>>,
+    ) -> Option<String> {
+        let instruction = publish::nudge_instruction(brief, reply, unpublished);
+        let outcome = run_turn
+            .run_steered_background(&self.record.id, responder, &instruction, control, sink)
+            .await;
+        // A steer that landed during the nudge is consumed here so it cannot
+        // leak into a later `control.take()` and be mistaken for a steer of the
+        // primary run, which has already ended.
+        if let Some(action) = control.take() {
+            tracing::info!(
+                agent = %responder,
+                action = ?action,
+                "[publish] the operator steered during the publish nudge; its reply is discarded"
+            );
+            return None;
+        }
+        match outcome {
+            Ok(outcome) => Some(outcome.reply),
+            Err(err) => {
+                tracing::warn!(
+                    agent = %responder,
+                    error = %err,
+                    "[publish] the nudge turn did not run; falling through to the warning"
+                );
+                None
+            }
+        }
+    }
+
     /// Journals a finished dispatch onto its card's timeline (issue #185): the
     /// run's reply, then the terminal anchor that closes the timeline.
     ///
@@ -849,7 +1043,13 @@ impl HarnessBrain {
     /// leaving a timeline stuck "still running" for a card the board already
     /// shows in its terminal column. Matches the existing journal-after-persist
     /// sites (`chat_and_emit`, `WorkflowCreated`, `TaskSteered`).
-    async fn journal_task_outcome(&self, card: &TaskRecord, responder: &str, result_text: String) {
+    async fn journal_task_outcome(
+        &self,
+        card: &TaskRecord,
+        responder: &str,
+        result_text: String,
+        artifact_ids: Vec<String>,
+    ) {
         let Some(events) = self.deps.events.as_ref() else {
             return;
         };
@@ -896,6 +1096,7 @@ impl HarnessBrain {
                     desk: responder.to_string(),
                     output: result_text,
                     column: card.column.clone(),
+                    artifact_ids,
                 },
             )
             .await
@@ -922,59 +1123,123 @@ impl HarnessBrain {
             .unwrap_or_else(|| self.responder.clone())
     }
 
-    /// Records a completed dispatch's output as a versioned artifact (#187).
+    /// Records everything the run published as versioned artifacts, returning
+    /// their ids (issue #244).
     ///
-    /// A task that is dispatched, reviewed, and dispatched again is the same
-    /// deliverable evolving — so the second run appends a **version** to the
-    /// existing artifact rather than opening a second one. The artifact to
-    /// extend is the most recently updated one already attached to this card;
-    /// only the first run creates.
+    /// # Extend by identity, never by recency
     ///
-    /// A missing artifact store is a silent no-op, exactly like a missing task
-    /// store: the note is still written, so the board behaves as it did before
-    /// this issue.
-    /// `run_id` is the attempt that produced `body`, stamped onto the revision
-    /// this call writes (issue #242) so a run row can point at what it actually
-    /// wrote. `None` for an untracked dispatch, which behaves exactly as before.
-    async fn record_task_artifact(
+    /// The record to extend is the one on this card whose `source` equals the
+    /// published path. That is the correction at the heart of this issue.
+    ///
+    /// The old rule was `max_by_key(updated_at_millis)` — extend whichever
+    /// artifact on the card was touched most recently. An **operator edit**
+    /// bumps `updated_at_millis`, so editing the invoice made the invoice the
+    /// target for the next agent write to the spec: the spec's v3 landed as the
+    /// invoice's v4, and `human_edit_diff` then reported an operator rewriting
+    /// a document they had never seen. Since that diff is the entire purpose of
+    /// the artifact port, recency did not merely mis-file records — it
+    /// fabricated the one number the product exists to measure.
+    ///
+    /// A path that has never been published opens a new record; a rename starts
+    /// a new lineage, which is a limitation named on
+    /// [`ArtifactRecord::source`](crate::ports::artifacts::ArtifactRecord::source)
+    /// rather than papered over with a guess.
+    ///
+    /// # Errors propagate
+    ///
+    /// Deliberately, and this is a change. The old path returned a silent
+    /// `Ok(())` when the store was missing and swallowed nothing else, which
+    /// meant a failed write to a deliverable an agent had explicitly published
+    /// was indistinguishable from success. An explicit publish that could not be
+    /// stored is a real failure of the run and the operator needs to see it.
+    ///
+    /// A **missing store** is different: `publish_artifact` is not wired at all
+    /// without one (see `build.rs`), so a non-empty queue here means something
+    /// upstream is misconfigured. It warns loudly rather than failing the cycle,
+    /// because the turn's actual work is already done and persisted.
+    ///
+    /// `run_id` stamps the revision this call writes (#242) so a run row can
+    /// point at what it actually produced. An earlier attempt's version keeps
+    /// the attempt that wrote *it*.
+    async fn record_published_artifacts(
         &self,
         card: &TaskRecord,
         responder: &str,
-        body: &str,
+        published: Vec<publish::PendingPublish>,
         run_id: Option<&str>,
-    ) -> Result<()> {
-        let Some(artifacts) = self.deps.artifacts.as_ref() else {
-            return Ok(());
-        };
-        let existing = artifacts
-            .list(&self.record.id, Some(&card.id))
-            .await?
-            .into_iter()
-            .max_by_key(|a| a.updated_at_millis);
-        let at = now_millis();
-        let mut record = match existing {
-            Some(mut found) => {
-                found.push_version(body, ArtifactAuthor::Agent, responder, at, None);
-                found
-            }
-            None => ArtifactRecord::new(
-                generate_id(),
-                &card.id,
-                &card.title,
-                ArtifactKind::Text,
-                body,
-                responder,
-                at,
-            ),
-        };
-        // Only the revision this run wrote. An earlier attempt's version keeps
-        // the attempt that wrote *it*, which is the point of stamping per
-        // version instead of per record.
-        if let Some(run_id) = run_id {
-            record.stamp_run(run_id);
+    ) -> Result<Vec<String>> {
+        if published.is_empty() {
+            // The honest, common case: this run produced no file. There is no
+            // artifact, and the run trace is the addressable record of what
+            // happened.
+            return Ok(Vec::new());
         }
-        artifacts.upsert(&self.record.id, &record).await?;
-        Ok(())
+        let Some(artifacts) = self.deps.artifacts.as_ref() else {
+            tracing::warn!(
+                task_id = %card.id,
+                staged = published.len(),
+                "[publish] files were published but no artifact store is configured; the tool \
+                 should not have been wired — nothing was recorded"
+            );
+            return Ok(Vec::new());
+        };
+
+        let mut on_card = artifacts.list(&self.record.id, Some(&card.id)).await?;
+        let mut ids = Vec::with_capacity(published.len());
+        for pending in published {
+            let at = now_millis();
+            // Identity, not recency: the record whose `source` is this exact
+            // path, or a new one.
+            let existing = on_card
+                .iter()
+                .position(|a| a.source.as_deref() == Some(pending.source.as_str()));
+            let mut record = match existing {
+                Some(index) => {
+                    let mut found = on_card.remove(index);
+                    found.push_version(
+                        &pending.body,
+                        ArtifactAuthor::Agent,
+                        responder,
+                        at,
+                        pending.note.clone(),
+                    );
+                    // A republished file may have changed shape — a markdown
+                    // draft exported as a PDF, a small file grown past the
+                    // inline cap. The record follows what was actually
+                    // captured, or the console renders the new version with the
+                    // old version's renderer.
+                    found.kind = pending.kind;
+                    found
+                }
+                None => {
+                    let mut fresh = ArtifactRecord::new(
+                        generate_id(),
+                        &card.id,
+                        &pending.title,
+                        pending.kind,
+                        &pending.body,
+                        responder,
+                        at,
+                    )
+                    .with_source(pending.source.clone());
+                    if let Some(note) = pending.note.clone()
+                        && let Some(first) = fresh.versions.first_mut()
+                    {
+                        first.note = Some(note);
+                    }
+                    fresh
+                }
+            };
+            if let Some(run_id) = run_id {
+                record.stamp_run(run_id);
+            }
+            artifacts.upsert(&self.record.id, &record).await?;
+            ids.push(record.id.clone());
+            // Keep the working set current so two publishes of the same path in
+            // one run extend one record rather than opening two.
+            on_card.push(record);
+        }
+        Ok(ids)
     }
 
     /// Resolves which agent answers an operator message.
@@ -1941,16 +2206,21 @@ members = ["engineer"]
         assert!(!posted.text.contains("is done"), "{}", posted.text);
     }
 
-    /// Artifact capture keys off the run's **ending**, not off the card's
-    /// column — so a delegated card, which no longer gets its own terminal,
-    /// still has its deliverable versioned.
+    /// **The headline of #244, stated as its own test.** This used to assert
+    /// the opposite — that a completed dispatch always mints an artifact from
+    /// its chat reply.
     ///
-    /// This is the guard that used to be `card.column == success_terminal_column`.
-    /// Reading the ending instead is what keeps capture correct now that every
-    /// success shares one landing: a column comparison would have to be re-taught
-    /// every time the board's vocabulary moves.
+    /// It does not any more. A run that published nothing yields **no
+    /// artifact**, and that is a first-class outcome rather than a gap. The old
+    /// behaviour is exactly what made the Artifacts tab present refusals and
+    /// blocker messages as deliverables: capture was gated on run disposition
+    /// and never on whether anything had been produced.
+    ///
+    /// Nothing is lost. The reply still reaches the card note, the timeline, the
+    /// completion event and the run trace — five records, none of which claims
+    /// to be a deliverable.
     #[tokio::test]
-    async fn a_delegated_card_stopping_in_review_still_records_an_artifact() {
+    async fn a_completed_run_that_published_nothing_records_no_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let (brain, ops) = brain_with_artifacts(dir.path());
         // Empty assignee → the default responder, so the turn actually runs.
@@ -1981,17 +2251,226 @@ members = ["engineer"]
         )
         .await
         .expect("list");
-        assert_eq!(
-            artifacts.len(),
-            1,
-            "a delegated card's deliverable must still be versioned"
+        assert!(
+            artifacts.is_empty(),
+            "a run that published nothing has no deliverable: {artifacts:?}"
         );
-        assert_eq!(artifacts[0].versions.len(), 1);
+        // …and the reply is still recorded where it belongs: on the card.
+        assert!(
+            moved.note.expect("note").contains("Ship the thing"),
+            "the reply must survive even though it is not an artifact"
+        );
     }
 
-    /// The other half of the same guard: a run that did NOT succeed still
-    /// writes its note but must not open an artifact, whichever terminal the
-    /// card would otherwise have used.
+    /// **The identity-vs-recency regression** — the second defect #244 names,
+    /// and the one with teeth.
+    ///
+    /// The old extend target was `max_by_key(updated_at_millis)`: whichever
+    /// artifact on the card had been touched most recently. An **operator edit**
+    /// bumps that timestamp. So an operator who tidied the invoice made the
+    /// invoice the target for the agent's next write to the spec — the spec's v2
+    /// landed as the invoice's v3, and `human_edit_diff` then reported a human
+    /// rewriting a document they had never opened.
+    ///
+    /// The setup here reproduces exactly that: publish two files, operator-edit
+    /// the **second** so it is unambiguously the most recent, then republish the
+    /// **first**. Under recency this appends to the invoice. Under identity it
+    /// extends the spec, and the invoice is untouched.
+    #[tokio::test]
+    async fn a_republish_extends_by_identity_not_by_whatever_was_edited_last() {
+        use crate::harness::publish::PendingPublish;
+        use crate::ports::artifacts::{ArtifactAuthor, ArtifactStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, ops) = brain_with_artifacts(dir.path());
+        let company = CompanyId::new("acme");
+        let c = card("t-1", "maya");
+        let publish = |source: &str, body: &str| PendingPublish {
+            source: source.to_string(),
+            title: source.to_string(),
+            kind: crate::ports::artifacts::ArtifactKind::Markdown,
+            note: None,
+            body: body.to_string(),
+        };
+
+        // Run 1 publishes both files.
+        let ids = brain
+            .record_published_artifacts(
+                &c,
+                "maya",
+                vec![
+                    publish("specs/launch.md", "# Spec v1"),
+                    publish("billing/invoice.md", "# Invoice v1"),
+                ],
+                Some("run-1"),
+            )
+            .await
+            .expect("records");
+        assert_eq!(ids.len(), 2, "two files, two records");
+
+        let by_source = |list: &[crate::ports::artifacts::ArtifactRecord], source: &str| {
+            list.iter()
+                .find(|a| a.source.as_deref() == Some(source))
+                .expect("record for source")
+                .clone()
+        };
+        let listed = ArtifactStore::list(&*ops, &company, Some("t-1"))
+            .await
+            .unwrap();
+        let mut invoice = by_source(&listed, "billing/invoice.md");
+
+        // The operator edits the INVOICE, making it the most recently updated
+        // artifact on the card. This is the trap.
+        invoice.push_version(
+            "# Invoice v1, corrected",
+            ArtifactAuthor::Operator,
+            "operator",
+            now_millis() + 1_000,
+            Some("operator edit before approval".to_string()),
+        );
+        ArtifactStore::upsert(&*ops, &company, &invoice)
+            .await
+            .unwrap();
+
+        // Run 2 republishes the SPEC only.
+        brain
+            .record_published_artifacts(
+                &c,
+                "maya",
+                vec![publish("specs/launch.md", "# Spec v2")],
+                Some("run-2"),
+            )
+            .await
+            .expect("records");
+
+        let after = ArtifactStore::list(&*ops, &company, Some("t-1"))
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 2, "no duplicate record was opened");
+
+        let spec = by_source(&after, "specs/launch.md");
+        assert_eq!(
+            spec.versions.len(),
+            2,
+            "the republished path must extend its OWN record"
+        );
+        assert_eq!(spec.latest().unwrap().body, "# Spec v2");
+        assert_eq!(spec.latest().unwrap().run_id.as_deref(), Some("run-2"));
+        assert_eq!(
+            spec.versions[0].run_id.as_deref(),
+            Some("run-1"),
+            "an earlier attempt keeps the attempt that wrote it"
+        );
+
+        let invoice = by_source(&after, "billing/invoice.md");
+        assert_eq!(
+            invoice.versions.len(),
+            2,
+            "the agent's spec must not have landed on the invoice"
+        );
+        assert_eq!(invoice.latest().unwrap().body, "# Invoice v1, corrected");
+        assert_eq!(
+            invoice.latest().unwrap().author,
+            ArtifactAuthor::Operator,
+            "the invoice's newest version is still the human's"
+        );
+        // And the reason all of this matters: the human-edit diff still says
+        // what a human actually did, on each document separately.
+        let diff = invoice.human_edit_diff().expect("the operator edited it");
+        assert_eq!((diff.from_version, diff.to_version), (1, 2));
+        assert!(
+            spec.human_edit_diff().is_none(),
+            "nobody edited the spec, so it must report no human edit"
+        );
+    }
+
+    /// Two publishes of the same path within one run extend one record rather
+    /// than opening two — the working set the loop keeps has to stay current.
+    #[tokio::test]
+    async fn republishing_the_same_path_twice_in_one_run_extends_once() {
+        use crate::harness::publish::PendingPublish;
+        use crate::ports::artifacts::ArtifactStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (brain, ops) = brain_with_artifacts(dir.path());
+        let c = card("t-1", "maya");
+        let publish = |body: &str| PendingPublish {
+            source: "spec.md".to_string(),
+            title: "spec.md".to_string(),
+            kind: crate::ports::artifacts::ArtifactKind::Markdown,
+            note: None,
+            body: body.to_string(),
+        };
+
+        brain
+            .record_published_artifacts(&c, "maya", vec![publish("draft"), publish("final")], None)
+            .await
+            .expect("records");
+
+        let listed = ArtifactStore::list(&*ops, &CompanyId::new("acme"), Some("t-1"))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].versions.len(), 2);
+        assert_eq!(listed[0].latest().unwrap().body, "final");
+    }
+
+    /// A store fault on an **explicit** publish propagates. The old path
+    /// returned a silent `Ok(())`, which made a lost deliverable
+    /// indistinguishable from a successful one.
+    #[tokio::test]
+    async fn a_store_error_on_a_published_file_propagates() {
+        use crate::harness::publish::PendingPublish;
+        use crate::ports::artifacts::{ArtifactRecord, ArtifactStore};
+
+        /// Reads fine, refuses every write.
+        struct BrokenArtifacts;
+        #[async_trait]
+        impl ArtifactStore for BrokenArtifacts {
+            async fn list(
+                &self,
+                _: &CompanyId,
+                _: Option<&str>,
+            ) -> crate::Result<Vec<ArtifactRecord>> {
+                Ok(Vec::new())
+            }
+            async fn get(&self, _: &CompanyId, _: &str) -> crate::Result<Option<ArtifactRecord>> {
+                Ok(None)
+            }
+            async fn upsert(&self, _: &CompanyId, _: &ArtifactRecord) -> crate::Result<()> {
+                Err(crate::error::OpenCompanyError::Store(
+                    "the disk is full".to_string(),
+                ))
+            }
+            async fn delete(&self, _: &CompanyId, _: &str) -> crate::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut brain, _ops) = brain_with_artifacts(dir.path());
+        brain.deps.artifacts = Some(Arc::new(BrokenArtifacts));
+
+        let err = brain
+            .record_published_artifacts(
+                &card("t-1", "maya"),
+                "maya",
+                vec![PendingPublish {
+                    source: "spec.md".to_string(),
+                    title: "spec.md".to_string(),
+                    kind: crate::ports::artifacts::ArtifactKind::Markdown,
+                    note: None,
+                    body: "# Spec".to_string(),
+                }],
+                None,
+            )
+            .await
+            .expect_err("a lost deliverable must not read as a success");
+        assert!(err.to_string().contains("the disk is full"), "{err}");
+    }
+
+    /// The other half: a run that did NOT succeed records nothing either, and
+    /// its note still says what happened.
     #[tokio::test]
     async fn a_cancelled_delegated_card_records_no_artifact() {
         let dir = tempfile::tempdir().unwrap();
