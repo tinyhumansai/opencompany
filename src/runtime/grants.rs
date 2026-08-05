@@ -44,21 +44,48 @@
 //!   consent to an action now, not a standing authorisation; without this, a
 //!   grant minted today would still fire if the same call surfaced next month.
 //!
+//! ## The second scope: a standing grant (issue #374)
+//!
+//! Single-use is the right *default* and was for a while the only mode, which
+//! made it the whole design. An agent reaching for the same tool a dozen times
+//! produced a dozen near-identical cards, and the operator's rational escapes
+//! were approving blind or switching the company to `full` — throwing the gate
+//! away to stop it nagging. So there is now a second scope the operator can
+//! pick: [`StandingGrant`], "this tool, for this teammate, until a deadline".
+//!
+//! It is a **distinct type**, not a scope enum on [`GrantedCall`], and both
+//! differences are load-bearing:
+//!
+//! * it has **no `args` field**, so it is structurally incapable of
+//!   argument-matching or of being widened into one later;
+//! * its expiry is **not optional**, so it is structurally incapable of living
+//!   forever. The issue forbids silent accumulation, and a type that cannot
+//!   express "no expiry" cannot regress into it.
+//!
+//! What it never covers is decided elsewhere, once:
+//! [`broadly_grantable`](crate::harness::policy::broadly_grantable) delegates to
+//! the existing consequence taxonomy, so only `EffectGroup::Other` tools can be
+//! granted this way — never Spend, Send, Sign, Publish, Hire or Identity.
+//!
 //! ## Durability
 //!
-//! The live set is in-memory, but its lifecycle is journaled
-//! (`ApprovalGranted` / `GrantConsumed` / `GrantExpired`) and replayed on boot
-//! via [`RuntimeJournal::replayed_grants`](crate::runtime::journal::RuntimeJournal::replayed_grants),
-//! so a restart between "operator approved" and "agent re-issued" does not
-//! silently drop the approval. Consumed and expired grants are folded *out* on
-//! replay, so a restart can never resurrect one that already fired.
+//! Both sets are in-memory, but their lifecycles are journaled
+//! (`ApprovalGranted` / `GrantConsumed` / `GrantExpired` for single-use;
+//! `StandingGrantMinted` / `StandingGrantRevoked` / `StandingGrantExpired` for
+//! standing) and replayed on boot via
+//! [`RuntimeJournal::replayed_grants`](crate::runtime::journal::RuntimeJournal::replayed_grants)
+//! and its standing counterpart, so a restart between "operator approved" and
+//! "agent re-issued" does not silently drop the approval. Consumed, revoked and
+//! expired grants are folded *out* on replay, so a restart can never resurrect
+//! one that already fired or one the operator took back.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::types::ApprovalId;
+use crate::ports::generate_id;
+use crate::ports::types::{Actor, ApprovalId};
 
 /// How long an unredeemed grant stays live: 15 minutes.
 ///
@@ -100,6 +127,112 @@ pub struct GrantedCall {
     pub origin_thread: Option<String>,
 }
 
+/// The hard ceiling on a standing grant's life: 7 days.
+///
+/// A request past this is a **400**, never a silent clamp. Quietly shortening a
+/// duration the operator chose would leave them believing a permission is live
+/// when it lapsed days earlier — the failure this issue exists to stop, in the
+/// opposite direction.
+pub const MAX_STANDING_GRANT_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// A standing grant's own id.
+///
+/// Separate from [`ApprovalId`] because the two have different lifetimes: the
+/// approval is resolved and gone, the grant it minted outlives it and is what
+/// the operator later revokes. Keying revocation on the approval id would tie
+/// the revoke route to a record that is, from the operator's side, history.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GrantId(String);
+
+impl GrantId {
+    /// Wraps an existing grant id string.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Mints a fresh grant id.
+    pub fn generate() -> Self {
+        Self(generate_id())
+    }
+}
+
+impl From<String> for GrantId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for GrantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for GrantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What an operator's approve actually buys (issue #374).
+///
+/// Two options, and only two. Count-based ("the next 5 calls") was rejected: it
+/// reintroduces the annoyance nondeterministically and needs a durable decrement
+/// on the hot path. "For this session" was rejected because the runtime has no
+/// operator-session object that an agent's work spans — it would be a fiction.
+/// "Forever" is what the issue forbids.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrantScope {
+    /// Today's behaviour, byte for byte: one call, argument-exact, agent-scoped.
+    /// The default, and what every caller that says nothing gets.
+    #[default]
+    Once,
+    /// This tool, for this teammate, with any arguments, until
+    /// `expires_at_millis` — an absolute epoch-millis deadline.
+    Tool {
+        /// Absolute epoch-millis the grant stops admitting calls.
+        expires_at_millis: u64,
+    },
+}
+
+/// A standing permission: one tool, one teammate, until a deadline (issue #374).
+///
+/// Deliberately **not** a variant of [`GrantedCall`]. See the module docs: no
+/// `args` and a non-optional expiry are the two properties that make this type
+/// unable to become the thing the issue warns about.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StandingGrant {
+    /// This grant's id — what a revoke addresses.
+    pub id: GrantId,
+    /// The roster agent allowed to redeem it. Nobody else matches.
+    pub agent: String,
+    /// The tool it admits, with any arguments.
+    pub tool: String,
+    /// Who granted it. Journaled so "who opened this up" is answerable later.
+    pub granted_by: Actor,
+    /// The approval whose resolution minted it — the provenance the brain's
+    /// re-dispatch joins on, and the audit link back to the card the operator
+    /// was looking at when they decided.
+    pub approval_id: ApprovalId,
+    /// Epoch-millis it was minted.
+    pub at_millis: u64,
+    /// Absolute epoch-millis it stops admitting calls. Not an optional, and not
+    /// a duration: an absolute deadline survives a restart without arithmetic,
+    /// and a required field cannot be omitted into immortality.
+    pub expires_at_millis: u64,
+}
+
+impl StandingGrant {
+    /// Whether this grant still admits calls at `now_millis`.
+    ///
+    /// Strictly `<`, so the deadline instant itself is already past. Checked at
+    /// redemption under the grant lock as well as swept periodically — the sweep
+    /// is housekeeping and an operator notice, never the enforcement.
+    pub fn is_live_at(&self, now_millis: u64) -> bool {
+        now_millis < self.expires_at_millis
+    }
+}
+
 /// The live grant set: a cheap shared handle, the same pattern as
 /// [`ApprovalRequestQueue`](crate::harness::policy::ApprovalRequestQueue).
 ///
@@ -124,6 +257,14 @@ struct GrantState {
     /// in the safe direction: the operator is asked again rather than the tool
     /// firing again unasked.
     consumed: Vec<ApprovalId>,
+    /// Standing grants (issue #374), keyed by their own id.
+    ///
+    /// A second map rather than a second variant in `live`: the two are matched
+    /// on different keys (approval id vs grant id), matched by different
+    /// predicates (argument-exact vs tool-and-agent), and have opposite
+    /// redemption semantics (remove vs leave). Fusing them would put a branch on
+    /// every operation of both.
+    standing: HashMap<GrantId, StandingGrant>,
 }
 
 impl GrantSet {
@@ -206,12 +347,123 @@ impl GrantSet {
     pub fn live_count(&self) -> usize {
         self.inner.lock().expect("grant set poisoned").live.len()
     }
+
+    // -----------------------------------------------------------------------
+    // Standing grants (issue #374)
+    // -----------------------------------------------------------------------
+
+    /// Arms a standing grant.
+    pub fn grant_standing(&self, grant: StandingGrant) {
+        self.inner
+            .lock()
+            .expect("grant set poisoned")
+            .standing
+            .insert(grant.id.clone(), grant);
+    }
+
+    /// Matches an unexpired standing grant for `(agent, tool)` **without**
+    /// removing it — that is the whole difference from [`consume`](Self::consume).
+    ///
+    /// Expiry is enforced *here*, under the same lock as the match, rather than
+    /// being left to the sweep. The sweep runs on the scheduler's maintenance
+    /// tick; between two ticks a lapsed grant would otherwise keep admitting
+    /// calls, and "until 5pm" has to mean 5pm rather than "until the next tick
+    /// after 5pm".
+    ///
+    /// Deterministic when several grants could match — the same agent and tool
+    /// granted twice — by taking the one that expires **last**: the operator's
+    /// most recent intent is the more permissive one they are living with, and
+    /// picking arbitrarily out of a `HashMap` would make redemption depend on
+    /// hash order.
+    pub fn match_standing(
+        &self,
+        agent: &str,
+        tool: &str,
+        now_millis: u64,
+    ) -> Option<StandingGrant> {
+        let state = self.inner.lock().expect("grant set poisoned");
+        state
+            .standing
+            .values()
+            .filter(|g| g.agent == agent && g.tool == tool && g.is_live_at(now_millis))
+            .max_by_key(|g| g.expires_at_millis)
+            .cloned()
+    }
+
+    /// Revokes a standing grant, returning it when there was one.
+    ///
+    /// `None` means it was already gone — revoked by another browser tab, or
+    /// swept — which the route reports as a 404 rather than pretending to have
+    /// done something.
+    pub fn revoke_standing(&self, id: &GrantId) -> Option<StandingGrant> {
+        self.inner
+            .lock()
+            .expect("grant set poisoned")
+            .standing
+            .remove(id)
+    }
+
+    /// Reads a standing grant by the approval that minted it.
+    ///
+    /// The brain's re-dispatch needs this: it is handed an approval id and has
+    /// to find the permission that resolution created, whichever scope it was.
+    pub fn peek_standing_by_approval(&self, approval_id: &ApprovalId) -> Option<StandingGrant> {
+        self.inner
+            .lock()
+            .expect("grant set poisoned")
+            .standing
+            .values()
+            .find(|g| &g.approval_id == approval_id)
+            .cloned()
+    }
+
+    /// Every live standing grant, newest first — what the console lists.
+    pub fn standing(&self) -> Vec<StandingGrant> {
+        let state = self.inner.lock().expect("grant set poisoned");
+        let mut out: Vec<StandingGrant> = state.standing.values().cloned().collect();
+        out.sort_by(|a, b| b.at_millis.cmp(&a.at_millis).then_with(|| a.id.cmp(&b.id)));
+        out
+    }
+
+    /// Removes every standing grant whose deadline has passed, returning them so
+    /// the caller can journal each expiry.
+    pub fn sweep_standing(&self, now_millis: u64) -> Vec<StandingGrant> {
+        let mut state = self.inner.lock().expect("grant set poisoned");
+        let expired: Vec<GrantId> = state
+            .standing
+            .values()
+            .filter(|g| !g.is_live_at(now_millis))
+            .map(|g| g.id.clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| state.standing.remove(&id))
+            .collect()
+    }
+
+    /// Seeds the standing map from a journal replay (boot recovery).
+    pub fn rehydrate_standing(&self, grants: impl IntoIterator<Item = StandingGrant>) {
+        let mut state = self.inner.lock().expect("grant set poisoned");
+        for grant in grants {
+            state.standing.insert(grant.id.clone(), grant);
+        }
+    }
+
+    /// How many standing grants are live (tests / observability).
+    pub fn standing_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("grant set poisoned")
+            .standing
+            .len()
+    }
 }
 
 impl std::fmt::Debug for GrantSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrantSet")
             .field("live", &self.live_count())
+            .field("standing", &self.standing_count())
             .finish_non_exhaustive()
     }
 }
@@ -354,5 +606,153 @@ mod test {
         assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(set.live_count(), 0);
         assert_eq!(set.drain_consumed().len(), 1, "one consumption journaled");
+    }
+
+    // -----------------------------------------------------------------------
+    // Standing grants (issue #374)
+    // -----------------------------------------------------------------------
+
+    fn operator() -> Actor {
+        Actor {
+            kind: crate::ports::types::ActorKind::User,
+            id: "user-1".to_string(),
+        }
+    }
+
+    fn standing(id: &str, agent: &str, tool: &str, expires_at_millis: u64) -> StandingGrant {
+        StandingGrant {
+            id: GrantId::new(id),
+            agent: agent.to_string(),
+            tool: tool.to_string(),
+            granted_by: operator(),
+            approval_id: ApprovalId::new(format!("approval-{id}")),
+            at_millis: 1_000,
+            expires_at_millis,
+        }
+    }
+
+    /// The whole point of the scope: the tool stops asking, whatever the
+    /// arguments, until the deadline.
+    #[test]
+    fn a_standing_grant_admits_varying_arguments_until_it_expires() {
+        let set = GrantSet::default();
+        set.grant_standing(standing("g1", "ops", "shell", 10_000));
+
+        assert!(set.match_standing("ops", "shell", 2_000).is_some());
+        // Matching does not depend on arguments at all — there are none to
+        // depend on. Two different calls, same admission.
+        assert!(set.match_standing("ops", "shell", 9_999).is_some());
+        assert_eq!(
+            set.standing_count(),
+            1,
+            "redeeming a standing grant must not remove it — that is single-use's job"
+        );
+
+        // The deadline instant itself is already past.
+        assert!(set.match_standing("ops", "shell", 10_000).is_none());
+        assert!(set.match_standing("ops", "shell", 10_001).is_none());
+    }
+
+    #[test]
+    fn a_standing_grant_is_scoped_to_its_agent_and_its_tool() {
+        let set = GrantSet::default();
+        set.grant_standing(standing("g1", "ops", "shell", 10_000));
+
+        assert!(
+            set.match_standing("marketing", "shell", 2_000).is_none(),
+            "another teammate is not who the operator granted"
+        );
+        assert!(
+            set.match_standing("ops", "workspace_write", 2_000)
+                .is_none(),
+            "another tool is not what the operator granted"
+        );
+    }
+
+    #[test]
+    fn revoking_a_standing_grant_stops_it_matching() {
+        let set = GrantSet::default();
+        set.grant_standing(standing("g1", "ops", "shell", 10_000));
+        assert!(set.match_standing("ops", "shell", 2_000).is_some());
+
+        let revoked = set.revoke_standing(&GrantId::new("g1")).expect("was live");
+        assert_eq!(revoked.tool, "shell");
+        assert!(set.match_standing("ops", "shell", 2_000).is_none());
+        assert_eq!(set.standing_count(), 0);
+        assert!(
+            set.revoke_standing(&GrantId::new("g1")).is_none(),
+            "revoking twice reports nothing to revoke rather than pretending"
+        );
+    }
+
+    /// A single-use grant must burn even when a standing grant would also have
+    /// admitted the call.
+    ///
+    /// The ordering is enforced by the policy arm, but the primitives have to
+    /// make it expressible: `consume` is what removes, and a standing match
+    /// never touches the single-use set. If a standing match ran first, the
+    /// operator's one-off approval would sit live until its TTL and then be
+    /// announced as "the agent never acted" — a lie about work that ran.
+    #[test]
+    fn a_single_use_grant_still_burns_while_a_standing_grant_is_live() {
+        let set = GrantSet::default();
+        let args = serde_json::json!({ "cmd": "ls" });
+        set.grant(call("a1", "ops", "shell", args.clone()));
+        set.grant_standing(standing("g1", "ops", "shell", 10_000));
+
+        assert!(set.consume("ops", "shell", &args).is_some());
+        assert_eq!(set.live_count(), 0, "the single-use grant burned");
+        assert_eq!(set.standing_count(), 1, "the standing grant is untouched");
+        assert_eq!(set.drain_consumed().len(), 1);
+    }
+
+    #[test]
+    fn sweep_standing_removes_only_lapsed_grants() {
+        let set = GrantSet::default();
+        set.grant_standing(standing("old", "ops", "shell", 5_000));
+        set.grant_standing(standing("new", "ops", "workspace_write", 50_000));
+
+        let expired = set.sweep_standing(10_000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, GrantId::new("old"));
+        assert_eq!(set.standing_count(), 1);
+        assert!(
+            set.match_standing("ops", "workspace_write", 10_000)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_longest_lived_match_wins_so_redemption_is_not_hash_order() {
+        let set = GrantSet::default();
+        set.grant_standing(standing("short", "ops", "shell", 5_000));
+        set.grant_standing(standing("long", "ops", "shell", 50_000));
+
+        let matched = set.match_standing("ops", "shell", 1_000).expect("matches");
+        assert_eq!(matched.id, GrantId::new("long"));
+    }
+
+    #[test]
+    fn standing_grants_rehydrate_and_are_findable_by_their_approval() {
+        let set = GrantSet::default();
+        set.rehydrate_standing([
+            standing("g1", "ops", "shell", 10_000),
+            standing("g2", "legal", "workspace_write", 10_000),
+        ]);
+        assert_eq!(set.standing_count(), 2);
+
+        let found = set
+            .peek_standing_by_approval(&ApprovalId::new("approval-g2"))
+            .expect("provenance is queryable");
+        assert_eq!(found.agent, "legal");
+        assert!(
+            set.peek_standing_by_approval(&ApprovalId::new("nope"))
+                .is_none()
+        );
+
+        // Newest first, and `at_millis` ties break on id so the list is stable.
+        let listed = set.standing();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, GrantId::new("g1"));
     }
 }
