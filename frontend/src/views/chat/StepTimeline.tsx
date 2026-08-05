@@ -1,7 +1,23 @@
 import { useState } from "react";
-import { AlertTriangle, Brain, ChevronDown, ChevronRight, SquareKanban, Wrench, type LucideIcon } from "lucide-react";
+import {
+  AlertTriangle,
+  Brain,
+  ChevronDown,
+  ChevronRight,
+  Hourglass,
+  Scissors,
+  SquareKanban,
+  Wrench,
+  type LucideIcon,
+} from "lucide-react";
 
-import type { TurnStep, TurnStepKind } from "@/api/types";
+import {
+  AWAITING_APPROVAL_LABEL,
+  STEP_FAILURE_LABEL,
+  isFailedStep,
+  type TurnStep,
+  type TurnStepKind,
+} from "@/api/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -25,9 +41,13 @@ export function StepTimeline({
   steps: TurnStep[];
   defaultOpen?: boolean;
 }) {
-  const failed = steps.filter((s) => s.status === "error").length;
+  const failed = steps.filter((s) => isFailedStep(s.status)).length;
+  // A parked step is counted and surfaced separately — it is not a failure, and
+  // it is the most actionable thing in the list, so it must not hide behind a
+  // collapsed summary either (#411).
+  const parked = steps.filter((s) => s.status === "awaiting_approval").length;
   const hasError = failed > 0;
-  const [open, setOpen] = useState(defaultOpen || hasError);
+  const [open, setOpen] = useState(defaultOpen || hasError || parked > 0);
 
   if (steps.length === 0) return null;
 
@@ -39,13 +59,18 @@ export function StepTimeline({
         aria-expanded={open}
         className={cn(
           "flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium transition-colors hover:bg-accent/60",
-          hasError ? "text-destructive" : "text-muted-foreground",
+          hasError
+            ? "text-destructive"
+            : parked > 0
+              ? "text-amber-600 dark:text-amber-400"
+              : "text-muted-foreground",
         )}
       >
         {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
         <span>
           {steps.length} step{steps.length === 1 ? "" : "s"}
           {failed > 0 && ` · ${failed} failed`}
+          {parked > 0 && ` · ${parked} awaiting approval`}
         </span>
       </button>
       {open && (
@@ -60,22 +85,66 @@ export function StepTimeline({
 }
 
 function StepRow({ step }: { step: TurnStep }) {
-  const error = step.status === "error";
-  const Icon = stepIcon(step.kind);
+  const error = isFailedStep(step.status);
+  const parked = step.status === "awaiting_approval";
+  const Icon = parked ? Hourglass : stepIcon(step.kind);
   return (
     <li
       className={cn(
-        "flex items-center gap-1.5 text-[11px] leading-relaxed",
-        error ? "text-destructive" : "text-muted-foreground",
+        "flex flex-col gap-0.5 text-[11px] leading-relaxed",
+        error
+          ? "text-destructive"
+          : parked
+            ? "text-amber-600 dark:text-amber-400"
+            : "text-muted-foreground",
       )}
     >
-      <Icon className={cn("size-3 shrink-0", step.status === "running" && "animate-pulse")} />
-      <span className={cn("font-medium", !error && "text-foreground/80")}>{step.label}</span>
-      {step.detail && <span className="min-w-0 truncate">— {step.detail}</span>}
-      {typeof step.elapsedMs === "number" && (
-        <span className="ml-auto shrink-0 tabular-nums opacity-70">{formatElapsed(step.elapsedMs)}</span>
+      <div className="flex items-center gap-1.5">
+        <Icon className={cn("size-3 shrink-0", step.status === "running" && "animate-pulse")} />
+        <span className={cn("font-medium", !error && !parked && "text-foreground/80")}>
+          {step.label}
+        </span>
+        {/* The typed state, rendered by lookup — never by reading `result`. */}
+        {parked && <StepChip tone="amber">{AWAITING_APPROVAL_LABEL}</StepChip>}
+        {step.failure && <StepChip tone="rose">{STEP_FAILURE_LABEL[step.failure]}</StepChip>}
+        {step.truncated && (
+          <StepChip tone="amber">
+            <Scissors className="size-2.5 shrink-0" aria-hidden />
+            Result cut
+          </StepChip>
+        )}
+        {step.detail && <span className="min-w-0 truncate">— {step.detail}</span>}
+        <span className="ml-auto shrink-0 tabular-nums opacity-70">
+          {formatElapsed(step.elapsedMs, step.status)}
+        </span>
+      </div>
+      {/* What came back, on its own line: it is the answer to "how far did we
+          get", and inlining it would push the arguments off the row. */}
+      {step.result && (
+        <span className="min-w-0 truncate pl-[18px] opacity-80">{step.result}</span>
       )}
     </li>
+  );
+}
+
+function StepChip({
+  tone,
+  children,
+}: {
+  tone: "amber" | "rose";
+  children: React.ReactNode;
+}) {
+  return (
+    <span
+      className={cn(
+        "flex shrink-0 items-center gap-1 rounded px-1 py-px text-[10px] font-medium",
+        tone === "amber"
+          ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+          : "bg-rose-500/15 text-rose-700 dark:text-rose-400",
+      )}
+    >
+      {children}
+    </span>
   );
 }
 
@@ -92,7 +161,17 @@ function stepIcon(kind: TurnStepKind): LucideIcon {
   }
 }
 
-function formatElapsed(ms: number): string {
+/**
+ * A step's duration.
+ *
+ * A gated call never ran, so it reports `0ms` — which read identically to a
+ * fast success and was one of the things #411 called out. Say "didn't run"
+ * instead: a duration of zero on a step that never left the process is not a
+ * measurement, it is the absence of one.
+ */
+function formatElapsed(ms: number | undefined, status: TurnStep["status"]): string {
+  if (status === "awaiting_approval") return "didn't run";
+  if (typeof ms !== "number") return "";
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
