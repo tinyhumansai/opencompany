@@ -125,6 +125,41 @@ describe("validateProposal", () => {
     expect(out).toMatchObject({ reason: expect.stringContaining("id") });
   });
 
+  /**
+   * A key this console does not know cannot be rendered — an added step's diff
+   * line carries its id and name — so keeping it would put something in the
+   * candidate graph the operator never saw, and dropping it would apply a step
+   * that is not the one described. Refused, like `updateNode`'s unknown field.
+   */
+  it("refuses a new step carrying a field that isn't a step field", () => {
+    const out = validateProposal(
+      {
+        summary: "s",
+        ops: [
+          {
+            op: "addNode",
+            node: { id: "notify", kind: "output", name: "Notify", sudo: true },
+          },
+        ],
+      },
+      g,
+    );
+    expect(out).toMatchObject({ reason: expect.stringContaining("sudo") });
+  });
+
+  /**
+   * A duplicate edge would append a second identical entry and diff to nothing
+   * — the diff compares sets keyed by `from`/`to` — so the operator would apply
+   * a change the review never showed.
+   */
+  it("refuses a connection that already exists", () => {
+    const out = validateProposal(
+      { summary: "s", ops: [{ op: "addEdge", from: "collect", to: "send" }] },
+      g,
+    );
+    expect(out).toMatchObject({ reason: expect.stringContaining("already connected") });
+  });
+
   it("refuses a connection to a step the proposal never adds", () => {
     const out = validateProposal(
       { summary: "s", ops: [{ op: "addEdge", from: "collect", to: "ghost" }] },

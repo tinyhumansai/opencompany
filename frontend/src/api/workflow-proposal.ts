@@ -179,8 +179,25 @@ export function validateProposal(
         if (ids.has(id)) {
           return { reason: `A proposed new step reuses the existing id \`${id}\`.` };
         }
+        // Refused rather than dropped. A key this console does not know is a
+        // key the review card cannot render — an added step's diff line shows
+        // its id and name — so silently keeping it would put something in the
+        // candidate graph the operator never saw, and silently discarding it
+        // would apply a step that is not the one the copilot described. Both
+        // break the same guarantee: the diff is what would happen.
+        const stray = Object.keys(candidate).find(
+          (field) => !["id", "kind", "name"].includes(field) && !isNodeField(field),
+        );
+        if (stray) {
+          return {
+            reason: `A proposed new step sets \`${stray}\`, which isn't a step field.`,
+          };
+        }
         ids.add(id);
-        ops.push({ op: "addNode", node: { ...(candidate as unknown as WorkflowNode), id, kind, name } });
+        ops.push({
+          op: "addNode",
+          node: { ...(candidate as unknown as WorkflowNode), id, kind, name },
+        });
         break;
       }
       case "updateNode": {
@@ -221,6 +238,17 @@ export function validateProposal(
         if (!ids.has(from) || !ids.has(to)) {
           return {
             reason: `A proposed connection joins \`${from || "?"}\` to \`${to || "?"}\`, and one of those steps isn't there.`,
+          };
+        }
+        // A connection that already exists would be appended a second time and
+        // then diff to NOTHING — the diff compares sets keyed by `from`/`to` —
+        // so the operator would apply a duplicated edge the review never
+        // showed. Refused for the same reason `removeEdge` refuses a
+        // connection that is not there: the graph, not the request, decides
+        // whether an op means anything.
+        if (edges.has(edgeKey({ from, to }))) {
+          return {
+            reason: `A proposed connection joins \`${from}\` to \`${to}\`, which is already connected.`,
           };
         }
         const label = typeof op.label === "string" && op.label.trim() ? op.label.trim() : undefined;
@@ -374,7 +402,12 @@ export function proposalIsStale(proposal: WorkflowProposal, graph: WorkflowGraph
 }
 
 function edgeKey(edge: Pick<WorkflowEdge, "from" | "to">): string {
-  return `${edge.from} ${edge.to}`;
+  return `${edge.from} ${edge.to}`;
+}
+
+/** Whether `field` is a step field this console can render in a diff. */
+function isNodeField(field: string): boolean {
+  return (UPDATABLE as readonly string[]).includes(field);
 }
 
 /** The fields that differ between two versions of one step, rendered for review. */

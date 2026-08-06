@@ -2155,9 +2155,36 @@ async fn a_copilot_thread_question_opens_no_board_card() {
 
     let (status, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
     assert_eq!(status, StatusCode::OK);
+    // Strict on the shape, like the control half below: `is_none_or` would pass
+    // on a body that is not a list at all, so a route that started answering an
+    // error object would go green here and panic there — reported as a failure
+    // of the control rather than of the thing under test.
+    let cards = board.as_array().expect("the board lists cards");
     assert!(
-        board.as_array().is_none_or(|cards| cards.is_empty()),
+        cards.is_empty(),
         "a copilot question left work on the board: {board}"
+    );
+
+    // The same rule reaches the other deterministic side effect a chat turn
+    // has: a complaint phrase on a copilot thread is the operator correcting a
+    // conversation about their graph, not feedback about the company's work.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({
+            "message": "no, that is wrong, this node keeps failing",
+            "chat": "workflow-copilot:weekly_report",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, filed) = send(&state, "GET", "/api/v1/company/feedback", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = filed.as_array().expect("the feedback list is an array");
+    assert!(
+        items.is_empty(),
+        "a copilot correction filed company feedback: {filed}"
     );
 
     // Control: the same sentence on the ordinary thread still opens a card, so

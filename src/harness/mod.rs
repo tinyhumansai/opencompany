@@ -3704,6 +3704,88 @@ description = "Sets direction."
         assert_eq!(before, after, "a refused turn stores nothing in memory");
     }
 
+    /// Issue #416, the reason [`HarnessPool::total_ceiling_refusal`] was
+    /// extracted rather than copied: a confined turn reaches nothing, but it
+    /// still spends model tokens, so the tenant's ceiling refuses it exactly as
+    /// it refuses a roster dispatch. Without this test the gate could be dropped
+    /// from `run_confined` and every other test would stay green — the copilot
+    /// would simply keep spending past the cap.
+    #[tokio::test]
+    async fn a_confined_turn_is_refused_once_the_total_ceiling_is_crossed() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = Arc::new(MockContext::default());
+        let meter = Arc::new(RecordingMeter::default());
+        let plan = crate::harness::capability_budget::CapabilityPlan {
+            period: crate::harness::capability_budget::BudgetPeriod::Daily,
+            budgets: std::collections::BTreeMap::new(),
+            total_budget: Some(100),
+        };
+        let deps = deps_with_plan(
+            dir.path(),
+            context.clone(),
+            Some(meter.clone() as Arc<dyn UsageMeter>),
+            Some(plan),
+        );
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &deps).await.expect("ensure");
+
+        let confinement = confine::Confinement::workflow("weekly_report");
+        let thread = Some("workflow-copilot:weekly_report");
+
+        // Under the ceiling the copilot answers, so the refusal below is the
+        // ceiling talking and not the confined path failing to run at all.
+        let ok = pool
+            .run_confined(&rec.id, "Acme", "hello-marker", &deps, thread, &confinement)
+            .await
+            .expect("under-ceiling confined turn runs")
+            .reply;
+        assert!(
+            ok.contains("hello-marker"),
+            "under the ceiling the model runs: {ok:?}"
+        );
+
+        // Push total period spend past the 100-token ceiling.
+        meter
+            .record(
+                &rec.id,
+                &UsageSample {
+                    at_millis: crate::ports::now_millis(),
+                    agent: "ceo".into(),
+                    provider: "managed".into(),
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 0,
+                    cost_usd: 0.0,
+                    kind: crate::ports::SampleKind::Inference,
+                    run_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let refused = pool
+            .run_confined(
+                &rec.id,
+                "Acme",
+                "should-not-echo",
+                &deps,
+                thread,
+                &confinement,
+            )
+            .await
+            .expect("a refusal is a benign outcome, not a hard error")
+            .reply;
+        assert_eq!(
+            refused, TOTAL_BUDGET_EXHAUSTED_NOTICE,
+            "the copilot must not keep spending past the tenant ceiling"
+        );
+        assert!(
+            !refused.contains("should-not-echo"),
+            "the model was never called, so the prompt is not echoed: {refused:?}"
+        );
+    }
+
     /// Fail-closed tradeoff (issue #188): with a total ceiling configured but no
     /// meter to read spend from, the hard refusal does NOT fire — a transient
     /// unreadable-spend condition must not brick every turn. The turn runs (the

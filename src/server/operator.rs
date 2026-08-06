@@ -1039,10 +1039,22 @@ async fn run_chat(
     parent: Option<EventSeq>,
 ) -> Result<(CycleReport, Option<String>), ApiError> {
     runtime.ensure_running().await?;
+    // Whether this is a workflow copilot thread (issue #416): a conversation
+    // ABOUT one graph, not a request to the company. Read once, because both
+    // of the deterministic side effects below have to be suppressed for it.
+    let confined = crate::company::copilot::is_copilot_thread(message.chat.as_deref());
     // Operator-chat feedback intent: a complaint phrase ("that was wrong — flag
     // it") captures a feedback item alongside the normal cycle. Neutral chat
     // carries no intent, so ordinary messages are untouched.
-    let feedback_note = if let Some(category) = crate::feedback::detect_chat_intent(&message.text) {
+    //
+    // Suppressed on a copilot thread for the same reason the card below is: "no,
+    // that's wrong, this node keeps failing" is the operator correcting a
+    // conversation about their graph, and filing it as company feedback would
+    // record a complaint they did not make about work they were not discussing.
+    let feedback_note = if let Some(category) = (!confined)
+        .then(|| crate::feedback::detect_chat_intent(&message.text))
+        .flatten()
+    {
         runtime
             .capture_feedback(crate::feedback::FeedbackInput {
                 category,
@@ -1072,7 +1084,6 @@ async fn run_chat(
     // the harness stops the turn from acting; this stops the route from acting
     // on its behalf, and it holds in every build because it is here rather than
     // behind the `openhuman` feature.
-    let confined = crate::company::copilot::is_copilot_thread(message.chat.as_deref());
     if let Some(title) = (!confined)
         .then(|| crate::company::task_intent::detect_task_intent(&message.text))
         .flatten()

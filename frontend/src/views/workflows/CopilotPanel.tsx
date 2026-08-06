@@ -168,6 +168,16 @@ export function CopilotPanel({
     let live = true;
     conversation.current += 1;
     setMessages([]);
+    // The proposal state goes with the transcript it belongs to (issue #415).
+    // Usually the panel is remounted — the parent keys it on the workflow id —
+    // but not when a company switch lands on a workflow of the SAME id, which
+    // is the case `send` already guards its in-flight reply against. Left
+    // behind, `reviews` would hold entries keyed by the previous company's
+    // journal ids, and `thisSession` would vouch for a proposal made against
+    // another company's graph. `proposalIsStale` catches most of that through
+    // the version token, and a host predating the token has no such catch.
+    setReviews({});
+    setThisSession(new Set());
     setError(null);
     setSending(false);
     (async () => {
