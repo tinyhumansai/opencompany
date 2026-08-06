@@ -86,6 +86,23 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
   // click can't spawn a second overlapping poll. Cleared on unmount so stale
   // callbacks don't fire against a gone component.
   const pollTimers = useRef<Record<string, number>>({});
+  // Set by the unmount cleanup below. A sign-in poll that is mid-`await` when
+  // this component goes away has already removed its own timer entry, so the
+  // cleanup has nothing left to cancel — it checks this instead of re-arming.
+  const unmounted = useRef(false);
+  // Which company's answers are still wanted, bumped whenever the scope
+  // changes. `refresh` reads it before asking and again on arrival, and drops
+  // the answer if it moved: without this, switching company while the list
+  // request is in flight lets the older response resolve last and write one
+  // company's servers into another company's view.
+  //
+  // A generation counter rather than the effect-local `live` flag used
+  // elsewhere in this file's siblings, because `refresh` is also called
+  // imperatively after every add, toggle, remove and completed sign-in. A flag
+  // owned by the mount effect cannot speak for those calls; a counter that only
+  // moves on a scope change lets them all through while still fencing the ones
+  // that belong to a company the operator has left.
+  const scope = useRef(0);
 
   // Add-server form.
   const [name, setName] = useState("");
@@ -98,10 +115,14 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
   const [addError, setAddError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    const mine = scope.current;
     try {
-      setServers(await listMcpServers(client, company));
+      const list = await listMcpServers(client, company);
+      if (scope.current !== mine) return;
+      setServers(list);
       setLoad("ready");
     } catch (err) {
+      if (scope.current !== mine) return;
       // A 404 is a host with no MCP surface: a fact about the build, not a
       // failure. Anything else (offline, 5xx, a body that wasn't the list the
       // route promises) means we do not know what this company has, and saying
@@ -111,15 +132,19 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
   }, [client, company]);
 
   useEffect(() => {
+    scope.current += 1;
     setLoad("loading");
     void refresh();
   }, [refresh]);
 
   // Cancel any in-flight sign-in polls when the view unmounts so their timers
-  // don't fire against a torn-down component.
+  // don't fire against a torn-down component, and tell a poll that is currently
+  // between its own `delete` and its next arm that there is nothing to come
+  // back to.
   useEffect(() => {
     const timers = pollTimers.current;
     return () => {
+      unmounted.current = true;
       for (const id of Object.values(timers)) window.clearTimeout(id);
     };
   }, []);
@@ -207,7 +232,14 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
       // Poll for completion for up to ~2 minutes; stop as soon as it's healthy.
       const deadline = Date.now() + 120_000;
       const poll = async () => {
+        // The entry goes before the probe, so from here to the arm at the
+        // bottom this poll is invisible to the unmount cleanup — which is why
+        // every step below re-checks. Without it, an unmount inside the probe
+        // leaves the cleanup nothing to cancel, the arm attaches to a
+        // torn-down component, and the chain keeps probing and toasting until
+        // the two-minute deadline.
         delete pollTimers.current[server.name];
+        if (unmounted.current) return;
         if (Date.now() > deadline) {
           toast.message(
             `Sign-in for ${server.name} timed out. Try again if it didn't complete.`,
@@ -216,6 +248,7 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
         }
         try {
           const health = await testMcpServer(client, company, server.name);
+          if (unmounted.current) return;
           setTested((t) => ({ ...t, [server.name]: health }));
           if (health.status === "ok") {
             toast.success(`Signed in to ${server.name}.`);
@@ -225,6 +258,7 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
         } catch {
           // Ignore transient probe errors while the operator finishes sign-in.
         }
+        if (unmounted.current) return;
         pollTimers.current[server.name] = window.setTimeout(() => void poll(), 2_000);
       };
       pollTimers.current[server.name] = window.setTimeout(() => void poll(), 2_000);

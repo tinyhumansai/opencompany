@@ -73,25 +73,40 @@ test("an admin adds and removes a runtime MCP server", async ({ page }) => {
   const name = `pw-mcp-${Date.now()}`;
   const endpoint = `https://mcp.example.test/${name}`;
 
-  await page.getByTestId("mcp-add-name").fill(name);
-  await page.getByTestId("mcp-add-endpoint").fill(endpoint);
-  await page.getByTestId("mcp-add-submit").click();
+  // The Remove click below is what this test is *about*, but it is also the
+  // only thing that takes the server back out of the host's secret store — and
+  // it is the last step, so any assertion before it that fails leaves the
+  // server registered for good. Unique names mean a re-run still passes, which
+  // is exactly why the leak would go unnoticed: the store just grows. The
+  // `finally` deletes through the API regardless of how the body ended, and is
+  // a harmless 404 on the happy path where the UI already removed it.
+  try {
+    await page.getByTestId("mcp-add-name").fill(name);
+    await page.getByTestId("mcp-add-endpoint").fill(endpoint);
+    await page.getByTestId("mcp-add-submit").click();
 
-  const row = page.getByTestId("mcp-server-row").filter({ hasText: name });
-  await expect(row).toBeVisible({ timeout: 15_000 });
-  await expect(row).toContainText("runtime");
-  await expect(row).toContainText(endpoint);
+    const row = page.getByTestId("mcp-server-row").filter({ hasText: name });
+    await expect(row).toBeVisible({ timeout: 15_000 });
+    await expect(row).toContainText("runtime");
+    await expect(row).toContainText(endpoint);
 
-  // The host is the authority on what was stored, so confirm the row is not
-  // just optimistic console state.
-  const listed = await page.request.get("/api/v1/company/mcp/servers");
-  expect(listed.ok()).toBeTruthy();
-  const body: unknown = await listed.json();
-  expect(Array.isArray(body), "GET .../mcp/servers answers a bare array").toBeTruthy();
-  expect((body as { name: string }[]).map((server) => server.name)).toContain(name);
+    // The host is the authority on what was stored, so confirm the row is not
+    // just optimistic console state.
+    const listed = await page.request.get("/api/v1/company/mcp/servers");
+    expect(listed.ok()).toBeTruthy();
+    const body: unknown = await listed.json();
+    expect(Array.isArray(body), "GET .../mcp/servers answers a bare array").toBeTruthy();
+    expect((body as { name: string }[]).map((server) => server.name)).toContain(name);
 
-  await row.getByRole("button", { name: `Remove ${name}` }).click();
-  await expect(row).toHaveCount(0, { timeout: 15_000 });
+    await row.getByRole("button", { name: `Remove ${name}` }).click();
+    await expect(row).toHaveCount(0, { timeout: 15_000 });
 
-  expect(pageErrors, `the page threw: ${pageErrors.join(" | ")}`).toEqual([]);
+    expect(pageErrors, `the page threw: ${pageErrors.join(" | ")}`).toEqual([]);
+  } finally {
+    // Best-effort: a teardown that throws would replace the real failure with
+    // its own, and the thing it is cleaning up is test residue either way.
+    await page.request
+      .delete(`/api/v1/company/mcp/servers/${encodeURIComponent(name)}`)
+      .catch(() => undefined);
+  }
 });

@@ -16,6 +16,26 @@ import { ApiError } from "@/api/types";
  * as a render-time TypeError: a body that isn't the promised list is a load
  * error raised at the fetch, not a value that flows on.
  */
+/**
+ * What `run` threw, or `undefined` if it returned.
+ *
+ * Deliberately not a `try` / `catch` with `expect.unreachable` in the body: that
+ * helper throws a plain `Error`, the `catch` then catches *it*, and the failure
+ * reads "expected Error to be an instance of ApiError" — the message explaining
+ * what was actually wrong is swallowed by the assertion meant to report it. A
+ * value handed back to the assertions cannot be confused for the thing under
+ * test: a call that wrongly returns yields `undefined` and fails on the first
+ * line, saying so.
+ */
+function thrownBy(run: () => unknown): unknown {
+  try {
+    run();
+  } catch (err) {
+    return err;
+  }
+  return undefined;
+}
+
 describe("expectList", () => {
   it("passes a bare array through as the list", () => {
     const servers = [{ name: "notion" }, { name: "linear" }];
@@ -39,18 +59,15 @@ describe("expectList", () => {
   });
 
   it("names the route in the failure and marks it as not the host refusing", () => {
-    try {
-      expectList({}, "tool list for notion");
-      expect.unreachable("a non-list body must throw");
-    } catch (err) {
-      expect(err).toBeInstanceOf(ApiError);
-      const api = err as ApiError;
-      expect(api.code).toBe("unexpected_shape");
-      expect(api.message).toContain("tool list for notion");
-      // Nothing was refused, so there is no HTTP status to report and the
-      // message is ours, not the host's envelope.
-      expect(api.status).toBe(0);
-      expect(api.fromHost).toBe(false);
-    }
+    const thrown = thrownBy(() => expectList({}, "tool list for notion"));
+
+    expect(thrown, "a non-list body must throw").toBeInstanceOf(ApiError);
+    const api = thrown as ApiError;
+    expect(api.code).toBe("unexpected_shape");
+    expect(api.message).toContain("tool list for notion");
+    // Nothing was refused, so there is no HTTP status to report and the
+    // message is ours, not the host's envelope.
+    expect(api.status).toBe(0);
+    expect(api.fromHost).toBe(false);
   });
 });
