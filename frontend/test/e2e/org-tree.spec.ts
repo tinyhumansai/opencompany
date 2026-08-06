@@ -206,6 +206,15 @@ const chart = (page: Page) => page.getByRole("tree", { name: "Company org chart"
 const deskNode = (page: Page, name: string) =>
   chart(page).locator('[role="treeitem"][aria-level="2"]').filter({ hasText: name });
 
+/**
+ * Land on the chart from a cold load.
+ *
+ * Always the test's **first** navigation, so the document loads at `#/company`
+ * rather than changing only its fragment. A `goto` between two hashes of the
+ * same document is a same-document navigation the SPA may or may not have
+ * routed by the time the assertion runs — see the reachability test below,
+ * which needs a second navigation and therefore clicks instead.
+ */
 async function openChart(page: Page) {
   await page.goto("/#/company");
   await expect(chart(page)).toBeVisible({ timeout: 30_000 });
@@ -216,17 +225,29 @@ test.beforeEach(reset);
 test("#311 the org chart is reachable, which it was not before", async ({ page }) => {
   await mockApi(page);
 
-  // The nav entry. Before this change there was none, and no hash reached it.
+  // Start somewhere else, so arriving at the chart is a real navigation and not
+  // the page it happened to load on. Before this change there was no nav entry
+  // and no hash that reached this surface at all.
   await page.goto("/#/overview");
-  const nav = page.getByRole("link", { name: "Company" }).or(
-    page.getByRole("button", { name: "Company" }),
-  );
-  await expect(nav.first()).toBeVisible({ timeout: 30_000 });
+  const nav = page
+    .getByRole("link", { name: "Company" })
+    .or(page.getByRole("button", { name: "Company" }))
+    .first();
+  await expect(nav).toBeVisible({ timeout: 30_000 });
 
-  await openChart(page);
-  // The hash survives rather than being rewritten to the fallback view, which
-  // is exactly what `#/desks` did (and still does — it names no view).
-  expect(page.url()).toContain("#/company");
+  // Click it rather than `goto` a second hash. Two reasons, and the first is
+  // why this test flaked once before: `page.goto` from `#/overview` to
+  // `#/company` changes only the fragment, so the document never reloads and
+  // the assertion can run against the view still on screen — a captured
+  // failure snapshot showed the knowledge graph, not the chart. Clicking is
+  // also the stronger claim: it proves the nav entry *routes*, which typing a
+  // URL does not.
+  await nav.click();
+  await expect(chart(page)).toBeVisible({ timeout: 30_000 });
+
+  // And the hash survives rather than being rewritten to the fallback view,
+  // which is exactly what `#/desks` does — it names no view.
+  await expect.poll(() => page.url()).toContain("#/company");
 });
 
 test("#311 the chart is three levels and never a fourth", async ({ page }) => {
