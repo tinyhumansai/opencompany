@@ -22,15 +22,22 @@
 //    "no cross-workflow leakage" criterion, enforced server-side rather than by
 //    this file remembering to filter.
 //
-//    **Read that precisely: it isolates TRANSCRIPTS, not authority.** The
-//    thread id picks the responder and the journal; it does not narrow the
-//    orchestrator's context or tools, which stay company-wide. Asking this
-//    copilot about another workflow is not prevented by the transport — only
-//    by the instruction in the composed prompt, which is advisory. That is a
-//    deliberate limit of reusing the chat seam rather than building a scoped
-//    agent, and it costs nothing in privilege: the operator is already
-//    authenticated to the company and can reach the same orchestrator from the
-//    Chat tab and every workflow route. See `docs/spec/runtime/api.md`.
+//    **It isolates TRANSCRIPTS.** One workflow's copilot never sees another's,
+//    and none of it appears in the team's chat.
+//
+//    Until issue #416 that was the *whole* of the scoping: the thread id picked
+//    the responder and the journal and narrowed nothing else, so the teammate
+//    answering was the company orchestrator with its full context and tools,
+//    and "answer only about this workflow" was an instruction in the prompt —
+//    advice, not a boundary. It cost nothing in privilege (the operator can
+//    reach the same orchestrator from the Chat tab), but it meant an answer
+//    about a workflow could be drawn from anywhere in the company.
+//
+//    The host now reads the thread itself. `workflow-copilot:<id>` runs a
+//    **confined turn**: an ephemeral agent with no tools, no company memory and
+//    no delegation, whose whole world is the message composed below. See
+//    `src/company/copilot.rs` (the convention) and `src/harness/confine.rs`
+//    (the boundary), plus `docs/spec/runtime/api.md`.
 // 3. **It rehydrates for free.** Because the exchange is journaled under that
 //    thread, `GET {scope}/chat/history?desk=<thread>` replays it after a reload,
 //    with no new storage and no new route.
@@ -130,7 +137,13 @@ export function composeCopilotMessage(context: CopilotContext, question: string)
 
   const lines: string[] = [
     `You are the workflow copilot for this company, answering about ONE saved workflow.`,
-    `Answer only about this workflow. If the question is about a different workflow, or about the company generally, say so instead of guessing.`,
+    // The host confines this turn (issue #416): it runs on an agent with no
+    // tools and no company memory, so this is a description of the turn's real
+    // boundary rather than an instruction it could step outside of. Kept in the
+    // message as well as in the host-side persona so the disclosure the panel
+    // shows the operator is built from the same text that was actually sent.
+    `Everything you know about it is below. You have no tools and no access to the rest of the company, so answer from this material only.`,
+    `If the question needs a different workflow or the wider company, say which part you cannot answer here and that it has to be asked in the company chat. Do not guess, and do not claim to have looked anything up.`,
     ``,
     `## Workflow`,
     `Name: ${graph.name}`,
@@ -198,6 +211,7 @@ export function composeCopilotMessage(context: CopilotContext, question: string)
     `## What you can and cannot do`,
     `You can explain this workflow, diagnose why its runs failed, and describe in words what should change.`,
     `You CANNOT edit the workflow: this console does not apply copilot-authored changes. If a change is wanted, describe it precisely enough for a person to make it in the workflow editor. Do not claim to have made it.`,
+    `You CANNOT reach anything else in the company: no tools, no board, no teammates, no other workflow, no files. The host enforces this, so a call would be refused rather than answered.`,
   );
 
   // Joined with the marker verbatim, so `questionOf` splits on exactly the

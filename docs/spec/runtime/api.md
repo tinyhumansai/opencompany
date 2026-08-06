@@ -310,20 +310,32 @@ scope; SSE (`/chat` streaming, the `/events` work feed) is not yet wired.
   `owns` to match on prefix, would break that surface — see
   [`frontend/src/api/workflow-copilot.ts`](../../../frontend/src/api/workflow-copilot.ts).
 
-  **Thread addressing isolates transcripts. It does not scope authority.**
-  These are two different things and only the first is enforced here. The
-  thread id decides who answers and where the exchange is journaled; it does
-  **not** narrow the orchestrator's context or its tool grants, which stay
-  company-wide for every `/chat` turn whatever thread it names. A caller that
-  needs the responder confined to one subject has to constrain it in the
-  prompt — which is advisory — or build a genuinely scoped agent, which this
-  seam is not.
+  **Thread addressing isolates transcripts. For every thread but one, it does
+  not scope authority.** The thread id decides who answers and where the
+  exchange is journaled; for an ordinary thread it does **not** narrow the
+  responder's context or tool grants, which stay company-wide however the turn
+  is addressed.
 
-  That is a scoping property, not an authorization one: `/chat` is already
-  authenticated and company-scoped, so an operator addressing a workflow
-  thread gains nothing they could not get by opening the Chat tab or calling
-  the workflow routes directly. The copilot therefore adds no privilege; what
-  it adds is a transcript that stays out of the team's chat.
+  **The copilot thread is the exception (issue #416).** A `chat` id matching
+  `workflow-copilot:<workflowId>` ([`company::copilot`](../../../src/company/copilot.rs))
+  makes the turn **confined**, host-side, in two places that hold independently:
+
+  - the harness runs it on an ephemeral agent with **no tools, no company
+    memory and no delegation** ([`harness::confine`](../../../src/harness/confine.rs)),
+    and skips the retrieve→inject step and the memory writeback, so the turn
+    answers from the message it was sent and leaves nothing behind. Every tool
+    call is denied by the host with a reason, so an empty toolbelt is a
+    boundary rather than an absence;
+  - the `/chat` handler does not open a board card from a copilot message, so a
+    question phrased as a request cannot leave work on the board. That half is
+    in the default build, not behind `openhuman`.
+
+  Confinement narrows one **turn**; it is not an authorization check and must
+  not be read as one. `/chat` is already authenticated and company-scoped, so
+  an operator addressing a workflow thread gains nothing they could not get by
+  opening the Chat tab or calling the workflow routes directly. What the
+  copilot adds is a transcript that stays out of the team's chat and an answer
+  drawn from one workflow rather than from everything the company knows.
 
   Two more consequences worth knowing before reusing the seam. A chat turn
   runs the **whole** company cycle, so an actionable message also opens a

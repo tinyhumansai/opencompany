@@ -2124,6 +2124,63 @@ async fn inbox_list_and_messages_project_store() {
     assert_eq!(msgs[1]["outbound"], true);
 }
 
+/// Issue #416, the half that holds in every build: a question asked on a
+/// workflow copilot thread must not leave work on the company's board.
+///
+/// The copilot is a conversation *about a graph*, and its questions are phrased
+/// at the graph — "add a node that emails the report". The chat route's
+/// deterministic intent detector reads that as a request to the company and
+/// opens a `todo` card, which is the same class of over-reach this issue is
+/// about, reached from the route rather than from the model. The control half
+/// matters as much as the confined half: the identical sentence on an ordinary
+/// thread still opens its card, so this narrows the copilot rather than
+/// disabling a feature.
+#[tokio::test]
+async fn a_copilot_thread_question_opens_no_board_card() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    // Deliberately the most actionable phrasing the copilot invites.
+    let ask = "build a node that emails the weekly report";
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({"message": ask, "chat": "workflow-copilot:weekly_report"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        board.as_array().is_none_or(|cards| cards.is_empty()),
+        "a copilot question left work on the board: {board}"
+    );
+
+    // Control: the same sentence on the ordinary thread still opens a card, so
+    // the suppression is scoped to the copilot and not a regression of #246.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({"message": ask})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, board) = send(&state, "GET", "/api/v1/company/tasks", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let cards = board.as_array().expect("the board lists cards");
+    assert_eq!(
+        cards.len(),
+        1,
+        "the ordinary thread must still open exactly one card: {board}"
+    );
+}
+
 #[tokio::test]
 async fn chat_accepts_desk_id_and_replies() {
     let home_dir = home();

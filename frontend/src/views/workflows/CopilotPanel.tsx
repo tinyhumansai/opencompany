@@ -6,6 +6,11 @@
 // `@/api/workflow-copilot` for why it needs no new host route and how the
 // scoping is enforced server-side.
 //
+// Issue #416 made "scoped" true of the answering agent and not only of the
+// question: the host reads the copilot thread id and runs the turn confined —
+// no tools, no company memory, no delegation. That is what the disclosure block
+// below is allowed to claim, and it claims exactly that and no more.
+//
 // ## It says what it cannot do
 //
 // Two honesty gates, and both exist because the failure they prevent is a chat
@@ -255,42 +260,39 @@ export function CopilotPanel({
         {/* What it can see and what it cannot do, stated before the first
             question rather than discovered after it.
 
-            The first line used to end "— not other workflows", which was an
-            over-claim: what the thread buys is transcript isolation, not a
-            confined responder. The teammate answering is the company's
-            orchestrator with its ordinary company-wide context and tools, so
-            the honest claim is about what is SENT with the question, not about
-            what the responder is unable to reach. Grounding and isolation are
-            both real and both verified; confinement is not, so it is not
-            claimed. See the header of `@/api/workflow-copilot`. */}
+            This block is a claim about the host, so it changes only when the
+            host does. #405 had to *withdraw* a confinement claim: the thread
+            bought transcript isolation, not a confined responder, and the
+            teammate answering held the company's whole context and tool
+            surface. #416 built the confinement, so the claim is back — and it
+            is now the narrower, checkable one: no tools, no company context,
+            and a turn that says which part of a question it could not answer
+            rather than reaching for the rest of the company. See the header of
+            `@/api/workflow-copilot`, and `harness::confine` host-side. */}
         <div className="rounded-lg border bg-muted/30 p-2 text-[11px] leading-snug text-muted-foreground">
           <p>
             Answers are grounded in{" "}
-            <span className="font-medium text-foreground">{graph.name}</span> — its steps
-            and its recorded runs are what gets sent with your question.
+            <span className="font-medium text-foreground">{graph.name}</span>: its steps and
+            its recorded runs are what gets sent with your question.
           </p>
           <p className="mt-1.5">
-            This conversation stays with this workflow: it isn't in the company
-            chat, and another workflow's copilot can't see it. The teammate
-            answering is your company's orchestrator though, so it can still
-            draw on what it knows about the rest of the company.
+            That is also all the answer is drawn from. This turn runs{" "}
+            <span className="font-medium text-foreground">confined to this workflow</span>: no
+            tools, no company memory, and no reach into the board, your teammates or another
+            workflow. Ask something that needs the wider company and it will say so rather
+            than guess.
+          </p>
+          <p className="mt-1.5">
+            The conversation stays here too: it isn&apos;t in the company chat, and another
+            workflow&apos;s copilot can&apos;t see it.
           </p>
           <p className="mt-1.5">
             It can explain and suggest, but{" "}
-            <span className="font-medium text-foreground">it can't change the workflow</span>.
+            <span className="font-medium text-foreground">it can&apos;t change the workflow</span>
+            .
             {sourceDefined
               ? " This one is defined by a file in the company source tree, so changes belong in the company repository."
-              : " Apply a change yourself with Edit — that's the path that checks the graph and refuses a stale write."}
-          </p>
-          {/* The copilot is a company chat turn, and a chat turn that reads as
-              an instruction opens a board card. That is the host's ordinary
-              behaviour, not a copilot quirk — but an operator who was not told
-              would find a card they never asked for, so say it once, up front,
-              and frame it as what it is: how a request gets recorded when the
-              copilot itself cannot act on it. */}
-          <p className="mt-1.5">
-            Asking for a change may open a card on the board — that's how the
-            company records work to pick up.
+              : " Apply a change yourself with Edit, the path that checks the graph and refuses a stale write."}
           </p>
         </div>
 

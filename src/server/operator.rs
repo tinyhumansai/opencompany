@@ -1063,7 +1063,20 @@ async fn run_chat(
     // sub-tasks on top). Pure questions, greetings, and acknowledgements don't
     // fire, so the board fills with work, not small talk. Best-effort: a card
     // write failure must never sink the chat reply.
-    if let Some(title) = crate::company::task_intent::detect_task_intent(&message.text) {
+    //
+    // NOT on a workflow copilot thread (issue #416). A copilot question is
+    // phrased at the workflow — "add a node that emails the report", "why does
+    // this fail on Mondays" — and the intent detector reads the first of those
+    // as a request to the company, which would put a card on the board from a
+    // conversation the operator was having *about a graph*. The confinement in
+    // the harness stops the turn from acting; this stops the route from acting
+    // on its behalf, and it holds in every build because it is here rather than
+    // behind the `openhuman` feature.
+    let confined = crate::company::copilot::is_copilot_thread(message.chat.as_deref());
+    if let Some(title) = (!confined)
+        .then(|| crate::company::task_intent::detect_task_intent(&message.text))
+        .flatten()
+    {
         // Keep the full message as the note only when the title was shortened
         // from it, so a one-line ask doesn't duplicate itself.
         let note =

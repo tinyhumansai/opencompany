@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
 use crate::harness::build::agent_workspace;
+use crate::harness::confine;
 // The note shape is shared with the ungated system paths (issue #337): the
 // backstop, the quiescing-runtime settle and the boot reaper all append their
 // reason to a card, and a second copy of it here is how one card ends up with
@@ -1927,6 +1928,46 @@ impl Brain for HarnessBrain {
         for event in &req.events {
             match event {
                 CompanyEvent::OperatorMessage { text, chat, .. } => {
+                    // Issue #416: a workflow copilot thread is answered by a
+                    // CONFINED turn, not by the company orchestrator.
+                    //
+                    // This branch is the boundary. Everything below it — the
+                    // delegation runner, the publish claim, the MCP failure
+                    // drain, the card a `spawn_task` opens — exists to let a
+                    // turn act on the company's behalf, and a copilot turn is
+                    // precisely the one that must not. So it does not fall
+                    // through to any of it: no tools ran, so there is nothing to
+                    // drain, and no desk was reachable, so there is nothing to
+                    // relay. What comes back is one bubble on this thread, which
+                    // is the whole of what the copilot was ever meant to be.
+                    if let Some(workflow_id) =
+                        crate::company::copilot::workflow_of_thread(chat.as_deref())
+                    {
+                        let confinement = confine::Confinement::workflow(workflow_id);
+                        let outcome = self
+                            .pool
+                            .run_confined(
+                                &self.record.id,
+                                &self.record.manifest.company.name,
+                                text,
+                                &self.deps,
+                                chat.as_deref(),
+                                &confinement,
+                            )
+                            .await?;
+                        channel_responses.push(OutboundMessage {
+                            message_id: None,
+                            // No card, by construction: a confined turn has no
+                            // `spawn_task` to call, and the chat handler does
+                            // not open one from a copilot message either.
+                            task_id: None,
+                            channel: "operator".to_string(),
+                            text: outcome.reply,
+                            reply_to: None,
+                            steps: outcome.steps,
+                        });
+                        continue;
+                    }
                     // Route to the addressed desk's lead, else the orchestrator.
                     let responder = self.responder_for(chat.as_deref());
                     // The chat/desk thread this turn answers — the same id the

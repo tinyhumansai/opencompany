@@ -50,6 +50,10 @@ pub mod composio_catalog;
 /// model's choices and the Composio backend are scripted. Test-only.
 #[cfg(all(test, feature = "composio"))]
 mod composio_turn_test;
+/// Issue #416: the confined turn — an ephemeral agent with no tools, no company
+/// memory and no delegation, for a question that is about one object rather than
+/// about the company. See [`confine`].
+pub mod confine;
 pub mod cost;
 /// Hosted embeddings compute for the in-pod memory engine's meaning tier (188c2).
 /// Needs the `tinycortex` crate's `EmbeddingBackend` trait, so it links only when
@@ -1188,6 +1192,139 @@ impl HarnessPool {
         .await
     }
 
+    /// The plan-level total-token ceiling, as a refusal or nothing.
+    ///
+    /// Extracted from [`run_inner`](Self::run_inner) so the confined turn
+    /// (issue #416) is gated by the *same* ceiling rather than a second copy of
+    /// the rule: a turn that reaches nothing still spends model tokens, so a
+    /// tenant past its cap must not be able to keep spending through the
+    /// copilot.
+    async fn total_ceiling_refusal(
+        company: &CompanyId,
+        agent_id: &str,
+        deps: &HarnessDeps,
+    ) -> Option<TurnOutcome> {
+        let plan = deps.plan.as_ref()?;
+        plan.total_budget?;
+        match deps.meter.as_deref() {
+            Some(meter) => {
+                let since = plan.period.period_start_millis(crate::ports::now_millis());
+                match meter.query(company, since).await {
+                    Ok(samples) => {
+                        let spent = capability_budget::tokens_in(&samples);
+                        if plan.total_exhausted(spent) {
+                            tracing::info!(
+                                company = %company,
+                                agent = agent_id,
+                                spent,
+                                "[capability-budget] total token ceiling reached; refusing dispatch (no model call) until the period resets"
+                            );
+                            return Some(TurnOutcome {
+                                reply: TOTAL_BUDGET_EXHAUSTED_NOTICE.to_string(),
+                                steps: Vec::new(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            company = %company,
+                            %error,
+                            "[capability-budget] total-ceiling spend query failed; not hard-refusing — deferring to the per-namespace fail-closed roster"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    company = %company,
+                    "[capability-budget] no usage meter; cannot enforce the total token ceiling — deferring to the per-namespace fail-closed roster"
+                );
+            }
+        }
+        None
+    }
+
+    /// Runs one **confined** turn (issue #416): an ephemeral agent with no
+    /// tools, no company memory and no roster identity, for a question about one
+    /// object rather than about the company.
+    ///
+    /// Deliberately not a variant of [`run_inner`](Self::run_inner), because the
+    /// two differ in what they are allowed to touch rather than in a flag:
+    ///
+    /// * the agent is **built here and dropped after**, so it is never in the
+    ///   pooled roster and cannot be addressed, dispatched or delegated to;
+    /// * there is **no retrieve→inject** — the company's prior task outcomes are
+    ///   not prepended to the message, so the model cannot answer from work it
+    ///   was not asked about;
+    /// * there is **no memory writeback** — the exchange leaves nothing for a
+    ///   later company turn to retrieve, so a confined conversation cannot
+    ///   become unconfined context tomorrow.
+    ///
+    /// What it does share: the plan-level token ceiling (spend is spend), live
+    /// turn streaming onto the addressed thread, and cost recording, so a
+    /// confined turn is billed and observable exactly like any other.
+    pub async fn run_confined(
+        &self,
+        company: &CompanyId,
+        company_name: &str,
+        message: &str,
+        deps: &HarnessDeps,
+        chat_id: Option<&str>,
+        confinement: &confine::Confinement,
+    ) -> crate::Result<TurnOutcome> {
+        if let Some(refusal) =
+            Self::total_ceiling_refusal(company, confine::CONFINED_AGENT_ID, deps).await
+        {
+            return Ok(refusal);
+        }
+
+        let agent = CompanyAgent {
+            agent_id: confine::CONFINED_AGENT_ID.to_string(),
+            role: "Workflow copilot".to_string(),
+            // A confined turn carries no manifest teammate, so there is no
+            // per-agent daily cap to read; the company-wide ceiling above is the
+            // one that applies to it.
+            budget_usd_daily: None,
+            agent: Mutex::new(confine::build_confined_agent(
+                company,
+                company_name,
+                confinement,
+                deps,
+            )?),
+        };
+
+        let stream_ctx = Some(crate::turn_stream::TurnStreamCtx {
+            company: company.clone(),
+            agent_id: confine::CONFINED_AGENT_ID.to_string(),
+            chat_id: chat_id
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string()),
+        });
+
+        // The message goes to the model AS SENT. This is the retrieve→inject
+        // step's absence, and it is the difference between "grounded in one
+        // workflow" and "confined to one workflow".
+        let (outcome, turn_costs) = agent
+            .run_with_steer(message, None, stream_ctx, None)
+            .await?;
+
+        let provider_slug = deps.provider.telemetry_provider_id();
+        for turn_cost in &turn_costs {
+            record_turn_cost(
+                turn_cost,
+                confine::CONFINED_AGENT_ID,
+                &provider_slug,
+                company,
+                deps.store.as_ref(),
+                deps.meter.as_deref(),
+                None,
+            )
+            .await?;
+        }
+
+        Ok(outcome)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
@@ -1260,44 +1397,8 @@ impl HarnessPool {
         // A `warn!` records the deferral. Refusing every turn on a flaky meter
         // read would be a strictly worse failure mode than letting an
         // intrinsic-tools-only turn through.
-        if let Some(plan) = deps.plan.as_ref()
-            && plan.total_budget.is_some()
-        {
-            match deps.meter.as_deref() {
-                Some(meter) => {
-                    let since = plan.period.period_start_millis(crate::ports::now_millis());
-                    match meter.query(company, since).await {
-                        Ok(samples) => {
-                            let spent = capability_budget::tokens_in(&samples);
-                            if plan.total_exhausted(spent) {
-                                tracing::info!(
-                                    company = %company,
-                                    agent = agent_id,
-                                    spent,
-                                    "[capability-budget] total token ceiling reached; refusing dispatch (no model call) until the period resets"
-                                );
-                                return Ok(TurnOutcome {
-                                    reply: TOTAL_BUDGET_EXHAUSTED_NOTICE.to_string(),
-                                    steps: Vec::new(),
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                company = %company,
-                                %error,
-                                "[capability-budget] total-ceiling spend query failed; not hard-refusing — deferring to the per-namespace fail-closed roster"
-                            );
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        company = %company,
-                        "[capability-budget] no usage meter; cannot enforce the total token ceiling — deferring to the per-namespace fail-closed roster"
-                    );
-                }
-            }
+        if let Some(refusal) = Self::total_ceiling_refusal(company, agent_id, deps).await {
+            return Ok(refusal);
         }
 
         // Per-agent daily spend cap (issue #304): the same HARD, pre-model-call
@@ -2232,6 +2333,104 @@ description = "Builds the product."
             .reply;
 
         assert!(second.contains("second"));
+    }
+
+    /// Issue #416 — a confined turn reaches the company's memory neither on the
+    /// way in nor on the way out.
+    ///
+    /// The control half is what makes this a test rather than an assertion of
+    /// absence: the SAME message on the ordinary roster path pulls the seeded
+    /// chunk into the prompt (the mock provider echoes what it was sent, so the
+    /// injection is visible in the reply), and writes the turn back. The
+    /// confined path does neither, from the same store, in the same test.
+    #[tokio::test]
+    async fn a_confined_turn_neither_reads_nor_writes_company_memory() {
+        let context = Arc::new(MockContext::default());
+        let mut fx = fixture();
+        fx.deps.context = context.clone();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        // A prior outcome sitting in the company's memory. The mock store
+        // matches a chunk whose BODY contains the query, and retrieve→inject
+        // queries with the whole message — so a body built around the message is
+        // what a hit looks like here.
+        let question = "why did it fail";
+        context
+            .put(
+                &rec.id,
+                ContextChunk {
+                    label: "prior/outcome".into(),
+                    body: format!("SECRET-PAYROLL-REVIEW: {question} on Monday"),
+                },
+            )
+            .await
+            .expect("seed the company's memory");
+        let seeded = context.chunks.lock().unwrap().len();
+
+        // Control: the ordinary path injects the hit and writes the turn back.
+        let ordinary = pool
+            .run(&rec.id, "ceo", question, &fx.deps, None)
+            .await
+            .expect("the ordinary turn runs")
+            .reply;
+        assert!(
+            ordinary.contains("SECRET-PAYROLL-REVIEW"),
+            "the retrieve→inject step must be live for this test to mean anything: {ordinary}"
+        );
+        assert!(
+            context.chunks.lock().unwrap().len() > seeded,
+            "the ordinary path writes its outcome back to company memory"
+        );
+
+        let before_confined = context.chunks.lock().unwrap().len();
+        let confined = pool
+            .run_confined(
+                &rec.id,
+                "Acme",
+                question,
+                &fx.deps,
+                Some("workflow-copilot:weekly_report"),
+                &confine::Confinement::workflow("weekly_report"),
+            )
+            .await
+            .expect("the confined turn runs")
+            .reply;
+
+        assert!(
+            confined.contains(question),
+            "the confined turn still answers the question it was asked: {confined}"
+        );
+        assert!(
+            !confined.contains("SECRET-PAYROLL-REVIEW"),
+            "a confined turn must not be handed company memory: {confined}"
+        );
+        assert_eq!(
+            context.chunks.lock().unwrap().len(),
+            before_confined,
+            "a confined turn must leave nothing behind for a later turn to retrieve"
+        );
+    }
+
+    /// The confined agent is not on the roster, so nothing can address it: a
+    /// dispatch, a desk hand-off or a `chat` naming it is an unknown agent, the
+    /// same as any other name that is not a teammate.
+    #[tokio::test]
+    async fn the_confined_agent_is_not_addressable() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        let err = pool
+            .run(&rec.id, confine::CONFINED_AGENT_ID, "hi", &fx.deps, None)
+            .await
+            .expect_err("the confined agent is not a roster agent");
+        assert!(
+            matches!(err, OpenCompanyError::InvalidRequest(_)),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
