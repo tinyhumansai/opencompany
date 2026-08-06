@@ -409,6 +409,59 @@ fn composio_execute_consequence(args: &serde_json::Value) -> Consequence {
     }
 }
 
+/// Which slice of a tool one standing grant is confined to (issue #457).
+///
+/// `None` for almost everything, and that is the honest answer: for a tool
+/// whose name *is* the whole of what it can do — `file_write`, `memory_store` —
+/// "this tool, for this teammate, until a deadline" already describes exactly
+/// what the operator consented to, and there is nothing left to narrow.
+///
+/// `composio_execute` is the exception the type exists for. Every Composio
+/// action across every connected toolkit arrives under that one name, so a grant
+/// keyed on the name alone turns "read from GitHub" — the sentence on the card —
+/// into "make any Composio read, anywhere". [`consequence_of`] already
+/// re-classifies the live action, so a send cannot slip through a read's grant;
+/// what it cannot see is that a *different provider's* read is a different
+/// sentence. The toolkit is that dimension, and it is the right grain: the
+/// operator agreed to a provider, not to one action slug, so a second GitHub
+/// read must still pass.
+///
+/// Read through the vendored catalogue, so a toolkit nobody has classified
+/// resolves to `None` and — per [`StandingGrant::admits_scope`] — a scoped grant
+/// refuses to admit it. Without the harness feature this is always `None`, which
+/// is safe rather than lax: that build cannot mint a Composio standing grant in
+/// the first place — `without_the_catalogue_every_composio_action_is_a_send`
+/// pins that — so there is no scoped grant there for `None` to widen.
+///
+/// [`StandingGrant::admits_scope`]: crate::runtime::grants::StandingGrant::admits_scope
+pub fn standing_scope_of(tool: &str, args: &serde_json::Value) -> Option<String> {
+    if !tool.eq_ignore_ascii_case(COMPOSIO_EXECUTE) {
+        return None;
+    }
+    let slug = args.get(COMPOSIO_ACTION_KEY).and_then(|v| v.as_str())?;
+    composio_toolkit_of(slug)
+}
+
+/// The catalogued toolkit an action slug belongs to, or `None` when the
+/// catalogue has never heard of it.
+#[cfg(feature = "openhuman")]
+fn composio_toolkit_of(slug: &str) -> Option<String> {
+    use openhuman_core::openhuman::memory_sync::composio::providers::{
+        catalog_for_toolkit, toolkit_from_slug,
+    };
+    let toolkit = toolkit_from_slug(slug)?;
+    // The slug's prefix is *some* word for every non-empty slug, so the
+    // catalogue lookup is what separates a real toolkit from a typo.
+    catalog_for_toolkit(&toolkit).is_some().then_some(toolkit)
+}
+
+/// Without the harness feature the curated catalogue is not linked in — the same
+/// seam `composio_action_is_read` straddles, answered the same cautious way.
+#[cfg(not(feature = "openhuman"))]
+fn composio_toolkit_of(_slug: &str) -> Option<String> {
+    None
+}
+
 /// Is this Composio action slug a read, according to the provider's own
 /// curated catalogue? Unknown is **not** a read.
 #[cfg(feature = "openhuman")]
@@ -752,6 +805,90 @@ mod tests {
             Standing::Grantable,
             "the curated lookup is case-insensitive on the slug too"
         );
+    }
+
+    /// Issue #457: a standing grant on `composio_execute` has to record *which
+    /// provider*, because the card said "read from GitHub" and the tool name
+    /// says nothing at all.
+    #[test]
+    #[cfg(feature = "openhuman")]
+    fn a_composio_call_is_scoped_to_its_toolkit() {
+        assert_eq!(
+            standing_scope_of(COMPOSIO_EXECUTE, &json!({ "tool": "GITHUB_LIST_BRANCHES" })),
+            Some("github".to_string())
+        );
+        // A different action in the same toolkit is the same scope — the
+        // operator agreed to a provider, not to one slug.
+        assert_eq!(
+            standing_scope_of(
+                COMPOSIO_EXECUTE,
+                &json!({ "tool": "GITHUB_LIST_PULL_REQUESTS" })
+            ),
+            Some("github".to_string())
+        );
+        // A different provider is a different scope, which is the whole point.
+        assert_eq!(
+            standing_scope_of(COMPOSIO_EXECUTE, &json!({ "tool": "GMAIL_FETCH_EMAILS" })),
+            Some("gmail".to_string())
+        );
+        // The tool name is matched the same lowercasing way the rest of the
+        // gate matches it.
+        assert_eq!(
+            standing_scope_of(
+                "COMPOSIO_EXECUTE",
+                &json!({ "tool": "github_list_branches" })
+            ),
+            Some("github".to_string())
+        );
+    }
+
+    /// Nothing the catalogue can place is `None`, and `None` is what a scoped
+    /// grant refuses — so an unplaceable slug parks rather than riding somebody
+    /// else's permission.
+    #[test]
+    fn an_unplaceable_composio_call_has_no_scope() {
+        for args in [
+            json!({ "tool": "NOTAREALTOOLKIT_LIST_THINGS" }),
+            json!({ "tool": "" }),
+            json!({ "tool": 7 }),
+            json!({ "arguments": { "owner": "acme" } }),
+            json!({}),
+        ] {
+            assert_eq!(
+                standing_scope_of(COMPOSIO_EXECUTE, &args),
+                None,
+                "nothing to narrow to: {args}"
+            );
+        }
+    }
+
+    /// Every other tool has no scope, and must not grow one by accident: the
+    /// name of `file_write` already is the whole of what it can do.
+    #[test]
+    fn a_tool_whose_name_says_everything_has_no_scope() {
+        for tool in ["file_write", "memory_store", "shell", "workspace_write"] {
+            assert_eq!(
+                standing_scope_of(tool, &json!({ "tool": "GITHUB_LIST_BRANCHES" })),
+                None,
+                "`{tool}` is not a Composio call whatever its arguments say"
+            );
+        }
+    }
+
+    /// The other side of the seam. A default build cannot mint a Composio
+    /// standing grant at all (see
+    /// `without_the_catalogue_every_composio_action_is_a_send`), so answering
+    /// "no scope" here widens nothing — there is no scoped grant to widen.
+    #[test]
+    #[cfg(not(feature = "openhuman"))]
+    fn without_the_catalogue_nothing_carries_a_scope() {
+        for slug in ["GITHUB_LIST_BRANCHES", "GMAIL_SEND_EMAIL"] {
+            assert_eq!(
+                standing_scope_of(COMPOSIO_EXECUTE, &json!({ "tool": slug })),
+                None,
+                "{slug}"
+            );
+        }
     }
 
     /// The literals above and the constants the tools themselves return are two

@@ -1,70 +1,112 @@
 import { expect, test } from "@playwright/test";
 
-import { MCP_SERVER } from "./capabilities";
+/**
+ * Issue #414 — Settings, MCP Servers must render the servers the host actually
+ * serves.
+ *
+ * The page used to be written against an API no host has ever answered: a
+ * `{ servers: [...] }` wrapper where `GET .../mcp/servers` returns a bare
+ * array, servers keyed by `server_id` where the host keys by name, plus
+ * `/connect` and `/disconnect` routes that exist nowhere. Opening it stored
+ * `undefined` as the server list and threw `Cannot read properties of undefined
+ * (reading 'length')` on render.
+ *
+ * That is why this spec asserts on an uncaught page error as well as on the
+ * rendering: the failure was a thrown TypeError, and a spec that only checked
+ * for visible rows could pass against a page that had already blown up before
+ * painting them.
+ *
+ * Runs against the default-feature host the rest of this directory drives — no
+ * extra capability needed. The harness company declares one `[[mcp_server]]`
+ * (`deepwiki`) in its manifest, so the list is never empty here, and the add /
+ * remove half exercises the runtime source against the routes the host serves.
+ * Live probing (`Test`) and tool discovery (`Tools`) need the `openhuman`
+ * feature and report `not_wired` on this build, so they are deliberately not
+ * driven here.
+ *
+ * The suite's shared storage state is the harness admin, which is what the add
+ * and remove controls require (issue #403).
+ */
 
-// The spec self-declared this requirement and then asserted it, which turned a
-// missing fixture into a red suite rather than an absent capability. Skipping
-// is the honest report: nothing is wrong, the server was not supplied.
-test.skip(
-  !MCP_SERVER,
-  "needs PW_MCP_SERVER pointing at the simple MCP server. Tracked by issue #467.",
-);
+type Page = import("@playwright/test").Page;
 
-test("operator installs and calls an MCP server from the console and an agent", async ({
-  page,
-}) => {
-  const serverScript = MCP_SERVER;
-  expect(
-    serverScript,
-    "PW_MCP_SERVER must point at the simple MCP server",
-  ).toBeTruthy();
+/** The MCP settings page, with the product tour dismissed if it appears. */
+async function openMcpSettings(page: Page) {
+  await page.goto("/#/settings/mcp");
+  const skip = page.getByRole("button", { name: "Skip for now" });
+  await skip
+    .waitFor({ state: "visible", timeout: 10_000 })
+    .then(() => skip.click())
+    .catch(() => {
+      /* already seen in this context — nothing to dismiss */
+    });
+}
 
-  await page.goto("/#/mcp");
-  await page.getByTestId("mcp-install-name").fill("simple");
-  await page.getByTestId("mcp-install-command").fill("node");
-  await page.getByTestId("mcp-install-args").fill(serverScript!);
-  await page.getByTestId("mcp-install-submit").click();
+test("Settings MCP lists the company's servers instead of crashing on open", async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  const row = page.getByTestId("mcp-server-row").filter({ hasText: "simple" });
-  await expect(row).toContainText("Connected", { timeout: 30_000 });
-  await expect(row).toContainText("2 tools");
+  await openMcpSettings(page);
 
-  const listed = await page.request.get("/api/v1/company/mcp/servers");
-  expect(listed.ok()).toBeTruthy();
-  const listedBody = await listed.json();
-  const serverId = listedBody.servers.find(
-    (server: { name: string }) => server.name === "simple",
-  )?.server_id as string | undefined;
-  expect(serverId).toBeTruthy();
+  await expect(page.getByRole("heading", { name: "MCP Servers" })).toBeVisible();
 
-  await row.getByRole("button", { name: "Show simple tools" }).click();
-  const marker = `pw-${Date.now()}`;
-  await row
-    .getByTestId("mcp-tool-call-args")
-    .fill(JSON.stringify({ text: marker }));
-  await row.getByTestId("mcp-tool-call-run").click();
-  await expect(row.getByTestId("mcp-tool-call-result")).toContainText(
-    `echo: ${marker}`,
-  );
+  // The manifest server the harness company declares. Rendering it at all is
+  // the fix: the old view read the list off a wrapper key the host never sent.
+  const manifest = page.getByTestId("mcp-server-row").filter({ hasText: "deepwiki" });
+  await expect(manifest).toBeVisible();
+  await expect(manifest).toContainText("manifest");
+  await expect(manifest).toContainText("https://mcp.deepwiki.com/mcp");
 
-  await page.goto("/#/conversation");
-  const agentMarker = `agent-mcp-${Date.now()}`;
-  const directive = `__MOCK_TOOL_CALL__ ${JSON.stringify({
-    name: "mcp_registry_tool_call",
-    arguments: {
-      server_id: serverId,
-      tool_name: "echo",
-      arguments: { text: agentMarker },
-    },
-  })}`;
-  await page.getByPlaceholder(/^Message /).fill(directive);
-  await page.getByRole("button", { name: "Send" }).click();
+  // The page must not be one that renders and throws. `.length` of `undefined`
+  // was the exact crash; any uncaught error here is a failure regardless.
+  expect(pageErrors, `the page threw: ${pageErrors.join(" | ")}`).toEqual([]);
+});
 
-  await expect(page.getByText(/__MOCK_LLM__/).last()).toBeVisible({
-    timeout: 60_000,
-  });
-  await expect(
-    page.getByText(new RegExp(`echo: ${agentMarker}`)).last(),
-  ).toBeVisible();
-  await expect(page.getByText(/^Couldn't send/)).toHaveCount(0);
+test("an admin adds and removes a runtime MCP server", async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await openMcpSettings(page);
+
+  // Unique per run: the host persists runtime servers in its secret store, and
+  // a re-run against the same data directory would otherwise collide on name.
+  const name = `pw-mcp-${Date.now()}`;
+  const endpoint = `https://mcp.example.test/${name}`;
+
+  // The Remove click below is what this test is *about*, but it is also the
+  // only thing that takes the server back out of the host's secret store — and
+  // it is the last step, so any assertion before it that fails leaves the
+  // server registered for good. Unique names mean a re-run still passes, which
+  // is exactly why the leak would go unnoticed: the store just grows. The
+  // `finally` deletes through the API regardless of how the body ended, and is
+  // a harmless 404 on the happy path where the UI already removed it.
+  try {
+    await page.getByTestId("mcp-add-name").fill(name);
+    await page.getByTestId("mcp-add-endpoint").fill(endpoint);
+    await page.getByTestId("mcp-add-submit").click();
+
+    const row = page.getByTestId("mcp-server-row").filter({ hasText: name });
+    await expect(row).toBeVisible({ timeout: 15_000 });
+    await expect(row).toContainText("runtime");
+    await expect(row).toContainText(endpoint);
+
+    // The host is the authority on what was stored, so confirm the row is not
+    // just optimistic console state.
+    const listed = await page.request.get("/api/v1/company/mcp/servers");
+    expect(listed.ok()).toBeTruthy();
+    const body: unknown = await listed.json();
+    expect(Array.isArray(body), "GET .../mcp/servers answers a bare array").toBeTruthy();
+    expect((body as { name: string }[]).map((server) => server.name)).toContain(name);
+
+    await row.getByRole("button", { name: `Remove ${name}` }).click();
+    await expect(row).toHaveCount(0, { timeout: 15_000 });
+
+    expect(pageErrors, `the page threw: ${pageErrors.join(" | ")}`).toEqual([]);
+  } finally {
+    // Best-effort: a teardown that throws would replace the real failure with
+    // its own, and the thing it is cleaning up is test residue either way.
+    await page.request
+      .delete(`/api/v1/company/mcp/servers/${encodeURIComponent(name)}`)
+      .catch(() => undefined);
+  }
 });

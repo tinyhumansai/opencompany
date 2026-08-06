@@ -10,7 +10,8 @@ ports**, not TinyCortex internals. When the adapter is written (feature
 ## Role
 
 Implement the two memory ports
-([runtime/ports.md](../runtime/ports.md)) for companies that outgrow the fs
+([runtime/ports-state.md](../runtime/ports-state.md)) for companies that
+outgrow the fs
 bundle:
 
 - **`MemoryStore`** — compressed cycle traces and task results. Requirements

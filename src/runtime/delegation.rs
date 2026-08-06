@@ -162,6 +162,38 @@ pub(crate) struct DeskReply {
     pub(crate) steps: Vec<TurnStep>,
 }
 
+/// Whether a drain may run the hand-offs it finds, or must drop them.
+///
+/// The CEO-relay turn is the one caller that must drop: a second hand-off from
+/// there is the re-delegation loop the drain exists to stop. Board writes are
+/// still executed — a card the relay turn opened is not a re-delegation (issue
+/// #442).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandOffs {
+    /// Run them, and report what came back.
+    Run,
+    /// Drop them, with a log line; execute everything else.
+    Drop,
+}
+
+/// What one drain of the delegation queue produced (issue #453).
+///
+/// Extracted so every path that runs a turn can reuse the *exact* execution
+/// semantics rather than re-deriving them. Before this, only the two callers
+/// that happened to contain the loop had them, and the approval re-dispatch —
+/// which runs a full toolbelt turn — silently had none at all.
+#[derive(Default)]
+pub(crate) struct Drained {
+    /// Standalone chat bubbles to surface as-is.
+    pub(crate) bubbles: Vec<OutboundMessage>,
+    /// Synchronous desk answers, in the order they came back. Empty when
+    /// [`HandOffs::Drop`] was asked for.
+    pub(crate) desk_replies: Vec<DeskReply>,
+    /// The **first** board card this drain opened, matching
+    /// [`OperatorTurn::spawned_task`]'s first-wins rule.
+    pub(crate) spawned_task: Option<String>,
+}
+
 /// The operator-facing result of one operator message after delegation: the
 /// bubble's reply and folded step timeline, plus any standalone delegation
 /// bubbles to append as sibling channel responses. None of the current
@@ -304,10 +336,12 @@ impl<'a> DelegationRunner<'a> {
         self
     }
 
-    /// Handles one operator message end-to-end: clear stale delegations, run the
-    /// responder's turn, drain whatever it queued (capped, discarded past the
-    /// cap), and — when a synchronous desk delegation answered — run exactly one
-    /// CEO-relay hand-back turn whose reply replaces the operator-facing text.
+    /// Handles one operator message end-to-end: claim the delegation queue for
+    /// this turn (issue #453 — the acquire also clears, so nothing stale leaks
+    /// in), run the responder's turn, drain whatever it queued (capped,
+    /// discarded past the cap), and — when a synchronous desk delegation
+    /// answered — run exactly one CEO-relay hand-back turn whose reply replaces
+    /// the operator-facing text.
     ///
     /// The relay turn must not re-delegate: its prompt is relay-only, and as a
     /// safety net the delegation queue is cleared before it and drained-and-
@@ -320,10 +354,20 @@ impl<'a> DelegationRunner<'a> {
         message: &str,
         chat_id: Option<&str>,
     ) -> Result<OperatorTurn> {
-        // Clear stale delegations so nothing leaks from a prior turn, run the
-        // responder's turn (metered behind the `RunTurn` impl), then drain
-        // whatever it queued.
-        self.queue.clear();
+        // Claim the delegation queue for this turn and its drain (issue #453).
+        //
+        // The acquire-clear subsumes the bare `clear()` this used to open with —
+        // same guarantee, that nothing a prior turn staged leaks into this one —
+        // and adds the half that was missing: for the span of this claim, and
+        // only for it, the delegation tools are allowed to queue at all. On every
+        // exit path, including the `?`s below, `Drop` un-commits and empties, so
+        // a turn that dies mid-drain cannot leave work staged for whoever runs
+        // next.
+        //
+        // Additive beside the `approvals` handle #474 wired: they do not
+        // interact — one reads a count either side of a turn, this one owns the
+        // queue's write window.
+        let _claim = self.queue.claim();
         // Issue #463: did the REST chat handler already card this message?
         //
         // Evaluated ONCE, here, and for one reason: this is the only place the
@@ -403,22 +447,18 @@ impl<'a> DelegationRunner<'a> {
         // why the operator bubble linked to nothing on a recognised imperative
         // even though the board carried a card for it.
         let mut spawned_task: Option<String> = handler_card.or(direct_card_id);
-        for delegation in self.queue.drain(self.max_delegations) {
-            let out = self
-                .run_delegation(delegation, chat_id, carded_by_handler)
-                .await?;
-            if let Some(id) = out.spawned_task {
-                spawned_task.get_or_insert(id);
-            }
-            if let Some(bubble) = out.bubble {
-                bubbles.push(bubble);
-            }
-            if let Some(desk) = out.desk_reply {
-                // Fold the teammate's activity onto the operator timeline, then
-                // remember the answer to relay.
-                operator_steps.extend(desk.steps);
-                desk_replies.push((desk.member, desk.reply));
-            }
+        let drained = self
+            .drain_and_execute(chat_id, carded_by_handler, HandOffs::Run)
+            .await?;
+        if let Some(id) = drained.spawned_task {
+            spawned_task.get_or_insert(id);
+        }
+        bubbles.extend(drained.bubbles);
+        for desk in drained.desk_replies {
+            // Fold the teammate's activity onto the operator timeline, then
+            // remember the answer to relay.
+            operator_steps.extend(desk.steps);
+            desk_replies.push((desk.member, desk.reply));
         }
         // CEO-relay hand-back: when a synchronous desk delegation answered, run
         // exactly ONE more responder turn whose prompt is the original message
@@ -442,26 +482,13 @@ impl<'a> DelegationRunner<'a> {
             // the turn that wanted it happened to be a relay, which is invisible
             // from the operator's side. Board writes are executed; hand-offs are
             // still dropped, so the bound stays exactly one extra turn.
-            for delegation in self.queue.drain(self.max_delegations) {
-                if let Delegation::DelegateToDesk { desk, .. } = &delegation {
-                    tracing::debug!(
-                        company = %self.company,
-                        desk = %desk,
-                        "[delegation] dropped a hand-off queued by the relay turn: a relay may only \
-                         relay"
-                    );
-                    continue;
-                }
-                let out = self
-                    .run_delegation(delegation, chat_id, carded_by_handler)
-                    .await?;
-                if let Some(id) = out.spawned_task {
-                    spawned_task.get_or_insert(id);
-                }
-                if let Some(bubble) = out.bubble {
-                    bubbles.push(bubble);
-                }
+            let drained = self
+                .drain_and_execute(chat_id, carded_by_handler, HandOffs::Drop)
+                .await?;
+            if let Some(id) = drained.spawned_task {
+                spawned_task.get_or_insert(id);
             }
+            bubbles.extend(drained.bubbles);
             // A hand-off the relay turn's tool refused is dropped with the
             // hand-offs themselves — there is no card in scope to record it on,
             // and the drain would otherwise leak it into the next turn.
@@ -489,6 +516,65 @@ impl<'a> DelegationRunner<'a> {
             bubbles,
             spawned_task,
         })
+    }
+
+    /// Drains the queue (capped, discarded past the cap) and executes every
+    /// delegation on it, reporting what came back (issue #453).
+    ///
+    /// # Why this is a function
+    ///
+    /// It used to be a loop written out twice inside
+    /// [`handle_operator_message`](Self::handle_operator_message), which meant a
+    /// path that ran a turn without copying that loop drained nothing — and two
+    /// production paths did exactly that. The approval re-dispatch runs a full
+    /// toolbelt turn and claimed only publishes, so a `review_task` made from a
+    /// re-issued call was staged, never executed, and destroyed by the next
+    /// turn's clear. Extracting the loop is what lets that path reuse the *exact*
+    /// execution semantics — the cap, the first-wins card id, the refusal
+    /// handling — instead of a near-copy that drifts.
+    ///
+    /// **This is not the guarantee.** The guarantee is
+    /// [`DelegationQueue::claim`]: a caller that forgets to drain gets an
+    /// in-turn refusal at the tool rather than a receipt for work that will not
+    /// happen. This is the convenience that makes doing it right the short path.
+    ///
+    /// Refused desk keys are deliberately NOT drained here — they are recorded
+    /// on the card by [`handle_task_delegations`](Self::handle_task_delegations)
+    /// and logged by the relay path, and those are two different treatments of
+    /// one fact rather than something a shared drain can decide.
+    pub(crate) async fn drain_and_execute(
+        &self,
+        chat_id: Option<&str>,
+        carded_by_handler: bool,
+        hand_offs: HandOffs,
+    ) -> Result<Drained> {
+        let mut drained = Drained::default();
+        for delegation in self.queue.drain(self.max_delegations) {
+            if hand_offs == HandOffs::Drop
+                && let Delegation::DelegateToDesk { desk, .. } = &delegation
+            {
+                tracing::debug!(
+                    company = %self.company,
+                    desk = %desk,
+                    "[delegation] dropped a hand-off queued by the relay turn: a relay may only \
+                     relay"
+                );
+                continue;
+            }
+            let out = self
+                .run_delegation(delegation, chat_id, carded_by_handler)
+                .await?;
+            if let Some(id) = out.spawned_task {
+                drained.spawned_task.get_or_insert(id);
+            }
+            if let Some(bubble) = out.bubble {
+                drained.bubbles.push(bubble);
+            }
+            if let Some(desk) = out.desk_reply {
+                drained.desk_replies.push(desk);
+            }
+        }
+        Ok(drained)
     }
 
     /// Drains and executes whatever a **dispatched card's** turn queued (issue
@@ -1116,6 +1202,20 @@ impl<'a> DelegationRunner<'a> {
                 note,
             } => {
                 let Some((tasks, mut card)) = self.load_card(&task_id).await? else {
+                    // Issue #453: the residual case. The tool told the model the
+                    // assignment takes effect as the turn completes, the drain
+                    // ran, and there was no card to write to — so the receipt
+                    // promised something no store hiccup or missing wiring
+                    // explains. Silent no-op is right for the *card* (there is
+                    // nothing to do), and wrong for the operator, who is the
+                    // only one who can tell a mistyped id from a deleted card.
+                    tracing::warn!(
+                        company = %self.company,
+                        task_id = %task_id,
+                        "[delegation] assign_task named a card that is not on the board (or no \
+                         task store is wired); nothing was assigned, and the turn was told it \
+                         would be"
+                    );
                     return Ok(DelegationOutcome::default());
                 };
                 // Issue #205: the orchestrator writes this `assignee` out of an
@@ -1175,6 +1275,20 @@ impl<'a> DelegationRunner<'a> {
                 note,
             } => {
                 let Some((tasks, mut card)) = self.load_card(&task_id).await? else {
+                    // Issue #453, the same residual case one arm up and the more
+                    // consequential of the two: the model has just been told the
+                    // card "moves to done as this turn completes", and this is
+                    // the drain completing with nothing to move. The claim
+                    // guarantees the drain ran; it cannot guarantee the id names
+                    // a real card.
+                    tracing::warn!(
+                        company = %self.company,
+                        task_id = %task_id,
+                        ?decision,
+                        "[delegation] review_task named a card that is not on the board (or no \
+                         task store is wired); the verdict was recorded nowhere, and the turn was \
+                         told the card had moved"
+                    );
                     return Ok(DelegationOutcome::default());
                 };
                 card.note = Some(append_note(
@@ -1475,7 +1589,9 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::ports::TaskStore;
-    use crate::ports::tasks::{COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_TODO};
+    use crate::ports::tasks::{
+        COLUMN_DONE, COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_TODO,
+    };
     use crate::ports::types::LedgerEntry;
     use crate::store::FsOps;
 
@@ -1673,6 +1789,12 @@ investor update for the quarter\n]"
         /// The board as it looked at the START of each turn, so a test can prove
         /// a card existed *while* an agent worked rather than only afterwards.
         board_at_turn: Mutex<Vec<Vec<(String, String)>>>,
+        /// Whether the delegation queue was **claimed** while each turn ran
+        /// (issue #453). This is what a real tool reads to decide between
+        /// staging and refusing, so recording it here is how a test proves the
+        /// turn was entitled to delegate at all — rather than only that the
+        /// drain happened to run afterwards.
+        committed_at_turn: Mutex<Vec<bool>>,
         tasks: Arc<dyn TaskStore>,
         company: CompanyId,
     }
@@ -1685,6 +1807,7 @@ investor update for the quarter\n]"
                 script: Mutex::new(turns.into()),
                 calls: Mutex::new(Vec::new()),
                 board_at_turn: Mutex::new(Vec::new()),
+                committed_at_turn: Mutex::new(Vec::new()),
                 tasks: fx.tasks.clone(),
                 company: fx.record.id.clone(),
             }
@@ -1699,6 +1822,12 @@ investor update for the quarter\n]"
         /// started.
         fn board_at_turn(&self, n: usize) -> Vec<(String, String)> {
             self.board_at_turn.lock().expect("board")[n].clone()
+        }
+
+        /// Whether the delegation queue was claimed while turn `n` ran (issue
+        /// #453).
+        fn committed_at_turn(&self, n: usize) -> bool {
+            self.committed_at_turn.lock().expect("committed")[n]
         }
 
         async fn next(
@@ -1720,6 +1849,10 @@ investor update for the quarter\n]"
                 .map(|c| (c.assignee, c.column))
                 .collect();
             self.board_at_turn.lock().expect("board").push(board);
+            self.committed_at_turn
+                .lock()
+                .expect("committed")
+                .push(self.queue.drain_committed());
             let turn = self
                 .script
                 .lock()
@@ -1875,6 +2008,81 @@ members = ["engineer"]
         async fn cards(&self) -> Vec<TaskRecord> {
             self.tasks.list(&self.record.id).await.expect("list cards")
         }
+    }
+
+    // ── Issue #453: the receipt and the board agree ─────────────────────────
+
+    /// The plain claim `review_task`'s receipt makes: an operator turn that
+    /// approves a card actually moves it.
+    ///
+    /// Both halves matter and they are different facts. `committed_at_turn`
+    /// proves the turn ran **under a claim**, which is what entitled the tool to
+    /// stage rather than refuse; the card's column proves the drain that claim
+    /// promised really executed. A test with only the second half would pass on
+    /// a path that drains but never claims — which is not the invariant, because
+    /// the next such path written would inherit nothing.
+    #[tokio::test]
+    async fn an_operator_turn_approval_actually_lands_the_card() {
+        let fx = Fixture::new();
+        let card = TaskRecord {
+            id: "card-1".to_string(),
+            title: "Draft the launch plan".to_string(),
+            note: Some("[engineer] drafted".to_string()),
+            column: COLUMN_IN_REVIEW.to_string(),
+            priority: "medium".to_string(),
+            assignee: "engineer".to_string(),
+            updated_at_millis: now_millis(),
+            origin_chat_id: None,
+            parent_task_id: None,
+            output: None,
+            plan: None,
+        };
+        fx.tasks
+            .upsert(&fx.record.id, &card)
+            .await
+            .expect("seed the card under review");
+
+        let turns = ScriptedTurns::new(
+            &fx,
+            vec![Turn::queueing(
+                "approved — it's done",
+                vec![Delegation::ReviewTask {
+                    task_id: "card-1".to_string(),
+                    decision: lifecycle::ReviewDecision::Approve,
+                    note: Some("looks good".to_string()),
+                }],
+            )],
+        );
+
+        fx.runner(&turns)
+            .handle_operator_message("chief", "approve the launch plan card", Some("general"))
+            .await
+            .expect("operator message handled");
+
+        assert!(
+            turns.committed_at_turn(0),
+            "the turn must run under a claim, or the tool would have refused instead of staging"
+        );
+        let cards = fx.cards().await;
+        assert_eq!(cards.len(), 1, "{cards:?}");
+        assert_eq!(
+            cards[0].column, COLUMN_DONE,
+            "the card the operator was told had moved must actually have moved"
+        );
+        assert!(
+            cards[0]
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("looks good"),
+            "the verdict is on the card: {:?}",
+            cards[0].note
+        );
+        assert_eq!(fx.queue.queued(), 0, "the drain emptied the queue");
+        assert!(
+            !fx.queue.drain_committed(),
+            "and the claim released with the turn, so the next caller inherits a refusal"
+        );
     }
 
     fn handoff(instruction: &str) -> Delegation {

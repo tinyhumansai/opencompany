@@ -85,18 +85,26 @@ enum Turn {
 /// A scripted OpenAI-compatible `/chat/completions` endpoint.
 struct Script {
     turns: Mutex<Vec<Turn>>,
+    /// Every request body the model was sent, in order (issue #453). The tool
+    /// results of a turn come back to the model inside the *next* request, so
+    /// this is where a test reads what a refused tool actually told it.
+    seen: Mutex<Vec<Value>>,
 }
 
-/// Serve the script on loopback and return its base URL.
-async fn spawn_script(turns: Vec<Turn>) -> String {
+/// Serve the script on loopback and return its base URL, handing back the
+/// shared script so a test can read what the model was sent.
+async fn spawn_script_recording(turns: Vec<Turn>) -> (String, Arc<Script>) {
     let script = Arc::new(Script {
         turns: Mutex::new(turns),
+        seen: Mutex::new(Vec::new()),
     });
+    let handle = Arc::clone(&script);
     let app = axum::Router::new().route(
         "/chat/completions",
-        post(move |Json(_body): Json<Value>| {
+        post(move |Json(body): Json<Value>| {
             let script = Arc::clone(&script);
             async move {
+                script.seen.lock().unwrap().push(body);
                 let next = {
                     let mut turns = script.turns.lock().unwrap();
                     if turns.is_empty() {
@@ -131,7 +139,12 @@ async fn spawn_script(turns: Vec<Turn>) -> String {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), handle)
+}
+
+/// Serve the script on loopback and return its base URL.
+async fn spawn_script(turns: Vec<Turn>) -> String {
+    spawn_script_recording(turns).await.0
 }
 
 /// A one-agent company that gates `shell`.
@@ -331,6 +344,85 @@ async fn the_parked_request_survives_a_later_chat_cycle() {
         deps.approval_requests.queued(),
         0,
         "and nothing is left on the queue for a later cycle to park a second time"
+    );
+}
+
+// ── Issue #453: a workflow node's board action is refused, not destroyed ────
+
+/// The second reachability hole of exactly the #395 shape, one queue over.
+///
+/// A workflow `agent` node runs a full toolbelt turn, and an orchestrator-tier
+/// `agent_ref` carries `review_task`. Nothing on this path drains the delegation
+/// queue — there is no card behind a run and no conversation to answer into — so
+/// before this the tool staged the verdict, answered *"Approved card X; it is
+/// complete and has moved to done"*, and the next chat cycle's `clear()` threw
+/// it away. Green tests, moved card in the transcript, unmoved card on the
+/// board.
+///
+/// This drives the **real** path — real graph, real `run_workflow`, real
+/// `HarnessAgentRunner`, real pool, real orchestrator tools — and asserts the
+/// two things a unit test over the tool cannot: that the refusal is what a
+/// workflow node actually receives, and that the queue is empty afterwards.
+///
+/// The refusal is read out of the *next* request the model was sent, because
+/// that is where a tool result lands. Asserting on the tool's return value in
+/// isolation would prove the string, not the reachability.
+#[tokio::test]
+async fn a_workflow_node_is_refused_in_turn_instead_of_having_its_verdict_destroyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_url, script) = spawn_script_recording(vec![
+        Turn::Call {
+            tool: "review_task",
+            args: json!({ "task_id": "card-1", "decision": "approve" }),
+        },
+        Turn::Say("I could not approve that card."),
+    ])
+    .await;
+    let (deps, _journal) = deps(base_url, dir.path());
+    let record = record();
+    let pool = Arc::new(HarnessPool::new());
+    pool.ensure(&record, &deps).await.expect("roster builds");
+
+    let file = parse_workflow(AGENT_GRAPH).expect("graph parses");
+    super::runner::run_workflow(
+        pool,
+        deps.clone(),
+        &record,
+        &file,
+        json!({ "request": "approve the launch card" }),
+        &WorkflowRunContext::new(false),
+    )
+    .await
+    .expect(
+        "the run completes — a refused board action refuses the call, it does not fail the node",
+    );
+
+    // The model was told, in its own turn, that the card did NOT move.
+    let seen = script.seen.lock().unwrap().clone();
+    let transcript = serde_json::to_string(&seen).expect("serialize the requests");
+    assert!(
+        transcript.contains("card card-1 was NOT reviewed"),
+        "the node's turn must carry the refusal: {transcript}"
+    );
+    assert!(
+        transcript.contains("Do not retry"),
+        "a workflow node drains no better next turn: {transcript}"
+    );
+    assert!(
+        !transcript.contains("has moved to done"),
+        "the receipt that made this a lie must be gone: {transcript}"
+    );
+
+    // …and nothing was staged for a later chat cycle to clear — the silent
+    // destruction this replaces.
+    assert_eq!(
+        deps.delegations.queued(),
+        0,
+        "a workflow node must leave nothing on the shared delegation queue"
+    );
+    assert!(
+        !deps.delegations.drain_committed(),
+        "this path deliberately claims nothing; see `HarnessAgentRunner`'s doc"
     );
 }
 

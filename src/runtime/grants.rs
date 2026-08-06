@@ -76,6 +76,14 @@
 //! re-classifies the live call before honouring a grant — see
 //! [`ApprovalPolicy::standing_grant_allows`](crate::harness::policy::ApprovalPolicy).
 //!
+//! That check keeps a send out of a read's grant, but it cannot tell one
+//! provider's read from another's: they are both reads, under the same tool
+//! name, for the same teammate. So the grant also records **which toolkit the
+//! card was about** ([`StandingGrant::scope`], issue #457). The operator
+//! consented to "read from GitHub"; without the scope the grant they got was
+//! "make any Composio read, anywhere" — broader than the sentence they agreed
+//! to, across every account the company had ever connected.
+//!
 //! ## Durability
 //!
 //! Both sets are in-memory, but their lifecycles are journaled
@@ -245,9 +253,58 @@ pub struct StandingGrant {
     /// [`agent`](Self::agent), which is right for a DM.
     #[serde(default)]
     pub origin_thread: Option<String>,
+    /// The slice of [`tool`](Self::tool) this grant is confined to, when the
+    /// tool's name is not the whole of what it can do (issue #457).
+    ///
+    /// `None` for every tool whose name already describes its consequence, and
+    /// for those it is not a missing value but the correct one: nothing about
+    /// `file_write` needs narrowing, and matching on `(agent, tool, unexpired)`
+    /// says exactly what the operator agreed to.
+    ///
+    /// `Some(toolkit)` for `composio_execute`, the one tool that carries every
+    /// action of every connected provider under a single name. The card the
+    /// operator read said "read from GitHub"; without this field the grant it
+    /// minted said "make any Composio read, anywhere", because every Composio
+    /// read matched the same `(agent, "composio_execute")` pair. Minted from the
+    /// parked effect's own payload, so what is recorded is what was shown.
+    ///
+    /// Scoped by **toolkit and not by action slug**, deliberately: the operator
+    /// consented to a provider, so a *different* GitHub read has to keep
+    /// passing. Slug-exact would re-park every new action and make the grant
+    /// worth nothing.
+    ///
+    /// `None` also on a grant replayed from a journal line written before this
+    /// field existed, where it means "unscoped" and reproduces the old
+    /// behaviour exactly — see [`admits_scope`](Self::admits_scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl StandingGrant {
+    /// Whether this grant admits a call whose live scope is `scope` (issue
+    /// #457).
+    ///
+    /// Three cases, and the two edges are the ones that matter:
+    ///
+    /// * **This grant has no scope** — it admits anything its `(agent, tool)`
+    ///   match already admitted. That is what makes a journal line written
+    ///   before the field existed replay into today's behaviour rather than
+    ///   into a grant that silently stopped working.
+    /// * **Scopes are equal** — the ordinary hit. A second GitHub read against a
+    ///   GitHub-scoped grant.
+    /// * **This grant is scoped and the live call has no scope** — refused. An
+    ///   action the catalogue cannot place might belong to any provider, so
+    ///   admitting it on a GitHub grant would be a guess in the permissive
+    ///   direction. It falls through and parks instead, which is the same answer
+    ///   this codebase gives an unrecognised action everywhere else: unknown is
+    ///   a send.
+    pub fn admits_scope(&self, scope: Option<&str>) -> bool {
+        match self.scope.as_deref() {
+            None => true,
+            Some(mine) => scope == Some(mine),
+        }
+    }
+
     /// Whether this grant still admits calls at `now_millis`.
     ///
     /// Strictly `<`, so the deadline instant itself is already past. Checked at
@@ -386,8 +443,17 @@ impl GrantSet {
             .insert(grant.id.clone(), grant);
     }
 
-    /// Matches an unexpired standing grant for `(agent, tool)` **without**
-    /// removing it — that is the whole difference from [`consume`](Self::consume).
+    /// Matches an unexpired standing grant for `(agent, tool, scope)`
+    /// **without** removing it — that is the whole difference from
+    /// [`consume`](Self::consume).
+    ///
+    /// `scope` is the *live* call's scope, computed from its arguments by
+    /// [`standing_scope_of`](crate::policy::consequence::standing_scope_of) and
+    /// compared against what the grant recorded at mint time (issue #457). It is
+    /// `None` for every tool whose name is the whole of what it can do, and for
+    /// a Composio action the catalogue cannot place — the second of which a
+    /// scoped grant refuses, per
+    /// [`StandingGrant::admits_scope`](StandingGrant::admits_scope).
     ///
     /// Expiry is enforced *here*, under the same lock as the match, rather than
     /// being left to the sweep. The sweep runs on the scheduler's maintenance
@@ -404,13 +470,19 @@ impl GrantSet {
         &self,
         agent: &str,
         tool: &str,
+        scope: Option<&str>,
         now_millis: u64,
     ) -> Option<StandingGrant> {
         let state = self.inner.lock().expect("grant set poisoned");
         state
             .standing
             .values()
-            .filter(|g| g.agent == agent && g.tool == tool && g.is_live_at(now_millis))
+            .filter(|g| {
+                g.agent == agent
+                    && g.tool == tool
+                    && g.admits_scope(scope)
+                    && g.is_live_at(now_millis)
+            })
             .max_by_key(|g| g.expires_at_millis)
             .cloned()
     }
@@ -654,6 +726,21 @@ mod test {
             at_millis: 1_000,
             expires_at_millis,
             origin_thread: None,
+            scope: None,
+        }
+    }
+
+    /// A grant confined to one Composio toolkit (issue #457).
+    fn scoped(
+        id: &str,
+        agent: &str,
+        tool: &str,
+        scope: &str,
+        expires_at_millis: u64,
+    ) -> StandingGrant {
+        StandingGrant {
+            scope: Some(scope.to_string()),
+            ..standing(id, agent, tool, expires_at_millis)
         }
     }
 
@@ -664,10 +751,10 @@ mod test {
         let set = GrantSet::default();
         set.grant_standing(standing("g1", "ops", "shell", 10_000));
 
-        assert!(set.match_standing("ops", "shell", 2_000).is_some());
+        assert!(set.match_standing("ops", "shell", None, 2_000).is_some());
         // Matching does not depend on arguments at all — there are none to
         // depend on. Two different calls, same admission.
-        assert!(set.match_standing("ops", "shell", 9_999).is_some());
+        assert!(set.match_standing("ops", "shell", None, 9_999).is_some());
         assert_eq!(
             set.standing_count(),
             1,
@@ -675,8 +762,8 @@ mod test {
         );
 
         // The deadline instant itself is already past.
-        assert!(set.match_standing("ops", "shell", 10_000).is_none());
-        assert!(set.match_standing("ops", "shell", 10_001).is_none());
+        assert!(set.match_standing("ops", "shell", None, 10_000).is_none());
+        assert!(set.match_standing("ops", "shell", None, 10_001).is_none());
     }
 
     #[test]
@@ -685,25 +772,124 @@ mod test {
         set.grant_standing(standing("g1", "ops", "shell", 10_000));
 
         assert!(
-            set.match_standing("marketing", "shell", 2_000).is_none(),
+            set.match_standing("marketing", "shell", None, 2_000)
+                .is_none(),
             "another teammate is not who the operator granted"
         );
         assert!(
-            set.match_standing("ops", "workspace_write", 2_000)
+            set.match_standing("ops", "workspace_write", None, 2_000)
                 .is_none(),
             "another tool is not what the operator granted"
         );
+    }
+
+    /// Issue #457, the discrimination that matters. A grant minted from a
+    /// GitHub read admits another GitHub read — the operator consented to a
+    /// provider, not to one action — and refuses a Gmail read. Both are
+    /// catalogue reads, so nothing upstream of this predicate tells them apart:
+    /// same agent, same tool, same grantable verdict.
+    #[test]
+    fn a_scoped_grant_admits_its_own_provider_and_refuses_another() {
+        let set = GrantSet::default();
+        set.grant_standing(scoped("g1", "ops", "composio_execute", "github", 10_000));
+
+        assert!(
+            set.match_standing("ops", "composio_execute", Some("github"), 2_000)
+                .is_some(),
+            "a second GitHub read is the sentence the operator agreed to"
+        );
+        assert!(
+            set.match_standing("ops", "composio_execute", Some("gmail"), 2_000)
+                .is_none(),
+            "'read from GitHub' is not consent to read a mailbox"
+        );
+    }
+
+    /// A call the catalogue cannot place has no scope, and a scoped grant must
+    /// not admit it: it could belong to any provider, and guessing would guess
+    /// permissively. It falls through and parks, which is what this codebase
+    /// does with every unrecognised action.
+    #[test]
+    fn a_scoped_grant_refuses_a_call_with_no_scope_at_all() {
+        let set = GrantSet::default();
+        set.grant_standing(scoped("g1", "ops", "composio_execute", "github", 10_000));
+
+        assert!(
+            set.match_standing("ops", "composio_execute", None, 2_000)
+                .is_none()
+        );
+    }
+
+    /// **Replay compatibility (issue #457).** A `StandingGrantMinted` line
+    /// written before the scope field existed deserializes with `scope: None`,
+    /// and an unscoped grant behaves exactly as it did before this change —
+    /// admitting the tool whatever the live scope is. Without this the upgrade
+    /// would silently void every permission an operator granted before it.
+    #[test]
+    fn a_grant_journaled_before_scopes_existed_replays_and_behaves_as_before() {
+        // The old wire shape, verbatim: no `scope` key anywhere.
+        let line = serde_json::json!({
+            "id": "g-old",
+            "agent": "ops",
+            "tool": "composio_execute",
+            "granted_by": { "kind": "user", "id": "user-1" },
+            "approval_id": "approval-g-old",
+            "at_millis": 1_000,
+            "expires_at_millis": 10_000,
+        });
+        let replayed: StandingGrant =
+            serde_json::from_value(line).expect("an old line still deserializes");
+        assert_eq!(replayed.scope, None, "absent means unscoped, not broken");
+
+        let set = GrantSet::default();
+        set.rehydrate_standing([replayed]);
+
+        // Unscoped: it admits the tool exactly as it did before scopes existed,
+        // whatever the live call resolves to.
+        for live in [Some("github"), Some("gmail"), None] {
+            assert!(
+                set.match_standing("ops", "composio_execute", live, 2_000)
+                    .is_some(),
+                "an unscoped grant must keep admitting: {live:?}"
+            );
+        }
+        // …and the boundaries it always had still hold.
+        assert!(
+            set.match_standing("marketing", "composio_execute", Some("github"), 2_000)
+                .is_none()
+        );
+        assert!(
+            set.match_standing("ops", "composio_execute", Some("github"), 10_000)
+                .is_none()
+        );
+    }
+
+    /// A scoped grant round-trips, and an unscoped one still writes the old
+    /// shape — so a journal read by an older build is unchanged.
+    #[test]
+    fn the_scope_round_trips_and_is_omitted_when_absent() {
+        let unscoped = serde_json::to_value(standing("g1", "ops", "shell", 10_000)).expect("json");
+        assert!(
+            unscoped.get("scope").is_none(),
+            "an unscoped grant writes the pre-#457 line: {unscoped}"
+        );
+
+        let grant = scoped("g2", "ops", "composio_execute", "github", 10_000);
+        let round: StandingGrant =
+            serde_json::from_value(serde_json::to_value(&grant).expect("json"))
+                .expect("round trip");
+        assert_eq!(round, grant);
     }
 
     #[test]
     fn revoking_a_standing_grant_stops_it_matching() {
         let set = GrantSet::default();
         set.grant_standing(standing("g1", "ops", "shell", 10_000));
-        assert!(set.match_standing("ops", "shell", 2_000).is_some());
+        assert!(set.match_standing("ops", "shell", None, 2_000).is_some());
 
         let revoked = set.revoke_standing(&GrantId::new("g1")).expect("was live");
         assert_eq!(revoked.tool, "shell");
-        assert!(set.match_standing("ops", "shell", 2_000).is_none());
+        assert!(set.match_standing("ops", "shell", None, 2_000).is_none());
         assert_eq!(set.standing_count(), 0);
         assert!(
             set.revoke_standing(&GrantId::new("g1")).is_none(),
@@ -743,7 +929,7 @@ mod test {
         assert_eq!(expired[0].id, GrantId::new("old"));
         assert_eq!(set.standing_count(), 1);
         assert!(
-            set.match_standing("ops", "workspace_write", 10_000)
+            set.match_standing("ops", "workspace_write", None, 10_000)
                 .is_some()
         );
     }
@@ -754,7 +940,9 @@ mod test {
         set.grant_standing(standing("short", "ops", "shell", 5_000));
         set.grant_standing(standing("long", "ops", "shell", 50_000));
 
-        let matched = set.match_standing("ops", "shell", 1_000).expect("matches");
+        let matched = set
+            .match_standing("ops", "shell", None, 1_000)
+            .expect("matches");
         assert_eq!(matched.id, GrantId::new("long"));
     }
 

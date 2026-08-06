@@ -87,6 +87,7 @@ use crate::harness::tool_dispatcher::AttrTolerantXmlDispatcher;
 use crate::harness::toolbelt;
 use crate::ports::skills_state::SkillState;
 use crate::ports::types::CompanyId;
+use crate::runtime::tools::extends_on_boundary;
 
 /// Map a manifest cognition-tier hint to a hosted model/tier name.
 ///
@@ -613,16 +614,29 @@ fn memory_tools(memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
     ]
 }
 
+/// The namespace separator for a `[tools].allow` grant: only `.`, because a
+/// namespace grant is written dotted (`docs.read`). Deliberately narrower than
+/// [`crate::runtime::tools`]'s tool-name set — `files_scratch` is not a grant
+/// under the `files` namespace, and never was.
+const NAMESPACE_SEPARATORS: &[char] = &['.'];
+
 /// Whether an agent's effective `grants` cover a tool `namespace`.
 ///
 /// Matches the bare namespace (`docs`), any glob under it (`docs.*`,
 /// `docs.read`), or the catch-all `*`. Shared with the workflow toolbelt
 /// ([`crate::workflows::caps`]) so a workflow `tool_call` is gated by the same
 /// namespace-grant rule an agent's exec tools are.
+///
+/// A thin caller of [`extends_on_boundary`] rather than its own prefix test.
+/// This matcher always required the prefix to stop on a separator (so
+/// `documentation.*` is not a grant on `docs`) while the per-tool matcher did
+/// not, and the two drifted apart unnoticed. The rule now exists once in the
+/// crate, next to [`grant_matches`](crate::runtime::tools), and cannot fork
+/// again (issue #461).
 pub(crate) fn grants_cover(grants: &[String], namespace: &str) -> bool {
-    grants.iter().any(|grant| {
-        grant == "*" || grant == namespace || grant.starts_with(&format!("{namespace}."))
-    })
+    grants
+        .iter()
+        .any(|grant| grant == "*" || extends_on_boundary(grant, namespace, NAMESPACE_SEPARATORS))
 }
 
 /// One agent's sandbox directory: `{root}/{company}/{agent}/workspace`.

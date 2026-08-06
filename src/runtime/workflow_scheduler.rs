@@ -47,7 +47,8 @@
 //! Issue #228 closes that gap without inventing a subsystem: every finished run
 //! — this scheduler's and the console's Run button alike — is journaled as a
 //! [`CompanyEvent::WorkflowRunFinished`](crate::ports::types::CompanyEvent)
-//! through [`record_run_finished`], projected live onto the operator SSE stream,
+//! through [`record_run_finished`](crate::runtime::record_run_finished), projected
+//! live onto the operator SSE stream,
 //! and read back durably from `GET …/workflows/runs`. The log lines below stay
 //! exactly as they were: they remain the platform team's diagnostic, and the
 //! event is the operator's surface. The two answer to different readers, so
@@ -86,7 +87,6 @@ use crate::ports::{DeliveryReport, DeliveryStatus};
 use crate::runtime::CompanyRegistry;
 use crate::runtime::cron::{CivilTime, CronExpr};
 use crate::runtime::scheduler::{Clock, MINUTE_MS, millis_to_next_minute};
-use crate::runtime::workflow_outcome::record_run_finished;
 
 /// Identifies one schedulable workflow: which company, which graph.
 type WorkflowKey = (CompanyId, String);
@@ -274,6 +274,18 @@ impl WorkflowScheduler {
                 }
             };
 
+            // Issue #440: the shared way to start a supervised run. Built once
+            // per company (it holds cloned handles, so a per-fire clone is
+            // cheap) and cloned into each fire's task below.
+            //
+            // This scheduler used to mint its own run id through the supervisor
+            // and journal its own `WorkflowRunFinished` on both arms — a second
+            // copy of the two rules `WorkflowSpawn` exists to own. The copies
+            // agreed, which is exactly what made the duplication dangerous: a
+            // fix to one would not have reached the other, and nothing would
+            // have failed to say so.
+            let spawn = crate::runtime::WorkflowSpawn::new(&runtime, runner);
+
             for (file, cron, expr) in scheduled {
                 if !expr.matches(&civil) {
                     continue;
@@ -308,22 +320,16 @@ impl WorkflowScheduler {
                     "firedAtMs": now,
                 });
 
-                let runner = runner.clone();
                 let workflow = file;
                 // Cloned BEFORE the spawn: the task outlives this loop
-                // iteration (and this borrow of `runtime`), so the handle has to
-                // be moved in rather than reached for from inside. Issue #228 —
-                // this is what turns a scheduled run's outcome from a host-stdout
-                // line into something the tenant's own console can read back.
-                let events = runtime.events().clone();
-                // Issue #383: cloned for the same reason as `events` — the task
-                // outlives this borrow of `runtime`. A cron fire is exactly the
-                // run an operator most needs to be able to stop: nobody chose
-                // its timing, and a wedged nightly run holds its overlap claim
-                // (above) until it ends, suppressing every later fire of that
-                // schedule. Registering it here is what puts a Cancel button on
-                // it in the console.
-                let supervisor = runtime.run_supervisor().clone();
+                // iteration (and this borrow of `runtime`), so everything it
+                // needs has to be moved in rather than reached for from inside.
+                // The clone carries the company id, the event log (issue #228 —
+                // what turns a scheduled run's outcome from a host-stdout line
+                // into something the tenant's own console reads back), the run
+                // supervisor (issue #383 — what puts a Cancel button on a cron
+                // fire nobody chose the timing of) and the runner.
+                let spawn = spawn.clone();
                 // A FRESH TASK PER FIRE IS CORRECT HERE, and is not a hole in
                 // the `WORKFLOW_DEPTH` re-entry guard
                 // (`crate::workflows::runner`). That guard is a task-local
@@ -347,19 +353,23 @@ impl WorkflowScheduler {
                     // schedule for the life of the process with no log line.
                     let _claim = claim;
                     let (company, workflow_id) = key;
-                    // Issue #371: minted here so this run's progress events and
-                    // its outcome share one id — including on the `Err` arm
-                    // below, where the runner hands back nothing that could
-                    // carry one. `scheduled: true` rides the run's
-                    // `WorkflowRunStarted`, so the console can mark a cron fire
-                    // as such *while it runs*, not only once it settles.
+                    // Issue #440: through the shared primitive, which owns both
+                    // halves this used to copy — the supervisor-minted run id
+                    // (issue #383: it is the address the console's Cancel button
+                    // sends to, and #371: the id the run's progress events and
+                    // its outcome share, including on the error arm where the
+                    // runner hands back nothing that could carry one) and the
+                    // `record_run_finished` on BOTH arms (issue #228), with the
+                    // run guard held across the journal write.
                     //
-                    // Issue #383: minted through the supervisor rather than
-                    // directly, which registers the run's stop signal. Held for
-                    // the whole run, including the outcome journalling below.
-                    let (ctx, _run_guard) = supervisor.begin(&workflow_id, true);
-                    match runner.run(&company, &workflow, input, &ctx).await {
-                        Ok(run) => {
+                    // The handle is **awaited**, not dropped. The claim above is
+                    // this scheduler's own overlap guard and has to outlive the
+                    // run, and the delivery-log sweep below needs the outcome.
+                    // Both remain the scheduler's job; what is shared is only
+                    // how a run is started and recorded.
+                    let (_run_id, handle) = spawn.spawn(workflow, input, true);
+                    match handle.await {
+                        Ok(Ok(run)) => {
                             // A manual run hands `deliveries` back in the HTTP
                             // response and the console renders it. A scheduled
                             // run has no response and nobody watching, so
@@ -439,41 +449,36 @@ impl WorkflowScheduler {
                                 undelivered = counts.undelivered(),
                                 "workflow scheduler: scheduled run finished"
                             );
-                            // Issue #228: the operator-facing half. The log
-                            // lines above stay exactly as they are — they are
-                            // the platform team's diagnostic on host stdout,
-                            // which on a hosted tenant is emphatically not the
-                            // operator. This is the record the tenant's own
-                            // console reads back, after the fact, on reload.
-                            record_run_finished(
-                                &events,
-                                &company,
-                                &workflow_id,
-                                true,
-                                &ctx.run_id,
-                                Ok(&run),
-                            )
-                            .await;
+                            // The operator-facing half — the journaled
+                            // `WorkflowRunFinished` the tenant's own console
+                            // reads back — was written by `spawn` before this
+                            // handle resolved (issue #228). The log lines above
+                            // stay exactly as they are: they are the platform
+                            // team's diagnostic on host stdout, which on a
+                            // hosted tenant is emphatically not the operator.
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             tracing::warn!(
                                 %company,
                                 workflow = %workflow_id,
                                 %err,
                                 "workflow scheduler: scheduled run failed"
                             );
-                            // The worst outcome was until now the quietest: a
-                            // run that died outright produced one host-stdout
-                            // warning and nothing an operator could ever find.
-                            record_run_finished(
-                                &events,
-                                &company,
-                                &workflow_id,
-                                true,
-                                &ctx.run_id,
-                                Err(err.to_string().as_str()),
-                            )
-                            .await;
+                        }
+                        // The run task itself came apart — a panic inside the
+                        // runner, which unwinds in the spawned task rather than
+                        // here. Nothing was journaled for it (the outcome write
+                        // lives in that task), so this line is the only trace
+                        // there is, and it must not be silent. The claim still
+                        // releases: it is held by this task's guard.
+                        Err(err) => {
+                            tracing::error!(
+                                %company,
+                                workflow = %workflow_id,
+                                %err,
+                                "workflow scheduler: a scheduled run's task did not complete; its \
+                                 outcome was never recorded"
+                            );
                         }
                     }
                 });
@@ -1500,6 +1505,24 @@ to = "done"
     // ── Issue #228: the run outcome reaches the journal, not just stdout ─────
 
     /// Every `WorkflowRunFinished` journaled for `company`.
+    /// Yields until the journal holds `want` finished-run records, then returns
+    /// them. The append happens after the run completes, so a test that reads
+    /// once races it.
+    async fn wait_for_outcomes(
+        registry: &CompanyRegistry,
+        company: &str,
+        want: usize,
+    ) -> Vec<CompanyEvent> {
+        for _ in 0..10_000 {
+            let outcomes = run_outcomes(registry, company).await;
+            if outcomes.len() >= want {
+                return outcomes;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("only ever saw fewer than {want} finished-run records");
+    }
+
     async fn run_outcomes(registry: &CompanyRegistry, company: &str) -> Vec<CompanyEvent> {
         let id = CompanyId::new(company);
         let runtime = registry.get(&id).expect("registered");
@@ -1583,6 +1606,108 @@ to = "done"
         // target rides it. This is the same field the manual run's HTTP response
         // already ships to the console today.
         assert_eq!(skipped.target.as_deref(), Some(RECIPIENT));
+    }
+
+    /// **Issue #440: the cron path and the shared path record the same thing.**
+    ///
+    /// The scheduler used to keep its own copy of "mint the id through the
+    /// supervisor, journal the outcome on both arms" — the two rules
+    /// [`WorkflowSpawn`](crate::runtime::WorkflowSpawn) owns. The copies agreed,
+    /// which is what made the duplication dangerous rather than harmless: a fix
+    /// to one would silently miss the other and no test would notice.
+    ///
+    /// So this runs the same graph through both entry points over one company
+    /// (one event log, one runner, one supervisor) and asserts the journaled
+    /// records differ in exactly two places: the `scheduled` flag, which is the
+    /// one thing the two paths genuinely mean differently, and the run id, which
+    /// is fresh per run by construction. Everything else — the workflow id, the
+    /// delivery rows, the pending approvals, the error and the cancelled flag —
+    /// must match, and a divergence introduced on either side fails here.
+    #[tokio::test]
+    async fn a_cron_fire_and_a_direct_spawn_journal_the_same_record() {
+        use crate::company::parse_workflow;
+
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let company = "spawn-parity-co";
+        // Non-empty delivery rows, so the comparison covers the part of the
+        // record most likely to be dropped by one path and not the other.
+        let (runner, completed) = RecordingRunner::with_deliveries(vec![
+            report(
+                "owner_summary",
+                DeliveryStatus::Skipped,
+                "this recipient has never written to the company",
+            ),
+            report("also_sent", DeliveryStatus::Sent, "emailed the recipient"),
+        ]);
+        let registry = company_with_overlays(
+            &home,
+            company,
+            vec![overlay("digest", Some("* * * * *"))],
+            Some(runner),
+            "running",
+        )
+        .await;
+        let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 13, 9, 0)));
+        let mut scheduler = WorkflowScheduler::new(registry.clone(), clock);
+
+        // --- path 1: the cron fire.
+        assert_eq!(scheduler.tick().await, 1);
+        wait_for(|| completed.load(Ordering::SeqCst) == 1).await;
+        wait_for_outcomes(&registry, company, 1).await;
+
+        // --- path 2: the shared primitive, driven directly over the SAME
+        // runtime — same event log, same runner, same supervisor.
+        let runtime = registry
+            .get(&CompanyId::new(company))
+            .expect("the company is registered");
+        let runner = runtime
+            .workflow_runner()
+            .cloned()
+            .expect("the same runner the scheduler used");
+        let workflow = parse_workflow(&body("digest", Some("* * * * *"))).expect("parses");
+        let (_run_id, handle) =
+            crate::runtime::WorkflowSpawn::new(&runtime, runner).spawn(workflow, json!({}), false);
+        handle.await.expect("the run task completes").expect("runs");
+        let outcomes = wait_for_outcomes(&registry, company, 2).await;
+
+        let [cron, direct] = [&outcomes[0], &outcomes[1]].map(|event| {
+            let CompanyEvent::WorkflowRunFinished {
+                workflow_id,
+                scheduled,
+                run_id,
+                deliveries,
+                pending_approvals,
+                error,
+                cancelled,
+            } = event
+            else {
+                unreachable!("filtered above")
+            };
+            (
+                workflow_id,
+                scheduled,
+                run_id,
+                deliveries,
+                pending_approvals,
+                error,
+                cancelled,
+            )
+        });
+
+        // The two legitimate differences.
+        assert!(*cron.1, "a cron fire is scheduled");
+        assert!(!*direct.1, "a directly spawned run is not");
+        assert!(cron.2.is_some() && direct.2.is_some(), "both carry an id");
+        assert_ne!(cron.2, direct.2, "each run is its own causal root");
+
+        // Everything else is the same record, written by the same code.
+        assert_eq!(cron.0, direct.0, "workflow id");
+        assert_eq!(cron.3, direct.3, "delivery rows");
+        assert_eq!(cron.4, direct.4, "pending approvals");
+        assert_eq!(cron.5, direct.5, "error");
+        assert_eq!(cron.6, direct.6, "cancelled");
+        assert_eq!(cron.3.len(), 2, "the fixture's rows really did survive");
     }
 
     /// The arm that was quietest of all: a scheduled run that failed outright
@@ -1807,12 +1932,16 @@ to = "done"
     ///
     /// This is the claim the scheduler's comment makes and nothing pinned. It
     /// is worth pinning because the two things that make it true are both easy
-    /// to undo without breaking anything else: the context has to be minted
-    /// through the supervisor **inside** the spawned task, and the guard has to
+    /// to undo without breaking anything else: the run id has to be minted
+    /// through the supervisor **inside** the spawned task, and its guard has to
     /// be held across `record_run_finished` rather than dropped after the run.
-    /// Moving `begin` out of the task, or binding the guard to `_`, would still
+    /// Starting the run unregistered, or binding the guard to `_`, would still
     /// pass every other test in this module — the run would fire, complete and
     /// journal exactly as before, and simply stop being stoppable.
+    ///
+    /// Since issue #440 both are `WorkflowSpawn`'s to keep rather than this
+    /// module's, which is the point of routing through it — but the claim is
+    /// the scheduler's to make, so the test stays here.
     ///
     /// The cron case matters more than the manual one: nobody chose the timing,
     /// and a wedged nightly run holds its overlap claim, suppressing every later

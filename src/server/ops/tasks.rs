@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::company::steer::{InflightEntry, SteerAction, SteerError, cap_redirect};
+use crate::company::steer::{InflightEntry, MAX_REDIRECT_CHARS, SteerAction, SteerError};
 use crate::error::OpenCompanyError;
 use crate::ports::tasks::{
     BOARD_COLUMNS, COLUMN_TODO, TaskRecord, cap_discussion, is_board_column,
@@ -1656,8 +1656,9 @@ async fn list_inflight(company: ScopedCompany) -> Result<Json<Vec<InflightCard>>
 /// `POST …/tasks/{task_id}/steer` — apply an operator steer to an in-flight run.
 ///
 /// Validation (all `400`): unknown action; `cancel` without `confirm: true`;
-/// `redirect` without a non-empty `instruction`. An unknown key is `404`; a card
-/// that exists but is not in flight is `409`. On accept the run's control is set,
+/// `redirect` without a non-empty `instruction`; `redirect` with an instruction
+/// longer than [`MAX_REDIRECT_CHARS`]. An unknown key is `404`; a card that
+/// exists but is not in flight is `409`. On accept the run's control is set,
 /// a best-effort [`CompanyEvent::TaskSteered`] is journaled, and the route
 /// returns `202 Accepted` (the disposition lands on the card asynchronously).
 async fn steer_task(
@@ -1682,8 +1683,19 @@ async fn steer_task(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| bad("redirect requires a non-empty instruction"))?;
+            // Refuse rather than silently cap. The operator is synchronously
+            // present and the console surfaces this 400, so telling them the
+            // instruction is too long beats handing the agent a halved one that
+            // reads — in the turn and in the audit trail — exactly like the
+            // whole of what they typed. Count characters, never bytes.
+            let chars = instruction.chars().count();
+            if chars > MAX_REDIRECT_CHARS {
+                return Err(bad(&format!(
+                    "redirect instruction is {chars} characters; the limit is {MAX_REDIRECT_CHARS}"
+                )));
+            }
             SteerAction::Redirect {
-                instruction: cap_redirect(instruction),
+                instruction: instruction.to_string(),
             }
         }
         other => return Err(bad(&format!("unknown steer action '{other}'"))),
@@ -1854,5 +1866,187 @@ mod durations_test {
     fn a_reader_clock_behind_the_host_does_not_go_backwards() {
         let d = TaskDurations::compute(&[entry(T0, "dispatched", None)], None, T0 + 300_000);
         assert_eq!(d.worked_at(T0), 300_000);
+    }
+}
+
+/// The redirect bound at the route boundary: an operator who typed too much is
+/// told so, and one who typed exactly the limit gets every character through.
+#[cfg(test)]
+mod steer_redirect_test {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::company::CompanyManifest;
+    use crate::company::steer::InflightKind;
+    use crate::ports::types::{CompanyId, CompanyRecord, EventSeq};
+    use crate::runtime::RuntimeBuilder;
+    use crate::server::router;
+    use crate::store::FsCompanyStore;
+    use crate::{AppConfig, AppState};
+
+    fn manifest() -> CompanyManifest {
+        toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .unwrap()
+    }
+
+    /// A company with one run already in flight under the key `active`, so the
+    /// steer route reaches its accept path. The caller must hold the returned
+    /// registration guard: dropping it deregisters the run.
+    async fn state_with_inflight_run(
+        home: &std::path::Path,
+    ) -> (AppState, crate::company::steer::RegistrationGuard) {
+        use crate::ports::CompanyStore;
+        let id = CompanyId::new("acme");
+        FsCompanyStore::new(home.to_path_buf())
+            .save(&CompanyRecord {
+                id: id.clone(),
+                manifest: manifest(),
+                ledger: Vec::new(),
+                lifecycle: "running".to_string(),
+                overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
+                template_provenance: None,
+            })
+            .await
+            .unwrap();
+        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let guard = runtime.steer().register(
+            &id,
+            InflightEntry {
+                key: "active".into(),
+                task_id: Some("active".into()),
+                kind: InflightKind::Task,
+                title: "Active".into(),
+                agent_id: "ceo".into(),
+                started_at_millis: 1,
+                pending_action: None,
+            },
+        );
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id, std::sync::Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+        (state, guard)
+    }
+
+    async fn steer(state: &AppState, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/company/tasks/active/steer")
+            .header("content-type", "application/json")
+            .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, value)
+    }
+
+    /// The instruction the run's audit event recorded, if any.
+    async fn journaled_redirect(state: &AppState) -> Option<String> {
+        let company = CompanyId::new("acme");
+        let runtime = state.registry().get(&company).unwrap();
+        runtime
+            .events()
+            .read_from(&company, EventSeq::new(0), usize::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|stored| match stored.event {
+                CompanyEvent::TaskSteered { instruction, .. } => instruction,
+                _ => None,
+            })
+    }
+
+    #[tokio::test]
+    async fn an_over_length_redirect_is_refused_naming_the_bound() {
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-steer-")
+            .tempdir()
+            .unwrap();
+        let (state, _inflight) = state_with_inflight_run(home.path()).await;
+
+        let too_long = "a".repeat(MAX_REDIRECT_CHARS + 1);
+        let (status, body) = steer(
+            &state,
+            json!({"action": "redirect", "instruction": too_long}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&MAX_REDIRECT_CHARS.to_string()),
+            "the refusal names the limit: {message}"
+        );
+        assert!(
+            message.contains(&(MAX_REDIRECT_CHARS + 1).to_string()),
+            "the refusal names the actual length: {message}"
+        );
+        assert!(
+            journaled_redirect(&state).await.is_none(),
+            "a refused redirect never reaches the run or the audit trail"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_length_multibyte_redirect_is_refused_not_split() {
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-steer-")
+            .tempdir()
+            .unwrap();
+        let (state, _inflight) = state_with_inflight_run(home.path()).await;
+
+        // Every character is 2 bytes, so a byte-indexed bound would land
+        // mid-codepoint and panic. The route counts characters.
+        let too_long = "é".repeat(MAX_REDIRECT_CHARS + 1);
+        let (status, body) = steer(
+            &state,
+            json!({"action": "redirect", "instruction": too_long}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&(MAX_REDIRECT_CHARS + 1).to_string()),
+            "length is counted in characters, not bytes: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_at_limit_redirect_is_accepted_verbatim() {
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-steer-")
+            .tempdir()
+            .unwrap();
+        let (state, _inflight) = state_with_inflight_run(home.path()).await;
+
+        let exact = "a".repeat(MAX_REDIRECT_CHARS);
+        let (status, _) = steer(&state, json!({"action": "redirect", "instruction": exact})).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            journaled_redirect(&state).await.as_deref(),
+            Some(exact.as_str()),
+            "an at-limit instruction reaches the run whole — no cut, no marker"
+        );
     }
 }

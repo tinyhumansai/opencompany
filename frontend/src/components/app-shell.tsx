@@ -47,7 +47,13 @@ import { type AgentReplyEvent, type CompanyStreamEvent, useEvents } from "@/hook
 import { useHashView } from "@/hooks/use-hash-view";
 import { toast } from "sonner";
 
-import { type ChatMessage, fromHistory, hostMessageId, makeMessage } from "@/lib/chat";
+import {
+  type ChatMessage,
+  fromHistory,
+  hostMessageId,
+  liveReplyIdentity,
+  makeMessage,
+} from "@/lib/chat";
 import { CONNECTION_PROVIDERS } from "@/lib/connections";
 import { defaultDesks, type Desk } from "@/lib/desks";
 import { writeLastChannel } from "@/lib/last-channel";
@@ -262,6 +268,17 @@ export function AppShell({
   // refreshes its run history live. Same shape as `taskEventTick` — a counter,
   // not the payload, so the view owns what it refetches.
   const [workflowRunTick, setWorkflowRunTick] = useState(0);
+  // Issue #384: bumped on every `workflow_created` / `workflow_updated` /
+  // `workflow_deleted`, so the Workflows view re-reads its picker while the tab
+  // stays open — a graph authored by the orchestrator, by another session or by
+  // a machine credential used to be invisible until a reload.
+  //
+  // A counter rather than the payload, for the same reason `taskEventTick` is:
+  // the view re-reads `GET …/workflows`, so two frames collapsing into one
+  // React batch still means "re-read". It also covers the delete case without
+  // carrying an id — the workflow that went away is precisely the one the
+  // refreshed list no longer has.
+  const [workflowListTick, setWorkflowListTick] = useState(0);
   // Issue #371: a rolling WINDOW of run-progress frames, not just a nonce.
   //
   // The canvas paints per-node state, so unlike the tick above it needs the
@@ -621,6 +638,8 @@ export function AppShell({
               makeMessage("company", event.text, {
                 channel: event.agentId,
                 taskId: event.taskId,
+                // Issue #483 — see `liveReplyIdentity`.
+                ...liveReplyIdentity(event),
               }),
             ],
           };
@@ -640,11 +659,18 @@ export function AppShell({
       if (!channelId) return;
       setTranscripts((t) => {
         const existing = t[channelId] ?? [];
-        // The same recent-tail content dedupe the thread store uses, and for
-        // the same reason: local ids are ephemeral counters and rehydrated ones
-        // are `h`-prefixed, so neither side of the race can be matched by id.
-        // The cost is that two genuinely identical company lines inside eight
-        // messages collapse into one — a price the thread store already pays.
+        // The same recent-tail content dedupe the thread store uses. It still
+        // earns its place: the operator's own turn is rendered locally by the
+        // awaited POST under an ephemeral `m<seq>` id, so a late echo of that
+        // reply can only be matched by content.
+        //
+        // It is no longer the ONLY guard, and issue #483 is why. This line now
+        // carries the host's id (below), so `hydrateChannel`'s id dedupe can
+        // recognise it — which the content check could never do from the other
+        // side, because hydration prepends history rather than appending to the
+        // recent tail this scans. Live-then-hydrate was the one route neither
+        // guard covered, and it doubled every reply that arrived while its
+        // channel was closed.
         const dup = existing
           .slice(-8)
           .some((m) => m.from === "company" && m.text === event.text);
@@ -656,6 +682,10 @@ export function AppShell({
             makeMessage("company", event.text, {
               channel: event.agentId,
               taskId: event.taskId,
+              // Issue #483: same identity as the thread store above. This is
+              // the store `hydrateChannel` writes into, so this is where the
+              // duplicate was visible.
+              ...liveReplyIdentity(event),
               // Issue #364: a reply to a thread joins that thread live, instead
               // of appearing in the channel and moving on the next reload. The
               // host names the parent by its own id, so it takes the same
@@ -836,6 +866,11 @@ export function AppShell({
       setWorkflowRunEvents((prev) => [...prev, event].slice(-WORKFLOW_EVENT_WINDOW));
       if (event.type === "workflow_run_finished") setWorkflowRunTick((n) => n + 1);
     }, []),
+    // Issue #384. The picker is refreshed from the host rather than patched
+    // from the frame: the frame carries no graph body by design, and a console
+    // that splices what it *thinks* changed is how a picker drifts in the first
+    // place.
+    onWorkflowChanged: useCallback(() => setWorkflowListTick((n) => n + 1), []),
     // Issue #379. Both frames do the same one thing — re-read the approvals
     // feed — and that is deliberate: the park frame is thin by design (no
     // payload, no asker), so the redacted summary on the feed is the only place
@@ -1022,6 +1057,7 @@ export function AppShell({
                 sub={sub}
                 runEventTick={workflowRunTick}
                 runEvents={workflowRunEvents}
+                listEventTick={workflowListTick}
               />
             </Suspense>
           )}

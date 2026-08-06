@@ -197,6 +197,29 @@ fn hex_segment(value: &str) -> String {
 /// teammate id. This extracts the turn message from the request and runs it
 /// through [`HarnessPool::run`], which meters the turn's cost through `deps` — so
 /// a workflow step and a chat turn account identically.
+///
+/// # It claims neither the publish queue nor the delegation queue — on purpose
+///
+/// A node's turn carries the whole toolbelt, so an orchestrator-tier `agent_ref`
+/// can reach `review_task`, `assign_task`, `spawn_task` and `delegate_to_desk`,
+/// and a granted one can reach `publish_artifact`. Nothing here drains either
+/// queue: a workflow run has no board card behind it and no conversation to
+/// surface a delegation's answer into — the same absence that makes
+/// [`park_gated_calls`](HarnessAgentRunner::park_gated_calls) record approvals
+/// explicitly unlinked.
+///
+/// So this path takes **no claim**, and that is the decision rather than an
+/// omission. What the agent gets is an honest in-turn refusal it can report —
+/// *"the card was NOT reviewed"* — instead of what it got before #453: a
+/// success receipt saying the card had moved to done, followed by the next
+/// turn's `clear()` destroying the delegation. Silent destruction replaced by a
+/// visible refusal.
+///
+/// Wiring a drain here would be a real feature (a workflow node that can move
+/// the board), and it is deliberately not this issue: it needs a decision about
+/// which card a node's `spawn_task` parents to and where a hand-off's reply
+/// goes. Until then, refusing is the truthful answer. Mirrors how this path
+/// already takes no [`PublishClaim`](crate::harness::publish::PublishClaim).
 pub struct HarnessAgentRunner {
     pool: Arc<HarnessPool>,
     deps: HarnessDeps,

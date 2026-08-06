@@ -49,12 +49,40 @@
 //!
 //! **Upstream nodes re-execute.** That is the engine's documented semantic for
 //! resume, not something added here, but it is real: agent nodes re-spend
-//! tokens, and a reached `output` node **re-delivers** — a warm-recipient email
-//! will send a second time, because the established-thread check is state-based
-//! rather than run-based. This is acceptable for v1 because a gate normally
-//! sits *before* the side-effecting node it is gating, which is the entire
-//! reason to author one. It is not acceptable silently, which is why it is
-//! written here, in the PR, and nowhere hidden.
+//! tokens on every continuation. A gate normally sits *before* the
+//! side-effecting node it is gating — which is the entire reason to author one
+//! — so for most graphs the cost is tokens and wall-clock. It is not acceptable
+//! silently, which is why it is written here, in the parked card's own `note`
+//! payload, and nowhere hidden.
+//!
+//! # The one cost that was not acceptable: re-delivery (issue #438)
+//!
+//! A reached `output` node used to **deliver again** on every continuation. The
+//! established-recipient check is state-based rather than run-based, so a warm
+//! recipient was simply mailed the same report a second time the moment an
+//! operator approved a *later* gate — a side effect that left the process and
+//! reached a real person, caused by clicking Approve.
+//!
+//! The fix is a **delivery ledger** carried in the parked card and threaded into
+//! the continuation's trigger input under [`CONTINUATION_DELIVERED_KEY`]:
+//! `{node, kind}` for every report this lineage has already sent (`Sent`) or
+//! parked (`Pending` — the card is durable, and approving it sends, so it counts
+//! as delivered). Delivery skips a listed node with
+//! [`DeliveryReason::AlreadyDelivered`](crate::ports::DeliveryReason::AlreadyDelivered)
+//! and dispatches nothing. The ledger is
+//! *unioned* with whatever the incoming input already carried, so a graph with
+//! two gates accumulates across both resumes rather than forgetting the first.
+//!
+//! Carrying it on the card rather than in a side table is the same choice the
+//! input itself makes: the card stays self-contained, so the guard survives a
+//! restart exactly like the resume does.
+//!
+//! **The honest limit.** The ledger is per `output` node, not per recipient. An
+//! `owner` destination that fanned out to three admins and failed on the third
+//! is recorded as delivered, and the continuation will not retry that third
+//! address. Re-mailing two people to reach one is the worse outcome, so this is
+//! deliberate rather than an oversight — a partial fan-out is repaired from the
+//! run history, not by a resume.
 //!
 //! # At-most-once, deny, and expiry
 //!
@@ -65,6 +93,7 @@
 //! paused run is already settled, "nothing runs" is the complete outcome — no
 //! task to cancel, no connection to close.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::Result;
@@ -72,6 +101,7 @@ use crate::company::load_workflow_union;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::Effect;
+use crate::ports::{DeliveryReport, DeliveryStatus};
 use crate::runtime::workflow_spawn::WorkflowSpawn;
 
 /// The effect kind a paused `requires_approval` node parks as (issue #395).
@@ -89,6 +119,103 @@ pub const PAYLOAD_WORKFLOW_ID: &str = "workflow_id";
 pub const PAYLOAD_NODE_ID: &str = "node_id";
 /// The payload key holding the trigger input the paused run was started with.
 pub const PAYLOAD_INPUT: &str = "input";
+/// The payload key holding this lineage's delivery ledger (issue #438) — the
+/// reports a continuation must NOT send again.
+pub const PAYLOAD_DELIVERED: &str = "delivered";
+/// The payload key holding the plain-prose statement of what approving costs.
+pub const PAYLOAD_NOTE: &str = "note";
+
+/// The reserved trigger-input key the delivery ledger rides into a continuation
+/// run under (issue #438).
+///
+/// Reserved, and shaped so nobody authors it by accident: it is threaded by the
+/// host, read by `deliver_outputs`, and never by the engine or a graph author.
+/// It is stripped before two parked gates are compared — see `is_same_gate` — because a continuation's input differs from the paused
+/// run's by exactly this key, and letting that difference count would make
+/// every continuation gate a "new" decision and stack a duplicate card.
+pub const CONTINUATION_DELIVERED_KEY: &str = "__opencompany_delivered";
+
+/// What approving a workflow gate actually does, in the operator's own terms.
+///
+/// This rides the card as [`PAYLOAD_NOTE`] rather than living only in a design
+/// doc, because the person deciding is the one who pays the cost: approving is
+/// not "let the run continue from here", it re-runs the graph from the trigger.
+/// Prose, not a code reference — the reader is an operator looking at an
+/// Approvals card.
+pub const CONTINUATION_NOTE: &str = "Approving this re-runs the whole workflow from the start — every step before this gate runs \
+     again, and any agent steps spend tokens again. Reports this run already delivered will not be \
+     sent a second time.";
+
+/// One `output` node whose report a run in this lineage has already delivered.
+///
+/// `kind` rides along beside `node` so the record says *what* was sent where —
+/// a card an operator reads, and a run history a reviewer reads, both want
+/// "the owner summary already went out", not a bare node id. Matching is on
+/// `node`: an output node has exactly one destination, so the id is the
+/// identity and the kind is the description.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredReport {
+    /// The `output` node whose report was delivered.
+    pub node: String,
+    /// The destination kind it was delivered to (`owner` / `email` / `channel`).
+    pub kind: String,
+}
+
+/// The reports this lineage has already delivered, read off a trigger input.
+///
+/// Tolerant by construction — a missing key, a non-array, or a malformed row
+/// yields "nothing known to be delivered", which is the pre-#438 behaviour
+/// (deliver it). Failing loudly here would turn a garbled continuation into a
+/// run that delivers nothing at all, which is the worse error.
+pub fn delivered_in_input(input: &Value) -> Vec<DeliveredReport> {
+    input
+        .get(CONTINUATION_DELIVERED_KEY)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| serde_json::from_value(row.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The ledger a gate parked on this run should carry: what the run just
+/// delivered, unioned with what its own trigger input already listed.
+///
+/// The union is what makes a **two-gate** graph correct. Approving the first
+/// gate starts a continuation that skips the already-delivered report — and
+/// then pauses at the second gate. If that second card carried only what the
+/// continuation itself delivered (nothing, since it skipped), approving it
+/// would deliver the report for real. The ledger has to accumulate down the
+/// lineage, not restart at each hop.
+///
+/// `Sent` and `Pending` both count. `Pending` is a parked cold-recipient card:
+/// journal-backed, survives a restart, and approving it sends. Treating it as
+/// undelivered would re-park an identical card on every continuation and
+/// approving both would send twice — `park_cold_recipient` has no dedupe of its
+/// own. `Skipped` / `Denied` / `Failed` deliberately do not count: nothing left
+/// the process, so a continuation is free to try again.
+fn delivery_ledger(input: &Value, deliveries: &[DeliveryReport]) -> Vec<DeliveredReport> {
+    let mut ledger = delivered_in_input(input);
+    for report in deliveries {
+        if !matches!(
+            report.status,
+            DeliveryStatus::Sent | DeliveryStatus::Pending
+        ) {
+            continue;
+        }
+        let entry = DeliveredReport {
+            node: report.node.clone(),
+            kind: report.kind.clone(),
+        };
+        // An `owner` destination fans out to one row per admin, so the same
+        // node appears several times; the ledger holds it once.
+        if !ledger.contains(&entry) {
+            ledger.push(entry);
+        }
+    }
+    ledger
+}
 
 /// Builds the effect a paused gate parks as.
 ///
@@ -105,7 +232,18 @@ pub const PAYLOAD_INPUT: &str = "input";
 /// [`ApprovalSummary::broadly_grantable`](crate::runtime::ApprovalSummary) requires an agent,
 /// the console never offers "let it do this for a period" on a card where that
 /// would mean nothing.
-pub fn gate_effect(workflow_id: &str, node_id: &str, input: &Value, run_id: &str) -> Effect {
+///
+/// `deliveries` is what the run that paused actually delivered (issue #438).
+/// It is folded into the card's ledger rather than looked up later for the same
+/// reason the input is copied in: a card that needs a side table is a card that
+/// stops working after a restart.
+pub fn gate_effect(
+    workflow_id: &str,
+    node_id: &str,
+    input: &Value,
+    run_id: &str,
+    deliveries: &[DeliveryReport],
+) -> Effect {
     Effect {
         kind: WORKFLOW_APPROVE_KIND.to_string(),
         group: crate::ports::types::EffectGroup::Other,
@@ -119,6 +257,10 @@ pub fn gate_effect(workflow_id: &str, node_id: &str, input: &Value, run_id: &str
             // a resume needs nothing but the journal. This is what makes
             // approve-after-restart work.
             PAYLOAD_INPUT: input.clone(),
+            // What must NOT be sent again when this card is approved.
+            PAYLOAD_DELIVERED: delivery_ledger(input, deliveries),
+            // What approving costs, in the operator's own terms.
+            PAYLOAD_NOTE: CONTINUATION_NOTE,
         }),
         // Native, not a teammate's tool call — see the doc above.
         agent: None,
@@ -140,13 +282,39 @@ pub fn gate_effect(workflow_id: &str, node_id: &str, input: &Value, run_id: &str
 /// rubber-stamp.
 ///
 /// `run_id` is deliberately **not** part of it: it differs by construction on
-/// every re-run, so including it would make the dedupe a no-op.
+/// every re-run, so including it would make the dedupe a no-op. Neither is the
+/// [`PAYLOAD_DELIVERED`] ledger, nor the [`CONTINUATION_DELIVERED_KEY`] the
+/// input carries it under (issue #438) — both differ by construction between a
+/// paused run and the continuation it started, and both describe what has
+/// *already happened* rather than what is being decided. Counting either would
+/// make every continuation gate read as a new decision, which is precisely the
+/// duplicate-card failure this function exists to prevent.
 fn is_same_gate(a: &Effect, b: &Effect) -> bool {
     a.kind == b.kind
         && a.kind == WORKFLOW_APPROVE_KIND
-        && [PAYLOAD_WORKFLOW_ID, PAYLOAD_NODE_ID, PAYLOAD_INPUT]
+        && [PAYLOAD_WORKFLOW_ID, PAYLOAD_NODE_ID]
             .iter()
             .all(|key| a.payload.get(*key) == b.payload.get(*key))
+        && decided_input(a) == decided_input(b)
+}
+
+/// The part of a parked gate's trigger input that identifies the *decision*:
+/// everything except the host-threaded delivery ledger.
+fn decided_input(effect: &Effect) -> Option<Value> {
+    effect
+        .payload
+        .get(PAYLOAD_INPUT)
+        .cloned()
+        .map(without_ledger)
+}
+
+/// `input` with the reserved delivery-ledger key removed. A non-object input is
+/// returned as-is — there is nothing to strip.
+fn without_ledger(mut input: Value) -> Value {
+    if let Value::Object(map) = &mut input {
+        map.remove(CONTINUATION_DELIVERED_KEY);
+    }
+    input
 }
 
 /// True when `effect` names a gate the journal is already holding a card for.
@@ -181,11 +349,6 @@ pub fn already_parked(journal: &crate::runtime::journal::RuntimeJournal, effect:
 pub async fn resume_from_effect(runtime: &CompanyRuntime, effect: &Effect) -> Result<()> {
     let workflow_id = required_str(effect, PAYLOAD_WORKFLOW_ID)?;
     let node_id = required_str(effect, PAYLOAD_NODE_ID)?;
-    let input = effect
-        .payload
-        .get(PAYLOAD_INPUT)
-        .cloned()
-        .unwrap_or(Value::Null);
 
     // Through the runtime's own accessor so a build without workflow execution
     // gives an honest error instead of a compile-time edge — this module is in
@@ -213,7 +376,7 @@ pub async fn resume_from_effect(runtime: &CompanyRuntime, effect: &Effect) -> Re
             ))
         })?;
 
-    let input = with_approval(input, node_id);
+    let input = continuation_input(effect)?;
     // The handle is dropped on purpose. The task holds its own guard, journals
     // its own outcome and deregisters itself; awaiting it here would hold the
     // approvals request open for the length of a whole workflow run, which is
@@ -227,6 +390,64 @@ pub async fn resume_from_effect(runtime: &CompanyRuntime, effect: &Effect) -> Re
         "workflow: an approved gate started a continuation run; upstream nodes re-execute"
     );
     Ok(())
+}
+
+/// The trigger input a continuation run starts with: the paused run's own
+/// input, plus the approved gate, plus this lineage's delivery ledger.
+///
+/// One function rather than three call-site steps because the three have to
+/// travel together — an input that carries the approval but not the ledger
+/// resumes *and re-delivers*, which is issue #438 with extra steps. It is
+/// `pub(crate)` so the run-level regression test can build a continuation
+/// exactly the way the approvals path does, rather than reconstructing it and
+/// proving only that the reconstruction works.
+pub(crate) fn continuation_input(effect: &Effect) -> Result<Value> {
+    let node_id = required_str(effect, PAYLOAD_NODE_ID)?;
+    let input = effect
+        .payload
+        .get(PAYLOAD_INPUT)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let delivered: Vec<DeliveredReport> = effect
+        .payload
+        .get(PAYLOAD_DELIVERED)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| serde_json::from_value(row.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(with_delivered(with_approval(input, node_id), &delivered))
+}
+
+/// Writes `delivered` onto the trigger input under
+/// [`CONTINUATION_DELIVERED_KEY`], replacing whatever was there.
+///
+/// Replace, not merge: the card's ledger was *built* by unioning the input's
+/// own list with what the run delivered (see [`delivery_ledger`]), so it is
+/// already the superset. Merging again here would be a second, redundant place
+/// for that rule to drift.
+///
+/// An empty ledger writes nothing at all, which keeps a first run's input shape
+/// untouched — the reserved key appears only once there is something to
+/// suppress.
+fn with_delivered(input: Value, delivered: &[DeliveredReport]) -> Value {
+    if delivered.is_empty() {
+        return input;
+    }
+    match input {
+        Value::Object(mut map) => {
+            map.insert(
+                CONTINUATION_DELIVERED_KEY.to_string(),
+                serde_json::json!(delivered),
+            );
+            Value::Object(map)
+        }
+        // `with_approval` always yields an object, so this is unreachable
+        // through `continuation_input`. Kept total rather than panicking.
+        other => other,
+    }
 }
 
 /// Unions `node_id` into the trigger input's `approvals` array.
@@ -289,7 +510,24 @@ mod tests {
     use super::*;
 
     fn effect(workflow: &str, node: &str, input: Value) -> Effect {
-        gate_effect(workflow, node, &input, "run-1")
+        gate_effect(workflow, node, &input, "run-1", &[])
+    }
+
+    /// A delivery row with `status`, as `deliver_outputs` would have returned it.
+    fn delivery(node: &str, kind: &str, status: DeliveryStatus) -> DeliveryReport {
+        DeliveryReport {
+            node: node.to_string(),
+            kind: kind.to_string(),
+            target: None,
+            status,
+            detail: String::new(),
+            reason: crate::ports::DeliveryReason::Unspecified,
+        }
+    }
+
+    /// The ledger rows a parked card carries.
+    fn ledger(effect: &Effect) -> Vec<DeliveredReport> {
+        serde_json::from_value(effect.payload[PAYLOAD_DELIVERED].clone()).expect("ledger parses")
     }
 
     #[test]
@@ -385,6 +623,208 @@ mod tests {
     fn non_string_entries_in_a_prior_approvals_array_are_dropped() {
         let out = with_approval(serde_json::json!({ "approvals": ["a", 7, null] }), "b");
         assert_eq!(out["approvals"], serde_json::json!(["a", "b"]));
+    }
+
+    // --- issue #438: the delivery ledger -------------------------------------
+
+    /// What the run delivered rides the card, so approving it can suppress a
+    /// second send. `Sent` and `Pending` are both "already delivered": a parked
+    /// cold-send card is durable and approving it sends, so re-parking would
+    /// stack a duplicate and approving both would mail twice.
+    #[test]
+    fn a_gate_card_carries_what_the_run_already_delivered() {
+        let e = gate_effect(
+            "digest",
+            "gate",
+            &serde_json::json!({ "request": "x" }),
+            "run-1",
+            &[
+                delivery("owner_summary", "owner", DeliveryStatus::Sent),
+                delivery("cold_note", "email", DeliveryStatus::Pending),
+            ],
+        );
+        assert_eq!(
+            ledger(&e),
+            vec![
+                DeliveredReport {
+                    node: "owner_summary".into(),
+                    kind: "owner".into()
+                },
+                DeliveredReport {
+                    node: "cold_note".into(),
+                    kind: "email".into()
+                },
+            ]
+        );
+    }
+
+    /// A row that never left the process is NOT on the ledger — nothing was
+    /// sent, so a continuation is free to try again. Suppressing these would
+    /// silently retire a report on the strength of a failure.
+    #[test]
+    fn a_report_that_did_not_go_out_stays_deliverable() {
+        for status in [
+            DeliveryStatus::Skipped,
+            DeliveryStatus::Denied,
+            DeliveryStatus::Failed,
+        ] {
+            let e = gate_effect(
+                "digest",
+                "gate",
+                &Value::Null,
+                "run-1",
+                &[delivery("summary", "owner", status)],
+            );
+            assert!(
+                ledger(&e).is_empty(),
+                "{status:?} sent nothing, so it must stay deliverable"
+            );
+        }
+    }
+
+    /// An `owner` destination fans out to one row per admin. The ledger is per
+    /// node, so it holds that node once rather than once per recipient.
+    #[test]
+    fn a_fanned_out_destination_is_one_ledger_row() {
+        let e = gate_effect(
+            "digest",
+            "gate",
+            &Value::Null,
+            "run-1",
+            &[
+                delivery("summary", "owner", DeliveryStatus::Sent),
+                delivery("summary", "owner", DeliveryStatus::Sent),
+            ],
+        );
+        assert_eq!(ledger(&e).len(), 1);
+    }
+
+    /// The ledger rides the continuation's trigger input — this is the whole
+    /// mechanism, since `deliver_outputs` reads it from there and nowhere else.
+    #[test]
+    fn the_ledger_rides_the_continuation_input() {
+        let card = gate_effect(
+            "digest",
+            "gate",
+            &serde_json::json!({ "request": "x" }),
+            "run-1",
+            &[delivery("summary", "owner", DeliveryStatus::Sent)],
+        );
+
+        let input = continuation_input(&card).expect("a well-formed card continues");
+
+        assert_eq!(input["approvals"], serde_json::json!(["gate"]));
+        assert_eq!(
+            input["request"], "x",
+            "the original topic still rides along"
+        );
+        assert_eq!(
+            delivered_in_input(&input),
+            vec![DeliveredReport {
+                node: "summary".into(),
+                kind: "owner".into()
+            }]
+        );
+    }
+
+    /// **The two-gate case.** Approving the first gate starts a continuation
+    /// that skips the already-sent report and then pauses at the second gate.
+    /// That second card must carry the FIRST run's deliveries too — it delivered
+    /// nothing itself, so a ledger built only from its own rows would be empty
+    /// and approving it would send the report for real.
+    #[test]
+    fn the_ledger_accumulates_across_two_gates() {
+        // Run 1 delivers the summary and pauses on gate-a.
+        let first = gate_effect(
+            "digest",
+            "gate-a",
+            &serde_json::json!({ "request": "x" }),
+            "run-1",
+            &[delivery("summary", "owner", DeliveryStatus::Sent)],
+        );
+        let continuation = continuation_input(&first).expect("continues");
+
+        // Run 2 skips the summary (delivering nothing) and pauses on gate-b.
+        let second = gate_effect("digest", "gate-b", &continuation, "run-2", &[]);
+        assert_eq!(
+            ledger(&second),
+            vec![DeliveredReport {
+                node: "summary".into(),
+                kind: "owner".into()
+            }],
+            "the second card must remember what the first run sent"
+        );
+
+        // And approving THAT still suppresses it, with both gates approved.
+        let next = continuation_input(&second).expect("continues");
+        assert_eq!(next["approvals"], serde_json::json!(["gate-a", "gate-b"]));
+        assert_eq!(delivered_in_input(&next).len(), 1);
+    }
+
+    /// A run that delivered nothing writes no reserved key at all, so an
+    /// ordinary continuation's input keeps exactly the shape it always had.
+    #[test]
+    fn a_lineage_that_delivered_nothing_threads_no_reserved_key() {
+        let card = effect("digest", "gate", serde_json::json!({ "request": "x" }));
+        let input = continuation_input(&card).expect("continues");
+        assert!(input.get(CONTINUATION_DELIVERED_KEY).is_none(), "{input}");
+        assert!(delivered_in_input(&input).is_empty());
+    }
+
+    /// The ledger must not make a continuation's gate look like a *different*
+    /// decision — that would stack a second card for one gate on every resume,
+    /// which is the dedupe failure #395 closed.
+    #[test]
+    fn the_ledger_does_not_split_one_decision_into_two_cards() {
+        let paused = gate_effect(
+            "digest",
+            "gate",
+            &serde_json::json!({ "request": "x" }),
+            "run-1",
+            &[delivery("summary", "owner", DeliveryStatus::Sent)],
+        );
+        // The same gate, re-reached by the continuation the card started: same
+        // input plus the approval… minus the approval, which the gate node
+        // consumed. What differs is the ledger key alone.
+        let mut continuation = continuation_input(&paused).expect("continues");
+        continuation
+            .as_object_mut()
+            .expect("object")
+            .remove("approvals");
+        let re_reached = gate_effect("digest", "gate", &continuation, "run-2", &[]);
+
+        assert!(
+            is_same_gate(&paused, &re_reached),
+            "the ledger is not part of the decision:\n{:?}\n{:?}",
+            paused.payload,
+            re_reached.payload
+        );
+    }
+
+    /// The card says, in plain words, what approving actually does. The operator
+    /// deciding is the one who pays for the re-run.
+    #[test]
+    fn the_card_states_what_approving_costs() {
+        let e = effect("digest", "gate", Value::Null);
+        let note = e.payload[PAYLOAD_NOTE].as_str().expect("a note");
+        assert!(note.contains("re-runs"), "{note}");
+        assert!(note.contains("tokens"), "{note}");
+        assert!(note.contains("not be sent"), "{note}");
+    }
+
+    /// A garbled ledger degrades to "nothing known to be delivered" rather than
+    /// refusing the resume. Failing here would turn one malformed row into a
+    /// continuation that delivers nothing at all — the worse error.
+    #[test]
+    fn a_malformed_ledger_is_ignored_rather_than_fatal() {
+        for garbage in [
+            serde_json::json!("not an array"),
+            serde_json::json!([{ "node": 7 }]),
+            serde_json::json!([null]),
+        ] {
+            let input = serde_json::json!({ CONTINUATION_DELIVERED_KEY: garbage });
+            assert!(delivered_in_input(&input).is_empty());
+        }
     }
 
     #[test]
@@ -553,7 +993,16 @@ mode = "full"
         rt: &Arc<crate::company::runtime::CompanyRuntime>,
         input: Value,
     ) -> ApprovalId {
-        let effect = gate_effect("gated", "gate", &input, "run-that-paused");
+        park_gate_after(rt, input, &[]).await
+    }
+
+    /// [`park_gate`], for a run that delivered `deliveries` before it paused.
+    async fn park_gate_after(
+        rt: &Arc<crate::company::runtime::CompanyRuntime>,
+        input: Value,
+        deliveries: &[DeliveryReport],
+    ) -> ApprovalId {
+        let effect = gate_effect("gated", "gate", &input, "run-that-paused", deliveries);
         let id = rt
             .approvals
             .park(rt.id(), effect.clone())
@@ -611,6 +1060,48 @@ mode = "full"
         // A new causal root, not the paused run's id.
         assert_ne!(started[0].run_id, "run-that-paused");
         assert!(rt.pending_approvals().is_empty(), "the card is decided");
+    }
+
+    /// Issue #438, over the real decide path: the run an approval starts is
+    /// handed the ledger of what its ancestor already delivered.
+    ///
+    /// The unit tests above pin the ledger's arithmetic; this one pins that it
+    /// actually reaches a run — through the gate, the journal, `perform_effect`
+    /// and the spawn — because that is the hop where a threading mistake would
+    /// leave every other test green and still mail the report twice.
+    #[tokio::test]
+    async fn a_continuation_run_is_told_what_was_already_delivered() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate_after(
+            &rt,
+            json!({ "request": "quarterly numbers" }),
+            &[DeliveryReport {
+                node: "summary".into(),
+                kind: "owner".into(),
+                target: Some("ada@acme.test".into()),
+                status: DeliveryStatus::Sent,
+                detail: "emailed the company's admin".into(),
+                reason: crate::ports::DeliveryReason::OwnerEmailed,
+            }],
+        )
+        .await;
+
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("resolves");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            delivered_in_input(&started[0].input),
+            vec![DeliveredReport {
+                node: "summary".into(),
+                kind: "owner".into()
+            }],
+            "the continuation must know the summary already went out: {:?}",
+            started[0].input
+        );
     }
 
     /// Denying starts nothing. The paused run was already settled, so "nothing

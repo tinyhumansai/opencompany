@@ -496,6 +496,22 @@ fn jsonl<T: Serialize>(items: &[T]) -> Result<String> {
 }
 
 /// Parses every non-empty JSONL line of `path`, skipping an absent file.
+///
+/// **Import stays strict, by decision** (issue #387). The boot path now tolerates
+/// a damaged ledger line — see
+/// [`read_jsonl_lenient`](crate::store::fs::read_jsonl_lenient) — and this reader
+/// deliberately does not follow it. The two are not the same situation:
+///
+/// * Boot has no alternative. The bundle is the company's only copy, refusing to
+///   read it strands the tenant, and skipping keeps the bytes on disk for repair.
+/// * Import does have one. The bundle being read is an *incoming* archive whose
+///   source still exists, and refusing it costs nothing but a retry with a good
+///   bundle. Half-importing instead would mint a company whose ledger silently
+///   disagrees with the archive it claims to be, with no record of what was
+///   dropped — an inconsistency that outlives the damaged file.
+///
+/// So a corrupt archive fails the import outright. That is the correct answer
+/// here, and it should not be "fixed" to match the boot path.
 async fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let contents = match tokio::fs::read_to_string(path).await {
         Ok(contents) => contents,

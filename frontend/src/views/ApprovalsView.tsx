@@ -358,7 +358,7 @@ function StandingPermissions({
               <CardContent className="flex flex-wrap items-center gap-3 py-3">
                 <div className="min-w-0 flex-1">
                   {/* Phrased, never the raw identifier — the glossary rule. */}
-                  <p className="truncate text-sm font-medium">{toolAction(g.tool)}</p>
+                  <p className="truncate text-sm font-medium">{grantHeadline(g)}</p>
                   <p className="text-xs text-muted-foreground">
                     {askerNames.get(g.agent) ?? g.agent} ·{" "}
                     {expired ? "expired" : `expires ${untilLabel(g.expires_at_millis, now)}`} ·
@@ -386,6 +386,41 @@ function StandingPermissions({
       </div>
     </section>
   );
+}
+
+/**
+ * What one standing permission actually covers, in one line (#457).
+ *
+ * `toolAction` alone answers "which tool", which is the whole sentence for
+ * `file_write` and only half of it for `composio_execute`: that name carries
+ * every action of every connected provider, so a row reading "Act in one of its
+ * connected accounts" leaves an operator unable to tell a permission over their
+ * code host from one over their mailbox — and a permission you cannot read is
+ * one you cannot decide to revoke. When the host names a scope, the row names
+ * the provider.
+ *
+ * Composed as a suffix rather than a second phrasing table: the tool's own words
+ * stay in `lib/language`, so there is nothing here to drift out of step with it.
+ */
+function grantHeadline(g: StandingGrant): string {
+  const action = toolAction(g.tool);
+  return g.scope ? `${action} — ${providerLabel(g.scope)} only` : action;
+}
+
+/**
+ * A toolkit identifier as a person would write it: `microsoft_teams` →
+ * "Microsoft Teams".
+ *
+ * Mechanical on purpose. A lookup table of pretty provider names would render
+ * the ~30 toolkits it knew and the raw slug for everything else, and the ones it
+ * did not know would be exactly the ones added most recently.
+ */
+function providerLabel(scope: string): string {
+  return scope
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 /**

@@ -8,7 +8,18 @@ system sits behind a port trait.
 
 Supporting docs:
 
-- [ports.md](ports.md) — the port trait contracts (normative)
+- [ports.md](ports.md) — the port trait contracts (normative): the index over
+  the five files below, plus the runtime assembly and the default
+  implementation of each port
+  - [ports-cognition.md](ports-cognition.md) — `Brain`, `CycleHost`,
+    `ChannelAdapter` and the `TurnStep` activity trace
+  - [ports-state.md](ports-state.md) — `CompanyStore`, `EventLog`,
+    `MemoryStore`, `ContextStore`, `SecretStore`, and the identity trio
+  - [ports-effects.md](ports-effects.md) — `ToolProvider`, `AgentEconomy`,
+    `ApprovalGate`
+  - [ports-console.md](ports-console.md) — the WS3 console-surface stores
+  - [ports-runs.md](ports-runs.md) — `RunStore`: one attempt at a task, its
+    trace, and who writes it
 - [events.md](events.md) — the `CompanyEvent` vocabulary those ports carry, and
   the run/task/approval correlation rules a journal reader folds on
 - [artifacts.md](artifacts.md) — what makes something a deliverable: the

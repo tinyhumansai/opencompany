@@ -1921,6 +1921,19 @@ async fn seed_workspace(
 ///
 /// Returns `None` unless `[place].discoverable` is set and a `@handle` is
 /// present; a missing/unreadable identity key degrades to `None` with a warning.
+///
+/// # The one place the Agent-Card replayer is attached (issue #454)
+///
+/// This function is the **only** production path that builds a concrete
+/// [`TinyplaceEconomy`], and the last point at which its outbox is still
+/// reachable: the return type erases it to `Arc<dyn AgentEconomy>`, a trait with
+/// no flush surface, which is precisely how the outbox came to have a `drain()`
+/// whose only caller lived in its own test module. So
+/// [`spawn_outbox_replayer`](crate::economy::adapter::spawn_outbox_replayer) is
+/// called here, before the erasure, and calling it is what entitles
+/// `publish_card` to answer `Ok(())` while offline. Delete the call and every
+/// offline publish starts erroring instead of lying — which is the failure
+/// direction we want, and which a test asserts.
 #[cfg(feature = "tinyplace")]
 async fn maybe_build_economy(
     manifest: &CompanyManifest,
@@ -1930,6 +1943,7 @@ async fn maybe_build_economy(
     tinyplace_api_url: Option<String>,
     going_public: bool,
 ) -> Option<Arc<dyn AgentEconomy>> {
+    use crate::economy::adapter::{OUTBOX_REPLAY_INTERVAL, spawn_outbox_replayer};
     use crate::economy::signer::load_or_create_signer;
     use crate::economy::{HttpTinyplaceClient, TinyplaceEconomy};
     use crate::store::paths::Bundle;
@@ -1950,15 +1964,21 @@ async fn maybe_build_economy(
     let base = tinyplace_api_url
         .unwrap_or_else(|| crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string());
     let client = Arc::new(HttpTinyplaceClient::new(base, signer.clone()));
-    let economy = TinyplaceEconomy::new(
-        client,
-        signer,
-        store,
-        id.clone(),
-        manifest.budget.monthly_usd,
-    )
-    .going_public(going_public);
-    Some(Arc::new(economy))
+    let economy = Arc::new(
+        TinyplaceEconomy::new(
+            client,
+            signer,
+            store,
+            id.clone(),
+            manifest.budget.monthly_usd,
+        )
+        .going_public(going_public),
+    );
+    // Issue #454: attach the replayer while the concrete type is still in hand.
+    // Without this line the outbox has no drain, and `publish_card` knows it —
+    // it stops queuing and starts returning the unreachable error instead.
+    spawn_outbox_replayer(&economy, OUTBOX_REPLAY_INTERVAL);
+    Some(economy)
 }
 
 /// Default build: no tiny.place economy is linked.
@@ -2003,8 +2023,16 @@ async fn maybe_go_public(
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("http://{}", crate::app::config::DEFAULT_BIND));
             let card = build_agent_card(manifest, &base);
+            // Issue #454: an error here now means the card was NOT queued and
+            // nothing will retry it — the offline-but-recoverable case returns
+            // `Ok` and logs its own "queued for replay" line from the adapter, so
+            // the two are no longer the same message.
             if let Err(err) = economy.publish_card(&identity, &card).await {
-                tracing::warn!(company = %id, "tiny.place publish_card failed ({err}); card is stale");
+                tracing::warn!(
+                    company = %id,
+                    "tiny.place publish_card failed ({err}); the card was not queued for replay, \
+                     so the directory entry stays stale until the next boot"
+                );
             } else {
                 tracing::info!(company = %id, handle = %identity.handle, "tiny.place: discoverable (public)");
             }
@@ -3212,6 +3240,71 @@ mod test {
         assert!(runtime.has_economy());
         assert_eq!(mock.count("register_name"), 1, "boot claimed the handle");
         assert_eq!(mock.count("put_agent"), 1, "boot published the card");
+    }
+
+    /// Issue #454, at the construction path that actually runs in production.
+    ///
+    /// The economy above is *injected*, so it proves nothing about how a real
+    /// company's economy is assembled. This one goes through
+    /// [`maybe_build_economy`] — the only production builder of a
+    /// [`TinyplaceEconomy`] — and asserts the property that only holds when the
+    /// outbox replayer was attached before the type erasure: an offline
+    /// `publish_card` returns `Ok`, because there is now something that will send
+    /// the card it queued.
+    ///
+    /// **This test is the guard on that one line.** Delete
+    /// `spawn_outbox_replayer(&economy, …)` from `maybe_build_economy` and the
+    /// publish below returns `tinyplace_unreachable` instead — verified by doing
+    /// exactly that.
+    #[cfg(feature = "tinyplace")]
+    #[tokio::test]
+    async fn discoverable_path_builds_an_economy_that_can_degrade_offline() {
+        use crate::economy::build_agent_card;
+        use crate::ports::CompanyStore;
+        use crate::ports::types::CompanyIdentity;
+        use crate::store::FsCompanyStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = parse(
+            r#"
+            [company]
+            name = "Acme"
+            handle = "acme"
+            [place]
+            discoverable = true
+            "#,
+        );
+        let id = CompanyId::new("acme");
+        let store: Arc<dyn CompanyStore> = Arc::new(FsCompanyStore::new(dir.path().to_path_buf()));
+
+        // A port nothing listens on: every call is refused, which is exactly the
+        // `unreachable` condition the outbox exists for. Bound and released so
+        // the OS confirms it is free, rather than guessing a number.
+        let dead = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+
+        let economy = maybe_build_economy(
+            &manifest,
+            dir.path(),
+            &id,
+            store,
+            Some(format!("http://{dead}")),
+            true,
+        )
+        .await
+        .expect("a discoverable company with a handle gets an economy");
+
+        let identity = CompanyIdentity {
+            company: id.clone(),
+            handle: "acme".to_string(),
+        };
+        let card = build_agent_card(&manifest, "http://127.0.0.1:8080");
+        economy
+            .publish_card(&identity, &card)
+            .await
+            .expect("the built economy degrades offline, which it may only do with a replayer");
     }
 
     /// Spawns an in-process OpenAI-compatible stub that answers every

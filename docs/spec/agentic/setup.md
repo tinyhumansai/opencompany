@@ -17,7 +17,8 @@ the whole effective configuration — Charter, Roster, `[policy]`,
 `[[schedule]]`, draft `[place].skills` — and the interview questions become
 one part of its conversation.
 
-It is a cognition job on the [`Brain` port](../runtime/ports.md): a
+It is a cognition job on the
+[`Brain` port](../runtime/ports-cognition.md#brain): a
 dedicated onboarding session against hosted Medulla, with the Template
 library loaded as context. It registers **no effect-producing tools** — its
 only output channel is a Blueprint handed back to the runtime. It cannot

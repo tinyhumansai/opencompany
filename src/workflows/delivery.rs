@@ -74,6 +74,26 @@
 //! workflow mail on most companies and turn the established-thread gate into a
 //! suggestion. See `park_cold_recipient` below.
 //!
+//! # A report is delivered once per approval lineage (issue #438)
+//!
+//! Resuming a workflow gate is a **re-run**: the engine settles when it pauses,
+//! so continuing walks the graph again from the trigger and every `output` node
+//! upstream of the gate is reached a second time. Delivery is state-based — an
+//! established recipient stays established — so approving a gate used to mail
+//! the same report to the same person again, as a direct result of clicking
+//! Approve.
+//!
+//! [`deliver_outputs`] therefore takes a **delivery ledger**: the `{node, kind}`
+//! rows this lineage has already sent or parked, threaded onto the
+//! continuation's trigger input by the approval that started it (see
+//! [`crate::runtime::workflow_resume`]). A reached node on that list is skipped
+//! with [`DeliveryReason::AlreadyDelivered`] and nothing is dispatched.
+//!
+//! A `Pending` row counts as delivered, which closes a second hole in the same
+//! place: [`park_cold_recipient`] has no dedupe of its own, so a continuation
+//! used to stack a second identical cold-send card — and approving both would
+//! send the mail twice.
+//!
 //! # Failure is reported, never fatal
 //!
 //! A delivery failure must not fail a run that already did its work. Every
@@ -127,6 +147,7 @@ use crate::ports::{
 };
 use crate::runtime::cycle::EMAIL_SEND_KIND;
 use crate::runtime::journal::RuntimeJournal;
+use crate::runtime::workflow_resume::DeliveredReport;
 use crate::server::ops::mailer::{MailCredentials, OutboundEmail};
 use crate::server::ops::smtp::local_part;
 
@@ -215,11 +236,20 @@ impl std::fmt::Debug for WorkflowDeliveryDeps {
 /// Never returns an error: a delivery problem is data on the run result, not a
 /// failed run (see the module docs). Nodes with no `destination`, and nodes the
 /// run never reached, produce no rows at all.
+///
+/// `already_delivered` is this lineage's delivery ledger (issue #438): the
+/// reports a run *earlier in the same approval chain* already sent or parked. A
+/// reached node listed there is skipped with
+/// [`DeliveryReason::AlreadyDelivered`] and **nothing is dispatched** — it is
+/// empty on every run nobody resumed, so an ordinary run is untouched. See
+/// [`crate::runtime::workflow_resume`] for why a continuation reaches these
+/// nodes again at all.
 pub async fn deliver_outputs(
     delivery: Option<&WorkflowDeliveryDeps>,
     record: &CompanyRecord,
     workflow: &WorkflowFile,
     output: &Value,
+    already_delivered: &[DeliveredReport],
 ) -> Vec<DeliveryReport> {
     let mut reports = Vec::new();
 
@@ -244,6 +274,36 @@ pub async fn deliver_outputs(
                 node = %node.id,
                 "workflow delivery: output node not reached; nothing to deliver"
             );
+            continue;
+        }
+
+        // Issue #438: a run earlier in this approval lineage already delivered
+        // this node's report. The continuation reached the node again because
+        // resuming re-runs the graph from the trigger, not because anything is
+        // owed — so this is a skip with a reason, and **no dispatch of any
+        // kind**. Checked before the unwired-ports arm below on purpose: a
+        // report that already went out must not be reported as one this build
+        // could not send.
+        if already_delivered.iter().any(|prior| prior.node == node.id) {
+            tracing::info!(
+                company = %record.id,
+                workflow = %workflow.id,
+                node = %node.id,
+                kind = %destination.kind,
+                "workflow delivery: an earlier run in this approval lineage already delivered this \
+                 report; not sending it again"
+            );
+            reports.push(DeliveryReport {
+                node: node.id.clone(),
+                kind: destination.kind.clone(),
+                target: destination.target.clone(),
+                status: DeliveryStatus::Skipped,
+                detail: "this report was already delivered by an earlier run of this workflow — \
+                         approving a gate re-runs the graph from the start, and a report that has \
+                         already gone out is not sent a second time"
+                    .to_string(),
+                reason: DeliveryReason::AlreadyDelivered,
+            });
             continue;
         }
 
@@ -1264,6 +1324,7 @@ allow = [{allow}]
             &record(&[]),
             &graph("owner", None),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1322,6 +1383,7 @@ allow = [{allow}]
             &record(&[]),
             &graph("owner", None),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1343,6 +1405,7 @@ allow = [{allow}]
             &record(&[]),
             &graph("owner", None),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1367,6 +1430,7 @@ allow = [{allow}]
             &record(&[]),
             &graph("owner", None),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1389,6 +1453,7 @@ allow = [{allow}]
             &record(&[]),
             &graph("owner", None),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1412,6 +1477,7 @@ allow = [{allow}]
             &record(&["email.send"]),
             &graph("email", Some("ada@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1442,6 +1508,7 @@ allow = [{allow}]
             &record(&["docs.*", "web"]),
             &graph("email", Some("ada@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1470,6 +1537,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1504,6 +1572,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1549,6 +1618,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1608,6 +1678,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1657,6 +1728,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1684,6 +1756,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("ada@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1710,6 +1783,7 @@ allow = [{allow}]
             &record(&["docs.*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1734,6 +1808,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1768,6 +1843,7 @@ allow = [{allow}]
             &record(&["*"]),
             &graph("email", Some("ada@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1816,6 +1892,7 @@ mode = "full"
             &rec,
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1857,6 +1934,7 @@ mode = "full"
             &record(&["*"]),
             &graph("email", Some("stranger@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1877,6 +1955,7 @@ mode = "full"
             &record(&["*"]),
             &graph("email", Some("ada@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1902,6 +1981,7 @@ mode = "full"
             &record(&["*"]),
             &graph("email", Some("ada@example.com")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1956,6 +2036,7 @@ mode = "full"
             &record(&["*"]),
             &graph("email", Some(ADDRESS)),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -1992,6 +2073,7 @@ mode = "full"
             &record(&[]),
             &graph("channel", Some(OPERATOR_CHANNEL)),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -2015,6 +2097,7 @@ mode = "full"
             &record(&["*"]),
             &graph("channel", Some("telegram")),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -2057,6 +2140,7 @@ mode = "full"
             &record(&["*"]),
             &graph("owner", None),
             &output,
+            &[],
         )
         .await;
 
@@ -2090,8 +2174,14 @@ to = "done"
         )
         .expect("parses");
 
-        let reports =
-            deliver_outputs(Some(&h.deps), &record(&["*"]), &plain, &reached_output()).await;
+        let reports = deliver_outputs(
+            Some(&h.deps),
+            &record(&["*"]),
+            &plain,
+            &reached_output(),
+            &[],
+        )
+        .await;
         assert!(reports.is_empty(), "{reports:?}");
     }
 
@@ -2105,6 +2195,7 @@ to = "done"
             &record(&["*"]),
             &graph("owner", None),
             &reached_output(),
+            &[],
         )
         .await;
 
@@ -2117,6 +2208,147 @@ to = "done"
             reports[0].detail.contains("nothing was sent"),
             "{reports:?}"
         );
+    }
+
+    // --- issue #438: one delivery per approval lineage ------------------------
+
+    /// One ledger row naming `node`, as a continuation's trigger input carries.
+    fn already(node: &str, kind: &str) -> Vec<DeliveredReport> {
+        vec![DeliveredReport {
+            node: node.to_string(),
+            kind: kind.to_string(),
+        }]
+    }
+
+    /// **The regression.** A continuation reaches the same `output` node again,
+    /// and must not mail the report a second time. The row says so, and the
+    /// transport is never touched.
+    #[tokio::test]
+    async fn a_report_this_lineage_already_sent_is_not_sent_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path(), true, true);
+        h.add_admin("u1", "ada@acme.test").await;
+
+        let reports = deliver_outputs(
+            Some(&h.deps),
+            &record(&[]),
+            &graph("owner", None),
+            &reached_output(),
+            &already("done", "owner"),
+        )
+        .await;
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].status, DeliveryStatus::Skipped);
+        assert_eq!(reports[0].reason, DeliveryReason::AlreadyDelivered);
+        assert_eq!(reports[0].node, "done");
+        assert!(
+            h.mail.sent().is_empty(),
+            "the transport must never be reached: {:?}",
+            h.mail.sent()
+        );
+        assert!(h.channel.sent().is_empty());
+    }
+
+    /// A report the first run **parked** counts as delivered too. Otherwise
+    /// every continuation stacks a second identical cold-send card, and
+    /// approving both mails the stranger twice — `park_cold_recipient` has no
+    /// dedupe of its own.
+    #[tokio::test]
+    async fn a_report_this_lineage_already_parked_is_not_parked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path(), true, false).with_parking(dir.path(), "full");
+        // Cold: the company has never heard from this address.
+        let cold = graph("email", Some("stranger@example.test"));
+
+        let reports = deliver_outputs(
+            Some(&h.deps),
+            &record(&["email"]),
+            &cold,
+            &reached_output(),
+            &already("done", "email"),
+        )
+        .await;
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].status, DeliveryStatus::Skipped);
+        assert_eq!(reports[0].reason, DeliveryReason::AlreadyDelivered);
+        assert!(
+            h.journal
+                .as_ref()
+                .expect("parking wired")
+                .pending()
+                .is_empty(),
+            "a continuation must not stack a second card for one send"
+        );
+        assert!(h.mail.sent().is_empty());
+    }
+
+    /// The ledger suppresses the node it names and nothing else. A second
+    /// output node in the same graph still delivers — otherwise one earlier
+    /// send would silence the whole graph.
+    #[tokio::test]
+    async fn a_node_the_ledger_does_not_name_still_delivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path(), true, true);
+        h.add_admin("u1", "ada@acme.test").await;
+
+        let reports = deliver_outputs(
+            Some(&h.deps),
+            &record(&[]),
+            &graph("owner", None),
+            &reached_output(),
+            &already("some_other_node", "owner"),
+        )
+        .await;
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].status, DeliveryStatus::Sent);
+        assert_eq!(h.mail.sent().len(), 1);
+    }
+
+    /// A run nobody resumed carries an empty ledger, and behaves exactly as it
+    /// did before #438. Every other test in this module passes `&[]`, so this
+    /// states the invariant they all rely on.
+    #[tokio::test]
+    async fn a_run_with_no_ledger_delivers_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path(), true, true);
+        h.add_admin("u1", "ada@acme.test").await;
+
+        let reports = deliver_outputs(
+            Some(&h.deps),
+            &record(&[]),
+            &graph("owner", None),
+            &reached_output(),
+            &[],
+        )
+        .await;
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].status, DeliveryStatus::Sent);
+        assert_eq!(h.mail.sent().len(), 1);
+    }
+
+    /// An unreached node on the ledger produces no row at all: "not reached"
+    /// outranks "already delivered", because there was nothing to deliver this
+    /// time either way.
+    #[tokio::test]
+    async fn an_unreached_node_on_the_ledger_still_produces_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path(), true, true);
+        let unreached = serde_json::json!({ "nodes": { "start": { "items": [] } } });
+
+        let reports = deliver_outputs(
+            Some(&h.deps),
+            &record(&[]),
+            &graph("owner", None),
+            &unreached,
+            &already("done", "owner"),
+        )
+        .await;
+
+        assert!(reports.is_empty(), "{reports:?}");
     }
 
     // --- report extraction ---------------------------------------------------

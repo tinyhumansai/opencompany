@@ -45,7 +45,7 @@ sequence per company under the `CompanyRegistry`.
 ## Event → cycle loop
 
 All stimuli normalize to `CompanyEvent { source, kind, payload, correlation }`
-(variants in [ports.md](ports.md)). Per company there is **one serial cycle
+(variants in [events.md](events.md)). Per company there is **one serial cycle
 queue** — one cycle at a time, events batched/debounced between cycles;
 distinct companies run concurrently. A cycle
 ([company-brain/README.md](../company-brain/README.md)):

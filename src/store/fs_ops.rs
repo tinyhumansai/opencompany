@@ -37,7 +37,7 @@ use crate::ports::types::CompanyId;
 use crate::ports::usage::{UsageMeter, UsageSample, retention_cutoff};
 use crate::ports::users::{InviteRecord, UserRecord, UserStore};
 use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceStore};
-use crate::store::fs::{PathLocks, append_line, io_err, read_jsonl, read_optional, write_atomic};
+use crate::store::fs::{append_line, io_err, path_lock, read_jsonl, read_optional, write_atomic};
 use crate::store::paths::Bundle;
 
 /// One filesystem store implementing every WS3 console port over a company
@@ -46,16 +46,12 @@ use crate::store::paths::Bundle;
 #[derive(Clone)]
 pub struct FsOps {
     root: PathBuf,
-    locks: PathLocks,
 }
 
 impl FsOps {
     /// Creates an ops store rooted at `root` (the OpenCompany home).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            locks: PathLocks::default(),
-        }
+        Self { root: root.into() }
     }
 
     fn bundle(&self, id: &CompanyId) -> Bundle {
@@ -79,7 +75,7 @@ impl TaskStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.tasks_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut tasks = load_json_vec::<TaskRecord>(&path).await?;
         match tasks.iter_mut().find(|t| t.id == task.id) {
@@ -91,7 +87,7 @@ impl TaskStore for FsOps {
 
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).tasks_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut tasks = load_json_vec::<TaskRecord>(&path).await?;
         let before = tasks.len();
@@ -136,7 +132,7 @@ impl UserStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.users_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut users = load_json_vec::<UserRecord>(&path).await?;
         // Email is unique per company: a second id holding one address would
@@ -160,7 +156,7 @@ impl UserStore for FsOps {
 
     async fn delete_user(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).users_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut users = load_json_vec::<UserRecord>(&path).await?;
         let before = users.len();
@@ -193,7 +189,7 @@ impl UserStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.user_invites_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut invites = load_json_vec::<InviteRecord>(&path).await?;
         if invites
@@ -214,7 +210,7 @@ impl UserStore for FsOps {
 
     async fn delete_invite(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).user_invites_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut invites = load_json_vec::<InviteRecord>(&path).await?;
         let before = invites.len();
@@ -237,7 +233,7 @@ impl SessionStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.user_sessions_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
         // A repeated token hash would mean the CSPRNG repeated (or a caller
@@ -275,7 +271,7 @@ impl SessionStore for FsOps {
 
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).user_sessions_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
         let before = sessions.len();
@@ -289,7 +285,7 @@ impl SessionStore for FsOps {
 
     async fn delete_for_user(&self, company: &CompanyId, user_id: &str) -> Result<u64> {
         let path = self.bundle(company).user_sessions_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
         let before = sessions.len();
@@ -303,7 +299,7 @@ impl SessionStore for FsOps {
 
     async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
         let path = self.bundle(company).user_sessions_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut sessions = load_json_vec::<SessionRecord>(&path).await?;
         let before = sessions.len();
@@ -326,7 +322,7 @@ impl LoginCodeStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.login_codes_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
         codes.push(code.clone());
@@ -357,7 +353,7 @@ impl LoginCodeStore for FsOps {
         // on one code cannot both mint a session. This holds within a process;
         // the fs backend is single-process by construction (one bundle, one
         // host), which is the same assumption every other fs store makes.
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
         let Some(code) = codes
@@ -374,7 +370,7 @@ impl LoginCodeStore for FsOps {
 
     async fn delete_for_email(&self, company: &CompanyId, email: &str) -> Result<u64> {
         let path = self.bundle(company).login_codes_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
         let before = codes.len();
@@ -388,7 +384,7 @@ impl LoginCodeStore for FsOps {
 
     async fn purge_expired(&self, company: &CompanyId, now_millis: u64) -> Result<u64> {
         let path = self.bundle(company).login_codes_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut codes = load_json_vec::<LoginCodeRecord>(&path).await?;
         let before = codes.len();
@@ -431,7 +427,7 @@ impl FactStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.facts_jsonl();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut facts = dedup_latest(read_jsonl::<FactRecord>(&path).await?);
         match facts.iter_mut().find(|f| f.id == fact.id) {
@@ -443,7 +439,7 @@ impl FactStore for FsOps {
 
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).facts_jsonl();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut facts = dedup_latest(read_jsonl::<FactRecord>(&path).await?);
         let before = facts.len();
@@ -488,7 +484,7 @@ impl ArtifactStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.artifacts_jsonl();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut artifacts = dedup_latest(read_jsonl::<ArtifactRecord>(&path).await?);
         match artifacts.iter_mut().find(|a| a.id == artifact.id) {
@@ -500,7 +496,7 @@ impl ArtifactStore for FsOps {
 
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).artifacts_jsonl();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut artifacts = dedup_latest(read_jsonl::<ArtifactRecord>(&path).await?);
         let before = artifacts.len();
@@ -527,7 +523,7 @@ impl RunStore for FsOps {
         // process-local — the documented fs-backend assumption everywhere in
         // this file — which is why the port's `create_run` contract calls the
         // filesystem ordinal best-effort rather than transactional.
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut runs = dedup_latest(read_jsonl::<RunRecord>(&path).await?);
         if runs.iter().any(|r| r.id == spec.id) {
@@ -572,7 +568,7 @@ impl RunStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.runs_jsonl();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut runs = dedup_latest(read_jsonl::<RunRecord>(&path).await?);
         match runs.iter_mut().find(|r| r.id == run.id) {
@@ -598,7 +594,7 @@ impl RunStore for FsOps {
         bundle.ensure_dirs().await?;
         let path = bundle.run_steps_jsonl();
         let line = serde_json::to_string(step)?;
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         // A genuine append: the trace only ever grows, and a replayed
         // `(run_id, step_seq)` is folded out at read time rather than by
@@ -627,7 +623,7 @@ impl UsageMeter for FsOps {
         bundle.ensure_dirs().await?;
         let path = bundle.usage_jsonl();
         let line = serde_json::to_string(sample)?;
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         append_line(&path, &line).await?;
         // Retention: compact `usage.jsonl` in place when it holds samples older
@@ -671,7 +667,7 @@ impl SkillStateStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.skills_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut states = load_json_vec::<SkillState>(&path).await?;
         match states.iter_mut().find(|s| s.slug == state.slug) {
@@ -683,7 +679,7 @@ impl SkillStateStore for FsOps {
 
     async fn remove(&self, company: &CompanyId, slug: &str) -> Result<bool> {
         let path = self.bundle(company).skills_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut states = load_json_vec::<SkillState>(&path).await?;
         let before = states.len();
@@ -723,7 +719,7 @@ impl WorkspaceStore for FsOps {
 
     async fn write(&self, company: &CompanyId, id: &str, content: &str) -> Result<WorkspaceNode> {
         let path = self.bundle(company).workspace_index_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut index = self.load_index(company).await?;
         let node = index
@@ -759,7 +755,7 @@ impl WorkspaceStore for FsOps {
         let bundle = self.bundle(company);
         bundle.ensure_dirs().await?;
         let path = bundle.workspace_index_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut index = self.load_index(company).await?;
         if index.contains_key(&node.id) {
@@ -816,7 +812,7 @@ impl WorkspaceStore for FsOps {
             reject_unsafe_name(name)?;
         }
         let path = self.bundle(company).workspace_index_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut index = self.load_index(company).await?;
         if !index.contains_key(id) {
@@ -869,7 +865,7 @@ impl WorkspaceStore for FsOps {
 
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).workspace_index_json();
-        let lock = self.locks.get(&path);
+        let lock = path_lock(&path);
         let _guard = lock.lock().await;
         let mut index = self.load_index(company).await?;
         if !index.contains_key(id) {

@@ -489,6 +489,11 @@ const INTRINSIC_TOOLS: &[&str] = &[
     "run_workflow",
     "create_workflow",
     "add_agent",
+    // #186's pair. Missing here until #461 noticed the drift, so an
+    // `assign_task` / `review_task` refusal ("agent is not on the roster")
+    // rendered as a bare class instead of the sentence the tool wrote.
+    "assign_task",
+    "review_task",
 ];
 
 /// Bound on an OC-authored message surfaced as a step result.
@@ -834,6 +839,40 @@ mod tests {
              Workaround: Ask the user to approve this action, then retry. \
              Relay this to the user: explain what was blocked and why."
         )
+    }
+
+    /// The lockstep [`INTRINSIC_TOOLS`] claims, made mechanical. Every
+    /// orchestrator tool name is a `pub const`, so drift between the two lists
+    /// now fails here instead of silently downgrading a tool's own sentence to
+    /// a bare failure class (which is how `assign_task` / `review_task` sat
+    /// missing from #186 until #461).
+    #[test]
+    fn intrinsic_tools_covers_every_orchestrator_tool() {
+        use crate::harness::orchestrator::{
+            ADD_AGENT_TOOL, ASSIGN_TASK_TOOL, CREATE_WORKFLOW_TOOL, QUERY_COMPANY_TOOL,
+            REVIEW_TASK_TOOL, RUN_WORKFLOW_TOOL,
+        };
+        use crate::runtime::delegation_tools::{DELEGATE_TO_DESK_TOOL, SPAWN_TASK_TOOL};
+
+        let expected = [
+            QUERY_COMPANY_TOOL,
+            SPAWN_TASK_TOOL,
+            DELEGATE_TO_DESK_TOOL,
+            RUN_WORKFLOW_TOOL,
+            CREATE_WORKFLOW_TOOL,
+            ADD_AGENT_TOOL,
+            ASSIGN_TASK_TOOL,
+            REVIEW_TASK_TOOL,
+        ];
+        for name in expected {
+            assert!(
+                INTRINSIC_TOOLS.contains(&name),
+                "{name} is wired by `orchestrator_tools` but absent from INTRINSIC_TOOLS"
+            );
+        }
+        // Exact, not just covering: a name here that no longer exists upstream
+        // would surface a stale tool's output as OC-authored copy.
+        assert_eq!(INTRINSIC_TOOLS.len(), expected.len(), "{INTRINSIC_TOOLS:?}");
     }
 
     /// Reads a file out of the vendored OpenHuman checkout, for the tests that

@@ -368,12 +368,39 @@ async fn run_workflow_inner(
         }
     };
 
+    // Route every reached `output` node's report to its configured destination.
+    // Deliberately here rather than in the HTTP handler: the orchestrator's
+    // `run_workflow` tool and the trigger scheduler drive this same path, and a
+    // scheduled run is exactly the case where nobody is watching the console's
+    // run-result drawer. Never fails the run — each attempt is reported instead.
+    //
+    // Issue #438: `already_delivered` is what a continuation must NOT send
+    // again. It is read off the trigger input, where the approval that started
+    // this run threaded it — an empty list on a run nobody resumed, so a
+    // first-run delivery is untouched.
+    let already_delivered = crate::runtime::workflow_resume::delivered_in_input(&trigger_input);
+    let deliveries = super::delivery::deliver_outputs(
+        delivery.as_ref(),
+        record,
+        workflow,
+        &outcome.output,
+        &already_delivered,
+    )
+    .await;
+
     // Issue #395: turn every gate the engine paused on into a decidable
     // approval. Deliberately here, beside the delivery call and for the same
     // reason: all three entry points — the console route, the cron scheduler,
     // and the orchestrator's `run_workflow` tool — come through this function,
     // and a scheduled run is exactly the case where nobody is watching the
     // response that used to be the only place these ids appeared.
+    //
+    // **After delivery, and that ordering is load-bearing** (issue #438). The
+    // parked card carries the ledger of what this run delivered, so it can only
+    // be built once delivery has happened. Nothing is lost by the swap: the two
+    // steps are independent — parking reads `pending_approvals` and delivery
+    // reads reached `output` nodes, and a node past a gate was never reached, so
+    // no delivery could ever depend on a gate having been parked first.
     //
     // Skipped for a cancelled run, which returns above: an operator who stopped
     // a run is not asking to be asked about the gates it never reached.
@@ -384,17 +411,9 @@ async fn run_workflow_inner(
         &run_id,
         &trigger_input,
         &outcome.pending_approvals,
+        &deliveries,
     )
     .await;
-
-    // Route every reached `output` node's report to its configured destination.
-    // Deliberately here rather than in the HTTP handler: the orchestrator's
-    // `run_workflow` tool and the trigger scheduler drive this same path, and a
-    // scheduled run is exactly the case where nobody is watching the console's
-    // run-result drawer. Never fails the run — each attempt is reported instead.
-    let deliveries =
-        super::delivery::deliver_outputs(delivery.as_ref(), record, workflow, &outcome.output)
-            .await;
 
     Ok(WorkflowRun {
         output: outcome.output,
@@ -432,6 +451,13 @@ async fn run_workflow_inner(
 /// queue fills with identical cards for one decision — which is exactly how an
 /// operator learns to rubber-stamp the queue. Identity is the gate, not the run;
 /// see [`already_parked`](crate::runtime::workflow_resume::already_parked).
+///
+/// # The delivery ledger (issue #438)
+///
+/// `deliveries` is what this run actually routed, and it rides the card so the
+/// continuation an approval starts knows what has already left the process.
+/// Without it, approving a gate re-mails every report upstream of it — the
+/// re-run semantics above applied to a side effect that reaches a real person.
 async fn park_pending_gates(
     delivery: Option<&super::delivery::WorkflowDeliveryDeps>,
     record: &CompanyRecord,
@@ -439,6 +465,7 @@ async fn park_pending_gates(
     run_id: &str,
     trigger_input: &Value,
     pending: &[String],
+    deliveries: &[crate::ports::DeliveryReport],
 ) {
     if pending.is_empty() {
         return;
@@ -464,6 +491,7 @@ async fn park_pending_gates(
             node_id,
             trigger_input,
             run_id,
+            deliveries,
         );
         if crate::runtime::workflow_resume::already_parked(&parking.journal, &effect) {
             tracing::debug!(
@@ -2049,6 +2077,195 @@ to = "done"
         .expect("run completes");
         assert!(run.pending_approvals.is_empty());
         assert!(journal.pending().is_empty());
+    }
+
+    // --- #438: a report is delivered once per approval lineage ---------------
+
+    /// A graph that **delivers before it pauses**: the report goes out, then the
+    /// gate stops the run. This is the shape that made approving a gate mail the
+    /// same person twice, and it is not exotic — "summarise, send it, then ask
+    /// me before doing the irreversible thing" is an ordinary workflow.
+    const DELIVER_THEN_GATE: &str = r#"
+id = "lineage"
+name = "Lineage"
+[[node]]
+id = "start"
+kind = "trigger"
+name = "Start"
+[[node]]
+id = "summary"
+kind = "output"
+name = "Owner summary"
+[node.destination]
+kind = "owner"
+[[node]]
+id = "gate"
+kind = "output"
+name = "Gate"
+requires_approval = true
+[[edge]]
+from = "start"
+to = "summary"
+[[edge]]
+from = "summary"
+to = "gate"
+"#;
+
+    /// Deps with a real approvals queue **and** a counting mail sender, plus an
+    /// active admin so an `owner` destination resolves to a real address.
+    ///
+    /// The mail sender is the instrument the whole test rests on: the claim is
+    /// not "the row says skipped", it is "the transport was called exactly
+    /// once across the entire lineage".
+    async fn deps_with_parking_and_mail(
+        dir: &std::path::Path,
+    ) -> (
+        HarnessDeps,
+        Arc<crate::runtime::journal::RuntimeJournal>,
+        crate::server::ops::mailer::RecordingMailSender,
+    ) {
+        use crate::ports::{UserRecord, UserRole, UserStatus, UserStore};
+
+        let users = Arc::new(FsOps::new(dir));
+        users
+            .upsert_user(
+                &CompanyId::new("acme"),
+                &UserRecord {
+                    id: "u1".to_string(),
+                    email: "ada@acme.test".to_string(),
+                    display_name: None,
+                    role: UserRole::Admin,
+                    status: UserStatus::Active,
+                    password_hash: None,
+                    must_change_password: false,
+                    created_at_millis: 1,
+                    last_seen_at_millis: None,
+                    updated_at_millis: 1,
+                },
+            )
+            .await
+            .expect("admin upserted");
+
+        let mail = crate::server::ops::mailer::RecordingMailSender::new();
+        let policy = toml::from_str("mode = \"full\"\n").expect("valid [policy] block");
+        let journal = Arc::new(crate::runtime::journal::RuntimeJournal::new(
+            dir.join("journal.jsonl"),
+        ));
+        let mut deps = deps(dir);
+        deps.delivery = Some(super::super::delivery::WorkflowDeliveryDeps {
+            mail: Some(crate::company::runtime::CompanyMail {
+                sender: Arc::new(mail.clone()),
+                smtp: crate::server::ops::smtp::SmtpCredentials {
+                    host: "smtp.example.test".into(),
+                    port: 587,
+                    security: crate::server::ops::smtp::SmtpSecurity::Starttls,
+                    username: "acme".into(),
+                    password: "hunter2".into(),
+                    from_name: "Acme".into(),
+                    from_email: "acme@opencompany.test".into(),
+                },
+            }),
+            inbox: Arc::new(crate::store::FsInboxStore::new(dir)),
+            users,
+            channels: Vec::new(),
+            parking: Some(super::super::delivery::DeliveryParking {
+                approvals: Arc::new(crate::policy::ManifestApprovalGate::new(policy)),
+                journal: journal.clone(),
+            }),
+        });
+        (deps, journal, mail)
+    }
+
+    /// **The headline regression for issue #438.** Across a whole lineage — the
+    /// run that paused plus the continuation an approval starts — the report is
+    /// delivered exactly **once**.
+    ///
+    /// Counted at the transport, not at the row: a `skipped` row proves the
+    /// bookkeeping, and only the send count proves nobody's inbox was touched
+    /// twice. Before the fix this test reads `2` on the last assertion.
+    ///
+    /// The continuation is built by
+    /// [`continuation_input`](crate::runtime::workflow_resume::continuation_input)
+    /// — the same function the Approvals path calls — rather than assembled
+    /// here, so what is proven is the production path and not a lookalike. The
+    /// approvals plumbing on either side of it (the card is parked, approving
+    /// resolves it and spawns) is pinned by `workflow_resume`'s own suite.
+    #[tokio::test]
+    async fn a_report_is_delivered_once_across_a_gate_and_its_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, journal, mail) = deps_with_parking_and_mail(dir.path()).await;
+        let file = parse_workflow(DELIVER_THEN_GATE).expect("parses");
+
+        // --- run 1: the report goes out, then the run pauses on the gate.
+        let first = run_workflow(
+            Arc::new(HarnessPool::new()),
+            deps.clone(),
+            &record(),
+            &file,
+            serde_json::json!({ "request": "quarterly numbers" }),
+            &WorkflowRunContext::new(false),
+        )
+        .await
+        .expect("run pauses cleanly");
+
+        assert!(
+            first.pending_approvals.iter().any(|id| id == "gate"),
+            "the run must pause on the gate: {:?}",
+            first.pending_approvals
+        );
+        assert_eq!(first.deliveries.len(), 1, "{:?}", first.deliveries);
+        assert_eq!(
+            first.deliveries[0].status,
+            crate::ports::DeliveryStatus::Sent
+        );
+        assert_eq!(mail.sent().len(), 1, "run 1 sends the report once");
+
+        // --- the operator approves: the card becomes a continuation input.
+        let card = journal
+            .pending()
+            .into_iter()
+            .find(|p| p.effect.kind == crate::runtime::WORKFLOW_APPROVE_KIND)
+            .expect("the paused gate is waiting on the operator")
+            .effect;
+        let continuation = crate::runtime::workflow_resume::continuation_input(&card)
+            .expect("a well-formed card continues");
+
+        // --- run 2: the same graph, from the trigger, with the gate approved.
+        let second = run_workflow(
+            Arc::new(HarnessPool::new()),
+            deps,
+            &record(),
+            &file,
+            continuation,
+            &WorkflowRunContext::new(false),
+        )
+        .await
+        .expect("the continuation runs");
+
+        // The whole point, in one number — asserted FIRST, so a regression
+        // fails on the send count itself rather than on the bookkeeping that
+        // describes it.
+        assert_eq!(
+            mail.sent().len(),
+            1,
+            "one report, one send, across the whole lineage: {:?}",
+            mail.sent()
+        );
+
+        assert!(
+            second.pending_approvals.is_empty(),
+            "the approved gate must not pause again: {:?}",
+            second.pending_approvals
+        );
+        assert_eq!(second.deliveries.len(), 1, "{:?}", second.deliveries);
+        assert_eq!(
+            second.deliveries[0].status,
+            crate::ports::DeliveryStatus::Skipped
+        );
+        assert_eq!(
+            second.deliveries[0].reason,
+            crate::ports::DeliveryReason::AlreadyDelivered
+        );
     }
 
     // --- issue #371: the per-node progress trail -----------------------------

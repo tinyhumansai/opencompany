@@ -750,6 +750,12 @@ working on):\n{}\n]",
             // reply lands back in that conversation. Read off the retained
             // origin, exactly as `mint_grant` does.
             origin_thread: self.rt.journal.approval_thread(id).flatten(),
+            // Issue #457: which slice of the tool the card was actually about.
+            // Read off the **parked effect's own payload** — the arguments the
+            // operator was shown — rather than re-derived from anything live, so
+            // the grant records the sentence they consented to. `None` for every
+            // tool whose name is the whole of what it can do.
+            scope: crate::policy::consequence::standing_scope_of(&effect.kind, &effect.payload),
         };
         self.rt.journal.record_standing_granted(&grant).await?;
         tracing::debug!(
@@ -5084,6 +5090,71 @@ mod test {
         assert_eq!(
             listed[0].granted_by.id, "owner",
             "the resolving actor is recorded, not a placeholder"
+        );
+    }
+
+    /// Issue #457: the grant records **which provider the card was about**.
+    ///
+    /// `composio_execute` carries every action of every connected toolkit under
+    /// one name, so a grant that recorded only the name turned "read from
+    /// GitHub" — the sentence on the card — into "make any Composio read,
+    /// anywhere". The toolkit is read off the parked effect's own payload, so
+    /// what is stored is what the operator was shown.
+    ///
+    /// Gated on the harness feature because the toolkit comes from the vendored
+    /// catalogue; the default build cannot mint a Composio standing grant at all
+    /// (every action reads as a send there), which
+    /// `without_the_catalogue_every_composio_action_is_a_send` pins.
+    #[tokio::test]
+    #[cfg(feature = "openhuman")]
+    async fn a_standing_grant_on_a_composio_read_records_the_toolkit_it_was_shown_for() {
+        let home_dir = tmp_home();
+        let (rt, id) = park_one_blocked_tool_call(
+            home_dir.path().to_path_buf(),
+            grantable_effect(
+                "ops",
+                crate::policy::consequence::COMPOSIO_EXECUTE,
+                serde_json::json!({ "tool": "GITHUB_LIST_PULL_REQUESTS" }),
+            ),
+        )
+        .await;
+
+        let (_, follow_up) = rt
+            .resolve_approval_spawned(&id, Verdict::Approve, operator(), tool_scope())
+            .await
+            .unwrap();
+        let _ = crate::company::runtime::join_follow_up(follow_up).await;
+
+        let listed = rt.standing_grants();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].scope.as_deref(),
+            Some("github"),
+            "the grant has to remember which account the operator was looking at"
+        );
+    }
+
+    /// The counterpart: a tool whose name already is the whole of what it can do
+    /// records no scope, so its grant matches exactly as it always did.
+    #[tokio::test]
+    async fn a_standing_grant_on_an_ordinary_tool_records_no_scope() {
+        let home_dir = tmp_home();
+        let (rt, id) = park_one_blocked_tool_call(
+            home_dir.path().to_path_buf(),
+            grantable_effect("ops", "file_write", serde_json::json!({ "path": "a" })),
+        )
+        .await;
+
+        let (_, follow_up) = rt
+            .resolve_approval_spawned(&id, Verdict::Approve, operator(), tool_scope())
+            .await
+            .unwrap();
+        let _ = crate::company::runtime::join_follow_up(follow_up).await;
+
+        assert_eq!(
+            rt.standing_grants()[0].scope,
+            None,
+            "there is nothing to narrow `file_write` to"
         );
     }
 

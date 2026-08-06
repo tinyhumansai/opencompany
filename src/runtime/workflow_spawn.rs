@@ -15,16 +15,27 @@
 //! `spawn_workflow_run`. Issue #395 added a second entry point — resuming a
 //! `requires_approval` node the operator signed off, which is a **new run** and
 //! therefore owes the same two things — and a second copy of a rule this
-//! specific is a rule that drifts. So it moves here, and both callers construct
+//! specific is a rule that drifts. So it moves here, and every caller constructs
 //! a [`WorkflowSpawn`] instead.
 //!
-//! # What this deliberately does not own
+//! # The cron scheduler too (issue #440)
 //!
-//! The cron [`WorkflowScheduler`](super::WorkflowScheduler) keeps its own spawn
-//! body. It wraps the same two steps in a schedule *claim* and a per-delivery
-//! log sweep that only make sense for a fire nobody is watching, and folding
-//! those in here would make this helper a union of two jobs rather than the
-//! shared floor of one. It is a candidate for a later pass, not this one.
+//! The cron [`WorkflowScheduler`](super::WorkflowScheduler) used to keep its own
+//! spawn body, on the argument that its schedule *claim* and its per-delivery
+//! log sweep would make this helper a union of two jobs. That argument was
+//! wrong about where the seam is. The claim and the sweep are the scheduler's
+//! and stay there — it takes the claim before starting, holds it across an
+//! **awaited** [`spawn`](Self::spawn) handle, and folds the returned outcome
+//! into its host-stdout summary. What it no longer keeps is a second copy of
+//! the two rules above.
+//!
+//! The copies agreed at the time, and that is precisely what made them
+//! dangerous: two identical implementations of a discipline mean a fix to
+//! either one silently misses the other, with nothing failing to say so.
+//!
+//! Awaiting the handle is what makes that sharing work for a scheduled fire:
+//! the outcome is journaled inside the task, so by the time the handle resolves
+//! the record exists and the claim can be released.
 //!
 //! # Owned parts, not the runtime
 //!
@@ -84,10 +95,12 @@ impl WorkflowSpawn {
     /// was.
     ///
     /// The returned [`JoinHandle`] may be awaited (the console's synchronous
-    /// mode) or dropped (its detached mode, and the resume arm). Dropping it
-    /// abandons the *waiting*, never the work: the task holds its own guard,
-    /// journals its own outcome, and deregisters itself on every exit path
-    /// including an unwind.
+    /// mode, and the cron scheduler, which has to hold its overlap claim for
+    /// the length of the run) or dropped (the console's detached mode, and the
+    /// resume arm). Dropping it abandons the *waiting*, never the work: the
+    /// task holds its own guard, journals its own outcome, and deregisters
+    /// itself on every exit path including an unwind. Awaiting it therefore
+    /// resolves only once the outcome is already durable.
     pub fn spawn(
         self,
         workflow: WorkflowFile,

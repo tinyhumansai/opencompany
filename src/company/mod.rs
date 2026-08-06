@@ -8,6 +8,11 @@
 pub mod composio;
 #[cfg(test)]
 mod content_test;
+// The workflow copilot's thread convention (issues #303, #416). Always
+// compiled and openhuman-free: the chat handler reads it in every build to keep
+// a copilot question from opening a board card, and the harness reads the same
+// function to decide that a turn runs confined.
+pub mod copilot;
 // How this instance obtains its TinyHumans credential (projected, rotating
 // platform token vs a static key). Always compiled: the answer decides whether a
 // company can think at all, in every build.

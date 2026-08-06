@@ -146,6 +146,7 @@ export function WorkflowsView({
   sub = null,
   runEventTick = 0,
   runEvents = EMPTY_RUN_EVENTS,
+  listEventTick = 0,
 }: {
   client: OpenCompanyClient;
   company: string | null;
@@ -180,6 +181,20 @@ export function WorkflowsView({
    * coalesced render can never lose a node.
    */
   runEvents?: CompanyStreamEvent[];
+  /**
+   * Bumped by the shell on every workflow **authoring** frame —
+   * `workflow_created`, `workflow_updated`, `workflow_deleted` (issue #384) —
+   * so the picker follows what the host holds while this tab stays open.
+   *
+   * Distinct from `runEventTick`, which is about what a run did. A workflow the
+   * orchestrator authored (or a second session deleted) changes which entries
+   * exist, and nothing else would tell this view that.
+   *
+   * A counter, not the payload: it re-reads the list, and the list is the
+   * answer to all three frames — including the delete, which is simply an entry
+   * the fresh list no longer has.
+   */
+  listEventTick?: number;
 }) {
   const { resolvedTheme } = useTheme();
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
@@ -329,34 +344,107 @@ export function WorkflowsView({
   const appliedWorkflowRef = useRef<string | null>(null);
   const appliedRunRef = useRef<string | null>(null);
 
-  // Load the workflow list once, and auto-select the first entry.
+  // How many local writes have landed. Compared across the list effect's await
+  // so a `GET …/workflows` that was already in flight when a create, save or
+  // delete completed cannot paint the picker with rows that predate it — the
+  // entry the operator just made vanishing again, or the one they just deleted
+  // coming back, until some later frame happened to correct it.
+  //
+  // Only reachable now that this effect re-runs on a live frame: it used to run
+  // on mount and on a company switch, neither of which races an authoring
+  // action. Nothing is lost by discarding such a response — the local handler
+  // has already applied the newer truth, and each of these writes emits its own
+  // frame, which brings a fresh list along behind it.
+  const localWriteRef = useRef(0);
+
+  // The id the list effect moved the selection to ON THE OPERATOR'S BEHALF —
+  // a correction, not a navigation.
+  //
+  // The hash mirror below pushes a history entry whenever the selection moves
+  // between two named workflows, which was right while only an operator action
+  // could move it. A live delete moves it too, and pushing that leaves a place
+  // the operator never went in their history: one Back press onto a URL naming
+  // a workflow the host no longer has. The view does not even correct itself
+  // there — the URL-follow effect treats an id it has already applied as an
+  // echo and leaves it alone (which is also why no error toast appears, the
+  // route by which that would fire being closed by the same guard) — so the
+  // address bar names one graph while the canvas shows another, and that
+  // address is what the operator would copy out and share.
+  //
+  // Holds the id rather than a bare flag so a marker that outlives its render
+  // cannot suppress an unrelated push later — it counts only when it names the
+  // very selection the mirror is about to write.
+  const reconciledSelectionRef = useRef<string | null>(null);
+
+  // Load the workflow list, and auto-select the first entry.
+  //
+  // Re-runs on `listEventTick` (issue #384), i.e. whenever the host says a
+  // workflow was created, edited or deleted anywhere — the orchestrator's
+  // `create_workflow` tool, a second console session, a machine credential.
+  // Before that this ran on mount and on a company switch only, so the picker
+  // silently drifted from the host for the whole life of the tab.
+  //
+  // Re-reading the list is also what makes a **delete** land properly rather
+  // than greying an entry out: the selection reconciliation below drops an id
+  // the fresh list no longer has, which moves the canvas off a graph the host
+  // does not hold and takes the entry out of the picker in the same pass. No
+  // spinner and no flash — `loadingList` is not raised again, so the picker
+  // just changes.
   useEffect(() => {
     let live = true;
     (async () => {
+      const writesBefore = localWriteRef.current;
       try {
         const rows = await listWorkflows(client, company);
         if (!live) return;
+        // A local write landed while this request was in flight. It holds the
+        // newer truth and these rows predate it, so they are dropped rather
+        // than allowed to undo it.
+        if (localWriteRef.current !== writesBefore) return;
         setWorkflows(rows);
         setSelectedId((prev) => {
-          // Issue #339: a workflow id in the URL outranks both the held
-          // selection and the first-row default — the operator followed a link
-          // to *that* graph. Resolved here rather than left to the follow
-          // effect below purely to avoid the flash: selecting `rows[0]` first
-          // and correcting a render later would fetch a graph nobody asked for
-          // and show the wrong name in the picker on the way past.
+          // Keep the selection when the freshly loaded list still has it —
+          // otherwise a stale id would leave the canvas on a graph the host
+          // does not hold. One rule, two cases: a leftover id from the previous
+          // company (this effect reruns on a switch), and the workflow on
+          // screen being deleted from somewhere else (issue #384, this effect
+          // reruns on the frame).
+          //
+          // Held selection BEFORE the URL, and that ordering is load-bearing
+          // for #384 without costing #339 anything. On mount `prev` is null, so
+          // a link still lands on the graph it names, flash-free — which is all
+          // #339 asked for here, changes after mount being the follow effect's
+          // job. But this effect now also reruns on a *live* frame, and the
+          // hash trails the selection by a `hashchange`: reading the URL first
+          // would let a frame arriving inside that gap — the console's own
+          // `workflow_created`, for instance — snap the operator back off the
+          // workflow they just made.
+          if (prev && rows.some((r) => r.id === prev)) return prev;
+          // Issue #339: a workflow id in the URL outranks the first-row
+          // default — the operator followed a link to *that* graph, and
+          // selecting `rows[0]` first and correcting a render later would fetch
+          // a graph nobody asked for and show the wrong name on the way past.
           //
           // `requestedWorkflowId` is read from the closure and deliberately NOT
           // a dependency: it changes on every picker click (the writer below
           // mirrors the selection into the hash), and re-running this would
-          // spend a full list round trip on each one. Changes after mount are
-          // the follow effect's job.
+          // spend a full list round trip on each one.
           if (requestedWorkflowId && rows.some((r) => r.id === requestedWorkflowId)) {
             return requestedWorkflowId;
           }
-          // Keep the selection only if it still exists in the freshly loaded list
-          // (this effect also reruns on company change) — otherwise a stale id
-          // from the previous company would fetch the wrong/nonexistent graph.
-          return prev && rows.some((r) => r.id === prev) ? prev : (rows[0]?.id ?? null);
+          // Nothing valid to keep: fall to the first remaining entry, exactly
+          // as the local Delete button does — so a workflow deleted from
+          // another session and one deleted from this button leave the view in
+          // the same place. A company whose last workflow just went away
+          // selects nothing, and the canvas empties.
+          //
+          // Marked as a reconciliation so the hash mirror replaces rather than
+          // pushes: nobody navigated here, the workflow they were on stopped
+          // existing. Writing the same id twice (React re-invokes an updater in
+          // StrictMode) says the same thing twice.
+          const fallback = rows[0]?.id ?? null;
+          reconciledSelectionRef.current = fallback;
+          return fallback;
         });
         setError(null);
       } catch (e) {
@@ -372,7 +460,7 @@ export function WorkflowsView({
     // `requestedWorkflowId` is read above but deliberately not a dependency —
     // see the comment at the read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, company]);
+  }, [client, company, listEventTick]);
 
   // Issue #339: follow the URL while the view stays mounted — the operator
   // clicks a second task card's link without ever leaving this tab, so the
@@ -413,13 +501,25 @@ export function WorkflowsView({
   // to a different workflow the query is dropped, which is correct — that run
   // belongs to the graph being left behind.
   //
-  // Replace vs push is decided by whether the hash already names a workflow.
+  // Replace vs push is decided by whether the hash already names a workflow,
+  // and by whether the operator moved the selection at all.
+  //
   // Filling in a bare `#/workflows` is this view resolving its own default, not
   // a place the operator has been — pushing it would put an entry in the
   // history stack that looks identical to the one before it, so their first
   // Back press out of the tab would appear to do nothing. Moving from one named
   // workflow to another IS a navigation they took, and Back should undo it.
+  //
+  // A reconciliation is neither: the workflow they were on stopped existing and
+  // the list effect moved them off it (issue #384). Pushing that would offer
+  // Back as a route to a workflow that is gone — see `reconciledSelectionRef`
+  // for why the view does not even correct itself once it is there.
   useEffect(() => {
+    // Consumed on every run, whichever branch is taken below: a marker left
+    // over from a reconciliation that did not end up writing the URL must not
+    // decide a later, genuine navigation.
+    const reconciled = reconciledSelectionRef.current === selectedId;
+    reconciledSelectionRef.current = null;
     if (!selectedId) return;
     const { onWorkflows, workflowId } = readWorkflowHash();
     // Another view owns the hash (a company switch mid-navigation, a stale
@@ -427,7 +527,7 @@ export function WorkflowsView({
     if (!onWorkflows) return;
     if (workflowId === selectedId) return;
     const next = `#/workflows/${encodeURIComponent(selectedId)}`;
-    if (workflowId === null) window.history.replaceState(null, "", next);
+    if (workflowId === null || reconciled) window.history.replaceState(null, "", next);
     else window.location.hash = next.slice(1);
   }, [selectedId]);
 
@@ -694,7 +794,9 @@ export function WorkflowsView({
     try {
       await deleteWorkflow(client, company, selectedId, graph.version);
       // Drop it locally rather than re-listing: the host has confirmed, and a
-      // re-list would flash an empty picker.
+      // re-list would flash an empty picker. A list request already in flight
+      // predates this and would put the entry back — hence the bump.
+      localWriteRef.current += 1;
       const remaining = workflows.filter((w) => w.id !== selectedId);
       setWorkflows(remaining);
       setSelectedId(remaining[0]?.id ?? null);
@@ -721,6 +823,8 @@ export function WorkflowsView({
   // save again without a re-read — dropping it and re-fetching would be a round
   // trip that can only return the same thing.
   const handleSaved = useCallback((saved: WorkflowGraph) => {
+    // Newer than any list request already in flight — see `localWriteRef`.
+    localWriteRef.current += 1;
     setGraph(saved);
     // The name and description are editable, so the picker entry has to move
     // with them. The id cannot change, which is what makes this a rewrite of
@@ -743,6 +847,10 @@ export function WorkflowsView({
   // The creator posts the full graph back, so the new entry can be spliced
   // straight into the list and selected — no extra round trip to re-list.
   const handleCreated = useCallback((created: WorkflowGraph) => {
+    // Newer than any list request already in flight — see `localWriteRef`.
+    // This is the race the operator would notice most: the workflow they just
+    // created disappearing out of the picker a moment after it appeared.
+    localWriteRef.current += 1;
     setWorkflows((prev) => {
       const rest = prev.filter((w) => w.id !== created.id);
       return [...rest, { id: created.id, name: created.name, description: created.description }].sort(
@@ -1153,7 +1261,18 @@ export function WorkflowsView({
               </AlertDialogContent>
             </AlertDialog>
           </span>
-          <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+          {/* Issue #341: THE control named "New workflow". It is in the
+              toolbar in every state, so it is the one an operator — or a
+              screen reader, or a spec — should find under that name. The
+              empty-state call to action below is named differently on
+              purpose; two buttons answering to one name is an ambiguity
+              nothing can resolve. */}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setCreateOpen(true)}
+            data-testid="workflow-create"
+          >
             <Plus className="mr-1.5 size-4" />
             New workflow
           </Button>
@@ -1244,9 +1363,19 @@ export function WorkflowsView({
         ) : !selectedId ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-muted-foreground">
             <p>This company has no saved workflows yet.</p>
-            <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+            {/* Issue #341: opens the same dialog as the toolbar button, and
+                therefore must NOT carry the same name. "Create a workflow"
+                rather than "Create the first workflow" because this state is
+                also where deleting the last workflow lands, and by then there
+                is nothing first about it. */}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setCreateOpen(true)}
+              data-testid="workflow-create-empty"
+            >
               <Plus className="mr-1.5 size-4" />
-              New workflow
+              Create a workflow
             </Button>
           </div>
         ) : (

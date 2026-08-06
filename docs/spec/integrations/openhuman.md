@@ -17,7 +17,7 @@ directly and, under `feature = "openhuman"`, builds one openhuman
 wired to OpenCompany's own ports:
 
 - **Memory** → `OcMemory`, an openhuman `Memory` implemented over the
-  OpenCompany [`ContextStore`](../runtime/ports.md).
+  OpenCompany [`ContextStore`](../runtime/ports-state.md#contextstore).
 - **Inference provider** → the hosted Medulla `Provider` (a `MockProvider`
   stands in for offline tests).
 - **Approval policy** → `ApprovalPolicy` maps the manifest `[policy].mode`
@@ -42,7 +42,8 @@ delivered, not pending.
 openhuman surfaces a completed turn's token/cost totals only through a
 `pub(crate)` accessor (`Agent::take_last_turn_usage_totals`), so a host crate
 cannot read the real `TurnCost` after `turn()`. The harness cost mapping
-(`TurnCost` → ledger + [`UsageMeter`](../runtime/ports.md)) is complete and
+(`TurnCost` → ledger + [`UsageMeter`](../runtime/ports-console.md#usagemeter))
+is complete and
 tested, but until the **public turn-usage accessor**
 (tinyhumansai/openhuman#4940) lands, `HarnessPool::run` records a **zero-usage
 turn** — which, per the cost contract, writes nothing. Usage/Finances token and

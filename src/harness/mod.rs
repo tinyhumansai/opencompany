@@ -50,6 +50,10 @@ pub mod composio_catalog;
 /// model's choices and the Composio backend are scripted. Test-only.
 #[cfg(all(test, feature = "composio"))]
 mod composio_turn_test;
+/// Issue #416: the confined turn — an ephemeral agent with no tools, no company
+/// memory and no delegation, for a question that is about one object rather than
+/// about the company. See [`confine`].
+pub mod confine;
 pub mod cost;
 /// Hosted embeddings compute for the in-pod memory engine's meaning tier (188c2).
 /// Needs the `tinycortex` crate's `EmbeddingBackend` trait, so it links only when
@@ -664,6 +668,58 @@ fn is_transient_empty_response(err: &anyhow::Error) -> bool {
         .contains("empty response")
 }
 
+/// What a workspace-ensure attempt should say, given what the last attempt for
+/// the same agent said (issue #449).
+///
+/// The attempt itself is per dispatch and stays that way — see
+/// [`note_workspace_attempt`](HarnessPool::note_workspace_attempt) for why
+/// memoising it is the wrong fix. Only the *reporting* is edge-triggered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceReport {
+    /// The first failure since this agent was last healthy: report it.
+    Failed,
+    /// Still failing, and already reported: say nothing.
+    StillFailing,
+    /// Working again after a reported failure: say so once, so a reader who saw
+    /// the error learns it ended.
+    Recovered,
+    /// Working, and was already working: say nothing.
+    StillHealthy,
+}
+
+impl WorkspaceReport {
+    /// Whether this transition has anything to log at all.
+    pub(crate) fn is_silent(self) -> bool {
+        matches!(self, Self::StillFailing | Self::StillHealthy)
+    }
+}
+
+/// Folds one attempt's outcome into the set of currently-failing keys and
+/// returns what to report.
+///
+/// Pure but for the `failing` set it edits, so the whole state machine is
+/// testable without a model, a roster or a filesystem. `failing` holds exactly
+/// the keys whose last attempt failed **and** whose failure has been reported;
+/// `failed` is this attempt's outcome.
+fn workspace_report<K>(failing: &mut HashSet<K>, key: &K, failed: bool) -> WorkspaceReport
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    if failed {
+        // `insert` returns false when the key was already there — i.e. the
+        // previous attempt failed and was already reported.
+        if failing.insert(key.clone()) {
+            WorkspaceReport::Failed
+        } else {
+            WorkspaceReport::StillFailing
+        }
+    } else if failing.remove(key) {
+        WorkspaceReport::Recovered
+    } else {
+        WorkspaceReport::StillHealthy
+    }
+}
+
 /// A pool of live agents, one roster per company.
 pub struct HarnessPool {
     agents: RwLock<HashMap<CompanyId, Vec<Arc<CompanyAgent>>>>,
@@ -722,6 +778,19 @@ pub struct HarnessPool {
     /// A company that never sets an override keeps an empty set and a stable
     /// fingerprint — no rebuild, byte-identical to the pre-#343 behaviour.
     budget_fingerprints: RwLock<HashMap<CompanyId, u64>>,
+    /// The `(company, agent)` pairs whose last workspace-ensure failed and whose
+    /// failure has already been reported (issue #449).
+    ///
+    /// Not a memo of the *attempt* — see
+    /// [`note_workspace_attempt`](Self::note_workspace_attempt). Purely a record
+    /// of what has already been said, so an unmountable volume produces one
+    /// error line instead of one per turn forever.
+    ///
+    /// A `std::sync::Mutex` rather than a `tokio::sync::RwLock` like its
+    /// neighbours: the critical section is a single hash lookup with no `await`
+    /// in it, so the async lock would buy nothing and cost a scheduling point on
+    /// the dispatch path.
+    workspace_failures: std::sync::Mutex<HashSet<(CompanyId, String)>>,
 }
 
 impl Default for HarnessPool {
@@ -754,7 +823,42 @@ impl HarnessPool {
             composio_fingerprints: RwLock::new(HashMap::new()),
             skill_fingerprints: RwLock::new(HashMap::new()),
             budget_fingerprints: RwLock::new(HashMap::new()),
+            workspace_failures: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Records one workspace-ensure outcome for `(company, agent)` and returns
+    /// what it should say.
+    ///
+    /// **The attempt stays per dispatch.** The obvious fix for a repeating log
+    /// line — remember that this agent's workspace was already handled and stop
+    /// trying — is the wrong one in both directions, and this is why the
+    /// suppression is on the reporting rather than on the work:
+    ///
+    /// * Memoising **success** means a data dir wiped or restored *after* the
+    ///   first successful turn is never noticed again, and every relative file
+    ///   write is refused for the life of the process — the exact regression
+    ///   issue #409 added the per-dispatch retry to prevent.
+    /// * Memoising **failure** means a volume that mounts a second late never
+    ///   recovers, because nothing ever tries again.
+    ///
+    /// Both trade a noisy log for a broken agent. The retry is cheap (two
+    /// syscalls on the already-exists path, against a turn about to call a
+    /// model) and it is what makes the condition self-healing, so it keeps
+    /// running every time. What changes is that a persistent failure is stated
+    /// once rather than once per turn.
+    fn note_workspace_attempt(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        failed: bool,
+    ) -> WorkspaceReport {
+        let key = (company.clone(), agent_id.to_string());
+        let mut failing = self
+            .workspace_failures
+            .lock()
+            .expect("workspace-failure set poisoned");
+        workspace_report(&mut failing, &key, failed)
     }
 
     /// Ensures a company's roster is built and cached.
@@ -1188,6 +1292,139 @@ impl HarnessPool {
         .await
     }
 
+    /// The plan-level total-token ceiling, as a refusal or nothing.
+    ///
+    /// Extracted from [`run_inner`](Self::run_inner) so the confined turn
+    /// (issue #416) is gated by the *same* ceiling rather than a second copy of
+    /// the rule: a turn that reaches nothing still spends model tokens, so a
+    /// tenant past its cap must not be able to keep spending through the
+    /// copilot.
+    async fn total_ceiling_refusal(
+        company: &CompanyId,
+        agent_id: &str,
+        deps: &HarnessDeps,
+    ) -> Option<TurnOutcome> {
+        let plan = deps.plan.as_ref()?;
+        plan.total_budget?;
+        match deps.meter.as_deref() {
+            Some(meter) => {
+                let since = plan.period.period_start_millis(crate::ports::now_millis());
+                match meter.query(company, since).await {
+                    Ok(samples) => {
+                        let spent = capability_budget::tokens_in(&samples);
+                        if plan.total_exhausted(spent) {
+                            tracing::info!(
+                                company = %company,
+                                agent = agent_id,
+                                spent,
+                                "[capability-budget] total token ceiling reached; refusing dispatch (no model call) until the period resets"
+                            );
+                            return Some(TurnOutcome {
+                                reply: TOTAL_BUDGET_EXHAUSTED_NOTICE.to_string(),
+                                steps: Vec::new(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            company = %company,
+                            %error,
+                            "[capability-budget] total-ceiling spend query failed; not hard-refusing — deferring to the per-namespace fail-closed roster"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    company = %company,
+                    "[capability-budget] no usage meter; cannot enforce the total token ceiling — deferring to the per-namespace fail-closed roster"
+                );
+            }
+        }
+        None
+    }
+
+    /// Runs one **confined** turn (issue #416): an ephemeral agent with no
+    /// tools, no company memory and no roster identity, for a question about one
+    /// object rather than about the company.
+    ///
+    /// Deliberately not a variant of [`run_inner`](Self::run_inner), because the
+    /// two differ in what they are allowed to touch rather than in a flag:
+    ///
+    /// * the agent is **built here and dropped after**, so it is never in the
+    ///   pooled roster and cannot be addressed, dispatched or delegated to;
+    /// * there is **no retrieve→inject** — the company's prior task outcomes are
+    ///   not prepended to the message, so the model cannot answer from work it
+    ///   was not asked about;
+    /// * there is **no memory writeback** — the exchange leaves nothing for a
+    ///   later company turn to retrieve, so a confined conversation cannot
+    ///   become unconfined context tomorrow.
+    ///
+    /// What it does share: the plan-level token ceiling (spend is spend), live
+    /// turn streaming onto the addressed thread, and cost recording, so a
+    /// confined turn is billed and observable exactly like any other.
+    pub async fn run_confined(
+        &self,
+        company: &CompanyId,
+        company_name: &str,
+        message: &str,
+        deps: &HarnessDeps,
+        chat_id: Option<&str>,
+        confinement: &confine::Confinement,
+    ) -> crate::Result<TurnOutcome> {
+        if let Some(refusal) =
+            Self::total_ceiling_refusal(company, confine::CONFINED_AGENT_ID, deps).await
+        {
+            return Ok(refusal);
+        }
+
+        let agent = CompanyAgent {
+            agent_id: confine::CONFINED_AGENT_ID.to_string(),
+            role: "Workflow copilot".to_string(),
+            // A confined turn carries no manifest teammate, so there is no
+            // per-agent daily cap to read; the company-wide ceiling above is the
+            // one that applies to it.
+            budget_usd_daily: None,
+            agent: Mutex::new(confine::build_confined_agent(
+                company,
+                company_name,
+                confinement,
+                deps,
+            )?),
+        };
+
+        let stream_ctx = Some(crate::turn_stream::TurnStreamCtx {
+            company: company.clone(),
+            agent_id: confine::CONFINED_AGENT_ID.to_string(),
+            chat_id: chat_id
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string()),
+        });
+
+        // The message goes to the model AS SENT. This is the retrieve→inject
+        // step's absence, and it is the difference between "grounded in one
+        // workflow" and "confined to one workflow".
+        let (outcome, turn_costs) = agent
+            .run_with_steer(message, None, stream_ctx, None)
+            .await?;
+
+        let provider_slug = deps.provider.telemetry_provider_id();
+        for turn_cost in &turn_costs {
+            record_turn_cost(
+                turn_cost,
+                confine::CONFINED_AGENT_ID,
+                &provider_slug,
+                company,
+                deps.store.as_ref(),
+                deps.meter.as_deref(),
+                None,
+            )
+            .await?;
+        }
+
+        Ok(outcome)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
@@ -1230,15 +1467,38 @@ impl HarnessPool {
         // not: an agent with no file grant runs a perfectly good turn without
         // this directory. The `error!` (not `warn!`) records the one condition
         // under which the misdirecting guard message can still be reached, so it
-        // is greppable next to the refusal it explains.
-        if let Err(error) = build::ensure_agent_workspace(&deps.workspace_root, company, agent_id) {
-            tracing::error!(
-                company = %company,
-                agent = agent_id,
-                workspace = %build::agent_workspace(&deps.workspace_root, company, agent_id).display(),
-                %error,
-                "[harness] could not create the agent workspace before dispatch; relative file writes will be refused (the refusal will read as a workspace escape, but the cause is this missing directory)"
-            );
+        // is greppable next to the refusal it explains. Both of those are the
+        // right calls and issue #449 does not change either.
+        //
+        // What #449 changes is only how often it is *said*. A workspace root
+        // that cannot be written — a volume that failed to mount, a path that
+        // resolves onto a file — fails identically on every dispatch, so the
+        // unconditional `error!` emitted one byte-identical line per turn,
+        // forever, with nothing distinguishing the thousandth from the first.
+        // The state is edge-triggered instead: the first failure reads exactly
+        // as it did before, the repeats are silent, and a recovery gets one
+        // `info!` so a reader who saw the error learns when it ended. The
+        // attempt itself still runs every dispatch — see
+        // `note_workspace_attempt` for why memoising it would be a regression.
+        let attempt = build::ensure_agent_workspace(&deps.workspace_root, company, agent_id);
+        let report = self.note_workspace_attempt(company, agent_id, attempt.is_err());
+        if !report.is_silent() {
+            let workspace = build::agent_workspace(&deps.workspace_root, company, agent_id);
+            match attempt {
+                Err(error) => tracing::error!(
+                    company = %company,
+                    agent = agent_id,
+                    workspace = %workspace.display(),
+                    %error,
+                    "[harness] could not create the agent workspace before dispatch; relative file writes will be refused (the refusal will read as a workspace escape, but the cause is this missing directory)"
+                ),
+                Ok(_) => tracing::info!(
+                    company = %company,
+                    agent = agent_id,
+                    workspace = %workspace.display(),
+                    "[harness] agent workspace is available again; the earlier creation failure has cleared and relative file writes work"
+                ),
+            }
         }
 
         // Plan-level total-token ceiling (issue #188): a HARD dispatch refusal
@@ -1260,44 +1520,8 @@ impl HarnessPool {
         // A `warn!` records the deferral. Refusing every turn on a flaky meter
         // read would be a strictly worse failure mode than letting an
         // intrinsic-tools-only turn through.
-        if let Some(plan) = deps.plan.as_ref()
-            && plan.total_budget.is_some()
-        {
-            match deps.meter.as_deref() {
-                Some(meter) => {
-                    let since = plan.period.period_start_millis(crate::ports::now_millis());
-                    match meter.query(company, since).await {
-                        Ok(samples) => {
-                            let spent = capability_budget::tokens_in(&samples);
-                            if plan.total_exhausted(spent) {
-                                tracing::info!(
-                                    company = %company,
-                                    agent = agent_id,
-                                    spent,
-                                    "[capability-budget] total token ceiling reached; refusing dispatch (no model call) until the period resets"
-                                );
-                                return Ok(TurnOutcome {
-                                    reply: TOTAL_BUDGET_EXHAUSTED_NOTICE.to_string(),
-                                    steps: Vec::new(),
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                company = %company,
-                                %error,
-                                "[capability-budget] total-ceiling spend query failed; not hard-refusing — deferring to the per-namespace fail-closed roster"
-                            );
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        company = %company,
-                        "[capability-budget] no usage meter; cannot enforce the total token ceiling — deferring to the per-namespace fail-closed roster"
-                    );
-                }
-            }
+        if let Some(refusal) = Self::total_ceiling_refusal(company, agent_id, deps).await {
+            return Ok(refusal);
         }
 
         // Per-agent daily spend cap (issue #304): the same HARD, pre-model-call
@@ -2234,6 +2458,104 @@ description = "Builds the product."
         assert!(second.contains("second"));
     }
 
+    /// Issue #416 — a confined turn reaches the company's memory neither on the
+    /// way in nor on the way out.
+    ///
+    /// The control half is what makes this a test rather than an assertion of
+    /// absence: the SAME message on the ordinary roster path pulls the seeded
+    /// chunk into the prompt (the mock provider echoes what it was sent, so the
+    /// injection is visible in the reply), and writes the turn back. The
+    /// confined path does neither, from the same store, in the same test.
+    #[tokio::test]
+    async fn a_confined_turn_neither_reads_nor_writes_company_memory() {
+        let context = Arc::new(MockContext::default());
+        let mut fx = fixture();
+        fx.deps.context = context.clone();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        // A prior outcome sitting in the company's memory. The mock store
+        // matches a chunk whose BODY contains the query, and retrieve→inject
+        // queries with the whole message — so a body built around the message is
+        // what a hit looks like here.
+        let question = "why did it fail";
+        context
+            .put(
+                &rec.id,
+                ContextChunk {
+                    label: "prior/outcome".into(),
+                    body: format!("SECRET-PAYROLL-REVIEW: {question} on Monday"),
+                },
+            )
+            .await
+            .expect("seed the company's memory");
+        let seeded = context.chunks.lock().unwrap().len();
+
+        // Control: the ordinary path injects the hit and writes the turn back.
+        let ordinary = pool
+            .run(&rec.id, "ceo", question, &fx.deps, None)
+            .await
+            .expect("the ordinary turn runs")
+            .reply;
+        assert!(
+            ordinary.contains("SECRET-PAYROLL-REVIEW"),
+            "the retrieve→inject step must be live for this test to mean anything: {ordinary}"
+        );
+        assert!(
+            context.chunks.lock().unwrap().len() > seeded,
+            "the ordinary path writes its outcome back to company memory"
+        );
+
+        let before_confined = context.chunks.lock().unwrap().len();
+        let confined = pool
+            .run_confined(
+                &rec.id,
+                "Acme",
+                question,
+                &fx.deps,
+                Some("workflow-copilot:weekly_report"),
+                &confine::Confinement::workflow("weekly_report"),
+            )
+            .await
+            .expect("the confined turn runs")
+            .reply;
+
+        assert!(
+            confined.contains(question),
+            "the confined turn still answers the question it was asked: {confined}"
+        );
+        assert!(
+            !confined.contains("SECRET-PAYROLL-REVIEW"),
+            "a confined turn must not be handed company memory: {confined}"
+        );
+        assert_eq!(
+            context.chunks.lock().unwrap().len(),
+            before_confined,
+            "a confined turn must leave nothing behind for a later turn to retrieve"
+        );
+    }
+
+    /// The confined agent is not on the roster, so nothing can address it: a
+    /// dispatch, a desk hand-off or a `chat` naming it is an unknown agent, the
+    /// same as any other name that is not a teammate.
+    #[tokio::test]
+    async fn the_confined_agent_is_not_addressable() {
+        let fx = fixture();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        let err = pool
+            .run(&rec.id, confine::CONFINED_AGENT_ID, "hi", &fx.deps, None)
+            .await
+            .expect_err("the confined agent is not a roster agent");
+        assert!(
+            matches!(err, OpenCompanyError::InvalidRequest(_)),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_agent_is_invalid_request() {
         let fx = fixture();
@@ -2262,6 +2584,155 @@ description = "Builds the product."
         assert!(
             matches!(err, OpenCompanyError::CompanyNotFound(_)),
             "{err:?}"
+        );
+    }
+
+    // --- Workspace-ensure log edge-triggering (issue #449) -------------------
+
+    /// The whole transition table, exhaustively: a broken volume must produce
+    /// one error line and then nothing, and a recovery must be announced once.
+    #[test]
+    fn workspace_report_is_edge_triggered() {
+        let mut failing: HashSet<&str> = HashSet::new();
+
+        // First failure speaks.
+        assert_eq!(
+            workspace_report(&mut failing, &"a", true),
+            WorkspaceReport::Failed
+        );
+        // Every repeat is silent — this is the flood #449 is about.
+        for _ in 0..100 {
+            assert_eq!(
+                workspace_report(&mut failing, &"a", true),
+                WorkspaceReport::StillFailing
+            );
+        }
+        // Recovery speaks exactly once.
+        assert_eq!(
+            workspace_report(&mut failing, &"a", false),
+            WorkspaceReport::Recovered
+        );
+        assert_eq!(
+            workspace_report(&mut failing, &"a", false),
+            WorkspaceReport::StillHealthy
+        );
+        // A healthy agent that was never failing says nothing on its first
+        // attempt either — a working workspace has never been worth a line.
+        assert_eq!(
+            workspace_report(&mut failing, &"never-failed", false),
+            WorkspaceReport::StillHealthy
+        );
+        // And it can fail again later: the edge re-arms.
+        assert_eq!(
+            workspace_report(&mut failing, &"a", true),
+            WorkspaceReport::Failed
+        );
+
+        assert!(
+            WorkspaceReport::StillFailing.is_silent() && WorkspaceReport::StillHealthy.is_silent(),
+            "only the repeats are silent"
+        );
+        assert!(
+            !WorkspaceReport::Failed.is_silent() && !WorkspaceReport::Recovered.is_silent(),
+            "both edges must be reported"
+        );
+    }
+
+    /// Two agents interleaved: one failing, one healthy. Each key's edge is its
+    /// own — a second agent's failure must not be swallowed by the first's, and
+    /// a second agent's recovery must not clear the first's failure.
+    #[test]
+    fn workspace_report_tracks_each_key_separately() {
+        let mut failing: HashSet<&str> = HashSet::new();
+
+        assert_eq!(
+            workspace_report(&mut failing, &"ceo", true),
+            WorkspaceReport::Failed
+        );
+        // A different agent failing is its own first failure, not a repeat.
+        assert_eq!(
+            workspace_report(&mut failing, &"engineer", true),
+            WorkspaceReport::Failed
+        );
+        assert_eq!(
+            workspace_report(&mut failing, &"ceo", true),
+            WorkspaceReport::StillFailing
+        );
+        // One recovers; the other stays failing and stays silent.
+        assert_eq!(
+            workspace_report(&mut failing, &"engineer", false),
+            WorkspaceReport::Recovered
+        );
+        assert_eq!(
+            workspace_report(&mut failing, &"ceo", true),
+            WorkspaceReport::StillFailing
+        );
+        assert_eq!(
+            workspace_report(&mut failing, &"ceo", false),
+            WorkspaceReport::Recovered
+        );
+        assert!(failing.is_empty(), "a recovered key leaves no residue");
+    }
+
+    /// The real dispatch path against a workspace root that cannot hold a
+    /// directory, driven through [`HarnessPool::run`] rather than the helper.
+    ///
+    /// The root is pointed at a **file**, which makes `create_dir_all` fail
+    /// deterministically on every platform (`ENOTDIR` / its Windows equivalent)
+    /// without needing permission bits a CI root user would ignore.
+    ///
+    /// Asserts the reporting state, not the log text: this test binary already
+    /// installs a global `tracing` subscriber elsewhere
+    /// (`runtime::workflow_scheduler`) and asserts it wins that race, so a
+    /// second global capture here would make whichever test lost panic. The
+    /// state is what decides whether a line is emitted, so pinning it pins the
+    /// line count — three dispatches, one report.
+    #[tokio::test]
+    async fn a_broken_workspace_root_reports_once_across_repeated_dispatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file where the workspace tree is expected.
+        let not_a_dir = dir.path().join("workspace-root");
+        std::fs::write(&not_a_dir, b"this is a file, not a directory").unwrap();
+
+        let mut fx = fixture();
+        fx.deps.workspace_root = not_a_dir.clone();
+        let pool = HarnessPool::new();
+        let rec = record();
+        pool.ensure(&rec, &fx.deps).await.expect("ensure");
+
+        // Sanity: the condition really is a hard, repeatable failure.
+        assert!(
+            build::ensure_agent_workspace(&not_a_dir, &rec.id, "ceo").is_err(),
+            "the test root must actually be unusable, or this proves nothing"
+        );
+
+        for turn in 0..3 {
+            pool.run(&rec.id, "ceo", "hi", &fx.deps, None)
+                .await
+                .unwrap_or_else(|e| panic!("turn {turn} still runs without a workspace: {e:?}"));
+        }
+
+        // The turns ran — a missing workspace is not fatal, which #449 does not
+        // change — and the failure is recorded exactly once.
+        let failing = pool.workspace_failures.lock().unwrap();
+        assert_eq!(
+            failing.len(),
+            1,
+            "one failing agent, tracked once, however many turns it takes"
+        );
+        assert!(failing.contains(&(rec.id.clone(), "ceo".to_string())));
+        drop(failing);
+
+        // The next dispatch after the first is silent: only turn 1 spoke.
+        assert_eq!(
+            pool.note_workspace_attempt(&rec.id, "ceo", true),
+            WorkspaceReport::StillFailing,
+            "dispatches after the first must not re-emit the error"
+        );
+        // And when the volume comes back, one line says so.
+        assert_eq!(
+            pool.note_workspace_attempt(&rec.id, "ceo", false),
+            WorkspaceReport::Recovered
         );
     }
 

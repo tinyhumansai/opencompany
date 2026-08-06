@@ -77,9 +77,10 @@ pub enum DeliveryStatus {
     /// then look at Approvals for what became of it.
     Pending,
     /// Deliberately not attempted — a policy precondition was unmet (no mailbox
-    /// configured, or a cold recipient on a runtime that cannot park). Not an
-    /// error; the report simply was not owed to that address under the current
-    /// rules.
+    /// configured, or a cold recipient on a runtime that cannot park), or a run
+    /// earlier in this lineage already delivered this node's report and the
+    /// continuation must not send it twice (issue #438). Not an error; the
+    /// report simply was not owed to that address under the current rules.
     Skipped,
     /// Refused by policy: the company does not grant what the destination needs.
     Denied,
@@ -146,6 +147,21 @@ pub enum DeliveryReason {
     /// The recipient is not an established thread and the send could not be
     /// parked for approval either.
     ParkingUnavailable,
+    /// A run earlier in this lineage already delivered this node's report, so
+    /// the continuation did not send it again (issue #438).
+    ///
+    /// Resuming an approved gate is a **re-run** — the engine settles when it
+    /// pauses, so continuing means walking the graph again from the trigger.
+    /// Every `output` node upstream of the gate is therefore reached a second
+    /// time, and without this the operator's approval would mail the same
+    /// report to the same person twice. The ledger of what a lineage has
+    /// already sent rides the continuation's trigger input; see
+    /// [`crate::runtime::workflow_resume`].
+    ///
+    /// A **parked** report counts as delivered too: the card is durable and
+    /// approving it sends, so re-parking would stack a second identical card
+    /// and approving both would send twice.
+    AlreadyDelivered,
     /// A `channel` report was posted to the wired adapter.
     ChannelPosted,
     /// The destination names a channel this deployment never wired. **Which
@@ -197,6 +213,10 @@ impl std::fmt::Display for DeliveryReason {
             Self::ParkingUnavailable => {
                 "the recipient has never written to the company, and the report could not be \
                  queued for approval either"
+            }
+            Self::AlreadyDelivered => {
+                "an earlier run in this workflow's approval lineage already delivered this report, \
+                 so it was not sent again"
             }
             Self::ChannelPosted => "posted to the channel",
             Self::ChannelNotWired => "the destination channel is not wired on this runtime",

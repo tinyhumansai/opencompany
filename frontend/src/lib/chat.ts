@@ -88,6 +88,28 @@ let seq = 0;
 const nextId = () => `m${seq++}`;
 
 /**
+ * The identity a live-streamed company reply must be built with (issue #483).
+ *
+ * A reply arriving over the stream and the same reply coming back from
+ * `chat/history` are one message, and the console has to be able to tell. Both
+ * sides carry the host's `StoredEvent` sequence — the stream frame as `seq`,
+ * the history entry as `id` — so stamping the live line with it makes the two
+ * resolve to the same console id, and `hydrateChannel`'s id dedupe recognises
+ * the line it already has.
+ *
+ * Without this the live line was born under an ephemeral `m<counter>` id that
+ * hydration could never match, so a reply that arrived while its channel was
+ * closed was rendered twice on opening it.
+ *
+ * This exists as its own function so the identity decision has somewhere a test
+ * can reach. Inlined at the two call sites, nothing could assert it was still
+ * being made.
+ */
+export function liveReplyIdentity(event: { seq: number }): { messageId: string } {
+  return { messageId: String(event.seq) };
+}
+
+/**
  * Build a stamped message. `at` is injected so callers stay pure/testable.
  *
  * `messageId` is the host's own id for the line, when the caller already has

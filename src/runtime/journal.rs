@@ -2089,6 +2089,7 @@ mod test {
             at_millis: 1_000,
             expires_at_millis,
             origin_thread: None,
+            scope: None,
         }
     }
 

@@ -870,6 +870,24 @@ async fn main() -> Result<()> {
             // warning above: the default `EnvFilter` would swallow an `info!`.
             let journal = opencompany::app::journal::prepare(&data_root).await?;
             println!("{}", journal.summary());
+            // Register the same root as the vendored keyring's directory, so
+            // credential storage cannot resolve to `$HOME` — or, further down
+            // the same fallback chain, to `/tmp` at no log level (issue #451).
+            // The export above already steers it there in practice, but only
+            // because nothing has touched the keyring yet; the resolved value is
+            // cached in a `OnceLock`, so the guarantee rests on startup ordering
+            // nobody is checking. Registering says it outright.
+            //
+            // Here, and not later: this runs before any company runtime, agent
+            // harness or HTTP listener exists, so the pin cannot lose a race to
+            // a first keyring touch. `println!` for the same reason as the lines
+            // around it — the default `EnvFilter` would swallow an `info!`, and
+            // an operator needs to be able to see where the credentials live.
+            #[cfg(feature = "openhuman")]
+            println!(
+                "{}",
+                opencompany::app::journal::pin_keyring(&journal).summary()
+            );
             // Soft disk-quota alerting. Hard enforcement is the container /
             // StorageClass layer's job (EFS access point, k8s ResourceQuota);
             // here we surface an operator-visible warning when a workspace

@@ -29,9 +29,20 @@
 //!   condition it would retry against cannot resolve itself while the process
 //!   lives, because the mount is read-only for the lifetime of the pod.
 //!
-//! Only the resolved *path* is reported at startup. No environment value other
-//! than `OPENHUMAN_WORKSPACE` is read here and none is echoed, so the startup
+//! Only the resolved *path* is reported at startup. The only environment values
+//! read here are `OPENHUMAN_WORKSPACE` and — for the temp-directory guard below
+//! — the platform's temp-dir variable, and neither is echoed, so the startup
 //! line cannot carry credential material.
+//!
+//! # The keyring rides the same root
+//!
+//! `pin_keyring` registers the resolved root as the vendored runtime's
+//! *keyring* directory too, so secret material lands beside the journal rather
+//! than in whatever its own fallback chain reaches — a chain that ends, if no
+//! home directory resolves, at `/tmp` with no log line at all (issue #451). The
+//! export above happens to steer it correctly today, but only because nothing
+//! has touched the keyring yet; registering says it outright instead of relying
+//! on startup order.
 
 use std::path::{Path, PathBuf};
 
@@ -184,6 +195,130 @@ pub async fn prepare(data_dir: &Path) -> Result<JournalRoot> {
     Ok(resolved)
 }
 
+// ---------------------------------------------------------------------------
+// Keyring pin (issue #451)
+// ---------------------------------------------------------------------------
+
+/// Where the vendored keyring writes its secret material, once [`pin_keyring`]
+/// has registered it.
+#[cfg(feature = "openhuman")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyringPin {
+    dir: PathBuf,
+    source: RootSource,
+    temporary: bool,
+}
+
+#[cfg(feature = "openhuman")]
+impl KeyringPin {
+    /// The directory the vendored keyring will resolve to.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Whether the pinned directory sits under the system temp directory — see
+    /// [`pin_keyring`] for why that is reported rather than refused.
+    pub fn is_temporary(&self) -> bool {
+        self.temporary
+    }
+
+    /// The one-line startup report: which directory holds the credentials, and
+    /// the caveat when that directory is temporary.
+    pub fn summary(&self) -> String {
+        let base = format!(
+            "keyring: {} (pinned, from {})",
+            self.dir.display(),
+            self.source.as_str()
+        );
+        if self.temporary {
+            format!(
+                "{base} — WARNING: this is under the system temp directory. \
+                 Credentials stored here can be removed by the OS at any time, \
+                 and connected accounts will silently need reconnecting. Point \
+                 {} at a durable volume for anything but local development.",
+                self.source.as_str()
+            )
+        } else {
+            base
+        }
+    }
+}
+
+/// Whether `dir` lies inside `temp_dir`.
+///
+/// Component-wise by construction ([`Path::starts_with`] compares whole
+/// components), so `/tmpfoo` is not treated as being under `/tmp`.
+#[cfg(feature = "openhuman")]
+fn under_temp_dir(dir: &Path, temp_dir: &Path) -> bool {
+    dir.starts_with(temp_dir)
+}
+
+/// Registers `root` as the vendored keyring's workspace, so credential storage
+/// lands beside the journal instead of wherever its own fallback chain ends up.
+///
+/// # Why register rather than rely on the export
+///
+/// The vendored resolver
+/// (`keyring::store::workspace_dir_for_file_backend`) tries, in order: a
+/// directory registered through its `init_workspace` seam, then
+/// `OPENHUMAN_WORKSPACE`, then the user's home directory — and if it cannot
+/// find a home directory at all, `/tmp`, at no log level whatsoever.
+///
+/// [`prepare`] already exports `OPENHUMAN_WORKSPACE`, so today a hosted tenant
+/// happens to land in the data dir. That is safe **by accident**: the resolved
+/// value is cached in a `OnceLock`, so whichever code touches the keyring first
+/// fixes the answer for the life of the process. Nothing enforces that the
+/// export happens before that first touch — it holds because of the order two
+/// unrelated pieces of startup currently run in, which is not a property anyone
+/// is checking when they move code around. If a touch ever lands first, secret
+/// material silently goes to `$HOME` (the read-only root filesystem in a tenant)
+/// or to `/tmp`, with no error and no log line to say so.
+///
+/// Registering explicitly removes the ordering dependency instead of restating
+/// it: after this call the first branch of the resolver matches, so the env-var
+/// branch, the home branch and the `/tmp` branch are all unreachable regardless
+/// of what runs when. `init_workspace` is idempotent-by-first-writer (it logs at
+/// debug and ignores a second call), and this is called once from `serve`.
+///
+/// # Loudness, not refusal
+///
+/// A pinned root under the system temp directory earns a `warn!` naming the path
+/// and what it costs — not a refusal. Pointing `OPENCOMPANY_DATA_DIR` at a temp
+/// path is a legitimate thing to do in local development and in tests; the
+/// defect this addresses was never that credentials *could* be temporary, it was
+/// that they could become temporary in **silence**.
+///
+/// # Owed upstream
+///
+/// The `/tmp` fallback itself still exists in `vendor/openhuman` and should be
+/// removed there — a keyring that cannot resolve a durable directory should
+/// fail loudly rather than quietly choosing world-readable scratch space. That
+/// is a vendored-crate change and is out of scope here; this function makes the
+/// fallback unreachable for `opencompany serve`, which is the half this crate
+/// can own.
+#[cfg(feature = "openhuman")]
+pub fn pin_keyring(root: &JournalRoot) -> KeyringPin {
+    let dir = root.root().to_path_buf();
+    openhuman_core::openhuman::keyring::init_workspace(&dir);
+
+    let temporary = under_temp_dir(&dir, &std::env::temp_dir());
+    if temporary {
+        tracing::warn!(
+            keyring = %dir.display(),
+            knob = root.source().as_str(),
+            "[keyring] secret material is being stored under the system temp directory; \
+             the OS may remove it at any time and connected accounts will silently need \
+             reconnecting — point the data directory at a durable volume outside local development",
+        );
+    }
+
+    KeyringPin {
+        dir,
+        source: root.source(),
+        temporary,
+    }
+}
+
 /// Creates `root` and confirms a file can actually be written inside it.
 ///
 /// `create_dir_all` alone is not proof: it succeeds silently when the directory
@@ -242,6 +377,14 @@ mod test {
     /// The data dir the child compares against.
     #[cfg(feature = "openhuman")]
     const SEAM_DATA_DIR_ENV: &str = "OC_JOURNAL_SEAM_DATA_DIR";
+
+    /// The child test the keyring-pin test re-invokes this binary to run.
+    #[cfg(feature = "openhuman")]
+    const KEYRING_CHILD_TEST: &str = "app::journal::test::keyring_pin_child";
+
+    /// The data dir the keyring-pin child pins against.
+    #[cfg(feature = "openhuman")]
+    const KEYRING_DATA_DIR_ENV: &str = "OC_KEYRING_PIN_DATA_DIR";
 
     #[test]
     fn absent_env_roots_the_journal_in_the_data_dir() {
@@ -533,6 +676,130 @@ mod test {
             ),
             other => panic!("unknown seam role {other:?}"),
         }
+    }
+
+    /// The temp-dir guard compares whole components, so a sibling directory
+    /// whose name merely starts with the temp dir's is not "inside" it.
+    #[cfg(feature = "openhuman")]
+    #[test]
+    fn the_temp_dir_guard_compares_components_not_prefixes() {
+        let temp = Path::new("/tmp");
+
+        assert!(under_temp_dir(Path::new("/tmp/oc/openhuman"), temp));
+        assert!(under_temp_dir(temp, temp), "the temp dir itself counts");
+        assert!(
+            !under_temp_dir(Path::new("/tmpfoo/openhuman"), temp),
+            "a name that merely begins with the temp dir's is a different directory"
+        );
+        assert!(!under_temp_dir(Path::new("/data/openhuman"), temp));
+        assert!(!under_temp_dir(Path::new("/var/lib/oc"), temp));
+    }
+
+    /// With `OPENHUMAN_WORKSPACE` unset, the vendored keyring must **still**
+    /// resolve to the data-dir root — i.e. `$HOME` and its `/tmp` fallback are
+    /// unreachable because the directory was registered, not inferred (#451).
+    ///
+    /// The negative half is what makes this worth running: the child's `HOME`
+    /// points somewhere real and writable, so if the pin did nothing the
+    /// resolver would happily answer with `$HOME/.openhuman` and the assertion
+    /// would fail rather than pass vacuously.
+    ///
+    /// Run in a **child process** for the same reason the vendored-seam test
+    /// above is: the registration is a process-global `OnceLock` set-once, so it
+    /// cannot be undone between tests, and `HOME` cannot be varied in-process
+    /// without racing every other environment reader in this binary.
+    #[cfg(feature = "openhuman")]
+    #[test]
+    fn pinning_keeps_the_keyring_out_of_home_without_the_env_var() {
+        let data_dir = scratch_root("keyring-pin");
+        // Deliberately a sibling of the data dir, not a child, so "did the
+        // keyring land under the data dir?" cannot be satisfied by $HOME.
+        let home = scratch_root("keyring-pin-home");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([KEYRING_CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+            .env(KEYRING_DATA_DIR_ENV, &data_dir)
+            .env("HOME", &home)
+            // The whole point: the pin must work with the seam variable absent.
+            .env_remove(OPENHUMAN_WORKSPACE_ENV)
+            .output()
+            .expect("spawn the keyring-pin child process");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = format!(
+            "--- child stdout ---\n{stdout}\n--- child stderr ---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{detail}");
+        // A filter that stops matching makes libtest run nothing and still exit
+        // 0, so success alone would be a vacuous pass.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have actually run the assertion, not filtered it \
+             away — is {KEYRING_CHILD_TEST} still the right path?\n{detail}"
+        );
+
+        std::fs::remove_dir_all(&data_dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The assertion half of the keyring-pin test, executed in the child process
+    /// the test above spawns. Ignored so a normal run never picks it up, and
+    /// inert unless the parent set the data dir, so a bare
+    /// `cargo test -- --ignored` cannot fail on a missing environment.
+    #[cfg(feature = "openhuman")]
+    #[test]
+    #[ignore = "spawned by pinning_keeps_the_keyring_out_of_home_without_the_env_var"]
+    fn keyring_pin_child() {
+        let Ok(data_dir) = std::env::var(KEYRING_DATA_DIR_ENV) else {
+            return;
+        };
+        let data_dir = PathBuf::from(data_dir);
+        assert!(
+            std::env::var(OPENHUMAN_WORKSPACE_ENV).is_err(),
+            "the parent must unset the seam variable — the registration, not the \
+             export, is what this test proves"
+        );
+
+        let expected = resolve(None, &data_dir);
+        let pin = pin_keyring(&expected);
+        assert_eq!(pin.dir(), expected.root());
+
+        let resolved = openhuman_core::openhuman::keyring::store::workspace_dir_for_file_backend();
+        assert_eq!(
+            resolved,
+            expected.root(),
+            "the vendored keyring must answer with the registered root"
+        );
+        assert!(
+            resolved.starts_with(&data_dir),
+            "secret material must resolve inside the data dir, got {}",
+            resolved.display()
+        );
+
+        // The home fallback is real and writable here, so this is the branch the
+        // pin actually displaced — and `/tmp` sits one step further down the
+        // same chain.
+        let home = PathBuf::from(std::env::var("HOME").expect("the parent sets HOME"));
+        assert!(
+            !resolved.starts_with(&home),
+            "the keyring must not fall back to $HOME once a root is registered"
+        );
+
+        // The data dir is scratch space under the system temp dir, so the
+        // loudness guard fires — and it warns rather than refusing, which is why
+        // `pin_keyring` returned at all.
+        assert!(
+            pin.is_temporary(),
+            "a root under the system temp dir must be flagged"
+        );
+        assert!(
+            pin.summary().contains("WARNING"),
+            "the startup line must carry the caveat: {}",
+            pin.summary()
+        );
     }
 
     /// Puts an owner-writable mode back on `dir` so the test's own cleanup can

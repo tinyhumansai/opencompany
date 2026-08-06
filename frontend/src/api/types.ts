@@ -391,6 +391,15 @@ export interface StandingGrant {
   at_millis: number;
   /** Epoch-millis it stops admitting calls. */
   expires_at_millis: number;
+  /**
+   * The slice of the tool it is confined to, when the tool's name is not the
+   * whole of what it can do (#457) — a Composio toolkit like `github`.
+   *
+   * Absent for every tool whose name already says everything, and absent from
+   * an older host that predates the field. Both mean "nothing to narrow", so
+   * the row simply says what it always said.
+   */
+  scope?: string;
 }
 
 export type FeedbackCategory =

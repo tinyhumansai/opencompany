@@ -152,6 +152,24 @@ export type CompanyStreamEvent =
       status: string;
       elapsedMs: number;
     }
+  // Issue #384: a saved workflow was authored, edited or removed — by the
+  // orchestrator's `create_workflow` tool, by a second console session, by a
+  // machine credential, or by this console itself. The host has journalled and
+  // projected all three since #112/#259; nothing here named them, so they
+  // reached `default:` and were dropped, and the picker drifted from what the
+  // host holds until a reload.
+  //
+  // Deliberately thin, like `approval_parked` and `task_card_changed`: an id
+  // and the display name, with **no graph body** — the host omits it on purpose
+  // (see `project_event`). A console reacts to this frame by re-reading
+  // `GET …/workflows`, so the picker's content keeps exactly one source.
+  | {
+      type: "workflow_created" | "workflow_updated" | "workflow_deleted";
+      seq: number;
+      atMillis: number;
+      workflowId: string;
+      name: string;
+    }
   // The transient live turn-progress frames (`src/turn_stream.rs`): a tool call
   // just started (status `running`) or finished (status `ok`/`error`). These are
   // ephemeral — never journaled — and drive the in-flight tool timeline the
@@ -190,6 +208,16 @@ export interface AgentReplyEvent {
   chatId: string;
   agentId: string;
   text: string;
+  /**
+   * The **host-side** id of this message (issue #483) — the stream envelope's
+   * `seq`. `chat/history` projects its own `id` from the same `StoredEvent`
+   * sequence, so a live line stamped with this carries the identity a later
+   * rehydration will mint for it, and the two can be recognised as one message
+   * instead of both being rendered.
+   *
+   * Namespaced into a console id by the injector, same as {@link parentId}.
+   */
+  seq: number;
   /** The board card this reply opened (issue #246), when it opened one. */
   taskId?: string;
   /**
@@ -242,6 +270,23 @@ interface Options {
    */
   onWorkflowRunEvent?: (event: CompanyStreamEvent) => void;
   /**
+   * Called for each workflow **authoring** frame — `workflow_created`,
+   * `workflow_updated`, `workflow_deleted` (issue #384) — so the Workflows view
+   * can re-read its picker live.
+   *
+   * Separate from {@link Options.onWorkflowRunEvent} because they answer
+   * different questions: that one is what a run *did*, this one is which
+   * workflows *exist*. A view can want either without the other, and folding
+   * them would make the run canvas re-derive itself on an unrelated create.
+   *
+   * Like {@link Options.onTaskEvent} this subscriber takes a **counter**, not
+   * the payload: it re-reads the list, so two frames collapsing inside one
+   * React batch still means "re-read". That is also why a delete needs nothing
+   * extra on the wire — the workflow that vanished is the one the refreshed
+   * list no longer has.
+   */
+  onWorkflowChanged?: (event: CompanyStreamEvent) => void;
+  /**
    * Called for each approval-lifecycle frame (`approval_parked`,
    * `approval_resolved`) so the shell can refresh the approvals feed live
    * (issue #379).
@@ -254,6 +299,17 @@ interface Options {
    */
   onApprovalEvent?: (event: CompanyStreamEvent) => void;
 }
+
+/**
+ * The subscriber half of {@link Options}, as {@link handleEvent} takes it.
+ *
+ * A named bag rather than a positional list, because five of the six share the
+ * type `(e: CompanyStreamEvent) => void` — so a call site that got the ORDER
+ * wrong would type-check perfectly and route every frame to the wrong surface.
+ * Derived from `Options` rather than restated so the two cannot drift, and so
+ * each callback keeps the documentation written against it above.
+ */
+type Subscribers = Omit<Options, "pendingApprovals">;
 
 /**
  * Opens an `EventSource` on `{scope}/events` for the active company and turns
@@ -273,6 +329,7 @@ export function useEvents(
     onTaskEvent,
     onTurnEvent,
     onWorkflowRunEvent,
+    onWorkflowChanged,
     onApprovalEvent,
   }: Options,
 ): void {
@@ -293,6 +350,10 @@ export function useEvents(
   useEffect(() => {
     onWorkflowRunEventRef.current = onWorkflowRunEvent;
   }, [onWorkflowRunEvent]);
+  const onWorkflowChangedRef = useRef(onWorkflowChanged);
+  useEffect(() => {
+    onWorkflowChangedRef.current = onWorkflowChanged;
+  }, [onWorkflowChanged]);
   const onApprovalEventRef = useRef(onApprovalEvent);
   useEffect(() => {
     onApprovalEventRef.current = onApprovalEvent;
@@ -343,14 +404,14 @@ export function useEvents(
         console.debug("[events] dropping unparseable event", err);
         return;
       }
-      handleEvent(
-        event,
-        onAgentReplyRef.current,
-        onTaskEventRef.current,
-        onTurnEventRef.current,
-        onWorkflowRunEventRef.current,
-        onApprovalEventRef.current,
-      );
+      handleEvent(event, {
+        onAgentReply: onAgentReplyRef.current,
+        onTaskEvent: onTaskEventRef.current,
+        onTurnEvent: onTurnEventRef.current,
+        onWorkflowRunEvent: onWorkflowRunEventRef.current,
+        onWorkflowChanged: onWorkflowChangedRef.current,
+        onApprovalEvent: onApprovalEventRef.current,
+      });
     };
 
     source.onerror = () => {
@@ -373,14 +434,15 @@ export function useEvents(
 }
 
 /** Routes one parsed event to its toast / transcript side effect. */
-function handleEvent(
-  event: CompanyStreamEvent,
-  onAgentReply?: (e: AgentReplyEvent) => void,
-  onTaskEvent?: (e: CompanyStreamEvent) => void,
-  onTurnEvent?: (e: CompanyStreamEvent) => void,
-  onWorkflowRunEvent?: (e: CompanyStreamEvent) => void,
-  onApprovalEvent?: (e: CompanyStreamEvent) => void,
-): void {
+function handleEvent(event: CompanyStreamEvent, subscribers: Subscribers): void {
+  const {
+    onAgentReply,
+    onTaskEvent,
+    onTurnEvent,
+    onWorkflowRunEvent,
+    onWorkflowChanged,
+    onApprovalEvent,
+  } = subscribers;
   switch (event.type) {
     // Live turn frames drive the in-flight tool timeline — no toast, they render
     // inline in the chat.
@@ -425,6 +487,9 @@ function handleEvent(
         chatId: event.chatId,
         agentId: event.agentId,
         text: event.text,
+        // Issue #483: the host's own id for this message. Carried so the
+        // injected line and its later rehydrated twin share an identity.
+        seq: event.seq,
         // Issue #246: a reply injected from the stream — one this console did
         // not POST for, e.g. an inbound Telegram turn — carries its "card
         // opened" chip too, rather than only the locally-awaited copy.
@@ -520,6 +585,20 @@ function handleEvent(
     case "workflow_run_started":
     case "workflow_node_finished":
       onWorkflowRunEvent?.(event);
+      break;
+    // Issue #384: the authoring half. Same subscriber-refreshes-its-own-surface
+    // shape as the run arms above, and the third time this file has grown arms
+    // for frames the host was already sending — #464 for the board, #371 for
+    // the canvas, these for the picker.
+    //
+    // Deliberately NO toast. A workflow appearing, being renamed or going away
+    // is not an attention signal: the orchestrator authors them as ordinary
+    // work, and a toast per create would be noise of exactly the kind #379
+    // argues against. The list refreshing IS the feedback.
+    case "workflow_created":
+    case "workflow_updated":
+    case "workflow_deleted":
+      onWorkflowChanged?.(event);
       break;
     default:
       // An unknown/forward event kind: ignore rather than surface noise.

@@ -444,7 +444,7 @@ Collections (all uniquely indexed on `company_id` + their key):
 `context_chunks`, `secrets`, plus `counters` and `owners`; and the WS3
 console-surface collections `tasks`, `workspace`, `facts`, `usage`, `skills`,
 and `inboxes`. The `usage` collection is trimmed to the 90-day retention window
-on each `record` (see [ports.md](ports.md), `UsageMeter`).
+on each `record` (see [`UsageMeter`](ports-console.md#usagemeter)).
 
 ### Multi-tenant isolation (two layers)
 

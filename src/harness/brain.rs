@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use crate::Result;
 use crate::company::steer::{InflightEntry, InflightKind, SteerAction, cap_redirect};
 use crate::harness::build::agent_workspace;
+use crate::harness::confine;
 // The note shape is shared with the ungated system paths (issue #337): the
 // backstop, the quiescing-runtime settle and the boot reaper all append their
 // reason to a card, and a second copy of it here is how one card ends up with
@@ -223,6 +224,22 @@ impl HarnessBrain {
         let control = guard.control().clone();
 
         let run_turn = HarnessRunTurn::new(&self.pool, &self.deps);
+        // Issue #453: the same argument as the publish claim below, one queue
+        // over. This is a full agent turn with the whole toolbelt, so it can
+        // reach `review_task` / `assign_task` / `spawn_task` — and nothing here
+        // drained them. A `review_task` from a re-issued call was staged, the
+        // tool said the card had moved, and the next turn's `clear()` destroyed
+        // it.
+        //
+        // It **drains** rather than refusing, deliberately. `review_task` is a
+        // gateable Write effect, so an operator can be asked to approve one; if
+        // this path refused, approving it would make the approval unspendable —
+        // approve, refuse, re-park, forever. The claim is taken **per
+        // re-dispatch turn**, not per continuation cycle: one cycle may run
+        // several of these (issue #476 batches resolutions), and each turn owns
+        // its own drain window so one re-dispatch's queue can never leak into
+        // the next one's.
+        let delegation_claim = self.deps.delegations.claim();
         // Issue #445: this is a full agent turn with the whole toolbelt, so it
         // can publish — and before this nothing drained it, exactly as on the
         // chat path. It is a conversation continuation (it answers into the
@@ -262,6 +279,39 @@ impl HarnessBrain {
         }
         drop(publish_claim);
 
+        // Then the delegations (issue #453), in that order: publishes first so a
+        // file the turn offered is recorded before a card write can fail, and
+        // delegations before the bubble is built so the bubble can carry the id
+        // of a card this drain opened.
+        //
+        // Never propagated with `?`. The turn has already run and the operator is
+        // owed its answer; unwinding here would swallow the reply over a board
+        // write. A hand-off drained from here runs the delegate and settles their
+        // card, but has nowhere to relay their reply to — there is no relay turn
+        // on this path. That is a strict improvement on dropping it unrun, and it
+        // is recorded on the card the hand-off opens.
+        let drained = match self
+            .delegation_runner(&run_turn)
+            .drain_and_execute(
+                grant.origin_thread.as_deref(),
+                false,
+                delegation::HandOffs::Run,
+            )
+            .await
+        {
+            Ok(drained) => drained,
+            Err(err) => {
+                tracing::error!(
+                    approval_id = %approval_id,
+                    agent = %grant.agent,
+                    error = %err,
+                    "[delegation] the re-issued call queued board work that could not be executed"
+                );
+                delegation::Drained::default()
+            }
+        };
+        drop(delegation_claim);
+
         let text = match outcome {
             Ok(outcome) => outcome.reply,
             Err(err) => {
@@ -298,7 +348,11 @@ impl HarnessBrain {
         // agent's answer into the conversation twice.
         Ok(Some(OutboundMessage {
             message_id: None,
-            task_id: None,
+            // The card this turn's board work opened, when it opened one (issue
+            // #453) — the same first-wins id an operator turn's bubble carries,
+            // so a continuation that spawned or handed off work links to it
+            // instead of pointing at nothing.
+            task_id: drained.spawned_task,
             channel: grant.agent.clone(),
             text,
             steps: Vec::new(),
@@ -415,6 +469,18 @@ impl HarnessBrain {
                 .pending_publishes
                 .claim(publish::PublishDestination::Task)
         });
+        // Issue #453: and the delegation queue, for the same span. A dispatched
+        // card's responder is the orchestrator, which carries the delegation
+        // tools, and `handle_task_delegations` below is the drain — so this path
+        // has always been entitled to delegate and now says so. Unconditional:
+        // the drain runs whatever else is wired (a card with no task store
+        // simply executes to no effect, which every task path on this seam does).
+        //
+        // Spans the whole steer loop through the drain, not one iteration of it.
+        // The per-iteration `clear()` inside the loop stays — it abandons a
+        // redirected turn's work, which is a different decision from who is
+        // entitled to queue.
+        let _delegation_claim = self.deps.delegations.claim();
         // Issue #339, same argument for staged workflow references: an operator
         // chat turn earlier in this cycle may have run a workflow through the
         // orchestrator's tool, and that run belongs to the conversation, not to
@@ -1927,6 +1993,46 @@ impl Brain for HarnessBrain {
         for event in &req.events {
             match event {
                 CompanyEvent::OperatorMessage { text, chat, .. } => {
+                    // Issue #416: a workflow copilot thread is answered by a
+                    // CONFINED turn, not by the company orchestrator.
+                    //
+                    // This branch is the boundary. Everything below it — the
+                    // delegation runner, the publish claim, the MCP failure
+                    // drain, the card a `spawn_task` opens — exists to let a
+                    // turn act on the company's behalf, and a copilot turn is
+                    // precisely the one that must not. So it does not fall
+                    // through to any of it: no tools ran, so there is nothing to
+                    // drain, and no desk was reachable, so there is nothing to
+                    // relay. What comes back is one bubble on this thread, which
+                    // is the whole of what the copilot was ever meant to be.
+                    if let Some(workflow_id) =
+                        crate::company::copilot::workflow_of_thread(chat.as_deref())
+                    {
+                        let confinement = confine::Confinement::workflow(workflow_id);
+                        let outcome = self
+                            .pool
+                            .run_confined(
+                                &self.record.id,
+                                &self.record.manifest.company.name,
+                                text,
+                                &self.deps,
+                                chat.as_deref(),
+                                &confinement,
+                            )
+                            .await?;
+                        channel_responses.push(OutboundMessage {
+                            message_id: None,
+                            // No card, by construction: a confined turn has no
+                            // `spawn_task` to call, and the chat handler does
+                            // not open one from a copilot message either.
+                            task_id: None,
+                            channel: "operator".to_string(),
+                            text: outcome.reply,
+                            reply_to: None,
+                            steps: outcome.steps,
+                        });
+                        continue;
+                    }
                     // Route to the addressed desk's lead, else the orchestrator.
                     let responder = self.responder_for(chat.as_deref());
                     // The chat/desk thread this turn answers — the same id the
@@ -5133,6 +5239,7 @@ members = ["eng1", "eng2"]
                 at_millis: now_millis(),
                 expires_at_millis: now_millis() + 60 * 60 * 1000,
                 origin_thread: None,
+                scope: None,
             });
         let brain = brain_with_queue_and_events(dir.path(), requests, log.clone());
 
@@ -5210,6 +5317,287 @@ members = ["eng1", "eng2"]
                 .is_empty(),
             "nothing is journaled for a deny"
         );
+    }
+
+    // --- Issue #453: a re-dispatch drains what its turn queued ---------------
+
+    /// What the scripted model does on each successive `/chat/completions` call.
+    #[derive(Clone, Debug)]
+    enum ScriptTurn {
+        /// Emit a native tool call.
+        Call {
+            tool: &'static str,
+            args: serde_json::Value,
+        },
+        /// Finish with plain assistant text.
+        Say(&'static str),
+    }
+
+    /// Serves a scripted OpenAI-compatible endpoint on loopback and returns its
+    /// base URL.
+    ///
+    /// `MockProvider` cannot express a tool call, and a tool call is the whole
+    /// point here: the defect is that a `review_task` made by a re-issued turn
+    /// was staged and never drained. Same shape `workspace_turn_test` and
+    /// `gated_tool_turn_test` established — stub exactly one boundary, the
+    /// model's choices, and run everything else for real.
+    async fn spawn_model_script(turns: Vec<ScriptTurn>) -> String {
+        use axum::Json;
+        use axum::routing::post;
+
+        let script = Arc::new(std::sync::Mutex::new(turns));
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let script = Arc::clone(&script);
+                async move {
+                    let next = {
+                        let mut turns = script.lock().unwrap();
+                        if turns.is_empty() {
+                            None
+                        } else {
+                            Some(turns.remove(0))
+                        }
+                    };
+                    // Running off the end means the loop went round more times
+                    // than expected; end the turn rather than hang.
+                    let message = match next.unwrap_or(ScriptTurn::Say("done")) {
+                        ScriptTurn::Say(text) => {
+                            serde_json::json!({ "role": "assistant", "content": text })
+                        }
+                        ScriptTurn::Call { tool, args } => serde_json::json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": format!("call-{tool}"),
+                                "type": "function",
+                                "function": { "name": tool, "arguments": args.to_string() }
+                            }]
+                        }),
+                    };
+                    Json(serde_json::json!({
+                        "choices": [{ "index": 0, "message": message }],
+                        "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A brain over the scripted model with a **real task store**, so a
+    /// `review_task` the re-dispatched turn makes can actually move a card.
+    fn brain_over_script(
+        dir: &std::path::Path,
+        requests: crate::harness::policy::ApprovalRequestQueue,
+        base_url: String,
+    ) -> HarnessBrain {
+        use crate::company::credentials::Credential;
+        use crate::harness::provider::{HostedProvider, HostedProviderConfig};
+
+        let deps = HarnessDeps {
+            provider: Arc::new(HostedProvider::new(HostedProviderConfig {
+                base_url,
+                credential: Credential::from_value("stub-key"),
+                extra_headers: Vec::new(),
+            })),
+            provider_slug: "managed".to_string(),
+            context: Arc::new(FsContextStore::new(dir)),
+            store: Arc::new(FsCompanyStore::new(dir)),
+            meter: None,
+            workspace_root: dir.to_path_buf(),
+            model_override: Some("stub-model".to_string()),
+            tasks: Some(Arc::new(FsOps::new(dir))),
+            artifacts: None,
+            skills: None,
+            skills_source_dir: None,
+            skills_registry: std::sync::Arc::from([]),
+            mcp_servers: Vec::new(),
+            facts: None,
+            events: None,
+            delegations: orchestrator::DelegationQueue::default(),
+            workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+            mcp_failures: crate::harness::mcp_probe::McpFailureQueue::default(),
+            pending_publishes: crate::harness::publish::PendingPublishQueue::default(),
+            workflow_refs: crate::harness::workflow_refs::WorkflowRefQueue::default(),
+            approval_requests: requests,
+            secrets: None,
+            web_allowed_domains: Vec::new(),
+            capabilities: crate::harness::toolbelt::CapabilityFilter::AllowAll,
+            workflow_source_dir: None,
+            plan: None,
+            media: None,
+            composio: None,
+            steer: crate::company::steer::InflightRegistry::default(),
+            run_supervisor: crate::runtime::RunSupervisor::default(),
+            delivery: None,
+            search: None,
+            workspace: None,
+        };
+        HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record())
+    }
+
+    /// A card sitting in review, waiting on the verdict the operator approved.
+    fn card_in_review(id: &str) -> TaskRecord {
+        TaskRecord {
+            id: id.to_string(),
+            title: format!("Work item {id}"),
+            note: None,
+            column: COLUMN_IN_REVIEW.to_string(),
+            priority: "medium".to_string(),
+            assignee: "ceo".to_string(),
+            updated_at_millis: now_millis(),
+            origin_chat_id: None,
+            parent_task_id: None,
+            output: None,
+            plan: None,
+        }
+    }
+
+    fn granted(approval: &str, tool: &str) -> crate::runtime::grants::GrantedCall {
+        crate::runtime::grants::GrantedCall {
+            approval_id: ApprovalId::new(approval),
+            agent: "ceo".into(),
+            tool: tool.into(),
+            args: serde_json::json!({}),
+            at_millis: now_millis(),
+            origin_thread: None,
+        }
+    }
+
+    /// **The reachability assertion.** A test that the drain works when called
+    /// is not coverage that the drain is reached — and on this path it was not.
+    ///
+    /// `redispatch_granted_call` runs a full toolbelt turn and claimed publishes
+    /// only, so a `review_task` the re-issued call made was staged, answered
+    /// with "the card has moved to done", and destroyed by the next turn's
+    /// `clear()`. It **drains** rather than refusing, deliberately: `review_task`
+    /// is a gateable Write effect, so refusing here would make an operator's own
+    /// approval unspendable — approve, refuse, re-park.
+    #[tokio::test]
+    async fn a_granted_redispatch_drains_the_board_work_its_turn_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = crate::harness::policy::ApprovalRequestQueue::default();
+        requests.grants().grant(granted("appr-1", "review_task"));
+        let base_url = spawn_model_script(vec![
+            ScriptTurn::Call {
+                tool: "review_task",
+                args: serde_json::json!({ "task_id": "card-1", "decision": "approve" }),
+            },
+            ScriptTurn::Say("Approved."),
+        ])
+        .await;
+        let brain = brain_over_script(dir.path(), requests, base_url);
+        let tasks = brain.deps.tasks.clone().expect("task store");
+        tasks
+            .upsert(&CompanyId::new("acme"), &card_in_review("card-1"))
+            .await
+            .expect("seed the card");
+
+        let result = brain
+            .run_cycle(
+                cycle_over(vec![approval_resolved("appr-1", Verdict::Approve)]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+        assert_eq!(result.channel_responses.len(), 1);
+
+        let cards = tasks.list(&CompanyId::new("acme")).await.expect("list");
+        assert_eq!(
+            cards[0].column,
+            crate::ports::tasks::COLUMN_DONE,
+            "the approved card must actually move — staging it and returning was the defect"
+        );
+        assert_eq!(
+            brain.deps.delegations.queued(),
+            0,
+            "and nothing may be left for a later turn's clear() to destroy"
+        );
+        assert!(
+            !brain.deps.delegations.drain_committed(),
+            "the claim releases with the re-dispatch turn"
+        );
+    }
+
+    /// The #476 nuance: one continuation cycle can run **several** re-dispatch
+    /// turns, one per batched resolution. The claim is therefore per turn, not
+    /// per cycle — each re-dispatch owns its own drain window.
+    ///
+    /// A per-cycle claim would pass a single-approval test and fail here in the
+    /// worst way: the second turn's staged verdict would ride on the first
+    /// turn's already-spent window, or the second acquire would clear work the
+    /// first had not drained yet.
+    #[tokio::test]
+    async fn batched_resolutions_each_get_their_own_drain_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = crate::harness::policy::ApprovalRequestQueue::default();
+        requests.grants().grant(granted("appr-1", "review_task"));
+        requests.grants().grant(granted("appr-2", "review_task"));
+        let base_url = spawn_model_script(vec![
+            ScriptTurn::Call {
+                tool: "review_task",
+                args: serde_json::json!({ "task_id": "card-1", "decision": "approve" }),
+            },
+            ScriptTurn::Say("Approved card-1."),
+            ScriptTurn::Call {
+                tool: "review_task",
+                args: serde_json::json!({ "task_id": "card-2", "decision": "revise" }),
+            },
+            ScriptTurn::Say("Sent card-2 back."),
+        ])
+        .await;
+        let brain = brain_over_script(dir.path(), requests, base_url);
+        let tasks = brain.deps.tasks.clone().expect("task store");
+        let company = CompanyId::new("acme");
+        for id in ["card-1", "card-2"] {
+            tasks
+                .upsert(&company, &card_in_review(id))
+                .await
+                .expect("seed the card");
+        }
+
+        let result = brain
+            .run_cycle(
+                cycle_over(vec![
+                    approval_resolved("appr-1", Verdict::Approve),
+                    approval_resolved("appr-2", Verdict::Approve),
+                ]),
+                &NoopHost,
+            )
+            .await
+            .expect("cycle runs");
+        assert_eq!(
+            result.channel_responses.len(),
+            2,
+            "both resolutions re-dispatch"
+        );
+
+        let cards = tasks.list(&company).await.expect("list");
+        let column = |id: &str| {
+            cards
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.column.clone())
+                .unwrap_or_else(|| panic!("{id} is on the board"))
+        };
+        assert_eq!(
+            column("card-1"),
+            crate::ports::tasks::COLUMN_DONE,
+            "the first re-dispatch's verdict must survive the second re-dispatch's claim"
+        );
+        assert_eq!(
+            column("card-2"),
+            crate::ports::tasks::COLUMN_TODO,
+            "and the second's own verdict lands too"
+        );
+        assert_eq!(brain.deps.delegations.queued(), 0);
+        assert!(!brain.deps.delegations.drain_committed());
     }
 
     /// An approved resolution with NO grant behind it is a silent no-op.

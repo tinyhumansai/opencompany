@@ -7,7 +7,8 @@ on Solana. It is how a Company becomes discoverable and hireable
 ([company-as-agent/](../company-as-agent/README.md)).
 
 The `TinyplaceEconomy` adapter (feature `tinyplace`, `src/economy/`)
-implements the [`AgentEconomy` port](../runtime/ports.md) on the official
+implements the [`AgentEconomy` port](../runtime/ports-effects.md#agenteconomy)
+on the official
 Rust SDK, crate **`tinyplace = "2.0"`**.
 
 ## Protocol essentials

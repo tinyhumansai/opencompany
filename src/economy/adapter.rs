@@ -6,10 +6,11 @@
 //!   flag standing in for the Identity approval checkpoint) and funding covers
 //!   the registry fee — catching the `402` challenge, budget-checking, then
 //!   completing the paid registration;
-//! - publishes the Agent Card, queuing it to the [`Outbox`] (never erroring)
-//!   when tiny.place is unreachable;
+//! - publishes the Agent Card, parking it in the [`Outbox`] for the attached
+//!   replayer when tiny.place is unreachable — and erroring when no replayer is
+//!   attached, because then nothing would ever send it;
 //! - sends outbound A2A tasks, paying an x402 challenge under budget and
-//!   journaling the spend, or queuing the task when offline;
+//!   journaling the spend, and **failing** rather than queuing when offline;
 //! - quotes and pays firm requirements, **failing closed** the instant a
 //!   payment would exceed either the caller's [`BudgetScope`] or the company's
 //!   monthly ceiling, and journaling every in/out movement to the ledger.
@@ -19,6 +20,8 @@
 //! [`MockTinyplaceClient`](super::client::MockTinyplaceClient).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -41,6 +44,15 @@ const PAY_ASSET: &str = "USDC";
 /// The settlement network used when a firm quote is paid.
 const PAY_NETWORK: &str = "solana";
 
+/// How often an attached replayer retries the queued Agent Card.
+///
+/// There is no connectivity signal in the [`TinyplaceClient`] seam — no
+/// reconnect event, no health stream — so the first tick after the network
+/// returns *is* the reconnect drain. Inventing a listener to sharpen that is out
+/// of scope for #454; a card that is at most one interval stale is the whole
+/// point of a degrade path.
+pub const OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(30);
+
 /// The [`AgentEconomy`] over a [`TinyplaceClient`].
 pub struct TinyplaceEconomy {
     client: Arc<dyn TinyplaceClient>,
@@ -50,6 +62,15 @@ pub struct TinyplaceEconomy {
     monthly_cap: Option<f64>,
     going_public: bool,
     outbox: Arc<Outbox>,
+    /// Whether a background replayer is attached to this economy — i.e. whether
+    /// anything will ever send what [`Self::publish_card`] queues.
+    ///
+    /// Set by exactly one function, [`spawn_outbox_replayer`], and never
+    /// unset. That is what lets the offline publish path answer *"is my degrade
+    /// honest?"* instead of assuming it. A constructor that forgets to attach a
+    /// replayer leaves this `false`, and the publish then errors in the caller's
+    /// face rather than dropping the card in silence.
+    replayer: AtomicBool,
 }
 
 impl TinyplaceEconomy {
@@ -71,6 +92,7 @@ impl TinyplaceEconomy {
             monthly_cap,
             going_public: false,
             outbox: Arc::new(Outbox::new()),
+            replayer: AtomicBool::new(false),
         }
     }
 
@@ -82,9 +104,42 @@ impl TinyplaceEconomy {
         self
     }
 
-    /// The outbox holding actions deferred while tiny.place was unreachable.
+    /// The outbox holding the card deferred while tiny.place was unreachable.
     pub fn outbox(&self) -> &Arc<Outbox> {
         &self.outbox
+    }
+
+    /// Whether a background replayer is attached — see [`spawn_outbox_replayer`].
+    pub fn has_replayer(&self) -> bool {
+        self.replayer.load(Ordering::SeqCst)
+    }
+
+    /// Replays the queued Agent Card, if there is one.
+    ///
+    /// Empty outbox is a silent success — the replayer calls this on a timer, so
+    /// "nothing to do" is the normal case. On continued unreachability the card
+    /// goes back into the slot (unless a newer one landed meanwhile: see
+    /// [`Outbox::requeue`]) and the error is returned, so the next tick tries
+    /// again.
+    ///
+    /// A **rejection** — a `4xx` the server actually answered — is not requeued.
+    /// Retrying it every interval forever would be a hot loop against a card the
+    /// directory has already refused; the error is surfaced, and the next real
+    /// `publish_card` queues a fresh card if one is warranted.
+    pub async fn flush_outbox(&self) -> Result<()> {
+        let Some(OutboxAction::PublishCard(card)) = self.outbox.take() else {
+            return Ok(());
+        };
+        match self.client.put_agent(&self.signer.agent_id(), &card).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if matches!(&err, OpenCompanyError::Tinyplace { code, .. } if code == "unreachable")
+                {
+                    self.outbox.requeue(OutboxAction::PublishCard(card));
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Journals a negative (outflow) ledger movement.
@@ -151,8 +206,63 @@ impl std::fmt::Debug for TinyplaceEconomy {
             .field("monthly_cap", &self.monthly_cap)
             .field("going_public", &self.going_public)
             .field("outbox_len", &self.outbox.len())
+            .field("replayer", &self.has_replayer())
             .finish_non_exhaustive()
     }
+}
+
+/// Attaches the background Agent-Card replayer to a freshly built economy, and
+/// with it the promise that a queued card will actually be sent (issue #454).
+///
+/// **This is the only thing that sets the "a replayer is attached" flag**, which
+/// is what makes the flag mean what it says. [`TinyplaceEconomy::publish_card`]
+/// reads it to decide whether an offline publish may honestly report success, so
+/// a construction path that does not come through here degrades to a visible
+/// error instead of a silent drop. Call it on the concrete economy **before** it
+/// is type-erased into `Arc<dyn AgentEconomy>` — after that the flush surface is
+/// unreachable, which is exactly how the queue ended up with no drain.
+///
+/// # Why a weak reference
+///
+/// The task holds a [`Weak`](std::sync::Weak), not an `Arc`, and exits the first
+/// time the upgrade fails. A runtime rebuild (issue #290) constructs a fresh
+/// economy and drops the old one; with a strong reference the old economy — and
+/// its timer — would live forever, so every rebuild would leak another flusher
+/// publishing an ever-staler card over the live one. Weak makes the replayer's
+/// lifetime exactly the economy's.
+///
+/// `every` is the retry period; production passes [`OUTBOX_REPLAY_INTERVAL`].
+/// It is a parameter rather than a constant read inside so a test can exercise
+/// *this* function — the real attachment path, flag and all — without waiting
+/// out a production interval.
+pub fn spawn_outbox_replayer(economy: &Arc<TinyplaceEconomy>, every: Duration) {
+    economy.replayer.store(true, Ordering::SeqCst);
+    let company = economy.company.clone();
+    let weak = Arc::downgrade(economy);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(every);
+        loop {
+            ticker.tick().await;
+            let Some(economy) = weak.upgrade() else {
+                // The economy is gone (a rebuild, or shutdown): so is its queue.
+                break;
+            };
+            if economy.outbox.is_empty() {
+                continue;
+            }
+            match economy.flush_outbox().await {
+                Ok(()) => tracing::info!(
+                    company = %company,
+                    "tiny.place: replayed the queued Agent Card; the directory entry is current"
+                ),
+                Err(err) => tracing::warn!(
+                    company = %company,
+                    error = %err,
+                    "tiny.place: replaying the queued Agent Card failed"
+                ),
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -195,18 +305,65 @@ impl AgentEconomy for TinyplaceEconomy {
         }
     }
 
+    /// Publishes the Agent Card, degrading to the outbox when tiny.place is
+    /// unreachable — **but only when something will actually drain it**
+    /// (issue #454).
+    ///
+    /// This is the inversion the whole issue turns on. The old arm queued
+    /// unconditionally and returned `Ok(())`, and nothing in the tree ever
+    /// drained that queue: `drain()`'s only caller lived in its own test module,
+    /// and the concrete economy is type-erased behind [`AgentEconomy`] the moment
+    /// it is built, so no production code could reach it even in principle. Every
+    /// card published during an outage was therefore dropped while the caller was
+    /// told it had succeeded.
+    ///
+    /// So the `Ok(())` is now *earned*: it is returned only when
+    /// [`spawn_outbox_replayer`] has attached a replayer, which makes the
+    /// sentence "queued, and it will go out" true. With no replayer the original
+    /// unreachable error propagates and nothing is queued — a constructor path
+    /// written later that forgets to attach one inherits a visible error rather
+    /// than the silent drop this issue is about. Fail-safe by construction, the
+    /// same direction as `PublishDestination::Unclaimed` in the harness publish
+    /// queue (issue #445).
     async fn publish_card(&self, _identity: &CompanyIdentity, card: &AgentCard) -> Result<()> {
         match self.client.put_agent(&self.signer.agent_id(), card).await {
             Ok(()) => Ok(()),
-            Err(OpenCompanyError::Tinyplace { code, .. }) if code == "unreachable" => {
-                // Offline: queue the card so it goes stale rather than erroring.
+            Err(OpenCompanyError::Tinyplace { code, message }) if code == "unreachable" => {
+                if !self.has_replayer() {
+                    return Err(OpenCompanyError::tinyplace("unreachable", message));
+                }
+                // Offline, and a replayer is listening: park the newest card and
+                // let it go stale rather than erroring.
                 self.outbox.enqueue(OutboxAction::PublishCard(card.clone()));
+                tracing::warn!(
+                    company = %self.company,
+                    handle = %card.handle,
+                    "tiny.place is unreachable; the Agent Card is queued for replay and the \
+                     directory entry is stale until it lands"
+                );
                 Ok(())
             }
             Err(err) => Err(err),
         }
     }
 
+    /// Sends an outbound A2A task, and **fails** when tiny.place is unreachable
+    /// rather than deferring it.
+    ///
+    /// This is the deliberate other half of [`publish_card`](Self::publish_card)'s
+    /// contract, and the split is about money (issue #454). A card publish
+    /// degrades and replays: it is idempotent, it costs nothing, and the newest
+    /// card is always the right one to send whenever the network returns. A task
+    /// send does neither. It may carry an x402 payment, the budget scope that
+    /// authorised it belongs to the caller's cycle and is gone by flush time, and
+    /// a replay that lands after the caller already retried is a double-send —
+    /// which here means a double-spend. So the error goes back to the caller, who
+    /// is the only party holding the context to decide whether to retry it.
+    ///
+    /// Before #454 this arm did *both*: it pushed a copy onto the outbox **and**
+    /// returned the error. Nothing ever drained that copy, so it was pure
+    /// unreachable state; had anything drained it, it would have been a
+    /// background double-send with no budget behind it.
     async fn send_a2a_task(&self, to: &AgentAddr, task: A2aTask) -> Result<A2aTaskHandle> {
         let params = serde_json::json!({
             "id": generate_id(),
@@ -239,12 +396,8 @@ impl AgentEconomy for TinyplaceEconomy {
                 Ok(handle_from_response(&response, &rpc.id))
             }
             Err(OpenCompanyError::Tinyplace { code, message }) if code == "unreachable" => {
-                // Offline: queue the task and surface the error so the caller
-                // decides whether to retry.
-                self.outbox.enqueue(OutboxAction::SendTask {
-                    to: to.clone(),
-                    task,
-                });
+                // Offline: surface the error and queue nothing. The caller owns
+                // the retry decision for a task that may cost money.
                 Err(OpenCompanyError::tinyplace("unreachable", message))
             }
             Err(err) => Err(err),
@@ -619,27 +772,131 @@ mod test {
         assert!(ledger_of(&store, &company).await.is_empty());
     }
 
+    fn card(handle: &str) -> AgentCard {
+        AgentCard {
+            handle: handle.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Polls until the outbox drains, bounded so a broken replayer fails the
+    /// test instead of hanging it.
+    async fn drained_within(outbox: &Arc<Outbox>, budget: Duration) -> bool {
+        let step = Duration::from_millis(10);
+        for _ in 0..(budget.as_millis() / step.as_millis()).max(1) {
+            if outbox.is_empty() {
+                return true;
+            }
+            tokio::time::sleep(step).await;
+        }
+        outbox.is_empty()
+    }
+
+    /// Issue #454, the reachability test that matters: an economy built through
+    /// the **production spawn path** may degrade offline, and the card it queued
+    /// is genuinely sent once the network returns.
+    ///
+    /// A test that calls `flush_outbox` by hand would prove the drain works. It
+    /// would not prove the drain is ever *reached* — which is the entire defect,
+    /// since the pre-#454 drain worked fine and had no caller outside its own
+    /// test module. So nothing here touches the flush surface: the replayer's
+    /// own timer is what has to do it.
     #[tokio::test]
-    async fn unreachable_publish_card_enqueues_outbox_not_error() {
+    async fn a_spawned_replayer_queues_offline_then_actually_sends() {
         let company = CompanyId::new("acme");
         let (_dir, store) = seeded_store(&company).await;
         let mock = Arc::new(MockTinyplaceClient::new());
         mock.set_reachable(false);
-        let economy = TinyplaceEconomy::new(mock.clone(), signer(), store, company.clone(), None);
+        let economy = Arc::new(TinyplaceEconomy::new(
+            mock.clone(),
+            signer(),
+            store,
+            company.clone(),
+            None,
+        ));
+        spawn_outbox_replayer(&economy, Duration::from_millis(20));
 
-        let card = AgentCard {
-            handle: "acme".into(),
-            ..Default::default()
-        };
         economy
-            .publish_card(&identity(&company), &card)
+            .publish_card(&identity(&company), &card("acme"))
             .await
-            .expect("publish never errors offline");
-        assert_eq!(economy.outbox().len(), 1, "card queued to the outbox");
+            .expect("an offline publish degrades once a replayer is attached");
+        assert_eq!(economy.outbox().len(), 1, "the card is queued");
+        assert_eq!(mock.count("put_agent"), 1, "one refused attempt so far");
+
+        // The network comes back. There is no reconnect signal in the client
+        // seam, so the next interval tick is the drain.
+        mock.set_reachable(true);
+        assert!(
+            drained_within(economy.outbox(), Duration::from_secs(5)).await,
+            "the replayer never drained the outbox"
+        );
+        assert!(
+            mock.count("put_agent") >= 2,
+            "the queued card was replayed onto the wire, not merely dropped"
+        );
     }
 
+    /// The other side of the same invariant: with no replayer attached, an
+    /// offline publish is an **error** and queues nothing. This is what a
+    /// constructor path that forgets to spawn the replayer inherits — a visible
+    /// failure instead of a card dropped behind an `Ok(())`.
     #[tokio::test]
-    async fn unreachable_send_task_enqueues_and_errors() {
+    async fn offline_publish_without_a_replayer_errors_and_queues_nothing() {
+        let company = CompanyId::new("acme");
+        let (_dir, store) = seeded_store(&company).await;
+        let mock = Arc::new(MockTinyplaceClient::new());
+        mock.set_reachable(false);
+        // The bare constructor: no `spawn_outbox_replayer`.
+        let economy = TinyplaceEconomy::new(mock.clone(), signer(), store, company.clone(), None);
+        assert!(!economy.has_replayer());
+
+        let err = economy
+            .publish_card(&identity(&company), &card("acme"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "tinyplace_unreachable");
+        assert!(
+            economy.outbox().is_empty(),
+            "nothing is queued when nothing would drain it"
+        );
+    }
+
+    /// Newest wins: replay only ever needs the current card, so a second offline
+    /// publish replaces the first rather than stacking behind it.
+    #[tokio::test]
+    async fn a_newer_offline_card_replaces_the_queued_one() {
+        let company = CompanyId::new("acme");
+        let (_dir, store) = seeded_store(&company).await;
+        let mock = Arc::new(MockTinyplaceClient::new());
+        mock.set_reachable(false);
+        let economy = Arc::new(TinyplaceEconomy::new(
+            mock.clone(),
+            signer(),
+            store,
+            company.clone(),
+            None,
+        ));
+        // The production interval, so the replayer's timer cannot fire inside
+        // this test: what is asserted is the queue, not the drain.
+        spawn_outbox_replayer(&economy, OUTBOX_REPLAY_INTERVAL);
+
+        let identity = identity(&company);
+        economy.publish_card(&identity, &card("old")).await.unwrap();
+        economy.publish_card(&identity, &card("new")).await.unwrap();
+
+        assert_eq!(economy.outbox().len(), 1, "the outbox stays bounded");
+        assert_eq!(
+            economy.outbox().take(),
+            Some(OutboxAction::PublishCard(card("new"))),
+            "the newest card is what replay would send"
+        );
+    }
+
+    /// Issue #454: an offline task send errors and queues **nothing**. The ghost
+    /// copy it used to push was unreachable state at best and a budget-less
+    /// background double-send at worst.
+    #[tokio::test]
+    async fn unreachable_send_task_errors_without_queueing() {
         let company = CompanyId::new("acme");
         let (_dir, store) = seeded_store(&company).await;
         let mock = Arc::new(MockTinyplaceClient::new());
@@ -657,7 +914,10 @@ mod test {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "tinyplace_unreachable");
-        assert_eq!(economy.outbox().len(), 1, "task queued despite the error");
+        assert!(
+            economy.outbox().is_empty(),
+            "a paid task is never deferred for background replay"
+        );
     }
 
     #[tokio::test]

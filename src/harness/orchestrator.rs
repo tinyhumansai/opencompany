@@ -17,7 +17,10 @@
 //!   [`Delegation`] onto a shared [`DelegationQueue`]. They perform no work
 //!   themselves; the [`HarnessBrain`](crate::harness::HarnessBrain) drains the
 //!   queue after the orchestrator's turn (v1: synchronous, in-cycle, capped at
-//!   [`MAX_DELEGATIONS_PER_TURN`], no sub-agent re-delegation).
+//!   [`MAX_DELEGATIONS_PER_TURN`], no sub-agent re-delegation). Since issue #453
+//!   they push only when a drain site has [claimed](DelegationQueue::claim) the
+//!   queue; a turn run from a path that drains nothing gets an in-turn refusal
+//!   instead of a receipt for work that will never happen.
 //! * [`RunWorkflowTool`] — executes one of the company's saved workflow graphs
 //!   by id via the [`WorkflowRunner`] port (issue #67). It loads the graph from
 //!   the company source directory (the same loader the REST run route uses) and
@@ -238,9 +241,37 @@ pub enum Delegation {
 /// queue is seen by the tools captured into the orchestrator agent and by the
 /// brain that drains it, because [`HarnessDeps`](crate::harness::HarnessDeps)
 /// clones share this handle.
+///
+/// # Why staging must be *claimed* (issue #453)
+///
+/// Staging has one failure mode and it is the worst kind: a caller for whom
+/// **nothing drains**. `review_task` returned *"Approved card X; it is complete
+/// and has moved to done"* the instant it pushed, and two production paths ran
+/// a full toolbelt turn and never drained — the approval re-dispatch and the
+/// workflow agent node. On those the sentence was false every time, and the
+/// next turn's [`clear`](Self::clear) destroyed the work the operator had just
+/// been told was done. A tool that cannot fail launders the failure through the
+/// agent into a confident falsehood.
+///
+/// So the queue carries a **drain commitment** alongside the staged items, and
+/// a drain site [`claim`](Self::claim)s it for the span in which it promises to
+/// drain. The default is *uncommitted*, and that direction is the whole
+/// guarantee: a turn run from a path that has not claimed — including one
+/// written later, by someone who never read this — gets an honest in-turn
+/// refusal instead of a receipt nothing will honour. Enforced by construction
+/// rather than by remembering: *no claim, no delegation*.
+///
+/// This is [`PendingPublishQueue`](crate::harness::publish::PendingPublishQueue)'s
+/// #445 shape, deliberately. The one difference is that there is nothing to name:
+/// every drain site executes the same delegations the same way, so the
+/// commitment is a boolean rather than a destination.
 #[derive(Clone, Default)]
 pub struct DelegationQueue {
     inner: Arc<Mutex<Vec<Delegation>>>,
+    /// Whether some drain site has promised to drain what is staged here
+    /// (issue #453). `false` — nothing drains — is the default and the
+    /// fail-safe direction.
+    committed: Arc<Mutex<bool>>,
     /// Desk keys a `delegate_to_desk` call named that the company does not have
     /// (issue #272).
     ///
@@ -259,8 +290,11 @@ impl DelegationQueue {
     ///
     /// Production callers want [`push_within_cap`](Self::push_within_cap)
     /// instead: this one can queue work the drain will later throw away, which
-    /// is exactly the failure issue #419 is about. Kept for the tests that
-    /// deliberately over-fill the queue to prove the cap holds.
+    /// is exactly the failure issue #419 is about. It bypasses the #453 drain
+    /// commitment for the same reason it bypasses the cap — it is the escape
+    /// hatch the tests that stand in for a turn use, and it is not reachable
+    /// from any tool. Kept for the tests that deliberately over-fill the queue
+    /// to prove the cap holds.
     pub fn push(&self, delegation: Delegation) {
         self.inner
             .lock()
@@ -268,8 +302,32 @@ impl DelegationQueue {
             .push(delegation);
     }
 
-    /// Enqueues a delegation unless `cap` are already queued for this turn.
-    /// Returns whether it was queued (issue #419).
+    /// Whether a drain site has committed to draining this queue (issue #453).
+    pub fn drain_committed(&self) -> bool {
+        *self.committed.lock().expect("delegation commitment")
+    }
+
+    /// Claims this queue for a drain site that promises to drain it, for as long
+    /// as the returned [`DelegationClaim`] lives (issue #453).
+    ///
+    /// Clears on the way in for the reason the drain sites already cleared by
+    /// hand — a prior turn's staged delegation must never be executed for this
+    /// caller — and, via [`DelegationClaim`]'s `Drop`, on the way out too. The
+    /// exit half is the one that is new and load-bearing: an early return, a
+    /// `?`, or a panic mid-turn used to leave items staged for the next caller
+    /// to clear, so correctness depended on every future path remembering. Now
+    /// the claim's scope *is* the window in which delegating works.
+    #[must_use = "the claim releases on drop; dropping it immediately un-claims the queue"]
+    pub fn claim(&self) -> DelegationClaim {
+        self.clear();
+        *self.committed.lock().expect("delegation commitment") = true;
+        DelegationClaim {
+            queue: self.clone(),
+        }
+    }
+
+    /// Enqueues a delegation unless nothing will drain it, or `cap` are already
+    /// queued for this turn (issues #419 and #453).
     ///
     /// # Why the cap is enforced *here*
     ///
@@ -289,14 +347,24 @@ impl DelegationQueue {
     /// queue is [`clear`](Self::clear)ed before every turn precisely so a stale
     /// delegation cannot leak into one — including into a CEO-relay turn, which
     /// is forbidden to delegate at all.
+    ///
+    /// # Why the commitment is checked *first*
+    ///
+    /// When nothing will drain, that is the only fact that matters: reporting
+    /// the cap instead would tell the model to try again next turn, and the next
+    /// turn on that path drains no better than this one. The two refusals are
+    /// therefore distinct [`Staged`] variants and never collapsed.
     #[must_use = "a refused delegation must be reported to the model, not dropped"]
-    pub fn push_within_cap(&self, delegation: Delegation, cap: usize) -> bool {
+    pub fn push_within_cap(&self, delegation: Delegation, cap: usize) -> Staged {
+        if !self.drain_committed() {
+            return Staged::NoDrain;
+        }
         let mut guard = self.inner.lock().expect("delegation queue");
         if guard.len() >= cap {
-            return false;
+            return Staged::OverCap;
         }
         guard.push(delegation);
-        true
+        Staged::Queued
     }
 
     /// Records that a hand-off named `desk`, which the company cannot hand work
@@ -364,6 +432,49 @@ impl DelegationQueue {
     #[cfg(test)]
     pub fn queued(&self) -> usize {
         self.inner.lock().expect("delegation queue").len()
+    }
+}
+
+/// What happened when a tool offered a delegation to the queue (issues #419,
+/// #453).
+///
+/// Three outcomes rather than a `bool`, because the two refusals need different
+/// sentences: one says *this turn is full, raise it next turn*, and the other
+/// says *this context cannot do board work at all, do not retry*. A model told
+/// the wrong one either burns its next turn on a call that will fail identically
+/// or gives up on work it could still have queued.
+#[must_use = "a delegation that was not queued must be reported to the model, not dropped"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Staged {
+    /// Queued; some drain site will execute it as this turn completes.
+    Queued,
+    /// Nothing has claimed the queue, so nothing would ever execute it.
+    NoDrain,
+    /// This turn has already queued [`MAX_DELEGATIONS_PER_TURN`].
+    OverCap,
+}
+
+/// The live claim on a [`DelegationQueue`] — proof that some drain site is
+/// listening (issue #453).
+///
+/// Held for the span in which a caller promises to drain; on `Drop` the queue is
+/// emptied and returns to uncommitted, so delegating is off again the moment
+/// that promise ends. Mirrors
+/// [`PublishClaim`](crate::harness::publish::PublishClaim), and the in-flight
+/// steer guard before it, for the same reason: the cleanup has to happen on
+/// **every** exit path, including the ones nobody wrote by hand.
+///
+/// Deliberately not [`Clone`] — two live claims would mean two owners of one
+/// promise, and the second to drop would un-claim the queue underneath the
+/// first.
+pub struct DelegationClaim {
+    queue: DelegationQueue,
+}
+
+impl Drop for DelegationClaim {
+    fn drop(&mut self) {
+        *self.queue.committed.lock().expect("delegation commitment") = false;
+        self.queue.clear();
     }
 }
 
@@ -845,7 +956,8 @@ impl Tool for SpawnTaskTool {
             .filter(|a| !a.is_empty())
             .map(str::to_string);
 
-        if !self.queue.push_within_cap(
+        let effect = format!("the card \"{title}\" was NOT opened");
+        match self.queue.push_within_cap(
             Delegation::SpawnTask {
                 title: title.clone(),
                 note,
@@ -853,9 +965,9 @@ impl Tool for SpawnTaskTool {
             },
             MAX_DELEGATIONS_PER_TURN,
         ) {
-            return Ok(ToolResult::error(over_cap(&format!(
-                "the card \"{title}\" was NOT opened"
-            ))));
+            Staged::Queued => {}
+            Staged::OverCap => return Ok(ToolResult::error(over_cap(&effect))),
+            Staged::NoDrain => return Ok(ToolResult::error(no_drain(SPAWN_TASK_TOOL, &effect))),
         }
         Ok(ToolResult::success(format!(
             "Queued a task card: \"{title}\". It will be opened on the board this turn."
@@ -970,16 +1082,19 @@ impl Tool for DelegateToDeskTool {
             return Ok(ToolResult::error(refusal));
         }
 
-        if !self.queue.push_within_cap(
+        let effect = format!("nothing was handed to the {desk} desk");
+        match self.queue.push_within_cap(
             Delegation::DelegateToDesk {
                 desk: desk.clone(),
                 instruction,
             },
             MAX_DELEGATIONS_PER_TURN,
         ) {
-            return Ok(ToolResult::error(over_cap(&format!(
-                "nothing was handed to the {desk} desk"
-            ))));
+            Staged::Queued => {}
+            Staged::OverCap => return Ok(ToolResult::error(over_cap(&effect))),
+            Staged::NoDrain => {
+                return Ok(ToolResult::error(no_drain(DELEGATE_TO_DESK_TOOL, &effect)));
+            }
         }
         Ok(ToolResult::success(format!(
             "Delegated to the {desk} desk. Its lead will answer this turn."
@@ -1048,7 +1163,8 @@ impl Tool for AssignTaskTool {
         let assignee = required_str(&args, "assignee")?;
         let note = optional_str(&args, "note");
 
-        if !self.queue.push_within_cap(
+        let effect = format!("card {task_id} was NOT assigned");
+        match self.queue.push_within_cap(
             Delegation::AssignTask {
                 task_id: task_id.clone(),
                 assignee: assignee.clone(),
@@ -1056,12 +1172,15 @@ impl Tool for AssignTaskTool {
             },
             MAX_DELEGATIONS_PER_TURN,
         ) {
-            return Ok(ToolResult::error(over_cap(&format!(
-                "card {task_id} was NOT assigned"
-            ))));
+            Staged::Queued => {}
+            Staged::OverCap => return Ok(ToolResult::error(over_cap(&effect))),
+            Staged::NoDrain => return Ok(ToolResult::error(no_drain(ASSIGN_TASK_TOOL, &effect))),
         }
+        // Staged truth, not the past tense (issue #453). Nothing has been
+        // written yet; the drain this turn's claim promises is what writes it.
         Ok(ToolResult::success(format!(
-            "Assigned card {task_id} to {assignee}."
+            "Recorded the assignment of card {task_id} to {assignee}; it takes effect as this turn \
+             completes."
         )))
     }
 }
@@ -1129,7 +1248,8 @@ impl Tool for ReviewTaskTool {
         })?;
         let note = optional_str(&args, "note");
 
-        if !self.queue.push_within_cap(
+        let effect = format!("card {task_id} was NOT reviewed");
+        match self.queue.push_within_cap(
             Delegation::ReviewTask {
                 task_id: task_id.clone(),
                 decision,
@@ -1137,16 +1257,23 @@ impl Tool for ReviewTaskTool {
             },
             MAX_DELEGATIONS_PER_TURN,
         ) {
-            return Ok(ToolResult::error(over_cap(&format!(
-                "card {task_id} was NOT reviewed"
-            ))));
+            Staged::Queued => {}
+            Staged::OverCap => return Ok(ToolResult::error(over_cap(&effect))),
+            Staged::NoDrain => return Ok(ToolResult::error(no_drain(REVIEW_TASK_TOOL, &effect))),
         }
+        // Issue #453: the card has NOT moved yet. It moves when the drain runs,
+        // and the drain runs because this turn is claimed — which is what makes
+        // "as this turn completes" a commitment rather than a hope. The old
+        // wording ("it is complete and has moved to done") was the past tense
+        // for something that had not happened, and on an unclaimed path it never
+        // would.
         Ok(match decision {
             ReviewDecision::Approve => ToolResult::success(format!(
-                "Approved card {task_id}; it is complete and has moved to done."
+                "Recorded your approval of card {task_id}; it moves to done as this turn completes."
             )),
             ReviewDecision::Revise => ToolResult::success(format!(
-                "Sent card {task_id} back to To-do for another pass."
+                "Recorded your revision request; card {task_id} returns to To-do as this turn \
+                 completes."
             )),
         })
     }
@@ -1165,6 +1292,29 @@ fn over_cap(effect: &str) -> String {
         "Refused: this turn has already used all {MAX_DELEGATIONS_PER_TURN} of its delegations, so \
 {effect}. Nothing was queued and nothing will happen. Do not report this as done — tell the \
 operator which items you got to and which you did not, and raise the rest in your next turn."
+    )
+}
+
+/// The refusal a delegation tool returns when **nothing will drain** what it
+/// would queue (issue #453) — modelled on
+/// [`cannot_publish_here`](crate::harness::publish) one module over.
+///
+/// It has to do two jobs, and they are not the two [`over_cap`] does. It must
+/// not read as a transient condition worth retrying — every turn on an unclaimed
+/// path fails identically — and it must tell the agent what to say next, because
+/// the failure this replaces was one the agent could not detect: it was told the
+/// card had moved, so it told the operator the card had moved, and the next
+/// turn's `clear()` threw the delegation away.
+fn no_drain(tool: &str, effect: &str) -> String {
+    tracing::warn!(
+        tool = %tool,
+        "[delegation] a delegation tool was called from a turn with no claimed drain; refusing \
+         rather than queuing into a queue nothing will drain"
+    );
+    format!(
+        "Refused: nothing here can carry out board work, so {effect}. Board actions are \
+         unavailable in this context. Do not retry — it will fail the same way — and do NOT report \
+         the action as done or describe the card as moved. Say plainly that you could not do it."
     )
 }
 
@@ -2241,25 +2391,159 @@ mod tests {
     #[test]
     fn push_within_cap_refuses_once_the_turn_is_full() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         for i in 0..MAX_DELEGATIONS_PER_TURN {
-            assert!(queue.push_within_cap(
+            assert_eq!(
+                queue.push_within_cap(
+                    Delegation::SpawnTask {
+                        title: format!("t{i}"),
+                        note: None,
+                        assignee: None,
+                    },
+                    MAX_DELEGATIONS_PER_TURN,
+                ),
+                Staged::Queued
+            );
+        }
+        assert_eq!(
+            queue.push_within_cap(
                 Delegation::SpawnTask {
-                    title: format!("t{i}"),
+                    title: "one too many".to_string(),
                     note: None,
                     assignee: None,
                 },
                 MAX_DELEGATIONS_PER_TURN,
-            ));
-        }
-        assert!(!queue.push_within_cap(
-            Delegation::SpawnTask {
-                title: "one too many".to_string(),
-                note: None,
-                assignee: None,
-            },
-            MAX_DELEGATIONS_PER_TURN,
-        ));
+            ),
+            Staged::OverCap
+        );
         assert_eq!(queue.queued(), MAX_DELEGATIONS_PER_TURN);
+    }
+
+    // ── Issue #453: no claim, no delegation ────────────────────────────────
+
+    /// The commitment is checked before the cap, and it is the answer an
+    /// unclaimed queue gives however empty it is. A model told "this turn is
+    /// full" would try again next turn; on an unclaimed path the next turn fails
+    /// identically, so the two refusals must stay distinguishable.
+    #[test]
+    fn an_unclaimed_queue_refuses_before_the_cap_is_even_consulted() {
+        let queue = DelegationQueue::default();
+        assert!(!queue.drain_committed(), "uncommitted is the default");
+        assert_eq!(
+            queue.push_within_cap(
+                Delegation::SpawnTask {
+                    title: "first and only".to_string(),
+                    note: None,
+                    assignee: None,
+                },
+                MAX_DELEGATIONS_PER_TURN,
+            ),
+            Staged::NoDrain,
+            "an EMPTY unclaimed queue is still a queue nothing drains"
+        );
+        assert_eq!(queue.queued(), 0);
+    }
+
+    /// The RAII half, which is the one that was missing everywhere before #453:
+    /// an early exit — a `?`, a panic, a `return` from the middle of a turn —
+    /// must leave the queue empty and uncommitted, so the *next* caller inherits
+    /// a refusal rather than this one's abandoned work.
+    #[test]
+    fn a_claim_that_exits_early_un_commits_and_clears() {
+        let queue = DelegationQueue::default();
+
+        // A turn that queues work and then bails before draining.
+        fn bail(queue: &DelegationQueue) -> Result<(), &'static str> {
+            let _claim = queue.claim();
+            assert_eq!(
+                queue.push_within_cap(
+                    Delegation::ReviewTask {
+                        task_id: "t1".to_string(),
+                        decision: ReviewDecision::Approve,
+                        note: None,
+                    },
+                    MAX_DELEGATIONS_PER_TURN,
+                ),
+                Staged::Queued
+            );
+            assert_eq!(queue.queued(), 1, "staged while the claim is live");
+            Err("the turn failed after queuing")
+        }
+
+        assert!(bail(&queue).is_err());
+        assert_eq!(
+            queue.queued(),
+            0,
+            "the abandoned delegation must not survive the claim that staged it"
+        );
+        assert!(
+            !queue.drain_committed(),
+            "and the next caller must inherit a refusal, not this one's promise"
+        );
+
+        // Acquiring also clears, so a prior turn's leftovers can never be
+        // executed for the caller that comes next.
+        queue.push(Delegation::SpawnTask {
+            title: "left behind".to_string(),
+            note: None,
+            assignee: None,
+        });
+        let _claim = queue.claim();
+        assert_eq!(queue.queued(), 0);
+    }
+
+    /// The headline refusal, per tool, with the sentence each one owes the
+    /// model. The effect clause is the tool's own — a generic "refused" would
+    /// leave the model guessing which of its calls did not happen.
+    #[tokio::test]
+    async fn every_delegation_tool_refuses_when_nothing_will_drain() {
+        let queue = DelegationQueue::default();
+        let store = Arc::new(MemStore::seeded(desks_record(&CompanyId::new("acme"))))
+            as Arc<dyn CompanyStore>;
+
+        let cases: Vec<(Box<dyn Tool>, Value, &str)> = vec![
+            (
+                Box::new(SpawnTaskTool::new(queue.clone())),
+                json!({ "title": "Ship it" }),
+                "the card \"Ship it\" was NOT opened",
+            ),
+            (
+                Box::new(DelegateToDeskTool::new(
+                    queue.clone(),
+                    CompanyId::new("acme"),
+                    store,
+                )),
+                json!({ "desk": "strategy", "instruction": "draft a plan" }),
+                "nothing was handed to the strategy desk",
+            ),
+            (
+                Box::new(AssignTaskTool::new(queue.clone())),
+                json!({ "task_id": "t1", "assignee": "writer" }),
+                "card t1 was NOT assigned",
+            ),
+            (
+                Box::new(ReviewTaskTool::new(queue.clone())),
+                json!({ "task_id": "t1", "decision": "approve" }),
+                "card t1 was NOT reviewed",
+            ),
+        ];
+
+        for (tool, args, effect) in cases {
+            let name = tool.name().to_string();
+            let result = tool.execute(args).await.expect("execute");
+            assert!(result.is_error, "{name} must refuse: {}", result.text());
+            let text = result.text();
+            assert!(text.contains(effect), "{name}: {text}");
+            // Not retryable — the next turn on this path drains no better.
+            assert!(text.contains("Do not retry"), "{name}: {text}");
+            // And the model must not narrate it as done, which is the whole
+            // failure this replaces.
+            assert!(text.contains("report the action as done"), "{name}: {text}");
+            // Deliberately NOT the cap sentence: this is a different problem
+            // with a different remedy.
+            assert!(!text.contains("delegations"), "{name}: {text}");
+        }
+        assert_eq!(queue.queued(), 0, "nothing may be staged by a refusal");
     }
 
     /// The defect #419 names: the tool told the model "it will be opened on the
@@ -2269,6 +2553,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_task_refuses_past_the_cap_instead_of_promising_a_discarded_card() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         let tool = SpawnTaskTool::new(queue.clone());
         for i in 0..MAX_DELEGATIONS_PER_TURN {
             let ok = tool
@@ -2301,6 +2586,7 @@ mod tests {
     #[tokio::test]
     async fn delegate_to_desk_refuses_past_the_cap() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         // An empty store loads no record, so desk grounding fails open and the
         // hand-off is queued exactly as it was before #272 — which isolates this
         // test to the cap.
@@ -2332,6 +2618,7 @@ mod tests {
     #[tokio::test]
     async fn the_lifecycle_tools_refuse_past_the_cap_too() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         let assign = AssignTaskTool::new(queue.clone());
         let review = ReviewTaskTool::new(queue.clone());
         for i in 0..MAX_DELEGATIONS_PER_TURN {
@@ -2366,6 +2653,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_task_tool_enqueues_a_task() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         let tool = SpawnTaskTool::new(queue.clone());
         tool.execute(json!({ "title": "Ship it", "note": "soon", "assignee": "eng" }))
             .await
@@ -2394,6 +2682,7 @@ mod tests {
     #[tokio::test]
     async fn assign_task_tool_enqueues_an_assignment() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         let tool = AssignTaskTool::new(queue.clone());
         tool.execute(json!({ "task_id": "t1", "assignee": "eng", "note": "closer to it" }))
             .await
@@ -2426,13 +2715,30 @@ mod tests {
     #[tokio::test]
     async fn review_task_tool_enqueues_both_verdicts() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         let tool = ReviewTaskTool::new(queue.clone());
-        tool.execute(json!({ "task_id": "t1", "decision": "approve", "note": "good" }))
+        let approved = tool
+            .execute(json!({ "task_id": "t1", "decision": "approve", "note": "good" }))
             .await
             .expect("approve");
-        tool.execute(json!({ "task_id": "t2", "decision": "revise" }))
+        let revised = tool
+            .execute(json!({ "task_id": "t2", "decision": "revise" }))
             .await
             .expect("revise");
+
+        // Issue #453: staged truth, not the past tense. The card has not moved
+        // when this sentence is written — the drain the claim promises is what
+        // moves it — and saying otherwise is what made an undrained turn a lie
+        // told through the agent.
+        assert!(!approved.is_error);
+        let text = approved.text();
+        assert!(text.contains("Recorded your approval of card t1"), "{text}");
+        assert!(text.contains("as this turn completes"), "{text}");
+        assert!(!text.contains("has moved"), "nothing has moved yet: {text}");
+        let text = revised.text();
+        assert!(text.contains("card t2 returns to To-do"), "{text}");
+        assert!(text.contains("as this turn completes"), "{text}");
+
         assert_eq!(
             queue.drain(MAX_DELEGATIONS_PER_TURN),
             vec![
@@ -2540,6 +2846,7 @@ members = ["nobody"]
     #[tokio::test]
     async fn delegate_to_desk_tool_enqueues_a_hand_off() {
         let queue = DelegationQueue::default();
+        let _claim = queue.claim();
         let tool = desk_tool(desks_record(&CompanyId::new("acme")), &queue);
         let result = tool
             .execute(json!({ "desk": "strategy", "instruction": "draft a plan" }))
@@ -2616,6 +2923,10 @@ members = ["nobody"]
     #[tokio::test]
     async fn delegate_to_desk_tool_queues_ungrounded_when_no_record_is_readable() {
         let queue = DelegationQueue::default();
+        // Claimed (issue #453): "fail open" is about the *desk grounding*, and
+        // this pins that an unreadable record still queues. Whether anything
+        // drains is a separate question with its own refusal.
+        let _claim = queue.claim();
         let tool = DelegateToDeskTool::new(
             queue.clone(),
             CompanyId::new("acme"),

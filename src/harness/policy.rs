@@ -503,6 +503,15 @@ impl ApprovalPolicy {
     ///   handle. Re-classifying the live arguments keeps the grant to the shape
     ///   the operator was shown. It also means a grant replayed from a journal
     ///   line written before this change cannot admit a send.
+    /// * **The call must fall in the same slice of the tool the grant was minted
+    ///   on** (issue #457). Re-classifying keeps a send out of a read's grant,
+    ///   but every Composio read across every connected toolkit is the same
+    ///   verdict under the same tool name — so a grant minted from "read from
+    ///   GitHub" admitted a read of the company's mailbox too. The live call's
+    ///   scope is computed here and matched against what the grant recorded; an
+    ///   action the catalogue cannot place has no scope and a scoped grant
+    ///   refuses it. A grant replayed from a line written before the field
+    ///   existed is unscoped and behaves exactly as it did.
     fn standing_grant_allows(&self, tool: &str, args: &serde_json::Value) -> bool {
         let Some(agent) = self.agent.as_deref() else {
             return false;
@@ -520,11 +529,17 @@ impl ApprovalPolicy {
             );
             return false;
         }
-        let Some(grant) =
-            self.requests
-                .grants()
-                .match_standing(agent, tool, crate::ports::now_millis())
-        else {
+        // Issue #457: which slice of the tool this *live* call falls in,
+        // computed by the same function the mint side used on the parked
+        // effect's payload — one function, so the two answers cannot drift into
+        // a grant that never matches its own tool.
+        let scope = crate::policy::consequence::standing_scope_of(tool, args);
+        let Some(grant) = self.requests.grants().match_standing(
+            agent,
+            tool,
+            scope.as_deref(),
+            crate::ports::now_millis(),
+        ) else {
             return false;
         };
         log::debug!(
@@ -2366,6 +2381,20 @@ mod tests {
             at_millis: 1_000,
             expires_at_millis,
             origin_thread: None,
+            scope: None,
+        }
+    }
+
+    /// The same fixture, confined to one Composio toolkit (issue #457).
+    fn scoped_standing(
+        agent: &str,
+        tool: &str,
+        scope: &str,
+        expires_at_millis: u64,
+    ) -> crate::runtime::grants::StandingGrant {
+        crate::runtime::grants::StandingGrant {
+            scope: Some(scope.to_string()),
+            ..standing(agent, tool, expires_at_millis)
         }
     }
 
@@ -2781,6 +2810,120 @@ mod tests {
             ),
             "a send on the same tool name parks despite the grant"
         );
+    }
+
+    /// Issue #457, through the real admission path. Re-classifying the live
+    /// action (the test above) separates a read from a send; it cannot separate
+    /// one provider's read from another's, because both are reads under the same
+    /// tool name for the same teammate. The card said "read from GitHub" and the
+    /// grant has to mean that.
+    #[tokio::test]
+    async fn a_grant_scoped_to_one_provider_does_not_admit_another_providers_read() {
+        let queue = ApprovalRequestQueue::default();
+        let grants = queue.grants();
+        let p = policy("supervised", &[], None)
+            .with_requests(queue)
+            .with_agent("ops");
+        grants.grant_standing(scoped_standing(
+            "ops",
+            "composio_execute",
+            "github",
+            far_future(),
+        ));
+
+        // A *different* GitHub read: the operator consented to the provider, so
+        // this is inside the sentence and must keep running. Scoping by action
+        // slug instead would have re-parked here and made the grant worthless.
+        assert_eq!(
+            p.check(&request(
+                "composio_execute",
+                serde_json::json!({ "tool": "GITHUB_LIST_PULL_REQUESTS" })
+            ))
+            .await,
+            ToolPolicyDecision::Allow
+        );
+
+        // A mailbox read. Also a catalogue read, also grantable, also `ops`,
+        // also `composio_execute` — every check upstream of the scope says yes.
+        assert!(
+            matches!(
+                p.check(&request(
+                    "composio_execute",
+                    serde_json::json!({ "tool": "GMAIL_FETCH_EMAILS" })
+                ))
+                .await,
+                ToolPolicyDecision::RequireApproval { .. }
+            ),
+            "'read from GitHub' is not consent to read the company's mail"
+        );
+
+        // An action the catalogue cannot place has no scope to compare, so the
+        // scoped grant refuses it and it parks — unknown is a send, here too.
+        assert!(matches!(
+            p.check(&request(
+                "composio_execute",
+                serde_json::json!({ "tool": "NOTAREALTOOLKIT_LIST_THINGS" })
+            ))
+            .await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
+
+        assert_eq!(
+            grants.standing_count(),
+            1,
+            "none of those refusals spent the permission"
+        );
+    }
+
+    /// **Replay compatibility (issue #457).** A grant journaled before the scope
+    /// field existed comes back unscoped, and an unscoped grant admits the tool
+    /// exactly as it did before — otherwise this change would silently void
+    /// every permission an operator had already granted.
+    #[tokio::test]
+    async fn a_grant_from_before_scopes_existed_still_admits_its_tool() {
+        let queue = ApprovalRequestQueue::default();
+        let grants = queue.grants();
+        let p = policy("supervised", &[], None)
+            .with_requests(queue)
+            .with_agent("ops");
+
+        // Deserialized from the pre-#457 wire shape rather than constructed, so
+        // this fails if the field ever stops defaulting.
+        let replayed: crate::runtime::grants::StandingGrant =
+            serde_json::from_value(serde_json::json!({
+                "id": "g-old",
+                "agent": "ops",
+                "tool": "composio_execute",
+                "granted_by": { "kind": "user", "id": "user-1" },
+                "approval_id": "appr-old",
+                "at_millis": 1_000,
+                "expires_at_millis": far_future(),
+            }))
+            .expect("an old journal line still replays");
+        assert_eq!(replayed.scope, None);
+        grants.grant_standing(replayed);
+
+        for slug in ["GITHUB_LIST_PULL_REQUESTS", "GMAIL_FETCH_EMAILS"] {
+            assert_eq!(
+                p.check(&request(
+                    "composio_execute",
+                    serde_json::json!({ "tool": slug })
+                ))
+                .await,
+                ToolPolicyDecision::Allow,
+                "an unscoped grant behaves exactly as it did: {slug}"
+            );
+        }
+        // …and the boundary that was always there is untouched: a send still
+        // parks, because the live re-classification runs first.
+        assert!(matches!(
+            p.check(&request(
+                "composio_execute",
+                serde_json::json!({ "tool": "GMAIL_SEND_EMAIL" })
+            ))
+            .await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
     }
 
     /// Issue #374 added the `deploy` arm. It still applies — to tools with no

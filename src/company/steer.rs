@@ -37,8 +37,15 @@ use std::sync::{Arc, Mutex};
 use crate::ports::types::CompanyId;
 
 /// The maximum instruction length an operator redirect carries, in **chars**
-/// (not bytes — truncation is codepoint-safe). A redirect longer than this is
-/// truncated at the route boundary before it ever reaches an agent turn.
+/// (not bytes — any cut here is codepoint-safe).
+///
+/// **Single capping authority**: the steer route is the one place that decides
+/// an over-long redirect's fate, and it *refuses* one — `400`, naming the actual
+/// length and this limit — rather than quietly halving what the agent will act
+/// on. The operator is synchronously present and can shorten the text.
+/// [`cap_redirect`] remains as defense-in-depth for any path that reaches a turn
+/// without crossing that route, and when it does cut it says so. Route
+/// validates; helper marks.
 pub const MAX_REDIRECT_CHARS: usize = 2000;
 
 /// What an operator asked us to do to an in-flight run.
@@ -51,8 +58,9 @@ pub enum SteerAction {
     /// Stop the current attempt and re-run it with an appended operator
     /// instruction. Bounded per dispatch (see the harness disposition).
     Redirect {
-        /// The operator's fresh instruction, already codepoint-capped to
-        /// [`MAX_REDIRECT_CHARS`] at the route boundary.
+        /// The operator's fresh instruction, verbatim. The route already
+        /// refused anything longer than [`MAX_REDIRECT_CHARS`], so what an
+        /// agent sees here is the whole of what the operator typed.
         instruction: String,
     },
 }
@@ -299,11 +307,49 @@ impl Drop for RegistrationGuard {
     }
 }
 
+/// The suffix [`cap_redirect`] appends when it has to cut, naming how many
+/// characters went missing so a truncated redirect is never byte-indistinguishable
+/// from a complete one.
+fn truncation_marker(dropped: usize) -> String {
+    format!(" […{dropped} chars truncated]")
+}
+
 /// Codepoint-safe truncation of an operator redirect instruction to
-/// [`MAX_REDIRECT_CHARS`]. Never splits a multi-byte character (unlike a byte
-/// slice), so a redirect ending in an emoji or accented letter can't panic.
+/// [`MAX_REDIRECT_CHARS`], **marking** whatever it drops.
+///
+/// This is defense-in-depth, not the enforcement point: the steer route refuses
+/// an over-long redirect outright (see [`MAX_REDIRECT_CHARS`]), so in the normal
+/// path this is the identity function. It exists for the paths that re-apply the
+/// bound without crossing the route — the harness caps the instruction again on
+/// every redirect dispatch — and there it must not cut silently, or a halved
+/// instruction reads to the agent (and to the audit trail) exactly like a
+/// complete one.
+///
+/// The result never exceeds [`MAX_REDIRECT_CHARS`] characters: the marker's own
+/// width is subtracted before the cut, so the cap this claims to honour is the
+/// cap it honours. Cutting counts characters, never bytes, so an instruction
+/// ending in an emoji or accented letter can't split a codepoint (or panic).
 pub fn cap_redirect(instruction: &str) -> String {
-    instruction.chars().take(MAX_REDIRECT_CHARS).collect()
+    let total = instruction.chars().count();
+    if total <= MAX_REDIRECT_CHARS {
+        return instruction.to_string();
+    }
+    // The marker names the dropped count, and the dropped count depends on how
+    // much room the marker itself takes — so settle it by fixpoint. Each pass
+    // either agrees with the previous one (done) or shrinks `keep` by the digit
+    // the growing count needs, so this terminates in a pass or two.
+    let mut keep = MAX_REDIRECT_CHARS;
+    let marker = loop {
+        let marker = truncation_marker(total - keep);
+        let room = MAX_REDIRECT_CHARS.saturating_sub(marker.chars().count());
+        if room >= keep {
+            break marker;
+        }
+        keep = room;
+    };
+    let mut out: String = instruction.chars().take(keep).collect();
+    out.push_str(&marker);
+    out
 }
 
 #[cfg(test)]
@@ -415,11 +461,49 @@ mod tests {
     }
 
     #[test]
+    fn cap_redirect_is_identity_under_the_cap() {
+        let exact: String = "a".repeat(MAX_REDIRECT_CHARS);
+        assert_eq!(
+            cap_redirect(&exact),
+            exact,
+            "an at-limit redirect is verbatim"
+        );
+        assert_eq!(cap_redirect("short"), "short");
+        assert_eq!(cap_redirect(""), "");
+    }
+
+    #[test]
+    fn cap_redirect_marks_how_much_it_dropped() {
+        let long: String = "a".repeat(MAX_REDIRECT_CHARS + 500);
+        let capped = cap_redirect(&long);
+        assert!(
+            capped.chars().count() <= MAX_REDIRECT_CHARS,
+            "the cap reserves room for its own marker, got {} chars",
+            capped.chars().count()
+        );
+        // The marker names the real loss: kept + dropped is the whole input.
+        let (head, tail) = capped.rsplit_once(" […").expect("a cut redirect is marked");
+        let dropped: usize = tail
+            .trim_end_matches(" chars truncated]")
+            .parse()
+            .expect("the marker names a count");
+        assert_eq!(
+            head.chars().count() + dropped,
+            long.chars().count(),
+            "shown + dropped accounts for every input character"
+        );
+    }
+
+    #[test]
     fn cap_redirect_is_codepoint_safe() {
+        // A multi-byte codepoint straddling the limit must be cut on a character
+        // boundary, not panic the way a byte slice would.
         let long: String = "é".repeat(MAX_REDIRECT_CHARS + 50);
         let capped = cap_redirect(&long);
-        assert_eq!(capped.chars().count(), MAX_REDIRECT_CHARS);
-        // Byte length is a clean multiple of 2 (é is 2 bytes) — no split codepoint.
-        assert_eq!(capped.len(), MAX_REDIRECT_CHARS * 2);
+        assert!(capped.chars().count() <= MAX_REDIRECT_CHARS);
+        assert!(capped.ends_with("chars truncated]"));
+        let head: String = capped.chars().take_while(|c| *c == 'é').collect();
+        // The surviving head is whole `é`s — 2 bytes each, no split codepoint.
+        assert_eq!(head.len(), head.chars().count() * 2);
     }
 }

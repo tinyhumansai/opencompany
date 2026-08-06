@@ -37,12 +37,12 @@
  */
 export const LIVE_BRAIN = process.env.PW_LIVE_BRAIN === "1";
 
-/**
- * A path to the simple MCP server script the MCP spec installs and calls.
- * Consumed directly by that spec; re-exported here so every capability the
- * suite has is visible in one file.
- */
-export const MCP_SERVER = process.env.PW_MCP_SERVER;
+// `PW_MCP_SERVER` used to live here: a path to a local stdio MCP server the MCP
+// spec installed and called. Both are gone. The console's MCP page installed it
+// through routes no host serves (issue #414), and the host rejects stdio servers
+// outright in hosted v1 — so the capability gated a spec that could not have
+// passed had the fixture been supplied. The MCP spec now drives the real
+// surface against the default-feature host and needs nothing extra.
 
 /** The reason string a `LIVE_BRAIN` skip carries, so no skip is ever bare. */
 export const LIVE_BRAIN_REASON =
