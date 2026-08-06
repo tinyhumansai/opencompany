@@ -1683,6 +1683,9 @@ async fn post_discussion(
         at_millis,
         text,
         by,
+        // A message cannot be withdrawn before it exists: the tombstone (#358)
+        // names this `seq`, and this is the request that mints it.
+        redacted_by: None,
     }
     .into_message(&authors);
     Ok((StatusCode::CREATED, Json(message)))
