@@ -47,7 +47,7 @@ declarative, version-controlled data the endpoints should read:
 | Path | Parsed today? | Feeds |
 |---|---|---|
 | `company.toml` `[company]`, `[[agent]]` | ✅ manifest | identity, Team roster |
-| `company.toml` `[[group_chat]]` | ✅ manifest | Conversation threads (desks) |
+| `company.toml` `[[group_chat]]` | ✅ manifest | Company org chart (desks), Chat channels |
 | `company.toml` `[[connection]]` | ✅ manifest | Connections priorities (intent, no secrets) |
 | `company.toml` `[workflows].enabled` | ✅ manifest | which Workflows are on |
 | `workflows/<id>.toml` | ✅ parsed (WS1) | Workflow graph (nodes/edges) |
@@ -103,11 +103,35 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
   desks from `[[group_chat]]` and page their history; send uses the `chat`
   endpoint. Desk-scoped routing of replies is single-responder in v1 (the full
   desk-member handler is WS3).
-- **Console:** the Desks management screen (`src/views/DesksView.tsx`) is no
-  longer listed in the sidebar as of issue #302 — hidden, not retired. The
-  `/desks` routes and store are unchanged and this thread list still builds from
-  real desks; desk management is manifest-only until a hierarchy/org-tree
-  successor lands.
+- **Console:** desk management lives on the **Company** org chart
+  (`src/views/company/`) as of issue #311. The flat Desks screen that #302
+  unmounted is gone rather than restored — see that section below.
+
+### Company (org chart) — `src/views/company/`, `src/lib/org.ts`
+- A three-level tree of the company's declared structure: **company → desk →
+  seat**. Creating a desk, deleting an operator-created one, adding and removing
+  members, and changing a desk's lead all happen here.
+- **Source:** ✅ real — `GET …/desks` (with `overlayCreated` / `overlayMembers`
+  carrying provenance), `GET …/team` for who fills a seat, `GET …/users` for the
+  humans, `GET /api/v1/companies/{id}` for the company's name. Writes are the
+  five desk routes: `POST …/desks`, `DELETE …/desks/{id}`,
+  `POST …/desks/{id}/members`, `DELETE …/desks/{id}/members/{agent}` and
+  `PUT …/desks/{id}/order`.
+- **The three-level cap is structural, not enforced.** No desk can name a parent
+  desk — the host's `GroupChat` and `OverlayDesk` have no such field — so a
+  fourth level is unrepresentable rather than rejected. `lib/org.ts` derives the
+  tree; nothing validates its depth, for the same reason nothing validates that
+  a string is a string. This is what issue #311 means by "a new reader over
+  existing data, not a data change".
+- **The lead is a position, never a flag.** `DeskDto.members[0]` is the host's
+  routing target, so changing the lead is a `PUT …/order` that moves somebody to
+  the front. There is no set-lead call and the console must not invent one.
+- **Provenance decides which controls exist.** The host refuses to delete a
+  blueprint desk or remove a blueprint member at runtime, so the chart offers
+  neither — a control that always fails is worse than no control.
+- **Not on a desk / People** are listed *beside* the tree, not inside it.
+  Neither has a position the company declares, and inventing one would be the
+  same mistake the Overview graph documents about its own derived departments.
 
 ### Inbox — `src/views/InboxView.tsx`, `src/api/inbox.ts`
 - Per-agent email inbox; enabled via a Team toggle.

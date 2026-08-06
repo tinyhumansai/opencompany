@@ -4,6 +4,7 @@ import {
   LayoutDashboard,
   type LucideIcon,
   MessagesSquare,
+  Network,
   Settings2,
   ShieldCheck,
   SquareKanban,
@@ -53,6 +54,7 @@ import { writeLastChannel } from "@/lib/last-channel";
 import { fromDto, type TeamMember } from "@/lib/team";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { Overview } from "@/views/Overview";
+import { OrgChartView } from "@/views/company/OrgChartView";
 import { ChatView } from "@/views/ChatView";
 import {
   channelIdForThread,
@@ -85,6 +87,7 @@ const FinancesView = lazy(() =>
 
 export type View =
   | "overview"
+  | "company"
   | "chat"
   | "conversation"
   | "inbox"
@@ -109,6 +112,9 @@ interface NavItem {
 // own, a heading over two rows labelled more than it sorted.
 const NAV: NavItem[] = [
   { view: "overview", label: "Overview", icon: LayoutDashboard },
+  // Issue #311: the company's structure, and the only way in to desk
+  // creation and membership since #302 unmounted the flat Desks page.
+  { view: "company", label: "Company", icon: Network },
   { view: "chat", label: "Chat", icon: MessagesSquare },
   { view: "tasks", label: "Tasks", icon: SquareKanban },
   { view: "workspace", label: "Workspace", icon: FolderClosed },
@@ -915,6 +921,7 @@ export function AppShell({
           {view === "overview" && (
             <Overview client={client} company={company} />
           )}
+          {view === "company" && <OrgChartView client={client} company={company} />}
           {view === "chat" && (
             <ChatView
               client={client}
