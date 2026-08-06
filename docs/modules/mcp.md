@@ -105,6 +105,20 @@ Discovery is gated on the `openhuman` feature (the MCP transport lives there);
 without it the route reports `not_wired` and the console falls back to the
 declared tool lists. Every mutating response carries a `note` reminder.
 
+## Console surface
+
+One component reads these routes —
+[`McpServersSection`](../../frontend/src/views/connections/McpServersSection.tsx),
+over the standalone functions in `frontend/src/api/mcp.ts` — rendered from two
+places: inline on Connections, and as the whole of Settings, MCP Servers.
+
+There is deliberately no MCP method on `OpenCompanyClient`. A second set used to
+sit there, declaring a `{ servers }` wrapper around this table's bare array,
+`server_id` keys, and `/connect` / `/disconnect` routes that exist nowhere; the
+Settings page built on it crashed on open (issue #414). The client casts an
+unparsed body to the declared type, so a second surface is never caught by the
+compiler — only by whoever opens the page.
+
 ## Pool-staleness caveat
 
 Agents materialize their MCP registry once, when the

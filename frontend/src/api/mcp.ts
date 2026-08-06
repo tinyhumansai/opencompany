@@ -10,17 +10,37 @@
 // the shared client), so no change to `OpenCompanyClient` is needed.
 
 import type { OpenCompanyClient } from "./client";
+import { ApiError } from "./types";
 import type { McpHealth, McpMutationResponse, McpServer, McpToolInfo } from "./types";
 
 /** The auth scheme a write-only credential is stored under. */
 export type McpAuthKind = "bearer" | "header" | "query_param";
 
+/**
+ * A list route's body, or a stated failure.
+ *
+ * `client.get<T>` casts an unparsed body straight to `T`: the declared type is
+ * a claim about the host, never a check on it. When the claim is wrong the
+ * value flows on as a lie — a caller stores `undefined` in a `T[]` and throws
+ * on `.length` several renders later, far from the fetch that caused it, which
+ * is precisely how issue #414 read at the console. Checking the one property
+ * these routes promise — that the body is a list — turns that into a load
+ * error the caller can report where it happened.
+ */
+export function expectList<T>(body: unknown, what: string): T[] {
+  if (Array.isArray(body)) return body as T[];
+  // Status 0: nothing was refused, the answer was unusable. `fromHost` stays
+  // false for the same reason.
+  throw new ApiError(0, "unexpected_shape", `the host's ${what} wasn't a list`);
+}
+
 /** The company's effective MCP servers. */
-export function listMcpServers(
+export async function listMcpServers(
   client: OpenCompanyClient,
   company: string | null,
 ): Promise<McpServer[]> {
-  return client.get<McpServer[]>(`${client.scopeFor(company)}/mcp/servers`);
+  const body = await client.get<unknown>(`${client.scopeFor(company)}/mcp/servers`);
+  return expectList<McpServer>(body, "MCP server list");
 }
 
 /**
@@ -90,14 +110,15 @@ export function removeMcpServer(
 }
 
 /** Live-discover a server's tools (404 `not_wired` when the harness is off). */
-export function discoverMcpTools(
+export async function discoverMcpTools(
   client: OpenCompanyClient,
   company: string | null,
   name: string,
 ): Promise<McpToolInfo[]> {
-  return client.get<McpToolInfo[]>(
+  const body = await client.get<unknown>(
     `${client.scopeFor(company)}/mcp/servers/${encodeURIComponent(name)}/tools`,
   );
+  return expectList<McpToolInfo>(body, `tool list for ${name}`);
 }
 
 /** The `oauth/start` response: the authorization URL to open in a browser. */
