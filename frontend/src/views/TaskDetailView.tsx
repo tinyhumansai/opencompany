@@ -39,6 +39,7 @@ import {
   ShieldCheck,
   Square,
   StickyNote,
+  Trash2,
   UserCog,
   Wrench,
 } from "lucide-react";
@@ -49,6 +50,7 @@ import {
   listInflight,
   patchTask,
   postTaskDiscussion,
+  redactTaskDiscussion,
   steerTask,
   type DiscussionMessage,
   type InflightRun,
@@ -1963,8 +1965,15 @@ function ExportButton({
  *
  * Operator-only in v1. Posting deliberately runs no agent turn — nothing here
  * dispatches work or spends money, which stays behind the board's column drag.
- * There is no edit and no delete either: the thread is journal-backed and
- * append-only, so what was said stays said.
+ * There is no edit: the thread is journal-backed and append-only, so what was
+ * said stays said.
+ *
+ * A message can be **withdrawn** (#358), which is not the same as deleted. The
+ * row keeps its place, its author and its time, and its text is replaced by the
+ * host — on this screen, on the exported record, and in the company bundle, so
+ * a pasted credential stops being readable and stops travelling. Withdrawing is
+ * the one thing on this tab that needs a confirmation, because it is the one
+ * thing that cannot be undone.
  *
  * The poll carries only the newest page of the thread (the host caps it so a
  * long discussion is not re-sent every 4s). Older messages are pulled on demand
@@ -2015,7 +2024,20 @@ function DiscussionTab({
       );
       let added = false;
       for (const m of rows) {
-        if (!bySeq.has(m.seq)) {
+        const held = bySeq.get(m.seq);
+        if (!held) {
+          bySeq.set(m.seq, m);
+          added = true;
+          continue;
+        }
+        // A message this thread already holds is normally identical to the copy
+        // the poll brought, and re-setting it would churn the render for
+        // nothing. A WITHDRAWAL is the exception (#358): the row arrives again
+        // with its text replaced, and it is the one update that must land —
+        // ignoring it would leave the original text on screen for as long as
+        // this tab stays open, which is precisely the reader the withdrawal was
+        // for.
+        if (m.redacted && !held.redacted) {
           bySeq.set(m.seq, m);
           added = true;
         }
@@ -2046,6 +2068,27 @@ function DiscussionTab({
       );
     } finally {
       setLoadingEarlier(false);
+    }
+  }
+
+  /**
+   * Withdraws one message (#358).
+   *
+   * The `200` carries the row as every reader now sees it — placeholder text,
+   * `redacted`, and who removed it — and `absorb` collapses it onto the copy on
+   * screen by `seq`, so the thread updates in place rather than waiting out the
+   * 4s poll. `onPosted` then re-reads the card for the same reason posting
+   * does: the parent holds the authoritative page.
+   */
+  async function redact(seq: number) {
+    try {
+      const row = await redactTaskDiscussion(client, company, taskId, seq);
+      absorb([row]);
+      await onPosted();
+    } catch (e) {
+      toast.error(
+        e instanceof Error ? e.message : "could not remove the message",
+      );
     }
   }
 
@@ -2099,7 +2142,15 @@ function DiscussionTab({
             </li>
           ) : null}
           {thread.map((m) => (
-            <li key={m.seq} className="rounded-lg border bg-card px-3 py-2">
+            <li
+              key={m.seq}
+              data-testid="discussion-message"
+              data-redacted={m.redacted ? "true" : undefined}
+              className={cn(
+                "rounded-lg border px-3 py-2",
+                m.redacted ? "border-dashed bg-muted/40" : "bg-card",
+              )}
+            >
               <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
                 <MessagesSquare className="size-3.5 shrink-0" aria-hidden />
                 <span className="min-w-0 flex-1 truncate font-medium text-foreground">
@@ -2111,10 +2162,41 @@ function DiscussionTab({
                 >
                   {timeOf(m.atMillis)}
                 </span>
+                {/* Issue #358. Offered only on a message that still has text to
+                    withdraw: a second removal changes nothing, so a button for
+                    it would be a control that does nothing. */}
+                {!m.redacted && (
+                  <ConfirmButton
+                    trigger={
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="-mr-1 size-6 shrink-0 text-muted-foreground hover:text-destructive"
+                        aria-label={`Remove the message from ${m.author}`}
+                        data-testid="discussion-redact"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    }
+                    title="Remove this message?"
+                    description="The message stops being readable here, on the exported record, and in this company's bundle. Its place in the thread stays, showing that you removed it. This cannot be undone, and if the message contained a credential you still need to rotate it."
+                    confirmLabel="Remove it"
+                    cancelLabel="Keep it"
+                    destructive
+                    onConfirm={() => void redact(m.seq)}
+                  />
+                )}
               </div>
-              <p className="mt-1 whitespace-pre-wrap break-words text-xs">
-                {m.text}
-              </p>
+              {m.redacted ? (
+                <p className="mt-1 text-xs italic text-muted-foreground">
+                  {m.text}
+                  {m.redactedBy ? ` Removed by ${m.redactedBy}.` : null}
+                </p>
+              ) : (
+                <p className="mt-1 whitespace-pre-wrap break-words text-xs">
+                  {m.text}
+                </p>
+              )}
             </li>
           ))}
         </ol>

@@ -249,6 +249,16 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Posted to the discussion on task {task_id}"),
             "task.discussion_posted",
         ),
+        // Card-only for the same reason, and one stronger: a withdrawal (#358)
+        // is the operator saying that text should stop being readable, so the
+        // one thing this arm must never do is quote it. It carries no text to
+        // quote either — the event holds a pointer, not a payload.
+        CompanyEvent::TaskDiscussionRedacted { task_id, .. } => (
+            Role::System,
+            "operator".to_string(),
+            format!("Removed a discussion message on task {task_id}"),
+            "task.discussion_redacted",
+        ),
         // Action-only body: the operator's redirect instruction is never wired.
         CompanyEvent::TaskSteered {
             task_id, action, ..

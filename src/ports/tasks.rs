@@ -257,6 +257,23 @@ pub fn cap_discussion(text: &str) -> String {
     text.chars().take(MAX_DISCUSSION_CHARS).collect()
 }
 
+/// What stands where a withdrawn discussion message's text was (issue #358).
+///
+/// One constant, two very different readers, and they must not drift:
+///
+/// * the **read fold** (`server::ops::tasks`) substitutes it so every surface
+///   that serves a thread — the console, the task-detail export document —
+///   shows the same thing;
+/// * the **bundle writer** ([`store::export`](crate::store::export)) substitutes
+///   it into `events.jsonl`, so the withdrawn text is not in the bundle at all
+///   and an import cannot resurrect it.
+///
+/// Deliberately a sentence rather than an empty string. A blank row reads as a
+/// rendering bug; this says a thing happened, which is the honest report — the
+/// row keeps its position, its author and its time, and the console names who
+/// withdrew it beside this text.
+pub const REDACTED_DISCUSSION_TEXT: &str = "This message was removed.";
+
 // ---------------------------------------------------------------------------
 // The plan brief (issue #337, epic #183 §4)
 // ---------------------------------------------------------------------------

@@ -856,6 +856,13 @@ fn summarize_event(event: &CompanyEvent) -> String {
         CompanyEvent::TaskDiscussionPosted { task_id, .. } => {
             format!("discussion post on task {task_id}")
         }
+        // Issue #358. Structural, like its neighbour and for a sharper reason:
+        // the operator has just said that message should stop being readable,
+        // so an insight line quoting anything about it would undo the act it
+        // reports. The event carries no text to quote in any case.
+        CompanyEvent::TaskDiscussionRedacted { task_id, .. } => {
+            format!("discussion message removed on task {task_id}")
+        }
         // A finished workflow run (#228). Counts only — never a delivery row's
         // `target` (a recipient's email address) or its `detail`, which can
         // quote one. This string is a non-sensitive one-liner for the insight

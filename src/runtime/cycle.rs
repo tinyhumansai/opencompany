@@ -1284,6 +1284,10 @@ fn cycle_task_id(
             | CompanyEvent::WorkflowNodeFinished { .. }
             | CompanyEvent::TaskSteered { .. }
             | CompanyEvent::TaskDiscussionPosted { .. }
+            // A withdrawal (#358) is a record about a record: it starts no
+            // work, names no card to compete for, and its whole content is a
+            // pointer to an earlier post.
+            | CompanyEvent::TaskDiscussionRedacted { .. }
             // Issue #464: a board write announcing itself. Emphatically a
             // record — it is appended by the store *after* the write it
             // describes, so treating it as a trigger would let a card start
@@ -1394,6 +1398,10 @@ fn cycle_thread_id(
             | CompanyEvent::WorkflowNodeFinished { .. }
             | CompanyEvent::TaskSteered { .. }
             | CompanyEvent::TaskDiscussionPosted { .. }
+            // A withdrawal (#358) is a record about a record: it starts no
+            // work, names no card to compete for, and its whole content is a
+            // pointer to an earlier post.
+            | CompanyEvent::TaskDiscussionRedacted { .. }
             // Issue #464: a board write announcing itself. Emphatically a
             // record — it is appended by the store *after* the write it
             // describes, so treating it as a trigger would let a card start

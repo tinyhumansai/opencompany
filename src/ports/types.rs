@@ -723,8 +723,11 @@ pub enum CompanyEvent {
     /// projections here reflect it: the text is deliberately never forwarded to
     /// the inference sidecar or the SSE stream.
     ///
-    /// Append-only, like every other variant: there is no edit and no delete in
-    /// v1, so a posted message is a fact about what was said and when.
+    /// Append-only, like every other variant: this event is never edited and
+    /// never removed. What #358 added is not a mutation of it but a *successor*
+    /// — see [`TaskDiscussionRedacted`](Self::TaskDiscussionRedacted) — so the
+    /// fact that something was said, by whom and when, stays in the record even
+    /// once its text stops being readable.
     ///
     /// Additive: old logs never carry it, and its presence doesn't change how
     /// any existing variant serializes.
@@ -740,6 +743,67 @@ pub enum CompanyEvent {
         /// reads back as "operator" — the same fallback
         /// [`OperatorMessage`](Self::OperatorMessage)'s `by` takes, and the same
         /// additive `skip_serializing_if` contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
+    /// A discussion post's text was withdrawn (issue #358).
+    ///
+    /// ## Why this exists
+    ///
+    /// A task discussion is the one surface where a person types free prose
+    /// about work that is *blocked*, and the next thing pasted into a thread
+    /// like that is often the thing that unblocks it — a key, a token, a
+    /// customer record. #348's own fixture reads "blocked on the API key". Until
+    /// this event there was no way to take it back: no edit, no delete, no
+    /// tombstone, and because the journal is what export/import ships, the
+    /// message was not merely permanent but **portable**.
+    ///
+    /// ## Why a successor rather than a mutation
+    ///
+    /// The log is append-only and that property is load-bearing well beyond
+    /// this tab: no control alters a past event, sequence numbers are stable
+    /// ids that threads and reactions name, and import replays a bundle from
+    /// zero to reproduce them. Rewriting or dropping the post in place would
+    /// break all three. So the post stays exactly as journaled and this event
+    /// **supersedes** it: every reader folds the pair and shows the post's
+    /// existence, author and time with its text replaced.
+    ///
+    /// ## What it does NOT claim
+    ///
+    /// This is not an at-rest erasure of the original bytes on the instance
+    /// that holds them, and it must not be read as one — the append-only
+    /// property is precisely what forbids that. What it guarantees is that the
+    /// text stops being served by any read surface and stops leaving the
+    /// building: [`export`](crate::store::export) replaces the superseded text
+    /// before the bundle is written, so a round trip cannot resurrect it. A
+    /// leaked credential still has to be rotated; this stops the record of it
+    /// being readable by every member of the company and travelling with the
+    /// bundle.
+    ///
+    /// Scoped deliberately to the discussion. `OperatorMessage` has the same
+    /// shape of problem and is **not** covered here; see
+    /// `docs/modules/server/README.md` for why that is a separate decision
+    /// rather than an oversight.
+    ///
+    /// Additive: old logs never carry it, and its presence doesn't change how
+    /// any existing variant serializes.
+    TaskDiscussionRedacted {
+        /// The card the superseded post belongs to. Carried so a fold that is
+        /// already filtering one task's journal can skip a tombstone for
+        /// another without resolving the post it names.
+        task_id: String,
+        /// The sequence position of the
+        /// [`TaskDiscussionPosted`](Self::TaskDiscussionPosted) this supersedes.
+        ///
+        /// Stable across export→import: a bundle replays from zero, so the
+        /// referenced position survives the round trip that carries both events.
+        seq: u64,
+        /// Who withdrew it, when a signed-in human is behind the request.
+        ///
+        /// Present for the same reason the post's `by` is: a message that
+        /// disappears with nobody's name on it is one a member can quietly
+        /// remove from a thread others were reading. `None` for a machine
+        /// credential, which reads back as "operator".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
     },
@@ -3034,6 +3098,35 @@ mod test {
         let attributed = CompanyEvent::TaskDiscussionPosted {
             task_id: "t1".into(),
             text: "unblocked".into(),
+            by: Some(Actor {
+                kind: ActorKind::User,
+                id: "u-7".into(),
+            }),
+        };
+        assert_eq!(round_trip(&attributed), attributed);
+    }
+
+    /// Issue #358: the tombstone's wire shape, pinned because it is written
+    /// into `events.jsonl` and read back by a *different* instance on import.
+    /// The pair (post, tombstone) is what stops a withdrawn message being
+    /// resurrected, so a tombstone that failed to round-trip would silently
+    /// restore the text it was appended to remove.
+    #[test]
+    fn task_discussion_redacted_round_trips_and_omits_an_absent_actor() {
+        let anonymous = CompanyEvent::TaskDiscussionRedacted {
+            task_id: "t1".into(),
+            seq: 42,
+            by: None,
+        };
+        assert_eq!(round_trip(&anonymous), anonymous);
+        assert_eq!(
+            serde_json::to_string(&anonymous).unwrap(),
+            r#"{"kind":"TaskDiscussionRedacted","task_id":"t1","seq":42}"#
+        );
+
+        let attributed = CompanyEvent::TaskDiscussionRedacted {
+            task_id: "t1".into(),
+            seq: 42,
             by: Some(Actor {
                 kind: ActorKind::User,
                 id: "u-7".into(),

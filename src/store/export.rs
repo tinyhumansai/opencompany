@@ -31,9 +31,9 @@ use crate::ports::events::EventLog;
 use crate::ports::memory::MemoryStore;
 use crate::ports::store::CompanyStore;
 use crate::ports::types::{
-    BudgetOverride, CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq, LedgerEntry,
-    OverlayAgent, OverlayDesk, OverlayDeskMember, OverlayDeskOrder, OverlayWorkflow, StoredEvent,
-    TemplateProvenance,
+    BudgetOverride, CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk,
+    EventSeq, LedgerEntry, OverlayAgent, OverlayDesk, OverlayDeskMember, OverlayDeskOrder,
+    OverlayWorkflow, StoredEvent, TemplateProvenance,
 };
 
 /// Canonical bundle file and directory names, matching the fs
@@ -191,7 +191,13 @@ impl BundleContents {
             .await?
             .ok_or_else(|| OpenCompanyError::CompanyNotFound(id.to_string()))?;
 
-        let events = events.read_from(id, EventSeq::new(0), usize::MAX).await?;
+        // Issue #358: the withdrawn half of a discussion never reaches the
+        // bundle. This is the load-bearing half of that issue — hiding a
+        // message on the console while the bundle keeps carrying it makes the
+        // record *portable* instead of merely permanent, which is the worse
+        // failure of the two.
+        let events =
+            scrub_redacted_discussion(events.read_from(id, EventSeq::new(0), usize::MAX).await?);
         let traces = memory.recent_traces(id, usize::MAX).await?;
 
         let metas = context.list(id, "").await?;
@@ -360,7 +366,14 @@ impl BundleContents {
         }
 
         let ledger = read_jsonl::<LedgerEntry>(&src.join(LEDGER_JSONL)).await?;
-        let events = read_jsonl::<StoredEvent>(&src.join(EVENTS_JSONL)).await?;
+        // Scrubbed on the way IN as well as on the way out (issue #358), which
+        // is not belt-and-braces: a bundle written by a host that predates this
+        // carries the withdrawn text beside its tombstone, and importing it
+        // as-is would write that text into a fresh journal — the resurrection
+        // the issue names, arriving through the one door the exporter cannot
+        // guard.
+        let events =
+            scrub_redacted_discussion(read_jsonl::<StoredEvent>(&src.join(EVENTS_JSONL)).await?);
         let traces =
             read_jsonl::<CompressedTrace>(&src.join(MEMORY_DIR).join(TRACES_JSONL)).await?;
 
@@ -394,6 +407,64 @@ impl BundleContents {
             overlay_budgets: meta.overlay_budgets,
         })
     }
+}
+
+/// Replaces the text of every discussion post a later tombstone withdrew
+/// (issue #358).
+///
+/// ## Why the bundle is where this matters most
+///
+/// A withdrawal that only affected the console would leave the message in
+/// `events.jsonl`, and the bundle is the copy that *leaves the instance* — it
+/// is handed to support, restored onto a laptop, committed to a repository. So
+/// a redaction that stops at the read fold does not make a pasted credential
+/// less exposed; it makes it exposed somewhere nobody is looking.
+///
+/// ## What it does
+///
+/// Walks the log once, collecting the `(task_id, seq)` pairs named by
+/// [`CompanyEvent::TaskDiscussionRedacted`], then rewrites the `text` of each
+/// post they name to
+/// [`REDACTED_DISCUSSION_TEXT`](crate::ports::tasks::REDACTED_DISCUSSION_TEXT).
+/// Two passes rather than one because a tombstone always follows its post, so a
+/// single forward pass would have already written the post out.
+///
+/// **The tombstone itself is kept.** Dropping it would leave the imported
+/// company with a post whose text is a placeholder and no record of why, and
+/// the fold would show it as an ordinary message reading "This message was
+/// removed." — a sentence nobody wrote. Carried through, the imported thread
+/// says the same thing the exporting one did, with the same attribution.
+///
+/// Every other event passes through untouched, including posts with no
+/// tombstone: this is a substitution, not a filter, so the log's shape,
+/// ordering and sequence numbering are exactly what they were.
+fn scrub_redacted_discussion(events: Vec<StoredEvent>) -> Vec<StoredEvent> {
+    use std::collections::HashSet;
+
+    let withdrawn: HashSet<(String, u64)> = events
+        .iter()
+        .filter_map(|stored| match &stored.event {
+            CompanyEvent::TaskDiscussionRedacted { task_id, seq, .. } => {
+                Some((task_id.clone(), *seq))
+            }
+            _ => None,
+        })
+        .collect();
+    if withdrawn.is_empty() {
+        return events;
+    }
+
+    events
+        .into_iter()
+        .map(|mut stored| {
+            if let CompanyEvent::TaskDiscussionPosted { task_id, text, .. } = &mut stored.event
+                && withdrawn.contains(&(task_id.clone(), stored.seq.value()))
+            {
+                *text = crate::ports::tasks::REDACTED_DISCUSSION_TEXT.to_string();
+            }
+            stored
+        })
+        .collect()
 }
 
 /// Exports `id`'s complete state through the ports into an unpacked bundle
@@ -893,6 +964,223 @@ mod test {
             events[0].event,
             CompanyEvent::LifecycleChanged { .. }
         ));
+
+        for dir in [home1, home2, dest] {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
+    /// Issue #358, the half that actually closes it: a withdrawn discussion
+    /// message is not in the bundle, and an import cannot bring it back.
+    ///
+    /// Asserted three ways, because each is a different way to leak it:
+    ///
+    /// 1. the **bundle file** (`events.jsonl`) does not contain the secret —
+    ///    this is the copy that leaves the instance, so grepping the bytes is
+    ///    the assertion that matters most;
+    /// 2. the **imported journal** carries the placeholder, not the text;
+    /// 3. the **tombstone travels**, so the imported thread still reports that
+    ///    a message was withdrawn rather than showing a bare placeholder that
+    ///    reads like something a person typed.
+    ///
+    /// A post with no tombstone is untouched in the same bundle, so this is a
+    /// substitution rather than a filter that eats discussion history.
+    #[tokio::test]
+    async fn a_withdrawn_discussion_message_does_not_survive_export_import() {
+        let home1 = tmp_root("redact-src");
+        let home2 = tmp_root("redact-dst");
+        let dest = tmp_root("redact-bundle");
+        let id = CompanyId::new("redact-co");
+        const SECRET: &str = "sk-live-DO-NOT-SHIP-THIS";
+
+        let (s1, e1, m1, c1) = fs_ports(&home1);
+        s1.save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".into(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+
+        let leaked = e1
+            .append(
+                &id,
+                CompanyEvent::TaskDiscussionPosted {
+                    task_id: "t1".into(),
+                    text: format!("blocked on the API key: {SECRET}"),
+                    by: None,
+                },
+            )
+            .await
+            .unwrap();
+        // A second post nobody withdrew, to prove the scrub is targeted.
+        e1.append(
+            &id,
+            CompanyEvent::TaskDiscussionPosted {
+                task_id: "t1".into(),
+                text: "rotated it, we are unblocked".into(),
+                by: None,
+            },
+        )
+        .await
+        .unwrap();
+        e1.append(
+            &id,
+            CompanyEvent::TaskDiscussionRedacted {
+                task_id: "t1".into(),
+                seq: leaked.value(),
+                by: Some(Actor {
+                    kind: ActorKind::Operator,
+                    id: "owner".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        export_bundle(&id, &dest, s1, e1, m1, c1, ExportOpts::default())
+            .await
+            .unwrap();
+
+        // 1. The bytes that leave the building.
+        let shipped = tokio::fs::read_to_string(dest.join(EVENTS_JSONL))
+            .await
+            .unwrap();
+        assert!(
+            !shipped.contains(SECRET),
+            "the withdrawn message shipped in the bundle: {shipped}"
+        );
+        assert!(
+            shipped.contains(crate::ports::tasks::REDACTED_DISCUSSION_TEXT),
+            "the withdrawn post is missing its placeholder: {shipped}"
+        );
+        assert!(
+            shipped.contains("rotated it, we are unblocked"),
+            "the scrub ate a post nobody withdrew: {shipped}"
+        );
+
+        // 2 and 3. What the importing instance ends up holding.
+        let (s2, e2, m2, c2) = fs_ports(&home2);
+        import_bundle(&dest, s2, e2.clone(), m2, c2).await.unwrap();
+        let events = e2
+            .read_from(&id, EventSeq::new(0), usize::MAX)
+            .await
+            .unwrap();
+
+        let posted: Vec<&str> = events
+            .iter()
+            .filter_map(|stored| match &stored.event {
+                CompanyEvent::TaskDiscussionPosted { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            posted,
+            vec![
+                crate::ports::tasks::REDACTED_DISCUSSION_TEXT,
+                "rotated it, we are unblocked"
+            ],
+            "the imported journal must carry the placeholder, not the secret"
+        );
+        assert!(
+            events.iter().any(|stored| matches!(
+                &stored.event,
+                CompanyEvent::TaskDiscussionRedacted { task_id, seq, .. }
+                    if task_id == "t1" && *seq == leaked.value()
+            )),
+            "the tombstone did not survive the round trip, so the imported thread \
+             cannot say the message was withdrawn"
+        );
+
+        for dir in [home1, home2, dest] {
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
+    /// The same guard on the way IN: a bundle written by a host that predates
+    /// #358 carries the withdrawn text beside its tombstone, and importing it
+    /// must not write that text into the fresh journal.
+    ///
+    /// Built by hand-editing the exported `events.jsonl` back to the
+    /// pre-redaction bytes, which is exactly the shape such a bundle has.
+    #[tokio::test]
+    async fn an_old_bundle_cannot_smuggle_a_withdrawn_message_back_in() {
+        let home1 = tmp_root("smuggle-src");
+        let home2 = tmp_root("smuggle-dst");
+        let dest = tmp_root("smuggle-bundle");
+        let id = CompanyId::new("smuggle-co");
+        const SECRET: &str = "sk-live-SMUGGLED";
+
+        let (s1, e1, m1, c1) = fs_ports(&home1);
+        s1.save(&CompanyRecord {
+            id: id.clone(),
+            manifest: manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".into(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
+            template_provenance: None,
+        })
+        .await
+        .unwrap();
+        let leaked = e1
+            .append(
+                &id,
+                CompanyEvent::TaskDiscussionPosted {
+                    task_id: "t1".into(),
+                    text: SECRET.into(),
+                    by: None,
+                },
+            )
+            .await
+            .unwrap();
+        e1.append(
+            &id,
+            CompanyEvent::TaskDiscussionRedacted {
+                task_id: "t1".into(),
+                seq: leaked.value(),
+                by: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        export_bundle(&id, &dest, s1, e1, m1, c1, ExportOpts::default())
+            .await
+            .unwrap();
+
+        // Put the secret back, as an older exporter would have written it.
+        let path = dest.join(EVENTS_JSONL);
+        let scrubbed = tokio::fs::read_to_string(&path).await.unwrap();
+        let old_shape = scrubbed.replace(crate::ports::tasks::REDACTED_DISCUSSION_TEXT, SECRET);
+        assert!(old_shape.contains(SECRET), "the fixture did not rewrite");
+        tokio::fs::write(&path, old_shape).await.unwrap();
+
+        let (s2, e2, m2, c2) = fs_ports(&home2);
+        import_bundle(&dest, s2, e2.clone(), m2, c2).await.unwrap();
+        let events = e2
+            .read_from(&id, EventSeq::new(0), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !events.iter().any(|stored| matches!(
+                &stored.event,
+                CompanyEvent::TaskDiscussionPosted { text, .. } if text.contains(SECRET)
+            )),
+            "an old bundle smuggled a withdrawn message into the new journal"
+        );
 
         for dir in [home1, home2, dest] {
             tokio::fs::remove_dir_all(&dir).await.ok();

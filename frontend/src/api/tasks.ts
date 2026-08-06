@@ -391,8 +391,27 @@ export interface DiscussionMessage {
    * with a machine credential. The host never sends a user id or an email here.
    */
   author: string;
-  /** The message text, exactly as posted. */
+  /**
+   * The message text, exactly as posted — or the host's fixed "This message was
+   * removed." once withdrawn (#358). The original text is never sent again on
+   * any surface, so a console that ignores {@link redacted} still cannot render
+   * it.
+   */
   text: string;
+  /**
+   * Whether this message was withdrawn (#358).
+   *
+   * Sent only when true, so an ordinary row keeps exactly the shape it had
+   * before. The substitution is server-side; this only lets the thread style a
+   * withdrawn row as what it is instead of as something a person typed.
+   */
+  redacted?: boolean;
+  /**
+   * Who withdrew it, as the same kind of label as {@link author}. Present only
+   * on a withdrawn row — a removal with nobody's name on it is one that can be
+   * made quietly from a thread other people were reading.
+   */
+  redactedBy?: string;
 }
 
 /** A neighbouring card in the lineage, trimmed to what a link needs (#185). */
@@ -553,6 +572,30 @@ export function postTaskDiscussion(
   return client.post<DiscussionMessage>(
     `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/discussion`,
     { text },
+  );
+}
+
+/**
+ * Withdraw a posted discussion message (#358).
+ *
+ * Answers `200` with the row as every reader now sees it: same `seq`, same
+ * author, same time, `redacted: true`, and the host's placeholder where the
+ * text was. The message is not deleted — the journal is append-only, so this
+ * appends a tombstone the read fold and the bundle writer both honour, which is
+ * what stops the text being served *and* stops it shipping in an export.
+ *
+ * Any member of the company may: the same authority that can delete the whole
+ * card, and the withdrawal is attributed. A `seq` that is not a discussion post
+ * on this card is a `404`; withdrawing twice is a no-op success.
+ */
+export function redactTaskDiscussion(
+  client: OpenCompanyClient,
+  company: string | null,
+  id: string,
+  seq: number,
+): Promise<DiscussionMessage> {
+  return client.del<DiscussionMessage>(
+    `${client.scopeFor(company)}/tasks/${encodeURIComponent(id)}/discussion/${encodeURIComponent(seq)}`,
   );
 }
 

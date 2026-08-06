@@ -43,7 +43,7 @@ why this is not a read/write split: [authority.md](authority.md).
 
 | Surface (`ops::*`) | Routes |
 |---|---|
-| `tasks` | `POST …/tasks`, `GET …/tasks`, `GET …/tasks/{id}` (the Task Detail read, #185), `PATCH`/`DELETE …/tasks/{id}`, `GET …/tasks/inflight`, `POST …/tasks/{id}/steer` (#111), `POST …/tasks/{id}/discussion` (#335) |
+| `tasks` | `POST …/tasks`, `GET …/tasks`, `GET …/tasks/{id}` (the Task Detail read, #185), `PATCH`/`DELETE …/tasks/{id}`, `GET …/tasks/inflight`, `POST …/tasks/{id}/steer` (#111), `POST …/tasks/{id}/discussion` (#335), `DELETE …/tasks/{id}/discussion/{seq}` (#358) |
 | `task_export` | `GET …/tasks/{id}/export` (the task's record as a document, #352) |
 | `memory` | `POST …/memory`, `DELETE …/memory/{id}` (journals `MemoryFactDeleted`) |
 | `workspace` | `GET …/workspace`, `GET …/workspace/file/{id}`, `POST …/workspace`, `PUT …/workspace/file/{id}`, `PATCH`/`DELETE …/workspace/{id}` (the two `GET`s are REST twins of the GraphQL reads — the console has no GraphQL client, #177) |
@@ -192,14 +192,69 @@ That deferral was cleaner when this branch was cut than it is now — #342 lande
 record on `main` and the question is answerable rather than blocked. Still
 deferred, but on scope, not on missing prior art.
 
-**Ordering, editing, deletion, references.** Oldest-first by journal sequence,
-which is also the console's render key. The journal is append-only, so v1 has no
-edit and no delete — what was said stays said; a retraction would need a
-tombstone event and is not one. That is a real gap: the log is what export/import
-ships, and a discussion is exactly where somebody pastes the API key they are
-blocked on. Tracked as **#358**, a redaction path for journaled human prose. A
-message is plain text: it cannot yet reference an artifact or an approval, left
-until there is a link target more durable than a row's position.
+**Ordering, editing, references.** Oldest-first by journal sequence, which is
+also the console's render key. There is still no *edit*: what was said stays
+said, and a message that could be rewritten after the fact would make the thread
+unciteable. A message is plain text: it cannot yet reference an artifact or an
+approval, left until there is a link target more durable than a row's position.
+
+### Withdrawing a discussion message (issue #358)
+
+The gap #335 shipped with: a discussion is exactly where somebody pastes the API
+key they are blocked on, the log is append-only, and the log is what
+export/import ships — so a pasted secret was not merely permanent, it was
+**portable**. Four decisions close it, and each of them is a decision rather
+than a default.
+
+**A tombstone, not a delete.** `CompanyEvent::TaskDiscussionRedacted { task_id,
+seq, by }` *supersedes* the post at `seq`; the post itself is never rewritten or
+removed. The append-only property is load-bearing beyond this tab — no control
+alters a past event, sequence numbers are stable ids other events name, and
+import replays a bundle from zero to reproduce them — and a delete would break
+all three to serve one screen.
+
+**What a reader sees.** The row keeps its place, its `seq`, its author and its
+time; its text is replaced by `REDACTED_DISCUSSION_TEXT` ("This message was
+removed.") and the row carries `redacted: true` plus `redactedBy`, the label of
+whoever withdrew it. Not a silent disappearance: a message that vanishes without
+trace lets one member quietly rewrite what a thread said, which is a different
+product from "anyone may take back a mistake in the open". The substitution
+happens in the fold, so the console thread and the task-detail export document
+(#352, which renders the same assembled value) cannot disagree.
+
+**Export and import.** `store::export::scrub_redacted_discussion` applies the
+same substitution to `events.jsonl` — on the way **out**, so a bundle never
+carries a withdrawn message, and on the way **in**, so a bundle written by a
+host that predates this cannot smuggle one back through import. The tombstone
+travels with it, so the imported thread says the same thing the exporting one
+did, with the same attribution. This is the half that actually closes the issue:
+a redaction that stopped at the console would move the exposure somewhere nobody
+is looking.
+
+**Who may.** `DELETE …/tasks/{taskId}/discussion/{seq}`, under the same
+`ScopedCompany` guard as every other task write — any member of the company, not
+admin-only. That matches the surrounding surface rather than inventing a rule:
+the same member may `DELETE` the whole card, thread and all, so holding one
+message to a higher bar than the card containing it would be incoherent. The
+withdrawal is attributed instead. An unknown card, or a `seq` that is not a
+discussion post *on this card*, is a `404`; withdrawing an already-withdrawn
+message is a no-op success, so a retry is not an error.
+
+**What it does not claim.** This is not erasure at rest on the instance that
+already holds the bytes — that is exactly what append-only forbids, and
+pretending otherwise would be worse than the gap. A leaked credential still has
+to be rotated. What the withdrawal guarantees is that the text stops being
+served by any read surface and stops leaving the building. Posts journaled
+before this shipped are fully covered, since the tombstone names a `seq` and
+nothing about the post has to change; bundles already exported are not, and
+cannot be.
+
+**Scope: the discussion, not the journal.** The mechanism is deliberately
+discussion-only. `OperatorMessage` has the same shape of problem, and generalizing
+before there is a second caller would fix its shape around one. The next human-prose
+writer that needs this should read this section and decide whether to widen the
+event or add its own — the pattern to inherit is the pair (tombstone in the log,
+substitution in every fold *and* in the bundle), not the variant.
 
 **Attribution.** A post carries the signed-in user as `by`, resolved to a roster
 label on read (a display name, or an email's local part). A user no longer on
