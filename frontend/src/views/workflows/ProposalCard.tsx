@@ -146,11 +146,25 @@ export function ProposalCard({
 function NodeLine({ node }: { node: NodeChange }) {
   if (node.change === "added") {
     return (
-      <span className="flex items-start gap-1 text-muted-foreground">
-        <Plus className="mt-px size-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
-        <span>
-          new step <span className="font-mono">{node.id}</span>{" "}
-          <span className="text-foreground">{node.name}</span>
+      <span className="block text-muted-foreground">
+        <span className="flex items-start gap-1">
+          <Plus className="mt-px size-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          <span>
+            new step <span className="font-mono">{node.id}</span>{" "}
+            <span className="text-foreground">{node.name}</span>
+          </span>
+        </span>
+        {/* A new step's whole payload, not just its name: its kind, and any
+            schedule, config or approval flag it arrives with, each of which
+            changes what the workflow does. Reviewing a name and applying a
+            scheduled auto-approving node is the gap this closes. */}
+        <span className="mt-0.5 ml-4 block space-y-0.5">
+          {node.fields.map((field) => (
+            <span key={field.field} className="block">
+              <span className="font-medium text-foreground">{field.field}</span>:{" "}
+              <span className="text-foreground">{field.after}</span>
+            </span>
+          ))}
         </span>
       </span>
     );

@@ -266,6 +266,43 @@ describe("diffGraphs", () => {
    * sets a field to what it already holds shows up as nothing. A proposal is
    * never allowed to look bigger than what it would do.
    */
+  /**
+   * A new step's whole payload reaches the review. `kind` decides what the step
+   * IS, and a `schedule` or `requiresApproval` decides what the workflow does
+   * without anybody pressing anything — applying those off a row that showed
+   * only a name is the reviewed-one-thing-applied-another failure this module
+   * exists to prevent.
+   */
+  it("shows every field a new step carries, not just its name", () => {
+    const current = graph();
+    const candidate = applyProposal(current, {
+      summary: "s",
+      ops: [
+        {
+          op: "addNode",
+          node: {
+            id: "digest",
+            kind: "trigger",
+            name: "Digest",
+            schedule: "0 9 * * *",
+            requiresApproval: true,
+          },
+        },
+      ],
+    });
+    const added = diffGraphs(current, candidate).nodes.find((n) => n.id === "digest");
+    expect(added?.change).toBe("added");
+    const shown = Object.fromEntries(added!.fields.map((f) => [f.field, f.after]));
+    expect(shown).toMatchObject({
+      kind: "trigger",
+      schedule: "0 9 * * *",
+      requiresApproval: "true",
+    });
+    // The header already carries the name; repeating it as a field line would
+    // be noise in the one place noise costs attention.
+    expect(shown).not.toHaveProperty("name");
+  });
+
   it("shows nothing for an edit that changes nothing", () => {
     const current = graph();
     const candidate = applyProposal(current, {
@@ -273,6 +310,46 @@ describe("diffGraphs", () => {
       ops: [{ op: "updateNode", id: "collect", set: { name: "Collect" } }],
     });
     expect(isEmptyDiff(diffGraphs(current, candidate))).toBe(true);
+  });
+});
+
+describe("edge identity", () => {
+  /**
+   * A space-delimited key collides: `("a b", "c")` and `("a", "b c")` both read
+   * as `a b c`. Two different connections comparing equal would let validation
+   * refuse a genuinely new edge, and would let `diffGraphs` hide a real one from
+   * the review — the two failures this module is most careful about, reached
+   * through a node id nobody thought to forbid.
+   */
+  it("tells apart two edges a space-joined key would confuse", () => {
+    const spaced: WorkflowGraph = {
+      ...graph(),
+      nodes: [
+        { id: "a b", kind: "agent", name: "A B" },
+        { id: "c", kind: "output", name: "C" },
+        { id: "a", kind: "agent", name: "A" },
+        { id: "b c", kind: "output", name: "B C" },
+      ],
+      edges: [{ from: "a b", to: "c" }],
+    };
+
+    // `("a", "b c")` is NOT the existing `("a b", "c")`, so it is a real new
+    // connection rather than a duplicate to refuse.
+    const out = validateProposal(
+      { summary: "s", ops: [{ op: "addEdge", from: "a", to: "b c" }] },
+      spaced,
+    );
+    expect(out).not.toHaveProperty("reason");
+
+    // …and it shows up in the diff as an addition rather than vanishing into
+    // the edge that was already there.
+    const candidate = applyProposal(spaced, {
+      summary: "s",
+      ops: [{ op: "addEdge", from: "a", to: "b c" }],
+    });
+    expect(diffGraphs(spaced, candidate).edges).toEqual([
+      { from: "a", to: "b c", change: "added" },
+    ]);
   });
 });
 

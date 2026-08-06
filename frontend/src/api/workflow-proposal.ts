@@ -354,7 +354,14 @@ export function diffGraphs(current: WorkflowGraph, candidate: WorkflowGraph): Gr
   for (const [id, node] of after) {
     const was = before.get(id);
     if (!was) {
-      nodes.push({ id, name: node.name, change: "added", fields: [] });
+      // Every field the new step carries, not just its id and name. A proposed
+      // step arrives with a `kind`, and often a `config`, a `schedule` or a
+      // `requiresApproval` — all of which change what the workflow DOES. An
+      // added row that showed only a name would let an operator apply a
+      // scheduled, auto-approving node believing they had reviewed it, which is
+      // the same guarantee this module makes about changed steps and had not
+      // been keeping about new ones.
+      nodes.push({ id, name: node.name, change: "added", fields: addedFields(node) });
       continue;
     }
     const fields = changedFields(was, node);
@@ -402,12 +409,35 @@ export function proposalIsStale(proposal: WorkflowProposal, graph: WorkflowGraph
 }
 
 function edgeKey(edge: Pick<WorkflowEdge, "from" | "to">): string {
-  return `${edge.from} ${edge.to}`;
+  // JSON, not `${from} ${to}`: a space delimiter collides — `("a b", "c")` and
+  // `("a", "b c")` both key as `a b c`. The host does not forbid a space in a
+  // node id, and the cost of the collision is not cosmetic: two different edges
+  // would compare equal, so validation could refuse a genuinely new connection
+  // and `diffGraphs` could hide a real one from the review.
+  return JSON.stringify([edge.from, edge.to]);
 }
 
 /** Whether `field` is a step field this console can render in a diff. */
 function isNodeField(field: string): boolean {
   return (UPDATABLE as readonly string[]).includes(field);
+}
+
+/**
+ * Everything a NEW step carries, rendered as diff lines against "not set".
+ *
+ * `name` is omitted because the row's own header already shows it; every other
+ * persisted field is listed, so what the operator reviews is the whole node the
+ * apply would write.
+ */
+function addedFields(node: WorkflowNode): { field: string; before: string; after: string }[] {
+  const out: { field: string; before: string; after: string }[] = [];
+  for (const field of UPDATABLE) {
+    if (field === "name") continue;
+    const value = node[field];
+    if (value === undefined || value === null) continue;
+    out.push({ field, before: "not set", after: render(value) });
+  }
+  return out;
 }
 
 /** The fields that differ between two versions of one step, rendered for review. */
