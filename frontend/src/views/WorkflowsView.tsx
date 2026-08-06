@@ -1417,6 +1417,12 @@ export function WorkflowsView({
                 // The graph on screen and the history in `runs` must be the
                 // same workflow's before anything is grounded on the pair.
                 runsReady={runsFor === graph.id}
+                // Issue #415: an applied proposal lands through the SAME
+                // handler the edit dialog's save does. One place decides what
+                // "the graph is now this" means, so a copilot edit and a canvas
+                // edit cannot leave the view in two different states.
+                onApplied={handleSaved}
+                onConflict={setConflict}
                 onClose={() => setCopilotOpen(false)}
               />
             ) : (

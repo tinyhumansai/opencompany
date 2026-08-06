@@ -33,16 +33,27 @@ import { Bot, Loader2, Send } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import { getInferenceStatus, type CognitionPath } from "@/api/inference";
-import type { WorkflowGraph, WorkflowRunOutcome } from "@/api/workflows";
+import { ApiError } from "@/api/types";
+import { updateWorkflow, type WorkflowGraph, type WorkflowRunOutcome } from "@/api/workflows";
 import {
   askCopilot,
   loadCopilotHistory,
   type CopilotMessage,
 } from "@/api/workflow-copilot";
+import {
+  applyProposal,
+  diffGraphs,
+  isEmptyDiff,
+  proposalIsStale,
+  readProposal,
+  type GraphDiff,
+  type WorkflowProposal,
+} from "@/api/workflow-proposal";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Markdown } from "@/components/markdown";
 import { Textarea } from "@/components/ui/textarea";
+import { ProposalCard, type ProposalState } from "@/views/workflows/ProposalCard";
 
 /** A local id for a message this session created (the journal supplies ids for
  * replayed ones). */
@@ -52,6 +63,20 @@ function localId(): string {
   return `local-${localSeq}`;
 }
 
+/** One company reply, split into what the operator reads and what they review. */
+interface Review {
+  /** The reply with the proposal block stripped out. */
+  prose: string;
+  proposal?: WorkflowProposal;
+  /** The candidate graph and its diff, computed once alongside the proposal. */
+  diff?: GraphDiff;
+  /** A malformed proposal block, said out loud rather than dropped. */
+  problem?: string;
+  state: ProposalState;
+  /** The host's refusal of an apply, when one came back. */
+  error?: string;
+}
+
 export function CopilotPanel({
   client,
   company,
@@ -59,6 +84,8 @@ export function CopilotPanel({
   runs,
   runsKnown,
   runsReady,
+  onApplied,
+  onConflict,
   onClose,
 }: {
   client: OpenCompanyClient;
@@ -81,6 +108,17 @@ export function CopilotPanel({
    * so the panel refuses to send until the two agree.
    */
   runsReady: boolean;
+  /**
+   * A proposal was applied and the host stored the result (issue #415).
+   *
+   * The saved graph carries a fresh version token, so this is the same hand-off
+   * the edit dialog makes on save: the view takes the stored graph as current,
+   * the canvas re-renders, and every proposal still on screen becomes stale
+   * against it — which is the behaviour we want, not a bug to work around.
+   */
+  onApplied: (saved: WorkflowGraph) => void;
+  /** A `409` from an apply, for the view's persistent reload banner. */
+  onConflict?: (message: string) => void;
   onClose: () => void;
 }) {
   const [messages, setMessages] = useState<CopilotMessage[]>([]);
@@ -98,6 +136,19 @@ export function CopilotPanel({
   // and a fast question gets exactly the parroted reply the gate exists to
   // prevent.
   const [inferenceChecked, setInferenceChecked] = useState(false);
+  // Issue #415. One entry per company message that carried a proposal block,
+  // parsed EXACTLY ONCE, when the message first appears.
+  //
+  // Once, because the parse is what stamps the graph version the proposal was
+  // reasoned about. Re-parsing on a later render — after the operator edited
+  // the canvas, or after another proposal was applied — would re-stamp it
+  // against a graph it never saw, which is precisely the silent rebase the
+  // issue rules out.
+  const [reviews, setReviews] = useState<Record<string, Review>>({});
+  // Message ids this session produced. A replayed proposal is never applyable:
+  // the graph it was reasoned about is not knowable from the journal, and
+  // "apply this to whatever is there now" is the failure mode, not the feature.
+  const [thisSession, setThisSession] = useState<ReadonlySet<string>>(() => new Set());
   const scrollRef = useRef<HTMLDivElement>(null);
   // Bumped whenever the conversation this panel is holding changes identity.
   // An in-flight request captures it and drops its result if it no longer
@@ -155,11 +206,117 @@ export function CopilotPanel({
     };
   }, [client, company]);
 
+  // Read each new company reply once: prose out, proposal (or the reason there
+  // isn't a usable one) in. `graph` is a dependency because a reply arriving
+  // after a canvas edit must be read against the graph on screen — but an
+  // already-read message is skipped, so an existing proposal keeps the version
+  // it was reasoned about.
+  useEffect(() => {
+    setReviews((prev) => {
+      let next = prev;
+      for (const message of messages) {
+        if (message.role !== "company" || next[message.id]) continue;
+        const read = readProposal(message.text, graph);
+        const review: Review = {
+          prose: read.prose,
+          proposal: read.proposal,
+          diff: read.proposal
+            ? diffGraphs(graph, applyProposal(graph, read.proposal))
+            : undefined,
+          problem: read.problem?.reason,
+          state: "pending",
+        };
+        if (next === prev) next = { ...prev };
+        next[message.id] = review;
+      }
+      return next;
+    });
+  }, [messages, graph]);
+
   // Keep the newest turn in view.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, sending]);
+
+  /**
+   * Applies one proposal through the SAME write the canvas editor performs:
+   * `updateWorkflow` with the version this panel is holding. So a proposal
+   * cannot produce a graph the editor could not have produced, and cannot
+   * overwrite a graph that moved while the operator was reading the diff — the
+   * host refuses that with a 409, and this refuses it one step earlier with a
+   * sentence naming what happened.
+   */
+  const apply = useCallback(
+    async (messageId: string, proposal: WorkflowProposal) => {
+      setReviews((prev) => ({
+        ...prev,
+        [messageId]: { ...prev[messageId], state: "applying", error: undefined },
+      }));
+      try {
+        const saved = await updateWorkflow(
+          client,
+          company,
+          graph.id,
+          applyProposal(graph, proposal),
+          graph.version,
+        );
+        setReviews((prev) => ({
+          ...prev,
+          [messageId]: { ...prev[messageId], state: "applied", error: undefined },
+        }));
+        onApplied(saved);
+      } catch (e) {
+        const conflict = e instanceof ApiError && e.status === 409;
+        const message = conflict
+          ? `${e.message} Reload the workflow and ask the copilot again.`
+          : e instanceof Error
+            ? e.message
+            : "The change could not be applied.";
+        // Back to `pending`, not to a dead end: the diff stays on screen and the
+        // operator can dismiss it or retry after reloading.
+        setReviews((prev) => ({
+          ...prev,
+          [messageId]: { ...prev[messageId], state: "pending", error: message },
+        }));
+        if (conflict && e instanceof ApiError) onConflict?.(e.message);
+      }
+    },
+    [client, company, graph, onApplied, onConflict],
+  );
+
+  /** Turning a proposal down writes nothing; the card stays, greyed. */
+  const dismiss = useCallback((messageId: string) => {
+    setReviews((prev) => ({
+      ...prev,
+      [messageId]: { ...prev[messageId], state: "dismissed", error: undefined },
+    }));
+  }, []);
+
+  /**
+   * Why this proposal cannot be applied, or `undefined` when it can.
+   *
+   * Every arm here is a refusal the issue asks for by name: a graph that moved
+   * under the proposal, a proposal replayed from a session whose graph we
+   * cannot know, a workflow the host will not let the console write at all, and
+   * a proposal that turns out to change nothing.
+   */
+  function blockedReason(messageId: string, review: Review): string | undefined {
+    if (!review.proposal || !review.diff) return undefined;
+    if (sourceDefined) {
+      return "This workflow is defined by a file in the company source tree, so a change has to be made in the repository.";
+    }
+    if (!thisSession.has(messageId)) {
+      return "This was proposed in an earlier session, so it can't be applied to the workflow as it stands now. Ask again for a fresh proposal.";
+    }
+    if (proposalIsStale(review.proposal, graph)) {
+      return "The workflow changed after this was proposed, so it no longer describes the graph on screen. Ask again for a fresh proposal.";
+    }
+    if (isEmptyDiff(review.diff)) {
+      return "This proposal would change nothing, so there is nothing to apply.";
+    }
+    return undefined;
+  }
 
   const echoing = cognition === "echo";
   // Nothing may be asked until BOTH the echo check has settled and the run
@@ -198,13 +355,12 @@ export function CopilotPanel({
         question,
       );
       if (!mine()) return;
-      setMessages((prev) => [
-        ...prev,
-        // An empty `responses` array is a real answer shape, not a crash: the
-        // cycle ran and produced no channel reply. Say that rather than
-        // dropping the turn silently, which would look like the message was
-        // never sent.
-        ...(replies.length === 0
+      // An empty `responses` array is a real answer shape, not a crash: the
+      // cycle ran and produced no channel reply. Say that rather than
+      // dropping the turn silently, which would look like the message was
+      // never sent.
+      const answered: CopilotMessage[] =
+        replies.length === 0
           ? [
               {
                 id: localId(),
@@ -218,8 +374,15 @@ export function CopilotPanel({
               role: "company" as const,
               text,
               atMillis: Date.now(),
-            }))),
-      ]);
+            }));
+      // Recorded before the messages land, so the review effect never sees a
+      // reply from this session and reads it as replayed (issue #415).
+      setThisSession((prev) => {
+        const next = new Set(prev);
+        for (const message of answered) next.add(message.id);
+        return next;
+      });
+      setMessages((prev) => [...prev, ...answered]);
     } catch (e) {
       if (!mine()) return;
       setError(e instanceof Error ? e.message : "the copilot could not answer");
@@ -287,12 +450,24 @@ export function CopilotPanel({
             workflow&apos;s copilot can&apos;t see it.
           </p>
           <p className="mt-1.5">
-            It can explain and suggest, but{" "}
-            <span className="font-medium text-foreground">it can&apos;t change the workflow</span>
-            .
-            {sourceDefined
-              ? " This one is defined by a file in the company source tree, so changes belong in the company repository."
-              : " Apply a change yourself with Edit, the path that checks the graph and refuses a stale write."}
+            {sourceDefined ? (
+              <>
+                It can explain and suggest, but{" "}
+                <span className="font-medium text-foreground">
+                  it can&apos;t change the workflow
+                </span>
+                . This one is defined by a file in the company source tree, so changes belong in
+                the company repository.
+              </>
+            ) : (
+              <>
+                Ask for a change and it{" "}
+                <span className="font-medium text-foreground">proposes one you review</span>: you
+                see the diff and decide. Nothing is written until you press Apply, and it goes
+                through the same save the editor uses, which refuses a workflow that moved while
+                you were reading.
+              </>
+            )}
           </p>
         </div>
 
@@ -333,8 +508,36 @@ export function CopilotPanel({
             ) : (
               // The same renderer every other markdown surface uses, so a
               // copilot answer reads like a chat reply rather than its own
-              // dialect.
-              <Markdown className="prose-sm">{m.text}</Markdown>
+              // dialect. The proposal block is stripped out of the prose and
+              // rendered as the review card below, so the operator never reads
+              // raw JSON (issue #415).
+              <Markdown className="prose-sm">{reviews[m.id]?.prose ?? m.text}</Markdown>
+            )}
+            {m.role === "company" &&
+              reviews[m.id]?.proposal &&
+              reviews[m.id]?.diff && (
+                <div className="mt-2">
+                  <ProposalCard
+                    summary={reviews[m.id].proposal!.summary}
+                    diff={reviews[m.id].diff!}
+                    state={reviews[m.id].state}
+                    blocked={blockedReason(m.id, reviews[m.id])}
+                    error={reviews[m.id].error}
+                    onApply={() => void apply(m.id, reviews[m.id].proposal!)}
+                    onDismiss={() => dismiss(m.id)}
+                  />
+                </div>
+              )}
+            {/* A block that arrived malformed is said out loud. Dropping it
+                would leave the operator reading prose that describes a change
+                with no way to apply it and no hint that one was attempted. */}
+            {m.role === "company" && reviews[m.id]?.problem && (
+              <Alert className="mt-2 py-1.5">
+                <AlertDescription className="text-[11px] leading-snug">
+                  The copilot tried to propose a change this console couldn&apos;t read.{" "}
+                  {reviews[m.id].problem} Ask again, or make the change in the editor.
+                </AlertDescription>
+              </Alert>
             )}
           </div>
         ))}

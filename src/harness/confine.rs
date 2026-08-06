@@ -217,8 +217,11 @@ pub fn confined_persona(company_name: &str, confinement: &Confinement) -> String
              which part you cannot answer and that it has to be asked in the company chat, then \
              answer whatever the rest of the question allows. Do not guess at company context, \
              and do not claim to have looked anything up.\n\n\
-             You cannot change the workflow. Describe a change precisely enough for a person to \
-             make it in the workflow editor, and never claim to have made it."
+             You cannot change the workflow yourself, and you have no way to try: this turn \
+             calls nothing. What you can do is PROPOSE a change in the format the message asks \
+             for (issue #415) — the operator reads it as a diff against their graph and applies \
+             it, or throws it away. A proposal is text in your reply, not an action, so never \
+             say you have made a change, and never propose one that was not asked for."
         ),
     }
 }
@@ -367,6 +370,26 @@ mod tests {
         assert!(persona.contains("no tools"), "{persona}");
         assert!(persona.contains("company chat"), "{persona}");
         assert!(persona.contains("cannot change the workflow"), "{persona}");
+    }
+
+    /// Issue #415. The turn may PROPOSE, and the persona has to be exact about
+    /// what that is: text in a reply that the operator applies, not something
+    /// the agent did. A model that reads "propose" as "do" would report changes
+    /// that never landed, which is worse than a copilot that cannot propose at
+    /// all. The confinement is untouched by this — proposing calls nothing, and
+    /// the tool policy still refuses everything.
+    #[test]
+    fn the_persona_allows_proposing_and_forbids_claiming_to_have_applied() {
+        let persona = confined_persona("Acme", &workflow());
+        assert!(persona.contains("PROPOSE"), "{persona}");
+        assert!(
+            persona.contains("the operator reads it as a diff"),
+            "{persona}"
+        );
+        assert!(
+            persona.contains("never say you have made a change"),
+            "{persona}"
+        );
     }
 
     /// The confined context is a hole: nothing written to it can be read back,

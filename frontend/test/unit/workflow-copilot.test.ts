@@ -71,9 +71,36 @@ describe("composeCopilotMessage", () => {
     expect(message).toMatch(/do not claim to have looked anything up/i);
   });
 
-  it("still refuses to claim it can edit the workflow", () => {
+  /**
+   * #415 replaced "you cannot edit" with the sharper pair: it cannot APPLY,
+   * and it may PROPOSE. Both halves matter — a model told only the first goes
+   * back to prose the operator has to retype, and one told only the second
+   * will claim to have made the change.
+   */
+  it("may propose a change and may not apply one", () => {
     const message = composeCopilotMessage(context, "add a retry");
-    expect(message).toMatch(/CANNOT edit the workflow/);
+    expect(message).toMatch(/CANNOT apply a change yourself/);
+    expect(message).toMatch(/PROPOSE/);
+    expect(message).toContain("## Proposing a change");
+    expect(message).toContain("```workflow-proposal");
+    // The ops the console can actually read back.
+    for (const op of ["addNode", "updateNode", "removeNode", "addEdge", "removeEdge"]) {
+      expect(message).toContain(op);
+    }
+  });
+
+  /**
+   * A source-defined workflow is refused every write by the host, so proposing
+   * one could only ever produce a diff whose Apply is refused. The protocol is
+   * withheld entirely rather than offered and then blocked.
+   */
+  it("does not offer the protocol for a workflow the console cannot write", () => {
+    const message = composeCopilotMessage(
+      { ...context, graph: { ...graph, editable: false } },
+      "add a retry",
+    );
+    expect(message).not.toContain("## Proposing a change");
+    expect(message).toMatch(/must not propose an edit/);
   });
 
   /**

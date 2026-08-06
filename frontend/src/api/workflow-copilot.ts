@@ -64,6 +64,7 @@
 // ever fails.
 
 import type { OpenCompanyClient } from "./client";
+import { PROPOSAL_FENCE } from "./workflow-proposal";
 import type {
   WorkflowGraph,
   WorkflowRunOutcome,
@@ -133,7 +134,12 @@ export interface CopilotContext {
  */
 export function composeCopilotMessage(context: CopilotContext, question: string): string {
   const { graph, runs, runsKnown } = context;
-  const editable = graph.editable === false;
+  // `editable: false` means the graph is defined by a file in the company
+  // source tree. Named for what it IS rather than for the flag's polarity: this
+  // was `editable`, holding the negation of the field it was named after, and
+  // #415 adds two more branches keyed off it (whether to describe the proposal
+  // protocol at all, and what to tell the model it may do).
+  const sourceDefined = graph.editable === false;
 
   const lines: string[] = [
     `You are the workflow copilot for this company, answering about ONE saved workflow.`,
@@ -149,7 +155,7 @@ export function composeCopilotMessage(context: CopilotContext, question: string)
     `Name: ${graph.name}`,
     `Id: ${graph.id}`,
     graph.description ? `Description: ${graph.description}` : `Description: (none)`,
-    editable
+    sourceDefined
       ? `Editable from the console: NO — this workflow is defined by a file in the company source tree (workflows/${graph.id}.toml). You can explain it, but changes have to be made in the company repository, not here.`
       : `Editable from the console: yes, through the workflow editor.`,
     ``,
@@ -210,9 +216,34 @@ export function composeCopilotMessage(context: CopilotContext, question: string)
     ``,
     `## What you can and cannot do`,
     `You can explain this workflow, diagnose why its runs failed, and describe in words what should change.`,
-    `You CANNOT edit the workflow: this console does not apply copilot-authored changes. If a change is wanted, describe it precisely enough for a person to make it in the workflow editor. Do not claim to have made it.`,
     `You CANNOT reach anything else in the company: no tools, no board, no teammates, no other workflow, no files. The host enforces this, so a call would be refused rather than answered.`,
+    // Issue #415. The proposal is DATA IN THE REPLY, not a capability: it is
+    // the operator's console that writes, through the same versioned
+    // `updateWorkflow` the editor uses, only after they have read the diff. So
+    // this instruction hands the model no reach it did not have — which is
+    // exactly why the confinement (#416) had to land first.
+    sourceDefined
+      ? `You CANNOT edit the workflow, and you must not propose an edit: this one is defined by a file in the company source tree, so the host refuses every write to it. Describe the change for someone to make in the company repository.`
+      : `You CANNOT apply a change yourself. What you CAN do is PROPOSE one: the operator reads it as a diff and applies it, or throws it away.`,
   );
+
+  if (!sourceDefined) {
+    lines.push(
+      ``,
+      `## Proposing a change`,
+      `When the operator asks for a change (and only then), end your reply with ONE fenced block of exactly this form, after your prose:`,
+      "```" + PROPOSAL_FENCE,
+      `{"summary": "one line saying what this does", "ops": [ … ]}`,
+      "```",
+      `Each op is one of:`,
+      `- {"op": "addNode", "node": {"id": "…", "kind": "…", "name": "…", …}} — a new step. Use the same fields the steps above show.`,
+      `- {"op": "updateNode", "id": "…", "set": {"field": value}} — change fields on an existing step. Only send the fields that change.`,
+      `- {"op": "removeNode", "id": "…"} — delete a step (its connections go with it).`,
+      `- {"op": "addEdge", "from": "…", "to": "…", "label": "optional"} — connect two steps.`,
+      `- {"op": "removeEdge", "from": "…", "to": "…"} — disconnect two steps.`,
+      `Rules: refer to steps by the ids listed above; never rename an id (that is a remove plus an add); propose the smallest change that answers the question; and say in your prose what the change does and why. If you are not confident enough to propose, say so and describe the change instead — a wrong proposal costs the operator more than no proposal.`,
+    );
+  }
 
   // Joined with the marker verbatim, so `questionOf` splits on exactly the
   // string this function used.

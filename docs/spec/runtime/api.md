@@ -337,9 +337,22 @@ scope; SSE (`/chat` streaming, the `/events` work feed) is not yet wired.
   copilot adds is a transcript that stays out of the team's chat and an answer
   drawn from one workflow rather than from everything the company knows.
 
+  **A copilot answer may carry a proposed edit (issue #415), and that adds no
+  route and no capability.** The proposal is a fenced block in the reply text —
+  a list of node/edge operations — which the *console* turns into a candidate
+  graph and applies through `PUT …/workflows/{wid}` with `expectedVersion`, the
+  same write the canvas editor performs, after the operator has read the diff
+  and pressed Apply. The confined turn still calls nothing: it emits text, and
+  a person decides. So the host needs no notion of a proposal, and a proposal
+  cannot produce a graph the editor could not have produced — including the
+  `409` a graph that moved underneath it earns.
+
   Two more consequences worth knowing before reusing the seam. A chat turn
   runs the **whole** company cycle, so an actionable message also opens a
-  board card via `company::task_intent`. And an unconfigured company answers
+  board card via `company::task_intent` — on every thread *except* a copilot
+  one, where that is suppressed (#416) precisely because the seam is being
+  reused for a conversation that is not a request to the company. And an
+  unconfigured company answers
   `200` with the echo brain's `"You said: …"` rather than an error, so a caller
   that needs a real answer must check `cognition` from `GET {scope}/inference`
   — there is no status code to catch.
