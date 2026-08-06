@@ -102,10 +102,13 @@ export function AssigneeSelect({
     // pick made in that window would name something that does not exist here.
     setDesks([]);
     setTeam([]);
-    // Both halves are best-effort, the stance the org chart takes too
-    // (`views/company/OrgChartView.tsx`): a host that does not serve one of
+    // Both halves are best-effort *here*: a host that does not serve one of
     // these surfaces still gets a usable picker rather than a dialog that
-    // fails to render.
+    // fails to render. The org chart is not the same rule and must not be read
+    // as one — `/desks` IS its chart, so losing it there is an error state,
+    // and only `/team` and `/users` are best-effort
+    // (`views/company/OrgChartView.tsx`). A picker with no desks is still a
+    // picker.
     void Promise.all([
       client.listDesks(company).catch(() => [] as DeskDto[]),
       client.listTeam(company).catch(() => [] as TeamMemberDto[]),

@@ -413,7 +413,7 @@ function Seat({
     >
       <span className="flex min-w-0 items-center gap-1.5">
         {seat.lead && (
-          <Crown className="size-3.5 shrink-0 text-amber-500" aria-label="Desk lead" />
+          <Crown role="img" aria-label="Desk lead" className="size-3.5 shrink-0 text-amber-500" />
         )}
         <span className={cn("truncate", !seat.known && "text-muted-foreground")}>{seat.name}</span>
         {seat.role && <span className="truncate text-xs text-muted-foreground">{seat.role}</span>}

@@ -255,9 +255,12 @@ test("#311 the lead is the desk's first member, badged", async ({ page }) => {
   const seats = deskNode(page, "Engineering").locator('[role="treeitem"][aria-level="3"]');
   await expect(seats).toHaveCount(2);
   await expect(seats.first()).toContainText("Grace");
-  await expect(seats.first().getByLabel("Desk lead")).toBeVisible();
+  // Through the role, not the bare attribute: a `getByLabel` match proves the
+  // attribute is in the DOM, not that anything would announce it. The crown
+  // carries `role="img"` so the accessible name actually resolves.
+  await expect(seats.first().getByRole("img", { name: "Desk lead" })).toBeVisible();
   await expect(seats.nth(1)).toContainText("Ada");
-  await expect(seats.nth(1).getByLabel("Desk lead")).toHaveCount(0);
+  await expect(seats.nth(1).getByRole("img", { name: "Desk lead" })).toHaveCount(0);
 });
 
 test("#311 a desk can be created from the chart and survives a reload", async ({ page }) => {
@@ -331,7 +334,7 @@ test("#311 the lead can be changed from the chart and survives a reload", async 
 
   const seats = deskNode(page, "Engineering").locator('[role="treeitem"][aria-level="3"]');
   await expect(seats.first()).toContainText("Ada");
-  await expect(seats.first().getByLabel("Desk lead")).toBeVisible();
+  await expect(seats.first().getByRole("img", { name: "Desk lead" })).toBeVisible();
 
   const ordered = writes.find((w) => w.method === "PUT" && w.path.endsWith("/order"));
   expect(ordered?.body).toEqual({ ordered_member_ids: ["ada", "grace"] });

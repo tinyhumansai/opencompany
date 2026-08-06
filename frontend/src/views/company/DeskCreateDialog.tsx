@@ -167,7 +167,7 @@ export function DeskCreateDialog({
                   >
                     <span className="flex min-w-0 items-center gap-1.5">
                       {order === 0 && (
-                        <Crown className="size-3.5 shrink-0 text-amber-500" aria-label="Desk lead" />
+                        <Crown role="img" aria-label="Desk lead" className="size-3.5 shrink-0 text-amber-500" />
                       )}
                       <span className="truncate">{member.name ?? member.role}</span>
                     </span>

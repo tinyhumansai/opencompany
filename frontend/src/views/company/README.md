@@ -5,7 +5,7 @@ the one place desks are created, staffed and led.
 
 ## Why this exists
 
-#302 removed the Desk nav entry for the v1 IA cut and said what that cost:
+Issue #302 removed the Desk nav entry for the v1 IA cut and said what that cost:
 "desk creation and membership editing become unreachable", editable by hand in
 the manifest and nowhere else. It called that temporary.
 
@@ -16,14 +16,14 @@ rebuild removed `"desks"` from `app-shell.tsx`'s `View` union altogether, so
 test suite behind them were reachable from no UI by any path, including by
 typing a URL.
 
-#311 is explicit that the answer is not to put the flat list back: "build the
-hierarchy surface that makes the Desks page unnecessary, and route creation and
-membership editing through it." So the old screen was retired into this one
+Issue #311 is explicit that the answer is not to put the flat list back: "build
+the hierarchy surface that makes the Desks page unnecessary, and route creation
+and membership editing through it." So the old screen was retired into this one
 rather than re-listed.
 
 ## Three levels, and why nothing enforces it
 
-```
+```text
 company            level 1   the company itself
 └── desk           level 2   a [[group_chat]], or an operator-created overlay desk
     └── seat       level 3   one teammate on that desk

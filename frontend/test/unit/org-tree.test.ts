@@ -119,7 +119,11 @@ describe("buildOrgTree", () => {
     expect(tree().unassigned).toEqual([]);
   });
 
-  it("falls back to the company id when the host names the company nothing", () => {
+  it("passes the company name through verbatim; the caller owns the fallback", () => {
+    // `OrgChartView` resolves `status?.name || company || "This company"` and
+    // hands the result down. The model must not second-guess that, or two
+    // places would decide what an unnamed company is called.
+    expect(buildOrgTree("Acme", [], []).companyName).toBe("Acme");
     expect(buildOrgTree("", [], []).companyName).toBe("");
   });
 });
