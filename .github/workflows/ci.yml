@@ -184,13 +184,47 @@ jobs:
       - name: Clippy (openhuman, tinycortex)
         run: cargo clippy --locked --no-deps --features openhuman,tinycortex --all-targets -- -D warnings
 
-      # `--lib` is LOAD-BEARING — do not widen it to a bare `cargo test`. There
-      # is no `tests/` directory, and the only other runnable target the feature
-      # set unlocks is the `live_company_turn` example, which dials a real
-      # inference backend and needs a credential. The build step above already
-      # proves it compiles; this step must never try to run it.
+      # `--tests` is LOAD-BEARING IN BOTH DIRECTIONS. Do not narrow it back to
+      # `--lib`, and do not widen it to a bare `cargo test`.
+      #
+      # Issue #475, why not `--lib`. `--lib` selects the library's unit tests and
+      # nothing else, so every integration target under `tests/` is excluded from
+      # this job — and this is the only job that has the features those targets
+      # need. The `Rust` job does select them (a bare `cargo test` includes
+      # `tests/`), but at DEFAULT features, where `one_card_per_message.rs`'s
+      # `#![cfg(feature = "openhuman")]` empties the file. One job had the
+      # feature and not the target, the other had the target and not the feature,
+      # so the 11-case suite that proves one operator message opens exactly one
+      # card (#463/#466) was built by nothing and ran nowhere: `cargo test
+      # --locked --test one_card_per_message` reported `0 passed`. A revert of
+      # the fix it guards would have been caught by no check in this file.
+      #
+      # This step's stated justification used to be "there is no `tests/`
+      # directory". That was a FACT ABOUT THE TREE, and #466 falsified it the day
+      # it merged, silently — nothing fails when a comment stops being true. The
+      # reason below is a property of the target selection instead, so it cannot
+      # expire the same way.
+      #
+      # Why not a bare `cargo test`: its default selection additionally runs the
+      # library's DOCTESTS, a distinct compile and link of the whole tree under
+      # this feature set for coverage the `rust` job's `cargo test` already
+      # provides, and it builds every example — including `live_company_turn`,
+      # whose `required-features = ["openhuman"]` this lane satisfies and which
+      # exists to dial a real inference backend with a real credential. `--tests`
+      # selects exactly the targets that assert: the lib and bin unit tests, plus
+      # every integration target under `tests/`, present and future.
       - name: Test (openhuman, tinycortex)
-        run: cargo test --locked --features openhuman,tinycortex --lib
+        run: cargo test --locked --features openhuman,tinycortex --tests
+
+      # The guard for the next one (issue #475). The step above runs whatever
+      # `tests/` holds, but "ran the target" and "the target ran anything" are
+      # different claims: a file whose crate-level `cfg` is not satisfied still
+      # builds, still links, and still exits 0 having executed nothing. That is
+      # exactly how a whole suite sat in the tree for weeks looking like
+      # coverage. This asserts a NUMBER per integration target, so the silent
+      # zero becomes a red check, and prints the counts into the run log.
+      - name: Assert every integration target actually runs
+        run: scripts/ci/assert-integration-targets-run.sh openhuman,tinycortex
 
       # Catches the combination traps no single feature set can: most often a
       # mandatory struct field constructed differently across feature arms.

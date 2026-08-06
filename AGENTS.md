@@ -52,7 +52,15 @@ the crate error type from `src/error.rs`.
 
 Add focused tests with every behavior change. Keep tests near the module they
 exercise unless they verify cross-module behavior, in which case place them in
-the consuming module or a future `tests/` directory.
+the consuming module or in `tests/` as an integration target.
+
+A new file under `tests/` is not covered until a CI job both selects it and
+enables the features its crate-level `cfg` needs (issue #475). A target missing
+either builds, runs and reports zero without failing anything. The gated `Rust
+(openhuman, tinycortex)` job runs `--tests` and then asserts a non-zero count
+per target via `scripts/ci/assert-integration-targets-run.sh`; if your target
+needs a feature set no lane builds, add the lane and run that script there too
+rather than loosening the `cfg`.
 
 Maintain at least 80% coverage for meaningful library behavior. Document any
 intentionally untested edge case in the PR description.
