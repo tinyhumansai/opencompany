@@ -10,7 +10,7 @@ desktop app plays today: the **device client** that ingests events, receives
 effects, and services device-tool callbacks.
 
 `HostedMedullaBrain` (`src/brain/hosted.rs`) implements the
-[`Brain` port](../runtime/ports.md) over this contract.
+[`Brain` port](../runtime/ports-cognition.md#brain) over this contract.
 
 ## Cognition contract (what the brain guarantees)
 

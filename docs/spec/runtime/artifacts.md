@@ -3,7 +3,8 @@
 What a task *produced*, as opposed to what its agent *said*.
 
 An artifact is a versioned record of a file an agent wrote and explicitly
-handed over. The port that stores it ([`ArtifactStore`](ports.md)) exists for
+handed over. The port that stores it
+([`ArtifactStore`](ports-console.md#artifactstore)) exists for
 one question: **how much did the human have to fix the agent's work?** That is
 the highest-signal quality datum the product can produce, and it is computable
 only if the record is honest about what it holds.
@@ -170,5 +171,6 @@ schema migration on any of them.
 
 ## Related
 
-- [ports.md](ports.md) — the `ArtifactStore` trait contract
+- [ports-console.md](ports-console.md#artifactstore) — the `ArtifactStore`
+  trait contract
 - [events.md](events.md) — `DeskTaskCompleted.artifact_ids`

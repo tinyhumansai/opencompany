@@ -1,13 +1,14 @@
 # Company Events
 
-The `CompanyEvent` vocabulary carried by the [`EventLog`](ports.md#eventlog)
-port, and the correlation rules that let a reader fold one company's
-append-only journal back into per-task, per-approval and per-run views.
+The `CompanyEvent` vocabulary carried by the
+[`EventLog`](ports-state.md#eventlog) port, and the correlation rules that let a
+reader fold one company's append-only journal back into per-task, per-approval
+and per-run views.
 
-Split out of [`ports.md`](ports.md) (issue #371), which had grown past this
-repo's 500-line cap for a Markdown file. That file still owns the *port
-contracts* — the traits and their method signatures; this one owns the *event
-vocabulary* those traits carry, which is the half that keeps growing.
+Split out of [`ports.md`](ports.md) (issue #371) on this repo's 500-line cap for
+a Markdown file; the port contracts have since split the same way (issue #427).
+Those files own the *traits and their method signatures*; this one owns the
+*event vocabulary* those traits carry, the half that keeps growing.
 
 ## The journal's shape
 

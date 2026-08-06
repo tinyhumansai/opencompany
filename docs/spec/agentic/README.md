@@ -47,7 +47,8 @@ provenance, and approval machinery that already exists.
 
 Neither the Architect nor the Manager is a new kind of runtime. Both are
 cognition jobs executed through the existing
-[`Brain` port](../runtime/ports.md) (hosted Medulla), consuming the same
+[`Brain` port](../runtime/ports-cognition.md#brain) (hosted Medulla),
+consuming the same
 tiers, budgets, and callbacks as a normal cycle. They add **no new external
 dependency** and respect the one-key invariant.
 

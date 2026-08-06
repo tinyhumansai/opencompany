@@ -17,7 +17,8 @@ let runtime = RuntimeBuilder::new(manifest)
 ```
 
 - **Bring your own persistence.** The four storage ports
-  ([runtime/ports.md](../runtime/ports.md)) are the entire storage contract;
+  ([runtime/ports-state.md](../runtime/ports-state.md)) are the entire storage
+  contract;
   DB-agnosticism means the kernel never names an engine. A conformance test
   suite (Phase 5) validates operator-supplied stores: isolation by
   `CompanyId`, append-only event/ledger semantics, export totality.

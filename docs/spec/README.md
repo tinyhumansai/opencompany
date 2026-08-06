@@ -78,7 +78,12 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [company-brain/approvals.md](company-brain/approvals.md) | Checkpoints and the approval model |
 | [company-brain/memory.md](company-brain/memory.md) | Long-term memory and retention |
 | [runtime/README.md](runtime/README.md) | Kernel architecture and crate layout |
-| [runtime/ports.md](runtime/ports.md) | Port trait contracts (normative) |
+| [runtime/ports.md](runtime/ports.md) | Port trait contracts (normative) — index, assembly, defaults |
+| [runtime/ports-cognition.md](runtime/ports-cognition.md) | `Brain`, `CycleHost`, `ChannelAdapter`, `TurnStep` |
+| [runtime/ports-state.md](runtime/ports-state.md) | `CompanyStore`, `EventLog`, memory/context, secrets, identity |
+| [runtime/ports-effects.md](runtime/ports-effects.md) | `ToolProvider`, `AgentEconomy`, `ApprovalGate` |
+| [runtime/ports-console.md](runtime/ports-console.md) | The WS3 console-surface stores |
+| [runtime/ports-runs.md](runtime/ports-runs.md) | `RunStore`: attempts and their traces |
 | [runtime/events.md](runtime/events.md) | `CompanyEvent` vocabulary + journal correlation rules |
 | [runtime/manifest.md](runtime/manifest.md) | `company.toml` schema, `agents.toml` compatibility |
 | [runtime/lifecycle.md](runtime/lifecycle.md) | Company state machine and durability |

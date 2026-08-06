@@ -9,7 +9,8 @@ Blueprint. Overview and invariants: [README.md](README.md).
 
 The Manager is not a chat persona, not a Roster member, and not a new
 runtime. It is a scheduled cognition job on the
-[`Brain` port](../runtime/ports.md), and its entire output surface is the
+[`Brain` port](../runtime/ports-cognition.md#brain), and its entire output
+surface is the
 Approvals Inbox — where its suggestions speak in the company's one voice
 ([company-brain](../company-brain/README.md)).
 

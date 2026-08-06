@@ -22,7 +22,8 @@ CompanyBrain
 └── feedback   inbox of feedback items + links to filed GitHub issues
 ```
 
-Each family maps to a storage port ([runtime/ports.md](../runtime/ports.md)):
+Each family maps to a storage port
+([runtime/ports-state.md](../runtime/ports-state.md)):
 identity/charter/roster/world → `CompanyStore` + `EventLog`, memory →
 `MemoryStore`, context → `ContextStore`. All of it exports as one bundle
 ([runtime/lifecycle.md](../runtime/lifecycle.md)).
