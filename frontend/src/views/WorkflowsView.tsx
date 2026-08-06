@@ -1153,7 +1153,18 @@ export function WorkflowsView({
               </AlertDialogContent>
             </AlertDialog>
           </span>
-          <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+          {/* Issue #341: THE control named "New workflow". It is in the
+              toolbar in every state, so it is the one an operator — or a
+              screen reader, or a spec — should find under that name. The
+              empty-state call to action below is named differently on
+              purpose; two buttons answering to one name is an ambiguity
+              nothing can resolve. */}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setCreateOpen(true)}
+            data-testid="workflow-create"
+          >
             <Plus className="mr-1.5 size-4" />
             New workflow
           </Button>
@@ -1244,9 +1255,19 @@ export function WorkflowsView({
         ) : !selectedId ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-muted-foreground">
             <p>This company has no saved workflows yet.</p>
-            <Button size="sm" variant="outline" onClick={() => setCreateOpen(true)}>
+            {/* Issue #341: opens the same dialog as the toolbar button, and
+                therefore must NOT carry the same name. "Create a workflow"
+                rather than "Create the first workflow" because this state is
+                also where deleting the last workflow lands, and by then there
+                is nothing first about it. */}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setCreateOpen(true)}
+              data-testid="workflow-create-empty"
+            >
               <Plus className="mr-1.5 size-4" />
-              New workflow
+              Create a workflow
             </Button>
           </div>
         ) : (
