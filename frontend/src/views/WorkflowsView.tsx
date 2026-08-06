@@ -146,6 +146,7 @@ export function WorkflowsView({
   sub = null,
   runEventTick = 0,
   runEvents = EMPTY_RUN_EVENTS,
+  listEventTick = 0,
 }: {
   client: OpenCompanyClient;
   company: string | null;
@@ -180,6 +181,20 @@ export function WorkflowsView({
    * coalesced render can never lose a node.
    */
   runEvents?: CompanyStreamEvent[];
+  /**
+   * Bumped by the shell on every workflow **authoring** frame —
+   * `workflow_created`, `workflow_updated`, `workflow_deleted` (issue #384) —
+   * so the picker follows what the host holds while this tab stays open.
+   *
+   * Distinct from `runEventTick`, which is about what a run did. A workflow the
+   * orchestrator authored (or a second session deleted) changes which entries
+   * exist, and nothing else would tell this view that.
+   *
+   * A counter, not the payload: it re-reads the list, and the list is the
+   * answer to all three frames — including the delete, which is simply an entry
+   * the fresh list no longer has.
+   */
+  listEventTick?: number;
 }) {
   const { resolvedTheme } = useTheme();
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
@@ -329,7 +344,20 @@ export function WorkflowsView({
   const appliedWorkflowRef = useRef<string | null>(null);
   const appliedRunRef = useRef<string | null>(null);
 
-  // Load the workflow list once, and auto-select the first entry.
+  // Load the workflow list, and auto-select the first entry.
+  //
+  // Re-runs on `listEventTick` (issue #384), i.e. whenever the host says a
+  // workflow was created, edited or deleted anywhere — the orchestrator's
+  // `create_workflow` tool, a second console session, a machine credential.
+  // Before that this ran on mount and on a company switch only, so the picker
+  // silently drifted from the host for the whole life of the tab.
+  //
+  // Re-reading the list is also what makes a **delete** land properly rather
+  // than greying an entry out: the selection reconciliation below drops an id
+  // the fresh list no longer has, which moves the canvas off a graph the host
+  // does not hold and takes the entry out of the picker in the same pass. No
+  // spinner and no flash — `loadingList` is not raised again, so the picker
+  // just changes.
   useEffect(() => {
     let live = true;
     (async () => {
@@ -338,25 +366,41 @@ export function WorkflowsView({
         if (!live) return;
         setWorkflows(rows);
         setSelectedId((prev) => {
-          // Issue #339: a workflow id in the URL outranks both the held
-          // selection and the first-row default — the operator followed a link
-          // to *that* graph. Resolved here rather than left to the follow
-          // effect below purely to avoid the flash: selecting `rows[0]` first
-          // and correcting a render later would fetch a graph nobody asked for
-          // and show the wrong name in the picker on the way past.
+          // Keep the selection when the freshly loaded list still has it —
+          // otherwise a stale id would leave the canvas on a graph the host
+          // does not hold. One rule, two cases: a leftover id from the previous
+          // company (this effect reruns on a switch), and the workflow on
+          // screen being deleted from somewhere else (issue #384, this effect
+          // reruns on the frame).
+          //
+          // Held selection BEFORE the URL, and that ordering is load-bearing
+          // for #384 without costing #339 anything. On mount `prev` is null, so
+          // a link still lands on the graph it names, flash-free — which is all
+          // #339 asked for here, changes after mount being the follow effect's
+          // job. But this effect now also reruns on a *live* frame, and the
+          // hash trails the selection by a `hashchange`: reading the URL first
+          // would let a frame arriving inside that gap — the console's own
+          // `workflow_created`, for instance — snap the operator back off the
+          // workflow they just made.
+          if (prev && rows.some((r) => r.id === prev)) return prev;
+          // Issue #339: a workflow id in the URL outranks the first-row
+          // default — the operator followed a link to *that* graph, and
+          // selecting `rows[0]` first and correcting a render later would fetch
+          // a graph nobody asked for and show the wrong name on the way past.
           //
           // `requestedWorkflowId` is read from the closure and deliberately NOT
           // a dependency: it changes on every picker click (the writer below
           // mirrors the selection into the hash), and re-running this would
-          // spend a full list round trip on each one. Changes after mount are
-          // the follow effect's job.
+          // spend a full list round trip on each one.
           if (requestedWorkflowId && rows.some((r) => r.id === requestedWorkflowId)) {
             return requestedWorkflowId;
           }
-          // Keep the selection only if it still exists in the freshly loaded list
-          // (this effect also reruns on company change) — otherwise a stale id
-          // from the previous company would fetch the wrong/nonexistent graph.
-          return prev && rows.some((r) => r.id === prev) ? prev : (rows[0]?.id ?? null);
+          // Nothing valid to keep: fall to the first remaining entry, exactly
+          // as the local Delete button does — so a workflow deleted from
+          // another session and one deleted from this button leave the view in
+          // the same place. A company whose last workflow just went away
+          // selects nothing, and the canvas empties.
+          return rows[0]?.id ?? null;
         });
         setError(null);
       } catch (e) {
@@ -372,7 +416,7 @@ export function WorkflowsView({
     // `requestedWorkflowId` is read above but deliberately not a dependency —
     // see the comment at the read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, company]);
+  }, [client, company, listEventTick]);
 
   // Issue #339: follow the URL while the view stays mounted — the operator
   // clicks a second task card's link without ever leaving this tab, so the

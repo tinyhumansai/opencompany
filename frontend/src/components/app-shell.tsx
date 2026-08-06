@@ -256,6 +256,17 @@ export function AppShell({
   // refreshes its run history live. Same shape as `taskEventTick` — a counter,
   // not the payload, so the view owns what it refetches.
   const [workflowRunTick, setWorkflowRunTick] = useState(0);
+  // Issue #384: bumped on every `workflow_created` / `workflow_updated` /
+  // `workflow_deleted`, so the Workflows view re-reads its picker while the tab
+  // stays open — a graph authored by the orchestrator, by another session or by
+  // a machine credential used to be invisible until a reload.
+  //
+  // A counter rather than the payload, for the same reason `taskEventTick` is:
+  // the view re-reads `GET …/workflows`, so two frames collapsing into one
+  // React batch still means "re-read". It also covers the delete case without
+  // carrying an id — the workflow that went away is precisely the one the
+  // refreshed list no longer has.
+  const [workflowListTick, setWorkflowListTick] = useState(0);
   // Issue #371: a rolling WINDOW of run-progress frames, not just a nonce.
   //
   // The canvas paints per-node state, so unlike the tick above it needs the
@@ -830,6 +841,11 @@ export function AppShell({
       setWorkflowRunEvents((prev) => [...prev, event].slice(-WORKFLOW_EVENT_WINDOW));
       if (event.type === "workflow_run_finished") setWorkflowRunTick((n) => n + 1);
     }, []),
+    // Issue #384. The picker is refreshed from the host rather than patched
+    // from the frame: the frame carries no graph body by design, and a console
+    // that splices what it *thinks* changed is how a picker drifts in the first
+    // place.
+    onWorkflowChanged: useCallback(() => setWorkflowListTick((n) => n + 1), []),
     // Issue #379. Both frames do the same one thing — re-read the approvals
     // feed — and that is deliberate: the park frame is thin by design (no
     // payload, no asker), so the redacted summary on the feed is the only place
@@ -1015,6 +1031,7 @@ export function AppShell({
                 sub={sub}
                 runEventTick={workflowRunTick}
                 runEvents={workflowRunEvents}
+                listEventTick={workflowListTick}
               />
             </Suspense>
           )}
