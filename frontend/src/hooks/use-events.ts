@@ -291,6 +291,17 @@ interface Options {
 }
 
 /**
+ * The subscriber half of {@link Options}, as {@link handleEvent} takes it.
+ *
+ * A named bag rather than a positional list, because five of the six share the
+ * type `(e: CompanyStreamEvent) => void` — so a call site that got the ORDER
+ * wrong would type-check perfectly and route every frame to the wrong surface.
+ * Derived from `Options` rather than restated so the two cannot drift, and so
+ * each callback keeps the documentation written against it above.
+ */
+type Subscribers = Omit<Options, "pendingApprovals">;
+
+/**
  * Opens an `EventSource` on `{scope}/events` for the active company and turns
  * incoming attention events into `sonner` toasts (and, for agent replies, a
  * transcript injection via {@link Options.onAgentReply}). This is the active
@@ -383,15 +394,14 @@ export function useEvents(
         console.debug("[events] dropping unparseable event", err);
         return;
       }
-      handleEvent(
-        event,
-        onAgentReplyRef.current,
-        onTaskEventRef.current,
-        onTurnEventRef.current,
-        onWorkflowRunEventRef.current,
-        onWorkflowChangedRef.current,
-        onApprovalEventRef.current,
-      );
+      handleEvent(event, {
+        onAgentReply: onAgentReplyRef.current,
+        onTaskEvent: onTaskEventRef.current,
+        onTurnEvent: onTurnEventRef.current,
+        onWorkflowRunEvent: onWorkflowRunEventRef.current,
+        onWorkflowChanged: onWorkflowChangedRef.current,
+        onApprovalEvent: onApprovalEventRef.current,
+      });
     };
 
     source.onerror = () => {
@@ -414,15 +424,15 @@ export function useEvents(
 }
 
 /** Routes one parsed event to its toast / transcript side effect. */
-function handleEvent(
-  event: CompanyStreamEvent,
-  onAgentReply?: (e: AgentReplyEvent) => void,
-  onTaskEvent?: (e: CompanyStreamEvent) => void,
-  onTurnEvent?: (e: CompanyStreamEvent) => void,
-  onWorkflowRunEvent?: (e: CompanyStreamEvent) => void,
-  onWorkflowChanged?: (e: CompanyStreamEvent) => void,
-  onApprovalEvent?: (e: CompanyStreamEvent) => void,
-): void {
+function handleEvent(event: CompanyStreamEvent, subscribers: Subscribers): void {
+  const {
+    onAgentReply,
+    onTaskEvent,
+    onTurnEvent,
+    onWorkflowRunEvent,
+    onWorkflowChanged,
+    onApprovalEvent,
+  } = subscribers;
   switch (event.type) {
     // Live turn frames drive the in-flight tool timeline — no toast, they render
     // inline in the chat.

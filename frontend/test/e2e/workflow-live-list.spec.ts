@@ -1,4 +1,10 @@
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import {
+  expect,
+  test,
+  type APIRequestContext,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 
 /**
  * Issue #384: workflow create / update / delete events reached the console's
@@ -99,6 +105,30 @@ async function openWorkflows(page: Page) {
 }
 
 /**
+ * Returned by {@link pickerOptionCount} when the popup could not be read at
+ * all — it never opened, or the click could not land.
+ *
+ * A sentinel rather than `0`, because `0` is a legitimate answer this file
+ * asserts twice ("the probe does not exist yet", "the deleted one is gone").
+ * Reporting an unread popup as zero would pass both of those against a console
+ * that rendered nothing whatsoever. A negative count matches no expectation:
+ * a poll keeps polling, and a direct assertion fails saying `-1`.
+ */
+const UNREADABLE = -1;
+
+/** `waitFor` reduced to a boolean — a timeout is an answer here, not a throw. */
+function settled(
+  locator: Locator,
+  state: "visible" | "hidden",
+  timeout: number,
+): Promise<boolean> {
+  return locator.waitFor({ state, timeout }).then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
  * How many options the picker offers under `name`, from a fresh open.
  *
  * Opened and closed around the count on purpose, so the reading never depends
@@ -107,14 +137,40 @@ async function openWorkflows(page: Page) {
  * property under test is that the console re-read the list at all, and opening
  * a dropdown fetches nothing (the view lists on mount, on a company switch, and
  * on an SSE frame, and that is all).
+ *
+ * **Nothing in here throws**, which is a requirement and not a style: one call
+ * site runs inside `expect.poll`, and the two automated reviews on this PR
+ * disagreed about whether Playwright retries a rejected poll callback or lets
+ * the rejection end the poll. The lockfile resolves `@playwright/test` to
+ * 1.61.1 rather than the `^1.49.0` in `package.json`, so the semantics anyone
+ * reasons about here may not be the semantics that run. A callback that cannot
+ * reject is correct under either reading, and that is cheaper than settling the
+ * argument.
+ *
+ * The transient this protects against is real: the popup is opened while an
+ * SSE frame is re-rendering the list underneath it, so "no options for a
+ * moment" is an ordinary state on the way to the answer, not a failure.
  */
 async function pickerOptionCount(page: Page, name: string): Promise<number> {
-  await picker(page).click();
-  await expect(page.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
-  const count = await page.getByRole("option", { name, exact: true }).count();
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("option")).toHaveCount(0);
-  return count;
+  try {
+    await picker(page).click();
+    // Not `expect(...).toBeVisible()`: that throws, and a popup that is empty
+    // for one render is exactly what this must survive.
+    if (!(await settled(page.getByRole("option").first(), "visible", 15_000))) {
+      return UNREADABLE;
+    }
+    const count = await page.getByRole("option", { name, exact: true }).count();
+    await page.keyboard.press("Escape");
+    // Best effort. The count is already read, so a popup slow to close is not
+    // worth discarding it over — and if it really is stuck, the next attempt's
+    // click fails and reports UNREADABLE rather than a wrong number.
+    await settled(page.getByRole("option").first(), "hidden", 5_000);
+    return count;
+  } catch {
+    // A click that could not land, a detached locator mid-re-render: all of it
+    // is "could not read the popup this time", never "the popup held nothing".
+    return UNREADABLE;
+  }
 }
 
 /** Selects a workflow by name and waits for the selection to settle. */
@@ -216,6 +272,54 @@ test("deleting the workflow on screen elsewhere takes it out of the picker, not 
       await pickerOptionCount(page, name),
       "a deleted workflow must leave the picker, not sit in it greyed out",
     ).toBe(0);
+  } finally {
+    await removeWorkflow(request, id);
+  }
+});
+
+/**
+ * The selection can now move without the operator moving it, which is what
+ * makes this worth pinning: the hash mirror pushes a history entry for a
+ * selection change, and that was unconditionally right while only a click could
+ * cause one.
+ *
+ * Measured as `history.length` rather than by pressing Back, because Back's
+ * destination depends on which workflow the view happened to select on mount —
+ * it could legitimately be any entry in the harness company. The stack not
+ * growing is the property itself, and it is true regardless.
+ */
+test("a delete elsewhere corrects the URL in place, without pushing history", async ({
+  page,
+  request,
+}) => {
+  const stamp = Date.now();
+  const id = `e2e-live-history-${stamp}`;
+  const name = `Live history probe ${stamp}`;
+  await createWorkflow(request, id, name);
+
+  try {
+    await openWorkflows(page);
+
+    // Picking it IS a navigation the operator made, so this one is a genuine
+    // history entry — and it is the entry the correction has to replace.
+    await selectWorkflow(page, name);
+    await expect.poll(() => page.url(), { timeout: 20_000 }).toContain(id);
+    const entriesBefore = await page.evaluate(() => window.history.length);
+
+    const deleted = await request.delete(`${COMPANY_SCOPE}/workflows/${id}`);
+    expect(deleted.ok(), `delete ${id}: ${deleted.status()}`).toBeTruthy();
+
+    // The selection moves off the deleted workflow and the hash follows it.
+    await expect.poll(() => page.url(), { timeout: 20_000 }).not.toContain(id);
+
+    // …by REPLACING that entry rather than stacking on it. A push would leave
+    // a URL naming a workflow the host no longer has one Back press away — an
+    // address the operator could copy out and share for a graph that does not
+    // exist, reached by undoing something they never did.
+    expect(
+      await page.evaluate(() => window.history.length),
+      "correcting a deleted selection must replace the history entry, not push one",
+    ).toBe(entriesBefore);
   } finally {
     await removeWorkflow(request, id);
   }
