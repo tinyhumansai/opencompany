@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { LIVE_BRAIN } from "./capabilities";
+
 /**
  * Issue #301 — the board's shape, asserted against a live host.
  *
@@ -101,7 +103,39 @@ test("new work enters through one prompt box and lands in To-do", async ({ page,
   expect(created.note).toBe(long);
 });
 
+/**
+ * Issue #501. This test states a **no-planner** contract, and only a host
+ * without one keeps it.
+ *
+ * Its own comment used to say the no-dispatch assertion "lets the column ship
+ * ahead of epic #183 §4's auto-advance". §4 has since landed as the planning
+ * station (`src/harness/planning.rs`, issue #337), and a card entering Planning
+ * on a planner-attached host now edge-fires exactly one pass and is **settled**
+ * by it — never left sitting in `planning`:
+ *
+ * | pass outcome | where the card lands |
+ * |---|---|
+ * | a plan, nothing blocking, a valid assignee | `in_progress` — and the dispatch edge fires |
+ * | a plan, a hard prerequisite missing | `todo`, with the gap on the note |
+ * | the pass itself failed | `todo`, with the reason on the note |
+ *
+ * So on the live-brain lane both of this test's claims are false by design: the
+ * card does not stay in `planning`, and the first row dispatches. `plan_task`
+ * is a `#[cfg(feature = "openhuman")]` no-op without the harness, so the
+ * assertions below remain exactly right on the default lane, which is where
+ * this runs.
+ *
+ * The skip is therefore INVERTED — `skip(LIVE_BRAIN)`, not `skip(!LIVE_BRAIN)`.
+ * This test needs the absence of a brain, which is the opposite of every other
+ * capability skip in the suite. The harness contract is asserted by the test
+ * below instead, so the lane loses no coverage.
+ */
 test("dragging into Planning moves the card without dispatching it", async ({ page, request }) => {
+  test.skip(
+    LIVE_BRAIN,
+    "asserts Planning is inert, which is only true without a planner; the harness " +
+      "contract is covered by the live-brain test below. Issue #501.",
+  );
   const title = `e2e planning drag ${Date.now()}`;
   const seeded = await request.post(`${API}/tasks`, { data: { title } });
   expect(seeded.ok()).toBeTruthy();
@@ -115,10 +149,23 @@ test("dragging into Planning moves the card without dispatching it", async ({ pa
 
   // Playwright's dragTo does not drive React's HTML5 drag handlers reliably
   // here, so the drop is dispatched directly at the Planning column.
+  //
+  // One **shared `DataTransfer`** across the three events, and it is
+  // load-bearing (issue #501). A bare `dispatchEvent("dragstart")` builds a
+  // `DragEvent` whose `dataTransfer` is `null`, so the board cannot stash the
+  // card id where a real drag puts it, and the drop handler falls back to
+  // React state — `moveTo(col, dropped)` reads `dropped || dragId`. That
+  // fallback exists for browsers that mangle the payload; it is not the path a
+  // real gesture takes, and leaning on it makes the three dispatches straddle a
+  // window in which a re-render matters. Handing the same `DataTransfer` to all
+  // three makes this the gesture a browser actually performs: `setData` at
+  // `dragstart`, `getData` at `drop`, and nothing in between that a re-render
+  // can touch.
+  const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
   const planning = page.locator("div.w-72").nth(EXPECTED_COLUMNS.indexOf("Planning"));
-  await card.dispatchEvent("dragstart");
-  await planning.dispatchEvent("dragover");
-  await planning.dispatchEvent("drop");
+  await card.dispatchEvent("dragstart", { dataTransfer });
+  await planning.dispatchEvent("dragover", { dataTransfer });
+  await planning.dispatchEvent("drop", { dataTransfer });
 
   await expect
     .poll(
@@ -141,4 +188,74 @@ test("dragging into Planning moves the card without dispatching it", async ({ pa
   expect(
     (detail.timeline ?? []).filter((entry: { kind: string }) => entry.kind === "dispatched"),
   ).toHaveLength(0);
+});
+
+/**
+ * The other half of issue #501: what Planning means **with** a planner.
+ *
+ * This is the assertion the live-brain lane was missing. It found the defect
+ * that opened #501 and had nothing to replace the inert-column claim with, so
+ * the lane reported a failure without ever stating the contract that actually
+ * holds there.
+ *
+ * The contract is settlement, not a destination. `src/harness/planning.rs`
+ * edge-fires one pass per card entering Planning and lands the card in
+ * `in_progress` (plan written, nothing blocking) or back in `todo` (a missing
+ * prerequisite, or the pass itself failed) — always with a `[system]` note
+ * saying which. The one outcome the product must never produce is a card left
+ * parked in `planning` with nothing having happened, which is exactly what a
+ * lost drop or a stalled pass would look like.
+ *
+ * So this asserts the negative that matters — the card does not stay put — and
+ * then that wherever it landed is one of the two documented landings and says
+ * why. It is deliberately agnostic about WHICH: the harness lane's brain echoes
+ * rather than plans, so today it always takes the failure row, and pinning that
+ * would make this test a description of the mock rather than of the product.
+ *
+ * The window is generous because a pass makes a real model call, bounded by
+ * `PLANNING_TIMEOUT` (120s) on the host side.
+ */
+test("a card dropped into Planning is planned and settled, never left parked", async ({
+  page,
+  request,
+}) => {
+  test.skip(
+    !LIVE_BRAIN,
+    "needs a --features openhuman,tinycortex host with a planner attached; without " +
+      "one Planning is inert and the test above is the applicable contract. Issue #501.",
+  );
+
+  const title = `e2e planning settle ${Date.now()}`;
+  const seeded = await request.post(`${API}/tasks`, { data: { title } });
+  expect(seeded.ok()).toBeTruthy();
+  const id = (await seeded.json()).id as string;
+
+  await page.goto("/#/tasks");
+  await dismissTour(page);
+
+  const card = page.locator("div[draggable=true]").filter({ hasText: title }).first();
+  await expect(card).toBeVisible({ timeout: 15_000 });
+
+  // The same faithful gesture as the test above: one DataTransfer across all
+  // three events, so the id travels where a real drag puts it.
+  const dataTransfer = await page.evaluateHandle(() => new DataTransfer());
+  const planning = page.locator("div.w-72").nth(EXPECTED_COLUMNS.indexOf("Planning"));
+  await card.dispatchEvent("dragstart", { dataTransfer });
+  await planning.dispatchEvent("dragover", { dataTransfer });
+  await planning.dispatchEvent("drop", { dataTransfer });
+
+  const read = async () => (await (await request.get(`${API}/tasks/${id}`)).json()).task;
+
+  // It reached the host and the pass settled it. A card still in `planning`
+  // when this expires is the real failure this test exists to catch: either the
+  // drop never landed, or a pass started and never finished.
+  await expect
+    .poll(async () => (await read()).column, { timeout: 150_000 })
+    .not.toBe("planning");
+
+  const settled = await read();
+  expect(["todo", "in_progress"]).toContain(settled.column);
+  // And it says why it moved, rather than moving silently. `[system]` is the
+  // attribution every planning outcome writes onto the note.
+  expect(settled.note ?? "").toContain("[system]");
 });
