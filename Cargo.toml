@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # fallback is only mounted when `OPENCOMPANY_CONSOLE_DIR` points at a real
 # directory, so the default build's behavior is byte-for-byte unchanged. Pure
 # Rust, no system libs, no network.
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs"] }
 # `ServiceExt::oneshot` lets the `/` SPA fallback hand a request off to
 # `ServeDir` from inside an axum handler, so reserved server prefixes can 404
 # before the static service ever sees them. Already in the tree via `tower-http`
