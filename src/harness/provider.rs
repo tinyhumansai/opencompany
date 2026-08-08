@@ -671,7 +671,20 @@ impl ChatModel<()> for HostedProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let mut http = self.client.post(&url).json(&body);
+        let (product_header_name, product_header_value) = crate::product::product_identity_header();
+        let mut http = self
+            .client
+            .post(&url)
+            .json(&body)
+            // `HostedProvider` always speaks to the TinyHumans-owned managed
+            // endpoint (`DEFAULT_TINYHUMANS_INFERENCE_URL`), never a
+            // third-party BYOK host, so tagging it with our product identity
+            // is unconditional. This client is a bespoke `reqwest::Client`,
+            // not one built through `openhuman_core`'s `IntegrationClient`,
+            // so it does not inherit the header set by
+            // `set_product_identity` and must attach it itself — see
+            // `crate::product`.
+            .header(product_header_name, product_header_value);
         // Resolved per request, never captured: on the hosted platform this reads
         // a token file the cluster rewrites in place every few minutes.
         let bearer = self.config.credential.current().await.map_err(|e| {
@@ -771,6 +784,18 @@ pub async fn request_plan(
             ("HTTP-Referer", OPENROUTER_REFERER.to_string()),
             ("X-Title", OPENROUTER_TITLE.to_string()),
         ]
+    } else if decl.provider == "managed" {
+        // Only `"managed"` is a TinyHumans-owned endpoint. The other three
+        // `INFERENCE_PROVIDERS` (`openrouter`, `openai_compatible`, `ollama`
+        // — see `company::types::INFERENCE_PROVIDERS`) are bring-your-own-key
+        // THIRD-PARTY endpoints (OpenAI, OpenRouter, DeepSeek, a
+        // self-hosted/local Ollama); sending them our `x-sdk-name` would leak
+        // which product a tenant is running to an operator who has no
+        // relationship with TinyHumans and gains nothing from knowing it.
+        // `openrouter` already gets its own attribution headers above — those
+        // are OpenRouter's own dashboard/rankings feature, unrelated to this.
+        let (name, value) = crate::product::product_identity_header();
+        vec![(name, value.to_string())]
     } else {
         Vec::new()
     };
@@ -1721,6 +1746,128 @@ mod tests {
         .expect("plan");
         assert!(plan.bearer.is_none(), "keyless Ollama sends no bearer");
         assert!(plan.headers.is_empty(), "no OpenRouter headers for Ollama");
+    }
+
+    /// The positive half of issue #376 (AC #1): `provider = "managed"` always
+    /// targets a TinyHumans-owned endpoint, so [`request_plan`] must attach
+    /// our `x-sdk-name: opencompany` product header alongside the tier's
+    /// other headers.
+    #[tokio::test]
+    async fn request_plan_attaches_the_product_header_for_managed() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let env = crate::company::inference::EnvDefault {
+            base_url: "https://env.example/openai/v1".into(),
+            credential: Credential::from_value("platform-key"),
+        };
+        // A hand-written `provider = "managed"` still resolves through the
+        // env default (mirrors `manifest_managed_inherits_env_credential` in
+        // `company::inference`'s own test suite) — this is the shape a real
+        // company manifest produces, not a synthetic decl.
+        let decl = inference::resolve_effective(
+            &company,
+            &manifest_inference("managed"),
+            Some(&env),
+            &secrets,
+        )
+        .await
+        .unwrap()
+        .expect("managed resolves via the env default");
+        assert_eq!(decl.provider, "managed");
+
+        let plan = request_plan(
+            &decl,
+            "chat-v1",
+            Vec::new(),
+            0.2,
+            None,
+            Vec::new(),
+            &ToolChoice::Auto,
+        )
+        .await
+        .expect("plan");
+        assert!(
+            plan.headers
+                .contains(&("x-sdk-name", "opencompany".to_string())),
+            "managed provider must carry the product header: {:?}",
+            plan.headers
+        );
+    }
+
+    /// The negative half of issue #376 (AC #1) — and the important one, per
+    /// the task: `openrouter` and `openai_compatible` are bring-your-own-key
+    /// THIRD-PARTY endpoints (OpenRouter's own API, and any OpenAI-compatible
+    /// host an operator points at — OpenAI, DeepSeek, a self-hosted proxy,
+    /// …). Sending them our product identity would tell a company we have no
+    /// relationship with which product a tenant is running, for no benefit to
+    /// anyone. Only `"managed"` (see the test above) may ever carry the
+    /// header.
+    #[tokio::test]
+    async fn request_plan_never_attaches_the_product_header_for_third_party_providers() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+
+        // openrouter: gets ITS OWN attribution headers, never ours.
+        let mut or_manifest = manifest_inference("openrouter");
+        or_manifest.models =
+            BTreeMap::from([("chat-v1".to_string(), "deepseek/deepseek-chat".to_string())]);
+        inference::store_key(&company, &secrets, "or-key")
+            .await
+            .unwrap();
+        let or_decl = inference::resolve_effective(&company, &or_manifest, None, &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+        let or_plan = request_plan(
+            &or_decl,
+            "chat-v1",
+            Vec::new(),
+            0.2,
+            None,
+            Vec::new(),
+            &ToolChoice::Auto,
+        )
+        .await
+        .expect("plan");
+        assert!(
+            !or_plan
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "x-sdk-name"),
+            "openrouter is third-party and must never see our product identity: {:?}",
+            or_plan.headers
+        );
+        assert!(
+            or_plan
+                .headers
+                .contains(&("HTTP-Referer", OPENROUTER_REFERER.to_string())),
+            "openrouter's own attribution headers must be unaffected: {:?}",
+            or_plan.headers
+        );
+
+        // openai_compatible: a bring-your-own-endpoint host — no headers at all.
+        let mut compat_manifest = manifest_inference("openai_compatible");
+        compat_manifest.base_url = Some("https://byok.example/v1".into());
+        let compat_decl = inference::resolve_effective(&company, &compat_manifest, None, &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+        let compat_plan = request_plan(
+            &compat_decl,
+            "chat-v1",
+            Vec::new(),
+            0.2,
+            None,
+            Vec::new(),
+            &ToolChoice::Auto,
+        )
+        .await
+        .expect("plan");
+        assert!(
+            compat_plan.headers.is_empty(),
+            "openai_compatible is third-party and must carry no headers at all: {:?}",
+            compat_plan.headers
+        );
     }
 
     /// Spawns an in-process OpenAI-compatible stub that echoes `marker` as the

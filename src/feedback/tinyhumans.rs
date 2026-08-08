@@ -27,7 +27,16 @@ use crate::feedback::types::FeedbackCategory;
 
 /// The product discriminator the hub routes on. Feedback from this runtime is
 /// always attributed to opencompany, whichever company reported it.
-pub const PRODUCT: &str = "opencompany";
+///
+/// Re-exported from [`crate::product::PRODUCT_IDENTITY`] rather than holding
+/// its own `"opencompany"` literal: that module is this crate's single
+/// source of truth for the product name, and a second copy of the string
+/// here would be exactly the kind of duplicate this task exists to remove
+/// (issue #376). If the two ever need to differ — e.g. the hub's `product`
+/// field wants a different spelling than the `x-sdk-name` header — that is a
+/// deliberate divergence to introduce explicitly, not something to default
+/// into by leaving a stale literal in place.
+pub const PRODUCT: &str = crate::product::PRODUCT_IDENTITY;
 
 /// One feedback report to forward.
 ///
@@ -217,9 +226,19 @@ mod http {
                 "origin": request.origin,
                 "externalRef": request.external_ref,
             });
+            let (product_header_name, product_header_value) =
+                crate::product::product_identity_header();
             let resp = self
                 .http
                 .post(&url)
+                // This client bypasses the embedded openhuman_core entirely, so
+                // unlike the harness's `IntegrationClient`-backed calls it must
+                // tag itself with our product identity directly — see
+                // `crate::product`. `body` already carries the same value under
+                // `"product"`, but that is the hub's own routing field over the
+                // JSON payload; this header is the transport-level marker every
+                // backend endpoint reads, feedback or otherwise.
+                .header(product_header_name, product_header_value)
                 // The credential rides the header and only the header.
                 .bearer_auth(self.credential.expose())
                 .json(&body)

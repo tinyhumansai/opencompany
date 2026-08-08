@@ -67,9 +67,18 @@ impl HttpSocketTransport {
         // Belt-and-suspenders: never send a body carrying a `model` field.
         wire::assert_no_model(&envelope)?;
 
+        let (product_header_name, product_header_value) = crate::product::product_identity_header();
         let response = self
             .client
             .post(self.endpoint(path))
+            // `HttpSocketTransport` always targets the TinyHumans-owned
+            // Medulla endpoint (`base_url` is `https://api.tinyhumans.ai`),
+            // never a third party, so tagging it is unconditional. This is a
+            // bespoke `reqwest::Client`, not one built through
+            // `openhuman_core`'s `IntegrationClient`, so it never inherits
+            // the header `set_product_identity` attaches elsewhere — see
+            // `crate::product`.
+            .header(product_header_name, product_header_value)
             .bearer_auth(self.credential.expose())
             .json(&envelope)
             .send()

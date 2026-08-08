@@ -21,6 +21,10 @@ pub mod metering;
 pub mod openhuman;
 pub mod policy;
 pub mod ports;
+/// The `x-sdk-name: opencompany` identity attached to this crate's own
+/// backend HTTP clients. Ungated (no `openhuman` feature requirement) because
+/// `brain/` and `feedback/` need it and neither is feature-gated.
+pub mod product;
 pub mod runtime;
 pub mod server;
 pub mod store;

@@ -282,10 +282,19 @@ mod http {
     impl HubIdentityExchange for HttpHubIdentityExchange {
         async fn identify(&self, token: &str) -> Result<HubIdentity> {
             let url = format!("{}/auth/me", self.api_url);
+            let (product_header_name, product_header_value) =
+                crate::product::product_identity_header();
             let resp = self
                 .http
                 .get(&url)
                 .bearer_auth(token)
+                // `api_url` is the TinyHumans backend itself (`AppConfig::api_url`,
+                // defaulting to `crate::app::config::DEFAULT_API_URL`), so this is
+                // our own backend and is tagged like every other call we make to
+                // it. A bespoke `reqwest::Client`, not one built through
+                // `openhuman_core`'s `IntegrationClient`, so it never inherits the
+                // header `set_product_identity` attaches — see `crate::product`.
+                .header(product_header_name, product_header_value)
                 .send()
                 .await
                 .map_err(|e| Self::err("unreachable", e))?;

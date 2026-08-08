@@ -204,7 +204,19 @@ impl HostedEmbeddings {
             _ => text,
         };
 
-        let mut http = self.client.post(&url).json(body);
+        let (product_header_name, product_header_value) = crate::product::product_identity_header();
+        let mut http = self
+            .client
+            .post(&url)
+            .json(body)
+            // `hosted_endpoint_from_env` (the sole resolver for `base_url`
+            // here) always points at the managed TinyHumans endpoint, never a
+            // BYOK third party, so tagging every request is unconditional.
+            // This is a bespoke `reqwest::Client`, not one built through
+            // `openhuman_core`'s `IntegrationClient`, so it never inherits
+            // the header `set_product_identity` attaches elsewhere — see
+            // `crate::product`.
+            .header(product_header_name, product_header_value);
         if let Some(bearer) = &bearer {
             http = http.bearer_auth(bearer);
         }
@@ -454,6 +466,72 @@ mod tests {
         assert!(
             body.get("dimensions").is_none(),
             "must NOT send a `dimensions` field to embedding-v1"
+        );
+    }
+
+    /// Wire-level proof for issue #376 (AC #1 + AC #3): a real HTTP request
+    /// this client sends must carry `x-sdk-name: opencompany` — not the
+    /// vendored `openhuman_core` crate's own `openhuman` default, and not
+    /// nothing. `HostedEmbeddings` was picked for this proof, of the three
+    /// direct backend clients this issue touches (feedback, the Medulla HTTP
+    /// transport, and this one): the other two live behind the `tinyhumans`
+    /// / `medulla` Cargo features respectively, so their tests only compile
+    /// under a feature set this crate's `openhuman` build does not enable by
+    /// default, while `harness/` — and therefore this file's tests — already
+    /// compiles and runs under plain `--features openhuman` (`reqwest` rides
+    /// in on that feature; see `Cargo.toml`).
+    ///
+    /// Deliberately a small standalone server rather than reusing
+    /// `spawn_server`/`Mode` above: this test cares about exactly one header
+    /// on exactly one request, and threading header capture through the
+    /// shared multi-mode fixture would only add indirection for it.
+    #[tokio::test]
+    async fn embed_request_carries_the_product_identity_header() {
+        use axum::Json;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+
+        let captured_header: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let capture = Arc::clone(&captured_header);
+        let app = axum::Router::new().route(
+            "/embeddings",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let capture = Arc::clone(&capture);
+                    async move {
+                        *capture.lock().unwrap() = headers
+                            .get(crate::product::PRODUCT_IDENTITY_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        // One 4-dim embedding per input, so this stays compatible
+                        // with the `dim: 4` backend built below regardless of how
+                        // many strings a future edit passes to `embed`.
+                        let inputs = body
+                            .get("input")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(1);
+                        let data: Vec<serde_json::Value> = (0..inputs)
+                        .map(|i| serde_json::json!({ "index": i, "embedding": vec![0.0_f64; 4] }))
+                        .collect();
+                        Json(serde_json::json!({ "data": data }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let be = backend(format!("http://{addr}"), 4);
+        be.embed(&["hello"]).await.expect("embeds against the stub");
+
+        assert_eq!(
+            captured_header.lock().unwrap().as_deref(),
+            Some("opencompany"),
+            "the embeddings client must attach x-sdk-name: opencompany on every request"
         );
     }
 

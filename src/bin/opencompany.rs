@@ -893,6 +893,23 @@ async fn main() -> Result<()> {
                 "{}",
                 opencompany::app::journal::pin_keyring(&journal).summary()
             );
+            // Tag every request the embedded openhuman_core makes to the
+            // TinyHumans backend as opencompany's, not the vendored
+            // runtime's own `openhuman` default (issue #376). This must run
+            // here — before any company runtime, agent harness or HTTP
+            // listener exists — because core's `IntegrationClient` reads the
+            // identity into its default headers AT CONSTRUCTION
+            // (`harness/toolbelt.rs`, `harness/composio.rs`,
+            // `harness/search.rs` each build one the first time a company
+            // needs it), so a call after the first client already exists
+            // would not retroactively re-tag it. Same startup-ordering
+            // reasoning as the keyring pin directly above: say it here, once,
+            // rather than leaving it implicit in which line happens to run
+            // first.
+            // The call itself lives in the library so a test can reach it —
+            // this arm cannot be exercised from one.
+            #[cfg(feature = "openhuman")]
+            opencompany::product::install_into_embedded_core();
             // Soft disk-quota alerting. Hard enforcement is the container /
             // StorageClass layer's job (EFS access point, k8s ResourceQuota);
             // here we surface an operator-visible warning when a workspace
