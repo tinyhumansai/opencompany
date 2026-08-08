@@ -1,0 +1,5 @@
+# pnpm 11 requires an explicit opt-in for native postinstall scripts. Vite's
+# production build needs esbuild's platform binary, including when Tauri runs
+# this command as its `beforeBuildCommand`.
+allowBuilds:
+  esbuild: true

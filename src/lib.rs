@@ -7,6 +7,11 @@
 pub mod app;
 pub mod brain;
 pub mod company;
+/// Local-only runtime host used by the packaged Tauri desktop application.
+/// It embeds the existing operator API and ships the curated company presets;
+/// it deliberately does not pull OpenHuman's local-AI configuration into the
+/// OpenCompany product.
+pub mod desktop;
 pub mod economy;
 pub mod error;
 pub mod feedback;

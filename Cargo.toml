@@ -3,7 +3,7 @@
 # definitions under companies/ (a company.toml manifest + docs), loaded at
 # runtime via `opencompany serve --company companies/<name>` — not Cargo crates.
 # The operator console is a Vite/TypeScript app under frontend/.
-members = ["."]
+members = [".", "frontend/src-tauri"]
 resolver = "3"
 
 [workspace.package]
