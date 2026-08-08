@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { expect, test, type Page } from "@playwright/test";
 
 import { LIVE_BRAIN, LIVE_BRAIN_REASON, MCP_SERVER } from "./capabilities";
@@ -41,9 +43,6 @@ test.skip(
 );
 test.skip(!LIVE_BRAIN, LIVE_BRAIN_REASON);
 
-/** The name the server is registered under, and the name the agent addresses. */
-const SERVER = "pw-agent-mcp";
-
 /**
  * Opens the conversation view on the company thread.
  *
@@ -86,24 +85,32 @@ function transcriptRow(page: Page, text: string) {
 test("an agent calls a tool on a registered MCP server and shows the result", async ({
   page,
 }) => {
+  // Unique per run, and a 409 is a FAILURE rather than a shrug. The host keeps
+  // runtime servers in its secret store, so a fixed name plus a tolerated
+  // "already exists" would let this spec adopt a leftover registration from an
+  // earlier run — pointing anywhere at all — pass against it, and then delete a
+  // server it never created.
+  const server = `pw-agent-mcp-${randomUUID()}`;
+
   // Registered through the API rather than the console: the console's add form
   // is `mcp.spec.ts`'s subject, and repeating it here would make this spec fail
   // for that page's reasons rather than its own.
   const added = await page.request.post("/api/v1/company/mcp/servers", {
-    data: { name: SERVER, endpoint: MCP_SERVER!, description: "e2e fixture" },
+    data: { name: server, endpoint: MCP_SERVER!, description: "e2e fixture" },
   });
   expect(
-    added.ok() || added.status() === 409,
-    `registering ${SERVER} failed: ${added.status()} ${await added.text()}`,
+    added.ok(),
+    `registering ${server} failed: ${added.status()} ${await added.text()}`,
   ).toBeTruthy();
 
+  let bodyPassed = false;
   try {
     await openThread(page);
 
-    const marker = `agent-mcp-${Date.now()}`;
+    const marker = `agent-mcp-${randomUUID()}`;
     const directive = `__MOCK_TOOL_CALL__ ${JSON.stringify({
       name: "mcp_call_tool",
-      arguments: { server: SERVER, tool: "echo", arguments: { text: marker } },
+      arguments: { server, tool: "echo", arguments: { text: marker } },
     })}`;
 
     // The POST is awaited EXPLICITLY, and the reload below is why. A turn runs
@@ -140,10 +147,32 @@ test("an agent calls a tool on a registered MCP server and shows the result", as
     const reply = transcriptRow(page, `echo: ${marker}`);
     await expect(reply).toBeVisible({ timeout: 30_000 });
     await expect(reply).toContainText("MOCK_LLM");
+    bodyPassed = true;
   } finally {
     // The host persists runtime servers in its secret store, so a spec that
     // failed half way would otherwise leave this one registered for every later
-    // run against the same data root. A 404 here is the harmless case.
-    await page.request.delete(`/api/v1/company/mcp/servers/${SERVER}`);
+    // run against the same data root.
+    //
+    // NOTHING here may throw past a failing body. An exception raised in a
+    // `finally` replaces the error already travelling out of the `try`, so a
+    // cleanup complaint would erase the real failure — the harder of the two to
+    // debug, and the one worth keeping. That covers both ways this can go
+    // wrong: `page.request.delete` REJECTS on a transport failure (it does not
+    // return a response to inspect), and the status check is an assertion.
+    // Both are therefore reported only when the body itself passed.
+    let removed: Awaited<ReturnType<typeof page.request.delete>> | undefined;
+    let transportError: unknown;
+    try {
+      removed = await page.request.delete(`/api/v1/company/mcp/servers/${server}`);
+    } catch (error) {
+      transportError = error;
+    }
+    if (bodyPassed) {
+      if (transportError) throw transportError;
+      expect(
+        removed!.ok(),
+        `removing ${server} failed: ${removed!.status()} ${await removed!.text()}`,
+      ).toBeTruthy();
+    }
   }
 });

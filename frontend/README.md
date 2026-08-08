@@ -206,7 +206,7 @@ To run them:
 
 ```sh
 cargo build --locked --features openhuman,tinycortex,mcp --bin opencompany
-npm run e2e:live                         # PW_LIVE_BRAIN=1 npm run e2e
+npm --prefix frontend run e2e:live       # PW_LIVE_BRAIN=1 npm run e2e
 ```
 
 `PW_LIVE_BRAIN=1` is a **declaration**, not a probe — nothing in a host's
