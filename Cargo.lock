@@ -5463,7 +5463,7 @@ dependencies = [
  "tinyflows",
  "tokio",
  "tokio-rustls",
- "toml 0.8.23",
+ "toml 1.1.4+spec-1.1.0",
  "tower",
  "tower-http",
  "tracing",
