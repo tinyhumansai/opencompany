@@ -41,7 +41,14 @@ admins = ["harness-e2e@tinyhumans.ai"]
 # Both forms are needed: this list is matched with exact/glob semantics, so bare
 # `workspace` covers an agent asking for `workspace` but NOT one asking for
 # `workspace.read`, and `workspace.*` covers the sub-grants but not the bare one.
-allow = ["composio", "mcp:*", "workspace", "workspace.*"]
+#
+# `search` is granted for the console workflow specs: the node-config e2e authors
+# a `tool_call` node with slug `web_search`, and author-time validation (#540)
+# rejects a `search`-namespace slug unless the company grants `search` explicitly
+# (a `*` wildcard never confers the priced family). Without this the save 400s and
+# the spec's dialog never closes. No agent below lists a search tool, so this only
+# widens the company ceiling for the workflow author, not any agent's turn.
+allow = ["composio", "mcp:*", "workspace", "workspace.*", "search"]
 
 [[agent]]
 id = "ceo"
