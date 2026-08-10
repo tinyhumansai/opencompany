@@ -1048,6 +1048,7 @@ impl CompanyEvent {
             Self::WorkflowRunFinished { .. } => "WorkflowRunFinished",
             Self::WorkflowRunStarted { .. } => "WorkflowRunStarted",
             Self::WorkflowNodeFinished { .. } => "WorkflowNodeFinished",
+            Self::WorkflowReportDelivered { .. } => "WorkflowReportDelivered",
         }
     }
 
@@ -1103,7 +1104,11 @@ impl CompanyEvent {
             | Self::TaskCardChanged { .. }
             | Self::DeskTaskCompleted { .. }
             | Self::TaskDiscussionPosted { .. }
-            | Self::TaskDiscussionRedacted { .. } => Permanent,
+            | Self::TaskDiscussionRedacted { .. }
+            // The write-behind delivery ledger (#529): its whole purpose is to
+            // stop a re-run from re-sending a report, so pruning it would
+            // reintroduce the duplicate it exists to prevent. Permanent.
+            | Self::WorkflowReportDelivered { .. } => Permanent,
         }
     }
 }
