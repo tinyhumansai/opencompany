@@ -166,9 +166,48 @@ const TOOL_LABELS: Readonly<Record<string, string>> = {
   memory_recall: "Look something up in its memory",
   web_fetch: "Fetch a web page",
   query_company: "Look up something about the company",
+  // The rest of the agent's own scratch space. These sit beside the
+  // `workspace_*` pair above but name files rather than notes, which is the
+  // distinction an operator sees: a note is something they might read in the
+  // console, a file is the agent's working material.
+  file_write: "Write a file in its workspace",
+  edit: "Edit a file in its workspace",
+  apply_patch: "Apply a set of file changes in its workspace",
+  csv_export: "Save a spreadsheet to its workspace",
+  // Reads its own files through `git status` / `git log`. It parks despite
+  // being a read (issue #459), so an operator meets it on a card and needs
+  // words for it like anything else here.
+  read_workspace_state: "Check the state of its workspace files",
+  // Outward reach, and each of the three is deliberately worded apart. The
+  // Standing permissions list (#374) shows these labels with no payload block
+  // under them, so two tools that read alike are two permissions an operator
+  // cannot tell apart — which is why `web_fetch` above says "a web page" and
+  // these two say "any address".
+  http_request: "Make a web request to any address",
+  curl: "Transfer data to or from any web address",
+  // Not grantable alongside its filesystem siblings: it can push to a remote
+  // this layer never sees, and the push is the part an operator is agreeing to.
+  git_operations: "Run a version control command that can push",
+  // Performs whatever the server or workflow performs, which the runtime
+  // cannot see in advance. Named apart from EFFECT_LABELS'
+  // `mcp_registry_tool_call` ("Use a connected tool") for the same
+  // tell-them-apart reason as the pair above.
+  mcp_call_tool: "Use a tool on one of its connected servers",
+  run_workflow: "Run one of its saved workflows",
+  // Externally visible and not reversible by the company alone.
+  publish_artifact: "Publish one of its documents publicly",
   // `mcp_registry_tool_call` is deliberately absent: EFFECT_LABELS already
   // names it and is consulted first, so an entry here would be unreachable.
 };
+
+/**
+ * What {@link toolAction} says when it has no words for a tool.
+ *
+ * Exported so the gated-tool test can assert against the same string the
+ * console renders, rather than restating it and passing while the two drift
+ * (issue #706).
+ */
+export const UNNAMED_TOOL_ACTION = "Use one of its tools";
 
 /**
  * What an approval is asking for, in plain language (#372).
@@ -206,7 +245,7 @@ export function approvalAction(a: ApprovalSummary): string {
  * pretending to know which one.
  */
 export function toolAction(kind: string): string {
-  return labelFor(EFFECT_LABELS, kind) ?? labelFor(TOOL_LABELS, kind) ?? "Use one of its tools";
+  return labelFor(EFFECT_LABELS, kind) ?? labelFor(TOOL_LABELS, kind) ?? UNNAMED_TOOL_ACTION;
 }
 
 /** A one-line, human summary of what needs approval. */
