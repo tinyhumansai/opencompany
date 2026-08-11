@@ -261,11 +261,12 @@ fn dto_from_decl(
 /// Every roster agent's *effective* tool grants (issue #568), as
 /// `(agent_id, grants)`. The roster is exactly what the harness builds in
 /// `build_roster`: the manifest agents (each with its own `tools` narrowed by
-/// the company `allow`), plus the promoted overlay teammates. An overlay
-/// teammate has no manifest `tools` row, so it inherits the full company `allow`
-/// — the standard grant `overlay_agent_to_manifest` gives it — and an overlay id
-/// already claimed by a manifest agent is skipped, both mirroring the harness so
-/// console reachability equals what an agent is actually granted.
+/// the company `allow`), plus the promoted overlay teammates — each with **its
+/// own** `tools` line narrowed the same way (issue #619), which for the
+/// overwhelmingly common empty line is still the full company `allow`, the
+/// standard grant `overlay_agent_to_manifest` gives it. An overlay id already
+/// claimed by a manifest agent is skipped, both mirroring the harness so console
+/// reachability equals what an agent is actually granted.
 fn roster_grants(record: &CompanyRecord) -> Vec<(String, Vec<String>)> {
     let allow = &record.manifest.tools.allow;
     let mut grants: Vec<(String, Vec<String>)> = record
@@ -289,9 +290,14 @@ fn roster_grants(record: &CompanyRecord) -> Vec<(String, Vec<String>)> {
         if manifest_ids.contains(overlay.id.as_str()) {
             continue;
         }
-        // No manifest tools row → the company's standard grant (empty `tools`
-        // ⇒ inherit `allow`), matching `overlay_agent_to_manifest`.
-        grants.push((overlay.id.clone(), agent_effective_grants(allow, &[])));
+        // The overlay teammate's own tools line (issue #619), read through the
+        // same function and with the same empty-means-inherit rule as a
+        // manifest row above — matching `overlay_agent_to_manifest`. A scoped
+        // teammate must not read back here as holding every granted server.
+        grants.push((
+            overlay.id.clone(),
+            agent_effective_grants(allow, &overlay.tools),
+        ));
     }
     grants
 }
@@ -859,4 +865,101 @@ async fn discover_tools(
 ) -> Response {
     let _ = (company, name);
     crate::server::ops::not_wired("mcp tool discovery")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::company::CompanyManifest;
+    use crate::ports::types::{CompanyId, OverlayAgent};
+
+    /// A company allowing two tool families, with one manifest agent that lists
+    /// none (so it inherits both).
+    fn record(overlay_agents: Vec<OverlayAgent>) -> CompanyRecord {
+        let manifest: CompanyManifest = toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[tools]
+allow = ["mcp:notion", "mcp:linear"]
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+"#,
+        )
+        .expect("manifest parses");
+        CompanyRecord {
+            id: CompanyId::new("acme"),
+            manifest,
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents,
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
+            overlay_policy: None,
+            disabled_workflows: Vec::new(),
+            template_provenance: None,
+        }
+    }
+
+    fn teammate(id: &str, tools: Vec<&str>) -> OverlayAgent {
+        OverlayAgent {
+            id: id.to_string(),
+            name: id.to_string(),
+            role: "Growth".to_string(),
+            description: None,
+            tools: tools.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    /// Issue #619: a scoped overlay teammate reads back here with its own
+    /// grant, not the company's.
+    ///
+    /// This is what `reachable_by` on every MCP server row is computed from, so
+    /// an overlay teammate whose scope this ignored would be listed as reaching
+    /// servers the harness does not grant it — the console asserting a
+    /// connection that is not there.
+    #[test]
+    fn a_scoped_overlay_teammate_does_not_read_back_as_reaching_everything() {
+        let scoped = record(vec![teammate("jamie", vec!["mcp:notion"])]);
+        let grants = roster_grants(&scoped);
+        let jamie = grants
+            .iter()
+            .find(|(id, _)| id == "jamie")
+            .expect("the overlay teammate is on the roster");
+        assert_eq!(
+            jamie.1,
+            vec!["mcp:notion".to_string()],
+            "a scoped teammate reaches only what it was scoped to"
+        );
+
+        // The manifest agent lists nothing and still inherits everything, so
+        // the narrowing above is the teammate's own and not a company change.
+        let ceo = grants
+            .iter()
+            .find(|(id, _)| id == "ceo")
+            .expect("on roster");
+        assert_eq!(
+            ceo.1,
+            vec!["mcp:notion".to_string(), "mcp:linear".to_string()]
+        );
+    }
+
+    /// The empty-means-inherit rule (#264) is untouched: a teammate written
+    /// before #619 — and every teammate the console still creates — reads back
+    /// holding the company's whole grant.
+    #[test]
+    fn an_unscoped_overlay_teammate_still_inherits_the_company_grant() {
+        let grants = roster_grants(&record(vec![teammate("jamie", Vec::new())]));
+        let jamie = grants.iter().find(|(id, _)| id == "jamie").expect("roster");
+        assert_eq!(
+            jamie.1,
+            vec!["mcp:notion".to_string(), "mcp:linear".to_string()]
+        );
+    }
 }

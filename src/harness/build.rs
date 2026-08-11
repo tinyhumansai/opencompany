@@ -610,6 +610,13 @@ pub fn build_agent(
             // the `read_run_output` companion reads back, so a clipped preview
             // is reachable within the turn. Orchestrator-only, like the tools.
             deps.run_outputs.clone(),
+            // Issue #619: who is minting, and how wide they are. `add_agent`
+            // bounds the teammate it mints by this agent's own scope, and names
+            // this agent in the mint log — a teammate can no longer be minted
+            // wider than its minter, or minted invisibly.
+            manifest_agent.id.clone(),
+            manifest_agent.tools.clone(),
+            grants.to_vec(),
         ));
     }
 

@@ -2176,6 +2176,27 @@ pub struct OverlayAgent {
     /// An optional description of the teammate's mandate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The tool globs this teammate asks for — the overlay's answer to a
+    /// manifest `[[agent]].tools` line (issue #619).
+    ///
+    /// **Empty means "the company's standard grant"**, not "no tools": it falls
+    /// through
+    /// [`agent_effective_grants`](crate::runtime::builder::agent_effective_grants)
+    /// to the whole `[tools].allow`, exactly as an empty manifest `tools` line
+    /// does. That inheritance rule is #264 working as designed and is not what
+    /// this field disputes — before it existed there was simply nowhere to
+    /// write a *non-empty* value for an overlay teammate, so every one of them
+    /// held the widest grant the company had, permanently.
+    ///
+    /// Serde-additive: defaulted on read and skipped when empty on write, so a
+    /// record written before this field existed round-trips byte-identically.
+    ///
+    /// Read by [`overlay_agent_to_manifest`](crate::harness) on the harness side
+    /// and by `requested_grants` on the console side. Those two must stay in
+    /// lockstep — if they drift, the console shows a grant the harness does not
+    /// honour, which is the exact failure #264 exists to prevent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 /// An operator-added desk membership that the version-controlled manifest does
@@ -4199,6 +4220,41 @@ mod test {
         assert!(blob.desk_order.is_empty());
     }
 
+    /// Issue #619's serde-additivity condition: the `tools` field must not
+    /// change a single byte of an existing company record.
+    ///
+    /// Both halves matter and they are different claims. A record written
+    /// before the field existed has to still parse (or every company on disk
+    /// breaks on upgrade), and a teammate with no scope has to still serialize
+    /// *without* the key (or the first save after upgrade rewrites every
+    /// overlay row in the store for no behaviour change at all).
+    #[test]
+    fn an_overlay_teammates_tool_line_is_serde_additive() {
+        let legacy = r#"{"id":"a","name":"A","role":"r"}"#;
+        let parsed: OverlayAgent = serde_json::from_str(legacy).expect("pre-#619 row parses");
+        assert!(
+            parsed.tools.is_empty(),
+            "and reads as unscoped, which is the company's standard grant"
+        );
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("serializes"),
+            legacy,
+            "an unscoped teammate round-trips byte-identically"
+        );
+
+        let scoped = OverlayAgent {
+            tools: vec!["workspace".into()],
+            ..parsed
+        };
+        let json = serde_json::to_string(&scoped).expect("serializes");
+        assert!(json.contains(r#""tools":["workspace"]"#), "got {json}");
+        assert_eq!(
+            serde_json::from_str::<OverlayAgent>(&json).expect("parses"),
+            scoped,
+            "and a scope survives the round trip"
+        );
+    }
+
     /// `is_roster_agent` accepts both manifest agents and overlay teammates, and
     /// rejects an unknown id — the validation the desk-add route relies on.
     #[test]
@@ -4210,6 +4266,7 @@ mod test {
             name: "Nova".into(),
             role: "Growth".into(),
             description: None,
+            tools: Vec::new(),
         });
         assert!(record.is_roster_agent("ceo"));
         assert!(record.is_roster_agent("nova"));
@@ -4231,6 +4288,7 @@ mod test {
             name: name.into(),
             role: "Worker".into(),
             description: None,
+            tools: Vec::new(),
         });
     }
 
@@ -4668,6 +4726,7 @@ mod test {
             name: "Shane".to_string(),
             role: "Growth".to_string(),
             description: None,
+            tools: Vec::new(),
         });
         assert_eq!(record.effective_budget("shane"), None);
 

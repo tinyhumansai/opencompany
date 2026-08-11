@@ -1867,6 +1867,12 @@ fn overlay_fingerprint(agents: &[OverlayAgent]) -> u64 {
         agent.name.hash(&mut hasher);
         agent.role.hash(&mut hasher);
         agent.description.hash(&mut hasher);
+        // Issue #619: the teammate's own tool line is roster-shaping, not
+        // display data — it decides what `build_agent` wires onto the agent. A
+        // scope narrowed through the console would otherwise not take effect
+        // until the next restart, which is the silent-no-op trap this repo has
+        // already hit twice (`policy_fingerprint` in #562, and this axis).
+        agent.tools.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -2129,10 +2135,11 @@ pub(crate) fn build_roster(
 }
 
 /// Converts an operator-added [`OverlayAgent`] into the manifest agent shape
-/// [`build::build_agent`] consumes: an empty `tools` list (so
-/// [`agent_effective_grants`] falls back to the full company `[tools].allow`
-/// — the "standard tool grant"), no cognition tier (→ the default `chat-v1`
-/// model), and no manifest budget cap — an overlay teammate has no manifest row
+/// [`build::build_agent`] consumes: the teammate's own `tools` line verbatim
+/// (issue #619 — empty, as it is for every teammate minted before that field
+/// existed, so [`agent_effective_grants`] falls back to the full company
+/// `[tools].allow`, the "standard tool grant"), no cognition tier (→ the default
+/// `chat-v1` model), and no manifest budget cap — an overlay teammate has no manifest row
 /// at all, so its cap (if any) comes from the record's budget overrides via
 /// [`CompanyRecord::effective_budget`], resolved by the caller. The overlay's
 /// `name` is a display
@@ -2146,7 +2153,7 @@ fn overlay_agent_to_manifest(overlay: &OverlayAgent) -> ManifestAgent {
         role: overlay.role.clone(),
         description: overlay.description.clone(),
         tier: None,
-        tools: Vec::new(),
+        tools: overlay.tools.clone(),
         budget_usd_daily: None,
     }
 }
@@ -2574,6 +2581,84 @@ description = "Builds the product."
         );
     }
 
+    /// Issue #619: an overlay teammate's own tool line reaches the manifest
+    /// shape `build_agent` consumes, verbatim.
+    ///
+    /// This is the harness half of the lockstep pair the issue names — the
+    /// console's `requested_grants` is the other. If this dropped the scope
+    /// back to an empty list, the console would render a narrowing the harness
+    /// never applied.
+    #[test]
+    fn an_overlay_teammates_tool_line_reaches_the_manifest_shape() {
+        let scoped = OverlayAgent {
+            id: "growth".into(),
+            name: "Jamie".into(),
+            role: "Growth Lead".into(),
+            description: None,
+            tools: vec!["workspace".into()],
+        };
+        assert_eq!(
+            overlay_agent_to_manifest(&scoped).tools,
+            vec!["workspace".to_string()],
+            "the scope must survive the conversion, or nothing downstream \
+             enforces it"
+        );
+
+        // And the unscoped teammate — every one written before #619 — still
+        // converts to an empty list, which `agent_effective_grants` reads as the
+        // company's standard grant (#264, unchanged).
+        let unscoped = OverlayAgent {
+            tools: Vec::new(),
+            ..scoped
+        };
+        assert!(overlay_agent_to_manifest(&unscoped).tools.is_empty());
+    }
+
+    /// Issue #619, the fingerprint axis: narrowing a teammate's scope must make
+    /// `overlay_fingerprint` disagree with itself, or `HarnessPool::ensure`'s
+    /// staleness fast-path skips the rebuild and the narrowing does not take
+    /// effect until the process restarts.
+    ///
+    /// This repo has shipped that exact silent no-op twice (`policy_fingerprint`
+    /// in #562, and this axis). `overlay_fingerprint` hashes `overlay_agents`
+    /// only, so a field added to `OverlayAgent` is covered *only* if it is
+    /// hashed here.
+    #[test]
+    fn narrowing_a_teammates_scope_changes_the_overlay_fingerprint() {
+        let unscoped = OverlayAgent {
+            id: "growth".into(),
+            name: "Jamie".into(),
+            role: "Growth Lead".into(),
+            description: None,
+            tools: Vec::new(),
+        };
+        let scoped = OverlayAgent {
+            tools: vec!["workspace".into()],
+            ..unscoped.clone()
+        };
+        let widened = OverlayAgent {
+            tools: vec!["workspace".into(), "composio".into()],
+            ..unscoped.clone()
+        };
+
+        let fp = |a: &OverlayAgent| overlay_fingerprint(std::slice::from_ref(a));
+        assert_ne!(
+            fp(&unscoped),
+            fp(&scoped),
+            "scoping a teammate must be visible to the freshness gate"
+        );
+        assert_ne!(
+            fp(&scoped),
+            fp(&widened),
+            "and so must widening one that was already scoped"
+        );
+        assert_eq!(
+            fp(&unscoped),
+            fp(&unscoped.clone()),
+            "while an unchanged teammate must not churn the roster"
+        );
+    }
+
     /// Issue #71 — an operator/orchestrator-added overlay teammate is promoted
     /// into a real, addressable roster agent (not just a console row).
     #[tokio::test]
@@ -2585,6 +2670,7 @@ description = "Builds the product."
             name: "Jamie".into(),
             role: "Growth Lead".into(),
             description: Some("Owns acquisition experiments.".into()),
+            tools: Vec::new(),
         });
 
         let roster = build_roster(&rec, &fx.deps, &[]).expect("roster builds");
@@ -2608,6 +2694,7 @@ description = "Builds the product."
             name: "Impostor".into(),
             role: "Shadow CEO".into(),
             description: None,
+            tools: Vec::new(),
         });
 
         let roster = build_roster(&rec, &fx.deps, &[]).expect("roster builds");
@@ -2637,7 +2724,7 @@ description = "Builds the product."
     async fn a_tool_added_teammate_colliding_with_a_manifest_id_still_joins_the_roster() {
         use openhuman_core::openhuman::tools::Tool;
 
-        use crate::harness::orchestrator::AddAgentTool;
+        use crate::harness::orchestrator::unscoped_add_agent;
 
         /// A `CompanyStore` that actually holds the record, unlike
         /// `RecordingStore` — `add_agent` has to load what it saves.
@@ -2667,7 +2754,7 @@ description = "Builds the product."
         let fx = fixture();
         let company = CompanyId::new("acme");
         let store = Arc::new(SeededStore(StdMutex::new(record())));
-        let tool = AddAgentTool::new(company.clone(), store.clone());
+        let tool = unscoped_add_agent(company.clone(), store.clone());
 
         let result = tool
             .execute(serde_json::json!({ "name": "Engineer", "role": "Platform" }))
@@ -2731,6 +2818,7 @@ description = "Builds the product."
             name: "Dana".into(),
             role: "Designer".into(),
             description: None,
+            tools: Vec::new(),
         });
         pool.ensure(&rec, &fx.deps).await.expect("second ensure");
 
@@ -3765,6 +3853,7 @@ description = "Builds the product."
             name: "Jamie".into(),
             role: "Growth Lead".into(),
             description: None,
+            tools: Vec::new(),
         });
         live_store.save(&updated).await.unwrap();
 
@@ -4595,6 +4684,7 @@ description = "Builds the product."
             name: "Jamie".into(),
             role: "Growth Lead".into(),
             description: None,
+            tools: Vec::new(),
         });
         let live_store = Arc::new(LiveStore::default());
         live_store.save(&rec).await.unwrap();

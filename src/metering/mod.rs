@@ -126,6 +126,7 @@ mod tests {
             name: "Creative studio (renamed)".into(),
             role: "Creative".into(),
             description: None,
+            tools: Vec::new(),
         }];
         let map = roster_display_names(&agents, &overlay);
         assert_eq!(map.get("strategy").unwrap(), "Strategy desk");

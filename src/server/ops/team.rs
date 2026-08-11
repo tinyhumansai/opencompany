@@ -425,6 +425,10 @@ async fn add_member(
         name: body.name,
         role: body.role,
         description: body.description,
+        // Unscoped on creation — the company's standard grant, exactly as
+        // before #619. Scoping is a `PATCH …/team/{id}` away, which is also the
+        // only route that can narrow a teammate that already exists.
+        tools: Vec::new(),
     };
     record.overlay_agents.push(agent.clone());
     let attribution = author.map(|admin| BudgetOverride {

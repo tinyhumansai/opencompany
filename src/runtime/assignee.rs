@@ -280,6 +280,7 @@ members = []
             name: "Nova".into(),
             role: "Growth".into(),
             description: None,
+            tools: Vec::new(),
         });
         assert_eq!(
             resolve(&record, "nova"),
@@ -313,6 +314,7 @@ members = []
             name: "Nova".into(),
             role: "Growth".into(),
             description: None,
+            tools: Vec::new(),
         });
         record.overlay_desk_members.push(OverlayDeskMember {
             desk_id: "empty".into(),
@@ -416,6 +418,7 @@ members = ["ceo"]
             name: "Shane".into(),
             role: "Support".into(),
             description: None,
+            tools: Vec::new(),
         });
         assert_eq!(
             resolve(&record, "Shane"),
@@ -440,6 +443,7 @@ members = ["ceo"]
             name: "engineer".into(),
             role: "Support".into(),
             description: None,
+            tools: Vec::new(),
         });
         assert_eq!(
             resolve(&record, "engineer"),
@@ -460,6 +464,7 @@ members = ["ceo"]
                 name: "Shane".into(),
                 role: "Support".into(),
                 description: None,
+                tools: Vec::new(),
             });
         }
         let resolution = resolve(&record, "Shane");
