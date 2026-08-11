@@ -229,8 +229,16 @@ exactly one root and no member folders.
 Team writes are an **operator overlay** persisted through the store, merged
 into the manifest roster at read time — the version-controlled `company.toml`
 is never rewritten. Overlay teammates are addressable: since issue #71 the
-harness builds a real agent for each one, with the company-wide tool grant, no
-cognition tier, and never the orchestrator.
+harness builds a real agent for each one, with no cognition tier and never the
+orchestrator.
+
+Since issue #619 an overlay teammate carries its own `tools` list — the
+overlay's answer to a manifest `[[agent]].tools` line, and the thing that was
+missing when the only readable answer for every teammate was "everything the
+company allows". It obeys the same rule a manifest line does: **empty means the
+company's standard grant** (#264), so a teammate written before the field
+existed reads back exactly as it did. What changed is that a non-empty value is
+now writable at all.
 
 `POST …/team` and the orchestrator's `add_agent` tool both **derive the roster
 id from the display name** (issue #686): "Dana Designer" becomes
@@ -270,7 +278,7 @@ lists, because only the third is the answer:
 
 | field | meaning |
 |---|---|
-| `requested` | the agent's own `[[agent]].tools` globs. **Empty means the company's standard grant**, not "no tools" |
+| `requested` | the agent's own globs — a manifest `[[agent]].tools` line, or an overlay teammate's `tools` list (#619). **Empty means the company's standard grant**, not "no tools" |
 | `companyAllow` | the `[tools].allow` ceiling the request is intersected with |
 | `effective` | what the agent actually holds |
 
@@ -280,18 +288,42 @@ when it builds the agent, so the readout cannot drift from what is enforced.
 "orchestrator"` agent, else the first declared) rather than read off `tier`, so
 a company that tags nobody still names its orchestrator.
 
-`PATCH …/team/{agentId}` edits an **overlay** teammate's `name`, `role` and
-`description`. It is a patch: an omitted key is left alone, and `"description":
-null` clears it — the two must stay apart or every partial save would erase an
-agent's instructions. A blank `name`/`role` is `400`, an unknown teammate `404`,
+`PATCH …/team/{agentId}` edits an **overlay** teammate's `name`, `role`,
+`description` and `tools`. It is a patch: an omitted key is left alone, and
+`"description": null` clears it — the two must stay apart or every partial save
+would erase an agent's instructions. `tools` needs no such distinction: an
+omitted key leaves the scope alone and `"tools": []` is the deliberate way back
+to the company's standard grant, so `null` never has to mean a third thing. A
+blank glob inside the list is a `400` — `""` matches nothing an operator meant,
+and storing it would read as a scope that grants nothing while looking like a
+scope that was set. Globs are stored verbatim, exactly like a manifest line: the
+`[tools].allow` ceiling is applied at read time, so a glob the company does not
+cover surfaces as asked-for-but-not-granted rather than vanishing on save.
+
+A blank `name`/`role` is `400`, an unknown teammate `404`,
 and a **manifest** teammate is `409`: its fields live in the version-controlled
 `company.toml`, and the console does not rewrite the blueprint. The one thing
 that *is* changeable on such a teammate is its daily budget, and that works
 because #343 modelled it as an override rather than as a rewrite. Every detail
 response carries an `editable` list naming the fields this route will accept, so
 a client renders read-only from the host's answer instead of re-deriving the
-rule. `tier` and `tools` are read-only for both kinds: there is no override
-layer for either, and adding one is a policy decision rather than a form field.
+rule. `tier` stays read-only for both kinds: there is no override layer for it,
+and adding one is a policy decision rather than a form field. `tools` was
+read-only for the same reason until #619 made that policy decision for the
+overlay half — a manifest teammate's `tools` line still lives in the blueprint
+and is still `409`.
+
+The orchestrator's `add_agent` tool writes the same field, under one added rule:
+**a minted teammate is never wider than the agent that minted it** (#619).
+Omitting `tools` copies the minter's own line — so an unscoped minter still
+mints an unscoped teammate, which keeps tracking `[tools].allow` instead of
+freezing a copy of it. Passing `tools` narrows the request against what the
+minter actually holds, and a request that narrows to nothing is a clean tool
+error rather than a stored empty list, because an empty list means *inherit
+everything* — silently storing one would turn a deliberate narrowing into the
+widest grant in the company. Every mint is logged with the minter, the teammate
+and the resolved scope: `add_agent` is `Reach::Nothing` and never asks, so the
+log is the only place the grant is observable at all.
 
 The two **budget** routes (issue #343) are how a teammate's `budget_usd_daily`
 becomes changeable without a redeploy. Both are **admin-only** — a member gets
