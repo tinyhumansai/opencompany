@@ -254,6 +254,37 @@ mod tests {
         (dir, ops)
     }
 
+    /// Seeds root folders that share a name by writing the workspace index
+    /// directly.
+    ///
+    /// The filesystem store refuses to *create* two siblings under one name,
+    /// because on that backend they resolve to one path (issue #666). The tree
+    /// below is the one this test needs to find rather than to build: an index
+    /// written before that refusal existed, or one an id-keyed backend can
+    /// still represent legally. Going through `create` would only re-assert the
+    /// store's refusal and never reach the sweep.
+    async fn seed_duplicate_roots(
+        dir: &std::path::Path,
+        company: &CompanyId,
+        name: &str,
+        ids: &[&str],
+    ) {
+        let index: std::collections::HashMap<String, WorkspaceNode> = ids
+            .iter()
+            .map(|id| ((*id).to_string(), folder(id, name, None)))
+            .collect();
+        let bundle = crate::store::Bundle::new(dir.to_path_buf(), company);
+        tokio::fs::create_dir_all(bundle.workspace_dir())
+            .await
+            .expect("workspace dir");
+        tokio::fs::write(
+            bundle.workspace_index_json(),
+            serde_json::to_vec(&index).expect("index json"),
+        )
+        .await
+        .expect("seed index");
+    }
+
     /// The sorted names in the tree, so an assertion says what survived rather
     /// than counting.
     async fn names(ws: &Arc<dyn WorkspaceStore>, company: &CompanyId) -> Vec<String> {
@@ -542,13 +573,9 @@ mod tests {
     /// one and deleting beneath it.
     #[tokio::test]
     async fn an_ambiguous_root_is_refused_and_removes_nothing() {
-        let (_dir, ws) = store().await;
+        let (dir, ws) = store().await;
         let company = CompanyId::new("odd");
-        for id in ["dup-a", "dup-b"] {
-            ws.create(&company, &folder(id, AGENTS_ROOT, None), None)
-                .await
-                .unwrap();
-        }
+        seed_duplicate_roots(dir.path(), &company, AGENTS_ROOT, &["dup-a", "dup-b"]).await;
         ws.create(&company, &folder("stray", "ceo", Some("dup-a")), None)
             .await
             .unwrap();
