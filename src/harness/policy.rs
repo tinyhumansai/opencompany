@@ -1631,7 +1631,14 @@ mod tests {
 
         // `full` on both sides, so the tier decides nothing and any parking
         // observed is the override's doing.
-        let harness = policy("full", fence, None);
+        //
+        // On the authored-workflow path so per-call judgement (#338) stays
+        // silent: `ManifestApprovalGate` has no `judge` step, so comparing it
+        // against the agent path — where an undeclared tool like
+        // `payroll.export` stops on judge alone — would measure that Agent-only
+        // rule, not the `always_approve` parity this test is about. Silencing
+        // judge here isolates the one list both paths are supposed to share.
+        let harness = policy("full", fence, None).for_authored_workflow_nodes();
         let gate = ManifestApprovalGate::new(Policy {
             mode: "full".to_string(),
             always_approve: fence.iter().map(|s| s.to_string()).collect(),
