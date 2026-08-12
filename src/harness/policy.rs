@@ -1611,14 +1611,32 @@ mod tests {
         use crate::ports::approvals::ApprovalGate;
         use crate::ports::types::PolicyDecision;
 
-        // A leading segment, an exact dotted kind, a bare tool name, a
-        // near-miss that must NOT be gated, and a case variant.
+        // A leading segment, an exact dotted kind, a bare tool name, a name the
+        // fence does NOT cover, and a case variant.
         //
         // Every name here is one the tier itself has no opinion about under
         // `full`, so the only thing that can make the two paths disagree is the
         // fence. A priced name like `web_search` would drag the harness's
         // metered-read and budget arms into a comparison that is not about
         // `always_approve`, so it is deliberately absent.
+        //
+        // **The un-fenced name must be a DECLARED tool.** This is the trap, and
+        // it is not obvious. The fenced names never reach past `always_approve`,
+        // so their declaration status cannot matter; the un-fenced one is the
+        // only entry that falls through to everything below — including the
+        // per-call judgement arm (issue #338), which stops an *undeclared* tool
+        // as `StopReason::Undeclared` before the two paths can be compared. The
+        // effect gate has no such arm, so an undeclared name here makes the two
+        // paths disagree about fail-closed rather than about the fence, and this
+        // test fails for a reason it is not about.
+        //
+        // That is exactly how it broke: this test and the judgement arm landed
+        // from different branches, each green against a `main` without the
+        // other, and `payroll.export` — undeclared — turned red on the merge.
+        // Its over-matching job was never lost by the swap: `pay` failing to
+        // gate `payroll.export` is asserted directly on the matcher, in
+        // `crate::policy::always_approve`'s own tests, which is where a matcher
+        // question belongs.
         let fence = &["payment", "filing.submit", "publish_artifact"];
         let names = [
             "payment.send",
@@ -1626,7 +1644,9 @@ mod tests {
             "filing.submit",
             "publish_artifact",
             "PUBLISH_ARTIFACT",
-            "payroll.export",
+            // Declared, unpriced, and matched by nothing in the fence, so both
+            // paths must allow it.
+            "memory_recall",
         ];
 
         // `full` on both sides, so the tier decides nothing and any parking
@@ -1680,7 +1700,7 @@ mod tests {
         ));
         assert_eq!(
             harness
-                .check(&request("payroll.export", serde_json::json!({})))
+                .check(&request("memory_recall", serde_json::json!({})))
                 .await,
             ToolPolicyDecision::Allow
         );
