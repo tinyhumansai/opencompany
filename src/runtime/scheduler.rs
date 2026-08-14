@@ -1917,4 +1917,42 @@ mod test {
         assert_eq!(sent.len(), 1, "the cap flushes one digest");
         assert_eq!(sent[0].1.to, "boss@acme.test");
     }
+
+    /// The digest body lists every notification's title and carries no payload
+    /// (issue #372's redaction line), and it agrees in number with the count.
+    #[test]
+    fn digest_body_lists_titles_and_never_payload() {
+        let note = |id: &str, title: &str| crate::ports::notifications::Notification {
+            id: id.into(),
+            kind: "approval_blocked".into(),
+            subject: crate::ports::notifications::Subject {
+                kind: crate::ports::notifications::SubjectKind::Approval,
+                id: format!("appr-{id}"),
+            },
+            created_at: 0,
+            title: title.into(),
+        };
+
+        let body = build_digest_body(
+            "Acme",
+            &[
+                note("1", "send the $5000 invoice"),
+                note("2", "publish the post"),
+            ],
+        );
+        assert!(body.contains("2 approvals in Acme are waiting"), "{body}");
+        assert!(body.contains("send the $5000 invoice"));
+        assert!(body.contains("publish the post"));
+        assert!(body.contains("approve or deny"));
+
+        // Singular grammar for one, and the subject id (a would-be payload leak)
+        // never appears — only the title does.
+        let one = build_digest_body("Acme", &[note("9", "one thing")]);
+        assert!(one.contains("1 approval in Acme is waiting"), "{one}");
+        assert!(one.contains("one thing"));
+        assert!(
+            !one.contains("appr-9"),
+            "the digest must not leak subject ids"
+        );
+    }
 }

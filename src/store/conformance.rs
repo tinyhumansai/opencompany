@@ -2496,6 +2496,13 @@ pub async fn assert_notification_store(notes: Arc<dyn NotificationStore>) {
         .unwrap();
     assert!(notes.undelivered(&alpha).await.unwrap().is_empty());
     assert_eq!(notes.undelivered(&beta).await.unwrap().len(), 1);
+
+    // Delivery is a marker, not a deletion: the console feed still shows every
+    // record after the digest has emailed it. This is the invariant the digest
+    // relies on when it marks delivered *before* sending — a backend that
+    // dropped the record on `mark_delivered` would break the console and must
+    // fail here rather than pass by only checking `undelivered`.
+    assert_eq!(notes.list(&alpha, "ada").await.unwrap().len(), 4);
 }
 
 pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
