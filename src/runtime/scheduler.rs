@@ -1848,4 +1848,73 @@ mod test {
             sent[0].1.subject
         );
     }
+
+    /// The `DIGEST_MAX_MS` cap flushes even when parks never fall quiet: the
+    /// newest notification is recent (inside the quiet window) but the oldest has
+    /// waited out the cap. Uses non-approval subjects, appended directly with
+    /// chosen timestamps, so the window logic is isolated from the pending-
+    /// approval gate and the fake clock alone drives it.
+    #[tokio::test]
+    async fn digest_flushes_on_the_max_cap_even_when_not_quiet() {
+        let home_dir = tmp_home();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_brain(Arc::new(ScheduleBrain))
+                .with_mail(CompanyMail {
+                    sender: sender.clone(),
+                    smtp: test_smtp("ceo@acme.test"),
+                })
+                .with_bootstrap_admin(Some("boss@acme.test".into()))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // A clock well past the cap so the subtractions stay positive.
+        let now = 100 * DIGEST_MAX_MS;
+        let note = |id: &str, created_at: u64| crate::ports::notifications::Notification {
+            id: id.into(),
+            kind: "info".into(),
+            // Non-approval, so both stay "live" without a pending-approval gate.
+            subject: crate::ports::notifications::Subject {
+                kind: crate::ports::notifications::SubjectKind::Run,
+                id: format!("run-{id}"),
+            },
+            created_at,
+            title: format!("run {id}"),
+        };
+        // Oldest waited out the cap; newest just arrived (well inside quiet).
+        rt.notifications()
+            .append(rt.id(), &note("old", now - DIGEST_MAX_MS - 1))
+            .await
+            .unwrap();
+        rt.notifications()
+            .append(rt.id(), &note("new", now - 1))
+            .await
+            .unwrap();
+
+        let clock = Arc::new(FakeClock::new(now));
+        let scheduler = CompanyScheduler::new(rt.clone(), &[], clock).unwrap();
+        // Not quiet (newest is 1ms old) but capped (oldest past the cap) → flush.
+        assert_eq!(scheduler.tick_digest().await.unwrap(), 2);
+        assert!(
+            rt.notifications()
+                .undelivered(rt.id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut sent = sender.sent();
+        for _ in 0..200 {
+            if !sent.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            sent = sender.sent();
+        }
+        assert_eq!(sent.len(), 1, "the cap flushes one digest");
+        assert_eq!(sent[0].1.to, "boss@acme.test");
+    }
 }

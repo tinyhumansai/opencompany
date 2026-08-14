@@ -2674,7 +2674,8 @@ impl crate::ports::notifications::NotificationStore for MongoStore {
             }
             // `$setOnInsert` is the latch: it seeds `delivered_ms` only when the
             // marker is first created, so a re-mark leaves the original instant.
-            self.collection("notification_delivered")
+            if let Err(e) = self
+                .collection("notification_delivered")
                 .update_one(
                     doc! {
                         "company_id": company.as_ref(),
@@ -2684,7 +2685,15 @@ impl crate::ports::notifications::NotificationStore for MongoStore {
                 )
                 .with_options(UpdateOptions::builder().upsert(true).build())
                 .await
-                .map_err(mongo_err)?;
+            {
+                // Two concurrent first marks can both miss the existing doc and
+                // race their upserts into one `E11000` on the unique index. The
+                // marker is present either way, so treat the duplicate as the
+                // no-op the latch promises rather than propagating it.
+                if !is_duplicate_key(&e) {
+                    return Err(mongo_err(e));
+                }
+            }
         }
         Ok(())
     }
