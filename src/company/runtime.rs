@@ -194,6 +194,14 @@ pub struct CompanyRuntime {
     /// wired via [`RuntimeBuilder::with_mail`](crate::runtime::RuntimeBuilder::with_mail).
     /// `None` when email send isn't wired.
     pub(crate) mail: Option<CompanyMail>,
+    /// The platform-injected bootstrap admin address
+    /// (`OPENCOMPANY_ADMIN_EMAIL`, pre-normalized), a standing admin-in-waiting on
+    /// a provisioned tenant whose manifest names nobody (issue #661). Install-wide
+    /// rather than a constructor argument, set by the builder like
+    /// [`source_dir`](Self::set_source_dir); read when resolving `owner`
+    /// recipients so the approval-notification path (#750) reaches a fresh tenant
+    /// the same way workflow delivery does.
+    pub(crate) bootstrap_admin: Option<String>,
     /// The WS3 console ports (tasks, workspace, facts, usage, skills).
     pub(crate) ops: OpsStores,
     /// Durable store of feedback items (the "feedback family").
@@ -374,6 +382,7 @@ impl CompanyRuntime {
             feedback,
             filer,
             source_dir: None,
+            bootstrap_admin: None,
             workflow_runner: None,
             steer: crate::company::steer::InflightRegistry::new(),
             run_supervisor: crate::runtime::RunSupervisor::new(),
@@ -399,6 +408,14 @@ impl CompanyRuntime {
     /// path so read resolvers can resolve committed skills/workflows content.
     pub fn set_source_dir(&mut self, dir: Option<PathBuf>) {
         self.source_dir = dir;
+    }
+
+    /// Sets the platform-injected bootstrap admin address, pre-normalized by
+    /// `AppConfig::bootstrap_admin` (issue #661). Set by the builder from the same
+    /// resolved config the workflow delivery path reads, so `owner` recipients
+    /// resolve identically on both.
+    pub fn set_bootstrap_admin(&mut self, bootstrap_admin: Option<String>) {
+        self.bootstrap_admin = bootstrap_admin;
     }
 
     /// The company's on-disk source directory, when built on the serve path.
@@ -599,6 +616,14 @@ impl CompanyRuntime {
     /// wired. `None` when email send isn't configured.
     pub fn mail(&self) -> Option<&CompanyMail> {
         self.mail.as_ref()
+    }
+
+    /// The platform-injected bootstrap admin address (`OPENCOMPANY_ADMIN_EMAIL`),
+    /// pre-normalized — a standing admin-in-waiting on a provisioned tenant whose
+    /// manifest names nobody (issue #661). Read when resolving `owner` recipients
+    /// for an approval notification (#750).
+    pub(crate) fn bootstrap_admin(&self) -> Option<&str> {
+        self.bootstrap_admin.as_deref()
     }
 
     /// This company's task board.

@@ -2392,6 +2392,10 @@ impl RuntimeBuilder {
         // skills/workflows content on the serve path.
         runtime.set_source_dir(self.seed_dir.clone());
         runtime.set_repos(repos);
+        // The bootstrap admin (issue #661), so an approval notification's `owner`
+        // recipients (#750) resolve from the same standing invite the workflow
+        // delivery path uses on a fresh tenant.
+        runtime.set_bootstrap_admin(self.bootstrap_admin.clone());
         // Install-wide MCP defaults (issue #527) — set before anything resolves
         // the effective server set, so the first resolution already sees them.
         runtime.set_default_mcp_servers(self.default_mcp_servers.clone());

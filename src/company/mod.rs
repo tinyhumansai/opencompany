@@ -31,6 +31,7 @@ pub mod mcp;
 // primitive + `uuid`/`base64`/`url`, so it links only under the `mcp` feature.
 #[cfg(feature = "mcp")]
 pub mod mcp_oauth;
+pub(crate) mod owners;
 pub mod runtime;
 mod skill_file;
 // Steer (issue #111): pause / cancel / redirect an in-flight task or delegation
