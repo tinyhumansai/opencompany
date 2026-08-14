@@ -518,8 +518,12 @@ impl CompanyScheduler {
                 crate::ports::notifications::SubjectKind::Approval => {
                     pending.contains(&n.subject.id)
                 }
-                // A non-approval subject has no "settled" notion here; keep it.
-                _ => true,
+                // This digest speaks only about parked approvals — its subject and
+                // body say so. Another notification kind belongs to whatever path
+                // owns it, so drain it here rather than mail it under the wrong
+                // heading; draining it also keeps the queue bounded, since a
+                // non-approval subject has no "settled" notion to remove it later.
+                _ => false,
             };
             if still_relevant {
                 live.push(n);
@@ -1850,17 +1854,20 @@ mod test {
     }
 
     /// The `DIGEST_MAX_MS` cap flushes even when parks never fall quiet: the
-    /// newest notification is recent (inside the quiet window) but the oldest has
-    /// waited out the cap. Uses non-approval subjects, appended directly with
-    /// chosen timestamps, so the window logic is isolated from the pending-
-    /// approval gate and the fake clock alone drives it.
+    /// newest record is recent (inside the quiet window) while the oldest has
+    /// waited out the cap. Both belong to one **still-pending approval** — a real
+    /// park plus a backdated companion record for that same approval id — so the
+    /// approval-only digest keeps them, and the fake clock alone drives the
+    /// cap-vs-quiet edge.
     #[tokio::test]
     async fn digest_flushes_on_the_max_cap_even_when_not_quiet() {
         let home_dir = tmp_home();
         let sender = Arc::new(RecordingMailSender::new());
         let rt = Arc::new(
             RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
-                .with_brain(Arc::new(ScheduleBrain))
+                .with_brain(Arc::new(ParkBrain {
+                    effect: park_effect("shell"),
+                }))
                 .with_mail(CompanyMail {
                     sender: sender.clone(),
                     smtp: test_smtp("ceo@acme.test"),
@@ -1871,32 +1878,36 @@ mod test {
                 .unwrap(),
         );
 
-        // A clock well past the cap so the subtractions stay positive.
-        let now = 100 * DIGEST_MAX_MS;
-        let note = |id: &str, created_at: u64| crate::ports::notifications::Notification {
-            id: id.into(),
-            kind: "info".into(),
-            // Non-approval, so both stay "live" without a pending-approval gate.
-            subject: crate::ports::notifications::Subject {
-                kind: crate::ports::notifications::SubjectKind::Run,
-                id: format!("run-{id}"),
-            },
-            created_at,
-            title: format!("run {id}"),
-        };
-        // Oldest waited out the cap; newest just arrived (well inside quiet).
+        // Park one real approval → it is pending, and its auto-notification is the
+        // recent (not-quiet) end of the window.
+        let base = crate::ports::now_millis();
+        rt.run_cycle(vec![park_message()]).await.unwrap();
+        let approval_id = rt.pending_approvals()[0].id.to_string();
+
+        // A second record for that SAME approval, backdated past the cap. Both are
+        // live (the approval is still pending), so the old one trips the cap while
+        // the fresh one keeps the window from being quiet.
         rt.notifications()
-            .append(rt.id(), &note("old", now - DIGEST_MAX_MS - 1))
-            .await
-            .unwrap();
-        rt.notifications()
-            .append(rt.id(), &note("new", now - 1))
+            .append(
+                rt.id(),
+                &crate::ports::notifications::Notification {
+                    id: "backdated".into(),
+                    kind: "approval_blocked".into(),
+                    subject: crate::ports::notifications::Subject {
+                        kind: crate::ports::notifications::SubjectKind::Approval,
+                        id: approval_id,
+                    },
+                    created_at: base - DIGEST_MAX_MS - 1,
+                    title: "an old parked approval".into(),
+                },
+            )
             .await
             .unwrap();
 
-        let clock = Arc::new(FakeClock::new(now));
+        // Clock just after the parks: newest is seconds old (not quiet), oldest is
+        // past the cap → the flush is the cap's doing alone.
+        let clock = Arc::new(FakeClock::new(base + 5_000));
         let scheduler = CompanyScheduler::new(rt.clone(), &[], clock).unwrap();
-        // Not quiet (newest is 1ms old) but capped (oldest past the cap) → flush.
         assert_eq!(scheduler.tick_digest().await.unwrap(), 2);
         assert!(
             rt.notifications()

@@ -149,9 +149,14 @@ pub(crate) async fn deliver_to_owners(
             )
             .await
         {
+            // The domain, not the address: enough to tell "this one mailbox
+            // rejected" from "the SMTP config is wrong", without putting a user
+            // identifier into log retention. Mirrors `owner_recipients`, which
+            // logs only the company and the error.
+            let recipient_domain = to.rsplit('@').next().unwrap_or("-");
             tracing::warn!(
                 company = %company,
-                to = %to,
+                recipient_domain = %recipient_domain,
                 error = %err,
                 "owner email failed to send",
             );

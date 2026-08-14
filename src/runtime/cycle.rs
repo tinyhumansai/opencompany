@@ -2163,10 +2163,11 @@ impl<'a> CycleHostImpl<'a> {
             thread = self.thread_id.as_deref().unwrap_or("-"),
             "[cycle] parked effect for operator approval"
         );
-        // Issue #750: a parked approval blocks work a person must act on. Raise a
-        // durable notification and reach the operator out-of-browser by email, so
-        // a request raised while nobody is watching does not sit parked for a day.
-        // Best-effort and strictly after the journal write above — see the method.
+        // Issue #750: a parked approval blocks work a person must act on. Raise
+        // the durable notification and leave it undelivered; out-of-browser
+        // delivery is the digest's job (issue #751), which batches an evening of
+        // parks into one email. Best-effort and strictly after the journal write
+        // above — see the method.
         self.notify_parked_approval(&approval_id, &effect).await;
         Ok(approval_id)
     }
