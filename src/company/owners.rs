@@ -118,3 +118,43 @@ pub(crate) async fn owner_recipients(
         }
     }
 }
+
+/// Sends one already-composed message to every server-resolved owner address.
+///
+/// The **send** half of owner delivery, split from [`owner_recipients`] (the
+/// **resolve** half) so a caller resolves the roster once and delivers to the
+/// set. A free function that owns its arguments so it can be spawned detached,
+/// and best-effort: a failed send is logged and the loop continues. Recipients
+/// must already be roster-resolved — this trusts them and names no policy, so a
+/// caller must never pass an address that did not come from
+/// [`owner_recipients`].
+pub(crate) async fn deliver_to_owners(
+    mail: crate::company::runtime::CompanyMail,
+    recipients: Vec<String>,
+    subject: String,
+    body: String,
+    company: CompanyId,
+) {
+    for to in recipients {
+        let email = crate::server::ops::mailer::OutboundEmail {
+            to: to.clone(),
+            subject: subject.clone(),
+            body: body.clone(),
+        };
+        if let Err(err) = mail
+            .sender
+            .send(
+                &crate::server::ops::mailer::MailCredentials::Smtp(mail.smtp.clone()),
+                &email,
+            )
+            .await
+        {
+            tracing::warn!(
+                company = %company,
+                to = %to,
+                error = %err,
+                "owner email failed to send",
+            );
+        }
+    }
+}

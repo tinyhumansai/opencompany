@@ -2004,56 +2004,6 @@ fn approval_notification_title(effect: &Effect) -> String {
     }
 }
 
-/// The plain-text body of the approval-alert email. Thin on purpose (see
-/// [`approval_notification_title`]): it names what parked and points the operator
-/// at the console, and carries no payload, so no argument value leaves the
-/// building and no second redaction surface is opened.
-fn approval_email_body(company_name: &str, effect: &Effect) -> String {
-    format!(
-        "A request in {company_name} is waiting for your approval and cannot proceed until you \
-         review it.\n\nWhat parked: {}\n\nOpen your OpenCompany console to approve or deny it.\n",
-        effect.kind,
-    )
-}
-
-/// Sends the approval-alert email to each server-resolved owner.
-///
-/// A free function rather than a method so it can be spawned detached (it owns
-/// its arguments and borrows nothing) and unit-tested directly against a
-/// `RecordingMailSender`. Every send is best-effort: a failure is logged and the
-/// loop continues, because the durable notification has already recorded the
-/// request and the parked journal entry is the binding record.
-async fn deliver_owner_approval_email(
-    mail: crate::company::runtime::CompanyMail,
-    recipients: Vec<String>,
-    subject: String,
-    body: String,
-    company: CompanyId,
-) {
-    for to in recipients {
-        let email = crate::server::ops::mailer::OutboundEmail {
-            to: to.clone(),
-            subject: subject.clone(),
-            body: body.clone(),
-        };
-        if let Err(err) = mail
-            .sender
-            .send(
-                &crate::server::ops::mailer::MailCredentials::Smtp(mail.smtp.clone()),
-                &email,
-            )
-            .await
-        {
-            tracing::warn!(
-                company = %company,
-                to = %to,
-                error = %err,
-                "approval notification email failed to send",
-            );
-        }
-    }
-}
-
 impl<'a> CycleHostImpl<'a> {
     fn new(
         company: CompanyId,
@@ -2221,27 +2171,21 @@ impl<'a> CycleHostImpl<'a> {
         Ok(approval_id)
     }
 
-    /// Records a durable notification for the parked approval (issue #749) and
-    /// reaches the operator out-of-browser by email (issue #750).
+    /// Records a durable notification for the parked approval (issues #749/#750).
     ///
-    /// **Best-effort.** The binding record is the parked journal entry written by
-    /// [`park`](Self::park); this is delivery on top of it, so every failure here
-    /// is logged and none propagates — a park that already happened must not be
-    /// undone by a store or mail error. The notification append and the recipient
-    /// resolution are awaited (fast, local reads); only the SMTP send is spawned,
-    /// so a slow mail server never stalls the parking turn.
+    /// **Best-effort and record-only.** The binding record is the parked journal
+    /// entry written by [`park`](Self::park); this appends the durable
+    /// notification on top of it, and any failure is logged rather than
+    /// propagated — a park that already happened must not be undone by a store
+    /// error. It does **not** email: out-of-browser delivery is the digest's job
+    /// (issue #751), which batches the overnight firehose into one message rather
+    /// than one per park (`CompanyScheduler::tick_digest`). The notification
+    /// carries only the effect kind + agent
+    /// (see [`approval_notification_title`]), never the payload.
     ///
-    /// **Server-side recipients only.** Addresses resolve from the company's own
-    /// roster via [`owner_recipients`](crate::workflows::delivery::owner_recipients)
-    /// — the same path the workflow `owner` destination uses (active admins +
-    /// standing admin invites + the bootstrap admin) — never from the effect. A
-    /// parked call names no address, and the email carries only the effect kind,
-    /// so no caller-supplied address is ever honoured and no payload leaks.
-    ///
-    /// The classification is consumed, not invented (issue #750 / #558): reaching
-    /// this method *is* the signal, because an effect is here only after the gate
-    /// judged it `Reach::Consequence` and parked it. Every parked approval blocks
-    /// work; that is the minimal rule, and the taxonomy stays #558's.
+    /// The classification is consumed, not invented (#750 / #558): reaching this
+    /// method *is* the signal — an effect is here only after the gate judged it
+    /// `Reach::Consequence` and parked it. Every parked approval blocks work.
     async fn notify_parked_approval(&self, approval_id: &ApprovalId, effect: &Effect) {
         let notification = crate::ports::notifications::Notification {
             id: crate::ports::generate_id(),
@@ -2265,49 +2209,6 @@ impl<'a> CycleHostImpl<'a> {
                 "approval parked and journaled, but recording its notification failed",
             );
         }
-
-        // Reach the operator out-of-browser. No mailbox wired on this deployment
-        // → the durable notification still stands; there is simply no email
-        // channel to reach.
-        let Some(mail) = self.rt.mail().cloned() else {
-            return;
-        };
-        let record = match self.rt.store().load(&self.company).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(
-                    company = %self.company,
-                    error = %err,
-                    "approval notification: could not load the company record to resolve owners",
-                );
-                return;
-            }
-        };
-        // Recipients resolve server-side, from the roster — never from the effect.
-        let recipients = crate::company::owners::owner_recipients(
-            self.rt.users().as_ref(),
-            &self.company,
-            &record,
-            self.rt.bootstrap_admin(),
-        )
-        .await;
-        if recipients.is_empty() {
-            // No admin mailbox and no standing invite: nobody to email. The
-            // durable notification remains for whoever connects next.
-            return;
-        }
-        let subject = format!("{} — approval needed", record.manifest.company.name);
-        let body = approval_email_body(&record.manifest.company.name, effect);
-        // Spawn the SMTP send so a slow mail server never stalls the turn; the
-        // resolution above was local, only the network send is detached.
-        tokio::spawn(deliver_owner_approval_email(
-            mail,
-            recipients,
-            subject,
-            body,
-            self.company.clone(),
-        ));
     }
 
     /// Intercepts the `send_email` tool: parses `to`/`subject`/`body`, checks
@@ -6834,13 +6735,12 @@ mod test {
         assert!(notes[0].notification.title.contains("shell"));
     }
 
-    /// **The acceptance bar for issue #750.** A parked approval reaches the
-    /// operator out-of-browser by email. The recipient resolves server-side from
-    /// the roster — here the standing bootstrap admin of a fresh tenant — and the
-    /// From address is the company's own; the effect names no address and none is
-    /// honoured from it.
+    /// A parked approval is **record-only** (issue #751): it raises the durable
+    /// notification and queues it undelivered, but does **not** email on the
+    /// park — out-of-browser delivery is the digest's job, so the overnight
+    /// firehose becomes one message. This pins that the per-park send is gone.
     #[tokio::test]
-    async fn a_parked_approval_emails_the_owner() {
+    async fn a_parked_approval_records_but_does_not_email() {
         let home_dir = tmp_home();
         let sender = Arc::new(RecordingMailSender::new());
         let rt = RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
@@ -6871,58 +6771,26 @@ mod test {
             .unwrap();
         assert_eq!(report.parked.len(), 1);
 
-        // The notification is synchronous.
+        // The durable notification is recorded and queued for the digest...
         assert_eq!(
             rt.notifications().list(rt.id(), "x").await.unwrap().len(),
             1
         );
-
-        // The email send is spawned so a slow mail server never stalls the turn;
-        // drain the detached task with cooperative yields (current-thread test
-        // runtime), then assert it reached the server-resolved owner.
-        let mut sent = sender.sent();
-        for _ in 0..200 {
-            if !sent.is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-            sent = sender.sent();
-        }
         assert_eq!(
-            sent.len(),
+            rt.notifications().undelivered(rt.id()).await.unwrap().len(),
             1,
-            "a parked approval must reach the owner by email"
+            "the parked approval is queued undelivered for the digest"
         );
-        assert_eq!(sent[0].1.to, "boss@acme.test");
-        assert_eq!(sent[0].0, "ceo@acme.test");
-    }
 
-    /// The send fan-out reaches every server-resolved owner, and the From address
-    /// is the company's own — a unit test of the detached send used above.
-    #[tokio::test]
-    async fn approval_email_reaches_every_resolved_owner() {
-        let sender = Arc::new(RecordingMailSender::new());
-        let mail = CompanyMail {
-            sender: sender.clone(),
-            smtp: test_smtp("ceo@acme.test"),
-        };
-        deliver_owner_approval_email(
-            mail,
-            vec!["a@acme.test".into(), "b@acme.test".into()],
-            "Acme — approval needed".into(),
-            "please review".into(),
-            CompanyId::new("acme"),
-        )
-        .await;
-
-        let sent = sender.sent();
-        assert_eq!(sent.len(), 2);
-        let tos: std::collections::HashSet<String> =
-            sent.iter().map(|(_, e)| e.to.clone()).collect();
-        assert!(tos.contains("a@acme.test"));
-        assert!(tos.contains("b@acme.test"));
-        assert_eq!(sent[0].1.subject, "Acme — approval needed");
-        assert_eq!(sent[0].0, "ceo@acme.test");
+        // ...but the park itself sends no email — give any (wrongly) spawned send
+        // a chance to run, then assert silence. The digest, not the park, mails.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            sender.sent().is_empty(),
+            "the park must not email; the digest delivers"
+        );
     }
 
     /// The title names the asker when the effect carries one, and degrades to a

@@ -429,6 +429,14 @@ impl Bundle {
         self.dir.join("notification-reads.json")
     }
 
+    /// Path to the per-company notification delivery markers
+    /// (`notification-delivered.json`, #751) — which notifications a digest has
+    /// already emailed. Company-level, not per person, so it sits in its own
+    /// document beside the records.
+    pub fn notification_delivered_json(&self) -> PathBuf {
+        self.dir.join("notification-delivered.json")
+    }
+
     /// The workspace subdirectory holding the seeded/edited file tree.
     pub fn workspace_dir(&self) -> PathBuf {
         self.dir.join("workspace")

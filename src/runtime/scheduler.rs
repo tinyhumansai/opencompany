@@ -61,6 +61,17 @@ pub const PRUNE_CUTOFF_MINUTES: u64 = 14 * 24 * 60;
 // that violated it would fail the build, not a test.
 const _: () = assert!(PRUNE_CUTOFF_MINUTES > CATCHUP_WINDOW_MINUTES);
 
+/// Issue #751: the parked-approval digest holds new notifications until parks go
+/// quiet for this long, then flushes what accumulated as one email — so twenty
+/// raised over an evening arrive as one message, not twenty.
+const DIGEST_QUIET_MS: u64 = 30 * MINUTE_MS; // 30 minutes of quiet
+/// …or until the oldest held notification has waited this long, whichever comes
+/// first, so a company whose parks never fall quiet still gets its digest.
+const DIGEST_MAX_MS: u64 = 12 * 60 * MINUTE_MS; // 12 hours
+/// The fire-claim id that serialises the digest flush to one replica per minute,
+/// reusing the same at-most-once store the cron schedules claim on.
+const DIGEST_SCHEDULE_ID: &str = "notification-digest";
+
 /// The single catch-up instant to fire for a schedule at boot, or `None`.
 ///
 /// The one place the "fire at most one missed occurrence" rule lives, shared by
@@ -468,6 +479,140 @@ impl CompanyScheduler {
         Ok(expired)
     }
 
+    /// Issue #751: batch the parked-approval notifications a company accumulates
+    /// into ONE digest email rather than one per park.
+    ///
+    /// **Quiet-then-flush**, derived from the undelivered notifications' own
+    /// timestamps so it needs no extra state: hold while parks keep arriving, and
+    /// flush once things go quiet for [`DIGEST_QUIET_MS`] or the oldest held one
+    /// has waited out [`DIGEST_MAX_MS`]. An approval settled during the window is
+    /// dropped from the digest (and marked delivered so it never reappears), so
+    /// the digest never reports work already actioned. Best-effort, and
+    /// at-most-once per company per minute across replicas via the fire claim.
+    pub async fn tick_digest(&self) -> Result<usize> {
+        let runtime = self.runtime();
+        if runtime.ensure_running().await.is_err() {
+            return Ok(0);
+        }
+        let company = runtime.id();
+        let undelivered = runtime.notifications().undelivered(company).await?;
+        if undelivered.is_empty() {
+            return Ok(0);
+        }
+        // An approval settled during the window is noise the digest exists to
+        // remove — partition the queue on "still parked".
+        let pending: std::collections::HashSet<String> = runtime
+            .pending_approvals()
+            .into_iter()
+            .map(|a| a.id.to_string())
+            .collect();
+        // `pending_approvals()` is authoritative for "still parked": boot replay
+        // rehydrates every parked approval into the gate *before* the scheduler
+        // is spawned (`RuntimeBuilder::build` performs the replay), so an id
+        // absent here is resolved/expired, never merely "not loaded yet" — a
+        // still-pending approval is therefore never dropped as settled.
+        let mut settled = Vec::new();
+        let mut live = Vec::new();
+        for n in undelivered {
+            let still_relevant = match n.subject.kind {
+                crate::ports::notifications::SubjectKind::Approval => {
+                    pending.contains(&n.subject.id)
+                }
+                // A non-approval subject has no "settled" notion here; keep it.
+                _ => true,
+            };
+            if still_relevant {
+                live.push(n);
+            } else {
+                settled.push(n.id);
+            }
+        }
+        // Drop settled ones from the queue for good: marked delivered without
+        // ever being emailed, so a later flush never reconsiders them. This runs
+        // *before* the mailbox check below, so resolved approvals drain even on a
+        // company with no mail — which is what keeps the queue bounded (it can
+        // then only hold still-pending approvals, itself a bounded set).
+        if !settled.is_empty() {
+            runtime
+                .notifications()
+                .mark_delivered(company, &settled)
+                .await?;
+        }
+        if live.is_empty() {
+            return Ok(0);
+        }
+        // Quiet-then-flush, read off the live set's own timestamps.
+        let now = self.clock.now_millis();
+        let newest = live.iter().map(|n| n.created_at).max().unwrap_or(now);
+        let oldest = live.iter().map(|n| n.created_at).min().unwrap_or(now);
+        let quiet = now.saturating_sub(newest) >= DIGEST_QUIET_MS;
+        let capped = now.saturating_sub(oldest) >= DIGEST_MAX_MS;
+        if !quiet && !capped {
+            return Ok(0); // still accumulating — wait for a lull or the cap
+        }
+        // Resolve the channel server-side. No mailbox or no owner → leave the
+        // live set undelivered for a later flush when one exists (the console
+        // still shows them); never drop what was never emailed. The queue stays
+        // bounded across this branch: only still-pending approvals remain here
+        // (settled ones drained above), so it tracks the pending set, not time —
+        // and dropping them instead would silently suppress real approvals.
+        let Some(mail) = runtime.mail().cloned() else {
+            return Ok(0);
+        };
+        let record = match runtime.store().load(company).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(0),
+            Err(err) => {
+                tracing::warn!(company = %company, %err, "digest: could not load the company record");
+                return Ok(0);
+            }
+        };
+        // Recipients resolve from the roster, never from a notification.
+        let recipients = crate::company::owners::owner_recipients(
+            runtime.users().as_ref(),
+            company,
+            &record,
+            runtime.bootstrap_admin(),
+        )
+        .await;
+        if recipients.is_empty() {
+            return Ok(0);
+        }
+        // At-most-once per company per minute across replicas.
+        let minute = now / MINUTE_MS;
+        if !runtime
+            .schedule_fires()
+            .claim_fire(company, DIGEST_SCHEDULE_ID, minute)
+            .await?
+        {
+            return Ok(0);
+        }
+        // Mark delivered BEFORE the send: a crash mid-send loses at most one
+        // email (the console still holds the notifications), whereas re-digesting
+        // would resurrect the very firehose #751 exists to remove.
+        let ids: Vec<String> = live.iter().map(|n| n.id.clone()).collect();
+        runtime
+            .notifications()
+            .mark_delivered(company, &ids)
+            .await?;
+        let count = live.len();
+        let subject = format!(
+            "{} — {count} approval{} awaiting review",
+            record.manifest.company.name,
+            if count == 1 { "" } else { "s" },
+        );
+        let body = build_digest_body(&record.manifest.company.name, &live);
+        // Spawn the SMTP send so a slow mail server never stalls the tick.
+        tokio::spawn(crate::company::owners::deliver_to_owners(
+            mail,
+            recipients,
+            subject,
+            body,
+            company.clone(),
+        ));
+        Ok(count)
+    }
+
     /// Spawns a background task that ticks on every minute boundary until
     /// `shutdown` is notified, then returns. Boot holds the join handle and the
     /// shared `shutdown` so the scheduler stops cleanly when the server does.
@@ -509,6 +654,9 @@ impl CompanyScheduler {
                         if let Err(err) = self.tick_maintenance().await {
                             tracing::warn!(company = %self.runtime.id(), %err, "approval sweep failed");
                         }
+                        if let Err(err) = self.tick_digest().await {
+                            tracing::warn!(company = %self.runtime.id(), %err, "notification digest failed");
+                        }
                     }
                 }
             }
@@ -526,20 +674,45 @@ pub(crate) fn millis_to_next_minute(now: u64) -> u64 {
     MINUTE_MS - into_minute
 }
 
+/// The plain-text body of a parked-approval digest (issue #751): the list of what
+/// is waiting, then where to act. Carries only each notification's title (the
+/// effect kind + agent, never the payload), so the digest opens no redaction
+/// surface the per-notification path did not.
+fn build_digest_body(
+    company_name: &str,
+    notifications: &[crate::ports::notifications::Notification],
+) -> String {
+    let count = notifications.len();
+    let mut body = format!(
+        "{count} approval{} in {company_name} {} waiting for your review:\n\n",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "is" } else { "are" },
+    );
+    for n in notifications {
+        body.push_str(&format!("  • {}\n", n.title));
+    }
+    body.push_str("\nOpen your OpenCompany console to approve or deny.\n");
+    body
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use async_trait::async_trait;
 
     use crate::company::CompanyManifest;
+    use crate::company::runtime::CompanyMail;
     use crate::policy::ManifestApprovalGate;
     use crate::ports::brain::{Brain, CycleHost};
+    use crate::ports::types::{Actor, ActorKind, Verdict};
     use crate::ports::types::{
         CompressedTrace, CycleRequest, CycleResult, Effect, EffectGroup, EventSeq, OutboundMessage,
         TokenUsage,
     };
     use crate::runtime::RuntimeBuilder;
     use crate::runtime::cron::CivilTime;
+    use crate::server::ops::mailer::RecordingMailSender;
+    use crate::server::ops::smtp::{SmtpCredentials, SmtpSecurity};
 
     fn tmp_home() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -1459,5 +1632,220 @@ mod test {
             "the retry makes up the missed fire"
         );
         assert_eq!(fired_count(&rt).await, 1);
+    }
+
+    // --- Notification digest (issue #751) -----------------------------------
+
+    /// A brain that parks one effect on each operator message, so a test can
+    /// accumulate parked approvals for the digest to batch.
+    struct ParkBrain {
+        effect: Effect,
+    }
+
+    #[async_trait]
+    impl Brain for ParkBrain {
+        async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
+            for event in &req.events {
+                if let CompanyEvent::OperatorMessage { .. } = event {
+                    host.emit_effect(self.effect.clone()).await?;
+                }
+            }
+            Ok(CycleResult {
+                channel_responses: Vec::new(),
+                new_traces: vec![CompressedTrace::now(&req.cycle_id, "parked")],
+                ledger_deltas: Vec::new(),
+                token_usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    /// A consequence effect that parks under `supervised`.
+    fn park_effect(kind: &str) -> Effect {
+        Effect {
+            kind: kind.into(),
+            group: EffectGroup::Sign,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({}),
+            agent: Some("engineer".into()),
+            run_id: None,
+        }
+    }
+
+    fn test_smtp(from_email: &str) -> SmtpCredentials {
+        SmtpCredentials {
+            host: "smtp.example.com".into(),
+            port: 587,
+            security: SmtpSecurity::Starttls,
+            username: "user".into(),
+            password: "hunter2".into(),
+            from_name: "Acme".into(),
+            from_email: from_email.into(),
+        }
+    }
+
+    fn park_message() -> CompanyEvent {
+        CompanyEvent::OperatorMessage {
+            parent: None,
+            text: "do it".into(),
+            by: None,
+            chat: None,
+        }
+    }
+
+    /// **The acceptance bar for issue #751.** Twenty (here three) approvals
+    /// parked over an evening arrive as ONE digest, held until parks fall quiet,
+    /// and are not re-sent after delivery. The clock is injectable, so the window
+    /// is exercised with no sleeps.
+    #[tokio::test]
+    async fn digest_batches_parked_approvals_into_one_email_after_quiet() {
+        let home_dir = tmp_home();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_brain(Arc::new(ParkBrain {
+                    effect: park_effect("shell"),
+                }))
+                .with_mail(CompanyMail {
+                    sender: sender.clone(),
+                    smtp: test_smtp("ceo@acme.test"),
+                })
+                .with_bootstrap_admin(Some("boss@acme.test".into()))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // A base instant, then three parks — each records one undelivered
+        // notification stamped at ~base (real `now_millis()`).
+        let base = crate::ports::now_millis();
+        for _ in 0..3 {
+            rt.run_cycle(vec![park_message()]).await.unwrap();
+        }
+        assert_eq!(
+            rt.notifications().undelivered(rt.id()).await.unwrap().len(),
+            3
+        );
+        assert_eq!(rt.pending_approvals().len(), 3);
+
+        // Within the quiet window → hold, send nothing.
+        let clock = Arc::new(FakeClock::new(base + MINUTE_MS));
+        let scheduler = CompanyScheduler::new(rt.clone(), &[], clock.clone()).unwrap();
+        assert_eq!(
+            scheduler.tick_digest().await.unwrap(),
+            0,
+            "still accumulating"
+        );
+        assert!(sender.sent().is_empty());
+
+        // Past the quiet threshold → one digest of all three; queue drains.
+        clock.set(base + DIGEST_QUIET_MS + 2 * MINUTE_MS);
+        assert_eq!(scheduler.tick_digest().await.unwrap(), 3);
+        assert!(
+            rt.notifications()
+                .undelivered(rt.id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Drain the spawned send: exactly one email to the server-resolved owner,
+        // its subject naming the batch of three.
+        let mut sent = sender.sent();
+        for _ in 0..200 {
+            if !sent.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            sent = sender.sent();
+        }
+        assert_eq!(sent.len(), 1, "three parks become one digest");
+        assert_eq!(sent[0].1.to, "boss@acme.test");
+        assert_eq!(sent[0].0, "ceo@acme.test");
+        assert!(
+            sent[0].1.subject.contains("3 approvals"),
+            "subject: {}",
+            sent[0].1.subject
+        );
+
+        // A second flush sends nothing more — everything was delivered.
+        assert_eq!(scheduler.tick_digest().await.unwrap(), 0);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sender.sent().len(), 1, "no re-send after delivery");
+    }
+
+    /// An approval settled during the window is dropped from the digest and never
+    /// emailed — the digest reports no already-actioned work.
+    #[tokio::test]
+    async fn digest_drops_an_approval_settled_during_the_window() {
+        let home_dir = tmp_home();
+        let sender = Arc::new(RecordingMailSender::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_brain(Arc::new(ParkBrain {
+                    effect: park_effect("shell"),
+                }))
+                .with_mail(CompanyMail {
+                    sender: sender.clone(),
+                    smtp: test_smtp("ceo@acme.test"),
+                })
+                .with_bootstrap_admin(Some("boss@acme.test".into()))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let base = crate::ports::now_millis();
+        for _ in 0..2 {
+            rt.run_cycle(vec![park_message()]).await.unwrap();
+        }
+        let pending = rt.pending_approvals();
+        assert_eq!(pending.len(), 2);
+
+        // Settle one before the flush — it becomes noise the digest must skip.
+        rt.resolve_approval(
+            &pending[0].id,
+            Verdict::Deny,
+            Actor {
+                kind: ActorKind::Operator,
+                id: "boss".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rt.pending_approvals().len(), 1);
+
+        // Flush past the quiet threshold.
+        let clock = Arc::new(FakeClock::new(base + DIGEST_QUIET_MS + 2 * MINUTE_MS));
+        let scheduler = CompanyScheduler::new(rt.clone(), &[], clock).unwrap();
+        // Only the still-pending one is digested; the settled one is dropped.
+        assert_eq!(scheduler.tick_digest().await.unwrap(), 1);
+        // Both leave the queue: the settled one marked delivered without an
+        // email, the live one delivered by the digest.
+        assert!(
+            rt.notifications()
+                .undelivered(rt.id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut sent = sender.sent();
+        for _ in 0..200 {
+            if !sent.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            sent = sender.sent();
+        }
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].1.subject.contains("1 approval "),
+            "digest reports only the live one: {}",
+            sent[0].1.subject
+        );
     }
 }
