@@ -145,4 +145,23 @@ pub trait NotificationStore: Send + Sync {
         user: &str,
         ids: Option<&[String]>,
     ) -> Result<u64>;
+
+    /// Every notification in the company that has **not** yet been included in a
+    /// digest delivery (issue #751), **oldest first** (by `created_at`
+    /// ascending; ties broken by `id` ascending), so a caller can read the
+    /// window's edges off the ends of the list.
+    ///
+    /// Delivery is per **company**, not per person: a notification is emailed
+    /// once, to the owner set, so this axis carries no user and is independent of
+    /// [`mark_read`](Self::mark_read)'s per-person read state. The ordering is
+    /// part of the contract and the conformance suite asserts it.
+    async fn undelivered(&self, company: &CompanyId) -> Result<Vec<Notification>>;
+
+    /// Marks notifications **delivered** — recorded as included in a digest, so a
+    /// later flush does not re-send them (issue #751).
+    ///
+    /// **A latch**, like [`mark_read`](Self::mark_read): once delivered it stays
+    /// delivered, re-marking is a no-op, and ids that name no notification are
+    /// ignored.
+    async fn mark_delivered(&self, company: &CompanyId, ids: &[String]) -> Result<()>;
 }

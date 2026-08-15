@@ -1138,6 +1138,14 @@ struct StoredNotifRead {
     read_at: u64,
 }
 
+/// One per-company delivery marker (#751): a notification a digest has already
+/// emailed. No user — delivery is to the owner set, once, for the whole company.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct StoredDelivered {
+    notification_id: String,
+    delivered_at: u64,
+}
+
 #[async_trait]
 impl crate::ports::notifications::NotificationStore for FsOps {
     async fn append(
@@ -1248,6 +1256,67 @@ impl crate::ports::notifications::NotificationStore for FsOps {
             })
             .count() as u64;
         Ok(unread)
+    }
+
+    async fn undelivered(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::notifications::Notification>> {
+        let bundle = self.bundle(company);
+        let records = load_json_vec::<crate::ports::notifications::Notification>(
+            &bundle.notifications_json(),
+        )
+        .await?;
+        let delivered =
+            load_json_vec::<StoredDelivered>(&bundle.notification_delivered_json()).await?;
+        let delivered_ids: std::collections::HashSet<&str> = delivered
+            .iter()
+            .map(|d| d.notification_id.as_str())
+            .collect();
+        let mut out: Vec<_> = records
+            .into_iter()
+            .filter(|n| !delivered_ids.contains(n.id.as_str()))
+            .collect();
+        // Oldest first, ties broken by id ascending — the order the trait
+        // documents, so the caller can read the window edges off the ends.
+        out.sort_by(|a: &crate::ports::notifications::Notification, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn mark_delivered(&self, company: &CompanyId, ids: &[String]) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let records = load_json_vec::<crate::ports::notifications::Notification>(
+            &bundle.notifications_json(),
+        )
+        .await?;
+        let path = bundle.notification_delivered_json();
+        let lock = path_lock(&path);
+        let _guard = lock.lock().await;
+        let mut delivered = load_json_vec::<StoredDelivered>(&path).await?;
+        let now = crate::ports::now_millis();
+        let mut changed = false;
+        for id in ids {
+            // Only mark an id that names an existing notification, and only once
+            // (a latch): the original delivery instant survives a re-mark.
+            let exists = records.iter().any(|n| &n.id == id);
+            let already = delivered.iter().any(|d| &d.notification_id == id);
+            if exists && !already {
+                delivered.push(StoredDelivered {
+                    notification_id: id.clone(),
+                    delivered_at: now,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            write_atomic(&path, &serde_json::to_string(&delivered)?).await?;
+        }
+        Ok(())
     }
 }
 

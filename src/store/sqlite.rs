@@ -216,6 +216,12 @@ CREATE TABLE IF NOT EXISTS notification_reads (
     read_ms         INTEGER NOT NULL,
     PRIMARY KEY (company_id, user_id, notification_id)
 );
+CREATE TABLE IF NOT EXISTS notification_delivered (
+    company_id      TEXT NOT NULL,
+    notification_id TEXT NOT NULL,
+    delivered_ms    INTEGER NOT NULL,
+    PRIMARY KEY (company_id, notification_id)
+);
 CREATE TABLE IF NOT EXISTS workspace_nodes (
     company_id TEXT NOT NULL,
     id         TEXT NOT NULL,
@@ -2677,6 +2683,76 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
             )
             .map_err(sql_err)?;
         Ok(unread as u64)
+    }
+
+    async fn undelivered(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::notifications::Notification>> {
+        let conn = self.conn();
+        // Every notification with no delivery marker, oldest first — a LEFT JOIN
+        // where the delivered row is NULL.
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.id, n.kind, n.subject_kind, n.subject_id, n.title, n.created_ms \
+                 FROM notifications n \
+                 LEFT JOIN notification_delivered d \
+                     ON d.company_id = n.company_id AND d.notification_id = n.id \
+                 WHERE n.company_id = ?1 AND d.notification_id IS NULL \
+                 ORDER BY n.created_ms ASC, n.id ASC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, kind, subject_kind, subject_id, title, created_ms) = row.map_err(sql_err)?;
+            let subject_kind = crate::ports::notifications::SubjectKind::from_token(&subject_kind)
+                .ok_or_else(|| {
+                    crate::error::OpenCompanyError::Store(format!(
+                        "notification {id} has an unknown subject kind {subject_kind:?}"
+                    ))
+                })?;
+            out.push(crate::ports::notifications::Notification {
+                id,
+                kind,
+                subject: crate::ports::notifications::Subject {
+                    kind: subject_kind,
+                    id: subject_id,
+                },
+                created_at: created_ms as u64,
+                title,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn mark_delivered(&self, company: &CompanyId, ids: &[String]) -> Result<()> {
+        let conn = self.conn();
+        let now = crate::ports::now_millis() as i64;
+        // `INSERT OR IGNORE` is the latch; the `WHERE EXISTS` gate marks only ids
+        // that name a real notification in this company.
+        for id in ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO notification_delivered \
+                     (company_id, notification_id, delivered_ms) \
+                 SELECT ?1, ?2, ?3 \
+                 WHERE EXISTS (SELECT 1 FROM notifications WHERE company_id = ?1 AND id = ?2)",
+                params![company.as_ref(), id.as_str(), now],
+            )
+            .map_err(sql_err)?;
+        }
+        Ok(())
     }
 }
 

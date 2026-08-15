@@ -2451,6 +2451,58 @@ pub async fn assert_notification_store(notes: Arc<dyn NotificationStore>) {
         4,
         "beta's write must not change alpha"
     );
+
+    // --- Delivery (issue #751): a per-company, once-only marker, independent of
+    // the per-person read state above ---
+
+    // Nothing delivered yet, so every record is undelivered — oldest first
+    // (created_at ascending, id ascending), the reverse of the read feed.
+    let undel = notes.undelivered(&alpha).await.unwrap();
+    assert_eq!(undel.len(), 4);
+    assert_eq!(undel[0].id, "n-old"); // created 100
+    assert_eq!(undel[1].id, "n-new"); // created 200
+    assert_eq!(undel[2].id, "id-a"); // created 300, id asc
+    assert_eq!(undel[3].id, "id-b"); // created 300
+
+    // Delivery is independent of read: Ada marked things read above, yet all
+    // four are still undelivered — read is per person, delivery is per company.
+    notes
+        .mark_delivered(&alpha, &["n-old".to_string(), "n-new".to_string()])
+        .await
+        .unwrap();
+    let undel = notes.undelivered(&alpha).await.unwrap();
+    assert_eq!(undel.len(), 2, "delivered ones drop from undelivered");
+    assert_eq!(undel[0].id, "id-a");
+    assert_eq!(undel[1].id, "id-b");
+
+    // A latch, and unknown ids ignored: re-marking a delivered id and marking a
+    // bogus id change nothing.
+    notes
+        .mark_delivered(&alpha, &["n-old".to_string(), "does-not-exist".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(notes.undelivered(&alpha).await.unwrap().len(), 2);
+
+    // Per company: beta's delivery is its own — its notification is undelivered
+    // even though alpha delivered.
+    let beta_undel = notes.undelivered(&beta).await.unwrap();
+    assert_eq!(beta_undel.len(), 1);
+    assert_eq!(beta_undel[0].id, "b-1");
+
+    // Drain the rest of alpha → alpha fully delivered, beta untouched.
+    notes
+        .mark_delivered(&alpha, &["id-a".to_string(), "id-b".to_string()])
+        .await
+        .unwrap();
+    assert!(notes.undelivered(&alpha).await.unwrap().is_empty());
+    assert_eq!(notes.undelivered(&beta).await.unwrap().len(), 1);
+
+    // Delivery is a marker, not a deletion: the console feed still shows every
+    // record after the digest has emailed it. This is the invariant the digest
+    // relies on when it marks delivered *before* sending — a backend that
+    // dropped the record on `mark_delivered` would break the console and must
+    // fail here rather than pass by only checking `undelivered`.
+    assert_eq!(notes.list(&alpha, "ada").await.unwrap().len(), 4);
 }
 
 pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {

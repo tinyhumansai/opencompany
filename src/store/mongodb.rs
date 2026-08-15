@@ -416,6 +416,13 @@ impl MongoStore {
             ))
             .await
             .map_err(mongo_err)?;
+        // Issue #751: the per-company delivery marker. Unique on
+        // `(company_id, notification_id)` so a re-mark is a no-op `E11000` and
+        // delivery stays a latch.
+        self.collection("notification_delivered")
+            .create_index(unique(doc! {"company_id": 1, "notification_id": 1}))
+            .await
+            .map_err(mongo_err)?;
         Ok(())
     }
 
@@ -2602,6 +2609,93 @@ impl crate::ports::notifications::NotificationStore for MongoStore {
             .filter(|v| v.read_at.is_none())
             .count() as u64;
         Ok(unread)
+    }
+
+    async fn undelivered(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::notifications::Notification>> {
+        // The delivered ids first, into a set.
+        let mut delivered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dcur = self
+            .collection("notification_delivered")
+            .find(doc! {"company_id": company.as_ref()})
+            .await
+            .map_err(mongo_err)?;
+        while let Some(d) = dcur.try_next().await.map_err(mongo_err)? {
+            delivered.insert(get_str(&d, "notification_id")?);
+        }
+        // Records oldest-first, minus the delivered ones.
+        let mut cursor = self
+            .collection("notifications")
+            .find(doc! {"company_id": company.as_ref()})
+            .sort(doc! {"created_ms": 1, "id": 1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(d) = cursor.try_next().await.map_err(mongo_err)? {
+            let id = get_str(&d, "id")?;
+            if delivered.contains(&id) {
+                continue;
+            }
+            let subject_kind = get_str(&d, "subject_kind")?;
+            let subject_kind = crate::ports::notifications::SubjectKind::from_token(&subject_kind)
+                .ok_or_else(|| {
+                    crate::error::OpenCompanyError::Store(format!(
+                        "notification has an unknown subject kind {subject_kind:?}"
+                    ))
+                })?;
+            out.push(crate::ports::notifications::Notification {
+                id,
+                kind: get_str(&d, "kind")?,
+                subject: crate::ports::notifications::Subject {
+                    kind: subject_kind,
+                    id: get_str(&d, "subject_id")?,
+                },
+                created_at: d.get_i64("created_ms").unwrap_or_default() as u64,
+                title: get_str(&d, "title")?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn mark_delivered(&self, company: &CompanyId, ids: &[String]) -> Result<()> {
+        let now = crate::ports::now_millis() as i64;
+        for id in ids {
+            // Only mark an id that names an existing notification in this company.
+            let exists = self
+                .collection("notifications")
+                .find_one(doc! {"company_id": company.as_ref(), "id": id.as_str()})
+                .await
+                .map_err(mongo_err)?
+                .is_some();
+            if !exists {
+                continue;
+            }
+            // `$setOnInsert` is the latch: it seeds `delivered_ms` only when the
+            // marker is first created, so a re-mark leaves the original instant.
+            if let Err(e) = self
+                .collection("notification_delivered")
+                .update_one(
+                    doc! {
+                        "company_id": company.as_ref(),
+                        "notification_id": id.as_str(),
+                    },
+                    doc! {"$setOnInsert": {"delivered_ms": now}},
+                )
+                .with_options(UpdateOptions::builder().upsert(true).build())
+                .await
+            {
+                // Two concurrent first marks can both miss the existing doc and
+                // race their upserts into one `E11000` on the unique index. The
+                // marker is present either way, so treat the duplicate as the
+                // no-op the latch promises rather than propagating it.
+                if !is_duplicate_key(&e) {
+                    return Err(mongo_err(e));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
