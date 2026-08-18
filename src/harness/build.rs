@@ -90,7 +90,7 @@ use openhuman_core::openhuman as oh;
 use oh::agent::prompts::SystemPromptBuilder;
 use oh::agent::{Agent, AgentBuilder};
 use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
-use oh::memory::traits::Memory;
+use oh::memory::Memory;
 use oh::security::SecurityPolicy;
 #[cfg(feature = "mcp")]
 use oh::tools::McpListToolsTool;

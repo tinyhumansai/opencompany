@@ -57,7 +57,7 @@ use oh::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher};
 use oh::agent::prompts::SystemPromptBuilder;
 use oh::agent::tool_policy::{ToolPolicy, ToolPolicyDecision, ToolPolicyRequest};
 use oh::agent::{Agent, AgentBuilder};
-use oh::memory::traits::Memory;
+use oh::memory::Memory;
 use oh::tools::Tool;
 
 use crate::error::OpenCompanyError;

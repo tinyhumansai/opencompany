@@ -25,7 +25,7 @@ use openhuman_core::openhuman as oh;
 use oh::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher};
 use oh::agent::prompts::SystemPromptBuilder;
 use oh::agent::{Agent, AgentBuilder};
-use oh::memory::traits::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts};
+use oh::memory::{Memory, MemoryCategory, MemoryEntry, NamespaceSummary, RecallOpts};
 use oh::tools::traits::Tool;
 
 use crate::error::OpenCompanyError;

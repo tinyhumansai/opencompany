@@ -35,7 +35,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openhuman_core::openhuman as oh;
 
-use oh::memory::traits::{
+use oh::memory::{
     Memory, MemoryCategory, MemoryEntry, MemoryTaint, NamespaceSummary, RecallOpts,
 };
 

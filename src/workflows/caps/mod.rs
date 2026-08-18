@@ -391,6 +391,13 @@ pub async fn build_capabilities(
         // already-settled ticket for a downstream `gate`; real overlap belongs
         // in the later concurrency adoption phase.
         tasks: None,
+        // New in a later tinyflows 0.8.x: `approval` nodes can push a request
+        // at a host-registered `ApprovalProvider`. `None` here leaves the
+        // fallback behaviour intact — an `approval` node still pauses the run
+        // for the host to settle through `engine::resume`; wiring a provider
+        // that proactively notifies a reviewer is a separate policy decision
+        // this repo has not made.
+        approvals: None,
     })
 }
 
