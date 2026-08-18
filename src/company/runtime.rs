@@ -361,6 +361,28 @@ pub struct CompanyRuntime {
     pub(crate) mcp: Option<Arc<crate::harness::mcp::McpRuntime>>,
 }
 
+/// The event the runtime appends when a continuation could not be picked back
+/// up (issue #469, defect 4).
+///
+/// Named so its **author** can be asserted (issue #966). This site writes the
+/// `AgentReply` directly rather than going through `OutboundMessage`, so it does
+/// not get the `agent` field's fallback and has to name the author itself. It
+/// used to store `OPERATOR_CHANNEL`, which made a correct system row
+/// indistinguishable on disk from a reply whose author the pre-#885 defect
+/// overwrote.
+fn continuation_failure_notice(thread: String, parent: Option<EventSeq>) -> CompanyEvent {
+    CompanyEvent::AgentReply {
+        parent,
+        chat_id: thread,
+        agent_id: crate::ports::SYSTEM_AUTHOR.to_string(),
+        text: "Your approval was recorded, but the agent could not pick the work back up. \
+               Nothing was half-done — approving again is safe and will retry it."
+            .to_string(),
+        steps: Vec::new(),
+        task_id: None,
+    }
+}
+
 impl CompanyRuntime {
     /// Assembles a runtime from its ports. Most callers use
     /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) instead.
@@ -1737,20 +1759,7 @@ impl CompanyRuntime {
         let parent = self.resolvable_parent(conversation.parent, &thread).await;
         if let Err(err) = self
             .events
-            .append(
-                &self.id,
-                CompanyEvent::AgentReply {
-                    parent,
-                    chat_id: thread,
-                    agent_id: crate::runtime::channel::OPERATOR_CHANNEL.to_string(),
-                    text: "Your approval was recorded, but the agent could not pick the work \
-                           back up. Nothing was half-done — approving again is safe and will \
-                           retry it."
-                        .to_string(),
-                    steps: Vec::new(),
-                    task_id: None,
-                },
-            )
+            .append(&self.id, continuation_failure_notice(thread, parent))
             .await
         {
             tracing::warn!(
@@ -2488,7 +2497,10 @@ impl std::fmt::Debug for CompanyRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{emergency_from_load, task_enters_in_progress, task_enters_planning};
+    use super::{
+        CompanyEvent, continuation_failure_notice, emergency_from_load, task_enters_in_progress,
+        task_enters_planning,
+    };
 
     /// Issue #880: which parked approvals name a workflow run, and which must
     /// not.
@@ -3422,6 +3434,34 @@ mod tests {
             rt.resolvable_parent(Some(roots[0]), "desk-ops").await,
             None,
             "and the General desk is not a named one",
+        );
+    }
+
+    /// Issue #966: the failed-continuation report is authored by the runtime.
+    ///
+    /// This site appends the `AgentReply` itself, so it never sees
+    /// `OutboundMessage::agent` or its `channel` fallback — it has to name the
+    /// author, and it used to name `OPERATOR_CHANNEL`. That made a correct
+    /// system row byte-identical on disk to a reply the pre-#885 defect had
+    /// damaged, which is the finding recorded on #966.
+    #[test]
+    fn a_failed_continuation_report_is_authored_by_the_runtime_not_the_operator() {
+        let event = continuation_failure_notice("desk-general".to_string(), None);
+        let CompanyEvent::AgentReply {
+            agent_id, chat_id, ..
+        } = event
+        else {
+            panic!("the notice must stay an AgentReply — the console renders it from that arm");
+        };
+        assert_eq!(agent_id, crate::ports::SYSTEM_AUTHOR);
+        assert_ne!(
+            agent_id,
+            crate::runtime::channel::OPERATOR_CHANNEL,
+            "a notice must not store the author a destination-overwrite produces"
+        );
+        assert_eq!(
+            chat_id, "desk-general",
+            "it still lands in the thread it answers"
         );
     }
 }
