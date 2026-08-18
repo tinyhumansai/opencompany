@@ -381,14 +381,20 @@ fn call_of(node: &tinyflows::model::Node) -> Option<(String, Value, Option<Strin
         // gating here would park the same call twice.
         NodeKind::Agent
         // Capabilities that are explicit stubs today: `CodeRunner`,
-        // `MemoryProvider`, and the `ShellRunner` (new in tinyflows 0.6.1) are
-        // wired to error / left `None` (see `caps`), so there is no call to
-        // classify. **These are the next three to gate** — sandboxed code, a
-        // memory *write*, and a shell script are all effectful — and the
-        // decision belongs with whoever wires the capability, in the same PR.
+        // `MemoryProvider`, the `ShellRunner` (new in tinyflows 0.6.1), and the
+        // `ApprovalProvider` (new in a later tinyflows 0.8.x) are wired to
+        // error / left `None` (see `caps`), so there is no call to classify.
+        // `Approval` falls back to pausing the run for the host to settle
+        // through `engine::resume` rather than reaching anywhere on its own,
+        // which is why it belongs in this group rather than being classified
+        // like `tool_call`/`http_request`. **These are the next four to
+        // gate** — sandboxed code, a memory *write*, a shell script, and a
+        // wired approval notification are all effectful — and the decision
+        // belongs with whoever wires the capability, in the same PR.
         | NodeKind::Code
         | NodeKind::Memory
         | NodeKind::Shell
+        | NodeKind::Approval
         // A child graph is resolved and run *inside* the engine
         // (`run_sub_workflow`), so its nodes never pass this function at all —
         // this arm is not what excludes them. The module docs give the reason
@@ -410,7 +416,10 @@ fn call_of(node: &tinyflows::model::Node) -> Option<(String, Value, Option<Strin
         | NodeKind::SplitOut
         | NodeKind::Switch
         | NodeKind::Transform
-        | NodeKind::Trigger => None,
+        | NodeKind::Trigger
+        // Terminal sink: discards its input and activates nothing further.
+        // Pure control flow, like the group above.
+        | NodeKind::Void => None,
     }
 }
 

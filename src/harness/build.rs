@@ -89,8 +89,8 @@ use openhuman_core::openhuman as oh;
 
 use oh::agent::prompts::SystemPromptBuilder;
 use oh::agent::{Agent, AgentBuilder};
-use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
 use oh::memory::Memory;
+use oh::memory::tools::{MemoryRecallTool, MemoryStoreTool};
 use oh::security::SecurityPolicy;
 #[cfg(feature = "mcp")]
 use oh::tools::McpListToolsTool;
@@ -250,7 +250,7 @@ pub fn build_agent(
     // loop. They are tenant-isolated (an agent's memory is its company's
     // `ContextStore`) and granted to every agent — unlike the external tools
     // below, which are scoped by the manifest `[tools]` allow-list.
-    let mut tools: Vec<Box<dyn Tool>> = memory_tools(memory.clone());
+    let mut tools: Vec<Box<dyn Tool>> = memory_tools(&memory);
     #[cfg(feature = "mcp")]
     {
         // These config-free tools read OpenHuman's live process registry, so
@@ -1055,11 +1055,18 @@ pub fn build_agent(
 ///
 /// `MemoryForgetTool` is deliberately excluded — [`OcMemory`]'s append-only
 /// `ContextStore` cannot delete, so a forget tool would silently no-op.
-fn memory_tools(memory: Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
+///
+/// Neither tool takes `memory` at construction any more: openhuman resolves
+/// the guarded driver per call from the session's ambient context, which is
+/// bound to this same `Arc<dyn Memory>` via `.memory(memory)` on the session
+/// builder. The parameter stays so the caller's intent (which memory these
+/// tools act over) reads at the call site rather than needing a comment.
+fn memory_tools(memory: &Arc<dyn Memory>) -> Vec<Box<dyn Tool>> {
+    let _ = memory;
     let security = Arc::new(SecurityPolicy::default());
     vec![
-        Box::new(MemoryStoreTool::new(memory.clone(), security)),
-        Box::new(MemoryRecallTool::new(memory)),
+        Box::new(MemoryStoreTool::new(security)),
+        Box::new(MemoryRecallTool::new()),
     ]
 }
 
@@ -1237,7 +1244,7 @@ mod tests {
             "ceo",
             Arc::new(NoopContext),
         ));
-        let tools = memory_tools(memory);
+        let tools = memory_tools(&memory);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"memory_store"), "got {names:?}");
         assert!(names.contains(&"memory_recall"), "got {names:?}");
