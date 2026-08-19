@@ -30,8 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::metering::{
-    AgentTokens, ProviderCalls, Usage, UsagePoint, UsageRange, UsageTotals, bucket_usage,
-    roster_display_names,
+    ProviderCalls, Usage, UsagePoint, UsageRange, bucket_usage, roster_display_names,
 };
 use crate::ports::now_millis;
 use crate::server::error::ApiError;
@@ -72,27 +71,74 @@ struct UsageDto {
     /// Zero-filled daily token series over the range, oldest first.
     series: Vec<UsagePoint>,
     /// Tokens per teammate (desk), highest first.
-    by_agent: Vec<AgentTokens>,
+    by_agent: Vec<AgentUsageDto>,
     /// OAuth calls per provider, highest first. Empty on a build with no
     /// connected-tool surface compiled in — see the module docs.
     by_provider: Vec<ProviderCalls>,
     /// Window totals.
-    totals: UsageTotals,
+    totals: UsageTotalsDto,
+    /// Money exists in this response but is withheld from this principal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cost_hidden: bool,
 }
 
-impl From<Usage> for UsageDto {
-    fn from(usage: Usage) -> Self {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentUsageDto {
+    name: String,
+    tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageTotalsDto {
+    input_tokens: u64,
+    output_tokens: u64,
+    tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+    oauth_calls: u64,
+    connections: u64,
+    search_calls: u64,
+}
+
+impl UsageDto {
+    fn new(usage: Usage, may_read_cost: bool) -> Self {
+        let cost_hidden = !may_read_cost && usage.totals.cost_usd > 0.0;
         Self {
             series: usage.series,
-            by_agent: usage.by_agent,
+            by_agent: usage
+                .by_agent
+                .into_iter()
+                .map(|agent| AgentUsageDto {
+                    name: agent.name,
+                    tokens: agent.tokens,
+                    cost_usd: may_read_cost.then_some(agent.cost_usd),
+                })
+                .collect(),
             by_provider: usage.by_provider,
-            totals: usage.totals,
+            totals: UsageTotalsDto {
+                input_tokens: usage.totals.input_tokens,
+                output_tokens: usage.totals.output_tokens,
+                tokens: usage.totals.tokens,
+                cost_usd: may_read_cost.then_some(usage.totals.cost_usd),
+                oauth_calls: usage.totals.oauth_calls,
+                connections: usage.totals.connections,
+                search_calls: usage.totals.search_calls,
+            },
+            cost_hidden,
         }
     }
 }
 
 /// Queries the meter and projects a company's usage for the window.
-async fn project_usage(runtime: &CompanyRuntime, range: UsageRange) -> Result<UsageDto, ApiError> {
+async fn project_usage(
+    runtime: &CompanyRuntime,
+    range: UsageRange,
+    may_read_cost: bool,
+) -> Result<UsageDto, ApiError> {
     let now = now_millis();
     let since = now.saturating_sub(range.days().saturating_mul(MILLIS_PER_DAY));
     let samples = runtime
@@ -107,7 +153,10 @@ async fn project_usage(runtime: &CompanyRuntime, range: UsageRange) -> Result<Us
         .map(|record| roster_display_names(&record.manifest.agents, &record.overlay_agents))
         .unwrap_or_default();
 
-    Ok(bucket_usage(&samples, range, now, &roster).into())
+    Ok(UsageDto::new(
+        bucket_usage(&samples, range, now, &roster),
+        may_read_cost,
+    ))
 }
 
 /// `GET …/usage?range=` — the company's usage read for the window.
@@ -116,7 +165,44 @@ async fn get_usage(
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<UsageDto>, ApiError> {
     let range = parse_range(query.range.as_deref());
-    Ok(Json(project_usage(company.runtime.as_ref(), range).await?))
+    Ok(Json(
+        project_usage(company.runtime.as_ref(), range, company.may_read_contents).await?,
+    ))
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    use crate::metering::{AgentTokens, UsageTotals};
+
+    #[test]
+    fn redacted_cost_is_explicit_and_never_serializes_as_zero() {
+        let dto = UsageDto::new(
+            Usage {
+                series: Vec::new(),
+                by_agent: vec![AgentTokens {
+                    name: "Ops".to_string(),
+                    tokens: 10,
+                    cost_usd: 2.5,
+                }],
+                by_provider: Vec::new(),
+                totals: UsageTotals {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    tokens: 10,
+                    cost_usd: 2.5,
+                    oauth_calls: 0,
+                    connections: 0,
+                    search_calls: 0,
+                },
+            },
+            false,
+        );
+        let value = serde_json::to_value(dto).expect("serialize usage");
+        assert_eq!(value["costHidden"], true);
+        assert!(value["totals"].get("costUsd").is_none(), "{value}");
+        assert!(value["byAgent"][0].get("costUsd").is_none(), "{value}");
+    }
 }
 
 #[cfg(test)]

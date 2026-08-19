@@ -37,6 +37,7 @@ import { ApiError } from "@/api/types";
 import {
   listWorkflowToolSlugs,
   updateWorkflow,
+  type UnwiredWorkflowTool,
   type WorkflowGraph,
   type WorkflowRunOutcome,
 } from "@/api/workflows";
@@ -153,6 +154,12 @@ export function CopilotPanel({
   // `runs`: an empty list on a host that serves the route ("no tools granted")
   // must not read the same as a host that does not serve it ("cannot say").
   const [toolSlugsKnown, setToolSlugsKnown] = useState(false);
+  // Issue #874. Granted here but unwired on this deployment — named to the model
+  // as off-limits, so it can explain the gap rather than propose a node that
+  // fails at the first run.
+  const [unwiredTools, setUnwiredTools] = useState<
+    UnwiredWorkflowTool[] | undefined
+  >(undefined);
   // Issue #415. One entry per company message that carried a proposal block,
   // parsed EXACTLY ONCE, when the message first appears.
   //
@@ -249,6 +256,13 @@ export function CopilotPanel({
     setRoster(undefined);
     setToolSlugs(undefined);
     setToolSlugsKnown(false);
+    // Cleared with the rest of the grounding, and for the same reason. Left
+    // behind, the previous company's unwired list rides along with THIS
+    // company's "the granted tools could not be listed here" for the whole
+    // in-flight window — a prompt that names tools as off-limits in the same
+    // breath as admitting it cannot name the granted ones, built from another
+    // company's wiring.
+    setUnwiredTools(undefined);
     (async () => {
       try {
         const team = await client.listTeam(company);
@@ -262,10 +276,11 @@ export function CopilotPanel({
     })();
     (async () => {
       try {
-        const slugs = await listWorkflowToolSlugs(client, company);
+        const tools = await listWorkflowToolSlugs(client, company);
         if (live) {
-          setToolSlugs(slugs);
+          setToolSlugs(tools.slugs);
           setToolSlugsKnown(true);
+          setUnwiredTools(tools.unwired);
         }
       } catch (e) {
         // The route is absent (older host): "cannot say", not "no tools".
@@ -273,6 +288,7 @@ export function CopilotPanel({
         if (live) {
           setToolSlugs(undefined);
           setToolSlugsKnown(false);
+          setUnwiredTools(undefined);
         }
       }
     })();
@@ -426,7 +442,15 @@ export function CopilotPanel({
         client,
         company,
         workflowId,
-        { graph, runs, runsKnown, roster, toolSlugs, toolSlugsKnown },
+        {
+          graph,
+          runs,
+          runsKnown,
+          roster,
+          toolSlugs,
+          toolSlugsKnown,
+          unwiredTools,
+        },
         question,
       );
       if (!mine()) return;
@@ -479,6 +503,7 @@ export function CopilotPanel({
     sending,
     toolSlugs,
     toolSlugsKnown,
+    unwiredTools,
     workflowId,
   ]);
 

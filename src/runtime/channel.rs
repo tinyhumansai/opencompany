@@ -318,7 +318,7 @@ mod test {
         fn subscribe(
             &self,
             _company: &CompanyId,
-        ) -> BoxStream<'static, crate::ports::types::StoredEvent> {
+        ) -> BoxStream<'static, crate::ports::events::EventStreamItem> {
             Box::pin(stream::empty())
         }
     }

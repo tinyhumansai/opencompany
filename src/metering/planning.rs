@@ -219,7 +219,10 @@ mod test {
         let entry = inference_ledger_entry(&usage_with(0.25), UNATTRIBUTED_AGENT)
             .expect("a costed pass posts");
         assert_eq!(entry.kind, crate::metering::INFERENCE_SPEND_KIND);
-        assert_eq!(entry.amount_usd, 0.25);
+        assert_eq!(
+            entry.amount_usd, -0.25,
+            "an outflow is negative (issue #1047)"
+        );
         assert_eq!(entry.memo, "company");
         // A token-bearing but zero-cost pass (the managed passthrough) posts no
         // money — the sample still lands, the ledger stays honest.

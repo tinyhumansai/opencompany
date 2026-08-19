@@ -93,7 +93,11 @@ pub const CLIP_MARKER: &str = "…";
 /// `nodes` is the engine's `run.output["nodes"]` map — `{ "<node id>": {
 /// "items": [ … ] } }` — already passed through [`bound_node_output`], so a
 /// reader gets a value that is safe to render whole. `truncated` says whether
-/// any clipping happened, so the console can badge it honestly.
+/// any clipping happened, so the console can badge it honestly. `partial` says
+/// the run **did not settle cleanly** (it failed or blocked), so the map holds
+/// only what the observer captured from the nodes that finished before the
+/// stop — not a complete outcome. Issue #1008: a failed/blocked run used to
+/// persist nothing, so its inspector wrongly claimed the run predated capture.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowRunOutputRecord {
@@ -107,17 +111,29 @@ pub struct WorkflowRunOutputRecord {
     pub nodes: Value,
     /// Whether [`bound_node_output`] clipped any value to fit the caps.
     pub truncated: bool,
+    /// Whether this is a **partial** capture from a run that failed or blocked
+    /// rather than a complete settled outcome (issue #1008). `#[serde(default)]`
+    /// so a record written before this field existed reads back `false` — a
+    /// pre-#1008 snapshot is, by definition, from a run that settled cleanly.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 impl WorkflowRunOutputRecord {
     /// Builds a record from a *raw* node map, bounding it in the process. The
     /// caller hands the engine's `outcome.output["nodes"]` straight in; this is
     /// the one place bounding is applied, so no writer can forget it.
+    ///
+    /// `partial` flags a capture from a run that failed or blocked rather than
+    /// settling cleanly (issue #1008): a clean settle passes `false`, the two
+    /// failure arms pass `true` alongside the node map the progress observer
+    /// accumulated before the stop.
     pub fn from_raw_nodes(
         run_id: impl Into<String>,
         workflow_id: impl Into<String>,
         at_millis: u64,
         raw_nodes: &Value,
+        partial: bool,
     ) -> Self {
         let (nodes, truncated) = bound_node_output(raw_nodes);
         Self {
@@ -126,6 +142,7 @@ impl WorkflowRunOutputRecord {
             at_millis,
             nodes,
             truncated,
+            partial,
         }
     }
 }
@@ -278,12 +295,46 @@ mod test {
             at_millis: 42,
             nodes: serde_json::json!({ "ceo": { "items": ["hi"] } }),
             truncated: false,
+            partial: false,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"runId\""), "{json}");
         assert!(json.contains("\"workflowId\""), "{json}");
         assert!(json.contains("\"atMillis\""), "{json}");
         assert_eq!(record, serde_json::from_str(&json).unwrap());
+    }
+
+    #[test]
+    fn partial_round_trips_and_defaults_false_for_a_pre_feature_payload() {
+        // Issue #1008: a `partial` capture round-trips as camelCase.
+        let record = WorkflowRunOutputRecord {
+            run_id: "run-2".to_string(),
+            workflow_id: "greet".to_string(),
+            at_millis: 7,
+            nodes: serde_json::json!({ "ceo": { "items": ["hi"] } }),
+            truncated: false,
+            partial: true,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"partial\":true"), "{json}");
+        assert_eq!(record, serde_json::from_str(&json).unwrap());
+
+        // A payload persisted before this field existed carries no `partial`
+        // key; `#[serde(default)]` reads it back `false` — a pre-#1008 snapshot
+        // is from a run that settled cleanly, so "not partial" is the honest
+        // default.
+        let pre_feature = serde_json::json!({
+            "runId": "old-run",
+            "workflowId": "greet",
+            "atMillis": 1,
+            "nodes": { "ceo": { "items": ["hi"] } },
+            "truncated": false,
+        });
+        let decoded: WorkflowRunOutputRecord = serde_json::from_value(pre_feature).unwrap();
+        assert!(
+            !decoded.partial,
+            "a pre-feature payload with no `partial` key must default to false"
+        );
     }
 
     #[test]
@@ -333,6 +384,7 @@ mod test {
             at_millis: at,
             nodes: Value::Null,
             truncated: false,
+            partial: false,
         };
         let mut recs = vec![rec("a", 10), rec("c", 20), rec("b", 20)];
         sort_newest_first(&mut recs);
@@ -344,10 +396,16 @@ mod test {
     fn from_raw_nodes_bounds_and_flags() {
         let long = "z".repeat(NODE_OUTPUT_ITEM_CHAR_CAP + 10);
         let raw = serde_json::json!({ "n": { "items": [long] } });
-        let record = WorkflowRunOutputRecord::from_raw_nodes("r", "wf", 5, &raw);
+        let record = WorkflowRunOutputRecord::from_raw_nodes("r", "wf", 5, &raw, false);
         assert!(record.truncated, "from_raw_nodes must bound its input");
         assert_eq!(record.run_id, "r");
         assert_eq!(record.workflow_id, "wf");
         assert_eq!(record.at_millis, 5);
+        assert!(!record.partial, "a clean settle passes partial=false");
+
+        // Issue #1008: the failure arms hand `partial=true`; it survives onto
+        // the record unchanged.
+        let flagged = WorkflowRunOutputRecord::from_raw_nodes("r2", "wf", 6, &raw, true);
+        assert!(flagged.partial, "from_raw_nodes must carry partial through");
     }
 }

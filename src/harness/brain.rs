@@ -208,6 +208,30 @@ pub struct HarnessBrain {
 ///
 /// No card, by construction: a confined turn has no `spawn_task` to call, and
 /// the chat handler does not open one from a copilot message either.
+/// A bubble the **runtime** wrote, not an agent (issue #966).
+///
+/// Two sites emit these on the operator channel: the approval-overflow notice
+/// and the cycle's `"Acknowledged."` fallback. Both used to leave the author
+/// unset, so the journal writer's `channel` fallback stamped `"operator"` — and
+/// that made a *correct* system row byte-identical on disk to a reply whose
+/// author the pre-#885 defect had overwritten. No reader could tell them apart,
+/// which is the finding recorded on #966.
+///
+/// Named rather than inlined for the same reason [`confined_bubble`] is: the
+/// author is the load-bearing field, and a free function is what lets it be
+/// asserted without standing up a cycle.
+fn system_notice(text: String) -> OutboundMessage {
+    OutboundMessage {
+        message_id: None,
+        task_id: None,
+        channel: "operator".to_string(),
+        agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
+        text,
+        steps: Vec::new(),
+        reply_to: None,
+    }
+}
+
 fn confined_bubble(outcome: crate::harness::TurnOutcome) -> OutboundMessage {
     OutboundMessage {
         message_id: None,
@@ -2230,6 +2254,7 @@ impl HarnessBrain {
             parent_task_id: None,
             output: None,
             plan: None,
+            planning_attempts: Vec::new(),
             deliverable: crate::ports::tasks::TaskDeliverable::Once,
             workflow_proposal: None,
             origin_run_id: None,
@@ -2975,28 +3000,12 @@ impl HarnessBrain {
         // the agent was cut off — and because a turn whose only outcome was
         // overflow has no reply to append to.
         if let Some(notice) = self.park_approval_requests(host).await? {
-            channel_responses.push(OutboundMessage {
-                message_id: None,
-                task_id: None,
-                channel: "operator".to_string(),
-                agent: None,
-                text: notice,
-                steps: Vec::new(),
-                reply_to: None,
-            });
+            channel_responses.push(system_notice(notice));
         }
 
         // The runtime requires at least one channel response per cycle.
         if channel_responses.is_empty() {
-            channel_responses.push(OutboundMessage {
-                message_id: None,
-                task_id: None,
-                channel: "operator".to_string(),
-                agent: None,
-                text: "Acknowledged.".to_string(),
-                steps: Vec::new(),
-                reply_to: None,
-            });
+            channel_responses.push(system_notice("Acknowledged.".to_string()));
         }
 
         let trace = CompressedTrace::now(
@@ -4099,6 +4108,7 @@ members = ["engineer"]
             parent_task_id: None,
             output: None,
             plan: None,
+            planning_attempts: Vec::new(),
             deliverable: crate::ports::tasks::TaskDeliverable::Once,
             workflow_proposal: None,
             origin_run_id: None,
@@ -6457,7 +6467,10 @@ members = ["eng1", "eng2"]
             ) -> Result<Vec<StoredEvent>> {
                 Ok(Vec::new())
             }
-            fn subscribe(&self, _id: &CompanyId) -> BoxStream<'static, StoredEvent> {
+            fn subscribe(
+                &self,
+                _id: &CompanyId,
+            ) -> BoxStream<'static, crate::ports::events::EventStreamItem> {
                 Box::pin(stream::empty())
             }
         }
@@ -6639,6 +6652,7 @@ members = ["eng1", "eng2"]
                 mode: "supervised".to_string(),
                 always_approve: Vec::new(),
                 auto_approve_under_usd: None,
+                approval_ttl_hours: None,
             },
             None,
         )
@@ -7466,6 +7480,7 @@ members = ["eng1", "eng2"]
             parent_task_id: None,
             output: None,
             plan: None,
+            planning_attempts: Vec::new(),
             deliverable: crate::ports::tasks::TaskDeliverable::Once,
             workflow_proposal: None,
             origin_run_id: None,
@@ -8776,6 +8791,25 @@ members = ["eng1", "eng2"]
             bubble.agent.as_deref(),
             Some(bubble.channel.as_str()),
             "author and destination must not be the same value — that conflation is issue #885"
+        );
+    }
+
+    /// Issue #966: a bubble the runtime wrote names a non-agent author.
+    ///
+    /// Asserts it is not `"operator"` specifically, rather than only that it
+    /// equals the constant. The whole defect is that a host-authored notice and
+    /// a reply whose author was overwritten stored the *same* value, so a test
+    /// that checked equality alone would still pass if `SYSTEM_AUTHOR` were ever
+    /// redefined to the channel name.
+    #[test]
+    fn a_host_authored_notice_is_not_authored_by_the_operator_channel() {
+        let bubble = system_notice("Acknowledged.".to_string());
+        assert_eq!(bubble.channel, "operator", "the destination is unchanged");
+        assert_eq!(bubble.agent.as_deref(), Some(crate::ports::SYSTEM_AUTHOR));
+        assert_ne!(
+            bubble.agent.as_deref(),
+            Some("operator"),
+            "a notice must not store the author a destination-overwrite produces"
         );
     }
 }

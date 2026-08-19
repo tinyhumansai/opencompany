@@ -102,6 +102,19 @@ impl TriageVerdict {
         matches!(self, Self::Answer)
     }
 
+    /// Whether the model positively read this message as **conversation**
+    /// (issue #984) — so the deterministic card paths open nothing for it.
+    ///
+    /// [`Work`](Self::Work) and [`Unavailable`](Self::Unavailable) are both
+    /// false, and for the same reason from opposite directions: `Work` is the
+    /// model saying a card is right, and `Unavailable` is the model saying
+    /// nothing at all. Only an explicit `Chatter` may subtract a card, which is
+    /// what keeps every degraded path byte-identical to the behaviour before
+    /// this verdict had a consumer.
+    pub fn is_chatter(&self) -> bool {
+        matches!(self, Self::Chatter)
+    }
+
     /// Reads a model's reply as a verdict, or [`Self::Unavailable`].
     ///
     /// A **closed vocabulary**, matched on the first recognised word rather than

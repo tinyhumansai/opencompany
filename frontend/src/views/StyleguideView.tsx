@@ -222,7 +222,7 @@ function ColorSection() {
   return (
     <Section
       title="Color"
-      hint="Brand indigo is the only hue the product owns. It marks interaction and identity — never status."
+      hint="Brand violet is the only hue the product owns. It marks interaction and identity — never status."
     >
       <div>
         <h3 className="mb-2 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -264,20 +264,35 @@ function ColorSection() {
 
       <div>
         <h3 className="mb-2 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
-          Text on background
+          Text hierarchy
         </h3>
         <Card>
           <CardContent className="space-y-1 py-4">
-            <p className="text-sm text-foreground">
-              foreground — primary reading text. 17.6:1
+            <p className="text-sm text-ink-primary">
+              ink-primary — active labels, channel headers. 16.5:1
             </p>
-            <p className="text-sm text-muted-foreground">
-              muted-foreground — secondary and metadata. 4.9:1
+            <p className="text-sm text-ink-secondary">
+              ink-secondary — nav items, section labels, names. 7.5:1
             </p>
-            <p className="text-sm text-primary">primary — links and emphasis. 4.6:1</p>
+            <p className="text-sm text-ink-tertiary">
+              ink-tertiary — descriptions, body text. 6.4:1
+            </p>
+            <p className="text-sm text-ink-hint">
+              ink-hint — subtitles, empty-state prompts. 5.4:1
+            </p>
+            <p className="text-sm text-ink-muted">
+              ink-muted — member counts, metadata. 4.5:1
+            </p>
+            <p className="text-sm text-primary">primary — links and emphasis. 4.7:1</p>
             <p className="text-sm text-destructive">destructive — errors. 3.8:1 (marks)</p>
           </CardContent>
         </Card>
+        <p className="mt-2 text-2xs text-muted-foreground">
+          Five levels, from the brand guide. Ratios are worst case across both
+          themes and every ground text sits on — the canvas, a card, and the
+          active row. The weakest level sits on 4.5:1 and the rest step up from
+          it in even increments of lightness.
+        </p>
       </div>
 
       <div>
@@ -298,7 +313,7 @@ function ColorSection() {
           ))}
         </div>
         <p className="mt-2 text-2xs text-muted-foreground">
-          Ordered so the two-series case gets indigo and cyan — the pair that
+          Ordered so the two-series case gets violet and cyan — the pair that
           survives the most common colour-vision deficiencies.
         </p>
       </div>
@@ -401,7 +416,7 @@ function StatusSection() {
         </CardContent>
       </Card>
       <p className="text-2xs text-muted-foreground">
-        Never use brand indigo for a status, and never use a status hue for
+        Never use the brand violet for a status, and never use a status hue for
         something clickable. The moment those cross, a green dot stops meaning
         "done".
       </p>

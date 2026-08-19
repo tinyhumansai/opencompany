@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, CircleDot, Copy, Hash, Lock, PanelRight, PanelLeft } from "lucide-react";
+import { Check, CircleDot, Copy, Hash, Lock, PanelLeft, Users } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -44,7 +44,7 @@ export function ChatHeader({
   }
 
   return (
-    <header className="flex h-13 shrink-0 items-center gap-2 border-b px-3">
+    <header className="flex h-15.5 shrink-0 items-center gap-2 border-b px-6">
       {onOpenRail && (
         <Button
           variant="ghost"
@@ -83,11 +83,14 @@ export function ChatHeader({
       <Button
         variant="ghost"
         size="sm"
-        className={cn("h-8 gap-1.5 px-2 text-xs", membersOpen && "bg-accent")}
+        className={cn(
+          "h-7 gap-1.5 rounded-full border px-2.5 text-xs",
+          membersOpen ? "bg-accent" : "bg-muted/60",
+        )}
         onClick={onToggleMembers}
         aria-pressed={membersOpen}
       >
-        <PanelRight className="size-4" />
+        <Users className="size-3.5" />
         <span className="tabular-nums">{memberCount}</span>
         <span className="sr-only">{membersOpen ? "Hide" : "Show"} members</span>
       </Button>

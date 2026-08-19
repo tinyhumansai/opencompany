@@ -1512,6 +1512,7 @@ mod tests {
             mode: mode.to_string(),
             always_approve: always.iter().map(|s| s.to_string()).collect(),
             auto_approve_under_usd: auto_under,
+            approval_ttl_hours: None,
         };
         ApprovalPolicy::new(&p, Some(25.0))
     }
@@ -1667,6 +1668,7 @@ mod tests {
             mode: "full".to_string(),
             always_approve: fence.iter().map(|s| s.to_string()).collect(),
             auto_approve_under_usd: None,
+            approval_ttl_hours: None,
         });
 
         let mut agreed = 0;
@@ -3486,6 +3488,7 @@ mod tests {
             mode: mode.to_string(),
             always_approve: Vec::new(),
             auto_approve_under_usd: auto_under,
+            approval_ttl_hours: None,
         };
         let queue = ApprovalRequestQueue::default();
         let grants = queue.grants();
@@ -3744,6 +3747,7 @@ mod tests {
             mode: "full".to_string(),
             always_approve: Vec::new(),
             auto_approve_under_usd: None,
+            approval_ttl_hours: None,
         };
         let uncapped = ApprovalPolicy::new(&p, None)
             .with_requests(ApprovalRequestQueue::default())
@@ -3779,6 +3783,7 @@ mod tests {
             mode: "full".to_string(),
             always_approve: Vec::new(),
             auto_approve_under_usd: None,
+            approval_ttl_hours: None,
         };
         let no_meter = ApprovalPolicy::new(&p, Some(5.0))
             .with_requests(ApprovalRequestQueue::default())

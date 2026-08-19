@@ -40,8 +40,18 @@ async function selectWorkflow(page: Page, name: string) {
 }
 
 /** Best-effort teardown so a failed spec does not poison the next run. */
+/**
+ * Best-effort teardown so a failed spec does not poison the next run.
+ * `expectedVersion` is required (issue #1013), so this reads the workflow's
+ * current token first.
+ */
 async function removeWorkflow(request: APIRequestContext, id: string) {
-  await request.delete(`${COMPANY_SCOPE}/workflows/${id}`).catch(() => undefined);
+  const version = await request
+    .get(`${COMPANY_SCOPE}/workflows/${id}`)
+    .then(async (res) => (res.ok() ? ((await res.json()).version as string | null) : null))
+    .catch(() => null);
+  const query = version ? `?expectedVersion=${encodeURIComponent(version)}` : "";
+  await request.delete(`${COMPANY_SCOPE}/workflows/${id}${query}`).catch(() => undefined);
 }
 
 const SUBMIT = "workflow-dialog-submit";

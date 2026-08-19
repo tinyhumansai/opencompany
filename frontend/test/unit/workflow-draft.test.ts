@@ -15,6 +15,7 @@ import { draftBanners } from "@/lib/workflow-draft";
 const GRAPH: WorkflowGraph = {
   id: "weekly-digest",
   name: "Weekly digest",
+  version: null,
   nodes: [],
   edges: [],
 };

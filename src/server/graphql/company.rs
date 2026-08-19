@@ -349,6 +349,14 @@ pub struct ApprovalGql {
     /// Epoch-millis the effect was parked. `Float` round-trips the full u64
     /// range that would overflow GraphQL's `Int`.
     pub at_millis: f64,
+    /// Epoch-millis this approval default-denies if nobody decides it
+    /// (issue #971). `Float` for the same reason as `atMillis`.
+    ///
+    /// Carried here rather than left to the REST summary alone so the two
+    /// projections of one approval cannot drift into disagreeing about when it
+    /// dies — which is the sort of divergence a reader discovers by acting on
+    /// the wrong one. Null against a host that does not report a deadline.
+    pub expires_at_millis: Option<f64>,
     /// Whether `amountUsd` was withheld from this reader by their role (#618).
     ///
     /// Carried for the same reason it is on the REST summary: a `null` amount
@@ -371,6 +379,7 @@ impl From<crate::runtime::types::ApprovalSummary> for ApprovalGql {
             kind: summary.kind,
             amount_usd: summary.amount_usd,
             at_millis: summary.at_millis as f64,
+            expires_at_millis: summary.expires_at_millis.map(|ms| ms as f64),
             contents_hidden: summary.contents_hidden,
             workflow_run_id: summary.workflow_run_id,
         }

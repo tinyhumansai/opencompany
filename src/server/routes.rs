@@ -243,13 +243,19 @@ impl Serving {
         self.listener.local_addr()
     }
 
-    /// Serves until the process ends or the task is dropped.
+    /// Serves until a termination signal arrives (see [`serve_on`]) or the task
+    /// is dropped.
     pub async fn run(self) -> Result<()> {
         serve_on(self.listener, self.state).await
     }
 }
 
-/// Serves on a listener the caller already bound.
+/// Serves on a listener the caller already bound, until a termination signal.
+///
+/// Returns `Ok(())` on a graceful shutdown, so the CLI's `serve` exits `0` on a
+/// rollout rather than reporting a failure it did not have. What "graceful"
+/// means here — and what it deliberately does not wait for — is spelled out on
+/// [`serve_on_until`].
 ///
 /// The one production serving path — `bind`/`serve` and the desktop app's own
 /// [`start_local`](crate::desktop::start_local) both end up here, so there is
@@ -268,11 +274,120 @@ impl Serving {
 /// loopback, so the peer this process observes reads as loopback regardless of
 /// where its own caller actually was).
 pub async fn serve_on(listener: TcpListener, state: AppState) -> Result<()> {
-    axum::serve(
+    serve_on_until(listener, state, crate::server::shutdown::signal()).await
+}
+
+/// [`serve_on`] with the termination signal supplied by the caller.
+///
+/// Exists for tests: a test cannot raise a real `SIGTERM` at its own process
+/// without every *other* test in the binary receiving it too, and the thing
+/// worth proving here is what happens *after* the signal, not that tokio
+/// delivers one.
+///
+/// ## The shutdown sequence
+///
+/// On the signal, in order:
+///
+/// 1. Every registered company stops accepting new cycles and the ones in
+///    flight are waited on, bounded by
+///    [`shutdown::grace_from_env`](crate::server::shutdown::grace_from_env).
+///    The server is deliberately **still serving** through this: the console's
+///    event stream is how an operator watches the turn land, and cutting it at
+///    the signal would hide the very work the drain exists to preserve. New
+///    cycles are refused with `503 Quiescing` in the meantime, which is what
+///    "stop accepting new work" means for a host whose work does not arrive on
+///    the connection it will be done on.
+/// 2. The listener stops accepting and open connections are given
+///    [`CONNECTION_GRACE`](crate::server::shutdown::CONNECTION_GRACE) to finish
+///    writing.
+/// 3. The process returns regardless. This is the ceiling that matters: the
+///    console's event stream never ends on its own, so waiting for connections
+///    to close on their own terms would hold the pod open until the kubelet's
+///    `SIGKILL` — trading a clean exit for the exact abrupt one this is here to
+///    remove.
+///
+/// Step 2's clock starts when the drain *returns*, not at the signal, so an idle
+/// host with an open event stream exits in about `CONNECTION_GRACE` rather than
+/// sitting out the whole bound. Total time from signal to exit is therefore at
+/// most `grace + CONNECTION_GRACE` — the number the pod's
+/// `terminationGracePeriodSeconds` has to stay above.
+///
+/// `/healthz` is untouched. Nothing in this path runs before the signal, and the
+/// signal only arrives at the end of a pod's life — the manager's
+/// wake-on-request proxy blocks on that endpoint during *boot*, which this
+/// cannot reach.
+pub async fn serve_on_until<S>(listener: TcpListener, state: AppState, signal: S) -> Result<()>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    serve_on_until_with_grace(
+        listener,
+        state,
+        signal,
+        crate::server::shutdown::grace_from_env(),
+    )
+    .await
+}
+
+/// [`serve_on_until`] with the drain bound supplied by the caller.
+///
+/// Split out so a test can prove the ceiling without waiting the real
+/// twenty-five seconds for it — and without mutating process environment, which
+/// no test can do safely in a binary whose other tests share the process.
+pub(crate) async fn serve_on_until_with_grace<S>(
+    listener: TcpListener,
+    state: AppState,
+    signal: S,
+    grace: std::time::Duration,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    use std::future::IntoFuture;
+
+    let drain_state = state.clone();
+    // Starts the ceiling's clock when the *drain* returns, not at the signal.
+    //
+    // Timing it from the signal instead would make the connection window
+    // whatever the drain left over — up to the whole of `grace` on an idle host
+    // — so a tenant with nothing in flight but an open event stream would sit
+    // there for the full bound before exiting. That is the rollout latency this
+    // whole change exists to reduce. Drained-then-two-seconds keeps the worst
+    // case identical (`grace` + `CONNECTION_GRACE`, since `drain` is itself
+    // bounded by `grace`) while letting the common case go quickly.
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutting_down = async move {
+        signal.await;
+        crate::server::shutdown::arm_force_exit_on_second_signal();
+        crate::server::shutdown::drain(&drain_state, grace).await;
+        let _ = drained_tx.send(());
+    };
+
+    // `into_future` because `WithGracefulShutdown` is `IntoFuture`, not
+    // `Future`, and the ceiling below has to race a *pinned* server future.
+    let serving = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutting_down)
+    .into_future();
+    tokio::pin!(serving);
+    // `Err` means the sender was dropped, which can only happen once the serve
+    // future is gone — at which point the other arm has already won.
+    let ceiling = async {
+        if drained_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(crate::server::shutdown::CONNECTION_GRACE).await;
+    };
+
+    tokio::select! {
+        served = &mut serving => served?,
+        () = ceiling => tracing::warn!(
+            "connections were still open {}s after the drain finished; exiting anyway",
+            crate::server::shutdown::CONNECTION_GRACE.as_secs()
+        ),
+    }
     Ok(())
 }
 

@@ -15,6 +15,9 @@ import type {
  * raw third-party payload is ever on the wire.
  */
 export type CompanyStreamEvent =
+  // A structural control frame, never a journal event. The receiver fell
+  // behind, so durable views must re-read their canonical endpoints.
+  | { type: "stream_gap"; missed: number }
   | {
       type: "agent_reply";
       seq: number;
@@ -53,6 +56,32 @@ export type CompanyStreamEvent =
   // the card sits. There is **no title and no note** on purpose — the card's
   // text lives on `GET …/tasks`, and a console reacts to this frame by
   // re-reading that, so the board's content has exactly one source.
+  // One task attempt moved (issue #1015). Before this the task detail screen
+  // could only learn an attempt's status by polling every four seconds — and not
+  // at all while the tab was hidden — which is the surface #581 removed
+  // elsewhere when it replaced the whole-company refetch with Snapshot +
+  // Refresh.
+  //
+  // Deliberately thin, like `task_card_changed` beside it: ids, the status, and
+  // where it came from. There is **no error text** on purpose — a failure reason
+  // is tenant-scoped, so a console reacts to this frame by re-reading the run
+  // row, which is the one place that answers *why*.
+  | {
+      type: "run_status_changed";
+      seq: number;
+      atMillis: number;
+      runId: string;
+      /** Absent for a chat turn, which is an attempt at work with no card. */
+      taskId?: string;
+      /** 1-based attempt ordinal at that card. */
+      attempt: number;
+      /** The status moved to, widened so a word from a newer host is not a type
+       *  error. */
+      status: string;
+      /** The status moved from. Absent on the mint, which has no prior state —
+       *  a presence check, matching `turn_started`'s `parentId`. */
+      from?: string;
+    }
   | {
       type: "task_card_changed";
       seq: number;
@@ -148,6 +177,22 @@ export type CompanyStreamEvent =
       atMillis: number;
       approvalId: string;
       verdict: string;
+      /**
+       * The **host** resolved this, not a person (#971) — an approval that sat
+       * past its deadline and was declined on its own.
+       *
+       * A bit derived from the event's actor, never the actor itself: this feed
+       * is deny-by-default and carries no `by` and no user id, which is a
+       * property the host asserts. It answers the only question the console has
+       * — "did somebody decide this?" — and answering it matters because
+       * without it an expiry toasted "Approval denied", telling an operator
+       * they had declined a request they never saw.
+       *
+       * Absent on a person's own decision and against a host that predates the
+       * field. Both mean the same thing to a reader: treat it as a decision
+       * somebody made, exactly as before.
+       */
+      automatic?: boolean;
     }
   | {
       type: "lifecycle_changed";
@@ -346,6 +391,16 @@ interface Options {
    */
   pendingApprovals: number;
   /**
+   * Re-reads durable state after a structural stream gap, a healthy stream
+   * connection, or a stream that failed to open. The latter keeps the hosted
+   * console current while the manager proxy fix in opencompany-microservice#23
+   * is rolling out.
+   */
+  onResync?: () => Promise<void> | void;
+  /** Reports a failed canonical recovery once, without turning ordinary gaps
+   * or reconnects into toast noise. */
+  onRecoveryError?: (error: unknown) => void;
+  /**
    * Called for each `AgentReply` so the shell can inject it into the active
    * chat's transcript. The shell dedupes against its own optimistic echo.
    */
@@ -365,6 +420,23 @@ interface Options {
    * two payloads collapsing means one is lost.
    */
   onTaskEvent?: (event: CompanyStreamEvent) => void;
+  /**
+   * Called for each `run_status_changed` frame (issue #1015) so a screen showing
+   * one card's attempts can re-read them the moment one moves, rather than up to
+   * a poll interval later.
+   *
+   * Separate from {@link Options.onTaskEvent} because they answer different
+   * questions: that one is which cards moved on the board, this one is what one
+   * card's attempt is doing. The task detail screen wants the second without
+   * re-reading the whole board on every transition of every run.
+   *
+   * Like {@link Options.onTaskEvent} this subscriber takes a **counter**, not
+   * the payload: it re-reads the detail, so two frames collapsing inside one
+   * React batch still means "re-read". It is therefore immune to frame loss,
+   * and the consumer keeps its poll as the fallback for a frame that never
+   * arrives at all.
+   */
+  onRunEvent?: (event: CompanyStreamEvent) => void;
   /**
    * Called for each `desk_task_completed` frame (issue #377) so the shell can
    * post a card-linked system marker into the channel the card was raised in.
@@ -470,12 +542,15 @@ export function useEvents(
     pendingApprovals,
     onAgentReply,
     onTaskEvent,
+    onRunEvent,
     onDispatchTerminal,
     onWorkspaceEvent,
     onTurnEvent,
     onWorkflowRunEvent,
     onWorkflowChanged,
     onApprovalEvent,
+    onResync,
+    onRecoveryError,
   }: Options,
 ): void {
   // Keep the latest callbacks without re-opening the stream when they change.
@@ -487,6 +562,10 @@ export function useEvents(
   useEffect(() => {
     onTaskEventRef.current = onTaskEvent;
   }, [onTaskEvent]);
+  const onRunEventRef = useRef(onRunEvent);
+  useEffect(() => {
+    onRunEventRef.current = onRunEvent;
+  }, [onRunEvent]);
   const onDispatchTerminalRef = useRef(onDispatchTerminal);
   useEffect(() => {
     onDispatchTerminalRef.current = onDispatchTerminal;
@@ -511,6 +590,14 @@ export function useEvents(
   useEffect(() => {
     onApprovalEventRef.current = onApprovalEvent;
   }, [onApprovalEvent]);
+  const onResyncRef = useRef(onResync);
+  useEffect(() => {
+    onResyncRef.current = onResync;
+  }, [onResync]);
+  const onRecoveryErrorRef = useRef(onRecoveryError);
+  useEffect(() => {
+    onRecoveryErrorRef.current = onRecoveryError;
+  }, [onRecoveryError]);
 
   // The rising-edge detector for pending approvals. Seeded with the current
   // value so we only toast on an *increase* observed while mounted, never on the
@@ -535,10 +622,45 @@ export function useEvents(
     // stream of frames either way, so everything below is unchanged.
     const url = `${client.baseUrl}${client.scopeFor(company)}/events`;
     let unsubscribe: () => void;
+    let opened = false;
+    let recoveryFailed = false;
+    let recoveryInFlight = false;
+    let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+    const recover = async () => {
+      if (recoveryInFlight) return;
+      recoveryInFlight = true;
+      try {
+        await onResyncRef.current?.();
+        recoveryFailed = false;
+      } catch (err) {
+        // A failed canonical read is actionable, but repeated reconnects must
+        // not flood the operator with the same error every thirty seconds.
+        if (!recoveryFailed) onRecoveryErrorRef.current?.(err);
+        recoveryFailed = true;
+      } finally {
+        recoveryInFlight = false;
+      }
+    };
+    const startReconciliation = () => {
+      if (reconcileTimer) return;
+      void recover();
+      reconcileTimer = setInterval(() => void recover(), 30_000);
+    };
+    // The hosted manager currently buffers the whole upstream response (#23),
+    // so an EventSource can remain CONNECTING forever without firing onOpen or
+    // onError. Treat that as loss of the incremental channel, not as silence.
+    const openDeadline = setTimeout(() => {
+      if (!opened) startReconciliation();
+    }, 10_000);
     try {
       unsubscribe = client.subscribeToEvents(company, {
         onOpen: () => {
+          opened = true;
+          clearTimeout(openDeadline);
+          if (reconcileTimer) clearInterval(reconcileTimer);
+          reconcileTimer = undefined;
           console.debug("[events] connected", { url });
+          void recover();
         },
         onMessage: (data) => {
           let event: CompanyStreamEvent;
@@ -551,29 +673,35 @@ export function useEvents(
           handleEvent(event, {
             onAgentReply: onAgentReplyRef.current,
             onTaskEvent: onTaskEventRef.current,
+            onRunEvent: onRunEventRef.current,
             onDispatchTerminal: onDispatchTerminalRef.current,
             onWorkspaceEvent: onWorkspaceEventRef.current,
             onTurnEvent: onTurnEventRef.current,
             onWorkflowRunEvent: onWorkflowRunEventRef.current,
             onWorkflowChanged: onWorkflowChangedRef.current,
             onApprovalEvent: onApprovalEventRef.current,
+            onResync: recover,
           });
         },
         onError: ({ reconnecting }) => {
-          // A dead stream and a reconnecting one are both survivable: the poll
-          // remains the source of truth, so this logs rather than retrying.
+          opened = false;
+          startReconciliation();
           console.debug("[events] stream error", { url, reconnecting });
         },
       });
     } catch (err) {
-      // No streaming in this environment, or a malformed URL. Nothing to do —
-      // the poll already covers it.
+      clearTimeout(openDeadline);
+      startReconciliation();
       console.debug("[events] stream unavailable, falling back to poll", err);
-      return;
+      return () => {
+        if (reconcileTimer) clearInterval(reconcileTimer);
+      };
     }
     console.debug("[events] connecting", { url });
 
     return () => {
+      clearTimeout(openDeadline);
+      if (reconcileTimer) clearInterval(reconcileTimer);
       console.debug("[events] disconnecting", { url });
       unsubscribe();
     };
@@ -596,14 +724,21 @@ export function handleEvent(
   const {
     onAgentReply,
     onTaskEvent,
+    onRunEvent,
     onDispatchTerminal,
     onWorkspaceEvent,
     onTurnEvent,
     onWorkflowRunEvent,
     onWorkflowChanged,
     onApprovalEvent,
+    onResync,
   } = subscribers;
   switch (event.type) {
+    // A gap means incremental state is no longer trustworthy. It is structural
+    // rather than an attention event, so recovery is deliberately toast-free.
+    case "stream_gap":
+      void onResync?.();
+      break;
     // Live turn frames drive the in-flight tool timeline — no toast, they render
     // inline in the chat.
     case "tool_call":
@@ -640,6 +775,14 @@ export function handleEvent(
     // notification.
     case "task_card_changed":
       onTaskEvent?.(event);
+      break;
+    // Issue #1015, and **no toast** for the reason the board frames above raise
+    // none, more strongly if anything: this fires several times per attempt —
+    // mint, start, settle — on every card and every chat turn. Toasting those
+    // would train the operator to dismiss the toasts that matter. The attempt
+    // row moving on the screen IS the notification.
+    case "run_status_changed":
+      onRunEvent?.(event);
       break;
     // Issue #377: the settle is two facts at once, so it reaches two
     // subscribers. The board gets its tick, exactly as it has since #464 — a
@@ -693,12 +836,26 @@ export function handleEvent(
       // Refresh first, then say so. The refresh is what settles an inline card
       // whose decision was made on the Approvals page (or in another tab).
       onApprovalEvent?.(event);
-      toast(
-        event.verdict === "approve" ? "Approval granted" : "Approval denied",
-        {
-          description: "An approval was just resolved.",
-        },
-      );
+      // #971: an expiry is a resolution — a default-deny on silence — but it is
+      // not a decision anybody made. Saying "Approval denied" for one told the
+      // operator they had declined something they never saw, and shortening the
+      // deadline to 24 hours turns that from rare into routine. So the
+      // host-resolved case gets its own words, and only that case: `automatic`
+      // is set solely on the System arm, so a person's own decision reads
+      // exactly as it did before.
+      if (event.automatic) {
+        toast("Approval expired", {
+          description:
+            "It passed its deadline with no decision, so it was declined.",
+        });
+      } else {
+        toast(
+          event.verdict === "approve" ? "Approval granted" : "Approval denied",
+          {
+            description: "An approval was just resolved.",
+          },
+        );
+      }
       break;
     case "lifecycle_changed":
       toast(`Company is now ${event.to}`, {

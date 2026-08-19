@@ -91,6 +91,9 @@ pub(crate) struct TaskCard {
     pub(crate) priority: String,
     pub(crate) assignee: String,
     pub(crate) updated_at: u64,
+    /// Lifetime task cost, including descendants. Omitted for a true zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cost: Option<CostDisplay>,
     /// The card this one was spawned from (#185). Omitted on a lineage root so
     /// the board's existing wire shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -175,6 +178,7 @@ impl From<TaskRecord> for TaskCard {
             priority: t.priority,
             assignee: t.assignee,
             updated_at: t.updated_at_millis,
+            cost: None,
             parent_task_id: t.parent_task_id,
             origin_chat_id: t.origin_chat_id,
             output: t.output,
@@ -264,8 +268,21 @@ struct DiscussionPath {
 /// this to render the Kanban columns and each card's detail (note, assignee).
 async fn list_tasks(company: ScopedCompany) -> Result<Json<Vec<TaskCard>>, ApiError> {
     let mut rows = company.runtime.tasks().list(company.id()).await?;
+    let costs = costs_for_board(&company, &rows).await?;
     rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at_millis));
-    Ok(Json(rows.into_iter().map(TaskCard::from).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| {
+                let cost = costs
+                    .totals
+                    .get(&row.id)
+                    .and_then(|total| CostDisplay::new(total.total_usd, company.may_read_contents));
+                let mut card = TaskCard::from(row);
+                card.cost = cost;
+                card
+            })
+            .collect(),
+    ))
 }
 
 /// Validates a proposed `parent_task_id` against the board.
@@ -432,6 +449,7 @@ async fn create_task(
         // lands in To-do like any other; the builder pass fires only when it is
         // dragged into In Progress. There is no proposal yet — the builder mints
         // one.
+        planning_attempts: Vec::new(),
         deliverable: body.deliverable.unwrap_or_default(),
         workflow_proposal: None,
         origin_run_id: None,
@@ -709,6 +727,12 @@ pub(crate) struct TimelineEntry {
     /// Optional scrubbed detail (see the type docs for what may appear here).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
+    /// Stable key for a cost row that did not originate in the journal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cost_key: Option<String>,
+    /// Source-currency USD for this line, or an explicit hidden state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cost: Option<CostDisplay>,
     /// For an `approval` entry: how long the company sat waiting on the
     /// operator before this resolution landed (issue #305).
     ///
@@ -842,16 +866,78 @@ pub(crate) struct LineageRef {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) column: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cost: Option<CostDisplay>,
 }
 
-impl From<&TaskRecord> for LineageRef {
-    fn from(t: &TaskRecord) -> Self {
+impl LineageRef {
+    fn from_task(t: &TaskRecord, cost: Option<CostDisplay>) -> Self {
         Self {
             id: t.id.clone(),
             title: t.title.clone(),
             column: t.column.clone(),
+            cost,
         }
     }
+}
+
+/// A positive USD amount or an explicit role-redacted state. A true zero is
+/// represented by omitting the whole object, never by rendering `$0.00`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CostDisplay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    hidden: bool,
+}
+
+impl CostDisplay {
+    pub(super) fn new(amount_usd: f64, may_read: bool) -> Option<Self> {
+        (amount_usd > 0.0).then(|| Self {
+            amount_usd: may_read.then_some(amount_usd),
+            hidden: !may_read,
+        })
+    }
+}
+
+async fn costs_for_board(
+    company: &ScopedCompany,
+    tasks: &[TaskRecord],
+) -> Result<super::task_cost::TaskCosts, ApiError> {
+    use std::collections::{HashMap, HashSet};
+
+    let runs = company
+        .runtime
+        .runs()
+        .list_runs(company.id(), &crate::ports::runs::RunFilter::default())
+        .await?;
+    let active: HashSet<&str> = runs
+        .iter()
+        .filter(|run| !run.status.is_terminal())
+        .map(|run| run.id.as_str())
+        .collect();
+    let mut live = HashMap::new();
+    if !active.is_empty() {
+        let since = now_millis().saturating_sub(crate::ports::usage::RETENTION_MILLIS);
+        match company.runtime.usage().query(company.id(), since).await {
+            Ok(samples) => {
+                for sample in samples {
+                    if let Some(run_id) = sample.run_id
+                        && active.contains(run_id.as_str())
+                    {
+                        *live.entry(run_id).or_insert(0.0) += sample.cost_usd;
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(
+                company = %company.id(),
+                error = %err,
+                "[usage] live task cost reconciliation fell back to run snapshots"
+            ),
+        }
+    }
+    Ok(super::task_cost::reconcile(tasks, &runs, &live))
 }
 
 /// The parent/children view of a task.
@@ -1226,36 +1312,36 @@ async fn assemble_detail_with_cursor(
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(format!("task {task_id}")))?;
 
     // Lineage is a pure board read — no journal needed.
+    let costs = costs_for_board(company, &rows).await?;
+    let display_cost = |id: &str| {
+        costs
+            .totals
+            .get(id)
+            .and_then(|total| CostDisplay::new(total.total_usd, company.may_read_contents))
+    };
     let parent = card
         .parent_task_id
         .as_ref()
         .and_then(|pid| rows.iter().find(|t| &t.id == pid))
-        .map(LineageRef::from);
+        .map(|task| LineageRef::from_task(task, display_cost(&task.id)));
     let mut children: Vec<&TaskRecord> = rows
         .iter()
         .filter(|t| t.parent_task_id.as_deref() == Some(task_id.as_str()))
         .collect();
     children.sort_by_key(|t| t.updated_at_millis);
-    let children = children.into_iter().map(LineageRef::from).collect();
+    let children = children
+        .into_iter()
+        .map(|task| LineageRef::from_task(task, display_cost(&task.id)))
+        .collect();
 
     // This card's attempts (issue #242), as a set of run ids. One query, bounded
     // by the card's own attempt count — and the authoritative half of the
     // correlation: a run id resolves to exactly one card, so "was this approval
     // parked under one of *my* attempts" is answerable without opening a run.
-    let task_runs: std::collections::HashSet<String> = company
-        .runtime
-        .runs()
-        .list_runs(
-            company.id(),
-            &crate::ports::runs::RunFilter::for_task(task_id.clone()),
-        )
-        .await?
-        .into_iter()
-        .map(|run| run.id)
-        .collect();
+    let task_runs = costs.run_ids.get(&task_id).cloned().unwrap_or_default();
 
     let TaskFold {
-        timeline,
+        mut timeline,
         mut approvals,
         discussion,
         discussion_has_more,
@@ -1331,6 +1417,31 @@ async fn assemble_detail_with_cursor(
     // read the same numbers rather than deriving them separately (#352 review).
     let durations = TaskDurations::compute(&timeline, waiting_since, now_millis());
 
+    if let Some(entries) = costs.entries.get(&task_id) {
+        timeline.extend(entries.iter().filter_map(|entry| {
+            CostDisplay::new(entry.amount_usd, company.may_read_contents).map(|cost| {
+                TimelineEntry {
+                    seq: 0,
+                    at_millis: entry.at_millis,
+                    kind: "note".to_string(),
+                    label: entry.label.clone(),
+                    detail: None,
+                    cost_key: Some(entry.key.clone()),
+                    cost: Some(cost),
+                    waited_millis: None,
+                }
+            })
+        }));
+        timeline.sort_by(|a, b| {
+            a.at_millis.cmp(&b.at_millis).then_with(|| {
+                a.cost_key
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.cost_key.as_deref().unwrap_or(""))
+            })
+        });
+    }
+
     // What a retry would re-do (issue #351). A pure journal read — one indexed
     // lookup, no event scan — so a task that did nothing irreversible costs
     // nothing extra however long the company has been running.
@@ -1354,7 +1465,12 @@ async fn assemble_detail_with_cursor(
     let runs = runs_for_task(company, &task_id).await?;
 
     Ok(TaskDetail {
-        task: card.into(),
+        task: {
+            let cost = display_cost(&card.id);
+            let mut task = TaskCard::from(card);
+            task.cost = cost;
+            task
+        },
         timeline,
         approvals,
         durations,
@@ -1859,6 +1975,8 @@ fn fold_page(
                 kind: kind.to_string(),
                 label,
                 detail,
+                cost_key: None,
+                cost: None,
                 waited_millis,
             });
         }
@@ -2310,6 +2428,8 @@ mod durations_test {
             kind: kind.to_string(),
             label: kind.to_string(),
             detail: None,
+            cost_key: None,
+            cost: None,
             waited_millis: waited,
         }
     }

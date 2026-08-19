@@ -7,6 +7,7 @@
 //! it is backed by a `std::sync::RwLock`, not a tokio lock.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::company::runtime::CompanyRuntime;
@@ -16,6 +17,13 @@ use crate::ports::types::CompanyId;
 #[derive(Clone, Default)]
 pub struct CompanyRegistry {
     inner: Arc<RwLock<HashMap<CompanyId, Arc<CompanyRuntime>>>>,
+    /// Set once the host has begun shutting down (issue #986), so a company
+    /// registered from here on is born quiesced.
+    ///
+    /// `Arc`-shared like [`inner`](Self::inner): every clone of the registry —
+    /// and so every clone of `AppState` — has to see the same answer, or the
+    /// handler that registers a company would consult its own private `false`.
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl CompanyRegistry {
@@ -34,11 +42,44 @@ impl CompanyRegistry {
     }
 
     /// Registers (or replaces) the runtime for `id`.
+    ///
+    /// A runtime registered after [`begin_shutdown`](Self::begin_shutdown) is
+    /// marked quiesced before it goes in, so it refuses every cycle and the
+    /// host never starts a turn it is not going to wait for (issue #986).
+    ///
+    /// This is the choke point rather than the individual callers because every
+    /// way a company becomes addressable — boot, `POST /api/v1/companies`, a
+    /// rebuild swap — ends here. Guarding the provisioning handler alone would
+    /// leave the other two, and re-scanning the registry after the drain would
+    /// still race with whatever lands after the final scan.
     pub fn insert(&self, id: CompanyId, runtime: Arc<CompanyRuntime>) {
-        self.inner
-            .write()
-            .expect("registry poisoned")
-            .insert(id, runtime);
+        // Under the write lock, so the flag cannot be set between the check and
+        // the insert: `begin_shutdown` orders itself against this by taking the
+        // same lock, and the drain snapshots the map only afterwards. A company
+        // is therefore either in that snapshot or born quiesced — never neither.
+        let mut map = self.inner.write().expect("registry poisoned");
+        if self.shutting_down.load(Ordering::SeqCst) {
+            runtime.mark_quiesced();
+        }
+        map.insert(id, runtime);
+    }
+
+    /// Marks the host as shutting down, so every subsequent
+    /// [`insert`](Self::insert) registers a quiesced runtime.
+    ///
+    /// Deliberately one-way. Nothing resumes a registry: the process is on its
+    /// way out, and a company that misses this window is registered normally by
+    /// the next boot.
+    pub fn begin_shutdown(&self) {
+        // Taken for the ordering, not for the map: holding the write lock here
+        // means no `insert` can be midway through its own check.
+        let _ordering = self.inner.write().expect("registry poisoned");
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`begin_shutdown`](Self::begin_shutdown) has been called.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     /// Removes and returns the runtime registered under `id`, if any.

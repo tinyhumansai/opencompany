@@ -32,7 +32,19 @@ export interface NodeMessage {
 export type NodeOutputView =
   | { state: "loading" }
   | { state: "unavailable" }
-  | { state: "present"; value: unknown; truncated: boolean };
+  | {
+      state: "present";
+      value: unknown;
+      truncated: boolean;
+      /**
+       * Whether the snapshot this node came from is a PARTIAL capture — the run
+       * failed or blocked rather than settling cleanly (issue #1008). Drives a
+       * badge that distinguishes "run stopped early, here is what it reached"
+       * from a clean result. Optional so a caller that has no partial signal
+       * (a live run's in-memory result) can omit it — absent reads as `false`.
+       */
+      partial?: boolean;
+    };
 
 /** One node's readable, shape-checked result, ready to render. */
 export interface NodeResult {

@@ -19,6 +19,30 @@ learns the verdict.
 due. The clock is injectable so schedule firing is tested deterministically
 without wall-clock waits.
 
+`maintenance.rs` is the third minute loop, and it is deliberately not a cron at
+all: `MaintenanceTicker` retires overdue approvals, unredeemed grants and stale
+fire claims for **every** registered company, once a minute (issue #971). One
+process-wide task over `CompanyRegistry`, shaped like `workflow_scheduler.rs`
+and for the same reason — a company can be registered after boot.
+
+That shape *is* the fix. Maintenance used to ride `scheduler.rs`'s loop, which
+is only spawned for a company whose manifest declares a `[[schedule]]` — so a
+company with none never swept anything, at any age, and a tenant driven entirely
+by workflow schedules accumulated approvals for days. Anything that must happen
+for every company hangs off the registry, never off a per-company spawn.
+
+Two things differ from the schedulers beside it. A **paused** company is still
+swept: this finishes work rather than starting it, and a paused company's queue
+is the one most likely to be full of requests nobody will answer. And the sweep
+is **capped per tick, oldest first**, so the first pass after a shortened
+deadline drains a backlog over a few minutes instead of bursting. Enforcement is
+not here — the gate re-checks the deadline under the lock that removes a parked
+entry, so an overdue approval default-denies on the operator's click whether or
+not this ever ran; what this adds is that the queue empties and the badge goes
+back to describing current state. `CompanyScheduler::tick_maintenance` remains
+as a thin delegate over the same `sweep_company`, so the two callers cannot
+drift.
+
 `workflow_scheduler.rs` drives the *other* kind of cron: the `schedule` a saved
 workflow graph's `trigger` node carries (issue #169). Same `CronExpr` matcher,
 same injectable `Clock`, same minute-boundary loop — but **one process-wide

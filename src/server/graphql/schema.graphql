@@ -10,6 +10,10 @@ type AgentTokens {
 	Total tokens attributed to them.
 	"""
 	tokens: Float!
+	"""
+	Source-currency USD attributed to the teammate, when visible.
+	"""
+	costUsd: Float
 }
 
 """
@@ -34,6 +38,16 @@ type Approval {
 	range that would overflow GraphQL's `Int`.
 	"""
 	atMillis: Float!
+	"""
+	Epoch-millis this approval default-denies if nobody decides it
+	(issue #971). `Float` for the same reason as `atMillis`.
+	
+	Carried here rather than left to the REST summary alone so the two
+	projections of one approval cannot drift into disagreeing about when it
+	dies — which is the sort of divergence a reader discovers by acting on
+	the wrong one. Null against a host that does not report a deadline.
+	"""
+	expiresAtMillis: Float
 	"""
 	Whether `amountUsd` was withheld from this reader by their role (#618).
 	
@@ -921,6 +935,10 @@ type Usage {
 	Aggregate totals.
 	"""
 	totals: UsageTotals!
+	"""
+	Whether positive cost was withheld by the reader's role.
+	"""
+	costHidden: Boolean!
 }
 
 """
@@ -978,7 +996,7 @@ type UsageTotals {
 	"""
 	Total inference cost, USD.
 	"""
-	costUsd: Float!
+	costUsd: Float
 	"""
 	Total OAuth calls.
 	"""

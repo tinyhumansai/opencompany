@@ -100,9 +100,18 @@ async function createWorkflow(
   return body.version as string;
 }
 
-/** Best-effort teardown so a failed spec does not poison the next run. */
+/**
+ * Best-effort teardown so a failed spec does not poison the next run.
+ * `expectedVersion` is required (issue #1013), so this reads the workflow's
+ * current token first — a spec's own copy may be stale by teardown time.
+ */
 async function removeWorkflow(request: APIRequestContext, id: string) {
-  await request.delete(`${COMPANY_SCOPE}/workflows/${id}`).catch(() => undefined);
+  const version = await request
+    .get(`${COMPANY_SCOPE}/workflows/${id}`)
+    .then(async (res) => (res.ok() ? ((await res.json()).version as string | null) : null))
+    .catch(() => null);
+  const query = version ? `?expectedVersion=${encodeURIComponent(version)}` : "";
+  await request.delete(`${COMPANY_SCOPE}/workflows/${id}${query}`).catch(() => undefined);
 }
 
 /**
@@ -245,7 +254,7 @@ test("a version conflict surfaces distinctly with a way out, and deletes nothing
 }) => {
   const id = `e2e-conflict-${Date.now()}`;
   const name = `Conflict probe ${Date.now()}`;
-  await createWorkflow(request, id, name);
+  const createdVersion = await createWorkflow(request, id, name);
 
   try {
     await page.goto("/#/workflows");
@@ -253,9 +262,14 @@ test("a version conflict surfaces distinctly with a way out, and deletes nothing
     await selectWorkflow(page, name);
 
     // Force the race for real: someone else edits the graph while this console
-    // holds the token it loaded a moment ago.
+    // holds the token it loaded a moment ago. `expectedVersion` is required
+    // (issue #1013) even for this first out-of-band write, so it goes in as the
+    // token `createWorkflow` handed back.
     const edited = await request.put(`${COMPANY_SCOPE}/workflows/${id}`, {
-      data: graphBody(id, name, "0 11 * * *", "Edited out-of-band, after the console loaded it."),
+      data: {
+        ...graphBody(id, name, "0 11 * * *", "Edited out-of-band, after the console loaded it."),
+        expectedVersion: createdVersion,
+      },
     });
     expect(edited.ok(), `out-of-band edit: ${edited.status()}`).toBeTruthy();
 
@@ -385,7 +399,7 @@ test("a stale save surfaces the conflict banner and writes nothing", async ({
 }) => {
   const id = `e2e-edit-conflict-${Date.now()}`;
   const name = `Edit conflict probe ${Date.now()}`;
-  await createWorkflow(request, id, name);
+  const createdVersion = await createWorkflow(request, id, name);
 
   try {
     await page.goto("/#/workflows");
@@ -395,9 +409,14 @@ test("a stale save surfaces the conflict banner and writes nothing", async ({
     const dialog = await openEditDialog(page);
 
     // Someone else saves while this dialog holds the token it loaded a moment
-    // ago. Forced for real, as with the delete conflict above.
+    // ago. Forced for real, as with the delete conflict above. `expectedVersion`
+    // is required (issue #1013), so this out-of-band write needs the token
+    // `createWorkflow` returned.
     const edited = await request.put(`${COMPANY_SCOPE}/workflows/${id}`, {
-      data: graphBody(id, name, "0 11 * * *", "Edited out-of-band, mid-edit."),
+      data: {
+        ...graphBody(id, name, "0 11 * * *", "Edited out-of-band, mid-edit."),
+        expectedVersion: createdVersion,
+      },
     });
     expect(edited.ok(), `out-of-band edit: ${edited.status()}`).toBeTruthy();
 

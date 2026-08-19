@@ -45,9 +45,28 @@ effect emitted ─▶ evaluate ─▶ Allow ─▶ execute, journal
                             ApprovalResolved event ─▶ follow-up cycle
 ```
 
-- **Default-deny on silence**: parked approvals expire (default 7 days,
-  configurable) to `deny`. Nothing irreversible ever happens because the
+- **Default-deny on silence**: parked approvals expire to `deny` after a
+  deadline — **24 hours** by default, set per company with
+  `[policy].approval_ttl_hours`. Nothing irreversible ever happens because the
   Operator was on vacation.
+- **Something has to run the sweep.** The deadline binds at resolution time
+  regardless — `resolve_at` re-checks it under the same lock that removes the
+  parked entry, so an overdue approval default-denies on the operator's click
+  whether or not anything swept. Emptying the *queue* is a separate job, done
+  by the process-wide `MaintenanceTicker` (`src/runtime/maintenance.rs`) once a
+  minute for every registered company. Until issue #971 it rode the manifest
+  cron scheduler, which is not spawned for a company with no `[[schedule]]` —
+  so those companies parked approvals forever and swept none, at any age.
+  Deadlines and the thing that enforces them are two features, and only one of
+  them was shipped.
+- **Retirement is a deny nobody made, and says so.** The journal records
+  `ApprovalExpired { reason }`, the event log gets
+  `ApprovalResolved { verdict: Deny, by: System }`, and the operator SSE frame
+  carries `automatic: true` so the console can say "expired" rather than
+  attributing the decline to whoever is looking. No grant is ever minted on
+  this path: an approval that disappears must never read as one that was
+  granted. Each card carries its own `expiresAtMillis`, so nothing vanishes
+  unannounced.
 - **Edit** lets the Operator amend the effect payload (fix the email, lower
   the amount) and approve the amended version; the brain sees both the
   original and the edit.

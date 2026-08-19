@@ -33,8 +33,8 @@ pub fn bucket_usage(
 
     // Series: zero-filled per-day input/output token sums.
     let mut per_day: HashMap<i64, (u64, u64)> = HashMap::new();
-    // Per-agent token sums (keyed by raw agent id).
-    let mut per_agent: HashMap<String, u64> = HashMap::new();
+    // Per-agent token and USD sums (keyed by raw agent id).
+    let mut per_agent: HashMap<String, (u64, f64)> = HashMap::new();
     // Per-provider OAuth-call counts.
     let mut per_provider: HashMap<String, u64> = HashMap::new();
 
@@ -55,8 +55,11 @@ pub fn bucket_usage(
         // without the guard, an agent that only made connected-tool calls would
         // appear as a 0-token bar.
         let tokens = s.input_tokens + s.output_tokens;
-        if tokens > 0 {
-            *per_agent.entry(s.agent.clone()).or_default() += tokens;
+        let agent_attributed = !matches!(s.kind, SampleKind::OauthCall | SampleKind::SearchCall);
+        if agent_attributed && (tokens > 0 || s.cost_usd > 0.0) {
+            let row = per_agent.entry(s.agent.clone()).or_default();
+            row.0 += tokens;
+            row.1 += s.cost_usd;
         }
 
         if s.kind == SampleKind::OauthCall {
@@ -96,9 +99,10 @@ pub fn bucket_usage(
 
     let mut by_agent: Vec<AgentTokens> = per_agent
         .into_iter()
-        .map(|(id, tokens)| AgentTokens {
+        .map(|(id, (tokens, cost_usd))| AgentTokens {
             name: roster.get(&id).cloned().unwrap_or(id),
             tokens,
+            cost_usd,
         })
         .collect();
     // Highest tokens first; name as a stable tie-breaker.

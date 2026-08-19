@@ -1194,7 +1194,15 @@ impl RuntimeBuilder {
                 ledgers: ledgers_for_guard.clone(),
                 facts: self.facts.unwrap_or_else(|| fs_ops.clone()),
                 artifacts: self.artifacts.unwrap_or_else(|| fs_ops.clone()),
-                runs: self.runs.unwrap_or_else(|| fs_ops.clone()),
+                // Issue #1015: every attempt status change journals a frame, so
+                // the task screen can be pushed rather than polled. Wrapped here
+                // rather than at the cycle's call sites because
+                // `reap_orphaned_runs` settles crash-killed runs through
+                // `finish_run` directly — see `runtime::run_events`.
+                runs: Arc::new(crate::runtime::run_events::EventingRunStore::new(
+                    self.runs.unwrap_or_else(|| fs_ops.clone()),
+                    events.clone(),
+                )),
                 workflow_revisions: self.workflow_revisions.unwrap_or_else(|| fs_ops.clone()),
                 schedule_fires: self.schedule_fires.unwrap_or_else(|| fs_ops.clone()),
                 workflow_run_outputs: self
@@ -4276,6 +4284,7 @@ mod test {
             parent_task_id: None,
             output: None,
             plan: None,
+            planning_attempts: Vec::new(),
             deliverable: crate::ports::tasks::TaskDeliverable::Once,
             workflow_proposal: None,
             origin_run_id: None,
@@ -4741,6 +4750,7 @@ mod test {
             mode: mode.to_string(),
             always_approve: always.iter().map(|s| s.to_string()).collect(),
             auto_approve_under_usd: under,
+            approval_ttl_hours: None,
         }
     }
 

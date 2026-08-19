@@ -2,6 +2,7 @@
 // never exposes runtime internals ("agent graph", "tier", "dispatch", "cycle",
 // "checkpoint", "A2A"). Everything a person sees goes through this layer.
 
+import type { TaskApprovalStatus } from "../api/tasks";
 import type { ApprovalSummary, FeedbackCategory, StandingGrant } from "../api/types";
 
 /**
@@ -34,6 +35,39 @@ export function lifecycle(
       return { label: "Archived", tone: "stopped" };
     default:
       return { label: titleCase(state), tone: "idle" };
+  }
+}
+
+/**
+ * What became of one of a task's approvals, in plain language.
+ *
+ * `expired` is the reason this exists (#971). It has been in
+ * {@link TaskApprovalStatus} since #333 and nothing could ever produce it,
+ * because nothing swept approvals for a company without a manifest schedule —
+ * so no surface ever needed words for it and none had any. Now that requests
+ * age out for every company, the state is reachable, and a surface reaching it
+ * without a phrase here would print the raw identifier at an operator: the one
+ * thing this module exists to prevent.
+ *
+ * The wording carries the distinction that matters. "Declined" and "Expired"
+ * are both a no, and the whole point of #971's honesty work is that an
+ * operator can tell the no they made from the one the deadline made — the same
+ * distinction the event stream's `automatic` flag carries.
+ *
+ * Exhaustive over the union rather than a table with a fallback: the union is
+ * closed and small, so a member added later should fail the build here rather
+ * than quietly render as a runtime identifier.
+ */
+export function approvalStatusLabel(status: TaskApprovalStatus): string {
+  switch (status) {
+    case "pending":
+      return "Waiting on you";
+    case "approved":
+      return "Approved";
+    case "denied":
+      return "Declined";
+    case "expired":
+      return "Expired — nobody decided in time";
   }
 }
 
@@ -557,6 +591,44 @@ export const FEEDBACK_CATEGORIES: { value: FeedbackCategory; label: string }[] =
 ];
 
 /** A short relative time like "2m ago", "3h ago", "just now". */
+/**
+ * Does approving this put something outside the company (#1024)?
+ *
+ * Reads the host's own `group`, never the effect `kind`. For a harness tool call
+ * `kind` IS the tool name — `composio_execute`, not `email.send` — so a predicate
+ * keyed on `kind` would match the native effects the icon table knows and miss
+ * the composio `GMAIL_SEND_EMAIL` send this was reported for. `group` is derived
+ * host-side from the tool *and its arguments*, the only place that is known.
+ *
+ * `other` is the catch-all internal bucket — the same line the host draws for
+ * `broadly_grantable`. An absent `group` is an older host and reads as internal,
+ * so the card renders exactly as it did before rather than labelling something
+ * this console cannot classify.
+ */
+export function leavesTheCompany(a: ApprovalSummary): boolean {
+  return a.group != null && a.group !== "other";
+}
+
+/**
+ * How old the parked payload is, and whether to say so loudly (#1024).
+ *
+ * `at_millis` is stamped when the effect is parked, in the same turn that
+ * composed its arguments — so it dates the payload, not the queue, and
+ * "Composed" is the honest word. "Parked" would be closer to the field name and
+ * would reintroduce the exact reading this fixes: parking is a queue event, and
+ * a queue reading is what let a five-day-old digest look routine.
+ *
+ * Labelled only for effects that leave the company. Elsewhere the age genuinely
+ * IS queue latency, and labelling it everywhere would spend the emphasis where
+ * it does not matter and dilute it where it does.
+ */
+export function payloadAge(a: ApprovalSummary, now: number): { text: string; emphasise: boolean } {
+  const age = timeAgo(a.at_millis, now);
+  return leavesTheCompany(a)
+    ? { text: `Composed ${age}`, emphasise: true }
+    : { text: age, emphasise: false };
+}
+
 export function timeAgo(atMillis: number, now: number): string {
   const secs = Math.max(0, Math.floor((now - atMillis) / 1000));
   if (secs < 45) return "just now";
@@ -566,6 +638,30 @@ export function timeAgo(atMillis: number, now: number): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+/**
+ * "in 42m" / "in 6h" / "in 3d" — how long something has left before a deadline.
+ *
+ * The counterpart to {@link timeAgo}, and it lives beside it for the reason
+ * this module exists: two places rendering a deadline in two vocabularies is
+ * how an operator ends up comparing "in 6h" on one row with "6 hours" on the
+ * next and wondering whether they mean the same thing. It was written for the
+ * standing-permission rows (#374) and is shared with the approval card's
+ * deadline (#971) rather than copied, so the buckets cannot drift apart.
+ *
+ * Clamped at zero: a deadline already passed reads "in 0m", never a negative.
+ * The caller decides what a passed deadline should say — the grants list, for
+ * instance, renders "expired" instead of calling this at all — because "what
+ * happens after the deadline" differs by surface and is not a formatting
+ * question.
+ */
+export function untilLabel(atMillis: number, now: number): string {
+  const mins = Math.max(0, Math.round((atMillis - now) / 60_000));
+  if (mins < 60) return `in ${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `in ${hours}h`;
+  return `in ${Math.round(hours / 24)}d`;
 }
 
 /**

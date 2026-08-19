@@ -25,7 +25,7 @@ stylesheet — and it needs no host, company, or sign-in.
 The stylesheet is three layers, and nothing skips one:
 
 ```
-1. PRIMITIVES   --brand-500, --gray-200, --green-mark
+1. PRIMITIVES   --brand-500, --surface-dark-2, --ink-light-hint, --green-mark
                 Raw ramps. Theme-independent. Never referenced by a component.
                 ↓
 2. SEMANTICS    --primary, --border, --status-running
@@ -55,7 +55,7 @@ the work.
 | `bg-[#5865f2]` | a named brand token | A raw hex cannot theme |
 | `text-green-600` (Tailwind palette) | `text-status-done-text` | Palette colours carry no meaning and are untuned for this canvas |
 | `shadow-lg` on a resting card | `border` + surface lightness | Elevation means "floats above the page" |
-| A new accent hue | the existing indigo | There is one accent |
+| A new accent hue | the existing violet | There is one accent |
 | `text-status-done` for a *label* | `text-status-done-text` | Mark weights measure 3:1 — enough for a dot, not for words |
 
 ---

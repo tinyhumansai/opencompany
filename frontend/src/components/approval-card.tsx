@@ -38,7 +38,7 @@ import {
 
 import type { OpenCompanyClient } from "@/api/client";
 import { GRANT_DURATIONS, type ApprovalSummary, type GrantScope } from "@/api/types";
-import { approvalAction, money, payloadLines, timeAgo } from "@/lib/language";
+import { approvalAction, money, payloadAge, payloadLines, untilLabel } from "@/lib/language";
 import { cn } from "@/lib/utils";
 
 const KIND_ICONS: Record<string, LucideIcon> = {
@@ -126,6 +126,8 @@ export function ApprovalMeta({
   // An id the roster does not know still beats no attribution at all — the
   // operator can at least tell two askers apart.
   const asker = a.agent ? (askerNames.get(a.agent) ?? a.agent) : null;
+  // #1024, computed once: the age, and whether this card should say it loudly.
+  const age = payloadAge(a, now);
 
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
@@ -149,7 +151,37 @@ export function ApprovalMeta({
           <span aria-hidden>·</span>
         </>
       )}
-      <span>{timeAgo(a.at_millis, now)}</span>
+      {/*
+       * #1024. The same integer means two different things depending on where it
+       * sits. In this footer, between "Asked by Maya" and "Open the card", a bare
+       * "5d ago" reads as QUEUE LATENCY — how long the operator's backlog has held
+       * this — a fact about the queue. What decides an outbound send is that the
+       * PAYLOAD is five days old, a fact about the content. A digest built from
+       * 13 Aug mailed as "Weekly Digest — 18 Aug" the moment a backlog was cleared,
+       * and the report says why nobody caught it: "from the operator's side it
+       * looked like a routine send." The signal was not missing — it was
+       * unlabelled, and dressed as routing metadata.
+       *
+       * Wording and emphasis both come from `payloadAge`, so they are testable as
+       * a string rather than only as rendered output.
+       */}
+      <span className={age.emphasise ? "font-medium text-foreground" : undefined}>
+        {age.text}
+      </span>
+      {/* The deadline (#971), beside how old the payload is — the two halves of
+          "is this still worth deciding?".
+
+          Rendered only when the host reports one. An absent
+          `expires_at_millis` means the host does not have deadlines, NOT that
+          this card has none, so the console shows nothing rather than
+          computing a deadline nothing would enforce: an operator who acted on
+          an invented "in 3h" would be refused. */}
+      {typeof a.expires_at_millis === "number" && (
+        <>
+          <span aria-hidden>·</span>
+          <span>declined {untilLabel(a.expires_at_millis, now)}</span>
+        </>
+      )}
       {status && (
         <>
           <span aria-hidden>·</span>

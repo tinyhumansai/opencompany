@@ -65,6 +65,25 @@ pub const INFERENCE_SPEND_KIND: &str = "inference.spend";
 /// tokens but bills backend-side and echoes no USD, so a token-bearing
 /// zero-cost cycle must not post a meaningless `$0.00` spend line to Finances.
 /// Its tokens still land on the Usage surface through [`inference_sample`].
+///
+/// # Sign (issue #1047)
+///
+/// The amount is posted **negative**. Inference is an outflow, and the ledger's
+/// convention — stated in [`finances`](super::finances) and implemented by
+/// `finances_from` — is that outflows are negative and inflows positive. This
+/// posted `usage.cost_usd` unnegated, so the projection read every model charge
+/// as income: `revenueUsd` and `balanceUsd` grew with spending while `spentUsd`
+/// and the `byCategory` breakdown stayed empty.
+///
+/// Negated **here**, at the one constructor every writer goes through
+/// (`harness::cost`, `metering::planning`, `metering::triage`,
+/// `metering::workflow_build`), rather than at the reader — the x402 outflow in
+/// `economy::adapter` already posts negative, so inverting `finances_from`
+/// would have meant changing that and both server fixtures to match a
+/// convention the docs already state correctly.
+///
+/// `usage.cost_usd` is a non-zero cost, so the result is strictly negative; the
+/// zero case returned above and never reaches here.
 pub fn inference_ledger_entry(usage: &TokenUsage, agent: &str) -> Option<LedgerEntry> {
     if usage.cost_usd == 0.0 {
         return None;
@@ -72,7 +91,7 @@ pub fn inference_ledger_entry(usage: &TokenUsage, agent: &str) -> Option<LedgerE
     Some(LedgerEntry {
         at_millis: now_millis(),
         kind: INFERENCE_SPEND_KIND.to_string(),
-        amount_usd: usage.cost_usd,
+        amount_usd: -usage.cost_usd,
         memo: agent.to_string(),
     })
 }
@@ -151,6 +170,106 @@ pub async fn record_inference_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Issue #1047, the test whose absence let this stand.** The writer and
+    /// the reader, together — because each was self-consistent and only their
+    /// pairing was wrong.
+    ///
+    /// A company that has only ever spent money must report that spending as
+    /// `spent_usd`. Before this, `inference_ledger_entry` posted the cost
+    /// unnegated and `finances_from` read a positive amount as income, so the
+    /// Finances surface showed growing **revenue** and a growing **balance**
+    /// while `spent_usd` and `by_category` stayed at zero.
+    ///
+    /// Asserts the **direction**, not the magnitude: `revenue_usd` must be
+    /// exactly zero and `balance_usd` must be negative. A test that only
+    /// checked `spent_usd.abs()` would pass with the sign flipped either way,
+    /// which is the failure mode that produced this bug.
+    #[test]
+    fn a_costed_cycle_is_spending_not_revenue() {
+        let usage = TokenUsage {
+            input: 1_000,
+            output: 200,
+            cached_input: 0,
+            cost_usd: 0.42,
+        };
+        let entry = inference_ledger_entry(&usage, "ceo").expect("a costed cycle posts");
+
+        // The writer's half: an outflow is negative.
+        assert!(
+            entry.amount_usd < 0.0,
+            "inference is an outflow, so the ledger amount is negative: {}",
+            entry.amount_usd
+        );
+        assert!((entry.amount_usd - -0.42).abs() < 1e-9);
+
+        // The reader's half, over the entry the writer actually produced.
+        let at_millis = entry.at_millis;
+        let finances = crate::metering::finances::finances_from(
+            std::slice::from_ref(&entry),
+            &crate::company::Budget { monthly_usd: None },
+            None,
+            at_millis,
+        );
+
+        assert!(
+            (finances.spent_usd - 0.42).abs() < 1e-9,
+            "the charge lands in spent_usd: {finances:?}"
+        );
+        assert_eq!(
+            finances.revenue_usd, 0.0,
+            "a company that only spent money has NO revenue: {finances:?}"
+        );
+        assert!(
+            finances.balance_usd < 0.0,
+            "and spending moves the balance down, not up: {}",
+            finances.balance_usd
+        );
+        assert_eq!(
+            finances.by_category.len(),
+            1,
+            "the spend is categorised rather than invisible: {finances:?}"
+        );
+        assert_eq!(finances.by_category[0].category, "Inference");
+        assert!((finances.by_category[0].amount - 0.42).abs() < 1e-9);
+    }
+
+    /// The operator-facing rendering, pinned because it is the half a sign
+    /// change could plausibly break: `Transaction` carries an **absolute**
+    /// amount plus a `Direction`, so negating the writer must flip the
+    /// direction to `Out` and must NOT start rendering a negative figure.
+    #[test]
+    fn a_charge_renders_as_an_outgoing_transaction_with_a_positive_amount() {
+        let usage = TokenUsage {
+            input: 10,
+            output: 5,
+            cached_input: 0,
+            cost_usd: 0.42,
+        };
+        let entry = inference_ledger_entry(&usage, "ceo").expect("a costed cycle posts");
+        let at_millis = entry.at_millis;
+        let finances = crate::metering::finances::finances_from(
+            std::slice::from_ref(&entry),
+            &crate::company::Budget { monthly_usd: None },
+            None,
+            at_millis,
+        );
+
+        assert_eq!(finances.transactions.len(), 1);
+        let tx = &finances.transactions[0];
+        assert!(
+            matches!(tx.direction, crate::metering::types::Direction::Out),
+            "a charge is money going out"
+        );
+        assert!(
+            tx.amount_usd > 0.0,
+            "the rendered amount stays a positive magnitude — the sign is the \
+             `direction` field's job, not the number's: {}",
+            tx.amount_usd
+        );
+        assert!((tx.amount_usd - 0.42).abs() < 1e-9);
+        assert_eq!(tx.category, "Inference");
+    }
 
     use std::sync::Mutex;
 
@@ -295,7 +414,8 @@ mod tests {
     fn spend_maps_to_the_inference_ledger_kind() {
         let entry = inference_ledger_entry(&usage_with(0.42), "ceo").unwrap();
         assert_eq!(entry.kind, INFERENCE_SPEND_KIND);
-        assert_eq!(entry.amount_usd, 0.42);
+        // Negative: an outflow, per the ledger convention (issue #1047).
+        assert_eq!(entry.amount_usd, -0.42);
         assert_eq!(entry.memo, "ceo");
     }
 
@@ -315,7 +435,8 @@ mod tests {
 
         let ledger = store.ledger.lock().unwrap();
         assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger[0].amount_usd, 1.5);
+        // Negative: an outflow, per the ledger convention (issue #1047).
+        assert_eq!(ledger[0].amount_usd, -1.5);
         let samples = meter.samples.lock().unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].kind, SampleKind::Inference);

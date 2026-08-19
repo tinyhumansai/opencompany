@@ -17,10 +17,18 @@
 //! `RequireApproval` outcome is minted separately by [`park`](ManifestApprovalGate::park).
 //!
 //! Silence is a default-deny: a parked approval left unresolved past its TTL
-//! (default [`DEFAULT_TTL_MILLIS`]) resolves to deny, whether swept by
+//! (default [`DEFAULT_TTL_MILLIS`], overridable per company with
+//! `[policy].approval_ttl_hours`) resolves to deny, whether swept by
 //! [`sweep_expired`](ManifestApprovalGate::sweep_expired) or observed at
 //! resolution time by [`resolve_at`](ManifestApprovalGate::resolve_at) /
 //! [`resolve_amended`](ManifestApprovalGate::resolve_amended).
+//!
+//! **The TTL is only half of default-deny-on-silence.** The other half is
+//! something actually running the sweep, which until issue #971 only a company
+//! with a manifest `[[schedule]]` had — see
+//! [`MaintenanceTicker`](crate::runtime::maintenance::MaintenanceTicker), which
+//! now drives it for every registered company. A shorter deadline with nothing
+//! sweeping is still a queue that never empties.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -36,8 +44,23 @@ use crate::ports::types::{
     Actor, ApprovalId, CompanyId, Effect, EffectGroup, PolicyDecision, Verdict,
 };
 
-/// Default time-to-live for a parked approval: 7 days in milliseconds.
-pub const DEFAULT_TTL_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Default time-to-live for a parked approval: 24 hours in milliseconds.
+///
+/// **Was 7 days until issue #971.** A parked call is refused and re-dispatched
+/// rather than suspended (#243/#469), so approving a three-day-old entry does
+/// not usefully resume the turn that raised it — the turn is long gone. A
+/// week-long deadline therefore did not buy an operator a week of useful
+/// decisions; it bought a queue whose oldest entries were unactionable *and*
+/// still counted toward the badge, which is how a badge stops describing
+/// current state and starts being ignored.
+///
+/// 24 hours is one working day: an approval raised during a day the operator
+/// works is still there when they next look, and one nobody looked at for a
+/// full day is one the work behind it has already moved past.
+///
+/// A company that genuinely wants longer says so explicitly with
+/// `[policy].approval_ttl_hours` rather than inheriting it from a constant.
+pub const DEFAULT_TTL_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
 /// Replays a company's event log to decide whether it should boot with the
 /// emergency stop engaged (issue #86).
@@ -140,10 +163,28 @@ pub struct ManifestApprovalGate {
 
 impl ManifestApprovalGate {
     /// Builds a gate from a company's manifest `[policy]` block.
+    ///
+    /// **The TTL default resolves HERE, not at parse** (issue #971).
+    /// [`Policy::approval_ttl_hours`] is a plain `Option` with no serde
+    /// default, so a manifest that never mentioned the knob deserializes to
+    /// `None` — the same bytes and the same value it did before the field
+    /// existed. That matters because
+    /// [`carry_policy_override`](crate::runtime::builder) compares the previous
+    /// boot's seed `[policy]` against this one's *as whole blocks* to decide
+    /// whether an operator's console override survives a rebuild. A field that
+    /// defaulted to `Some(24)` at parse would make the seed change under any
+    /// company whose manifest is silent the moment this constant moves, and the
+    /// rebuild would read that as version control having spoken and silently
+    /// discard the override. Nobody would have edited anything. See the same
+    /// trap spelled out on [`Policy::mode`](crate::company::Policy::mode).
     pub fn new(policy: Policy) -> Self {
+        let ttl_millis = policy
+            .approval_ttl_hours
+            .map(|hours| hours.saturating_mul(60 * 60 * 1000))
+            .unwrap_or(DEFAULT_TTL_MILLIS);
         Self {
             policy,
-            ttl_millis: DEFAULT_TTL_MILLIS,
+            ttl_millis,
             parked: Mutex::new(HashMap::new()),
             emergency: AtomicBool::new(false),
         }
@@ -178,6 +219,18 @@ impl ManifestApprovalGate {
         self
     }
 
+    /// How long a parked approval has before it default-denies.
+    ///
+    /// Read by [`CompanyRuntime::pending_approvals`](crate::CompanyRuntime::pending_approvals)
+    /// to project each card's deadline (issue #971). Exposed rather than
+    /// recomputed from `[policy]` at the projection because the gate is the one
+    /// that resolves the default, and a second resolution of the same rule is a
+    /// second thing that can disagree — the console would then show a deadline
+    /// the gate does not enforce.
+    pub fn ttl_millis(&self) -> u64 {
+        self.ttl_millis
+    }
+
     /// The ids of every currently-parked approval.
     pub fn parked_ids(&self) -> Vec<ApprovalId> {
         self.parked
@@ -203,12 +256,38 @@ impl ManifestApprovalGate {
     /// Removes every parked approval older than the TTL relative to `now`,
     /// returning the ids that expired (they resolve to deny).
     pub fn sweep_expired(&self, now_millis: u64) -> Vec<ApprovalId> {
+        self.sweep_expired_capped(now_millis, usize::MAX)
+    }
+
+    /// [`sweep_expired`](Self::sweep_expired), taking at most `limit` entries,
+    /// **oldest first** (issue #971).
+    ///
+    /// The cap is what keeps a first sweep after a long silence from turning
+    /// into one unbounded burst of retirement work. Each retirement is a
+    /// journal append, a grant clear, an event append and possibly a released
+    /// #469 continuation spawning a whole agent turn; a company that has been
+    /// accumulating for days would do all of that for its entire backlog inside
+    /// a single minute tick, on the tick shared by every other company in the
+    /// process. Capped, the backlog drains over a few minutes and nothing else
+    /// waits on it.
+    ///
+    /// **Oldest first, so the cap is not a lottery.** The map is a `HashMap`
+    /// and its iteration order is randomized per process, so an uncapped-order
+    /// cap would retire an arbitrary subset and leave an arbitrary one — the
+    /// same entry could sit unswept across many ticks while newer ones went
+    /// first. Sorting by park instant makes the drain deterministic and makes
+    /// "the oldest, most unactionable entries go first" true rather than
+    /// incidental.
+    pub fn sweep_expired_capped(&self, now_millis: u64, limit: usize) -> Vec<ApprovalId> {
         let mut map = self.parked.lock().expect("parked map poisoned");
-        let expired: Vec<ApprovalId> = map
+        let mut expired: Vec<(u64, ApprovalId)> = map
             .iter()
             .filter(|(_, pe)| now_millis.saturating_sub(pe.parked_at_millis) >= self.ttl_millis)
-            .map(|(id, _)| id.clone())
+            .map(|(id, pe)| (pe.parked_at_millis, id.clone()))
             .collect();
+        expired.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_ref().cmp(b.1.as_ref())));
+        expired.truncate(limit);
+        let expired: Vec<ApprovalId> = expired.into_iter().map(|(_, id)| id).collect();
         for id in &expired {
             map.remove(id);
         }
@@ -476,6 +555,7 @@ mod test {
             mode: mode.to_string(),
             always_approve: FENCE.iter().map(|s| s.to_string()).collect(),
             auto_approve_under_usd: cap,
+            approval_ttl_hours: None,
         }
     }
 
@@ -846,6 +926,105 @@ mod test {
         assert_eq!(decide(&gate, &cheap).await, PolicyDecision::RequireApproval);
         // ...but a dollar under a hundred-dollar cap is not irreversible.
         assert!(!gate.is_irreversible(&cheap));
+    }
+
+    /// **T5 (issue #971).** The deadline binds even when nothing swept.
+    ///
+    /// The sweep is housekeeping — it retires an entry and tells the operator —
+    /// but it is emphatically not the enforcement. `resolve_at` re-checks the
+    /// TTL under the same lock that removes the entry, so a 25-hour-old
+    /// approval default-denies on the operator's click whether or not any
+    /// maintenance tick ever ran for that company. That property is what made
+    /// the missing ticker a *visibility* bug rather than a safety one, and it
+    /// has to survive the ticker landing: a future refactor that made the sweep
+    /// the only expiry path would turn a paused host into one that honours
+    /// week-old consent.
+    #[tokio::test]
+    async fn the_default_deadline_binds_at_resolve_with_no_sweep() {
+        // No `with_ttl_millis`: the default the constant resolves to, so this
+        // fails if the 24h default is quietly widened again.
+        let gate = ManifestApprovalGate::new(policy("supervised", None));
+        assert_eq!(gate.ttl_millis(), 24 * 60 * 60 * 1000);
+        let id = gate
+            .park(&company(), effect("filing.submit", EffectGroup::Sign))
+            .await
+            .unwrap();
+        let twenty_five_hours = now_millis() + 25 * 60 * 60 * 1000;
+        // Nothing swept: the entry is still parked right up to the click.
+        assert_eq!(gate.parked_ids(), vec![id.clone()]);
+        assert_eq!(
+            gate.resolve_at(&id, Verdict::Approve, operator(), twenty_five_hours),
+            None,
+            "a 25h-old approval must default-deny even though no sweep ran"
+        );
+        // And an hour earlier it would still have been approvable, so the
+        // assertion above is about the deadline and not about `resolve_at`
+        // refusing everything.
+        let gate = ManifestApprovalGate::new(policy("supervised", None));
+        let id = gate
+            .park(&company(), effect("filing.submit", EffectGroup::Sign))
+            .await
+            .unwrap();
+        let twenty_three_hours = now_millis() + 23 * 60 * 60 * 1000;
+        assert!(
+            gate.resolve_at(&id, Verdict::Approve, operator(), twenty_three_hours)
+                .is_some()
+        );
+    }
+
+    /// `[policy].approval_ttl_hours` is what the gate enforces, and an absent
+    /// knob resolves to the default **here** rather than at parse (issue #971).
+    #[tokio::test]
+    async fn the_policy_knob_sets_the_deadline() {
+        let configured = Policy {
+            approval_ttl_hours: Some(2),
+            ..policy("supervised", None)
+        };
+        let gate = ManifestApprovalGate::new(configured);
+        assert_eq!(gate.ttl_millis(), 2 * 60 * 60 * 1000);
+
+        let silent = policy("supervised", None);
+        assert_eq!(
+            silent.approval_ttl_hours, None,
+            "a silent manifest must stay `None` through parse — see the field's note"
+        );
+        assert_eq!(
+            ManifestApprovalGate::new(silent).ttl_millis(),
+            DEFAULT_TTL_MILLIS
+        );
+    }
+
+    /// The per-tick cap takes the **oldest** expired entries, not an arbitrary
+    /// subset of them (issue #971).
+    ///
+    /// `parked` is a `HashMap`, so without the sort this passes or fails by
+    /// process-random iteration order — and in production an entry could sit
+    /// unretired across many ticks while newer ones drained ahead of it.
+    #[tokio::test]
+    async fn the_sweep_cap_drains_oldest_first() {
+        let gate = ManifestApprovalGate::new(policy("supervised", None)).with_ttl_millis(0);
+        let mut ids = Vec::new();
+        for i in 0..5u64 {
+            let id = gate
+                .park(&company(), effect("filing.submit", EffectGroup::Sign))
+                .await
+                .unwrap();
+            // Re-park under a known instant: `park` stamps `now`, and five
+            // parks inside one millisecond would make "oldest" undecidable.
+            gate.rehydrate(
+                id.clone(),
+                effect("filing.submit", EffectGroup::Sign),
+                1_000 + i,
+            );
+            ids.push(id);
+        }
+        let first = gate.sweep_expired_capped(10_000, 2);
+        assert_eq!(first, ids[..2].to_vec());
+        let second = gate.sweep_expired_capped(10_000, 2);
+        assert_eq!(second, ids[2..4].to_vec());
+        // The uncapped form is the same sweep with no limit.
+        assert_eq!(gate.sweep_expired(10_000), ids[4..].to_vec());
+        assert!(gate.parked_ids().is_empty());
     }
 
     #[tokio::test]

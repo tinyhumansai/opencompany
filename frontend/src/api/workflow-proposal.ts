@@ -114,7 +114,13 @@ export function readProposal(reply: string, graph: WorkflowGraph): ReadProposal 
 
   const result = validateProposal(parsed, graph);
   if ("reason" in result) return { prose, problem: result };
-  return { prose, proposal: { ...result, basedOnVersion: graph.version } };
+  // `version` is now `string | null` (issue #1013); `basedOnVersion` is the
+  // token this proposal was based on, so a non-editable graph's `null` means "no
+  // base" — coerce it to `undefined`.
+  return {
+    prose,
+    proposal: { ...result, basedOnVersion: graph.version ?? undefined },
+  };
 }
 
 /** The known node fields an `updateNode` may set. */
@@ -456,7 +462,10 @@ export function isEmptyDiff(diff: GraphDiff): boolean {
  * ours to know.
  */
 export function proposalIsStale(proposal: WorkflowProposal, graph: WorkflowGraph): boolean {
-  if (graph.version === undefined) return false;
+  // `null` (issue #1013, a current host's honest "no token" for a non-editable
+  // graph) and `undefined` (a host predating #259 entirely) both mean the same
+  // thing here: nothing to compare against, so nothing to call stale.
+  if (graph.version == null) return false;
   return proposal.basedOnVersion !== graph.version;
 }
 

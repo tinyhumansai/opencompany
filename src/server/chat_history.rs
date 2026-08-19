@@ -430,8 +430,8 @@ impl MessageView {
                 task_id, column, ..
             } => MessageView {
                 id,
-                channel: "system".to_string(),
-                author: "system".to_string(),
+                channel: crate::ports::SYSTEM_AUTHOR.to_string(),
+                author: crate::ports::SYSTEM_AUTHOR.to_string(),
                 text: dispatch_marker_text(&column),
                 at_millis,
                 mine: false,
@@ -443,8 +443,8 @@ impl MessageView {
             // `owns` never admits other variants into a history.
             other => MessageView {
                 id,
-                channel: "system".to_string(),
-                author: "system".to_string(),
+                channel: crate::ports::SYSTEM_AUTHOR.to_string(),
+                author: crate::ports::SYSTEM_AUTHOR.to_string(),
                 text: format!("{other:?}"),
                 at_millis,
                 mine: false,
@@ -533,7 +533,15 @@ impl AttributionAudit {
 /// bound; in practice that notice is rare enough not to move it.
 /// Whether a stored `agent_id` names an author we can actually resolve.
 ///
-/// The roster, **plus the confined copilot** (issue #966). `CONFINED_AGENT_ID`
+/// The roster, **plus two ids that are truthful authors without being teammates**.
+///
+/// [`SYSTEM_AUTHOR`](crate::ports::SYSTEM_AUTHOR) (issue #966) is the runtime
+/// speaking for itself — an approval-overflow notice, the `"Acknowledged."`
+/// fallback, a failed-continuation report. Those rows are *correct*, so counting
+/// them as damage would inflate the one figure in #965 that has to be
+/// trustworthy, and would caption a legitimate system message as unattributable.
+///
+/// `CONFINED_AGENT_ID`
 /// is deliberately not a roster id — it names no teammate, carries no manifest
 /// grants and cannot be addressed — but a copilot turn genuinely authored its
 /// reply, so the id is a truthful author rather than a destination that leaked
@@ -546,6 +554,7 @@ impl AttributionAudit {
 /// which rows are unknown.
 pub fn is_known_author(agent_id: &str, record: &CompanyRecord) -> bool {
     agent_id == crate::ports::CONFINED_AGENT_ID
+        || agent_id == crate::ports::SYSTEM_AUTHOR
         || record.resolve_roster_agent_id(agent_id).is_some()
 }
 
@@ -1261,6 +1270,37 @@ mod test {
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
             }
+        }
+
+        /// Issue #966. The runtime speaking for itself is a *correct* row, not
+        /// damage. Counting it would inflate the blast-radius figure on a company
+        /// doing nothing wrong, and would caption a legitimate system message as
+        /// something nobody can attribute.
+        #[test]
+        fn a_host_authored_notice_is_a_known_author_not_an_affected_row() {
+            let record = record();
+            let mut audit = AttributionAudit::default();
+            audit.fold(
+                &[reply(1, crate::ports::SYSTEM_AUTHOR), reply(2, "engineer")],
+                |agent_id| is_known_author(agent_id, &record),
+            );
+            assert_eq!(audit.replies, 2);
+            assert_eq!(audit.affected, 0);
+        }
+
+        /// The whole point of the reserved id: a notice and a damaged reply used
+        /// to be the same bytes. This pins that they are now different ones, so
+        /// the distinction a marker would rely on actually exists in the data.
+        #[test]
+        fn a_notice_and_an_overwritten_reply_are_no_longer_the_same_author() {
+            let record = record();
+            assert_ne!(
+                crate::ports::SYSTEM_AUTHOR,
+                "operator",
+                "a notice must not share the author a destination-overwrite produces"
+            );
+            assert!(is_known_author(crate::ports::SYSTEM_AUTHOR, &record));
+            assert!(!is_known_author("operator", &record));
         }
 
         /// Issue #966. A copilot turn genuinely authored its reply, so the id it

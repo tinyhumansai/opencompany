@@ -435,37 +435,25 @@ impl CompanyScheduler {
         Ok(fired)
     }
 
-    /// Runs the per-tick maintenance that rides the same minute boundary as
-    /// scheduled fires: sweep parked approvals past their TTL to a default-deny,
-    /// then sweep single-use grants the agent never redeemed (issue #243).
+    /// Runs one company's maintenance pass: sweep parked approvals past their
+    /// TTL to a default-deny, sweep single-use grants the agent never redeemed
+    /// (issue #243), and prune stale fire claims (issue #241).
     ///
-    /// The grant sweep's ids are deliberately not folded into the return value —
-    /// callers read it as "approvals that expired", and a grant expiry is a
-    /// different event with a different meaning (the operator DID approve; the
-    /// agent simply never acted). It announces itself on the operator channel
-    /// instead.
+    /// **No longer driven by this scheduler's loop** (issue #971). It delegates
+    /// to [`MaintenanceTicker`], the process-wide ticker that runs the same pass
+    /// for *every* registered company — including the ones with no manifest
+    /// `[[schedule]]`, which never spawned a scheduler and so were never swept
+    /// at all. Calling it from the cron loop too would sweep a scheduled company
+    /// twice a minute for no gain.
+    ///
+    /// Kept as a thin delegate rather than deleted so there is exactly one
+    /// implementation of "a company's maintenance pass". Its tests still hold
+    /// this scheduler to that behaviour, which is the point: the two callers
+    /// cannot drift, because there is only one thing to drift from.
     pub async fn tick_maintenance(&self) -> Result<Vec<crate::ports::types::ApprovalId>> {
         let runtime = self.runtime();
-        let expired = runtime.sweep_expired_approvals().await?;
-        runtime.sweep_expired_grants().await?;
-        // Issue #241: bound the fire-claim log's growth on the same tick. The
-        // cutoff sits a full week past the catch-up window (PRUNE_CUTOFF_MINUTES
-        // > CATCHUP_WINDOW_MINUTES), so an anchor a booting replica still needs
-        // is never eligible. Best-effort — a prune failure must not abort the
-        // approval sweeps it shares a tick with.
-        let cutoff = (self.clock.now_millis() / MINUTE_MS).saturating_sub(PRUNE_CUTOFF_MINUTES);
-        if let Err(err) = runtime
-            .schedule_fires()
-            .prune_fires_before(runtime.id(), cutoff)
-            .await
-        {
-            tracing::warn!(
-                company = %runtime.id(),
-                %err,
-                "scheduler: pruning old fire claims failed"
-            );
-        }
-        Ok(expired)
+        let minute = self.clock.now_millis() / MINUTE_MS;
+        Ok(crate::runtime::maintenance::sweep_company(runtime.id(), &runtime, minute).await)
     }
 
     /// Spawns a background task that ticks on every minute boundary until
@@ -506,9 +494,12 @@ impl CompanyScheduler {
                         if let Err(err) = self.tick().await {
                             tracing::warn!(company = %self.runtime.id(), %err, "scheduled cycle failed");
                         }
-                        if let Err(err) = self.tick_maintenance().await {
-                            tracing::warn!(company = %self.runtime.id(), %err, "approval sweep failed");
-                        }
+                        // Issue #971: maintenance is NOT driven from here any
+                        // more. It rides the process-wide
+                        // `MaintenanceTicker`, which reaches every registered
+                        // company rather than only the ones with a manifest
+                        // cron — and a company with a cron would otherwise be
+                        // swept twice a minute for no gain.
                     }
                 }
             }

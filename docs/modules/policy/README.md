@@ -26,7 +26,9 @@ parked effect is journaled one way and survives a restart with its original id):
 Effects are classified into the checkpoint groups (Spend / Send / Sign /
 Publish / Hire / Identity) with per-group supervised defaults. Parked approvals
 **default-deny on silence**: they expire to `deny` after a configurable window
-(default 7 days) measured against an injectable clock. The operator may **edit**
+(`[policy].approval_ttl_hours`, default 24 hours) measured against an
+injectable clock. The window is enforced at resolution time by the gate itself;
+draining the queue is the `MaintenanceTicker`'s job (issue #971). The operator may **edit**
 a parked effect's payload and approve the amended version; the follow-up cycle
 shows the brain both the original and the edit.
 

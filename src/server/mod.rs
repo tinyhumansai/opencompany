@@ -28,6 +28,7 @@ pub mod provision;
 mod routes;
 /// The first-run setup flow: one surface that configures an instance.
 pub mod setup;
+pub mod shutdown;
 pub mod users;
 
 #[cfg(test)]
@@ -35,4 +36,4 @@ pub(crate) mod test_support;
 pub mod webhook;
 
 pub use error::ApiError;
-pub use routes::{Serving, bind, router, serve, serve_on};
+pub use routes::{Serving, bind, router, serve, serve_on, serve_on_until};

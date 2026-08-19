@@ -77,6 +77,14 @@ kind = "output"
 name = "Ship and report"
 summary = "Release behind approval and report back."
 
+# Go-to-market, not engineering: engineering built the thing and does not need a
+# report of its own work, while docs, devrel and support are the people whose
+# next action depends on knowing what shipped. The pipeline already ends on
+# `docs_writer`, who sits on this desk.
+[node.destination]
+kind = "channel"
+target = "go_to_market"
+
 [[edge]]
 from = "request"
 to = "spec"

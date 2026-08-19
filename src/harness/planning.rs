@@ -336,12 +336,12 @@ pub async fn run_planning_pass(runtime: Arc<CompanyRuntime>, task_id: String) {
         Err(failure) => {
             // Metering first: the tokens of a failed-to-parse call were still
             // spent. A hard transport error reports zero, which meters nothing.
-            record_usage(&runtime, &planner, &failure.usage).await;
+            record_usage(&runtime, &planner, &task_id, &failure.usage).await;
             settle_failed(&runtime, &task_id, token, &failure.reason).await;
             return;
         }
     };
-    record_usage(&runtime, &planner, &usage).await;
+    record_usage(&runtime, &planner, &task_id, &usage).await;
 
     let prerequisites = verify_prerequisites(&runtime, &evidence, &draft.prerequisites).await;
     let proposed = resolve_proposed_assignee(&evidence, draft.proposed_assignee.as_deref());
@@ -421,7 +421,12 @@ async fn load_card(runtime: &Arc<CompanyRuntime>, task_id: &str) -> Option<TaskR
     }
 }
 
-async fn record_usage(runtime: &Arc<CompanyRuntime>, planner: &TaskPlanner, usage: &TokenUsage) {
+async fn record_usage(
+    runtime: &Arc<CompanyRuntime>,
+    planner: &TaskPlanner,
+    task_id: &str,
+    usage: &TokenUsage,
+) {
     crate::metering::record_planning_usage(
         usage,
         &planner.provider_slug(),
@@ -430,6 +435,46 @@ async fn record_usage(runtime: &Arc<CompanyRuntime>, planner: &TaskPlanner, usag
         runtime.usage().as_ref(),
     )
     .await;
+
+    if usage.is_zero() {
+        return;
+    }
+
+    // Planning has no RunRecord, so the task is the durable attribution seam.
+    // This is deliberately independent of the meter write above: accounting a
+    // model call that already happened must not disappear because the rolling
+    // usage projection was temporarily unavailable.
+    let _serialized = runtime.task_writes.lock().await;
+    let task = runtime.tasks().list(runtime.id()).await.and_then(|rows| {
+        rows.into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| crate::OpenCompanyError::CompanyNotFound(format!("task {task_id}")))
+    });
+    let mut task = match task {
+        Ok(task) => task,
+        Err(err) => {
+            tracing::warn!(
+                company = %runtime.id(),
+                task = task_id,
+                error = %err,
+                "[usage] planning spend could not be attributed to its task"
+            );
+            return;
+        }
+    };
+    task.planning_attempts
+        .push(crate::ports::tasks::TaskPlanningUsage {
+            at_millis: crate::ports::now_millis(),
+            usage: *usage,
+        });
+    if let Err(err) = runtime.tasks().upsert(runtime.id(), &task).await {
+        tracing::warn!(
+            company = %runtime.id(),
+            task = task_id,
+            error = %err,
+            "[usage] planning spend could not be persisted on its task"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

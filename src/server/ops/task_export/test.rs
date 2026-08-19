@@ -25,6 +25,8 @@ fn entry(seq: u64, at: u64, kind: &str, label: &str, detail: Option<&str>) -> Ti
         kind: kind.to_string(),
         label: label.to_string(),
         detail: detail.map(str::to_string),
+        cost_key: None,
+        cost: None,
         waited_millis: None,
     }
 }
@@ -38,6 +40,7 @@ fn card(title: &str) -> TaskCard {
         priority: "high".to_string(),
         assignee: "writer".to_string(),
         updated_at: T0 + 600_000,
+        cost: None,
         parent_task_id: None,
         origin_chat_id: None,
         origin_run_id: None,
@@ -105,11 +108,13 @@ fn detail_at(waiting_since: Option<u64>) -> TaskDetail {
                 id: "t-parent".to_string(),
                 title: "Launch week".to_string(),
                 column: "in_progress".to_string(),
+                cost: None,
             }),
             children: vec![LineageRef {
                 id: "t-child".to_string(),
                 title: "Social cutdowns".to_string(),
                 column: "todo".to_string(),
+                cost: None,
             }],
         },
         runs: Vec::new(),

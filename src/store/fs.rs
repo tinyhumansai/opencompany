@@ -20,7 +20,7 @@ use tokio::sync::{Mutex as TokioMutex, broadcast};
 use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::context::ContextStore;
-use crate::ports::events::{EventLog, PruneReport, RetentionPolicy, plan_prune};
+use crate::ports::events::{EventLog, EventStreamItem, PruneReport, RetentionPolicy, plan_prune};
 use crate::ports::inbox::{EmailRecord, InboxMeta, InboxStore};
 use crate::ports::memory::MemoryStore;
 use crate::ports::secrets::SecretStore;
@@ -986,15 +986,17 @@ impl EventLog for FsEventLog {
         Ok(tail.into_iter().rev().collect())
     }
 
-    fn subscribe(&self, id: &CompanyId) -> BoxStream<'static, StoredEvent> {
+    fn subscribe(&self, id: &CompanyId) -> BoxStream<'static, EventStreamItem> {
         let rx = self.sender_for(id).subscribe();
         let stream = futures::stream::unfold(rx, |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => return Some((event, rx)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
+            // Each call to this closure produces exactly one item and hands the
+            // receiver back as continuation state, so there is no loop here.
+            match rx.recv().await {
+                Ok(event) => Some((EventStreamItem::Event(event), rx)),
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    Some((EventStreamItem::Gap { missed }, rx))
                 }
+                Err(broadcast::error::RecvError::Closed) => None,
             }
         });
         Box::pin(stream)
@@ -1827,6 +1829,15 @@ mod test {
     }
 
     #[tokio::test]
+    async fn conformance_event_subscription_surfaces_gap() {
+        let root_dir = tmp_root();
+        conformance::assert_event_subscription_surfaces_gap(Arc::new(FsEventLog::new(
+            root_dir.path(),
+        )))
+        .await;
+    }
+
+    #[tokio::test]
     async fn conformance_event_read_before() {
         let root_dir = tmp_root();
         let root = root_dir.path().to_path_buf();
@@ -2264,6 +2275,9 @@ mod test {
         .await
         .unwrap();
         let received = stream.next().await.expect("event delivered");
+        let EventStreamItem::Event(received) = received else {
+            panic!("subscription unexpectedly reported a gap");
+        };
         assert_eq!(
             received.event,
             CompanyEvent::OperatorMessage {

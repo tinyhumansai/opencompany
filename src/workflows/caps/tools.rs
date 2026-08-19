@@ -19,13 +19,13 @@
 //! gracefully when no managed credential is configured (fail-closed).
 //!
 //! Every invocation is **fail-closed**: the slug's grant namespace (via
-//! [`toolbelt::namespace_of`]) must be covered by the company's `[tools].allow`
-//! globs — reusing the exact grant-intersection rule an agent's exec tools use
-//! ([`crate::harness::build::grants_cover`]) — before the tool is even looked
-//! up. The one exception is the priced `search` namespace, which requires an
-//! **explicit** `search` grant (`grants_search_explicit`) rather than glob
-//! coverage, so `*` never buys a managed search call and the invoke-time gate
-//! matches construction.
+//! [`toolbelt::namespace_of`]) must be granted by the company's `[tools].allow`
+//! before the tool is even looked up. Construction above and refusal below both
+//! ask [`grants_workflow_namespace`] — the grant-intersection rule an agent's
+//! exec tools use, except for the priced `search` namespace, which requires an
+//! **explicit** `search` grant rather than glob coverage. So `*` never buys a
+//! managed search call, and the invoke-time gate matches construction because
+//! neither can answer the question differently.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -77,6 +77,32 @@ fn capability_filtered(filter: &CapabilityFilter, namespace: &'static str) -> bo
     }
 }
 
+/// Whether `[tools].allow` grants a **workflow-tool namespace** (issue #874).
+///
+/// The one grant rule every workflow-tool decision keys off: the priced `search`
+/// family needs an EXPLICIT `search` grant — a `*` wildcard never confers it,
+/// because each call is a priced managed request — while every other namespace
+/// uses the ordinary grant-glob intersection.
+///
+/// Three places used to spell this split out by hand, and they must agree or the
+/// system contradicts itself: author-time validation
+/// (`company::validate_tool_call_node`), the grounding lists
+/// (`workflow_effective_tool_slugs` / `workflow_granted_but_unwired_tool_slugs`,
+/// via `grants_workflow_tool`), and [`refusal_for`] below. A slug offered for
+/// grounding that validation would reject, or accepted at save and refused at
+/// run for a *grant* reason, is a bug in the seam rather than in any one of
+/// them — so the split lives here once, beside the wiring rule it pairs with.
+///
+/// It cannot live with its siblings in the always-compiled `company::types`:
+/// `grants_cover` is behind the `openhuman` feature, as is every caller.
+pub(crate) fn grants_workflow_namespace(grants: &[String], namespace: &str) -> bool {
+    if namespace == "search" {
+        crate::company::grants_search_explicit(grants)
+    } else {
+        crate::harness::build::grants_cover(grants, namespace)
+    }
+}
+
 pub(crate) fn workflow_tool_wiring(deps: &crate::harness::HarnessDeps) -> WorkflowToolWiring {
     let mut wiring = WorkflowToolWiring::default();
     for namespace in WORKFLOW_TOOL_NAMESPACES {
@@ -96,12 +122,6 @@ pub(crate) fn workflow_tool_wiring(deps: &crate::harness::HarnessDeps) -> Workfl
     wiring
 }
 
-pub(crate) fn wired_workflow_namespaces(
-    deps: &crate::harness::HarnessDeps,
-) -> BTreeSet<&'static str> {
-    workflow_tool_wiring(deps).wired_namespaces
-}
-
 pub(crate) fn refusal_for(
     slug: &str,
     grants: &[String],
@@ -110,12 +130,7 @@ pub(crate) fn refusal_for(
     let Some(namespace) = toolbelt::namespace_of(slug) else {
         return Some(format!("tool_call '{slug}' is not a wired workflow tool"));
     };
-    let granted = if namespace == "search" {
-        crate::company::grants_search_explicit(grants)
-    } else {
-        crate::harness::build::grants_cover(grants, namespace)
-    };
-    if !granted {
+    if !grants_workflow_namespace(grants, namespace) {
         return Some(format!(
             "tool_call '{slug}' (namespace '{namespace}') is not granted by this company's [tools].allow"
         ));
@@ -319,9 +334,14 @@ impl WorkflowToolInvoker {
     ) -> Self {
         // Mirror `build_agent`: do not initialize a tool family (or its audit
         // state) unless the company's grants can invoke that namespace.
+        //
+        // Every arm reads `grants_workflow_namespace`, the same rule
+        // `refusal_for` applies below. Construction and refusal disagreeing is
+        // the one failure this file cannot afford: a family wired here but
+        // refused there is a tool that exists and always errors, and the reverse
+        // is a refusal for a tool that is sitting right there.
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
-        if crate::harness::build::grants_cover(&grants, "shell")
-            && wiring.wired_namespaces.contains("shell")
+        if grants_workflow_namespace(&grants, "shell") && wiring.wired_namespaces.contains("shell")
         {
             tools.extend(toolbelt::shell_tools(
                 security.clone(),
@@ -330,14 +350,10 @@ impl WorkflowToolInvoker {
                 workspace,
             ));
         }
-        if crate::harness::build::grants_cover(&grants, "code")
-            && wiring.wired_namespaces.contains("code")
-        {
+        if grants_workflow_namespace(&grants, "code") && wiring.wired_namespaces.contains("code") {
             tools.extend(toolbelt::code_tools(security.clone(), workspace));
         }
-        if crate::harness::build::grants_cover(&grants, "web")
-            && wiring.wired_namespaces.contains("web")
-        {
+        if grants_workflow_namespace(&grants, "web") && wiring.wired_namespaces.contains("web") {
             tools.extend(toolbelt::web_tools(
                 security,
                 web_allowed_domains,
@@ -345,12 +361,13 @@ impl WorkflowToolInvoker {
             ));
         }
         // Metered web search (issue #238) — mirror `build_agent`'s two-gate
-        // wiring exactly: an EXPLICIT `search` grant (`grants_search_explicit`;
-        // the catch-all `*` never confers it, because each call is a priced
-        // managed request) AND a managed search backend on the deps. Granted-but-
+        // wiring exactly: an EXPLICIT `search` grant (which is what
+        // `grants_workflow_namespace` resolves to for this namespace; the
+        // catch-all `*` never confers it, because each call is a priced managed
+        // request) AND a managed search backend on the deps. Granted-but-
         // uncredentialed wires nothing and warns, so `web_search` degrades
         // gracefully when no managed credential is configured (fail-closed).
-        if crate::company::grants_search_explicit(&grants)
+        if grants_workflow_namespace(&grants, "search")
             && wiring.wired_namespaces.contains("search")
         {
             match search {

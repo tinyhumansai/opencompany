@@ -88,6 +88,57 @@ function SelectTrigger({
 const SELECT_POPUP_CLASSES =
   "relative isolate z-50 max-h-(--available-height) max-w-[min(28rem,var(--available-width))] min-w-[min(max(9rem,var(--anchor-width)),28rem,var(--available-width))] origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10"
 
+/**
+ * The shared look of both scroll arrows (issue #975).
+ *
+ * # Why a gradient and not just a chevron
+ *
+ * An arrow was already here and already worked: Base UI mounts it exactly when
+ * the list can scroll further, and a browser measurement confirms it is present
+ * and visible at the moment of truncation. It was still missed in live QA, where
+ * a tester recorded two of a company's eight workflows as *"not inspected due to
+ * dropdown truncation"* — including the healthiest one on the tenant.
+ *
+ * The reason is that it was the **only** signal. Base UI adds
+ * `base-ui-disable-scrollbar` to the list whenever scroll arrows are mounted, so
+ * the native scrollbar is deliberately traded away for the arrow — and the arrow
+ * was a small low-contrast chevron on a flat `bg-popover` strip, below a list
+ * that ended on a clean, uncut row. A list that ends tidily reads as a list that
+ * ended. There was nothing at the cut edge saying otherwise.
+ *
+ * The gradient is what makes the edge itself the affordance: the row under the
+ * arrow fades out instead of stopping square, so the content visibly continues
+ * past the boundary rather than finishing at it. `from-55%` keeps the chevron
+ * sitting on solid `popover` so it loses no contrast, and only the half nearest
+ * the content fades.
+ *
+ * A count beside the trigger (`Workflows 8`) was the issue's other suggestion
+ * and is deliberately **not** what this does. A total tells you how many exist;
+ * it does not tell you that the list in front of you is cut, and it would have
+ * to be added to each of the twenty-odd selects in the console one at a time.
+ * This is one change to the shared primitive and it lands at the point of
+ * truncation, which is where the information was missing.
+ *
+ * `h-7` over the old `py-1`: the gradient needs vertical room to read as a fade
+ * rather than a band, and a fixed height keeps both arrows the same size whether
+ * or not their icon renders.
+ */
+const SELECT_SCROLL_ARROW_CLASSES =
+  "z-10 flex h-7 w-full cursor-default justify-center text-muted-foreground [&_svg:not([class*='size-'])]:size-4"
+
+/**
+ * Exported for `select-scroll-affordance.test.ts`, which cannot reach them any
+ * other way: Base UI mounts a scroll arrow only once it measures the list as
+ * scrollable, and jsdom does no layout — so the arrows never render there, and
+ * rendering the parts standalone throws for want of `SelectRootContext`. The
+ * rule is therefore pinned at its source, and the behavioural proof (a real
+ * Chromium, twelve entries, a constrained viewport) lives in the PR.
+ */
+export const SELECT_SCROLL_UP_ARROW_CLASSES = `${SELECT_SCROLL_ARROW_CLASSES} top-0 items-start bg-gradient-to-b from-popover from-30% to-transparent`
+
+/** The down arrow's mirror. See {@link SELECT_SCROLL_UP_ARROW_CLASSES}. */
+export const SELECT_SCROLL_DOWN_ARROW_CLASSES = `${SELECT_SCROLL_ARROW_CLASSES} bottom-0 items-end bg-gradient-to-t from-popover from-30% to-transparent`
+
 function SelectContent({
   className,
   children,
@@ -189,7 +240,7 @@ function SelectScrollUpButton({
     <SelectPrimitive.ScrollUpArrow
       data-slot="select-scroll-up-button"
       className={cn(
-        "top-0 z-10 flex w-full cursor-default items-center justify-center bg-popover py-1 [&_svg:not([class*='size-'])]:size-4",
+        SELECT_SCROLL_UP_ARROW_CLASSES,
         className
       )}
       {...props}
@@ -208,7 +259,7 @@ function SelectScrollDownButton({
     <SelectPrimitive.ScrollDownArrow
       data-slot="select-scroll-down-button"
       className={cn(
-        "bottom-0 z-10 flex w-full cursor-default items-center justify-center bg-popover py-1 [&_svg:not([class*='size-'])]:size-4",
+        SELECT_SCROLL_DOWN_ARROW_CLASSES,
         className
       )}
       {...props}

@@ -5,7 +5,7 @@ in `frontend/src/index.css` in oklch; the hex on each row is the canonical
 value for anything outside CSS (Figma, a slide, a favicon).
 
 **Contrast figures are measured**, using WCAG 2.1 relative luminance against
-the light canvas `#FCFCFD` or the dark canvas `#0C0C0F`. They are not
+the light canvas `#F7F7FC` or the dark canvas `#08090B`. They are not
 estimates. Re-measure after any change:
 
 ```js
@@ -23,21 +23,25 @@ Targets: **4.5:1** for text, **3:1** for UI marks and large text.
 
 ## Brand ramp
 
-Indigo. The only hue the product owns. `--brand-*`, addressable as
+Violet. The only hue the product owns. `--brand-*`, addressable as
 `bg-brand-500` etc., though components should prefer the semantic names below.
 
 | Token | Hex | Role |
 | --- | --- | --- |
-| `--brand-50` | `#EEEDFF` | Tint backgrounds |
-| `--brand-100` | `#E0DEFF` | Tint backgrounds, borders on brand surfaces |
-| `--brand-200` | `#C7C3FF` | Disabled brand fills |
-| `--brand-300` | `#A6A0FF` | Dark-mode active nav ink |
-| `--brand-400` | `#857EFF` | **Dark-mode accent** — links, focus, primary |
-| `--brand-500` | `#635BFF` | **The brand.** Light-mode accent and all filled brand buttons |
-| `--brand-600` | `#524AE0` | Pressed state on brand fills |
-| `--brand-700` | `#423BBA` | Light-mode active nav ink |
-| `--brand-800` | `#322C8F` | High-contrast ink on tint |
-| `--brand-900` | `#241F66` | Reserved |
+| `--brand-50` | `#F0ECFD` | Tint backgrounds |
+| `--brand-100` | `#E4DDFC` | Tint backgrounds, borders on brand surfaces |
+| `--brand-200` | `#CEC1FA` | Disabled brand fills |
+| `--brand-300` | `#B09DF8` | Dark-mode active nav ink |
+| `--brand-400` | `#937BF6` | **Dark-mode accent** — links, focus, primary |
+| `--brand-500` | `#7153F0` | **The brand.** Light-mode accent and all filled brand buttons |
+| `--brand-600` | `#6247D7` | Pressed state on brand fills |
+| `--brand-700` | `#5038B2` | Light-mode active nav ink |
+| `--brand-800` | `#3C2A89` | High-contrast ink on tint |
+| `--brand-900` | `#2B1E62` | Reserved |
+
+500 is the value the brand guide names. Every other step holds this ramp's
+original lightness cadence and hue drift, with chroma scaled so 500 lands
+exactly on it; every step is inside the sRGB gamut.
 
 The ramp is theme-independent — 500 is 500 in both themes. What changes is
 *which step the accent role points at*: 500 in light, 400 in dark, because 500
@@ -45,10 +49,11 @@ is too dense to read as ink on near-black.
 
 | Pair | Ratio | Verdict |
 | --- | --- | --- |
-| white on `brand-500` | 4.70:1 | AA — filled buttons, both themes |
-| `brand-500` on light canvas | 4.58:1 | AA — links |
-| `brand-400` on dark canvas | 5.98:1 | AA — links, dark |
-| `brand-700` on `brand-50` tint | 7.98:1 | AA — active nav row |
+| white on `brand-500` | 5.00:1 | AA — filled buttons, both themes |
+| `brand-500` on light canvas | 4.68:1 | AA — links |
+| `brand-400` on dark canvas | 6.08:1 | AA — links, dark |
+| `brand-700` on light active row | 6.91:1 | AA — active nav row |
+| `brand-300` on dark active row | 7.10:1 | AA — active nav row, dark |
 
 ---
 
@@ -58,22 +63,57 @@ Cool-tinted at ~286°, chroma 0.001–0.03. See
 [`../brand/README.md`](../brand/README.md#neutrals-carry-the-brand) for why they
 are not pure grey.
 
-| Token | Hex | Used as |
-| --- | --- | --- |
-| `--gray-25` | `#FCFCFD` | Light canvas |
-| `--gray-50` | `#F4F4F7` | Light muted / sidebar; dark foreground |
-| `--gray-100` | `#EEEEF3` | Light secondary |
-| `--gray-200` | `#E6E6EC` | Light border |
-| `--gray-300` | `#D9D9E3` | Light input border |
-| `--gray-400` | `#8C8C9E` | Light idle mark |
-| `--gray-500` | `#6E6E80` | Light muted text |
-| `--gray-600` | `#9797A8` | Dark muted text |
-| `--gray-800` | `#23232C` | Dark secondary |
-| `--gray-850` | `#1E1E26` | Dark muted |
-| `--gray-875` | `#17171D` | Dark popover |
-| `--gray-900` | `#16161D` | Light foreground |
-| `--gray-925` | `#131318` | Dark card / sidebar |
-| `--gray-950` | `#0C0C0F` | Dark canvas |
+There is no single grey ramp. The brand guide draws light and dark as two
+independent ladders whose rungs carry the same *roles* rather than the same
+lightnesses, and the roles are what the semantic layer binds to — so the rung
+is the primitive and the theme picks a set.
+
+### Surface rungs
+
+| Rung | Light | Dark | Role |
+| --- | --- | --- | --- |
+| `bg` | `#F7F7FC` | `#08090B` | Main content canvas |
+| `1` | `#FFFFFF` | `#0C0D0F` | Sidebar · cards · panels |
+| `2` | `#F1F1F8` | `#121315` | Panel stroke · date badge |
+| `3` | `#E8E8F2` | `#131317` | Icon circles |
+| `4` | `#DADAE5` | `#161719` | Card stroke · dividers |
+| `active` | `#ECE9FC` | `#1E1E28` | The nav row you are standing on |
+
+Declared as `--surface-light-*` and `--surface-dark-*`. Every value is the
+brand guide's, unchanged.
+
+### Ink levels
+
+The five-level text hierarchy, `--ink-light-*` / `--ink-dark-*`, surfaced to
+components as `text-ink-*`. Ratios are worst case across the three grounds text
+actually sits on — `bg`, rung `1`, and `active`. Rungs 2–4 are strokes and icon
+circles, not text grounds.
+
+| Level | Light | Dark | Role |
+| --- | --- | --- | --- |
+| `primary` | `#0A0A14` 16.53:1 | `#FFFFFF` 16.52:1 | Active labels · channel headers |
+| `secondary` | `#43435A` 8.05:1 | `#AEAEBB` 7.53:1 | Nav items · section labels · names |
+| `tertiary` | `#4A535A` 6.59:1 | `#99A2AC` 6.38:1 | Descriptions · body text |
+| `hint` | `#5A5E65` 5.47:1 | `#92929E` 5.37:1 | Subtitles · empty-state prompts |
+| `muted` | `#6A6973` 4.54:1 | `#858590` 4.53:1 | Member counts · metadata |
+
+`primary` and light `secondary` are the guide's values. The rest are the
+guide's hue and chroma at a corrected lightness: six of the ten levels as drawn
+do not clear 4.5:1 against the surfaces the guide itself assigns them — dark
+`tertiary`, marked *body text*, measured 2.91:1, and light `muted` measured
+1.45:1.
+
+Lifting each failing level by the smallest amount that clears the floor
+collapses the ramp — all five land on 4.5:1 and become one colour. The ramp is
+redistributed instead: the weakest level sits on the floor and the rest step up
+in even increments of lightness, the same perceptual-uniformity argument the
+brand ramp is built on. Hierarchy is preserved by *role*; the guide draws dark
+`hint` brighter than dark `secondary`, which its own usage labels contradict.
+
+Dark `hint` (`#8E9286`) and dark `muted` (`#62665C`) also move hue. They are
+drawn at ~122° — green — while every other neutral in the guide sits near 285°,
+and the guide's own subtitle reads "All cool-toned greys with purple
+undertone".
 
 ---
 
@@ -83,27 +123,33 @@ Layer 2. These are what components use.
 
 | Token | Light | Dark | Role |
 | --- | --- | --- | --- |
-| `--background` | `gray-25` | `gray-950` | The canvas |
-| `--card` | white | `gray-925` | Resting panels |
-| `--popover` | white | `gray-875` | Floating surfaces |
-| `--muted` | `gray-50` | `gray-850` | Recessed fills, code, skeletons |
-| `--secondary` | `gray-100` | `gray-800` | Secondary button fill |
-| `--accent` | brand 7% on canvas | brand 14% on muted | Hover/rest tint under rows |
-| `--sidebar` | `gray-50` | `gray-925` | Nav column |
-| `--sidebar-accent` | brand 10% | brand 16% | Active nav row background |
-| `--border` | `gray-200` | white 9% | The hairline |
-| `--input` | `gray-300` | white 14% | Field borders, stronger rules |
+| `--background` | rung `bg` | rung `bg` | The canvas |
+| `--card` | rung `1` | rung `1` | Resting panels |
+| `--popover` | rung `1` | rung `3` | Floating surfaces |
+| `--muted` | rung `2` | rung `2` | Recessed fills, code, skeletons |
+| `--secondary` | rung `3` | rung `active` | Secondary button fill |
+| `--surface-icon` | rung `3` | rung `3` | Ground behind an icon circle |
+| `--accent` | rung `active` | rung `active` | Hover/rest tint under rows |
+| `--sidebar` | rung `1` | rung `1` | Nav column |
+| `--sidebar-accent` | rung `active` | rung `active` | Active nav row background |
+| `--border` | rung `4` | rung `4` | The hairline |
+| `--input` | rung `4` | rung `active` | Field borders, stronger rules |
 | `--ring` | `brand-500` | `brand-400` | Focus |
 
-Light surfaces climb *toward* the viewer with lightness (canvas `#FCFCFD` →
-card white), and dark does the same (`#0C0C0F` → `#131318` → `#17171D`). A card
+Light surfaces climb *toward* the viewer with lightness (canvas `#F7F7FC` →
+card white), and dark does the same (`#08090B` → `#0C0D0F` → `#161719`). A card
 lifts off the page before any shadow is applied.
 
-Dark borders are translucent on purpose: they must read against three
-different surface lightnesses, and a fixed colour would vanish on one of them.
+Dark borders were translucent white, so one value could read against the
+canvas, the card and the popover at once. The guide names the stroke outright —
+rung 4, "card stroke / dividers" — so they are opaque now, and the ladder keeps
+them legible: every ground a border lands on sits clear of rung 4 in lightness.
+That constraint is why the dark popover is rung 3 rather than rung 4 — a
+surface painted the same rung as the stroke renders its own edge invisible,
+which is what the translucent value used to prevent.
 
 **`--accent-foreground` stays neutral.** 40 call sites pair `bg-accent` with
-`text-accent-foreground`; indigo text on every hover would make the console
+`text-accent-foreground`; brand text on every hover would make the console
 strobe. The single place brand ink is spent is `--sidebar-accent-foreground` —
 the nav row you are standing on.
 
@@ -111,8 +157,8 @@ the nav row you are standing on.
 
 | Token | Light | Dark | Role |
 | --- | --- | --- | --- |
-| `--foreground` | 17.56:1 | 17.79:1 | Primary reading text |
-| `--muted-foreground` | 4.87:1 | 6.80:1 | Secondary, metadata, captions |
+| `--foreground` | 18.44:1 | 19.92:1 | Primary reading text |
+| `--muted-foreground` | 5.07:1 | 5.46:1 | Secondary, metadata, captions |
 | `--primary` | 4.58:1 | 5.98:1 | Links, emphasis |
 | `--destructive` | 3.82:1 | 6.73:1 | Error marks (see caveat below) |
 
@@ -179,8 +225,14 @@ Five rather than eight, because five hues clear of the status vocabulary is
 what the hue circle has room for once brand and five states are spoken for. A
 hash over five still distributes well.
 
-**Where the hues do come close — violet against brand indigo, blue against
-running cyan — form separates them:**
+**Where the hues do come close — identity violet against the brand, blue
+against running cyan — form separates them:**
+
+The brand moving from indigo to violet tightened this. `--tone-1` sits at 292.7°
+and `--brand-500` now sits at 285.5°, roughly 7° apart where they were 14°
+before. Form still separates them, and the two never take the same shape, but
+`--tone-1` is the first thing to retune if identity and interaction start
+reading as the same colour.
 
 | | Shape | Carries |
 | --- | --- | --- |
@@ -203,7 +255,7 @@ renamed — they name a slot, not a colour. A desk keyed `amber` resolves to
 
 | Slot | Light | Dark |
 | --- | --- | --- |
-| `--chart-1` | `#635BFF` indigo | `#857EFF` |
+| `--chart-1` | `#7153F0` violet | `#937BF6` |
 | `--chart-2` | `#0EA5E9` cyan | `#38BDF8` |
 | `--chart-3` | `#12A150` green | `#35C77F` |
 | `--chart-4` | `#F5A524` amber | `#FFC53D` |
@@ -211,7 +263,7 @@ renamed — they name a slot, not a colour. A desk keyed `amber` resolves to
 
 Brand leads slot 1; the sequence then walks the hue circle so neighbouring
 series never collide. The ordering is chosen so the *two-series* case — by far
-the most common — gets indigo and cyan, the pair that survives the most common
+the most common — gets violet and cyan, the pair that survives the most common
 colour-vision deficiencies.
 
 Chart colours are marks, not text. Axis labels and legends use

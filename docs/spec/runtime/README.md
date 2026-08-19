@@ -33,6 +33,9 @@ Supporting docs:
     why an ephemeral data root refuses to boot
   - [data-root.md](data-root.md) — the root itself: resolution order, ownership,
     and two processes wanting the same directory
+  - [offline.md](offline.md) — running with no network at all: the documented
+    manifest, what stays hosted (Medulla, Composio, the hub identity exchange),
+    and the CI lane that executes the claim inside a network namespace
 - [events.md](events.md) — the `CompanyEvent` vocabulary those ports carry, and
   the run/task/approval correlation rules a journal reader folds on
   - [workflow-events.md](workflow-events.md) — the workflow-run progress

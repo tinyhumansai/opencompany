@@ -34,6 +34,37 @@ all", and putting a re-enable click behind every typo fix is how an operator
 learns to click through it. `a_switched_off_workflow_does_not_fire` and
 `an_edit_that_adds_a_schedule_switches_the_workflow_off` pin the two halves.
 
+**A schedule that cannot run is refused arming (issue #976).** `set_company_workflow_enabled`
+rejects `enabled = true` when the graph carries a trigger schedule and has **no
+node other than its trigger**. Such a graph fires on time, runs nothing and
+reports nothing: on staging `campaign` was one resume away from exactly that.
+
+**Refused at arming, not at save**, and the distinction is the fix. Saving a stub
+mid-authoring is legitimate — the console drops a Start node first and adds
+stages after, `parse_workflow` was made lenient on purpose (issue #661) to allow
+it, and refusing at save would also refuse every existing seed and legacy body on
+its next edit. Saving promises nothing; switching a schedule on promises that
+something happens. Arming is also already the human gate the disarm rule above
+forces a scheduled graph through, and it has the parsed graph in hand for the
+journal name — so the check costs no extra load.
+
+Switching such a workflow **off** stays allowed, on the same principle as the
+unparseable-body case: an operator must always be able to stop a thing. A manual
+(unscheduled) stub is left alone — running one by hand is the author's business,
+and the run says so itself (below).
+
+**A run of a stage-less graph records a notice.** The engine runs such a graph
+happily — no stage fails, because there is no stage — so before this it settled
+as an ordinary finished run, and `QA Test Pipeline` banked six of them. It now
+carries `WorkflowRun.notices` (the issue #638 channel) saying it had nothing to
+run. Deliberately a notice and **not** an error: nothing broke and nothing was
+attempted, so marking it failed would put a half-authored stub into the failure
+count beside runs that genuinely went wrong — the same call issue #925 makes one
+level down with `NoDestinationConfigured`. `WorkflowFile::has_runnable_node` is
+the single predicate behind both halves, for the reason `trigger_schedule` is
+single: two copies that disagreed would let a graph be refused a schedule and
+still run silently, or the reverse.
+
 **In the console.** Each row carries a switch, rendered from `enabled` on the
 list read. Like `editable`, only an explicit `false` counts — a host predating
 issue `#276` sends no field, and `undefined` must not read as paused. A row the

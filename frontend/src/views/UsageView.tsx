@@ -37,16 +37,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { formatUsdCost } from "@/lib/cost";
 
 /** Compact token/number formatting: 1.2M, 340K, 5.1K. */
 function compact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1)}K`;
   return `${n}`;
-}
-
-function usd(n: number): string {
-  return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: n < 100 ? 2 : 0 });
 }
 
 const RANGES: Record<string, number> = { "7d": 7, "30d": 30, "90d": 90 };
@@ -61,7 +58,7 @@ const RANGE_LABELS: Record<string, string> = { "7d": "Last 7 days", "30d": "Last
  * token deletes the duplication and the drift: a palette change now reaches
  * this chart without anyone remembering it exists.
  *
- * Slot order is the system's: indigo leads, cyan follows. See
+ * Slot order is the system's: violet leads, cyan follows. See
  * docs/design-system/color.md.
  */
 const chartConfig = {
@@ -165,7 +162,16 @@ export function UsageView({ client, company }: Props) {
         {/* KPIs */}
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
           <Kpi icon={Coins} label="Total tokens" value={compact(totals.tokens)} hint={`${compact(totals.inputTokens)} in · ${compact(totals.outputTokens)} out`} />
-          <Kpi icon={CreditCard} label="Est. cost" value={usd(totals.costUsd)} hint="Tokens plus metered calls" />
+          <Kpi
+            icon={CreditCard}
+            label="Cost"
+            value={
+              data.costHidden
+                ? "Cost hidden"
+                : formatUsdCost({ amountUsd: totals.costUsd }, "total") ?? "$0.00"
+            }
+            hint="Source USD · tokens plus metered calls"
+          />
           <Kpi icon={Zap} label="OAuth calls" value={compact(totals.oauthCalls)} hint={`Across ${totals.connections} providers`} />
           <Kpi icon={Plug} label="Connections" value={String(totals.connections)} hint="Active integrations" />
           {/* Issue #238. Its own KPI rather than a line inside "OAuth calls":
@@ -220,6 +226,18 @@ export function UsageView({ client, company }: Props) {
                   </Bar>
                 </BarChart>
               </ChartContainer>
+              <div className="mt-3 divide-y rounded-md border">
+                {data.byAgent.map((agent) => (
+                  <div key={agent.name} className="flex items-center justify-between gap-3 px-3 py-2 text-xs">
+                    <span className="min-w-0 truncate">{agent.name}</span>
+                    <span className="shrink-0 font-medium tabular-nums">
+                      {data.costHidden
+                        ? "Cost hidden"
+                        : formatUsdCost({ amountUsd: agent.costUsd }, "total") ?? "$0.00"}
+                    </span>
+                  </div>
+                ))}
+              </div>
             </CardContent>
           </Card>
 

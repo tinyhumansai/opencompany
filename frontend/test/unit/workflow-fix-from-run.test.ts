@@ -32,7 +32,13 @@ describe("fixWorkflowFromRun", () => {
     const answer: WorkflowFixFromRun = {
       automatable: true,
       summary: "dropped the unwired step",
-      workflow: { id: "weekly digest", name: "Weekly digest", nodes: [], edges: [] },
+      workflow: {
+        id: "weekly digest",
+        name: "Weekly digest",
+        version: null,
+        nodes: [],
+        edges: [],
+      },
       readiness: { ok: true },
     };
     const { client, calls } = fakeClient(answer);

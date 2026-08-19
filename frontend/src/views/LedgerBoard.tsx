@@ -236,9 +236,11 @@ export function LedgerBoard<T extends BoardRow>({
               over === column.id && "border-primary/40 bg-accent/40",
             )}
           >
-            <div className="flex shrink-0 items-center gap-2 px-3 py-2.5">
+            <div className="mx-3 flex shrink-0 items-center gap-2 border-b py-2.5">
               <span className="text-sm font-medium">{column.label}</span>
-              <span className="text-xs text-muted-foreground">{held.length}</span>
+              <span className="rounded-full bg-muted px-1.5 text-2xs font-medium tabular-nums text-muted-foreground">
+                {held.length}
+              </span>
               <div className="ml-auto">{columnHeader?.(column)}</div>
             </div>
             <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
@@ -271,7 +273,7 @@ export function LedgerBoard<T extends BoardRow>({
                 ))
               )}
               {!loading && held.length === 0 && (
-                <p className="px-1 py-4 text-center text-xs text-muted-foreground">
+                <p className="mt-2 flex h-38 items-center justify-center rounded-lg bg-muted/50 px-1 text-center text-xs text-muted-foreground">
                   {emptyHint}
                 </p>
               )}

@@ -213,6 +213,7 @@ describe("the workflow ring survives desks replacing the hardcoded departments",
         {
           id: "wf-nightly",
           name: "Nightly digest",
+          version: null,
           // `hedy` is seated on Engineering by the desk, not by her job title.
           nodes: [
             { id: "t", kind: "trigger", name: "22:00 UTC" },

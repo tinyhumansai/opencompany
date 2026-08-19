@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::ports::artifacts::{ArtifactAuthor, ArtifactKind, ArtifactRecord, ArtifactStore};
 use crate::ports::context::ContextStore;
-use crate::ports::events::EventLog;
+use crate::ports::events::{EventLog, EventStreamItem};
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
 use crate::ports::inbox::{EmailRecord, InboxMeta, InboxStore};
 use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
@@ -42,6 +42,7 @@ use crate::ports::workflow_revisions::{
     MAX_WORKFLOW_REVISIONS, WorkflowRevisionRecord, WorkflowRevisionStore,
 };
 use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceOrigin, WorkspaceStore};
+use futures::StreamExt;
 
 /// A minimal valid manifest used to seed [`CompanyRecord`]s in the suite.
 fn sample_manifest() -> crate::company::CompanyManifest {
@@ -476,6 +477,39 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
         .unwrap();
     assert_eq!(tail.len(), 2);
     assert_eq!(tail[0].seq, EventSeq::new(3));
+}
+
+/// A live receiver that falls behind the 256-slot backend broadcast ring must
+/// report loss before delivering its retained tail. Silent `Lagged` handling
+/// leaves a console unable to distinguish a quiet company from a stale one.
+pub async fn assert_event_subscription_surfaces_gap(events: Arc<dyn EventLog>) {
+    let id = CompanyId::new("gap");
+    let mut stream = events.subscribe(&id);
+    for seq in 0..300 {
+        events
+            .append(
+                &id,
+                CompanyEvent::OperatorMessage {
+                    parent: None,
+                    text: format!("event {seq}"),
+                    by: None,
+                    chat: None,
+                    deliverable: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        stream.next().await,
+        Some(EventStreamItem::Gap { missed: 44 }),
+        "a lagged receiver must announce exactly the entries its 256-slot buffer lost"
+    );
+    let Some(EventStreamItem::Event(first_retained)) = stream.next().await else {
+        panic!("the retained tail must continue after its gap signal");
+    };
+    assert_eq!(first_retained.seq, EventSeq::new(44));
 }
 
 /// `read_before` returns a bounded, newest-first page before an exclusive
@@ -1060,6 +1094,7 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
         parent_task_id: None,
         output: None,
         plan: None,
+        planning_attempts: Vec::new(),
         deliverable: crate::ports::tasks::TaskDeliverable::Once,
         workflow_proposal: None,
         origin_run_id: None,
@@ -2039,6 +2074,7 @@ pub async fn assert_workflow_run_output_store(outputs: Arc<dyn WorkflowRunOutput
         at_millis: at,
         nodes: serde_json::json!({ "writer": { "items": [marker] } }),
         truncated: false,
+        partial: false,
     };
 
     // Roundtrip: a stored record reads back byte-identically.

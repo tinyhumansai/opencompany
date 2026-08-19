@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
+use crate::ports::events::EventStreamItem;
 use crate::ports::types::{
     Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, EventSeq, OutboundMessage, OverlayDesk,
     OverlayDeskMember, OverlayDeskOrder, StoredEvent, TurnStep, Verdict,
@@ -611,11 +612,11 @@ async fn company_events(
         .runtime
         .events()
         .subscribe(&company)
-        .filter_map(move |stored| {
+        .filter_map(move |item| {
             // Keep the teardown guard alive for the life of the stream.
             let _ = &guard;
-            let event =
-                project_event(&stored).map(|value| Ok(Event::default().data(value.to_string())));
+            let event = project_stream_item(&item)
+                .map(|value| Ok(Event::default().data(value.to_string())));
             std::future::ready(event)
         });
     // Merge the transient live turn-progress bus (tool_call/tool_result frames a
@@ -634,6 +635,18 @@ async fn company_events(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+/// Projects a live subscription item into the operator stream's safe wire
+/// shape. A gap is an unpersisted control frame, deliberately structural-only.
+fn project_stream_item(item: &EventStreamItem) -> Option<serde_json::Value> {
+    match item {
+        EventStreamItem::Event(stored) => project_event(stored),
+        EventStreamItem::Gap { missed } => Some(serde_json::json!({
+            "type": "stream_gap",
+            "missed": missed,
+        })),
+    }
 }
 
 /// Projects a stored event into the safe SSE wire shape, or `None` to drop it.
@@ -826,14 +839,41 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             }
             o
         }
+        // The actor is still dropped — see the deny-by-default note above and
+        // `projects_approval_resolved_without_the_actor`. What crosses the wire
+        // is one bit derived from it.
         CompanyEvent::ApprovalResolved {
             approval_id,
             verdict,
-            ..
+            by,
         } => {
             let mut o = envelope("approval_resolved");
             o["approvalId"] = json!(approval_id.as_ref());
             o["verdict"] = json!(verdict);
+            // Issue #971: say when the HOST resolved it, not a person.
+            //
+            // An expiry appends `ApprovalResolved { verdict: Deny, by: System }`
+            // — a default-deny on silence, which is a real resolution and has
+            // to be one (#305, #469). But this frame carried only the verdict,
+            // so the console toasted **"Approval denied"** and an operator was
+            // told they had declined something they never saw. That was a rare
+            // false attribution while the deadline was a week; shortening it to
+            // 24 hours makes it routine, which is what turns a latent wording
+            // bug into a defect worth fixing in the same change.
+            //
+            // **A flag, deliberately not `by`.** Sending the actor would be the
+            // obvious fix and is the wrong one: the projection is deny-by-default
+            // and an assertion below pins that no actor and no user id reaches
+            // this feed. A boolean derived from `by.kind` answers the console's
+            // question — "did a person decide this?" — while carrying nothing
+            // identifying. That assertion is EXTENDED to cover this field, never
+            // replaced.
+            //
+            // Skipped when false, so an operator's own decision serializes
+            // exactly as it did before and an old console is unaffected.
+            if by.kind == ActorKind::System {
+                o["automatic"] = json!(true);
+            }
             o
         }
         CompanyEvent::LifecycleChanged { from, to, .. } => {
@@ -1087,6 +1127,36 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
         CompanyEvent::TurnFailed { turn_id, .. } => {
             let mut o = envelope("turn_settled");
             o["turnId"] = json!(turn_id);
+            o
+        }
+        // Issue #1015: the push half of attempt status. Structural, and for the
+        // same sharper reason as `turn_settled` directly above — `error` is a
+        // failure reason in our own words that can name internals, so the
+        // console learns *that* the attempt moved here and reads *why* from the
+        // run row, which is tenant-scoped.
+        //
+        // `from` rides along so a consumer holding a row can tell a live frame
+        // from a replayed or out-of-order one, which a bare `to` cannot. It is
+        // omitted rather than null on the mint, where there is no prior state —
+        // the same presence-check discipline `turn_started`'s `parentId` uses.
+        CompanyEvent::RunStatusChanged {
+            run_id,
+            task_id,
+            attempt,
+            from,
+            to,
+            ..
+        } => {
+            let mut o = envelope("run_status_changed");
+            o["runId"] = json!(run_id);
+            o["attempt"] = json!(attempt);
+            o["status"] = json!(to);
+            if let Some(task_id) = task_id {
+                o["taskId"] = json!(task_id);
+            }
+            if let Some(from) = from {
+                o["from"] = json!(from);
+            }
             o
         }
         // Not an attention signal, or carries a raw payload we never put on the
@@ -1439,6 +1509,7 @@ async fn run_chat(
             // "build me a workflow for X" (deliverable: "workflow") routes the
             // card through the builder pass when it reaches In Progress. Nothing
             // here infers the choice from the text (decision D2a).
+            planning_attempts: Vec::new(),
             deliverable: message.deliverable.unwrap_or_default(),
             workflow_proposal: None,
             // Issue #983: the turn that opened it. A card raised from chat used
@@ -6503,6 +6574,16 @@ mode = "full"
     }
 
     #[test]
+    fn projects_a_gap_with_structural_fields_only() {
+        let value = super::project_stream_item(&EventStreamItem::Gap { missed: 44 })
+            .expect("a gap must reach the console");
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "stream_gap", "missed": 44 })
+        );
+    }
+
+    #[test]
     fn projects_agent_reply_with_chat_fields_and_steps() {
         use crate::ports::types::{TurnStep, TurnStepKind, TurnStepStatus};
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
@@ -6943,6 +7024,54 @@ mode = "full"
         assert!(
             !v.to_string().contains("secret-user-id"),
             "user id leaked onto the wire"
+        );
+        // Issue #971: and a person's decision carries no `automatic` flag, so
+        // the console's "an operator decided this" reading of its absence is
+        // the correct one.
+        assert!(
+            v.get("automatic").is_none(),
+            "a user's own decision is not automatic"
+        );
+    }
+
+    /// **T6 (issue #971).** A host-side expiry says so, without saying who.
+    ///
+    /// The defect: an expiry appends `ApprovalResolved { Deny, System }`, this
+    /// frame dropped the actor, and the console toasted "Approval denied" — so
+    /// an operator was told they had declined a request they never saw. With a
+    /// 24-hour deadline that stops being rare.
+    ///
+    /// The assertion above is **extended here, not replaced**: the new field is
+    /// a bit derived from `by.kind`, and the no-actor / no-user-id property it
+    /// is derived from has to keep holding, so it is re-asserted on this arm
+    /// with a `System` actor whose id is equally secret.
+    #[test]
+    fn projects_a_host_side_expiry_as_automatic_without_the_actor() {
+        let v = super::project_event(&stored(CompanyEvent::ApprovalResolved {
+            approval_id: ApprovalId::new("ap-2"),
+            verdict: Verdict::Deny,
+            by: Actor {
+                kind: ActorKind::System,
+                // Even the system actor's id stays off the feed: the console
+                // needs the *fact* that no person decided this, not the name of
+                // the internal path that did.
+                id: "expiry".into(),
+            },
+        }))
+        .expect("approval_resolved is an attention signal");
+        assert_eq!(v["type"], "approval_resolved");
+        assert_eq!(v["approvalId"], "ap-2");
+        assert_eq!(v["verdict"], "deny");
+        assert_eq!(
+            v["automatic"], true,
+            "the console must be able to say the deadline passed rather than \
+             attributing the deny to whoever is looking at it"
+        );
+        // The extended property, restated on this arm.
+        assert!(v.get("by").is_none(), "actor must not be projected");
+        assert!(
+            !v.to_string().contains("expiry"),
+            "the actor id must not reach the wire on this arm either"
         );
     }
 

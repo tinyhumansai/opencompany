@@ -181,8 +181,13 @@ pub async fn rebuild_company(state: &AppState, id: &CompanyId) -> Result<Arc<Com
         Ok(runtime) => runtime,
         Err(err) => {
             // The stale brain is a worse company; a permanently quiesced one is
-            // not a company at all.
-            outgoing.resume();
+            // not a company at all — unless the host is already draining. In that
+            // case the shutdown drain has gated this company against new cycles,
+            // and re-opening it would admit a turn nothing is waiting for in the
+            // seconds before the process exits (issue #986).
+            if !state.registry().is_shutting_down() {
+                outgoing.resume();
+            }
             return Err(err);
         }
     };
@@ -372,6 +377,35 @@ mod test {
             .run_cycle(vec![tick()])
             .await
             .expect("the surviving runtime still runs cycles");
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebuild_during_shutdown_keeps_the_company_quiesced() {
+        // The shutdown drain (issue #986) gates every registered company against
+        // new cycles. A rebuild that fails *after* the drain began must not
+        // `resume()` the outgoing runtime and re-open admission on a company the
+        // process is about to leave — that would admit a turn nothing waits for
+        // in the seconds before exit.
+        let home_dir = tmp_home();
+        let home = home_dir.path();
+        let id = CompanyId::new("acme");
+        let state = state_with(home, &id).await.with_rebuilder(Arc::new(Broken));
+        state.registry().begin_shutdown();
+        let outgoing = state.registry().get(&id).expect("registered");
+
+        let err = rebuild_company(&state, &id)
+            .await
+            .expect_err("the rebuilder fails");
+        assert!(matches!(err, OpenCompanyError::Config(_)), "{err}");
+
+        assert!(
+            outgoing.is_quiesced(),
+            "a failed rebuild during shutdown must keep the company gated"
+        );
+        assert!(
+            outgoing.run_cycle(vec![tick()]).await.is_err(),
+            "a company gated by shutdown must refuse a cycle"
+        );
     }
 
     #[tokio::test]

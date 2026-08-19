@@ -70,26 +70,55 @@ function graphBody(id: string, name: string) {
  * browser test can drive. The host journals `WorkflowCreated` on this path, so
  * the page under test can only learn about it through the SSE stream.
  */
-async function createWorkflow(request: APIRequestContext, id: string, name: string) {
+/** Creates a workflow over HTTP and returns its version token. */
+async function createWorkflow(
+  request: APIRequestContext,
+  id: string,
+  name: string,
+): Promise<string> {
   const res = await request.post(`${COMPANY_SCOPE}/workflows`, { data: graphBody(id, name) });
   expect(res.ok(), `create ${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
+  const body = await res.json();
+  return body.version as string;
 }
 
 /**
  * Renames a saved workflow out-of-band. Journals `WorkflowUpdated`.
  *
  * The graph goes in flat — `UpdateWorkflowBody` flattens it and carries only
- * the optional `expectedVersion` alongside — and no token is sent, which is the
- * unconditional write an out-of-band caller makes.
+ * `expectedVersion` alongside. `expectedVersion` is required (issue #1013), so
+ * this needs the token the caller read the graph at — an out-of-band actor is
+ * not exempt from the same conditional-write contract the console follows.
  */
-async function renameWorkflow(request: APIRequestContext, id: string, name: string) {
-  const res = await request.put(`${COMPANY_SCOPE}/workflows/${id}`, { data: graphBody(id, name) });
+async function renameWorkflow(
+  request: APIRequestContext,
+  id: string,
+  name: string,
+  expectedVersion: string,
+) {
+  const res = await request.put(`${COMPANY_SCOPE}/workflows/${id}`, {
+    data: { ...graphBody(id, name), expectedVersion },
+  });
   expect(res.ok(), `rename ${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
 }
 
-/** Best-effort teardown so a failed spec does not poison the next run. */
+/** Reads back a workflow's current version, or `null` if it is gone already. */
+async function currentVersion(request: APIRequestContext, id: string): Promise<string | null> {
+  const res = await request.get(`${COMPANY_SCOPE}/workflows/${id}`);
+  if (!res.ok()) return null;
+  const body = await res.json();
+  return (body.version as string | null) ?? null;
+}
+
+/**
+ * Best-effort teardown so a failed spec does not poison the next run.
+ * `expectedVersion` is required (issue #1013), so this reads the workflow's
+ * current token first — the caller's own copy may be stale by teardown time.
+ */
 async function removeWorkflow(request: APIRequestContext, id: string) {
-  await request.delete(`${COMPANY_SCOPE}/workflows/${id}`).catch(() => undefined);
+  const version = await currentVersion(request, id).catch(() => null);
+  const query = version ? `?expectedVersion=${encodeURIComponent(version)}` : "";
+  await request.delete(`${COMPANY_SCOPE}/workflows/${id}${query}`).catch(() => undefined);
 }
 
 /** The workflow picker's trigger. */
@@ -217,7 +246,7 @@ test("a workflow renamed elsewhere renames in the picker, with no reload", async
   const id = `e2e-live-rename-${stamp}`;
   const before = `Live rename probe ${stamp}`;
   const after = `Live renamed probe ${stamp}`;
-  await createWorkflow(request, id, before);
+  const createdVersion = await createWorkflow(request, id, before);
 
   try {
     await openWorkflows(page);
@@ -225,7 +254,7 @@ test("a workflow renamed elsewhere renames in the picker, with no reload", async
 
     // The graph on screen is renamed under the operator — the second-session
     // edit #259 made possible, and which nothing told this tab about.
-    await renameWorkflow(request, id, after);
+    await renameWorkflow(request, id, after, createdVersion);
 
     // Read off the trigger, which renders the *selected* workflow's name from
     // the same list the options come from: the rename has to land on the
@@ -247,7 +276,7 @@ test("deleting the workflow on screen elsewhere takes it out of the picker, not 
   const stamp = Date.now();
   const id = `e2e-live-delete-${stamp}`;
   const name = `Live delete probe ${stamp}`;
-  await createWorkflow(request, id, name);
+  const createdVersion = await createWorkflow(request, id, name);
 
   try {
     await openWorkflows(page);
@@ -256,8 +285,10 @@ test("deleting the workflow on screen elsewhere takes it out of the picker, not 
     // Deleted from another session while this tab has it selected and its graph
     // on the canvas. This is the worst symptom in the issue: the entry used to
     // stay put, and the next Run or Edit addressed a workflow the host had
-    // already dropped.
-    const deleted = await request.delete(`${COMPANY_SCOPE}/workflows/${id}`);
+    // already dropped. `expectedVersion` is required (issue #1013).
+    const deleted = await request.delete(
+      `${COMPANY_SCOPE}/workflows/${id}?expectedVersion=${encodeURIComponent(createdVersion)}`,
+    );
     expect(deleted.ok(), `delete ${id}: ${deleted.status()}`).toBeTruthy();
 
     // The selection moves off it, so the canvas stops showing a graph the host
@@ -295,7 +326,7 @@ test("a delete elsewhere corrects the URL in place, without pushing history", as
   const stamp = Date.now();
   const id = `e2e-live-history-${stamp}`;
   const name = `Live history probe ${stamp}`;
-  await createWorkflow(request, id, name);
+  const createdVersion = await createWorkflow(request, id, name);
 
   try {
     await openWorkflows(page);
@@ -306,7 +337,10 @@ test("a delete elsewhere corrects the URL in place, without pushing history", as
     await expect.poll(() => page.url(), { timeout: 20_000 }).toContain(id);
     const entriesBefore = await page.evaluate(() => window.history.length);
 
-    const deleted = await request.delete(`${COMPANY_SCOPE}/workflows/${id}`);
+    // `expectedVersion` is required (issue #1013).
+    const deleted = await request.delete(
+      `${COMPANY_SCOPE}/workflows/${id}?expectedVersion=${encodeURIComponent(createdVersion)}`,
+    );
     expect(deleted.ok(), `delete ${id}: ${deleted.status()}`).toBeTruthy();
 
     // The selection moves off the deleted workflow and the hash follows it.

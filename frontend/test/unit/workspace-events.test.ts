@@ -40,6 +40,7 @@ describe("workspace_changed routing", () => {
       onWorkflowRunEvent: vi.fn(),
       onWorkflowChanged: vi.fn(),
       onApprovalEvent: vi.fn(),
+      onResync: vi.fn(),
     } satisfies Subs;
   }
 
@@ -100,5 +101,16 @@ describe("workspace_changed routing", () => {
     const subs = subscribers();
     handleEvent(frame("restored"), subs);
     expect(subs.onWorkspaceEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a stream gap as a silent canonical recovery instruction", () => {
+    const subs = subscribers();
+    handleEvent({ type: "stream_gap", missed: 44 }, subs);
+
+    expect(subs.onResync).toHaveBeenCalledTimes(1);
+    expect(subs.onWorkspaceEvent).not.toHaveBeenCalled();
+    expect(subs.onTaskEvent).not.toHaveBeenCalled();
+    expect(subs.onWorkflowChanged).not.toHaveBeenCalled();
+    for (const fn of Object.values(toasts)) expect(fn).not.toHaveBeenCalled();
   });
 });

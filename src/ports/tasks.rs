@@ -475,6 +475,20 @@ pub struct TaskPlan {
     pub planned_at_millis: u64,
 }
 
+/// One metered planning pass attributed to a task.
+///
+/// Planning runs outside the attempt machinery, so it has no `run_id`. Keeping
+/// each non-zero pass on the card preserves failed and superseded planning
+/// spend instead of making the latest successful brief stand in for history.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPlanningUsage {
+    /// When the model call completed.
+    pub at_millis: u64,
+    /// Tokens and source-currency USD reported by that call.
+    pub usage: crate::ports::types::TokenUsage,
+}
+
 impl TaskPlan {
     /// Every prerequisite whose verdict blocks the dispatch.
     pub fn blockers(&self) -> Vec<&Prerequisite> {
@@ -938,6 +952,9 @@ pub struct TaskRecord {
     /// a structured field rather than an artifact or note prose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<TaskPlan>,
+    /// Every non-zero planning pass, including failed and superseded passes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planning_attempts: Vec<TaskPlanningUsage>,
     /// Whether this card produces a one-off result or a reusable workflow
     /// (issue #580).
     ///
@@ -1426,6 +1443,7 @@ mod test {
             // #339's baseline fixture stays baseline: it exists to prove the
             // output stamp round-trips against a card carrying nothing else.
             plan: None,
+            planning_attempts: Vec::new(),
             deliverable: TaskDeliverable::Once,
             workflow_proposal: None,
             origin_run_id: None,
@@ -1713,6 +1731,7 @@ mod test {
 
         // A workflow card carrying a proposal round-trips whole.
         let proposed = TaskRecord {
+            planning_attempts: Vec::new(),
             deliverable: TaskDeliverable::Workflow,
             workflow_proposal: Some(TaskWorkflowProposal {
                 summary: "Email the weekly digest every Monday".to_string(),

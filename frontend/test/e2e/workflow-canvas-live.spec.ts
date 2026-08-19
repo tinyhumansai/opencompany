@@ -94,6 +94,20 @@ test.describe("workflow canvas during a live run", () => {
     expect(res.ok(), `create ${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
   }
 
+  /**
+   * Best-effort teardown so a failed spec does not poison the next run.
+   * `expectedVersion` is required (issue #1013), so this reads the workflow's
+   * current token first rather than sending a bare DELETE.
+   */
+  async function removeWorkflow(request: APIRequestContext, id: string) {
+    const version = await request
+      .get(`${COMPANY_SCOPE}/workflows/${id}`)
+      .then(async (res) => (res.ok() ? ((await res.json()).version as string | null) : null))
+      .catch(() => null);
+    const query = version ? `?expectedVersion=${encodeURIComponent(version)}` : "";
+    await request.delete(`${COMPANY_SCOPE}/workflows/${id}${query}`).catch(() => undefined);
+  }
+
   /** The per-node run marks the canvas is painting right now. */
   async function painted(page: Page): Promise<Record<string, string>> {
     return page.evaluate(() =>
@@ -159,7 +173,7 @@ test.describe("workflow canvas during a live run", () => {
       expect(settled["Step 0"], JSON.stringify(settled)).toBe("ok");
       await run;
     } finally {
-      await request.delete(`${COMPANY_SCOPE}/workflows/${id}`).catch(() => undefined);
+      await removeWorkflow(request, id);
     }
   });
 
@@ -204,7 +218,7 @@ test.describe("workflow canvas during a live run", () => {
       expect(settled["Done"], JSON.stringify(settled)).toBe("ok");
       await run;
     } finally {
-      await request.delete(`${COMPANY_SCOPE}/workflows/${id}`).catch(() => undefined);
+      await removeWorkflow(request, id);
     }
   });
 });

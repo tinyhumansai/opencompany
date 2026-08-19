@@ -68,6 +68,7 @@ import type { OpenCompanyClient } from "./client";
 import { PROPOSAL_FENCE } from "./workflow-proposal";
 import {
   WORKFLOW_NODE_KINDS,
+  type UnwiredWorkflowTool,
   type WorkflowGraph,
   type WorkflowRunOutcome,
 } from "./workflows";
@@ -134,9 +135,11 @@ export interface CopilotContext {
    */
   roster?: RosterEntry[];
   /**
-   * The wired, granted `tool_call` slugs a proposed tool step may run — issue
-   * #783. The exact set the host will accept (`GET …/workflows/tool-slugs`), so
-   * the model proposes a real tool instead of guessing `github_integration`.
+   * The **effective** `tool_call` slugs a proposed tool step may run — issue
+   * #783, narrowed by issue #874. Granted by the company AND wired on this
+   * deployment (`GET …/workflows/tool-slugs`), so the model proposes a real tool
+   * instead of guessing `github_integration` — and, since #874, not one that is
+   * granted but has no provider here and would fail at the first run.
    */
   toolSlugs?: string[];
   /**
@@ -149,6 +152,16 @@ export interface CopilotContext {
    * proposal. `false`/absent keeps the message from making the stronger claim.
    */
   toolSlugsKnown?: boolean;
+  /**
+   * Tools this company is granted but that are not wired here — issue #874.
+   *
+   * Listed as an advisory the model must not author from, mirroring the
+   * create-time copilot's `list_effective_tools`. Naming them is what lets the
+   * copilot answer "this needs web search, which is not configured on this
+   * deployment" instead of either proposing a doomed node or claiming the
+   * company has no such tool at all.
+   */
+  unwiredTools?: UnwiredWorkflowTool[];
 }
 
 /** One roster teammate a proposed `agent` step may name — id and role. */
@@ -170,7 +183,15 @@ export function composeCopilotMessage(
   context: CopilotContext,
   question: string,
 ): string {
-  const { graph, runs, runsKnown, roster, toolSlugs, toolSlugsKnown } = context;
+  const {
+    graph,
+    runs,
+    runsKnown,
+    roster,
+    toolSlugs,
+    toolSlugsKnown,
+    unwiredTools,
+  } = context;
   // `editable: false` means the graph is defined by a file in the company
   // source tree. Named for what it IS rather than for the flag's polarity: this
   // was `editable`, holding the negation of the field it was named after, and
@@ -286,16 +307,47 @@ export function composeCopilotMessage(
     `### Tools — the slugs a \`tool_call\` step may run`,
     `A \`tool_call\` node names its tool with \`config.slug\`, set to one of these EXACT slugs. Do not invent a slug (there is no \`github_integration\`, etc.).`,
   );
-  if (!toolSlugsKnown || toolSlugs === undefined) {
+  // The single predicate both the list and its advisory key off. Hoisted rather
+  // than spelled out twice: the advisory is only coherent directly under a list
+  // that was actually read, so the two conditions must be exact negations of one
+  // another — and two copies of `toolSlugsKnown && toolSlugs !== undefined` is
+  // precisely how they drift apart.
+  const slugsListed = toolSlugsKnown && toolSlugs !== undefined;
+  if (!slugsListed) {
     lines.push(
-      `(The granted tools could not be listed here. Do not invent a tool slug.)`,
+      `(The tools that can run here could not be listed. Do not invent a tool slug.)`,
     );
   } else if (toolSlugs.length === 0) {
     lines.push(
-      `(No tools are granted to this company's workflows, so do not propose a \`tool_call\` step.)`,
+      `(No tools can run in this company's workflows, so do not propose a \`tool_call\` step.)`,
     );
   } else {
     for (const slug of toolSlugs) lines.push(`- ${slug}`);
+  }
+
+  // Issue #874: named, but firmly out of bounds. The list above is already
+  // narrowed to what can run here, so without this the model cannot tell a tool
+  // the company was never granted from one that is merely unconfigured — and it
+  // should answer "search is not wired on this deployment" rather than either
+  // proposing a node that dies at the first run or denying the tool exists.
+  //
+  // Gated on `slugsListed`, so the pairing cannot come apart: the advisory is a
+  // NARROWING of the list above, and there is nothing to narrow when that list
+  // could not be read. Emitting it anyway would say "these are off-limits"
+  // directly under "the tools that can run here could not be listed", which is
+  // self-contradictory on its face — and, since the caller holds the two in
+  // separate state, the tools named would be whichever company was on screen
+  // last. The condition closes that by construction rather than by the caller
+  // remembering to clear one when it clears the other.
+  if (slugsListed && unwiredTools !== undefined && unwiredTools.length > 0) {
+    lines.push(
+      ``,
+      `### Granted but NOT wired on this deployment — do NOT author these`,
+      `These cannot run here. If the change the operator wants needs one, say so and name the reason instead of proposing it.`,
+    );
+    for (const tool of unwiredTools) {
+      lines.push(`- ${tool.slug} — ${tool.detail}`);
+    }
   }
 
   lines.push(

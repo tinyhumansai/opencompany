@@ -679,7 +679,7 @@ async fn e2e_reported_usage_lands_on_the_usage_meter() {
         record
             .ledger
             .iter()
-            .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND && e.amount_usd == 0.042)
+            .any(|e| e.kind == crate::metering::INFERENCE_SPEND_KIND && e.amount_usd == -0.042)
     );
 }
 

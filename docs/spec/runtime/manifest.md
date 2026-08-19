@@ -101,6 +101,8 @@ mode = "supervised"                # readonly | supervised | auto | full
 always_approve = ["publish_artifact"]   # default []; names a tool or an open
                                    # effect kind — see approvals.md
 auto_approve_under_usd = 1.0
+approval_ttl_hours = 24            # default 24; how long a parked approval
+                                   # waits before it default-denies
 
 [place]                            # see company-as-agent/
 discoverable = false               # default false: going public is opt-in
@@ -275,7 +277,12 @@ prompt = "Weekly review and operator digest"
   outward reads run unattended, anything that leaves the company or spends on
   submit still parks). `always_approve` lists effect kinds that park for
   approval regardless of amount and wins over every tier including `full`;
-  `auto_approve_under_usd` lets small spends through. The parse default is
+  `auto_approve_under_usd` lets small spends through; `approval_ttl_hours` sets
+  how long a parked approval waits before it default-denies (24 hours by
+  default — see [approvals.md](../company-brain/approvals.md), issue #971).
+  Omitting it is not the same as writing `24`: the key stays absent from the
+  persisted seed, which is what keeps a future change to the default from
+  looking like an edit and discarding a console `[policy]` override. The parse default is
   `supervised`, with all money/publish/filing effects gated — but a **new**
   company is given `auto`, written into its manifest explicitly rather than
   left to that default. See

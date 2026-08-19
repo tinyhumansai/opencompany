@@ -40,6 +40,13 @@ kind = "output"
 name = "Hand it to the operator"
 summary = "Park the draft for review."
 
+# Content: the one node before this is `writer` producing a written draft, and
+# this harness's other desk is engineering. The draft is the deliverable, so the
+# desk that reviews written work is the audience.
+[node.destination]
+kind = "channel"
+target = "content"
+
 [[edge]]
 from = "start"
 to = "draft"

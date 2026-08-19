@@ -298,7 +298,39 @@ export interface ApprovalSummary {
   /** The parked effect's dotted kind, e.g. "payment.send". */
   kind: string;
   amount_usd: number | null;
+  /**
+   * Epoch-millis the effect was parked — stamped in the same turn that composed
+   * its arguments, so it dates the **payload**, not the queue (#1024).
+   */
   at_millis: number;
+  /**
+   * Epoch-millis this approval default-denies if nobody decides it (#971) —
+   * `at_millis` plus the company's approval deadline
+   * (`[policy].approval_ttl_hours`, 24 hours by default).
+   *
+   * **Never recompute it.** The host projects it from the gate that actually
+   * enforces the deadline; a console that added its own 24 hours to
+   * `at_millis` would show a deadline nothing enforces, and an operator would
+   * act on "in 3h" and be refused.
+   *
+   * Optional because a host may predate the field. Absent means "this host
+   * does not report deadlines" — render the card exactly as before rather
+   * than guessing one.
+   */
+  expires_at_millis?: number | null;
+  /**
+   * The host's consequence group for the parked effect (#1024).
+   *
+   * Derived server-side from the tool **and its arguments**, so a
+   * `composio_execute` carrying `GMAIL_SEND_EMAIL` arrives as `"send"` rather
+   * than as the catch-all its tool name alone implies. It cannot be computed
+   * here: for a harness tool call `kind` is the tool name, so a console keying
+   * on `kind` would miss exactly the outbound sends this marks.
+   *
+   * Optional, and that is how an old host degrades: no field, no age label,
+   * exactly the pre-#1024 card.
+   */
+  group?: "spend" | "send" | "sign" | "publish" | "hire" | "identity" | "other";
   /**
    * Which board task this approval was parked for (#333). Mirrors `TaskLink` in
    * `src/runtime/journal.rs`.
@@ -1118,6 +1150,8 @@ export interface UsagePointDto {
 export interface AgentTokensDto {
   name: string;
   tokens: number;
+  /** Source-currency USD, absent when role-redacted. */
+  costUsd?: number;
 }
 
 /** OAuth-connected calls counted for one provider over the window. */
@@ -1131,7 +1165,7 @@ export interface UsageTotalsDto {
   inputTokens: number;
   outputTokens: number;
   tokens: number;
-  costUsd: number;
+  costUsd?: number;
   oauthCalls: number;
   connections: number;
   /**
@@ -1158,6 +1192,8 @@ export interface UsageDto {
   /** OAuth calls per provider, highest first (empty until Phase 2 emit). */
   byProvider: ProviderCallsDto[];
   totals: UsageTotalsDto;
+  /** Positive cost exists but is hidden from this role. */
+  costHidden?: boolean;
 }
 
 /** Spend rolled up by prosumer category (`GET .../finances`). */

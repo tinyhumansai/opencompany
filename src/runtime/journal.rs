@@ -38,6 +38,27 @@ use crate::runtime::grants::{GrantId, GrantedCall, StandingGrant};
 pub use crate::runtime::types::TaskLink;
 use crate::store::fs::FsJournalStore;
 
+/// Why a parked approval was retired without an operator deciding it
+/// (issue #971).
+///
+/// Retirement has one implementation — [`CompanyRuntime::retire_approval`] —
+/// and this says which rule invoked it. Recorded rather than inferred: the
+/// journal is the audit trail for a default-deny, and "the deadline passed" and
+/// any future automatic retirement are different things to have happened to
+/// someone's request, however identical the resulting queue looks.
+///
+/// One variant today. The enum exists rather than a bool because the next
+/// reason is already known — an approval retired because a newer identical
+/// request superseded it — and a `superseded: bool` beside a `reason` would be
+/// two fields describing one fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryReason {
+    /// It sat unresolved past its `[policy].approval_ttl_hours` deadline.
+    #[default]
+    Ttl,
+}
+
 /// One durable journal record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "record")]
@@ -157,6 +178,14 @@ enum JournalRecord {
         id: ApprovalId,
         /// Epoch-millis the expiry was recorded.
         at_millis: u64,
+        /// Why it was retired (issue #971).
+        ///
+        /// `#[serde(default)]` is what lets every line written before this
+        /// field existed replay: they were all TTL expiries, which is exactly
+        /// what [`ExpiryReason::Ttl`] means, so the default is the truth about
+        /// them rather than a placeholder.
+        #[serde(default)]
+        reason: ExpiryReason,
     },
     /// A parked approval the operator approved with an amended effect payload.
     ///
@@ -1419,7 +1448,12 @@ impl RuntimeJournal {
     /// Records that a parked approval expired to a default-deny, removing it
     /// from the queue. This is the durable audit entry for
     /// default-deny-on-silence.
-    pub async fn record_expired(&self, id: &ApprovalId, at_millis: u64) -> Result<()> {
+    pub async fn record_expired(
+        &self,
+        id: &ApprovalId,
+        at_millis: u64,
+        reason: ExpiryReason,
+    ) -> Result<()> {
         self.state
             .lock()
             .expect("journal state poisoned")
@@ -1428,6 +1462,7 @@ impl RuntimeJournal {
         self.append(&JournalRecord::ApprovalExpired {
             id: id.clone(),
             at_millis,
+            reason,
         })
         .await
     }
@@ -2640,7 +2675,10 @@ mod test {
             .unwrap();
         assert_eq!(journal.pending().len(), 1);
 
-        journal.record_expired(&id, now_millis()).await.unwrap();
+        journal
+            .record_expired(&id, now_millis(), ExpiryReason::Ttl)
+            .await
+            .unwrap();
         assert!(journal.pending().is_empty());
 
         // A restart replays the expiry: the approval stays gone.
@@ -2730,7 +2768,10 @@ mod test {
             .unwrap();
 
         journal.record_resolved(&resolved).await.unwrap();
-        journal.record_expired(&expired, 9_000).await.unwrap();
+        journal
+            .record_expired(&expired, 9_000, ExpiryReason::Ttl)
+            .await
+            .unwrap();
 
         // Both left the queue...
         assert!(journal.pending().is_empty());
@@ -3399,12 +3440,48 @@ mod test {
         }
     }
 
+    /// **Old journal lines replay unchanged (issue #971).**
+    ///
+    /// Every `ApprovalExpired` written before the field existed was a TTL
+    /// expiry, so the serde default is the truth about them. A missing default
+    /// here would not be a cosmetic regression: replay is how the parked queue
+    /// is rebuilt at boot, and a line that fails to parse leaves an approval
+    /// resurrected that the host had already retired.
+    #[test]
+    fn a_pre_reason_expiry_line_replays_as_a_ttl_expiry() {
+        let old_line = r#"{"record":"ApprovalExpired","id":"ap-old","at_millis":42}"#;
+        let parsed: JournalRecord = serde_json::from_str(old_line).expect("old line must replay");
+        match parsed {
+            JournalRecord::ApprovalExpired {
+                id,
+                at_millis,
+                reason,
+            } => {
+                assert_eq!(id.as_ref(), "ap-old");
+                assert_eq!(at_millis, 42);
+                assert_eq!(reason, ExpiryReason::Ttl);
+            }
+            other => panic!("expected ApprovalExpired, got {other:?}"),
+        }
+
+        // And a line written today carries the reason explicitly, so the two
+        // are told apart by what is on the wire rather than by inference.
+        let written = serde_json::to_string(&JournalRecord::ApprovalExpired {
+            id: ApprovalId::new("ap-new"),
+            at_millis: 43,
+            reason: ExpiryReason::Ttl,
+        })
+        .expect("serialize");
+        assert!(written.contains(r#""reason":"ttl""#), "{written}");
+    }
+
     #[test]
     fn expired_and_amended_records_round_trip_under_record_tag() {
         for record in [
             JournalRecord::ApprovalExpired {
                 id: ApprovalId::new("x"),
                 at_millis: 42,
+                reason: ExpiryReason::Ttl,
             },
             JournalRecord::ApprovalAmended {
                 id: ApprovalId::new("y"),
@@ -3465,6 +3542,7 @@ mod test {
             JournalRecord::ApprovalExpired {
                 id: ApprovalId::new("a"),
                 at_millis: 2,
+                reason: ExpiryReason::Ttl,
             },
             JournalRecord::ApprovalAmended {
                 id: ApprovalId::new("a"),

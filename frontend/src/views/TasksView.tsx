@@ -53,6 +53,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { formatUsdCost } from "@/lib/cost";
 import { startVisiblePolling } from "@/lib/visible-poll";
 import { labelFor, PRIORITY_STYLES } from "@/lib/board-columns";
 import { approvalAction, timeAgo } from "@/lib/language";
@@ -122,6 +123,7 @@ export function TasksView({
   client,
   company,
   taskEventTick,
+  attemptEventTick,
   approvals = EMPTY_APPROVALS,
   now,
   onOpenThread,
@@ -137,6 +139,13 @@ export function TasksView({
    * reload.
    */
   taskEventTick?: number;
+  /**
+   * Bumped on every `run_status_changed` (issue #1015), passed straight through
+   * to the detail screen. The board itself does not react to it: an attempt
+   * moving does not move a card, and folding it into `taskEventTick` would
+   * refetch the whole board on every transition of every run.
+   */
+  attemptEventTick?: number;
   /**
    * The company's parked approvals (issue #883), from the shell's existing feed
    * poll. A paused card is blocked until every approval its turn parked has
@@ -310,6 +319,7 @@ export function TasksView({
   if (detailId) {
     return (
       <TaskDetailView
+        attemptEventTick={attemptEventTick}
         client={client}
         company={company}
         taskId={detailId}
@@ -333,12 +343,7 @@ export function TasksView({
         <div className="flex items-center gap-2">
           <h2 className="text-sm font-semibold">Board</h2>
           <Badge variant="secondary">{tasks.length}</Badge>
-          <Button
-            size="sm"
-            variant="outline"
-            className="ml-1 h-7"
-            onClick={() => setCreating(true)}
-          >
+          <Button size="sm" className="ml-1 h-7" onClick={() => setCreating(true)}>
             <Plus className="size-4" />
             Add task
           </Button>
@@ -362,7 +367,7 @@ export function TasksView({
           rows={tasks}
           statusOf={(task) => task.column}
           loading={loading}
-          emptyHint="No cards"
+          emptyHint="Drop tasks here"
           onMove={(task, column) => void moveTo(task, column)}
           onMiss={() => toast.error("Drop the card on a column to move it.")}
           renderCard={(task, dragging) => (
@@ -469,6 +474,11 @@ export function TaskItem({
             {initials(task.assignee)}
           </span>
           <span className="truncate text-xs text-muted-foreground">{task.assignee}</span>
+        </div>
+      )}
+      {formatUsdCost(task.cost, "total") && (
+        <div className="mt-2 text-2xs font-medium tabular-nums text-foreground">
+          {formatUsdCost(task.cost, "total")}
         </div>
       )}
       {task.deliverable === "workflow" && (

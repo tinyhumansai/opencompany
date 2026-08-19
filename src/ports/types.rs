@@ -332,6 +332,52 @@ pub enum CompanyEvent {
         /// deliberately **not** projected onto the operator SSE stream.
         error: String,
     },
+    /// One task attempt changed status (issue #1015).
+    ///
+    /// **The whole status machine, from one seam.** Emitted by the store
+    /// decorator that wraps `put_run` — the single write primitive every
+    /// [`RunStatus`](crate::ports::runs::RunStatus) change passes through, since
+    /// `begin_run` and `finish_run` are trait defaults that call it and no
+    /// backend overrides either. So the frame cannot be missed by adding a
+    /// caller, which is what makes this a complete surface rather than a partial
+    /// one.
+    ///
+    /// That matters most for the path the obvious seam misses:
+    /// [`reap_orphaned_runs`](crate::ports::runs::reap_orphaned_runs) settles
+    /// crash-killed runs by calling `finish_run` **directly**, never through the
+    /// cycle. Emitting from the cycle's call sites would leave exactly those
+    /// runs — the ones whose visibility the reaper exists to provide —
+    /// transitioning in silence.
+    ///
+    /// **Not [`TurnStarted`](Self::TurnStarted)/[`TurnFailed`](Self::TurnFailed)**,
+    /// though `turn_id` and this `run_id` are the same key. Those two are
+    /// appended only on the chat HTTP path and bracket an
+    /// [`OperatorMessage`](Self::OperatorMessage); firing one for a task attempt
+    /// would put a turn in the chat transcript that no one took.
+    ///
+    /// Additive: a new `kind`, absent from every journal written before it.
+    RunStatusChanged {
+        /// The attempt's id — the same id
+        /// [`RunRecord::id`](crate::ports::runs::RunRecord::id) is keyed on.
+        run_id: String,
+        /// The card this attempt is at, when it is a task attempt rather than a
+        /// chat turn. Absent for a chat turn, which belongs to no card.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        /// The attempt ordinal at that card — `1` for the first.
+        attempt: u32,
+        /// The status moved from. Absent when the row is being minted, which is
+        /// the one write with no prior state rather than a transition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// The status moved to.
+        to: String,
+        /// Why, on a failure. Tenant-scoped like
+        /// [`WorkflowRunFinished::error`](Self::WorkflowRunFinished) and
+        /// deliberately **not** projected onto the operator SSE stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// An inbound webhook fired.
     WebhookReceived {
         /// The channel the webhook arrived on.
@@ -1372,6 +1418,7 @@ impl CompanyEvent {
             Self::OperatorMessage { .. } => "OperatorMessage",
             Self::TurnStarted { .. } => "TurnStarted",
             Self::TurnFailed { .. } => "TurnFailed",
+            Self::RunStatusChanged { .. } => "RunStatusChanged",
             Self::WebhookReceived { .. } => "WebhookReceived",
             Self::ScheduleFired { .. } => "ScheduleFired",
             Self::A2aTaskReceived { .. } => "A2aTaskReceived",
@@ -1468,6 +1515,22 @@ impl CompanyEvent {
             // history is not kept here at all: for a published deliverable it
             // lives on the artifact chain (#552), and for an ordinary note it
             // is not kept anywhere, which pruning this does not change.
+            // Issue #1015, put through the three questions above rather than
+            // swept in beside its neighbours.
+            //
+            // Is it evidence? No — the `RunRecord` is the record of an attempt's
+            // status, and this frame carries no state the row does not already
+            // hold; it says "the row moved". Does anything point at it? No: it
+            // is joined by `run_id`, which pruning does not disturb, and nothing
+            // is addressed by its sequence. Does anything read it back? No boot
+            // fold consults it — `reap_orphaned_runs` reads the *rows*, by
+            // status, which is why it can settle runs this frame never covered.
+            //
+            // And it is high-volume machine exhaust by construction: several
+            // frames per attempt, one per transition, on every card and every
+            // chat turn. Its entire meaning is "re-read this run", and it is
+            // worthless once the console has.
+            | Self::RunStatusChanged { .. }
             | Self::WorkspaceChanged { .. }
             // Issue #983, and classified deliberately rather than swept in with
             // its neighbours — the doc above asks for all three questions.
@@ -3334,6 +3397,11 @@ impl CompanyRecord {
             // for the tier and the always-ask list, and a spend threshold whose
             // console control does not exist would be a field nothing can write.
             auto_approve_under_usd: manifest.auto_approve_under_usd,
+            // Same reasoning for the approval deadline (issue #971): the knob is
+            // a manifest one, so the override carries the manifest's answer
+            // through unchanged rather than gaining a field no console control
+            // writes.
+            approval_ttl_hours: manifest.approval_ttl_hours,
         }
     }
 

@@ -84,6 +84,14 @@ kind = "output"
 name = "Report back"
 summary = "Summarize what shipped."
 
+# Strategy, because this report closes the loop the brief opened: the strategist
+# turned the client's brief into the angle, and "what shipped" is only meaningful
+# read against it. Creative made the post and already saw it; growth runs
+# acquisition on a campaign this pipeline does not measure.
+[node.destination]
+kind = "channel"
+target = "strategy"
+
 [[edge]]
 from = "brief"
 to = "strategist"

@@ -115,6 +115,7 @@ async function render(
         graph: {
           id: "feature_pipeline",
           name: "Feature pipeline",
+          version: null,
           nodes: [{ id: "spec", kind: "agent", name: "Draft the note", agent: "writer" }],
           edges: [],
         },

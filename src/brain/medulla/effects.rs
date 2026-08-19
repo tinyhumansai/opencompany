@@ -189,6 +189,21 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("Turn {turn_id} did not finish"),
             "turn.failed",
         ),
+        // Issue #1015. Structural only, like every arm here: a minted run id and
+        // two fixed-vocabulary statuses. `error` is deliberately not copied —
+        // it is tenant-scoped, the same reason `TurnFailed` above carries only
+        // its id.
+        CompanyEvent::RunStatusChanged {
+            run_id, from, to, ..
+        } => (
+            Role::System,
+            "board".to_string(),
+            match from {
+                Some(from) => format!("Attempt {run_id}: {from} -> {to}"),
+                None => format!("Attempt {run_id}: {to}"),
+            },
+            "run.status_changed",
+        ),
         CompanyEvent::TaskDispatched { task_id, .. } => (
             Role::System,
             "board".to_string(),

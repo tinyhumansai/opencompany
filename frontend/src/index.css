@@ -16,7 +16,8 @@
  *
  * Three layers, in this order, and nothing skips a layer:
  *
- *   1. PRIMITIVES  — raw ramps (`--brand-500`, `--gray-200`, `--green-600`).
+ *   1. PRIMITIVES  — raw ramps (`--brand-500`, `--surface-dark-2`,
+ *                    `--ink-light-hint`, `--green-mark`).
  *                    Theme-independent. Never referenced by a component.
  *   2. SEMANTICS   — what a colour *means* here (`--primary`, `--status-running`,
  *                    `--border`). Light lives in `:root`, dark overrides in
@@ -43,46 +44,95 @@
      * that is what goes into Figma, a slide, or a favicon.
      * ---------------------------------------------------------------- */
 
-    /* Brand — indigo. The one hue the product owns.
+    /* Brand — violet. The one hue the product owns.
        Reserved for interaction and identity: anything the operator can
        click, the active surface they are on, and the marks that stand for
-       the company itself. It is never a status. */
-    --brand-50: oklch(0.9522 0.0241 288.49); /* #EEEDFF */
-    --brand-100: oklch(0.9124 0.0448 288.26); /* #E0DEFF */
-    --brand-200: oklch(0.841 0.0833 287.52); /* #C7C3FF */
-    --brand-300: oklch(0.7488 0.1351 285.53); /* #A6A0FF */
-    --brand-400: oklch(0.6614 0.1856 282.51); /* #857EFF */
-    --brand-500: oklch(0.5784 0.2346 278.29); /* #635BFF — the brand */
-    --brand-600: oklch(0.5141 0.2191 277.75); /* #524AE0 */
-    --brand-700: oklch(0.4453 0.1918 277.66); /* #423BBA */
-    --brand-800: oklch(0.369 0.157 278.1); /* #322C8F */
-    --brand-900: oklch(0.2957 0.1198 279.29); /* #241F66 */
+       the company itself. It is never a status.
 
-    /* Neutrals — carrying ~286° of the brand hue at very low chroma.
-       Not pure grey. A console is ~95% neutral surface, so that residual
-       chroma is where most of the brand actually lives; pure grey (which
-       is what this file held before) reads as unfinished next to a
-       saturated accent. */
-    --gray-25: oklch(0.9913 0.0013 286.38); /* #FCFCFD */
-    --gray-50: oklch(0.968 0.004 286.33); /* #F4F4F7 */
-    --gray-100: oklch(0.9505 0.0067 286.27); /* #EEEEF3 */
-    --gray-200: oklch(0.9267 0.0081 286.24); /* #E6E6EC */
-    --gray-300: oklch(0.8882 0.0136 286.12); /* #D9D9E3 */
-    --gray-400: oklch(0.6461 0.0266 285.63); /* #8C8C9E */
-    /* #6A6A7B, not the #6E6E80 this started as. Muted text sits on three
-       different grounds — the canvas, the muted fill, and the brand-tinted
-       accent — and the accent is the darkest of them. At the old value it
-       measured 4.48:1 there: under 4.5, found by auditing the running app
-       rather than by reading the token. One step down clears all three
-       (4.76 / 4.83 / 5.17) and costs nothing anywhere else. */
-    --gray-500: oklch(0.5304 0.0264 285.46); /* #6A6A7B */
-    --gray-600: oklch(0.682 0.0248 285.72); /* #9797A8 — dark-mode muted text */
-    --gray-800: oklch(0.2601 0.0168 285.18); /* #23232C */
-    --gray-850: oklch(0.2386 0.0152 285.19); /* #1E1E26 */
-    --gray-875: oklch(0.2074 0.0118 285.32); /* #17171D */
-    --gray-900: oklch(0.2035 0.0139 285.1); /* #16161D */
-    --gray-925: oklch(0.1891 0.0101 285.4); /* #131318 */
-    --gray-950: oklch(0.1558 0.0063 285.64); /* #0C0C0F */
+       500 is the value the brand guide names; every other step holds this
+       ramp's original lightness cadence and hue drift, with chroma scaled so
+       500 lands exactly on it. Every step verified in sRGB gamut. */
+    --brand-50: oklch(0.9522 0.0230 295.71); /* #F0ECFD */
+    --brand-100: oklch(0.9124 0.0427 295.48); /* #E4DDFC */
+    --brand-200: oklch(0.841 0.0794 294.74); /* #CEC1FA */
+    --brand-300: oklch(0.7488 0.1287 292.75); /* #B09DF8 */
+    --brand-400: oklch(0.6614 0.1769 289.73); /* #937BF6 */
+    --brand-500: oklch(0.5649 0.2236 285.51); /* #7153F0 — the brand */
+    --brand-600: oklch(0.5141 0.2088 284.97); /* #6247D7 */
+    --brand-700: oklch(0.4453 0.1828 284.88); /* #5038B2 */
+    --brand-800: oklch(0.369 0.1496 285.32); /* #3C2A89 */
+    --brand-900: oklch(0.2957 0.1142 286.51); /* #2B1E62 */
+
+    /*
+     * Surfaces — the six-rung ladder, stated per theme.
+     *
+     * One ramp cannot hold both themes here. The brand guide draws light and
+     * dark as two independent ladders whose rungs carry the same *roles*, not
+     * the same lightnesses, and the roles are what the semantic layer binds
+     * to. So the rung is the primitive, and the theme picks a set.
+     *
+     * Rung meanings, fixed by the guide:
+     *   bg      main content canvas
+     *   1       sidebar · cards · panels
+     *   2       panel stroke · date badge
+     *   3       icon circles
+     *   4       card stroke · dividers
+     *   active  the nav row you are standing on
+     *
+     * Every value below is the guide's, unchanged.
+     */
+    --surface-light-bg: oklch(0.9776 0.0066 286.28); /* #F7F7FC */
+    --surface-light-1: oklch(1 0 0); /* #FFFFFF */
+    --surface-light-2: oklch(0.9601 0.0093 286.22); /* #F1F1F8 */
+    --surface-light-3: oklch(0.9339 0.0134 286.14); /* #E8E8F2 */
+    --surface-light-4: oklch(0.8916 0.0149 286.09); /* #DADAE5 */
+    --surface-light-active: oklch(0.942 0.0256 293.15); /* #ECE9FC */
+
+    --surface-dark-bg: oklch(0.1395 0.0048 262.8); /* #08090B */
+    --surface-dark-1: oklch(0.1588 0.0045 264.44); /* #0C0D0F */
+    --surface-dark-2: oklch(0.1865 0.0044 264.46); /* #121315 */
+    --surface-dark-3: oklch(0.1886 0.008 285.6); /* #131317 */
+    --surface-dark-4: oklch(0.2044 0.0043 264.47); /* #161719 */
+    --surface-dark-active: oklch(0.2396 0.019 284.87); /* #1E1E28 */
+
+    /*
+     * Ink — the five text levels, stated per theme.
+     *
+     * `primary` and the light `secondary` are the guide's values. The rest are
+     * the guide's hue and chroma at a corrected lightness, because six of the
+     * ten levels as drawn do not clear 4.5:1 against the very surfaces the
+     * guide assigns them — dark `tertiary`, which it marks as *body text*,
+     * measured 2.91:1, and light `muted` measured 1.45:1.
+     *
+     * Correcting each one by the smallest lift that clears the floor collapses
+     * the ramp: every level lands on 4.5:1 and the five levels become one
+     * colour. So the ramp is redistributed instead — the weakest level sits on
+     * the floor and the rest step up from it in even increments of L, which is
+     * the same perceptual-uniformity argument the brand ramp above is built
+     * on. Hierarchy is preserved by *role* (secondary strongest, muted
+     * weakest); the guide draws `hint` brighter than `secondary` in dark,
+     * which its own usage labels contradict.
+     *
+     * Two levels also move hue. Dark `hint` (#8E9286) and dark `muted`
+     * (#62665C) are drawn at ~122° — green — while every other neutral in the
+     * guide sits near 285°, and the guide's own subtitle reads "All cool-toned
+     * greys with purple undertone". They are brought back to that.
+     *
+     * Ratios below are worst-case across the three grounds text actually sits
+     * on (bg, surface 1, active); rungs 2–4 are strokes and icon circles, not
+     * text grounds. See `docs/design-system/color.md` for the full table.
+     */
+    --ink-light-primary: oklch(0.1505 0.0214 283.53); /* #0A0A14  16.53:1 */
+    --ink-light-secondary: oklch(0.391 0.0388 284.77); /* #43435A   8.05:1 */
+    --ink-light-tertiary: oklch(0.436 0.0165 244.9); /* #4A535A   6.59:1 */
+    --ink-light-hint: oklch(0.481 0.0131 259.82); /* #5A5E65   5.47:1 */
+    --ink-light-muted: oklch(0.526 0.0155 286.04); /* #6A6973   4.54:1 */
+
+    --ink-dark-primary: oklch(1 0 0); /* #FFFFFF  16.52:1 */
+    --ink-dark-secondary: oklch(0.754 0.0185 285.78); /* #AEAEBB   7.53:1 */
+    --ink-dark-tertiary: oklch(0.709 0.0181 248.18); /* #99A2AC   6.38:1 */
+    --ink-dark-hint: oklch(0.664 0.018 285.78); /* #92929E   5.37:1 */
+    --ink-dark-muted: oklch(0.619 0.0163 285.78); /* #858590   4.53:1 */
 
     /* Status hues.
        Each ships in three weights because one value cannot do all three
@@ -116,35 +166,52 @@
     /* Surfaces, from furthest back to closest to the operator. The canvas
        is a hair off white and cards are pure white, so a card lifts off the
        page by lightness alone — before any shadow is applied. */
-    --background: var(--gray-25);
-    --foreground: var(--gray-900);
-    --card: oklch(1 0 0);
-    --card-foreground: var(--gray-900);
-    --popover: oklch(1 0 0);
-    --popover-foreground: var(--gray-900);
+    --background: var(--surface-light-bg);
+    --foreground: var(--ink-light-primary);
+    --card: var(--surface-light-1);
+    --card-foreground: var(--ink-light-primary);
+    --popover: var(--surface-light-1);
+    --popover-foreground: var(--ink-light-primary);
 
     /* Interaction. `primary` is the brand: the button you press, the link
        you follow, the series that leads a chart. */
     --primary: var(--brand-500);
-    --primary-foreground: oklch(1 0 0);
-    --secondary: var(--gray-100);
-    --secondary-foreground: var(--gray-900);
-    --muted: var(--gray-50);
-    --muted-foreground: var(--gray-500);
+    --primary-foreground: var(--surface-light-1);
+    --secondary: var(--surface-light-3);
+    --secondary-foreground: var(--ink-light-primary);
+    --muted: var(--surface-light-2);
+    --muted-foreground: var(--ink-light-muted);
+
+    /* The five-level text hierarchy the brand guide defines, named directly
+       so a component can ask for the rung it means instead of approximating
+       it with `foreground` and `muted-foreground`. `--ink-primary` and
+       `--foreground` are deliberately the same value: one is the hierarchy's
+       top rung, the other is the shadcn contract, and collapsing them would
+       break one of the two vocabularies. */
+    /* Rung 3 is the ground behind an icon circle. It is the only rung the
+       shadcn vocabulary has no name for, so it gets one here rather than
+       being approximated with `muted`. */
+    --surface-icon: var(--surface-light-3);
+
+    --ink-primary: var(--ink-light-primary);
+    --ink-secondary: var(--ink-light-secondary);
+    --ink-tertiary: var(--ink-light-tertiary);
+    --ink-hint: var(--ink-light-hint);
+    --ink-muted: var(--ink-light-muted);
 
     /* `accent` is the hover/rest tint under menu rows, list items and
        nav. Brand-tinted, but the *text* on it stays neutral — 40 call
        sites pair `bg-accent` with `text-accent-foreground`, and indigo
        text on every hover would make the console strobe. The one place
        brand ink is allowed is the active sidebar row, below. */
-    --accent: color-mix(in oklab, var(--brand-500) 7%, var(--gray-25));
-    --accent-foreground: var(--gray-900);
+    --accent: var(--surface-light-active);
+    --accent-foreground: var(--ink-light-primary);
 
     --destructive: var(--red-mark);
-    --destructive-foreground: oklch(1 0 0);
+    --destructive-foreground: var(--surface-light-1);
 
-    --border: var(--gray-200);
-    --input: var(--gray-300);
+    --border: var(--surface-light-4);
+    --input: var(--surface-light-4);
     /* Focus is branded. It is the most-seen interactive signal in the app
        and it was grey. */
     --ring: var(--brand-500);
@@ -154,9 +221,9 @@
        those five map to five fixed colours everywhere they appear, so a
        green dot means the same thing in the Overview, a task card and a
        run log. `-soft` backs the badge, `-text` sets its label. */
-    --status-idle: var(--gray-400);
-    --status-idle-text: var(--gray-500);
-    --status-idle-soft: var(--gray-50);
+    --status-idle: var(--ink-light-hint);
+    --status-idle-text: var(--ink-light-muted);
+    --status-idle-soft: var(--surface-light-2);
 
     --status-running: var(--cyan-mark);
     --status-running-text: var(--cyan-text);
@@ -229,14 +296,14 @@
 
     /* Sidebar. Slightly recessed from the canvas so the working area is
        the brightest thing on screen. */
-    --sidebar: var(--gray-50);
-    --sidebar-foreground: var(--gray-900);
+    --sidebar: var(--surface-light-1);
+    --sidebar-foreground: var(--ink-light-primary);
     --sidebar-primary: var(--brand-500);
-    --sidebar-primary-foreground: oklch(1 0 0);
-    --sidebar-accent: color-mix(in oklab, var(--brand-500) 10%, var(--gray-50));
+    --sidebar-primary-foreground: var(--surface-light-1);
+    --sidebar-accent: var(--surface-light-active);
     /* The one place brand ink is spent: the nav row you are standing on. */
     --sidebar-accent-foreground: var(--brand-700);
-    --sidebar-border: var(--gray-200);
+    --sidebar-border: var(--surface-light-4);
     --sidebar-ring: var(--brand-500);
 
     /* Corner radius. 10px at `lg` — the whole scale derives from it, so a
@@ -287,38 +354,54 @@
        direction as light mode. The canvas is near-black, and each layer
        above it is a measured step up — never a translucent white wash,
        which tints unpredictably over whatever it lands on. */
-    --background: var(--gray-950);
-    --foreground: var(--gray-50);
-    --card: var(--gray-925);
-    --card-foreground: var(--gray-50);
-    --popover: var(--gray-875);
-    --popover-foreground: var(--gray-50);
+    --background: var(--surface-dark-bg);
+    --foreground: var(--ink-dark-primary);
+    --card: var(--surface-dark-1);
+    --card-foreground: var(--ink-dark-primary);
+    /* Rung 3, not rung 4. `--border` is rung 4, and a popover painted rung 4
+       renders its own edge in its own fill — the dialog loses its outline
+       entirely. Rung 3 keeps the popover above the card (rung 1) and leaves
+       the stroke a step to read against. */
+    --popover: var(--surface-dark-3);
+    --popover-foreground: var(--ink-dark-primary);
 
     /* Brand-500 is too dense to read as ink on near-black; 400 is the
        working accent in dark mode. Filled brand buttons keep 500 with
        white text, which measures 4.70:1 in both themes. */
     --primary: var(--brand-400);
-    --primary-foreground: var(--gray-950);
-    --secondary: var(--gray-800);
-    --secondary-foreground: var(--gray-50);
-    --muted: var(--gray-850);
-    --muted-foreground: var(--gray-600);
+    --primary-foreground: var(--surface-dark-bg);
+    --secondary: var(--surface-dark-active);
+    --secondary-foreground: var(--ink-dark-primary);
+    --muted: var(--surface-dark-2);
+    --muted-foreground: var(--ink-dark-muted);
 
-    --accent: color-mix(in oklab, var(--brand-400) 14%, var(--gray-850));
-    --accent-foreground: var(--gray-50);
+    --surface-icon: var(--surface-dark-3);
+
+    --ink-primary: var(--ink-dark-primary);
+    --ink-secondary: var(--ink-dark-secondary);
+    --ink-tertiary: var(--ink-dark-tertiary);
+    --ink-hint: var(--ink-dark-hint);
+    --ink-muted: var(--ink-dark-muted);
+
+    --accent: var(--surface-dark-active);
+    --accent-foreground: var(--ink-dark-primary);
 
     --destructive: var(--red-bright);
-    --destructive-foreground: var(--gray-950);
+    --destructive-foreground: var(--surface-dark-bg);
 
-    /* Borders stay translucent here on purpose: they must read against
-       the canvas, the card and the popover, which are three different
-       lightnesses. A fixed colour would be invisible on one of them. */
-    --border: oklch(1 0 0 / 9%);
-    --input: oklch(1 0 0 / 14%);
+    /* Borders were translucent white here, so that one value could read
+       against the canvas, the card and the popover at once. The guide names
+       the stroke outright — rung 4, "card stroke / dividers" — so they are
+       opaque now, and the ladder is what keeps them legible: every text
+       ground (bg, 1, active) sits clear of rung 4 in lightness. `--input`
+       takes the active rung, one step up, so a field edge stays visible
+       against a card that already uses rung 4 as its own border. */
+    --border: var(--surface-dark-4);
+    --input: var(--surface-dark-active);
     --ring: var(--brand-400);
 
-    --status-idle: var(--gray-600);
-    --status-idle-text: var(--gray-600);
+    --status-idle: var(--ink-dark-muted);
+    --status-idle-text: var(--ink-dark-muted);
     --status-idle-soft: oklch(1 0 0 / 6%);
 
     --status-running: var(--cyan-bright);
@@ -356,13 +439,13 @@
        a grey smudge over the dark canvas. */
     --highlight: oklch(0.78 0.17 98 / 32%);
 
-    --sidebar: var(--gray-925);
-    --sidebar-foreground: var(--gray-50);
+    --sidebar: var(--surface-dark-1);
+    --sidebar-foreground: var(--ink-dark-primary);
     --sidebar-primary: var(--brand-400);
-    --sidebar-primary-foreground: var(--gray-950);
-    --sidebar-accent: color-mix(in oklab, var(--brand-400) 16%, var(--gray-850));
+    --sidebar-primary-foreground: var(--surface-dark-bg);
+    --sidebar-accent: var(--surface-dark-active);
     --sidebar-accent-foreground: var(--brand-300);
-    --sidebar-border: oklch(1 0 0 / 9%);
+    --sidebar-border: var(--surface-dark-4);
     --sidebar-ring: var(--brand-400);
 
     /* Shadow alone cannot separate two near-black surfaces — there is no
@@ -420,6 +503,17 @@
     --color-border: var(--border);
     --color-input: var(--input);
     --color-ring: var(--ring);
+    --color-surface-icon: var(--surface-icon);
+
+    /* The five-level text hierarchy, as `text-ink-*`. Named `ink` rather than
+       `text` because `--text-*` is Tailwind's font-size namespace in this same
+       block — `--text-primary` here would mint a font size called
+       `text-primary`, silently. */
+    --color-ink-primary: var(--ink-primary);
+    --color-ink-secondary: var(--ink-secondary);
+    --color-ink-tertiary: var(--ink-tertiary);
+    --color-ink-hint: var(--ink-hint);
+    --color-ink-muted: var(--ink-muted);
 
     /* The brand ramp, addressable directly for the rare case that needs a
        specific step (illustration, a marketing surface, a chart annotation).

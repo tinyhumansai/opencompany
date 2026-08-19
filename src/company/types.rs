@@ -1244,6 +1244,30 @@ pub struct Policy {
     /// Spends strictly under this many USD skip approval.
     #[serde(default)]
     pub auto_approve_under_usd: Option<f64>,
+    /// How many hours a parked approval waits before it default-denies
+    /// (issue #971). `None` takes the gate's
+    /// [`DEFAULT_TTL_MILLIS`](crate::policy::DEFAULT_TTL_MILLIS), 24 hours.
+    ///
+    /// **Deliberately a bare `Option` with no serde default, and the absence is
+    /// load-bearing.** The obvious alternative — `#[serde(default = "…")]`
+    /// resolving to `Some(24)` at parse — walks straight into the trap
+    /// documented on [`mode`](Self::mode) above. The persisted record stores
+    /// the *defaulted* value, and `carry_policy_override` in
+    /// [`crate::runtime::builder`] is `previous_seed == next_seed` over this
+    /// whole block; so the day this default moves, every company with a silent
+    /// manifest gets a seed that changed under it, and the rebuild discards the
+    /// operator's console `[policy]` override as though version control had
+    /// spoken. Nobody edited anything, and the feature that breaks is not this
+    /// one.
+    ///
+    /// So `None` means "not configured" all the way through parse and persist,
+    /// and the default is resolved exactly once, at
+    /// [`ManifestApprovalGate::new`](crate::policy::ManifestApprovalGate::new).
+    ///
+    /// Skipped when absent so a manifest that never mentioned the knob
+    /// serializes byte-identically to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_ttl_hours: Option<u64>,
 }
 
 impl Default for Policy {
@@ -1252,6 +1276,7 @@ impl Default for Policy {
             mode: default_policy_mode(),
             always_approve: default_always_approve(),
             auto_approve_under_usd: None,
+            approval_ttl_hours: None,
         }
     }
 }
@@ -1380,6 +1405,64 @@ pub struct Schedule {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// **T10 (issue #971).** A manifest that never mentions
+    /// `approval_ttl_hours` parses to `None` and serializes without the key —
+    /// byte-identical to a build that predates the field.
+    ///
+    /// This is not a serde-formatting nicety, it is the guard on
+    /// `carry_policy_override`. That rule is `previous_seed == next_seed` over
+    /// the whole `[policy]` block, so any value this field acquires at parse
+    /// becomes part of the identity of a block nobody wrote — and the day the
+    /// default moves, every silent manifest's seed changes under it and the
+    /// operator's console `[policy]` override is discarded as though version
+    /// control had spoken. The absence has to survive parse, persist and
+    /// reload for that not to happen. See the field's own note.
+    #[test]
+    fn a_manifest_without_an_approval_ttl_round_trips_unchanged() {
+        let silent: Policy = toml::from_str(
+            r#"
+            mode = "supervised"
+            "#,
+        )
+        .expect("parse toml");
+        assert_eq!(silent.approval_ttl_hours, None);
+
+        // Byte-identical: the key is absent from the wire, not `null`.
+        let json = serde_json::to_string(&silent).expect("serialize");
+        assert!(
+            !json.contains("approval_ttl_hours"),
+            "a silent manifest must not gain the key on the wire: {json}"
+        );
+
+        // And the reload is `==` to the parse, which is the comparison
+        // `carry_policy_override` actually runs.
+        let back: Policy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, silent);
+        assert_eq!(
+            serde_json::to_string(&back).expect("serialize"),
+            json,
+            "a persist/reload cycle must be a fixed point"
+        );
+
+        // A manifest that DOES configure it keeps the value across the same
+        // cycle — the absence is meaningful, so presence must be too.
+        let configured: Policy = toml::from_str(
+            r#"
+            mode = "supervised"
+            approval_ttl_hours = 72
+            "#,
+        )
+        .expect("parse toml");
+        assert_eq!(configured.approval_ttl_hours, Some(72));
+        let json = serde_json::to_string(&configured).expect("serialize");
+        let back: Policy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, configured);
+
+        // The two are NOT equal, which is what makes the seed comparison able
+        // to tell "operator configured a deadline" from "nobody said anything".
+        assert_ne!(silent, configured);
+    }
 
     /// Real-money `media` (issue #109) is granted ONLY by an explicit `media` /
     /// `media.*` grant — never by the catch-all `*`. This wildcard exclusion is

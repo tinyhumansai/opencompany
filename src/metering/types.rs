@@ -45,13 +45,15 @@ pub struct UsagePoint {
 }
 
 /// Tokens attributed to one teammate over the window.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTokens {
     /// The teammate's display name (prosumer language), resolved from the roster.
     pub name: String,
     /// Total input + output tokens attributed to the teammate.
     pub tokens: u64,
+    /// Source-currency USD attributed to the teammate in the same window.
+    pub cost_usd: f64,
 }
 
 /// OAuth-connected tool calls counted per provider over the window.

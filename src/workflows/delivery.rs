@@ -1897,7 +1897,7 @@ admins = [{list}]
         fn subscribe(
             &self,
             _company: &CompanyId,
-        ) -> futures::stream::BoxStream<'static, crate::ports::types::StoredEvent> {
+        ) -> futures::stream::BoxStream<'static, crate::ports::events::EventStreamItem> {
             Box::pin(futures::stream::empty())
         }
     }

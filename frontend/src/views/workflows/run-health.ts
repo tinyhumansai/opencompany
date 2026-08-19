@@ -175,3 +175,40 @@ export function runTone(run: WorkflowRunOutcome): {
 export function isRunning(run: WorkflowRunOutcome): boolean {
   return run.running === true;
 }
+
+/**
+ * How long a run took, in milliseconds — `null` when the host recorded no
+ * start (a row journaled before #371 carries only its finish, and a duration
+ * measured from nothing would be the age of the epoch).
+ *
+ * Issue #1007: `startedAtMillis` has been on the wire since #371 and no
+ * workflow surface read it, so every run reported *when* it happened and none
+ * reported how long it took — the one number that tells a run that hung from
+ * one that failed immediately.
+ *
+ * `now` is passed in rather than read here so a still-running row ticks against
+ * the same clock as everything else on screen, and so this stays pure.
+ */
+export function runDuration(
+  run: WorkflowRunOutcome,
+  now: number = Date.now(),
+): number | null {
+  if (run.startedAtMillis == null) return null;
+  // A run in flight has no end yet, so the honest reading is "so far".
+  const end = isRunning(run) ? now : run.atMillis;
+  const ms = end - run.startedAtMillis;
+  // Host clock and browser clock are different clocks, so a live row can come
+  // out negative for the first second or two. Report nothing rather than "-1s".
+  return ms >= 0 ? ms : null;
+}
+
+/** A duration in the console's compact form: `840ms`, `12.4s`, `3m 07s`. */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  // Rounded to whole seconds FIRST, so the minute and the second can never
+  // disagree — `${Math.floor(ms / 60_000)}m ${Math.round(…)}s` renders "3m 60s"
+  // for anything within half a second of the minute.
+  const total = Math.round(ms / 1000);
+  return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+}

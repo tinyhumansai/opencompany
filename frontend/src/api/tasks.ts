@@ -180,6 +180,12 @@ export interface TaskPlan {
  */
 export type TaskDeliverable = "once" | "workflow";
 
+/** A positive source-currency USD amount or an explicit role-redacted state. */
+export interface TaskCost {
+  amountUsd?: number;
+  hidden?: boolean;
+}
+
 /**
  * A workflow the builder pass proposed for a `workflow`-deliverable card,
  * awaiting operator approval (issue #580).
@@ -209,6 +215,8 @@ export interface Task {
   /** The desk/teammate label that owns it (a roster agent id routes a turn). */
   assignee: string;
   updatedAt: number;
+  /** Lifetime total, including descendants. Absent for a true zero. */
+  cost?: TaskCost;
   /**
    * The card this one was spawned from (#185), when it has a parent. Omitted on
    * a lineage root — every card the board creates today — so the board's wire
@@ -365,6 +373,10 @@ export interface TimelineEntry {
    * host-side and bounded (#411).
    */
   detail?: string;
+  /** Stable key for a durable cost row that is not a journal event. */
+  costKey?: string;
+  /** Cost incurred by this line. Absent for a true zero. */
+  cost?: TaskCost;
   /**
    * On a run step: **what came back** — a shape summary, an intrinsic tool's
    * own message, or a failure's plain-language cause (#411). Absent on
@@ -397,7 +409,16 @@ export interface TimelineEntry {
   waitedMillis?: number;
 }
 
-/** What became of an approval (#333). `pending` is still waiting on a human. */
+/**
+ * What became of an approval (#333). `pending` is still waiting on a human.
+ *
+ * `expired` was declared here from the start and was **unreachable** until
+ * #971: nothing swept approvals for a company without a manifest schedule, so
+ * no approval ever aged out and no surface ever needed to render this. It is
+ * reachable now. Render it through `approvalStatusLabel` in `lib/language` —
+ * an operator must be able to tell the no they made from the one the deadline
+ * made, and neither should ever appear as a raw identifier.
+ */
 export type TaskApprovalStatus = "pending" | "approved" | "denied" | "expired";
 
 /**
@@ -497,6 +518,8 @@ export interface LineageRef {
   id: string;
   title: string;
   column: string;
+  /** This child's lifetime total, including its descendants. */
+  cost?: TaskCost;
 }
 
 /** The parent/children view of a task (#185). */

@@ -258,19 +258,63 @@ export function initialRunState(
   return state;
 }
 
-/** The per-node states of a PAST run, for overlaying it on the canvas.
+/** The per-node states of a run, for overlaying it on the canvas.
  *
- * No `running` ever comes out of this: the run is over. A node the run never
- * reached simply has no entry, so it renders unmarked — "not reached" and not
- * "still to come", which for a failed run is the honest reading. */
+ * A node the run never reached simply has no entry, so it renders unmarked —
+ * "not reached" and not "still to come", which for a failed run is the honest
+ * reading.
+ *
+ * Issue #1010: `running` now CAN come out of this, and only for a run the host
+ * still reports as in flight. `startedNodes` is the opening bracket the history
+ * fold never carried, so before this the only per-node facts a joining console
+ * had were finishes — and it painted the graph with a hole exactly where the
+ * work was happening. Started-minus-finished is the node executing right now.
+ *
+ * The `run.running` guard is load-bearing, not defensive. `startedNodes` is a
+ * receipt that deliberately survives the finish (so a cancelled run still names
+ * the node it was standing on), so a settled run whose last node never finished
+ * would otherwise overlay a spinner that nothing can ever clear — the same
+ * orphan `settle()` exists to remove from the live fold, reintroduced on the
+ * one surface that has no fold to settle it. */
 export function statesFromRun(
   run: WorkflowRunOutcome,
 ): Record<string, NodeRunState> {
   const state: Record<string, NodeRunState> = {};
+  // Starts first, so a finish for the same node overwrites its "running" with
+  // the reported outcome. The two lists are independently ordered — one by
+  // start, one by finish — so relying on their interleaving would be a bug;
+  // relying on finish-beats-start is just the bracket order the engine emits in.
+  if (run.running) {
+    for (const nodeId of run.startedNodes ?? []) state[nodeId] = "running";
+  }
   for (const node of run.nodes ?? []) {
     state[node.nodeId] = nodeStateFrom(node.status);
   }
   return state;
+}
+
+/** Whether the frame window can fold this run on its own (issue #1010).
+ *
+ * The question {@link foldLiveRun} actually asks: it folds from the window only
+ * when it finds a `workflow_run_started` for the run, and falls back to the
+ * history seed otherwise. So "has this console watched the run live?" — which
+ * a ref accumulating run ids answered, and answered forever — is the wrong
+ * question. The window is a rolling 300 frames and the ref was never cleared,
+ * so a run whose start had been evicted was still reported as covered, the seed
+ * was withheld, and the canvas went blank on a run the operator was watching:
+ * switching workflow away and back mid-run was enough to reproduce it.
+ *
+ * Node frames alone are deliberately NOT enough. `foldFromHistory` applies every
+ * frame in the window that belongs to the run, so a seed plus surviving node
+ * frames is strictly better than a seed alone — it is only the START that makes
+ * the seed redundant. */
+export function windowHasRunStart(
+  events: CompanyStreamEvent[],
+  runId: string,
+): boolean {
+  return events.some(
+    (e) => e.type === "workflow_run_started" && e.runId === runId,
+  );
 }
 
 /** Maps a reported node status onto a canvas state (issue #881).

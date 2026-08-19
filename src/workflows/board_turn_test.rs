@@ -237,6 +237,7 @@ async fn a_workflow_node_assigns_an_existing_card_without_moving_it() {
         parent_task_id: None,
         output: None,
         plan: None,
+        planning_attempts: Vec::new(),
         deliverable: crate::ports::tasks::TaskDeliverable::Once,
         workflow_proposal: None,
         origin_run_id: None,

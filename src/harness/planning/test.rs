@@ -994,6 +994,7 @@ fn card(id: &str, assignee: &str) -> TaskRecord {
         origin_chat_id: None,
         parent_task_id: None,
         plan: None,
+        planning_attempts: Vec::new(),
         deliverable: crate::ports::tasks::TaskDeliverable::Once,
         workflow_proposal: None,
         // A card entering Planning has never run, so it has produced nothing

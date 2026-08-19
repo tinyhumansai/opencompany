@@ -5,22 +5,28 @@
 // further out again, to `run-health.ts`, because the workflow cards need the
 // same reading — see that file's header.
 
+import { useEffect, useState } from "react";
+
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type {
   DeliveryReport,
   DeliveryStatus,
+  WorkflowGraph,
   WorkflowRunNode,
   WorkflowRunOutcome,
 } from "@/api/workflows";
 
-import { failedNodeOf } from "./graph";
+import { failedNodeOf, nodeName } from "./graph";
 import {
   awaitingCount,
   decidableApprovalCount,
+  formatDuration,
   isBlocked,
+  isRunning,
   relativeTime,
+  runDuration,
   runTone,
   undeliveredCount,
 } from "./run-health";
@@ -150,6 +156,7 @@ export function LastRunChip({ run }: { run: WorkflowRunOutcome }) {
  * console reload and a run nobody was watching. */
 export function RunHistoryPanel({
   runs,
+  graph,
   workflowName,
   onClose,
   selectedRunSeq,
@@ -159,6 +166,12 @@ export function RunHistoryPanel({
   fixReason,
 }: {
   runs: WorkflowRunOutcome[];
+  /**
+   * The selected workflow's graph, for turning a node id into the name the
+   * operator gave it (issue #1007). `null` while it loads or after a failed
+   * read, which {@link nodeName} degrades to the raw id for.
+   */
+  graph: WorkflowGraph | null;
   workflowName: string;
   onClose: () => void;
   /** The run currently overlaid on the canvas, if any (issue #371). */
@@ -184,6 +197,10 @@ export function RunHistoryPanel({
   // button (not just the in-flight one's) while `fixingRunSeq` is set turns
   // that race into "wait your turn".
   const anyFixInFlight = fixingRunSeq != null;
+  // Issue #1007: a clock, ticking only while a row is actually in flight. The
+  // elapsed time on a running row is the console's acknowledgement that the
+  // click did something, and it is only true if it moves.
+  const now = useRunningClock(runs.some(isRunning));
   return (
     <div className="border-t bg-card/60" data-testid="workflow-run-history">
       <div className="flex items-center justify-between px-4 py-2">
@@ -212,6 +229,8 @@ export function RunHistoryPanel({
               <RunHistoryRow
                 key={run.seq}
                 run={run}
+                graph={graph}
+                now={now}
                 selected={run.seq === selectedRunSeq}
                 onSelect={() => onSelectRun(run)}
                 onFixWithCopilot={onFixWithCopilot}
@@ -234,6 +253,8 @@ export function RunHistoryPanel({
  * live canvas by definition cannot cover because nobody was watching. */
 function RunHistoryRow({
   run,
+  graph,
+  now,
   selected,
   onSelect,
   onFixWithCopilot,
@@ -242,6 +263,10 @@ function RunHistoryRow({
   fixReason,
 }: {
   run: WorkflowRunOutcome;
+  /** The selected workflow's graph, for node ids → names (issue #1007). */
+  graph: WorkflowGraph | null;
+  /** The clock a still-running row counts against (issue #1007). */
+  now: number;
   selected: boolean;
   onSelect: () => void;
   /** Correct this run's workflow with the copilot (issue #840, PR-3). */
@@ -269,6 +294,7 @@ function RunHistoryRow({
   // worse than a parked one — there is no card to click.
   const unparkable = blocked.reduce((n, b) => n + (b.unparkable ?? 0), 0);
   const failedNode = failedNodeOf(run);
+  const duration = runDuration(run, now);
   return (
     <div
       className={`rounded-lg border bg-background/40 p-2 ${
@@ -284,6 +310,18 @@ function RunHistoryRow({
         <span className="text-2xs text-muted-foreground">
           {new Date(run.atMillis).toLocaleString()} ·{" "}
           {relativeTime(run.atMillis)}
+          {/* Issue #1007: how long it took, which nothing on this surface said.
+              A run that failed in 200ms was refused before it started; one that
+              failed after four minutes got somewhere first, and the two want
+              different next moves. `null` on a row journaled before #371, whose
+              only recorded time is its finish. */}
+          {duration != null && (
+            <span data-testid="workflow-run-duration">
+              {" · "}
+              {isRunning(run) ? "running for " : "took "}
+              {formatDuration(duration)}
+            </span>
+          )}
         </span>
         {/* Issue #880: what the run PARKED, in those words. A blocked run's
             `pendingApprovals` names the nodes it stopped at, which is a
@@ -352,9 +390,18 @@ function RunHistoryRow({
             {/* Name the node when the trail names one — the engine reports a
                 failing node as an errored step, so this is exact. When it does
                 not (a graph that would not compile, a capability that could not
-                be built), say nothing about nodes rather than guessing. */}
+                be built), say nothing about nodes rather than guessing.
+
+                Issue #1007: the NAME the operator gave the node, not its raw
+                id. The engine's trail is keyed by id, so this line named `n_3`
+                while the run drawer's timeline, the canvas and the overlay
+                banner all named "Draft the digest" for the same step.
+                `nodeName` falls back to the id when the graph is not loaded,
+                and a graph edited since the run can only give back the id it
+                no longer holds — both of which are the old reading, never a
+                wrong name. */}
             {failedNode
-              ? `This run failed at “${failedNode}”: `
+              ? `This run failed at “${nodeName(graph, failedNode)}”: `
               : "This run failed: "}
             {run.error}
             {/* Issue #840 (PR-3): correct the workflow with the copilot. Offered
@@ -564,4 +611,25 @@ function RunNodeChip({ node }: { node: WorkflowRunNode }) {
       </span>
     </span>
   );
+}
+
+/**
+ * A once-a-second clock, live only while something on screen is counting
+ * against it (issue #1007).
+ *
+ * Gated rather than always-on: the history drawer sits under the canvas for as
+ * long as the operator leaves it open, and a settled row's duration is a fixed
+ * number that re-rendering every second cannot change.
+ */
+function useRunningClock(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    // Read once on the way in too: the interval's first tick is a second away,
+    // and a row that mounts already running should not show a stale elapsed.
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  return now;
 }

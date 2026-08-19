@@ -764,6 +764,47 @@ jobs:
       - name: Assert every integration target actually runs
         run: scripts/ci/assert-integration-targets-run.sh openhuman,tinycortex
 
+      # Issue #579: the offline claim, executed rather than asserted.
+      #
+      # `sudo unshare -n` puts the test binary in a fresh network namespace: no
+      # routes, no DNS, no interfaces but the loopback this brings up. An
+      # accidental cloud call on a shared code path is therefore a RED BUILD
+      # here, which is the whole point — a lane that merely declines to
+      # configure cloud providers passes just as happily when something dials
+      # out on a path the test did not reach.
+      #
+      # Why not the alternatives. `iptables -P OUTPUT DROP` would also cut the
+      # Actions runner's own control connection to the service, and a container
+      # with `--network none` needs an image built for the purpose; the
+      # namespace needs neither and the binary is already on disk.
+      #
+      # BUILT FIRST, DELIBERATELY. `--no-run` compiles (and therefore fetches)
+      # while the network still exists; only the execution is sandboxed. A
+      # namespace around `cargo test` would fail on the registry, not on the
+      # code, and would say nothing about the runtime.
+      #
+      # `OPENCOMPANY_OFFLINE_LANE=1` is what arms the guard's own self-check —
+      # `a_deliberate_outbound_call_fails_inside_the_namespace` asserts that
+      # egress FAILS. Without it a sandbox that silently failed to apply would
+      # produce a green lane indistinguishable from a working one, and "nothing
+      # dialled out" could not be told from "the jail was never locked".
+      - name: Build the offline end-to-end target
+        run: cargo test --locked --features openhuman,tinycortex --test offline_e2e --no-run
+
+      - name: Run it with no network at all
+        run: |
+          set -eu
+          binary="$(cargo test --locked --features openhuman,tinycortex --test offline_e2e \
+            --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and (.target.name == "offline_e2e")) | .executable' \
+            | tail -n 1)"
+          test -n "$binary" || { echo "could not locate the offline_e2e test binary" >&2; exit 1; }
+          echo "running $binary inside a network namespace"
+          sudo --preserve-env=RUST_MIN_STACK,OPENCOMPANY_OFFLINE_LANE \
+            unshare --net -- sh -c "ip link set lo up && exec '$binary' --test-threads=1 --nocapture"
+        env:
+          OPENCOMPANY_OFFLINE_LANE: "1"
+
       # Catches the combination traps no single feature set can: most often a
       # mandatory struct field constructed differently across feature arms.
       #

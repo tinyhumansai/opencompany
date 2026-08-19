@@ -40,7 +40,7 @@ function desk(id: string, name: string, members: string[] = []): DeskDto {
 }
 
 function flow(over: Partial<WorkflowGraph> & Pick<WorkflowGraph, "id" | "name">): WorkflowGraph {
-  return { nodes: [], edges: [], ...over };
+  return { version: null, nodes: [], edges: [], ...over };
 }
 
 function person(id: string, email: string, role: "admin" | "member"): HostPerson {

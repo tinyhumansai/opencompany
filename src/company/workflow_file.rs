@@ -166,7 +166,60 @@ impl WorkflowFile {
             .find(|node| node.kind == WorkflowNodeKind::Trigger && node.schedule.is_some())
             .and_then(|node| node.schedule.as_deref())
     }
+
+    /// Whether this graph has any node that could actually do something
+    /// (issue #976).
+    ///
+    /// A `trigger` says *when* a workflow runs, never *what* it does, so a graph
+    /// whose nodes are all triggers is stage-less: the engine executes it
+    /// happily, no stage fails because there is no stage, and it settles as an
+    /// ordinary finished run. On staging that produced `QA Test Pipeline` with
+    /// six recorded runs that could not have done anything, and `campaign`
+    /// holding a schedule it cannot keep.
+    ///
+    /// Expressed as "is there a non-trigger node" rather than a node **count**,
+    /// which is the tempting shortcut and is wrong twice: a graph of three
+    /// triggers has three nodes and still does nothing, and a legitimate
+    /// one-stage graph (trigger → agent) has only two. What matters is whether
+    /// any node kind *executes*, and every kind except `Trigger` does.
+    ///
+    /// The single definition, shared by the arming refusal in
+    /// `workflow_create.rs` and the run notice in
+    /// [`workflows::runner`](crate::workflows::runner) — for the reason spelled
+    /// out on [`trigger_schedule`](Self::trigger_schedule) just above: two copies
+    /// of a predicate that disagreed would let a graph be refused a schedule and
+    /// still run silently, or the reverse.
+    pub fn has_runnable_node(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| node.kind != WorkflowNodeKind::Trigger)
+    }
 }
+
+/// What a run of a stage-less graph records (issue #976).
+///
+/// Carried as a run **notice**, not an error: an empty graph is not a failure.
+/// Nothing broke and nothing was attempted, so marking the run failed would put
+/// a half-authored stub into the failure count beside runs that genuinely went
+/// wrong — the same call [`DeliveryReason::NoDestinationConfigured`] makes one
+/// level down (issue #925), and the same one #638 already made for the
+/// approval-overflow notice this rides alongside.
+///
+/// A literal, like every other notice: nothing runtime-supplied reaches an
+/// operator surface through it.
+///
+/// [`DeliveryReason::NoDestinationConfigured`]: crate::ports::DeliveryReason::NoDestinationConfigured
+pub const STAGELESS_WORKFLOW_NOTICE: &str = "This workflow has no stage to run — its only node is the trigger that starts it — so this \
+     run did nothing. Add at least one node after the trigger and run it again.";
+
+/// Why arming a stage-less workflow's schedule is refused (issue #976).
+///
+/// Says what is wrong, why it matters, and the one thing the operator can do —
+/// the shape [`DrainedRequests::overflow_notice`](crate::harness::policy::DrainedRequests::overflow_notice)
+/// established for telling somebody their work will not happen.
+pub const STAGELESS_SCHEDULE_REFUSAL: &str = "This workflow has no stage to run — its only node is the trigger that starts it — so a \
+     schedule would fire on time and do nothing. Add at least one node after the trigger, then \
+     switch it on.";
 
 /// A single node in a workflow graph.
 #[derive(Clone, Debug, PartialEq)]

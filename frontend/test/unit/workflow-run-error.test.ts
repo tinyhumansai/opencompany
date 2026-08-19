@@ -78,6 +78,7 @@ describe("foldLiveRun scheduled", () => {
   const GRAPH: WorkflowGraph = {
     id: "wf1",
     name: "Nightly digest",
+    version: null,
     nodes: [
       { id: "t", kind: "trigger", name: "Trigger" },
       { id: "a", kind: "agent", name: "Agent" },

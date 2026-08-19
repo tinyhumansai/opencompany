@@ -12,8 +12,7 @@ use super::now_millis;
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::metering::{
-    AgentTokens, ProviderCalls, Usage, UsagePoint, UsageRange, UsageTotals, bucket_usage,
-    roster_display_names,
+    ProviderCalls, Usage, UsagePoint, UsageRange, bucket_usage, roster_display_names,
 };
 
 /// The usage lookback window.
@@ -59,6 +58,8 @@ pub struct AgentTokensGql {
     pub name: String,
     /// Total tokens attributed to them.
     pub tokens: f64,
+    /// Source-currency USD attributed to the teammate, when visible.
+    pub cost_usd: Option<f64>,
 }
 
 /// Call totals for one provider.
@@ -82,7 +83,7 @@ pub struct UsageTotalsGql {
     /// Total tokens (input + output).
     pub tokens: f64,
     /// Total inference cost, USD.
-    pub cost_usd: f64,
+    pub cost_usd: Option<f64>,
     /// Total OAuth calls.
     pub oauth_calls: f64,
     /// Number of distinct connections used.
@@ -104,23 +105,39 @@ pub struct UsageGql {
     pub by_provider: Vec<ProviderCallsGql>,
     /// Aggregate totals.
     pub totals: UsageTotalsGql,
+    /// Whether positive cost was withheld by the reader's role.
+    pub cost_hidden: bool,
 }
 
-impl From<Usage> for UsageGql {
-    fn from(usage: Usage) -> Self {
+impl UsageGql {
+    fn new(usage: Usage, may_read_cost: bool) -> Self {
+        let cost_hidden = !may_read_cost && usage.totals.cost_usd > 0.0;
         Self {
             series: usage.series.into_iter().map(UsagePointGql::from).collect(),
             by_agent: usage
                 .by_agent
                 .into_iter()
-                .map(AgentTokensGql::from)
+                .map(|agent| AgentTokensGql {
+                    name: agent.name,
+                    tokens: agent.tokens as f64,
+                    cost_usd: may_read_cost.then_some(agent.cost_usd),
+                })
                 .collect(),
             by_provider: usage
                 .by_provider
                 .into_iter()
                 .map(ProviderCallsGql::from)
                 .collect(),
-            totals: usage.totals.into(),
+            totals: UsageTotalsGql {
+                input_tokens: usage.totals.input_tokens as f64,
+                output_tokens: usage.totals.output_tokens as f64,
+                tokens: usage.totals.tokens as f64,
+                cost_usd: may_read_cost.then_some(usage.totals.cost_usd),
+                oauth_calls: usage.totals.oauth_calls as f64,
+                connections: usage.totals.connections as i32,
+                search_calls: usage.totals.search_calls as f64,
+            },
+            cost_hidden,
         }
     }
 }
@@ -135,34 +152,11 @@ impl From<UsagePoint> for UsagePointGql {
     }
 }
 
-impl From<AgentTokens> for AgentTokensGql {
-    fn from(agent: AgentTokens) -> Self {
-        Self {
-            name: agent.name,
-            tokens: agent.tokens as f64,
-        }
-    }
-}
-
 impl From<ProviderCalls> for ProviderCallsGql {
     fn from(provider: ProviderCalls) -> Self {
         Self {
             provider: provider.provider,
             calls: provider.calls as f64,
-        }
-    }
-}
-
-impl From<UsageTotals> for UsageTotalsGql {
-    fn from(totals: UsageTotals) -> Self {
-        Self {
-            input_tokens: totals.input_tokens as f64,
-            output_tokens: totals.output_tokens as f64,
-            tokens: totals.tokens as f64,
-            cost_usd: totals.cost_usd,
-            oauth_calls: totals.oauth_calls as f64,
-            connections: totals.connections as i32,
-            search_calls: totals.search_calls as f64,
         }
     }
 }
@@ -174,6 +168,8 @@ pub(crate) async fn resolve(
     range: UsageRangeGql,
 ) -> async_graphql::Result<UsageGql> {
     let _ = ctx.data::<AppState>()?;
+    let auth = ctx.data::<crate::server::graphql::auth::GqlAuth>()?;
+    let may_read_cost = crate::server::approval_visibility::may_read_approval_contents(auth);
     let range: UsageRange = range.into();
     let now = now_millis();
     let since = now.saturating_sub(range.days().saturating_mul(super::MILLIS_PER_DAY));
@@ -185,5 +181,8 @@ pub(crate) async fn resolve(
         .map(|record| roster_display_names(&record.manifest.agents, &record.overlay_agents))
         .unwrap_or_default();
 
-    Ok(bucket_usage(&samples, range, now, &roster).into())
+    Ok(UsageGql::new(
+        bucket_usage(&samples, range, now, &roster),
+        may_read_cost,
+    ))
 }

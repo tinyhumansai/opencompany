@@ -127,6 +127,8 @@ export function Overview({ client, company }: Props) {
               description: summary.description,
               nodes: [],
               edges: [],
+              // No saved graph to fetch, so no token (issue #1013).
+              version: null,
             }),
           ),
         ),

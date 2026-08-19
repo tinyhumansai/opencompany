@@ -572,6 +572,80 @@ pub struct HarnessDeps {
     pub checkouts: repo::CheckoutLedger,
 }
 
+/// A minimal [`HarnessDeps`] for tests that only care about **workflow-tool
+/// wiring**: which namespaces a `tool_call` can reach, and why the others cannot.
+///
+/// Only the inputs [`workflow_tool_wiring`](crate::workflows::caps) actually
+/// reads are parameters — the meter and plan (which resolve the capability
+/// filter per company and spend) and the static filter itself. `search` is
+/// pinned to `None`, because a deployment with no managed search backend is the
+/// shape issue #874 is about. Everything else is the cheapest inert default, so
+/// a test asserting on wiring does not have to name thirty fields that cannot
+/// affect the answer.
+///
+/// Shared rather than copied: the same fixture backs the runtime-level wiring
+/// tests and the `tool-slugs` route test, so both ask about one deployment shape.
+#[cfg(test)]
+pub(crate) fn workflow_wiring_deps(
+    runtime: &crate::CompanyRuntime,
+    meter: Option<Arc<dyn UsageMeter>>,
+    capabilities: toolbelt::CapabilityFilter,
+    plan: Option<capability_budget::CapabilityPlan>,
+) -> HarnessDeps {
+    HarnessDeps {
+        ledgers: None,
+        ledger_registry: Default::default(),
+        provider: Arc::new(provider::MockProvider::default()),
+        provider_slug: "mock".to_string(),
+        context: runtime.context.clone(),
+        store: runtime.store.clone(),
+        meter,
+        workspace_root: std::env::temp_dir(),
+        workspace_git_enabled: false,
+        audit_root: std::env::temp_dir(),
+        model_override: None,
+        tasks: None,
+        artifacts: None,
+        skills: None,
+        skills_source_dir: None,
+        skills_registry: Arc::from([]),
+        mcp_servers: Vec::new(),
+        default_mcp_servers: Vec::new(),
+        facts: None,
+        events: None,
+        delegations: orchestrator::DelegationQueue::default(),
+        workflow_runner: orchestrator::WorkflowRunnerHandle::default(),
+        mcp_failures: mcp_probe::McpFailureQueue::default(),
+        pending_publishes: publish::PendingPublishQueue::default(),
+        workflow_refs: workflow_refs::WorkflowRefQueue::default(),
+        run_outputs: orchestrator::RunOutputCache::default(),
+        run_output_store: None,
+        workflow_revisions: None,
+        approval_requests: policy::ApprovalRequestQueue::default(),
+        secrets: None,
+        web_allowed_domains: Vec::new(),
+        capabilities,
+        workflow_source_dir: None,
+        plan,
+        media: None,
+        composio: None,
+        #[cfg(feature = "chargebee")]
+        chargebee: None,
+        #[cfg(feature = "paypal")]
+        paypal: None,
+        hosting: None,
+        // The staging shape in issue #874: `searchCredentialConfigured: false`.
+        search: None,
+        steer: crate::company::steer::InflightRegistry::default(),
+        run_supervisor: crate::runtime::RunSupervisor::default(),
+        delivery: None,
+        workspace: None,
+        repos: None,
+        repo_bindings: Vec::new(),
+        checkouts: repo::CheckoutLedger::default(),
+    }
+}
+
 /// One live openhuman agent, keyed by its manifest id.
 pub struct CompanyAgent {
     /// The manifest agent id.

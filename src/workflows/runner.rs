@@ -135,20 +135,33 @@ pub async fn run_workflow(
 /// **same** channel, so the collector sees them in that order and a node's
 /// started event always journals ahead of its finished one.
 ///
-/// Deliberately scalars and no `ExecutionStep`: the engine's step carries the
-/// node's `output` items, and this hop exists partly to make it *impossible* for
-/// that payload to reach the journal — the same stance the live turn frames take
-/// on tool args. A `Started` frame carries the node id alone; the node has not
-/// run, so there is no status or duration to carry either. What is not carried
-/// cannot leak.
+/// Deliberately no whole `ExecutionStep`. A `Started` frame carries the node id
+/// alone; the node has not run, so there is no status, duration, or output to
+/// carry either. What is not carried cannot leak.
+///
+/// A `Finished` frame carries the node's `output` items (issue #1008) **as well
+/// as** its status and duration — but that payload is used for exactly one thing
+/// and is walled off from the journal: the collector accumulates it into a
+/// side map that feeds ONLY the durable, console-facing run-output store on the
+/// **failure/blocked arms**, where the engine returns no `outcome.output` to
+/// persist from. The journal still receives only `{node_id, status,
+/// elapsed_ms}` (see the `Finished` arm of the collector, which builds its
+/// `WorkflowNodeFinished` from those three scalars and never touches `output`) —
+/// the same stance the live turn frames take on tool args. Before #1008 the
+/// failure paths threw this output away, so a failed/blocked run's inspector
+/// wrongly claimed the run predated output capture.
 enum NodeProgress {
     /// A node began executing (issue #382) — the opening bracket. Id only.
     Started { node_id: String },
-    /// A node finished (issue #371) — its status and wall-clock duration.
+    /// A node finished (issue #371) — its status, wall-clock duration, and the
+    /// items it emitted (issue #1008; [`Value::Null`] on an error step). The
+    /// output is consumed only by the run-output persist on the failure arms;
+    /// it never reaches the journal.
     Finished {
         node_id: String,
         status: WorkflowNodeStatus,
         elapsed_ms: u64,
+        output: Value,
     },
 }
 
@@ -193,6 +206,13 @@ impl tinyflows::observability::RunObserver for ProgressObserver {
             // `u128` millis is the engine's type; a node running longer than
             // 584 million years is not the failure mode worth a `Result`.
             elapsed_ms: u64::try_from(step.duration_ms).unwrap_or(u64::MAX),
+            // Issue #1008: the node's emitted items, carried so the collector can
+            // accumulate a partial per-node output map for the failure/blocked
+            // arms (which have no `outcome.output` to persist from). A success
+            // step's `output` is the items array; an error step's is
+            // `Value::Null`. This clone rides the same channel as the scalars
+            // and never touches the journal.
+            output: step.output.clone(),
         });
     }
 }
@@ -297,6 +317,26 @@ async fn run_workflow_inner(
     // *outside* the capability bundle, so a hard abort that drops the engine future
     // (and with it the bundle and its board claim) still leaves every row already
     // collected readable here: a card is real once written, so it must stay listed.
+    // Issue #976: a graph whose only node is its trigger has nothing to execute.
+    // The engine runs it happily — there is no stage to fail — so it settles as
+    // an ordinary finished run, and a run row that says nothing is its own small
+    // lie: `QA Test Pipeline` on staging banked six of them. Said here, through
+    // the channel #638 built for exactly this shape of fact.
+    //
+    // A notice rather than an error, for the reason `notices` exists at all: an
+    // empty graph is not a failure. Nothing broke, nothing was attempted, and
+    // marking it failed would put a half-authored stub into the failure count
+    // next to runs that genuinely went wrong. Same call `NoDestinationConfigured`
+    // makes one level down (#925) — state the reason instead of leaving it to be
+    // inferred from an absence.
+    if !workflow.has_runnable_node() {
+        notices.push(crate::company::STAGELESS_WORKFLOW_NOTICE.to_string());
+        tracing::warn!(
+            company = %record.id,
+            workflow = %workflow.id,
+            "workflow run: the graph has no runnable node, so this run could not do anything"
+        );
+    }
     let board = super::caps::RunBoard::default();
     // Issue #881 / #880: the two sideways channels an agent node reports through
     // — that it blocked, and what it parked. Owned out here for exactly the
@@ -359,6 +399,14 @@ async fn run_workflow_inner(
     // The journal is passed to the collector only in that case; `None` there
     // means "collect the rows, write nothing" — the shape the default build and
     // every dry run take.
+    //
+    // Issue #1008: the collector *additionally* accumulates a per-node output
+    // map (`{ "<id>": { "items": [ … ] } }`) from each `Finished` frame's
+    // output. This map exists solely to feed the durable run-output persist on
+    // the failure/blocked arms, where the engine returns no `outcome.output`. It
+    // is returned beside the rows and never journaled — the journal invariant
+    // (no node output) is preserved because the `WorkflowNodeFinished` event is
+    // still built from the three scalars alone.
     let journal_nodes = events.clone().filter(|_| !dry_run);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<NodeProgress>();
     let collector = tokio::spawn({
@@ -367,6 +415,10 @@ async fn run_workflow_inner(
         let run_id = run_id.clone();
         async move {
             let mut rows: Vec<crate::ports::WorkflowRunNodeRow> = Vec::new();
+            // Issue #1008: node_id -> `{ "items": [ … ] }`, canonical-shaped so
+            // the console's `parseNodeMessages` reads it exactly like a clean
+            // run's `outcome.output["nodes"]`.
+            let mut partial_nodes = serde_json::Map::new();
             while let Some(progress) = rx.recv().await {
                 match progress {
                     // Issue #382: the node's opening bracket. Journaled only when
@@ -397,6 +449,7 @@ async fn run_workflow_inner(
                         node_id,
                         status,
                         elapsed_ms,
+                        output,
                     } => {
                         if let Some(events) = journal_nodes.as_ref() {
                             let event = CompanyEvent::WorkflowNodeFinished {
@@ -417,6 +470,19 @@ async fn run_workflow_inner(
                                 );
                             }
                         }
+                        // Issue #1008: accumulate this node's output into the
+                        // partial map under the canonical `{ "items": [ … ] }`
+                        // shape. A success step's `output` is the items array; an
+                        // error (or any non-array) step contributes an empty
+                        // `items`, so the failing node still appears as "produced
+                        // none" rather than vanishing. Keyed before `node_id`
+                        // moves into the row below.
+                        let items = match output {
+                            Value::Array(_) => output,
+                            _ => Value::Array(Vec::new()),
+                        };
+                        partial_nodes
+                            .insert(node_id.clone(), serde_json::json!({ "items": items }));
                         // Collected for the response on every path — status is
                         // `Copy`, `node_id` moves in after its clone (if any)
                         // went to the event.
@@ -428,7 +494,7 @@ async fn run_workflow_inner(
                     }
                 }
             }
-            rows
+            (rows, partial_nodes)
         }
     });
 
@@ -519,30 +585,37 @@ async fn run_workflow_inner(
     // clone somewhere longer-lived, this would log and move on with an empty
     // trail instead of wedging the run (and the host behind it) forever.
     drop(observer);
-    let nodes: Vec<crate::ports::WorkflowRunNodeRow> =
-        match tokio::time::timeout(PROGRESS_DRAIN_TIMEOUT, collector).await {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    company = %record.id,
-                    workflow = %workflow.id,
-                    %run_id,
-                    %err,
-                    "workflow: the node-progress collector did not shut down cleanly"
-                );
-                Vec::new()
-            }
-            Err(_) => {
-                tracing::warn!(
-                    company = %record.id,
-                    workflow = %workflow.id,
-                    %run_id,
-                    "workflow: node progress events did not drain in time; the run's finished \
-                     record may be journaled ahead of them"
-                );
-                Vec::new()
-            }
-        };
+    // Issue #1008: the collector now returns both the response rows and the
+    // accumulated per-node output map. The map feeds ONLY the run-output persist
+    // on the failure/blocked arms below; `nodes` stays the output-free row list
+    // the journal and `WorkflowRun.nodes` carry. A drain failure yields an empty
+    // map, so a persist on that path simply records "produced none".
+    let (nodes, partial_nodes): (
+        Vec<crate::ports::WorkflowRunNodeRow>,
+        serde_json::Map<String, Value>,
+    ) = match tokio::time::timeout(PROGRESS_DRAIN_TIMEOUT, collector).await {
+        Ok(Ok(collected)) => collected,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                company = %record.id,
+                workflow = %workflow.id,
+                %run_id,
+                %err,
+                "workflow: the node-progress collector did not shut down cleanly"
+            );
+            (Vec::new(), serde_json::Map::new())
+        }
+        Err(_) => {
+            tracing::warn!(
+                company = %record.id,
+                workflow = %workflow.id,
+                %run_id,
+                "workflow: node progress events did not drain in time; the run's finished \
+                 record may be journaled ahead of them"
+            );
+            (Vec::new(), serde_json::Map::new())
+        }
+    };
 
     // Resolved only AFTER the drain above, so a cancelled run's completed nodes
     // are journaled exactly like a completed run's before the caller writes the
@@ -564,7 +637,27 @@ async fn run_workflow_inner(
         // reports the error, and the block survives on the approval receipts.
         Some(Err(err)) => {
             let blocked = blocks.take();
+            // Issue #1008: the engine returns no `outcome.output` on this arm, so
+            // the run's per-node output lives ONLY in the map the progress
+            // observer accumulated. Persist that, flagged `partial`, on BOTH the
+            // genuine-failure and the blocked branches — before #1008 both threw
+            // it away, so the inspector wrongly reported "this run predates output
+            // capture" for every failed or blocked run.
+            let partial_output = Value::Object(partial_nodes);
             if blocked.is_empty() || !only_blocked_nodes_errored(&nodes, &blocked) {
+                // A genuine failure. Persist the partial capture so the inspector
+                // shows what the nodes that ran produced. Log-only on a write
+                // error (Part 3): this branch returns `Err`, so there is no
+                // `WorkflowRun` to hang a notice on.
+                let _ = persist_run_output(
+                    run_output_store.as_deref(),
+                    &record.id,
+                    &workflow.id,
+                    &run_id,
+                    &partial_output,
+                    true,
+                )
+                .await;
                 return Err(map_engine_error(err));
             }
             tracing::info!(
@@ -575,6 +668,20 @@ async fn run_workflow_inner(
                 "workflow: the run stopped because a node is waiting on an operator, not because \
                  it failed"
             );
+            // A blocked run DOES return a `WorkflowRun`, so a failed persist adds
+            // an operator-facing notice rather than only a log line (Part 6).
+            if !persist_run_output(
+                run_output_store.as_deref(),
+                &record.id,
+                &workflow.id,
+                &run_id,
+                &partial_output,
+                true,
+            )
+            .await
+            {
+                notices.push(run_output_persist_failed_notice());
+            }
             return Ok(blocked_run(BlockedRun {
                 nodes,
                 blocked,
@@ -606,14 +713,25 @@ async fn run_workflow_inner(
         // show how far the run got and what each finished node made. This is an
         // outcome-bearing arm (unlike the hard-abort return above, which has no
         // outcome and persists nothing).
-        persist_run_output(
+        //
+        // Issue #1008: this is a CLEAN cancel with a real `outcome.output`, so it
+        // persists that canonical map with `partial = false` — the "partial"
+        // flag is reserved for the failure/blocked arms that have no outcome and
+        // fall back to the observer's accumulated capture. A failed write adds an
+        // operator notice (Part 6), since this arm returns a `WorkflowRun`.
+        let raw_nodes = outcome.output.get("nodes").cloned().unwrap_or(Value::Null);
+        if !persist_run_output(
             run_output_store.as_deref(),
             &record.id,
             &workflow.id,
             &run_id,
-            &outcome.output,
+            &raw_nodes,
+            false,
         )
-        .await;
+        .await
+        {
+            notices.push(run_output_persist_failed_notice());
+        }
         return Ok(WorkflowRun {
             output: outcome.output,
             pending_approvals: Vec::new(),
@@ -789,14 +907,23 @@ async fn run_workflow_inner(
     // completion AND the paused-with-`pending_approvals` case both reach here).
     // Best-effort, upstream of the WorkflowRun below so console/scheduled/
     // agent-tool runs all persist through this one site.
-    persist_run_output(
+    //
+    // Issue #1008: a clean settle carries the real `outcome.output`, so it
+    // persists that canonical map with `partial = false`; a failed write adds an
+    // operator notice (Part 6) since this arm returns a `WorkflowRun`.
+    let raw_nodes = outcome.output.get("nodes").cloned().unwrap_or(Value::Null);
+    if !persist_run_output(
         run_output_store.as_deref(),
         &record.id,
         &workflow.id,
         &run_id,
-        &outcome.output,
+        &raw_nodes,
+        false,
     )
-    .await;
+    .await
+    {
+        notices.push(run_output_persist_failed_notice());
+    }
 
     // Issue #881: a node can block and the run still reach here — an author who
     // wrote `on_error = "continue"` or `"route"` asked for the branch to survive
@@ -1010,8 +1137,8 @@ pub(super) fn blocked_notice(blocked: &crate::ports::WorkflowBlockedNode) -> Str
     )
 }
 
-/// Persists a settled run's per-node output to the durable, console-facing
-/// store (issue #596), best-effort.
+/// Persists a run's per-node output to the durable, console-facing store (issue
+/// #596; failure/blocked capture added in #1008), best-effort.
 ///
 /// One helper, called from every outcome-bearing arm of `run_workflow_inner`, so
 /// the bounding + write live in exactly one place. `store` is `None` on the
@@ -1019,40 +1146,64 @@ pub(super) fn blocked_notice(blocked: &crate::ports::WorkflowBlockedNode) -> Str
 /// is logged at `warn` and never fails the run: the run's work is already done
 /// and correct, and losing an inspector snapshot must not discard it.
 ///
-/// The value persisted is `output["nodes"]` — the same capture the in-process
-/// [`RunOutputCache`](crate::harness::orchestrator::RunOutputCache) reads — but
-/// on a **separate** durable store, so the two consumers never share storage.
-/// Bounding happens inside
+/// The caller hands `raw_nodes` — the `{ "<id>": { "items": [ … ] } }` map — in
+/// directly: on the clean arms that is `outcome.output["nodes"]` (the same
+/// capture the in-process
+/// [`RunOutputCache`](crate::harness::orchestrator::RunOutputCache) reads), and
+/// on the failure/blocked arms (issue #1008) it is the map the progress observer
+/// accumulated, flagged `partial`. Bounding happens inside
 /// [`WorkflowRunOutputRecord::from_raw_nodes`](crate::ports::WorkflowRunOutputRecord::from_raw_nodes),
 /// which clips (never refuses) so the durable record always exists.
+///
+/// Returns `true` when the snapshot is safely stored (or there is no store to
+/// store it in — a no-op is not a failure), and `false` only when a store was
+/// present and the write errored. The notice-bearing callers (which return a
+/// `WorkflowRun`) use `false` to add an operator-facing notice; the genuine-`Err`
+/// caller has no `WorkflowRun` to hang one on and lets the `warn!` stand alone
+/// (issue #1008, Part 3).
 async fn persist_run_output(
     store: Option<&dyn crate::ports::run_output::WorkflowRunOutputStore>,
     company: &CompanyId,
     workflow_id: &str,
     run_id: &str,
-    output: &Value,
-) {
+    raw_nodes: &Value,
+    partial: bool,
+) -> bool {
     let Some(store) = store else {
-        return;
+        return true;
     };
-    // The engine's per-node map lives under `output["nodes"]`; a run with no such
-    // key persists an empty map, which the console renders as "produced none".
-    let raw_nodes = output.get("nodes").cloned().unwrap_or(Value::Null);
     let record = crate::ports::WorkflowRunOutputRecord::from_raw_nodes(
         run_id,
         workflow_id,
         crate::ports::now_millis(),
-        &raw_nodes,
+        raw_nodes,
+        partial,
     );
-    if let Err(err) = store.put_run_output(company, &record).await {
-        tracing::warn!(
-            company = %company,
-            workflow = %workflow_id,
-            %run_id,
-            %err,
-            "workflow: could not persist the run's per-node output; the run is unaffected"
-        );
+    match store.put_run_output(company, &record).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                company = %company,
+                workflow = %workflow_id,
+                %run_id,
+                %err,
+                "workflow: could not persist the run's per-node output; the run is unaffected"
+            );
+            false
+        }
     }
+}
+
+/// The operator-facing notice a notice-bearing arm adds when
+/// [`persist_run_output`] could not write the snapshot (issue #1008, Part 3).
+///
+/// The run's result itself is unaffected — this only warns that reopening the
+/// run later may show no output for its nodes, so the black-box silence has a
+/// visible cause instead of masquerading as "this run predates output capture".
+fn run_output_persist_failed_notice() -> String {
+    "This run's per-node output could not be saved, so reopening it later may show no output \
+     for some steps. The run itself was unaffected."
+        .to_string()
 }
 
 /// What a settled run left for the operator to decide.
@@ -1890,6 +2041,97 @@ to = "done"
                 .unwrap()
                 .is_none(),
             "a dry run must persist nothing durable"
+        );
+    }
+
+    /// Issue #1008 (the decisive change): a run whose first node SUCCEEDS and a
+    /// later node FAILS hard (default `on_error = "stop"`, so the engine returns
+    /// `Err`) must STILL persist the per-node output the observer captured before
+    /// the failure — flagged `partial`. Before #1008 this arm returned `Err`
+    /// without persisting anything, so the inspector wrongly claimed the run
+    /// predated output capture.
+    ///
+    /// `start → export (csv_export, succeeds) → boom (bogus_tool, unknown slug →
+    /// hard stop)`: the export node's frame is captured off the progress
+    /// observer, and the run fails on `boom`.
+    #[tokio::test]
+    async fn a_failed_run_persists_the_partial_output_it_reached() {
+        let src = r#"
+id = "partial_fail"
+name = "Partial fail"
+[[node]]
+id = "start"
+kind = "trigger"
+name = "Start"
+[[node]]
+id = "export"
+kind = "tool_call"
+name = "Export"
+[node.config]
+slug = "csv_export"
+[node.config.args]
+filename = "wf-out.csv"
+data = "[{\"name\":\"Ada\"},{\"name\":\"Bob\"}]"
+[[node]]
+id = "boom"
+kind = "tool_call"
+name = "Boom"
+[node.config]
+slug = "bogus_tool"
+[[edge]]
+from = "start"
+to = "export"
+[[edge]]
+from = "export"
+to = "boom"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsOps::new(dir.path()));
+        let mut deps = deps(dir.path());
+        deps.run_output_store = Some(store.clone());
+        let rec = tools_record();
+        let file = parse_workflow(src).expect("parses");
+        let ctx = WorkflowRunContext::new(false);
+        let run_id = ctx.run_id.clone();
+
+        let err = run_workflow(
+            Arc::new(HarnessPool::new()),
+            deps,
+            &rec,
+            &file,
+            serde_json::json!({ "seed": 1 }),
+            &ctx,
+        )
+        .await
+        .expect_err("the run fails hard on the unknown-slug node");
+        assert!(
+            err.to_string().contains("bogus_tool") || err.to_string().contains("boom"),
+            "the failure should come from the failing node: {err}"
+        );
+
+        // The decisive assertion: the snapshot exists (was `None` pre-#1008,
+        // because the `Err` arm persisted nothing).
+        let stored = store
+            .get_run_output(&rec.id, &run_id)
+            .await
+            .expect("store read")
+            .expect("a failed run must still persist the output it reached before failing");
+        assert!(
+            stored.partial,
+            "a failure-arm capture must be flagged partial: {stored:?}"
+        );
+        assert_eq!(stored.workflow_id, "partial_fail");
+        assert_eq!(stored.run_id, run_id);
+        // The successful `export` node's output is present under the canonical
+        // `{ items: [...] }` shape the console renders.
+        assert!(
+            stored
+                .nodes
+                .get("export")
+                .and_then(|n| n.get("items"))
+                .is_some(),
+            "the node that succeeded before the failure must be in the partial snapshot: {}",
+            stored.nodes
         );
     }
 

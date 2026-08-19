@@ -165,10 +165,13 @@ function describeDestination(destination: NonNullable<WorkflowNodeModel["destina
  * The Output section of the node inspector (issue #596): what this node produced
  * on the run being inspected — markdown-rendered agent/tool messages, the raw
  * value behind a toggle, a "truncated" badge when the durable snapshot was
- * clipped, and an explicit empty state for a run that predates capture or
- * produced nothing.
+ * clipped, a "partial capture" badge when the run failed or blocked (issue
+ * #1008), and an explicit empty state for a run that genuinely has no snapshot.
+ *
+ * Exported for the unit test that pins the badges and the empty state without
+ * standing up the whole panel.
  */
-function OutputSection({ output }: { output: NodeOutputView }) {
+export function OutputSection({ output }: { output: NodeOutputView }) {
   if (output.state === "loading") {
     return (
       <DetailField label="Output">
@@ -192,6 +195,15 @@ function OutputSection({ output }: { output: NodeOutputView }) {
   return (
     <DetailField label="Output">
       <div className="space-y-2" data-testid="node-output">
+        {output.partial && (
+          <Badge
+            variant="outline"
+            className="border-status-blocked/40 bg-status-blocked-soft font-normal"
+            data-testid="node-output-partial"
+          >
+            partial capture — run failed or blocked
+          </Badge>
+        )}
         {output.truncated && (
           <Badge
             variant="outline"

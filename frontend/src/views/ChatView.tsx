@@ -858,6 +858,7 @@ export function ChatView({
               liveSteps={openThreadId ? undefined : liveSteps}
               onOpenThread={setOpenThreadId}
               onReact={react}
+              onAddPeople={() => setMembersOpen(true)}
               now={now}
               askerNames={askerNames}
               decidingApprovals={decidingApprovals}

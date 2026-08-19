@@ -24,6 +24,19 @@ type Page = import("@playwright/test").Page;
 const TOAST = "[data-sonner-toast]";
 
 /**
+ * The one toast a test is about (issue #969).
+ *
+ * `TOAST` is unqualified and matches *every* toast on screen. These tests raise
+ * one, so it resolves — but a second arriving mid-test would silently change
+ * what is being hovered and asserted, and `toBeVisible()` on a two-match
+ * locator fails as a strict-mode violation rather than as the thing under test.
+ * Naming the first match makes the subject explicit instead of incidental.
+ */
+function firstToast(page: Page) {
+  return page.locator(TOAST).first();
+}
+
+/**
  * Land on Settings with no tour running, and no welcome dialog in the way.
  *
  * The dialog is not cosmetic here: it is a Radix dialog, so while it is open
@@ -41,7 +54,10 @@ async function settings(page: Page): Promise<void> {
 /** Raise the toast the issue is about, and park the pointer far from it. */
 async function replayTour(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Replay tour" }).click();
-  await expect(page.locator(TOAST)).toBeVisible();
+  // Scoped for the same reason as `firstToast` (#969): a `toBeVisible()` on the
+  // unqualified locator would fail as a strict-mode violation, not as the
+  // assertion it looks like, the moment a second toast is up.
+  await expect(firstToast(page)).toBeVisible();
   await page.mouse.move(20, 20);
 }
 
@@ -83,16 +99,37 @@ test("a toast does not follow the operator across views", async ({ page }) => {
 test("hovering a toast still holds it open to be read", async ({ page }) => {
   await settings(page);
   await page.getByRole("button", { name: "Replay tour" }).click();
-  const toast = page.locator(TOAST);
+  const toast = firstToast(page);
   await expect(toast).toBeVisible();
 
   // The pause the fix must not take away: a toast under the pointer is one
   // somebody is reading.
-  await toast.hover();
-  await page.waitForTimeout(9_000);
-  await expect(toast).toBeVisible();
+  //
+  // Held and re-asserted rather than slept through (issue #969). The guard
+  // re-reads the live `:hover` state every 500ms and suppresses only the
+  // VERDICT while hovered — `visibleMs` keeps accumulating underneath. So by
+  // the time this window is over the toast is already well past
+  // `duration + grace`, and a single tick that reads `:hover` false dismisses
+  // it instantly with no grace left. `await page.waitForTimeout(9_000)` then
+  // one assertion made the test pass only if all ~18 consecutive reads came
+  // back true, with a stationary synthetic pointer, on a loaded CI runner.
+  //
+  // Re-hovering each round is the point: it keeps the pointer's position true
+  // against a stack that may reflow underneath it, so the test measures
+  // "hovering holds the toast" rather than "the pointer never once lost the
+  // element". The total held time still exceeds the ~6s ceiling this is about.
+  const HOLD_ROUNDS = 12;
+  const HOLD_STEP_MS = 750;
+  for (let round = 0; round < HOLD_ROUNDS; round++) {
+    await toast.hover();
+    await page.waitForTimeout(HOLD_STEP_MS);
+    await expect(
+      toast,
+      `the hovered toast was dismissed after ~${(round + 1) * HOLD_STEP_MS}ms of hold`,
+    ).toBeVisible();
+  }
 
   // ...and it goes as soon as they look away, without a click.
   await page.mouse.move(20, 20);
-  await expect(toast).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.locator(TOAST)).toHaveCount(0, { timeout: 10_000 });
 });

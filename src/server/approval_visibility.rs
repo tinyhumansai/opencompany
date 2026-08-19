@@ -152,8 +152,10 @@ mod tests {
         ApprovalSummary {
             id: ApprovalId::new("appr-1"),
             kind: "email.send".to_string(),
+            group: crate::ports::types::EffectGroup::Send,
             amount_usd: Some(2400.0),
             at_millis: 1_000,
+            expires_at_millis: Some(87_400_000),
             task: None,
             agent: Some("ops".to_string()),
             payload: Some(serde_json::json!({ "to": "board@example.test" })),
@@ -200,6 +202,17 @@ mod tests {
             out[0].batch.as_deref(),
             Some("turn-1"),
             "role redaction withholds contents, not the grouping"
+        );
+        // **T11 (issue #971).** The deadline is not contents either, and it is
+        // the one field whose absence would actively mislead: a member watching
+        // their own stalled work would see a card silently vanish with no
+        // warning it was going to, which is the failure shortening the deadline
+        // would otherwise introduce. Money and recipients stay withheld — the
+        // two assertions above — so this widens nothing.
+        assert_eq!(
+            out[0].expires_at_millis,
+            Some(87_400_000),
+            "a member must be told when their stalled work will be given up on"
         );
     }
 

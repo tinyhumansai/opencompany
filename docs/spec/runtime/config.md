@@ -130,6 +130,7 @@ that does and does not imply.
 | `OPENCOMPANY_MAIL_SECURITY` | `starttls` | `none` \| `starttls` \| `ssl` |
 | `OPENCOMPANY_MAIL_USERNAME` / `_PASSWORD` | — | SMTP auth. Redacted from `Debug` and never logged |
 | `OPENCOMPANY_MAIL_FROM_NAME` | — | Display name on the `From` header |
+| `OPENCOMPANY_SHUTDOWN_GRACE_SECONDS` | `25` | How long a SIGTERM/SIGINT waits for in-flight turns before exiting anyway. `0` exits as soon as the companies are quiesced. Must stay at least 2s below the pod's `terminationGracePeriodSeconds` (the 2s is the connection-grace overhead at the end of the drain) — see [shutdown](lifecycle.md#shutdown) |
 | `OPENCOMPANY_CORS_ORIGINS` | — (CORS off) | Comma-separated exact origins allowed to make credentialed cross-origin requests, e.g. `http://localhost:5173` for a Vite dev server or `https://app.example.com` for a [hub console](hub-console.md). `*` is refused: a wildcard is illegal with credentials |
 | `OPENCOMPANY_PLATFORM_TOKEN` | — (no machine credential) | The shared platform secret. A bearer equal to it is the `tenant:platform` principal, with the `platform` scope |
 | `OPENCOMPANY_PLATFORM_JWT_SECRET` | — (signed tenant tokens not accepted) | HS256 secret that signs tenant-scoped machine tokens. No shipped literal and no fallback: unset means the path does not exist. Set on a build without `platform-jwt` (in the default feature set) and the host **refuses to boot** |

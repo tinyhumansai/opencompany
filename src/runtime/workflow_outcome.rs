@@ -144,6 +144,12 @@ impl From<Result<&WorkflowRun, &str>> for Settled {
     }
 }
 
+/// Returns whether the finish was durably appended. `false` means the append
+/// failed and was swallowed (the run itself is unaffected, exactly as before) —
+/// so a caller that knows the run is otherwise about to disappear from the live
+/// set can escalate the lost record from this helper's `warn` to an `error`
+/// naming the run. Issue #1009 added the return; callers that do not care about
+/// the outcome (the boot sweep, the read-side cross-check) simply ignore it.
 pub async fn record_run_finished(
     events: &Arc<dyn EventLog>,
     company: &CompanyId,
@@ -151,7 +157,7 @@ pub async fn record_run_finished(
     scheduled: bool,
     run_id: &str,
     outcome: Result<&WorkflowRun, &str>,
-) {
+) -> bool {
     // Which fields ride which arm, and why, is documented on `Settled::from`.
     let settled = Settled::from(outcome);
 
@@ -174,7 +180,9 @@ pub async fn record_run_finished(
 
     if let Err(err) = events.append(company, event).await {
         // Swallowed on purpose: the run already happened and its work is valid.
-        // Losing the record is worth a loud line, never a failed run.
+        // Losing the record is worth a loud line, never a failed run. The caller
+        // learns of the loss through the `false` return (issue #1009) and may
+        // escalate it — this helper stays best-effort and never fails the run.
         tracing::warn!(
             %company,
             workflow = %workflow_id,
@@ -182,7 +190,9 @@ pub async fn record_run_finished(
             %err,
             "workflow run outcome could not be journaled; the run itself was unaffected"
         );
+        return false;
     }
+    true
 }
 
 /// Terminates workflow runs a previous host process left open (issue #371).
@@ -1144,5 +1154,59 @@ mod test {
         let (_home, events) = log();
         let company = CompanyId::new("acme");
         assert!(stranded(&events, &company, "digest").await.is_empty());
+    }
+
+    /// An [`EventLog`] whose `append` always fails — the store went away
+    /// mid-run. Issue #1009 uses it to prove the swallowed-append path reports
+    /// its loss instead of only warning.
+    struct FailingAppendLog;
+
+    #[async_trait::async_trait]
+    impl EventLog for FailingAppendLog {
+        async fn append(&self, _id: &CompanyId, _event: CompanyEvent) -> crate::Result<EventSeq> {
+            Err(crate::error::OpenCompanyError::Store(
+                "append failed (test double)".to_string(),
+            ))
+        }
+
+        async fn read_from(
+            &self,
+            _id: &CompanyId,
+            _seq: EventSeq,
+            _limit: usize,
+        ) -> crate::Result<Vec<crate::ports::types::StoredEvent>> {
+            Ok(Vec::new())
+        }
+
+        fn subscribe(
+            &self,
+            _id: &CompanyId,
+        ) -> futures::stream::BoxStream<'static, crate::ports::events::EventStreamItem> {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    /// Issue #1009 (path B): a finish whose append is swallowed reports
+    /// `journaled == false` rather than the silent `()` it used to. The run is
+    /// otherwise unaffected — `record_run_finished` must not panic and must not
+    /// propagate the append error — and a working log reports `true`, so the
+    /// signal the caller escalates on is real both ways.
+    #[tokio::test]
+    async fn a_swallowed_append_reports_it_was_not_journaled() {
+        let company = CompanyId::new("acme");
+        let run = run_with(Vec::new(), Vec::new());
+
+        let failing: Arc<dyn EventLog> = Arc::new(FailingAppendLog);
+        let journaled =
+            record_run_finished(&failing, &company, "digest", false, "run-1", Ok(&run)).await;
+        assert!(
+            !journaled,
+            "a swallowed append reports the finish did not land"
+        );
+
+        let (_home, working) = log();
+        let journaled =
+            record_run_finished(&working, &company, "digest", false, "run-1", Ok(&run)).await;
+        assert!(journaled, "a working log reports the finish landed");
     }
 }

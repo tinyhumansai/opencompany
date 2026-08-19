@@ -1581,6 +1581,13 @@ fn summarize_event(event: &CompanyEvent) -> String {
         // carry.
         CompanyEvent::TurnStarted { turn_id, .. } => format!("turn accepted: {turn_id}"),
         CompanyEvent::TurnFailed { turn_id, .. } => format!("turn unanswered: {turn_id}"),
+        // Issue #1015. Structural only: the minted id and the status word, a
+        // fixed vocabulary. The failure reason is our own prose about the host
+        // and is tenant-scoped, so it stays off this surface exactly as
+        // `TurnFailed`'s does.
+        CompanyEvent::RunStatusChanged { run_id, to, .. } => {
+            format!("attempt {run_id}: {to}")
+        }
         CompanyEvent::AgentReply { agent_id, .. } => format!("reply from {agent_id}"),
         CompanyEvent::TaskDispatched { task_id, .. } => format!("task dispatched: {task_id}"),
         // Issue #464. Structural only, like every arm here: the id, the change
@@ -6313,7 +6320,10 @@ members = ["legal_counsel"]
                     .cloned()
                     .collect())
             }
-            fn subscribe(&self, _id: &CompanyId) -> BoxStream<'static, StoredEvent> {
+            fn subscribe(
+                &self,
+                _id: &CompanyId,
+            ) -> BoxStream<'static, crate::ports::events::EventStreamItem> {
                 Box::pin(stream::empty())
             }
         }
@@ -6415,7 +6425,10 @@ members = ["legal_counsel"]
                     .cloned()
                     .collect())
             }
-            fn subscribe(&self, _id: &CompanyId) -> BoxStream<'static, StoredEvent> {
+            fn subscribe(
+                &self,
+                _id: &CompanyId,
+            ) -> BoxStream<'static, crate::ports::events::EventStreamItem> {
                 Box::pin(stream::empty())
             }
         }

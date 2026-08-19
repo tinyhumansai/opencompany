@@ -47,6 +47,7 @@
 
 use std::sync::Arc;
 
+use futures::future::FutureExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
@@ -57,6 +58,20 @@ use crate::ports::types::CompanyId;
 use crate::ports::{EventLog, WorkflowRun, WorkflowRunContext, WorkflowRunner};
 use crate::runtime::workflow_outcome::record_run_finished;
 use crate::runtime::{RunGuard, RunSupervisor};
+
+/// The error stamped on a run whose task **panicked** before it could journal a
+/// finish (issue #1009).
+///
+/// Phrased, like [`INTERRUPTED_BY_RESTART`](crate::runtime::INTERRUPTED_BY_RESTART),
+/// as a host fact rather than a workflow fault the operator can act on at the
+/// node level: the run's task came apart, and the nodes recorded against it are
+/// the ones that completed before it did. A caught unwind journals this so the
+/// run stops reading `running: true` forever, then re-raises so the run's task
+/// still resolves to a `JoinError`.
+const PANICKED_BEFORE_FINISH: &str = concat!(
+    "this run's task panicked before it finished; ",
+    "the nodes recorded against it are the ones that completed before it stopped"
+);
 
 /// Everything starting a supervised workflow run needs, and nothing else.
 #[derive(Clone)]
@@ -177,7 +192,67 @@ impl WorkflowSpawn {
             // it can still do anything. Dropping on every exit path, unwind
             // included, is why this is a guard rather than a call at the end.
             let _guard = guard;
-            let result = self.runner.run(&self.company, &workflow, input, &ctx).await;
+            // Issue #1009 (path A): the runner future can **unwind** — a panic
+            // in a node, a poisoned lock — and an unwind jumps straight past the
+            // journal write below, so the run's `WorkflowRunStarted` never gets a
+            // matching finish and `GET …/workflows/runs` folds it `running: true`
+            // forever, until the next boot sweep settles it. The console shows a
+            // run that will never stop with a Stop button that cannot help.
+            //
+            // Catching the unwind *here* — inside the task, while `_guard` is
+            // still held, so the finish lands BEFORE the supervisor entry drops
+            // and no read-side rebuild race can open — lets us journal a finish
+            // for the panicked run, then re-raise the exact payload so the task
+            // still resolves to a `JoinError`. That keeps the synchronous mode's
+            // 500 (at the console run route) and the scheduler's `tracing::error`
+            // unchanged: nothing downstream can tell the panic was intercepted.
+            //
+            // Deliberately an in-task catch, not a separate watchdog task: only
+            // this way does the write stay inside the guard's lifetime and change
+            // no sync/detach contract.
+            let result = match std::panic::AssertUnwindSafe(self.runner.run(
+                &self.company,
+                &workflow,
+                input,
+                &ctx,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(result) => result,
+                Err(payload) => {
+                    // A dry run journals nothing on panic either, exactly as the
+                    // clean path below skips its finish — a test run must leave
+                    // no `WorkflowRunFinished` for the history to fold.
+                    if !dry_run {
+                        let journaled = record_run_finished(
+                            &self.events,
+                            &self.company,
+                            &workflow.id,
+                            scheduled,
+                            &ctx.run_id,
+                            Err(PANICKED_BEFORE_FINISH),
+                        )
+                        .await;
+                        // Issue #1009 (path B, surfaced): if even this finish
+                        // could not be appended, the run is right back to reading
+                        // in-flight until the next boot sweep — a state worth an
+                        // error line naming the run, not a swallowed warn.
+                        if !journaled {
+                            tracing::error!(
+                                company = %self.company,
+                                workflow = %workflow.id,
+                                run_id = %ctx.run_id,
+                                "a panicked workflow run's finish could not be journaled; \
+                                 it will read as in-flight until the next boot sweep settles it"
+                            );
+                        }
+                    }
+                    // Re-raise: the JoinHandle still resolves to a JoinError, so
+                    // the synchronous caller still 500s. The finish is durable.
+                    std::panic::resume_unwind(payload);
+                }
+            };
             // Issue #542: a dry run journals NOTHING. The runner already skipped
             // the started + per-node rows; skipping the finish here keeps the
             // pair honest, so a test run leaves no `WorkflowRunFinished` for the
@@ -190,7 +265,7 @@ impl WorkflowSpawn {
                     Ok(run) => Ok(run),
                     Err(err) => Err(err.to_string()),
                 };
-                match outcome {
+                let journaled = match outcome {
                     Ok(run) => {
                         record_run_finished(
                             &self.events,
@@ -200,7 +275,7 @@ impl WorkflowSpawn {
                             &ctx.run_id,
                             Ok(run),
                         )
-                        .await;
+                        .await
                     }
                     Err(err) => {
                         record_run_finished(
@@ -211,12 +286,154 @@ impl WorkflowSpawn {
                             &ctx.run_id,
                             Err(err.as_str()),
                         )
-                        .await;
+                        .await
                     }
+                };
+                // Issue #1009 (path B, surfaced): a swallowed append leaves the
+                // run reading `running: true` until the next boot sweep. The
+                // helper still swallows the append error itself (it must never
+                // fail the run), but a finish that did not land is worth an error
+                // line naming the run — not only the helper's warn — so the hole
+                // is visible in telemetry rather than only at the next restart.
+                if !journaled {
+                    tracing::error!(
+                        company = %self.company,
+                        workflow = %workflow.id,
+                        run_id = %ctx.run_id,
+                        "a finished workflow run could not be journaled; \
+                         it will read as in-flight until the next boot sweep settles it"
+                    );
                 }
             }
             result
         });
         (run_id, handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::types::{CompanyEvent, EventSeq};
+    use crate::store::FsEventLog;
+    use async_trait::async_trait;
+
+    /// A runner whose `run` **panics** — the path-A failure issue #1009 fixes.
+    /// An unwind here used to jump straight past the finish journal, leaving the
+    /// run reading `running: true` until the next boot sweep.
+    struct PanickingRunner;
+
+    #[async_trait]
+    impl WorkflowRunner for PanickingRunner {
+        async fn run(
+            &self,
+            _company: &CompanyId,
+            _workflow: &WorkflowFile,
+            _input: Value,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<WorkflowRun> {
+            panic!("the run blew up");
+        }
+    }
+
+    fn empty_workflow() -> WorkflowFile {
+        WorkflowFile {
+            id: "digest".to_string(),
+            name: "Digest".to_string(),
+            description: None,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            global: false,
+        }
+    }
+
+    /// Issue #1009 (path A): a run whose task panics still journals a finish, so
+    /// it stops reading `running: true`.
+    ///
+    /// The watchdog catches the unwind, writes the finish while the guard is
+    /// still held, then re-raises — so both halves hold at once: the JoinHandle
+    /// still resolves to a `JoinError` (the console's synchronous-mode 500 and
+    /// the scheduler's `tracing::error` are unchanged) AND the journal now
+    /// carries a `WorkflowRunFinished` for the run. Before the fix the handle
+    /// still errored but nothing was journaled — this asserts the JOURNAL, which
+    /// is the half the bug was about.
+    #[tokio::test]
+    async fn a_panicking_run_still_journals_its_finish() {
+        let dir = tempfile::Builder::new()
+            .prefix("oc-spawn-panic-")
+            .tempdir()
+            .expect("tempdir");
+        let events: Arc<dyn EventLog> = Arc::new(FsEventLog::new(dir.path()));
+        let company = CompanyId::new("acme");
+        let spawn = WorkflowSpawn {
+            company: company.clone(),
+            events: events.clone(),
+            supervisor: RunSupervisor::new(),
+            runner: Arc::new(PanickingRunner),
+        };
+
+        let (run_id, handle) = spawn
+            .spawn(empty_workflow(), Value::Null, false, false)
+            .expect("under the default cap");
+
+        let joined = handle.await;
+        assert!(
+            joined.is_err() && joined.unwrap_err().is_panic(),
+            "the panic still propagates to the JoinHandle, preserving the sync-mode 500"
+        );
+
+        let stored = events
+            .read_from(&company, EventSeq::new(0), usize::MAX)
+            .await
+            .expect("read journal");
+        let finished = stored.iter().any(|s| {
+            matches!(
+                &s.event,
+                CompanyEvent::WorkflowRunFinished {
+                    run_id: Some(id),
+                    error: Some(err),
+                    ..
+                } if id == &run_id && err == PANICKED_BEFORE_FINISH
+            )
+        });
+        assert!(
+            finished,
+            "the watchdog journaled a WorkflowRunFinished for the panicked run"
+        );
+    }
+
+    /// A dry (test) run that panics journals **nothing** — the watchdog honours
+    /// the same `dry_run` skip the clean path does, so a test run leaves no
+    /// `WorkflowRunFinished` for the history to fold even when it blows up.
+    #[tokio::test]
+    async fn a_panicking_dry_run_journals_nothing() {
+        let dir = tempfile::Builder::new()
+            .prefix("oc-spawn-panic-dry-")
+            .tempdir()
+            .expect("tempdir");
+        let events: Arc<dyn EventLog> = Arc::new(FsEventLog::new(dir.path()));
+        let company = CompanyId::new("acme");
+        let spawn = WorkflowSpawn {
+            company: company.clone(),
+            events: events.clone(),
+            supervisor: RunSupervisor::new(),
+            runner: Arc::new(PanickingRunner),
+        };
+
+        let (_run_id, handle) = spawn
+            .spawn(empty_workflow(), Value::Null, false, true)
+            .expect("under the default cap");
+        assert!(handle.await.is_err(), "the panic still propagates");
+
+        let stored = events
+            .read_from(&company, EventSeq::new(0), usize::MAX)
+            .await
+            .expect("read journal");
+        assert!(
+            !stored
+                .iter()
+                .any(|s| matches!(s.event, CompanyEvent::WorkflowRunFinished { .. })),
+            "a dry run journals no finish, panic or not"
+        );
     }
 }

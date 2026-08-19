@@ -89,13 +89,17 @@ Full values, ramps and measured contrast: [`design-system/color.md`](../design-s
 
 ### The one hue we own
 
-**Indigo `#635BFF`.** It means *interactive or ours*: buttons, links, focus
+**Violet `#7153F0`.** It means *interactive or ours*: buttons, links, focus
 rings, the active nav row, the leading chart series, the logo. Nothing else.
 
-The discipline that makes it work is what indigo is **forbidden** from doing:
+A cool-warm hybrid, deliberately carrying more warmth than a generic indigo
+such as `#6366F1`.
 
-- It is never a status. A run is not indigo.
-- It is not a background wash. There are no indigo gradients, no glows, no
+The discipline that makes it work is what the brand hue is **forbidden** from
+doing:
+
+- It is never a status. A run is not violet.
+- It is not a background wash. There are no violet gradients, no glows, no
   tinted hero panels.
 - It is not used to make something look important. Hierarchy comes from size,
   weight and position first.
@@ -141,8 +145,8 @@ This is not hypothetical tidiness. Identity used to be drawn from the same
 palette as status, so a desk was tinted the exact green that means "done" and
 a category the red that means "failed".
 
-Where the two palettes do come close — identity violet against brand indigo,
-identity blue against running cyan — **form separates them**:
+Where the two palettes do come close — identity violet against the brand
+violet, identity blue against running cyan — **form separates them**:
 
 | | Shape |
 | --- | --- |
@@ -207,13 +211,13 @@ merely delights. Nothing loops, nothing bounces, nothing pulses except a live
 
 The wordmark is **OpenCompany**, set in Geist Semibold, sentence-cased with a
 capital C — never `Open Company`, `OPENCOMPANY`, or `opencompany` in prose
-(lowercase is correct only as an identifier: the crate, the CLI, `#635BFF`).
+(lowercase is correct only as an identifier: the crate, the CLI, `#7153f0`).
 
 **Usage:**
 
 - Clear space on all sides ≥ the cap height of the "O".
 - Minimum width 88px; below that use the mark alone.
-- On colour, use the white lockup. Never indigo-on-colour.
+- On colour, use the white lockup. Never violet-on-colour.
 - Never re-set it in another face, stretch it, add a gradient, outline it, or
   apply a shadow.
 

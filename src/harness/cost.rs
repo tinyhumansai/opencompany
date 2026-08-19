@@ -212,7 +212,8 @@ mod tests {
         let turn = turn_with(0.42);
         let entry = ledger_entry_for(&turn, "ceo").unwrap();
         assert_eq!(entry.kind, "inference.spend");
-        assert_eq!(entry.amount_usd, 0.42);
+        // Negative: an outflow, per the ledger convention (issue #1047).
+        assert_eq!(entry.amount_usd, -0.42);
         assert_eq!(entry.memo, "ceo");
     }
 
@@ -235,7 +236,8 @@ mod tests {
 
         let ledger = store.ledger.lock().unwrap();
         assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger[0].amount_usd, 1.5);
+        // Negative: an outflow, per the ledger convention (issue #1047).
+        assert_eq!(ledger[0].amount_usd, -1.5);
         let samples = meter.samples.lock().unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].kind, SampleKind::Inference);
@@ -282,7 +284,7 @@ mod tests {
         // Attribution only — the spend itself is unchanged.
         let ledger = store.ledger.lock().unwrap();
         assert_eq!(ledger.len(), 2);
-        assert!(ledger.iter().all(|e| e.amount_usd == 0.5));
+        assert!(ledger.iter().all(|e| e.amount_usd == -0.5));
 
         // The field is additive on the wire: an unattributed sample serializes
         // exactly as it did before #242.

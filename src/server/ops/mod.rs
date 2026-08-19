@@ -48,6 +48,7 @@ pub mod runs;
 pub mod scope;
 pub mod skills;
 pub mod smtp;
+mod task_cost;
 pub mod task_export;
 pub mod tasks;
 pub mod team;

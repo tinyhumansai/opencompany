@@ -153,10 +153,59 @@ total by construction.
 
 ## Shutdown
 
-On SIGINT/SIGTERM: stop intake, drain the in-flight cycle with a bounded
-timeout, checkpoint stores, exit. The tiny.place Agent Card stays published
-(the endpoint simply goes offline); liveness is a directory concern, not a
-registration concern.
+On SIGINT/SIGTERM (`src/server/shutdown.rs`), in order:
+
+A second SIGTERM or Ctrl-C — while the drain below is still running — forces an
+immediate exit with status 130 and can cut in-flight work off before the normal
+drain completes. It is the local escape hatch from a long drain, deliberately a
+one-way action once the host has been told to stop twice.
+
+1. **Stop intake.** Every registered company is quiesced, so a new cycle is
+   refused with `503 Quiescing`. The schedulers, mailbox pollers and Telegram
+   pollers stop on the same signal, so nothing starts a fresh turn either.
+2. **Drain the in-flight cycles**, bounded by `OPENCOMPANY_SHUTDOWN_GRACE_SECONDS`
+   (default 25s). The wait is `CompanyRuntime::quiesce` — acquiring the
+   per-company `serial` lock every cycle holds for its whole duration — and it
+   runs across all companies concurrently, so one busy company cannot spend the
+   whole bound on behalf of the others. The server keeps serving throughout: the
+   console's event stream is how an operator watches the turn land.
+3. **Stop accepting connections**, giving the open ones two more seconds to
+   finish writing, then exit regardless. The event stream never ends on its own,
+   so waiting for connections to close on their own terms would hold the pod open
+   until the kubelet's `SIGKILL`.
+
+That two-second clock starts when step 2 returns, not at the signal, so a host
+with nothing in flight but an open event stream exits in about two seconds
+instead of sitting out the whole drain bound. Signal to exit is therefore at
+most `OPENCOMPANY_SHUTDOWN_GRACE_SECONDS` + 2s — the total the pod's
+`terminationGracePeriodSeconds` has to stay above.
+
+(The original spec included an explicit "checkpoint stores" step. Stores
+write every cycle — nothing is buffered beyond the current turn — so an
+explicit checkpoint is redundant; the work the drain waited for is already
+persisted. This note replaces the former step without changing the outcome.)
+
+Handling the signal at all is the load-bearing part: without a handler the
+default disposition applies and the process dies on the first signal, which is
+what a grace period on the pod spec is a window *for*. The tenant pod therefore
+sets `terminationGracePeriodSeconds` above `OPENCOMPANY_SHUTDOWN_GRACE_SECONDS`
++ the 2s connection grace — the total the earlier step measured — so a pod
+configured between the drain bound and that total would be `SIGKILL`ed during
+the connection window. The two move together, and raising the drain bound past
+the pod's grace period buys that same `SIGKILL` mid-drain rather than a longer
+drain.
+
+The bound is deliberately shorter than the longest turn — turns run well past
+fifteen minutes — so this reduces how often work is killed rather than
+eliminating it. A turn cut off anyway is settled by the boot reaper
+(`reap_orphaned_runs`), which stamps it failed with a named cause; that record
+remains the backstop.
+
+`/healthz` is untouched by any of this. The manager's wake-on-request proxy
+blocks on that endpoint during **boot**, and nothing here runs before the signal.
+
+The tiny.place Agent Card stays published (the endpoint simply goes offline);
+liveness is a directory concern, not a registration concern.
 
 ## Multi-company isolation
 

@@ -113,8 +113,15 @@ test.beforeEach(async ({ page, request }) => {
   expect(res.ok(), `create ${WORKFLOW.id}: ${res.status()} ${await res.text()}`).toBeTruthy();
 });
 
+// `expectedVersion` is required (issue #1013), so teardown reads the
+// workflow's current token first rather than sending a bare DELETE.
 test.afterEach(async ({ request }) => {
-  await request.delete(`${COMPANY_SCOPE}/workflows/${WORKFLOW.id}`).catch(() => undefined);
+  const version = await request
+    .get(`${COMPANY_SCOPE}/workflows/${WORKFLOW.id}`)
+    .then(async (res) => (res.ok() ? ((await res.json()).version as string | null) : null))
+    .catch(() => null);
+  const query = version ? `?expectedVersion=${encodeURIComponent(version)}` : "";
+  await request.delete(`${COMPANY_SCOPE}/workflows/${WORKFLOW.id}${query}`).catch(() => undefined);
 });
 
 /**

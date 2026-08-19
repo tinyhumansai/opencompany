@@ -33,8 +33,18 @@ async function createWorkflow(request: APIRequestContext, id: string, name: stri
   expect(res.ok(), `create ${id}: ${res.status()} ${await res.text()}`).toBeTruthy();
 }
 
+/**
+ * Best-effort teardown so a failed spec does not poison the next run.
+ * `expectedVersion` is required (issue #1013), so this reads the workflow's
+ * current token first rather than sending a bare DELETE.
+ */
 async function deleteWorkflow(request: APIRequestContext, id: string) {
-  await request.delete(`${COMPANY_SCOPE}/workflows/${id}`).catch(() => undefined);
+  const version = await request
+    .get(`${COMPANY_SCOPE}/workflows/${id}`)
+    .then(async (res) => (res.ok() ? ((await res.json()).version as string | null) : null))
+    .catch(() => null);
+  const query = version ? `?expectedVersion=${encodeURIComponent(version)}` : "";
+  await request.delete(`${COMPANY_SCOPE}/workflows/${id}${query}`).catch(() => undefined);
 }
 
 /** The workflow picker's trigger. */
