@@ -13,6 +13,8 @@ import { Crown } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import type { DeskDto, TeamMemberDto } from "@/api/types";
+import { TeammateAvatar } from "@/components/teammate-avatar";
+import { avatarFor, toneFor } from "@/lib/team";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -206,6 +208,12 @@ export function DeskCreateDialog({
                     )}
                   >
                     <span className="flex min-w-0 items-center gap-1.5">
+                      <TeammateAvatar
+                        name={member.name ?? member.role}
+                        avatar={avatarFor(member.id ?? member.name ?? "")}
+                        tone={toneFor(member.id ?? member.name ?? "")}
+                        className="size-5 shrink-0"
+                      />
                       {order === 0 && (
                         <Crown role="img" aria-label="Desk lead" className="size-3.5 shrink-0 text-muted-foreground" />
                       )}
