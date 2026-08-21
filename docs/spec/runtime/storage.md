@@ -220,9 +220,33 @@ changes.
 Beyond the core assertions (per-company isolation, append-only event/ledger,
 monotonic event sequence, export totality) it exercises each WS3 store —
 `assert_task_store`, `assert_workspace_store`, `assert_fact_store`,
-`assert_skill_state_store`, `assert_inbox_store`, `assert_usage_meter` — plus a
-dedicated `assert_usage_retention` that verifies samples older than the 90-day
-window are evicted on write. A new backend passes only when all of these hold.
+`assert_skill_state_store`, `assert_inbox_store`, `assert_usage_meter`,
+`assert_secret_store` — plus a dedicated `assert_usage_retention` that verifies
+samples older than the 90-day window are evicted on write. A new backend passes
+only when all of these hold.
+
+`assert_secret_store` (issue #1505) covers the port holding a tenant's inference
+credential, MCP OAuth tokens, Composio account tokens and SMTP password:
+read-back, absence, per-key independence, overwrite, "cleared is an empty value
+and not absence", and — the property with security consequences — that a secret
+written for company A is unreadable as company B, in both directions. The port
+has no `delete`; callers clear by writing an empty value, which is why the
+empty-value case stands in for a deletion case.
+
+One property it deliberately does **not** assert yet: that two distinct keys
+stay distinct. They do not on the filesystem backend, whose secret filename is a
+non-injective slug of the key, so two MCP servers whose names differ only by a
+folded character share one credential — issue #1510. The function's doc comment
+names that, so the hole is countable rather than silent.
+
+**Fixtures in this suite are non-empty on purpose.** An empty vec, map or `None`
+survives every possible bug, including a backend that never persisted the field
+at all, so seeding one certifies the gap it was meant to close. Issue #1504 was
+exactly that: `CompanyRecord::overlay_agents` was seeded as `Vec::new()` and
+never read back, so a backend that dropped every console-created teammate passed
+the whole suite. The fixture now seeds `overlay_agents`, `overlay_desks` and
+`overlay_desk_members` with their optional fields populated, and both
+`assert_isolation_by_company` and `assert_export_totality` assert them.
 
 `assert_workspace_folder_claims` (issue #759) additionally drives eight
 concurrent callers at one `(parent, name)`: all must succeed, all must come away

@@ -2169,6 +2169,16 @@ mod test {
         conformance::assert_inbox_store(Arc::new(FsInboxStore::new(&root))).await;
     }
 
+    /// Issue #1505. The port holds this company's inference credential, its MCP
+    /// OAuth tokens and its SMTP password, and had no conformance case on any
+    /// backend until this one.
+    #[tokio::test]
+    async fn conformance_secret_store() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_secret_store(Arc::new(FsSecretStore::new(&root))).await;
+    }
+
     #[tokio::test]
     async fn conformance_context_chunk_stamps() {
         let root_dir = tmp_root();

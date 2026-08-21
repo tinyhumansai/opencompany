@@ -198,6 +198,20 @@ pub trait SecretStore: Send + Sync {
 }
 ```
 
+There is no `delete`: callers clear a secret by writing an empty value
+(`src/company/mcp.rs::clear_auth`, `src/company/inference.rs::clear_key`), so an
+empty value and an unset key are **different states** and a backend must keep
+them apart — collapsing `""` into `None` would fall back to whatever the
+manifest or the environment supplies and silently undo the operator's
+revocation.
+
+`assert_secret_store` in `src/store/conformance.rs` is the contract every
+backend is checked against (issue #1505): read-back, absence, per-key
+independence, overwrite, the empty-value distinction above, and isolation in
+both directions. See
+[storage.md](storage.md#conformance-coverage) for what it deliberately does not
+assert yet.
+
 ## UserStore, SessionStore, LoginCodeStore
 
 The company's human collaborators and their credentials

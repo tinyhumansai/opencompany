@@ -4631,6 +4631,17 @@ mod test {
         drop_db(&s).await;
     }
 
+    /// Issue #1505. The port holds this tenant's inference credential, its MCP
+    /// OAuth tokens and its SMTP password, and had no conformance case on any
+    /// backend until this one — on the backend a hosted tenant actually runs,
+    /// where the company scope in the query IS the tenant boundary.
+    #[tokio::test]
+    async fn conformance_secret_store() {
+        let Some(s) = store().await else { return };
+        conformance::assert_secret_store(s.clone()).await;
+        drop_db(&s).await;
+    }
+
     #[tokio::test]
     async fn conformance_task_store() {
         let Some(s) = store().await else { return };
