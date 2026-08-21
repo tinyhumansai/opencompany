@@ -118,8 +118,14 @@ export function SettingsView({ client, company, feed, onFlag }: Props) {
           </Card>
         )}
 
-        {/* Domain & email */}
-        <DomainSettings company={company} />
+        {/* Domain & email.
+
+            `key` is load-bearing, not cosmetic: this card holds a
+            typed-but-unsaved SMTP password in React state, and without a
+            remount a company switch would carry a credential typed for one
+            company into another company's Save. `SettingsSection` remounts
+            `BillingView`/`HostingView` for exactly this reason. */}
+        <DomainSettings key={company ?? "self"} client={client} company={company} />
 
         {/* Appearance.
 

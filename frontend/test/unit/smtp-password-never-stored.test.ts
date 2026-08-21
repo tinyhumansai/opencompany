@@ -3,30 +3,30 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { scopedKey } from "@/connections/types";
-import {
-  emptyMailSettings,
-  loadMailSettings,
-  purgeStoredSmtpPasswords,
-  saveMailSettings,
-  withoutSmtpPassword,
-} from "@/lib/domain";
+import * as domainModule from "@/lib/domain";
+import { isValidDomain, purgeStoredSmtpPasswords } from "@/lib/domain";
 
 /**
  * The SMTP password must never reach `localStorage` (issue #1460).
  *
- * The pre-fix console held the whole card in one `useState` and wrote all of it
- * back on every change, so a live sending credential was persisted to browser
- * storage character by character as it was typed — readable by any script on
- * the origin, surviving sign-out, with no expiry.
+ * The first half of the fix filtered the password out on the way in: the module
+ * kept a `saveMailSettings` that structurally could not receive one. This half
+ * removed the store entirely — `Settings → General` reads and writes the host
+ * (`src/api/domain.ts`, `src/api/smtp.ts`), so a remembered copy of the domain,
+ * host, username or from addresses would only be a second answer that
+ * disagrees with the authoritative one.
  *
- * The assertions below are deliberately written against **the whole store**
- * rather than against a known key. A test that checks `oc-mail:…` for a missing
- * `password` field passes the day someone adds a second key, or renames the
- * prefix, or stores a draft somewhere new — and the credential leaks again with
- * a green suite. So: type a password, do the things the card does, then read
- * every value in `localStorage` and assert the secret appears in none of them.
- * That is the property the fix exists to hold, and it cannot rot into a weaker
- * one without the assertion visibly changing.
+ * That makes the guarantee a different, stronger shape, so these tests assert a
+ * different, stronger thing. It is no longer "the writer drops the password";
+ * it is **there is no writer**. `no-writer-left` below is the load-bearing
+ * assertion and the one that cannot rot: reintroducing any function that puts
+ * something under an `oc-mail` key fails it, whatever that function is called.
+ *
+ * The assertions about the store are still written against **the whole of
+ * `localStorage`** rather than against a known key. A test that checks
+ * `oc-mail:…` for a missing `password` field passes the day someone adds a
+ * second key, or renames the prefix, or stores a draft somewhere new — and the
+ * credential leaks again with a green suite.
  */
 
 const SCOPE = { connection: "conn-a", company: "acme" };
@@ -51,118 +51,129 @@ function entireStore(): string {
   return parts.join("\n");
 }
 
-/** A full settings object with a password typed into it. */
-function settingsWithPassword() {
-  const settings = emptyMailSettings();
-  settings.domain = { domain: "mail.acme.com", verified: false };
-  settings.smtp = {
-    host: "smtp.postmarkapp.com",
-    port: "587",
-    security: "starttls",
-    username: "apikey",
-    password: SECRET,
-    fromName: "Acme",
-    fromEmail: "hello@mail.acme.com",
-  };
-  return settings;
+/**
+ * A blob in the shape the pre-#1460 console wrote, password and all.
+ *
+ * Built as a literal rather than through a helper from the module, because the
+ * helpers that used to build it are exactly what this change deleted. The
+ * legacy shape is now test data — it describes what is in an operator's browser
+ * today, not anything the console can still produce.
+ */
+function legacyBlob(password: string = SECRET) {
+  return JSON.stringify({
+    domain: { domain: "mail.acme.com", verified: false },
+    smtp: {
+      host: "smtp.postmarkapp.com",
+      port: "587",
+      security: "starttls",
+      username: "apikey",
+      password,
+      fromName: "Acme",
+      fromEmail: "hello@mail.acme.com",
+    },
+  });
 }
 
-describe("saving the card", () => {
-  it("puts no part of the password anywhere in localStorage", () => {
-    saveMailSettings(SCOPE, withoutSmtpPassword(settingsWithPassword()));
-
-    expect(entireStore()).not.toContain(SECRET);
+/** The same blob a passing purge leaves behind: everything except the password. */
+function purgedBlob() {
+  return JSON.stringify({
+    domain: { domain: "mail.acme.com", verified: false },
+    smtp: {
+      host: "smtp.postmarkapp.com",
+      port: "587",
+      security: "starttls",
+      username: "apikey",
+      fromName: "Acme",
+      fromEmail: "hello@mail.acme.com",
+    },
   });
+}
 
-  it("still remembers the non-secret fields", () => {
-    saveMailSettings(SCOPE, withoutSmtpPassword(settingsWithPassword()));
+describe("the store this module used to keep", () => {
+  it("has no writer left: nothing exported puts an oc-mail key in localStorage", () => {
+    // The guard that replaces the old `@ts-expect-error` on `saveMailSettings`.
+    // That one proved a specific function refused a password; this one proves
+    // no function is there to refuse. Call every export with plausible
+    // arguments and assert the store is untouched — a reintroduced writer under
+    // any name fails here.
+    const exports = Object.entries(domainModule).filter(
+      ([, v]) => typeof v === "function",
+    ) as [string, (...args: unknown[]) => unknown][];
 
-    const raw = localStorage.getItem(scopedKey("oc-mail", SCOPE)) ?? "";
-    expect(raw).toContain("smtp.postmarkapp.com");
-    expect(raw).toContain("apikey");
-    expect(raw).toContain("mail.acme.com");
-    // The key itself is absent, not merely empty: `withoutSmtpPassword`
-    // destructures it away rather than blanking it.
-    expect(raw).not.toContain("password");
-  });
+    // Sanity: if the module ever exports nothing, the loop below is vacuous and
+    // this test would pass while proving nothing.
+    expect(exports.length).toBeGreaterThan(0);
 
-  it("survives the per-keystroke write pattern the card actually uses", () => {
-    // The regression was a `useEffect` firing once per character. Replaying it
-    // is what proves no intermediate write leaks a prefix of the secret.
-    const settings = settingsWithPassword();
-    for (let i = 0; i <= SECRET.length; i++) {
-      saveMailSettings(SCOPE, withoutSmtpPassword({
-        ...settings,
-        smtp: { ...settings.smtp, password: SECRET.slice(0, i) },
-      }));
+    // Two shapes, because the exports do not agree on what an argument is:
+    // `isValidDomain` wants a string, a hypothetical writer would want a
+    // settings object. A throw is fine and expected — the claim under test is
+    // about what reached the store, not about what returned.
+    const arguments_ = [
+      "mail.acme.com",
+      {
+        connection: "conn-a",
+        company: "acme",
+        domain: { domain: "mail.acme.com", verified: false },
+        smtp: { host: "smtp.postmarkapp.com", password: SECRET },
+      },
+    ];
+
+    for (const [, fn] of exports) {
+      for (const argument of arguments_) {
+        try {
+          fn(argument);
+        } catch {
+          /* wrong argument type for this export; the store assertion still holds */
+        }
+      }
     }
 
-    expect(entireStore()).not.toContain(SECRET.slice(0, 8));
-  });
-});
-
-describe("the persisted shape", () => {
-  it("will not accept a full settings object", () => {
-    // The load-bearing guard, and the one that cannot rot: if `saveMailSettings`
-    // ever becomes willing to take a password again, this `@ts-expect-error`
-    // stops being an error and `npm run typecheck:unit` fails on the unused
-    // directive. A reviewer has to delete this line on purpose to reintroduce
-    // the bug.
-    // @ts-expect-error a full MailSettings carries `password` and must not be storable
-    saveMailSettings(SCOPE, settingsWithPassword());
-
-    // Belt and braces: even having forced the call through, the value written
-    // is whatever the caller passed, so this is the assertion that would catch
-    // a runtime regression the type system was talked out of.
-    expect(entireStore()).toContain(SECRET);
-    purgeStoredSmtpPasswords();
     expect(entireStore()).not.toContain(SECRET);
-  });
-});
-
-describe("reading the card back", () => {
-  it("returns an empty password even when storage still holds one", () => {
-    // A key written by an older build, in a tab that has not reloaded since the
-    // purge ran. It must not flow back into the form.
-    localStorage.setItem(
-      scopedKey("oc-mail", SCOPE),
-      JSON.stringify({ ...settingsWithPassword() }),
-    );
-
-    expect(loadMailSettings(SCOPE).smtp.password).toBe("");
+    expect(entireStore()).not.toContain("oc-mail");
   });
 
-  it("keeps the non-secret fields it reads back", () => {
-    saveMailSettings(SCOPE, withoutSmtpPassword(settingsWithPassword()));
-
-    const loaded = loadMailSettings(SCOPE);
-    expect(loaded.smtp.host).toBe("smtp.postmarkapp.com");
-    expect(loaded.smtp.username).toBe("apikey");
-    expect(loaded.domain.domain).toBe("mail.acme.com");
+  it("exports only the domain pre-flight and the one-shot purge", () => {
+    // Names the surface, so deleting the store cannot quietly grow back a
+    // `loadMailSettings` that a reviewer skims past.
+    expect(Object.keys(domainModule).sort()).toEqual([
+      "isValidDomain",
+      "purgeStoredSmtpPasswords",
+    ]);
   });
 });
 
 describe("purging what the old console already stored", () => {
   it("clears passwords from every scope, not just the one on screen", () => {
-    const stored = JSON.stringify(settingsWithPassword());
-    localStorage.setItem(scopedKey("oc-mail", SCOPE), stored);
-    localStorage.setItem(scopedKey("oc-mail", OTHER_SCOPE), stored);
-    localStorage.setItem(LEGACY_KEY, stored);
+    localStorage.setItem(scopedKey("oc-mail", SCOPE), legacyBlob());
+    localStorage.setItem(scopedKey("oc-mail", OTHER_SCOPE), legacyBlob());
+    localStorage.setItem(LEGACY_KEY, legacyBlob());
 
     expect(purgeStoredSmtpPasswords()).toBe(3);
     expect(entireStore()).not.toContain(SECRET);
   });
 
-  it("keeps the operator's non-secret work", () => {
-    localStorage.setItem(scopedKey("oc-mail", SCOPE), JSON.stringify(settingsWithPassword()));
+  it("keeps the operator's non-secret work readable", () => {
+    // The store is retired, so nothing reads these back into the form any
+    // more — but deleting an operator's typed-in host and from address on
+    // their behalf is not this function's job either. It removes the
+    // credential and leaves the rest alone.
+    localStorage.setItem(scopedKey("oc-mail", SCOPE), legacyBlob());
 
     purgeStoredSmtpPasswords();
 
-    const loaded = loadMailSettings(SCOPE);
-    expect(loaded.smtp.host).toBe("smtp.postmarkapp.com");
-    expect(loaded.smtp.username).toBe("apikey");
-    expect(loaded.smtp.fromEmail).toBe("hello@mail.acme.com");
-    expect(loaded.domain.domain).toBe("mail.acme.com");
+    expect(localStorage.getItem(scopedKey("oc-mail", SCOPE))).toBe(purgedBlob());
+  });
+
+  it("strips a password nested somewhere the old shape never put one", () => {
+    // Intermediate builds and hand-edited blobs both exist. The contract is
+    // about the whole value, so the strip is about the whole value.
+    localStorage.setItem(
+      scopedKey("oc-mail", SCOPE),
+      JSON.stringify({ drafts: [{ smtp: { auth: { password: SECRET } } }] }),
+    );
+
+    expect(purgeStoredSmtpPasswords()).toBe(1);
+    expect(entireStore()).not.toContain(SECRET);
   });
 
   it("removes a key whose JSON cannot be parsed but mentions a password", () => {
@@ -176,17 +187,36 @@ describe("purging what the old console already stored", () => {
 
   it("leaves unrelated keys alone and reports nothing to clean", () => {
     localStorage.setItem("oc-tour:conn-a::acme", '{"step":3}');
-    localStorage.setItem(scopedKey("oc-mail", SCOPE), JSON.stringify(withoutSmtpPassword(emptyMailSettings())));
+    localStorage.setItem(scopedKey("oc-mail", SCOPE), purgedBlob());
 
     expect(purgeStoredSmtpPasswords()).toBe(0);
     expect(localStorage.getItem("oc-tour:conn-a::acme")).toBe('{"step":3}');
+    expect(localStorage.getItem(scopedKey("oc-mail", SCOPE))).toBe(purgedBlob());
   });
 
   it("is idempotent", () => {
-    localStorage.setItem(scopedKey("oc-mail", SCOPE), JSON.stringify(settingsWithPassword()));
+    localStorage.setItem(scopedKey("oc-mail", SCOPE), legacyBlob());
 
     expect(purgeStoredSmtpPasswords()).toBe(1);
     expect(purgeStoredSmtpPasswords()).toBe(0);
     expect(entireStore()).not.toContain(SECRET);
+  });
+});
+
+describe("the domain pre-flight", () => {
+  // UX, not a guard — the host does not validate — so what matters is only that
+  // an operator who typed something unusable hears about it before a round
+  // trip, and that a real domain is never refused.
+  it("accepts a hostname with at least one dot", () => {
+    expect(isValidDomain("mail.acme.com")).toBe(true);
+    expect(isValidDomain("acme.co")).toBe(true);
+    expect(isValidDomain("  mail.acme.com  ")).toBe(true);
+  });
+
+  it("rejects a bare label, an empty string, and a leading hyphen", () => {
+    expect(isValidDomain("acme")).toBe(false);
+    expect(isValidDomain("")).toBe(false);
+    expect(isValidDomain("   ")).toBe(false);
+    expect(isValidDomain("-acme.com")).toBe(false);
   });
 });

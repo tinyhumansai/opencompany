@@ -43,8 +43,9 @@ Routes (dual-scoped like all WS3 ops routes, except the callback):
 
 - `src/company/dns.rs`: pure record generation — verification TXT
   (deterministic token derived per company+domain), mail CNAME, two DKIM
-  CNAMEs, SPF TXT — mirroring `frontend/src/lib/domain.ts::dnsRecords` so the
-  console renders identically.
+  CNAMEs, SPF TXT. This is the only generator: the console's own
+  `frontend/src/lib/domain.ts::dnsRecords` was deleted by issue #1460, and the
+  card now renders the `records` off `DomainStatus` verbatim.
 - Verification via a mockable trait:
 
 ```rust
