@@ -357,59 +357,28 @@ export function AgentDetailView({
           and this page is linked from the org chart, the chat member pane and
           every "Not on a desk" chip. Arriving from any of those, "Back to team"
           named a page they had never seen.
-
-          The Edit affordance sits on the same row for the same reason. It
-          already existed, buried in the Instructions card halfway down, so a
-          teammate read as a read-only record; the page's one editing action
-          belongs where a page's actions go.
         */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <nav aria-label="Breadcrumb" data-testid="agent-breadcrumb">
-            <ol className="flex flex-wrap items-center gap-1 text-sm">
-              <li>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="-ml-2 h-7 px-2 text-muted-foreground"
-                  onClick={onBack}
-                  data-testid="agent-breadcrumb-company"
-                >
-                  Company
-                </Button>
-              </li>
-              <li aria-hidden className="text-muted-foreground">
-                <ChevronRight className="size-3.5" />
-              </li>
-              <li aria-current="page" className="min-w-0 truncate font-medium">
-                {/* Named as soon as there is a name, and "Teammate" until then.
-                    A crumb that appeared only once the read landed would move
-                    the Edit button across the row as the page settled. */}
-                {agent ? (agent.name?.trim() || agent.role) : "Teammate"}
-              </li>
-            </ol>
-          </nav>
-          {load === "ready" && agent && !editing && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setEditing(true)}
-              // Disabled with the reason, never absent. A manifest teammate is
-              // declared in version control and the host says so through its
-              // own `editable` list — an operator looking for the edit needs to
-              // find out *why* there isn't one, not to conclude the console
-              // forgot to build it.
-              disabled={agent.editable.length === 0}
-              title={
-                agent.editable.length === 0
-                  ? "This teammate is declared in your company blueprint (company.toml), so its name, role and instructions are edited there."
-                  : undefined
-              }
-              data-testid="agent-edit"
-            >
-              <Pencil className="size-4" /> Edit
-            </Button>
-          )}
-        </div>
+        <nav aria-label="Breadcrumb" data-testid="agent-breadcrumb">
+          <ol className="flex flex-wrap items-center gap-1 text-sm">
+            <li>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="-ml-2 h-7 px-2 text-muted-foreground"
+                onClick={onBack}
+                data-testid="agent-breadcrumb-company"
+              >
+                Company
+              </Button>
+            </li>
+            <li aria-hidden className="text-muted-foreground">
+              <ChevronRight className="size-3.5" />
+            </li>
+            <li aria-current="page" className="min-w-0 truncate font-medium">
+              {agent ? (agent.name?.trim() || agent.role) : "Teammate"}
+            </li>
+          </ol>
+        </nav>
 
         {load === "loading" && <Skeleton className="h-64 rounded-xl" />}
 
@@ -436,12 +405,37 @@ export function AgentDetailView({
 
         {load === "ready" && agent && (
           <>
-            <Identity agent={agent} />
+            <Identity
+              agent={agent}
+              action={
+                !editing ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setEditing(true)}
+                    // Disabled with the reason, never absent. A manifest teammate is
+                    // declared in version control and the host says so through its
+                    // own `editable` list — an operator looking for the edit needs to
+                    // find out *why* there isn't one, not to conclude the console
+                    // forgot to build it.
+                    disabled={agent.editable.length === 0}
+                    title={
+                      agent.editable.length === 0
+                        ? "This teammate is declared in your company blueprint (company.toml), so its name, role and instructions are edited there."
+                        : undefined
+                    }
+                    data-testid="agent-edit"
+                  >
+                    <Pencil className="size-4" /> Edit
+                  </Button>
+                ) : undefined
+              }
+            />
             <FactLine agent={agent} workload={workload} />
 
-            {/* The Edit action used to render here. It is on the page header
-                now (issue #1141) — one editing action, in the place a page's
-                actions live, rather than halfway down inside one of its cards. */}
+            {/* The Edit action sits on the teammate's name row (issue #1434) —
+                one editing action, in the place a page's actions live, rather
+                than halfway down inside one of its cards. */}
             <Section
               title="Instructions"
               subtitle="What this teammate was defined to do. It frames every turn they take."
@@ -526,7 +520,7 @@ export function AgentDetailView({
 }
 
 /** Name, role, id, and the two facts that classify an agent. */
-function Identity({ agent }: { agent: AgentDetailDto }) {
+function Identity({ agent, action }: { agent: AgentDetailDto; action?: ReactNode }) {
   const display = agent.name?.trim() || agent.role;
   const seed = agent.id || display;
   const tone = toneFor(seed);
@@ -539,44 +533,49 @@ function Identity({ agent }: { agent: AgentDetailDto }) {
   // the title was the title again on every teammate in every shipped company.
   const subtitle = roleSubtitle(display, agent.role);
   return (
-    <div className="flex items-start gap-4">
-      {/* The header of the page a teammate *is* — the one screen that should
-          never be the one showing letters (issue #1181). 56px. */}
-      <TeammateAvatar
-        name={display}
-        tone={tone}
-        avatar={avatar}
-        className="size-14 rounded-xl text-base"
-        data-testid="agent-avatar"
-      />
-      <div className="min-w-0 flex-1 space-y-2">
-        <div>
-          <h1 className="truncate text-2xl font-semibold tracking-tight" data-testid="agent-name">
-            {display}
-          </h1>
-          {subtitle && (
-            <p className="truncate text-sm text-muted-foreground" data-testid="agent-role">
-              {subtitle}
-            </p>
-          )}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="secondary" className="gap-1" data-testid="agent-tier">
-            <Sparkles className="size-3" /> {tierLabel(agent)}
-          </Badge>
-          <Badge variant="outline" data-testid="agent-source">
-            {agent.source === "manifest" ? "Company blueprint" : "Added here"}
-          </Badge>
-          {agent.inboxEnabled && (
-            <Badge variant="outline" className="gap-1">
-              <Mail className="size-3" /> Inbox
+    <div className="flex items-start justify-between gap-4">
+      <div className="flex items-start gap-4 min-w-0">
+        {/* The header of the page a teammate *is* — the one screen that should
+            never be the one showing letters (issue #1181). 56px. */}
+        <TeammateAvatar
+          name={display}
+          tone={tone}
+          avatar={avatar}
+          className="size-14 rounded-xl text-base"
+          data-testid="agent-avatar"
+        />
+        <div className="min-w-0 flex-1 space-y-2">
+          <div>
+            <h1 className="truncate text-2xl font-semibold tracking-tight" data-testid="agent-name">
+              {display}
+            </h1>
+            {subtitle && (
+              <p className="truncate text-sm text-muted-foreground" data-testid="agent-role">
+                {subtitle}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="secondary" className="gap-1" data-testid="agent-tier">
+              <Sparkles className="size-3" /> {tierLabel(agent)}
             </Badge>
-          )}
-          <span className="font-mono text-xs text-muted-foreground" data-testid="agent-id">
-            {agent.id}
-          </span>
+            <Badge variant="outline" data-testid="agent-source">
+              {agent.source === "manifest" ? "Company blueprint" : "Added here"}
+            </Badge>
+            {agent.inboxEnabled && (
+              <Badge variant="outline" className="gap-1">
+                <Mail className="size-3" /> Inbox
+              </Badge>
+            )}
+            <span className="font-mono text-xs text-muted-foreground" data-testid="agent-id">
+              {agent.id}
+            </span>
+          </div>
         </div>
       </div>
+      {action && (
+        <div className="flex shrink-0 flex-wrap justify-end gap-2">{action}</div>
+      )}
     </div>
   );
 }
@@ -603,7 +602,7 @@ function FactLine({
   const working = workload?.status === "working";
   return (
     <div
-      className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-muted-foreground"
+      className="flex flex-wrap items-center gap-x-2 gap-y-2 text-sm text-muted-foreground"
       data-testid="agent-facts"
     >
       {workload && (
@@ -626,6 +625,7 @@ function FactLine({
               {working ? "Working" : "Idle"}
             </span>
           </span>
+          <span aria-hidden>·</span>
           <span data-testid="agent-tasks">
             {workload.open === 1 ? "1 open task" : `${workload.open} open tasks`}
           </span>
@@ -693,9 +693,11 @@ function Tools({ agent }: { agent: AgentDetailDto }) {
           </div>
         </div>
       )}
-      <p className="text-xs text-muted-foreground">
-        Company tool list: {agent.tools.companyAllow.join(", ") || "nothing allowed"}
-      </p>
+      {!summary.standardGrant && (
+        <p className="text-xs text-muted-foreground">
+          Company tool list: {agent.tools.companyAllow.join(", ") || "nothing allowed"}
+        </p>
+      )}
     </Section>
   );
 }
