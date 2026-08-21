@@ -880,7 +880,14 @@ test("#311 blueprint structure offers no control the host would refuse", async (
   await openChart(page);
 
   // A manifest desk cannot be deleted at runtime, so no delete is offered.
-  await expect(deskNode(page, "Engineering")).toContainText("Blueprint");
+  // Its blueprint provenance is a muted lock, not a word badge — the badge only
+  // survives on a mixed-provenance desk, where it distinguishes one member from
+  // the runtime-added one beside it.
+  await expect(
+    deskNode(page, "Engineering")
+      .getByRole("img", { name: "Part of the company blueprint" })
+      .first(),
+  ).toBeVisible();
   await expect(
     deskNode(page, "Engineering").getByRole("button", {
       name: "Delete Engineering",

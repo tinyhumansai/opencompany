@@ -26,6 +26,7 @@ import {
   ChevronRight,
   ChevronUp,
   Crown,
+  Lock,
   Plus,
   Trash2,
   UserPlus,
@@ -758,6 +759,13 @@ function DeskNode({
   onDelete: () => void;
 }) {
   const locked = busy !== null;
+  // Whether any seat on this desk was added at runtime rather than declared by
+  // the manifest. Only on such a "mixed provenance" desk does the Blueprint
+  // badge still earn its place — everywhere else the whole desk is blueprint,
+  // so a muted lock says it with far less noise than a badge on every seat.
+  const hasOverlaySeats = desk.seats.some(
+    (s) => s.provenance === "overlay",
+  );
   // Whether the seat currently being dragged (from anywhere on the chart)
   // could land on *this* desk: it must come from a different desk, and it
   // must be an overlay seat — the host refuses to remove a blueprint member
@@ -838,11 +846,18 @@ function DeskNode({
           <div className="min-w-0">
             <p className="flex items-center gap-2 truncate font-medium">
               {desk.name}
-              {desk.provenance === "blueprint" && (
-                <Badge variant="secondary" className="shrink-0 text-3xs">
-                  Blueprint
-                </Badge>
-              )}
+              {desk.provenance === "blueprint" &&
+                (hasOverlaySeats ? (
+                  <Badge variant="secondary" className="shrink-0 text-3xs">
+                    Blueprint
+                  </Badge>
+                ) : (
+                  <Lock
+                    role="img"
+                    aria-label="Part of the company blueprint"
+                    className="size-3.5 shrink-0 text-muted-foreground"
+                  />
+                ))}
             </p>
             {desk.description && (
               <p className="line-clamp-2 text-xs text-muted-foreground">
@@ -894,6 +909,7 @@ function DeskNode({
               index={index}
               deskId={desk.id}
               deskName={desk.name}
+              deskHasOverlaySeats={hasOverlaySeats}
               first={index === 0}
               last={index === desk.seats.length - 1}
               busy={busy === `${desk.id}:${seat.id}`}
@@ -1011,6 +1027,7 @@ function Seat({
   index,
   deskId,
   deskName,
+  deskHasOverlaySeats,
   first,
   last,
   busy,
@@ -1028,6 +1045,8 @@ function Seat({
   index: number;
   deskId: string;
   deskName: string;
+  /** Whether this seat's desk mixes blueprint and overlay members. */
+  deskHasOverlaySeats: boolean;
   first: boolean;
   last: boolean;
   busy: boolean;
@@ -1204,10 +1223,16 @@ function Seat({
           >
             <X className="size-3.5" />
           </Button>
-        ) : (
+        ) : deskHasOverlaySeats ? (
           <Badge variant="secondary" className="shrink-0 text-3xs">
             Blueprint
           </Badge>
+        ) : (
+          <Lock
+            role="img"
+            aria-label="Part of the company blueprint"
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
         )}
       </span>
     </div>
