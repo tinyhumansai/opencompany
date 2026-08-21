@@ -22,6 +22,29 @@ except `[policy].always_approve` entries. `auto` sits between `supervised` and
 and anything that leaves the company or spends on submit still parks — see
 [the tier line](grants.md#the-auto-tier).
 
+**The ladder is ordered, and that order is a guarantee.** `POLICY_MODES` runs
+`readonly` → `supervised` → `auto` → `full` by increasing autonomy, the console
+renders it in that order, and the gate owes it one property: for any given
+effect, permissiveness never decreases as you move up. An operator moving a
+company up a tier to be interrupted less must not be interrupted more.
+`the_tier_ladder_is_monotonic` in `src/policy/gate.rs` pins it across every tier
+and every branch of the taxonomy above, because it was false for two releases
+and every test named a single mode (issue #1454).
+
+**Under `auto` this table applies unchanged.** The tier is real but its work is
+on the [tool gate](grants.md#the-auto-tier), where `auto` waves through the
+`Standing::Grantable` sandbox writes that `supervised` parks. The *effect*
+taxonomy has no such bucket to wave through: every group it parks — a spend at
+or over the cap, a message to a counterparty nobody has talked to, a signature,
+a publish, an identity change, an engagement over the cap — is by definition
+something that leaves the company or spends money, which is the exact line
+`auto` says it stops at. The only inside-the-company group is the residual
+**Other**, and `supervised` already allows it. So `ManifestApprovalGate` has a
+named `auto` arm that delegates to the supervised taxonomy rather than an alias
+or a second copy of it; if a native effect ever genuinely belongs to `auto` and
+not to `supervised`, it gets its own line there, and whatever `auto` parks stays
+a subset of what `supervised` parks.
+
 Three of the four names are OpenHuman's own security tiers. `auto` is not, so
 the mapping is no longer 1:1 and `PolicyMode::security_tier()` — the accessor
 that asserted it was — has been deleted rather than made to lie. Where the two

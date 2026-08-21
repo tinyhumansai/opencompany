@@ -168,6 +168,35 @@ depending on it: a Composio read is `Grantable` today while still carrying
 `Reach::Consequence`, and reclassifying its *reach* leaves its standing alone,
 so it runs unattended under `auto` either way.
 
+#### And on the effect gate (issue #1454)
+
+Everything above is the **tool** gate. The **effect** gate —
+`ManifestApprovalGate`, which decides the native effects the runtime performs
+itself — is a second dispatch on the same `[policy].mode` word, and #560 gave it
+no `auto` arm. `auto` fell into its fail-safe catch-all, so the tier every
+provisioned company boots on parked *every* native effect, behaving exactly like
+`readonly` and strictly stricter than the `supervised` tier below it on the
+ladder. Nothing caught it because a tier with no arm and a tier that decided to
+park return the same decision, and every gate test named a single mode.
+
+It has a named arm now, and that arm applies the
+[supervised checkpoint taxonomy](approvals.md#checkpoint-taxonomy) unchanged.
+That is not a placeholder. The split `auto` needs on the tool path is
+`Standing::Grantable` — the sandbox writes that stay inside the company — and
+the effect taxonomy has no equivalent: every group it parks leaves the company
+or spends money, which is the line `auto` advertises stopping at, and its one
+inside-the-company group (**Other**) is already allowed under `supervised`. So
+there is nothing left for `auto` to loosen there.
+
+The stricter reading — park `Spend`/`Send`/`Hire` unconditionally, withholding
+`supervised`'s cap relief and established-thread relief — was considered and
+rejected: it inverts the ladder a second time, parking a $1 spend and a reply on
+a running thread that the tier *below* waves through.
+
+Two properties are pinned by tests rather than by this prose: every word in
+`POLICY_MODES` reaches a named arm, and permissiveness is monotonic up the
+ladder for every branch of the taxonomy.
+
 `auto` is **not** the default. Issue #560 argues it should become one, but
 `default_policy_mode()` returning it would change behaviour for every existing
 company with no `[policy]` block on its next load, so that is its own decision.
