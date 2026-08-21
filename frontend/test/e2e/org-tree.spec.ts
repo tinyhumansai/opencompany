@@ -520,7 +520,7 @@ test("#839 creates a teammate on a selected desk and persists it", async ({
   // rather than an unlabelled icon button beside it.
   await growth.getByRole("button", { name: "Add teammate" }).click();
   await page
-    .getByRole("menuitem", { name: "Create teammate on Growth" })
+    .getByRole("menuitem", { name: "Add teammate to Growth" })
     .click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Name").fill("Babbage");
@@ -550,7 +550,7 @@ test("#839 creates a teammate with no desk as unplaced", async ({ page }) => {
   await mockApi(page);
   await openChart(page);
 
-  await page.getByRole("button", { name: "New teammate" }).click();
+  await page.getByRole("button", { name: "Add teammate" }).first().click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Name").fill("No Desk");
   await dialog.getByLabel("Role").fill("Roaming Engineer");
@@ -570,7 +570,7 @@ test("#839 refuses a company-page teammate add when the host has no team write p
   await mockApi(page);
   await openChart(page);
 
-  await page.getByRole("button", { name: "New teammate" }).click();
+  await page.getByRole("button", { name: "Add teammate" }).first().click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Name").fill("Not Saved");
   await dialog.getByLabel("Role").fill("Unavailable");
@@ -586,7 +586,7 @@ test("#1099 a teammate added from the company page is confirmed by name", async 
   await mockApi(page);
   await openChart(page);
 
-  await page.getByRole("button", { name: "New teammate" }).click();
+  await page.getByRole("button", { name: "Add teammate" }).first().click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Name").fill("Katherine");
   await dialog.getByLabel("Role").fill("Navigator");
@@ -612,7 +612,7 @@ test("#1099 a teammate the chart cannot read back is not confirmed as added", as
   await mockApi(page);
   await openChart(page);
 
-  await page.getByRole("button", { name: "New teammate" }).click();
+  await page.getByRole("button", { name: "Add teammate" }).first().click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Name").fill("Grace Murray");
   await dialog.getByLabel("Role").fill("Compiler");
@@ -700,7 +700,7 @@ test("a desk offers one add control, and it stays usable when the roster is exha
   const menu = page.getByRole("menu");
   await expect(menu).toContainText("Everyone on the roster is already here.");
   await expect(
-    menu.getByRole("menuitem", { name: "Create teammate on Engineering" }),
+    menu.getByRole("menuitem", { name: "Add teammate to Engineering" }),
   ).toBeVisible();
 });
 
@@ -720,7 +720,7 @@ test("#839 a teammate created but not placed is still on the chart to place by h
   // rather than an unlabelled icon button beside it.
   await growth.getByRole("button", { name: "Add teammate" }).click();
   await page
-    .getByRole("menuitem", { name: "Create teammate on Growth" })
+    .getByRole("menuitem", { name: "Add teammate to Growth" })
     .click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Name").fill("Hopper");

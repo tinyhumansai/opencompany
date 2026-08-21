@@ -489,7 +489,7 @@ export function OrgChartView({ client, company, focusDeskId, onBack }: Props) {
                 }}
               >
                 <UserPlus className="mr-1.5 size-4" />
-                New teammate
+                Add teammate
               </Button>
             </div>
           </div>
@@ -991,7 +991,7 @@ function DeskNode({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={onCreateMember}
-                  aria-label={`Create teammate on ${desk.name}`}
+                  aria-label={`Add teammate to ${desk.name}`}
                 >
                   <UserPlus className="size-4" />
                   New teammate…

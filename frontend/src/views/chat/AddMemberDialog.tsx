@@ -28,7 +28,7 @@ interface Props {
   onAdd: (fields: NewMemberFields) => void;
 }
 
-/** Define a teammate. Reached from the team pane's "Add" button. */
+/** Add teammate. Reached from the team pane's "Add" button. */
 export function AddMemberDialog({ open, onOpenChange, onAdd }: Props) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
@@ -58,7 +58,7 @@ export function AddMemberDialog({ open, onOpenChange, onAdd }: Props) {
     >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Define a teammate</DialogTitle>
+          <DialogTitle>Add teammate</DialogTitle>
           <DialogDescription>Add a teammate to your company&apos;s roster.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-2">

@@ -301,7 +301,7 @@ test("#1193 desk management survives — a desk can still be created and reached
     timeout: 30_000,
   });
   await expect(page.getByRole("button", { name: "New desk" })).toBeEnabled({ timeout: 30_000 });
-  await expect(page.getByRole("button", { name: "New teammate" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Add teammate" }).first()).toBeEnabled();
 });
 
 test("#485 a desk address still opens the chart at that desk", async ({ page }) => {

@@ -456,7 +456,7 @@ export function TeamView({
               className="flex min-h-32 flex-col items-center justify-center gap-2 rounded-xl border border-dashed text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:bg-accent/40 hover:text-foreground"
             >
               <Plus className="size-5" />
-              Define a teammate
+              Add teammate
             </button>
           </div>
         )}
@@ -772,7 +772,7 @@ function AddMemberDialog({
   canSetBudget: boolean;
 }) {
   // The same three authored fields the detail view edits, held in the same
-  // shape (issue #264) so "Define a teammate" and "Edit teammate" cannot drift into
+  // shape (issue #264) so "Add teammate" and "Edit teammate" cannot drift into
   // two different sets of labels for one set of values.
   const [draft, setDraft] = useState<AgentDraft>(emptyDraft);
   const [inbox, setInbox] = useState(false);
@@ -815,7 +815,7 @@ function AddMemberDialog({
     >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Define a teammate</DialogTitle>
+          <DialogTitle>Add teammate</DialogTitle>
           <DialogDescription>Add a teammate to your company&apos;s roster.</DialogDescription>
         </DialogHeader>
         <AgentFields

@@ -18,7 +18,7 @@ export interface AgentFieldSpec {
 /**
  * The single definition of an agent's authored fields.
  *
- * Shared deliberately by "Define a teammate" and the detail view's edit form: the
+ * Shared deliberately by "Add teammate" and the detail view's edit form: the
  * two collect the same three things, and before this they would have collected
  * them under two sets of labels and placeholders that drifted apart. The host
  * accepts exactly these keys in a `PATCH`, so the list is also the client half

@@ -6,7 +6,7 @@ import { AGENT_FIELDS, type AgentDraft, type AgentFieldKey } from "@/lib/agent";
 /**
  * An agent's authored fields, rendered from one definition (issue #264).
  *
- * Used by both "Define a teammate" and the detail view's edit form. They collect
+ * Used by both "Add teammate" and the detail view's edit form. They collect
  * the same three things, and rendering them from
  * [`AGENT_FIELDS`](@/lib/agent) is what keeps the labels, the placeholders and
  * the order the same in both places rather than the same by coincidence.
