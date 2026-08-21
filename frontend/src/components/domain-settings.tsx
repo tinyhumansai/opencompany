@@ -1,7 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
-import { Check, Copy, Globe, Info, Mail, ShieldAlert } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Check, Copy, Globe, Info, Loader2, Mail, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 
+import type { OpenCompanyClient } from "@/api/client";
+import {
+  type DnsRecord,
+  type DomainStatus,
+  fetchMailStatus,
+  putDomain,
+  putSmtp,
+  type SmtpSecurity,
+  type SmtpStatus,
+  testSmtp,
+  verifyDomain,
+} from "@/api/domain";
+import { ApiError } from "@/api/types";
+import { isValidDomain, parseSmtpPort } from "@/lib/domain";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,19 +35,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { useLocalScope } from "@/connections/ConnectionContext";
-import {
-  type DnsRecord,
-  dnsRecords,
-  isValidDomain,
-  loadMailSettings,
-  type MailSettings,
-  saveMailSettings,
-  type SmtpSecurity,
-} from "@/lib/domain";
 
 interface Props {
+  client: OpenCompanyClient;
   company: string | null;
 }
 
@@ -43,47 +49,142 @@ const SECURITY_LABELS: Record<SmtpSecurity, string> = {
   ssl: "SSL / TLS",
 };
 
-/** Custom domain (with DNS records) and SMTP credentials for the company. */
-export function DomainSettings({ company: _company }: Props) {
-  const scope = useLocalScope();
-  const [settings, setSettings] = useState<MailSettings>(() => loadMailSettings(scope));
+type Load = "loading" | "ready" | "error";
+
+/**
+ * Custom domain (with host-issued DNS records) and the company's own SMTP
+ * credentials (issue #1460).
+ *
+ * Everything here is the host's: status is read over GraphQL, the domain and its
+ * records are set through `PUT …/domain`, verification runs on the host through
+ * `POST …/domain/verify`, and SMTP credentials are stored write-only through
+ * `PUT …/smtp`. Nothing is kept in the browser — the SMTP password is held in
+ * component state only, never persisted, and the DNS records come from the host
+ * rather than being fabricated client-side.
+ */
+export function DomainSettings({ client, company }: Props) {
+  const [load, setLoad] = useState<Load>("loading");
+  const [domain, setDomain] = useState<DomainStatus | null>(null);
+  const [smtp, setSmtp] = useState<SmtpStatus | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const status = await fetchMailStatus(client, company);
+      setDomain(status.domain);
+      setSmtp(status.smtp);
+      setLoad("ready");
+    } catch {
+      // The host could not answer the mail-status read. Say so rather than
+      // rendering an empty "nothing configured" form over unknown state.
+      setLoad("error");
+    }
+  }, [client, company]);
 
   useEffect(() => {
-    saveMailSettings(scope, settings);
-  }, [scope, settings]);
+    setLoad("loading");
+    void refresh();
+  }, [refresh]);
+
+  if (load === "loading") {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-40 rounded-xl" />
+        <Skeleton className="h-64 rounded-xl" />
+      </div>
+    );
+  }
+
+  if (load === "error") {
+    return (
+      <Card>
+        <CardContent className="py-4">
+          <p className="text-xs text-muted-foreground">
+            Couldn&apos;t read this company&apos;s mail settings — the host could not answer, so this
+            is unknown rather than unconfigured. Reload to try again.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <>
-      <DomainCard settings={settings} setSettings={setSettings} />
-      <SmtpCard settings={settings} setSettings={setSettings} />
+      <DomainCard client={client} company={company} domain={domain} onChange={setDomain} />
+      <SmtpCard client={client} company={company} smtp={smtp} onChange={setSmtp} />
     </>
   );
 }
 
 function DomainCard({
-  settings,
-  setSettings,
+  client,
+  company,
+  domain,
+  onChange,
 }: {
-  settings: MailSettings;
-  setSettings: React.Dispatch<React.SetStateAction<MailSettings>>;
+  client: OpenCompanyClient;
+  company: string | null;
+  domain: DomainStatus | null;
+  onChange: (status: DomainStatus) => void;
 }) {
-  const [draft, setDraft] = useState(settings.domain.domain);
-  const configured = Boolean(settings.domain.domain);
-  const records = useMemo(() => dnsRecords(settings.domain.domain), [settings.domain.domain]);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState<"save" | "verify" | "remove" | null>(null);
+  const configured = domain !== null && domain.domain !== "";
 
-  function connect() {
-    const domain = draft.trim().toLowerCase();
-    if (!isValidDomain(domain)) {
+  async function connect() {
+    const value = draft.trim().toLowerCase();
+    if (!isValidDomain(value)) {
       toast.error("Enter a valid domain, e.g. mail.acme.com");
       return;
     }
-    setSettings((s) => ({ ...s, domain: { domain, verified: false } }));
-    toast.success("Domain saved — add the DNS records below.");
+    setBusy("save");
+    try {
+      // The records come back from the host — the console no longer invents
+      // them, so an operator publishes what this deployment actually chose.
+      onChange(await putDomain(client, company, value));
+      setDraft("");
+      toast.success("Domain saved — add the DNS records below.");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Couldn't save the domain.");
+    } finally {
+      setBusy(null);
+    }
   }
 
-  function remove() {
-    setSettings((s) => ({ ...s, domain: { domain: "", verified: false } }));
-    setDraft("");
+  async function verify() {
+    setBusy("verify");
+    try {
+      const status = await verifyDomain(client, company);
+      onChange(status);
+      if (status.verified) {
+        toast.success("Domain verified.");
+      } else {
+        toast.message("Records not found yet — DNS changes can take up to 48h to propagate.");
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError && err.code === "not_wired"
+          ? "DNS verification isn't enabled on this host — rebuild it with the `dns` feature."
+          : err instanceof ApiError
+            ? err.message
+            : "Couldn't verify the domain.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove() {
+    setBusy("remove");
+    try {
+      // No delete route: clearing the domain is an empty set, which the host
+      // stores as "no domain" and answers with an empty record list.
+      onChange(await putDomain(client, company, ""));
+      setDraft("");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Couldn't remove the domain.");
+    } finally {
+      setBusy(null);
+    }
   }
 
   return (
@@ -101,9 +202,10 @@ function DomainCard({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               placeholder="mail.acme.com"
-              onKeyDown={(e) => e.key === "Enter" && connect()}
+              onKeyDown={(e) => e.key === "Enter" && void connect()}
             />
-            <Button className="shrink-0" onClick={connect}>
+            <Button className="shrink-0" disabled={busy !== null} onClick={() => void connect()}>
+              {busy === "save" ? <Loader2 className="size-4 animate-spin" /> : null}
               Add domain
             </Button>
           </div>
@@ -112,19 +214,20 @@ function DomainCard({
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
               <span className="inline-flex items-center gap-2 font-mono text-sm">
                 <Globe className="size-4 text-muted-foreground" />
-                {settings.domain.domain}
+                {domain.domain}
               </span>
               <div className="flex items-center gap-2">
-                {settings.domain.verified ? (
+                {domain.verified ? (
                   <Badge className="gap-1 bg-status-done-soft text-status-done-text">
                     <Check className="size-3" /> Verified
                   </Badge>
                 ) : (
                   <Badge variant="secondary" className="gap-1">
-                    <span className="size-1.5 animate-pulse rounded-full bg-status-blocked" /> Pending
+                    <span className="size-1.5 rounded-full bg-status-blocked" /> Pending
                   </Badge>
                 )}
-                <Button variant="ghost" size="sm" onClick={remove}>
+                <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void remove()}>
+                  {busy === "remove" ? <Loader2 className="size-4 animate-spin" /> : null}
                   Remove
                 </Button>
               </div>
@@ -132,13 +235,15 @@ function DomainCard({
 
             <div className="space-y-2">
               <p className="text-sm font-medium">Add these DNS records</p>
-              <DnsTable records={records} />
+              <DnsTable records={domain.records} />
               <div className="flex items-center gap-2 pt-1">
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => toast.info("DNS verification runs on the host once connected. Records are saved.")}
+                  disabled={busy !== null}
+                  onClick={() => void verify()}
                 >
+                  {busy === "verify" ? <Loader2 className="size-4 animate-spin" /> : null}
                   Verify DNS
                 </Button>
                 <p className="text-xs text-muted-foreground">Changes can take up to 48h to propagate.</p>
@@ -152,6 +257,13 @@ function DomainCard({
 }
 
 function DnsTable({ records }: { records: DnsRecord[] }) {
+  if (records.length === 0) {
+    return (
+      <p className="rounded-lg border p-3 text-xs text-muted-foreground">
+        The host has not issued any records for this domain yet.
+      </p>
+    );
+  }
   return (
     <div className="overflow-x-auto rounded-lg border">
       <table className="w-full text-left text-xs">
@@ -206,41 +318,113 @@ function CopyCell({ value }: { value: string }) {
 }
 
 function SmtpCard({
-  settings,
-  setSettings,
+  client,
+  company,
+  smtp,
+  onChange,
 }: {
-  settings: MailSettings;
-  setSettings: React.Dispatch<React.SetStateAction<MailSettings>>;
+  client: OpenCompanyClient;
+  company: string | null;
+  smtp: SmtpStatus | null;
+  onChange: (status: SmtpStatus) => void;
 }) {
-  const s = settings.smtp;
-  const set = (patch: Partial<typeof s>) =>
-    setSettings((prev) => ({ ...prev, smtp: { ...prev.smtp, ...patch } }));
+  // The card mounts after the status read, so the non-secret fields the host
+  // returns (host / port / username) initialise the form once. The password is
+  // never returned and never stored — it lives here in memory only, and a save
+  // sends it write-only to the host's secret store.
+  const [host, setHost] = useState(smtp?.host ?? "");
+  const [port, setPort] = useState(smtp && smtp.port > 0 ? String(smtp.port) : "587");
+  const [security, setSecurity] = useState<SmtpSecurity>("starttls");
+  const [username, setUsername] = useState(smtp?.username ?? "");
+  const [password, setPassword] = useState("");
+  const [fromName, setFromName] = useState("");
+  const [fromEmail, setFromEmail] = useState("");
+  const [busy, setBusy] = useState<"save" | "test" | null>(null);
 
-  const complete = s.host && s.port && s.username && s.fromEmail;
+  const configured = smtp?.configured === true;
+  // A save REPLACES the stored credential in full — the host has no partial
+  // update — so the password is required every time, not only on first setup.
+  const canSave =
+    host.trim() !== "" &&
+    parseSmtpPort(port) !== null &&
+    username.trim() !== "" &&
+    fromEmail.trim() !== "" &&
+    password !== "";
+
+  async function save() {
+    const parsedPort = parseSmtpPort(port);
+    if (parsedPort === null) {
+      toast.error("Enter a valid port (1–65535).");
+      return;
+    }
+    setBusy("save");
+    try {
+      const status = await putSmtp(client, company, {
+        host: host.trim(),
+        port: parsedPort,
+        security,
+        username: username.trim(),
+        password,
+        from_name: fromName.trim(),
+        from_email: fromEmail.trim(),
+      });
+      onChange(status);
+      // Never keep the secret around after it has gone to the host.
+      setPassword("");
+      toast.success("SMTP credentials saved.");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Couldn't save the SMTP credentials.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function test() {
+    setBusy("test");
+    try {
+      const result = await testSmtp(client, company);
+      if (result.ok) {
+        toast.success(result.message);
+      } else {
+        toast.error(result.message);
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError && err.code === "not_wired"
+          ? "Test send isn't enabled on this host — rebuild it with the `smtp` feature."
+          : err instanceof ApiError
+            ? err.message
+            : "Couldn't send the test email.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
 
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
           <Mail className="size-4" /> Email (SMTP)
+          {configured && (
+            <Badge variant="secondary" className="gap-1">
+              <Check className="size-3" /> Configured
+            </Badge>
+          )}
         </CardTitle>
         <CardDescription>The outbound mail server your company sends through.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="SMTP host" id="smtp-host">
-            <Input id="smtp-host" value={s.host} onChange={(e) => set({ host: e.target.value })} placeholder="smtp.postmarkapp.com" />
+            <Input id="smtp-host" value={host} onChange={(e) => setHost(e.target.value)} placeholder="smtp.postmarkapp.com" />
           </Field>
           <div className="grid grid-cols-2 gap-3">
             <Field label="Port" id="smtp-port">
-              <Input id="smtp-port" value={s.port} onChange={(e) => set({ port: e.target.value })} placeholder="587" inputMode="numeric" />
+              <Input id="smtp-port" value={port} onChange={(e) => setPort(e.target.value)} placeholder="587" inputMode="numeric" />
             </Field>
             <Field label="Security" id="smtp-security">
-              <Select
-                value={s.security}
-                onValueChange={(v) => v && set({ security: v as SmtpSecurity })}
-                items={SECURITY_LABELS}
-              >
+              <Select value={security} onValueChange={(v) => v && setSecurity(v as SmtpSecurity)}>
                 <SelectTrigger id="smtp-security" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -255,41 +439,54 @@ function SmtpCard({
             </Field>
           </div>
           <Field label="Username" id="smtp-user">
-            <Input id="smtp-user" value={s.username} onChange={(e) => set({ username: e.target.value })} placeholder="apikey" autoComplete="off" />
+            <Input id="smtp-user" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="apikey" autoComplete="off" />
           </Field>
-          <Field label="Password" id="smtp-pass">
-            <Input id="smtp-pass" type="password" value={s.password} onChange={(e) => set({ password: e.target.value })} placeholder="••••••••" autoComplete="off" />
+          <Field label={configured ? "Password (stored — enter to replace)" : "Password"} id="smtp-pass">
+            <Input
+              id="smtp-pass"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={configured ? "•••••• write-only" : "••••••••"}
+              autoComplete="off"
+            />
           </Field>
           <Field label="From name" id="smtp-fromname">
-            <Input id="smtp-fromname" value={s.fromName} onChange={(e) => set({ fromName: e.target.value })} placeholder="Agentic Marketing Agency" />
+            <Input id="smtp-fromname" value={fromName} onChange={(e) => setFromName(e.target.value)} placeholder="Agentic Marketing Agency" />
           </Field>
           <Field label="From email" id="smtp-fromemail">
-            <Input id="smtp-fromemail" value={s.fromEmail} onChange={(e) => set({ fromEmail: e.target.value })} placeholder="hello@mail.acme.com" />
+            <Input id="smtp-fromemail" value={fromEmail} onChange={(e) => setFromEmail(e.target.value)} placeholder="hello@mail.acme.com" />
           </Field>
         </div>
 
         <Alert>
           <Info className="size-4" />
           <AlertDescription>
-            Saved to this browser as a draft. When the host is connected, credentials are stored in
-            its secret store and used per tenant — never handed to the workload directly.
+            Stored write-only in the host&apos;s secret store and used per tenant — the password is
+            never shown again, and a save replaces the whole credential. A change takes effect on the
+            next send.
           </AlertDescription>
         </Alert>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button disabled={busy !== null || !canSave} onClick={() => void save()}>
+            {busy === "save" ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+            Save
+          </Button>
           <Button
             variant="outline"
-            disabled={!complete}
-            onClick={() => toast.info("A test email is sent from the host once SMTP is connected.")}
+            disabled={busy !== null || !configured}
+            onClick={() => void test()}
           >
-            <ShieldAlert className="size-4" /> Test connection
+            {busy === "test" ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <ShieldAlert className="size-4" />
+            )}
+            Test connection
           </Button>
-          {complete ? (
-            <span className="inline-flex items-center gap-1 text-xs text-status-done-text">
-              <Check className="size-3.5" /> Ready
-            </span>
-          ) : (
-            <span className="text-xs text-muted-foreground">Fill host, port, username, and from email.</span>
+          {!configured && (
+            <span className="text-xs text-muted-foreground">Save credentials before sending a test.</span>
           )}
         </div>
       </CardContent>

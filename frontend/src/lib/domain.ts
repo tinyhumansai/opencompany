@@ -1,91 +1,26 @@
-// Custom domain + SMTP setup for a company. Persisted per company in
-// localStorage; the console has no provisioning API yet, so DNS verification
-// and SMTP tests are host-side once wired. Secrets live here only as a local
-// draft until the host stores them securely.
+// Domain validation for the custom-mail settings card.
+//
+// The DNS records, the verification token and the SMTP credentials all live on
+// the host now (issue #1460): the console reads status over GraphQL and writes
+// over `…/domain` and `…/smtp`, so nothing here fabricates records or persists a
+// secret. What is left is the one purely-local question worth answering before a
+// round trip — whether a string is even shaped like a domain.
 
-import { type LocalScope, scopedKeyAdoptingLegacy } from "@/connections/types";
-
-export interface DomainConfig {
-  domain: string;
-  verified: boolean;
-}
-
-export type SmtpSecurity = "none" | "starttls" | "ssl";
-
-export interface SmtpConfig {
-  host: string;
-  port: string;
-  security: SmtpSecurity;
-  username: string;
-  password: string;
-  fromName: string;
-  fromEmail: string;
-}
-
-export interface MailSettings {
-  domain: DomainConfig;
-  smtp: SmtpConfig;
-}
-
-export function emptyMailSettings(): MailSettings {
-  return {
-    domain: { domain: "", verified: false },
-    smtp: { host: "", port: "587", security: "starttls", username: "", password: "", fromName: "", fromEmail: "" },
-  };
-}
-
-/** The platform host records point at. In production this comes from the host. */
-const PLATFORM_TARGET = "mail.opencompany.host";
-
-export interface DnsRecord {
-  type: "CNAME" | "TXT";
-  name: string;
-  value: string;
-  ttl: string;
-}
-
-/** A short, stable verification token derived from the domain. */
-function verifyToken(domain: string): string {
-  let hash = 0;
-  for (let i = 0; i < domain.length; i++) hash = (hash * 31 + domain.charCodeAt(i)) | 0;
-  return Math.abs(hash).toString(16).padStart(8, "0");
-}
-
-/** The DNS records a user must add to point a custom domain at the platform
- *  and let it send email (verification + CNAME + DKIM + SPF). */
-export function dnsRecords(domain: string): DnsRecord[] {
-  const d = domain.trim().replace(/\.$/, "");
-  if (!d) return [];
-  return [
-    { type: "TXT", name: `_opencompany.${d}`, value: `oc-verify=${verifyToken(d)}`, ttl: "3600" },
-    { type: "CNAME", name: d, value: PLATFORM_TARGET, ttl: "3600" },
-    { type: "CNAME", name: `oc1._domainkey.${d}`, value: `oc1.dkim.opencompany.host`, ttl: "3600" },
-    { type: "CNAME", name: `oc2._domainkey.${d}`, value: `oc2.dkim.opencompany.host`, ttl: "3600" },
-    { type: "TXT", name: d, value: "v=spf1 include:spf.opencompany.host ~all", ttl: "3600" },
-  ];
-}
-
+/** Whether `domain` is shaped like a hostname (at least one dot, valid labels). */
 export function isValidDomain(domain: string): boolean {
   return /^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain.trim());
 }
 
-const KEY = (scope: LocalScope) =>
-  scopedKeyAdoptingLegacy("oc-mail", scope, `oc-mail:${scope.company ?? "single"}`);
-
-export function loadMailSettings(scope: LocalScope): MailSettings {
-  try {
-    const raw = localStorage.getItem(KEY(scope));
-    if (raw) return { ...emptyMailSettings(), ...(JSON.parse(raw) as MailSettings) };
-  } catch {
-    /* fall through */
-  }
-  return emptyMailSettings();
-}
-
-export function saveMailSettings(scope: LocalScope, settings: MailSettings): void {
-  try {
-    localStorage.setItem(KEY(scope), JSON.stringify(settings));
-  } catch {
-    /* storage unavailable */
-  }
+/**
+ * Parses an SMTP port string to a valid TCP port, or `null` when it is not one.
+ *
+ * The host's `port` is a `u16`, so a non-integer, a zero, or anything above
+ * 65535 must be caught before the round trip rather than surfacing as an opaque
+ * deserialize failure.
+ */
+export function parseSmtpPort(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const port = Number(trimmed);
+  return port >= 1 && port <= 65535 ? port : null;
 }

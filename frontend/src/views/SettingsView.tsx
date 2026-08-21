@@ -119,7 +119,7 @@ export function SettingsView({ client, company, feed, onFlag }: Props) {
         )}
 
         {/* Domain & email */}
-        <DomainSettings company={company} />
+        <DomainSettings client={client} company={company} />
 
         {/* Appearance.
 
