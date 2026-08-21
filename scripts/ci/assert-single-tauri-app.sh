@@ -70,15 +70,19 @@ fi
 unqualified_tauri() {
     local value=$1
     local segment first second saw_cd=0
-    local segments
+    local segments=()
 
-    # Split on the separators with IFS, then read words back with the default
-    # one. Doing both under `IFS=$'\n'` is a trap: the word split that follows
-    # would not split on spaces, and every segment's "first word" would be the
-    # whole segment — a check that silently accepts everything.
-    mapfile -t segments < <(printf '%s' "${value}" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
+    # Collected line by line rather than with `for segment in $(...)` under
+    # `IFS=$'\n'`. That reads well and is wrong: the word split below would then
+    # not split on spaces either, so every segment's "first word" would be the
+    # whole segment and the check would accept everything. `mapfile` would say
+    # it in one line and is bash 4 — macOS ships 3.2, and a guard a developer
+    # cannot run locally is a guard they find out about from CI.
+    while IFS= read -r segment; do
+        segments+=("${segment}")
+    done < <(printf '%s\n' "${value}" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
 
-    for segment in "${segments[@]}"; do
+    for segment in ${segments[@]+"${segments[@]}"}; do
         # shellcheck disable=SC2086 # deliberate: split the segment into words.
         set -- ${segment}
         first=${1-}
