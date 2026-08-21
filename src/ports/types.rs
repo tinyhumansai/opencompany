@@ -2020,6 +2020,21 @@ pub struct ChunkMeta {
     pub stored_at_millis: u64,
 }
 
+/// A context chunk's metadata paired with its body, returned by
+/// [`ContextStore::list_with_bodies`](crate::ports::ContextStore::list_with_bodies).
+///
+/// Lets a caller that needs every body under a prefix — the console's Brain
+/// list is the one such caller — get them in a single enumeration instead of a
+/// `list` followed by one `peek` per row, which on the provider overlay was a
+/// full account read each.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkWithBody {
+    /// The chunk's metadata (address, label, length, store time).
+    pub meta: ChunkMeta,
+    /// The chunk's full body.
+    pub body: String,
+}
+
 /// A single ledger movement.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LedgerEntry {

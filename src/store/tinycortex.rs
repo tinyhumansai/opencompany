@@ -464,14 +464,7 @@ impl ContextStore for CortexContextStore {
             })?;
         match range {
             None => Ok(body),
-            Some(r) => {
-                let start = r.start.min(body.len());
-                let end = r.end.min(body.len());
-                if start >= end {
-                    return Ok(String::new());
-                }
-                Ok(body[start..end].to_string())
-            }
+            Some(r) => Ok(crate::store::slice_on_char_boundaries(&body, r)),
         }
     }
 

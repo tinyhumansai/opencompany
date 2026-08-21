@@ -986,6 +986,37 @@ impl ContextStore for MongoStore {
         Ok(out)
     }
 
+    async fn list_with_bodies(
+        &self,
+        id: &CompanyId,
+        prefix: &str,
+    ) -> Result<Vec<crate::ports::types::ChunkWithBody>> {
+        // One cursor carries every field, including `body`, rather than the
+        // default's `list` followed by a per-row `peek` (a `find_one` each).
+        let mut cursor = self
+            .collection("context_chunks")
+            .find(doc! {"company_id": id.as_ref()})
+            .sort(doc! {"ord": 1})
+            .await
+            .map_err(mongo_err)?;
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
+            let label = get_str(&doc, "label")?;
+            if label.starts_with(prefix) {
+                out.push(crate::ports::types::ChunkWithBody {
+                    meta: ChunkMeta {
+                        addr: ChunkAddr::new(get_str(&doc, "addr")?),
+                        label,
+                        len: get_i64(&doc, "len")? as usize,
+                        stored_at_millis: doc.get_i64("stored_ms").unwrap_or(0).max(0) as u64,
+                    },
+                    body: get_str(&doc, "body")?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete(&self, id: &CompanyId, addr: &ChunkAddr) -> Result<bool> {
         let result = self
             .collection("context_chunks")
@@ -1012,14 +1043,7 @@ impl ContextStore for MongoStore {
         let body = get_str(&doc, "body")?;
         match range {
             None => Ok(body),
-            Some(r) => {
-                let start = r.start.min(body.len());
-                let end = r.end.min(body.len());
-                if start >= end {
-                    return Ok(String::new());
-                }
-                Ok(body[start..end].to_string())
-            }
+            Some(r) => Ok(crate::store::slice_on_char_boundaries(&body, r)),
         }
     }
 
@@ -1037,11 +1061,9 @@ impl ContextStore for MongoStore {
             }
             let body = get_str(&doc, "body")?;
             if let Some(pos) = body.find(query) {
-                let start = pos.saturating_sub(24);
-                let end = (pos + query.len() + 24).min(body.len());
                 hits.push(ChunkHit {
                     addr: ChunkAddr::new(get_str(&doc, "addr")?),
-                    snippet: body[start..end].to_string(),
+                    snippet: crate::store::search_snippet(&body, pos, query),
                     score: 1.0,
                 });
             }
@@ -4621,6 +4643,13 @@ mod test {
     async fn conformance_context_chunk_stamps() {
         let Some(s) = store().await else { return };
         conformance::assert_context_chunk_stamps(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_multibyte_and_bodies() {
+        let Some(s) = store().await else { return };
+        conformance::assert_context_multibyte_and_bodies(s.clone()).await;
         drop_db(&s).await;
     }
 

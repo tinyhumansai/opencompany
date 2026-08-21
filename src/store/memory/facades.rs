@@ -415,23 +415,44 @@ impl ContextStore for ProviderContextStore {
     }
 
     async fn list(&self, company: &CompanyId, prefix: &str) -> Result<Vec<ChunkMeta>> {
+        Ok(self
+            .list_with_bodies(company, prefix)
+            .await?
+            .into_iter()
+            .map(|chunk| chunk.meta)
+            .collect())
+    }
+
+    async fn list_with_bodies(
+        &self,
+        company: &CompanyId,
+        prefix: &str,
+    ) -> Result<Vec<crate::ports::types::ChunkWithBody>> {
+        // The one account enumeration already carries every body. The default
+        // would throw those away in `list` and then re-`get` each one — a fresh
+        // full enumeration per row. Keep them, so the console route pays a single
+        // read for the whole page instead of O(n) account reads.
         let chunks: Vec<StoredChunk> = self.bound.list(company).await?;
-        let mut metas: Vec<ChunkMeta> = chunks
+        let mut with_bodies: Vec<crate::ports::types::ChunkWithBody> = chunks
             .into_iter()
             .filter(|chunk| chunk.label.starts_with(prefix))
-            .map(|chunk| ChunkMeta {
-                addr: ChunkAddr::new(content_address(&chunk.body)),
-                label: chunk.label,
-                len: chunk.body.len(),
-                stored_at_millis: chunk.stored_at_millis,
+            .map(|chunk| crate::ports::types::ChunkWithBody {
+                meta: ChunkMeta {
+                    addr: ChunkAddr::new(content_address(&chunk.body)),
+                    label: chunk.label,
+                    len: chunk.body.len(),
+                    stored_at_millis: chunk.stored_at_millis,
+                },
+                body: chunk.body,
             })
             .collect();
-        metas.sort_by(|a, b| {
-            a.stored_at_millis
-                .cmp(&b.stored_at_millis)
-                .then_with(|| a.addr.as_ref().cmp(b.addr.as_ref()))
+        with_bodies.sort_by(|a, b| {
+            a.meta
+                .stored_at_millis
+                .cmp(&b.meta.stored_at_millis)
+                .then_with(|| a.meta.addr.as_ref().cmp(b.meta.addr.as_ref()))
         });
-        Ok(metas)
+        Ok(with_bodies)
     }
 
     async fn peek(
@@ -450,7 +471,7 @@ impl ContextStore for ProviderContextStore {
         let Some(range) = range else {
             return Ok(chunk.body);
         };
-        Ok(slice_on_char_boundaries(&chunk.body, range))
+        Ok(crate::store::slice_on_char_boundaries(&chunk.body, range))
     }
 
     async fn delete(&self, company: &CompanyId, addr: &ChunkAddr) -> Result<bool> {
@@ -487,43 +508,16 @@ impl ContextStore for ProviderContextStore {
     }
 }
 
-/// Clamps `range` to the string's length and to char boundaries.
-///
-/// A byte range that lands mid-character would panic on a naive slice. The
-/// callers here are the brain's own `peek` offsets, which are byte counts it
-/// derived from a previous read, so a mid-character bound is reachable with any
-/// non-ASCII body. Widening outward to the nearest boundary returns slightly
-/// more than asked rather than failing the read.
-fn slice_on_char_boundaries(body: &str, range: Range<usize>) -> String {
-    let start = floor_boundary(body, range.start.min(body.len()));
-    let end = ceil_boundary(body, range.end.min(body.len()));
-    if start >= end {
-        return String::new();
-    }
-    body[start..end].to_string()
-}
-
-fn floor_boundary(s: &str, mut at: usize) -> usize {
-    while at > 0 && !s.is_char_boundary(at) {
-        at -= 1;
-    }
-    at
-}
-
-fn ceil_boundary(s: &str, mut at: usize) -> usize {
-    while at < s.len() && !s.is_char_boundary(at) {
-        at += 1;
-    }
-    at
-}
-
 /// The leading window of a body, used as a search snippet.
+///
+/// Char-boundary-safe via [`crate::store::slice_on_char_boundaries`] (widening
+/// outward), so a multibyte char straddling the cut can't panic the read.
 fn snippet(body: &str) -> String {
     const MAX: usize = 200;
     if body.len() <= MAX {
         return body.to_string();
     }
-    body[..ceil_boundary(body, MAX)].to_string()
+    crate::store::slice_on_char_boundaries(body, 0..MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +773,7 @@ mod test {
     fn peek_range_widens_to_char_boundaries_instead_of_panicking() {
         // "é" is two bytes; a range that splits it would panic on a raw slice.
         let body = "aébc";
+        use crate::store::slice_on_char_boundaries;
         assert_eq!(slice_on_char_boundaries(body, 0..2), "aé");
         assert_eq!(slice_on_char_boundaries(body, 1..2), "é");
         // Past the end clamps rather than panicking.

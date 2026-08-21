@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::error::OpenCompanyError;
 use crate::ports::facts::{FactKind, FactRecord};
-use crate::ports::types::{CompanyEvent, ContextChunk};
+use crate::ports::types::{ChunkWithBody, CompanyEvent, ContextChunk};
 use crate::ports::{generate_id, now_millis};
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
@@ -332,48 +332,49 @@ async fn list_facts(
     // A fact-kind filter is inherently facts-only — context chunks carry no
     // `FactKind`, so skip them (and the reads) when one is set.
     if kind.is_none() {
-        // `""` lists every chunk; drop the operator-fact mirrors before peeking
-        // so we neither double-list them nor pay to read their bodies, then cap
-        // the reads so a huge context store can't unbound this request.
-        let mirror_prefix = format!("{OPERATOR_FACT_PREFIX}/");
-        let metas = company.runtime.context.list(company.id(), "").await?;
-        let mut chunks = Vec::new();
-        for meta in metas
-            .into_iter()
-            .filter(|m| !m.label.starts_with(&mirror_prefix))
-            .take(MAX_CONTEXT_ENTRIES)
-        {
-            // A peek failure degrades one row to an empty body rather than
-            // failing the whole list, but log it so a real storage fault
-            // surfaces instead of silently rendering blank cards.
-            let body = match company
-                .runtime
-                .context
-                .peek(company.id(), &meta.addr, None)
-                .await
-            {
-                Ok(body) => body,
-                Err(err) => {
-                    tracing::warn!(
-                        company = %company.id(),
-                        addr = %meta.addr,
-                        error = %err,
-                        "failed to peek context chunk; rendering empty body"
-                    );
-                    String::new()
-                }
-            };
-            chunks.push(RawChunk {
-                addr: meta.addr.to_string(),
-                label: meta.label,
-                body,
-                stored_at_millis: meta.stored_at_millis,
-            });
-        }
-        entries.extend(context_entries(chunks, query.as_deref()));
+        // One enumeration carries every body, so the whole page costs a single
+        // read on the durable backends (and one account read on the provider
+        // overlay) rather than a `list` followed by `MAX_CONTEXT_ENTRIES`
+        // per-row `peek`s — each a fresh account enumeration on that overlay.
+        let with_bodies = company
+            .runtime
+            .context
+            .list_with_bodies(company.id(), "")
+            .await?;
+        entries.extend(context_entries(
+            newest_context_chunks(with_bodies),
+            query.as_deref(),
+        ));
     }
 
     Ok(Json(entries))
+}
+
+/// Selects the page of context chunks the Brain list renders: drops the
+/// operator-fact mirrors, keeps the newest [`MAX_CONTEXT_ENTRIES`], and hands
+/// them to [`context_entries`] as [`RawChunk`]s carrying the body already read.
+///
+/// Backends list oldest-first, so an unsorted `take` would freeze the list on
+/// the first `MAX_CONTEXT_ENTRIES` chunks ever written and silently drop every
+/// newer memory while `/memory/stats` kept counting up (issue #1488). Sorting
+/// newest-first before the cap keeps the most recent memories, not the stalest.
+/// An unstamped chunk (`0`) sorts last, behind anything with a real stamp.
+fn newest_context_chunks(with_bodies: Vec<ChunkWithBody>) -> Vec<RawChunk> {
+    let mirror_prefix = format!("{OPERATOR_FACT_PREFIX}/");
+    let mut with_bodies = with_bodies;
+    // Drop the operator-fact mirrors: they double-list their FactStore row.
+    with_bodies.retain(|c| !c.meta.label.starts_with(&mirror_prefix));
+    with_bodies.sort_by_key(|c| std::cmp::Reverse(c.meta.stored_at_millis));
+    with_bodies
+        .into_iter()
+        .take(MAX_CONTEXT_ENTRIES)
+        .map(|c| RawChunk {
+            addr: c.meta.addr.to_string(),
+            label: c.meta.label,
+            body: c.body,
+            stored_at_millis: c.meta.stored_at_millis,
+        })
+        .collect()
 }
 
 /// `GET /memory/stats` — counts across the fact store and the agents' context
@@ -604,6 +605,85 @@ mod combined_list_tests {
             body: body.to_string(),
             stored_at_millis,
         }
+    }
+
+    fn with_body(label: &str, body: &str, stored_at_millis: u64) -> ChunkWithBody {
+        ChunkWithBody {
+            meta: crate::ports::types::ChunkMeta {
+                addr: crate::ports::types::ChunkAddr::new(format!("addr-{label}")),
+                label: label.to_string(),
+                len: body.len(),
+                stored_at_millis,
+            },
+            body: body.to_string(),
+        }
+    }
+
+    /// Major #1 (issue #1488): the Brain list froze on the oldest 500 chunks
+    /// because it capped an oldest-first enumeration with no sort — so past 500
+    /// chunks, every newer memory was silently dropped. Prove the cap now keeps
+    /// the NEWEST `MAX_CONTEXT_ENTRIES` and drops the stalest.
+    #[test]
+    fn the_cap_keeps_the_newest_chunks_not_the_oldest() {
+        // More than the cap, handed in oldest-first as the backends list them:
+        // stamp `i` for the i-th chunk, so higher stamp == newer.
+        let total = MAX_CONTEXT_ENTRIES + 50;
+        let input: Vec<ChunkWithBody> = (0..total)
+            .map(|i| with_body(&format!("agent-1/m{i}"), &format!("memory {i}"), i as u64))
+            .collect();
+
+        let kept = newest_context_chunks(input);
+        assert_eq!(kept.len(), MAX_CONTEXT_ENTRIES, "the page is capped");
+
+        let kept_stamps: std::collections::HashSet<u64> =
+            kept.iter().map(|c| c.stored_at_millis).collect();
+        // The 50 oldest (stamps 0..50) must be the ones dropped.
+        for old in 0..50u64 {
+            assert!(
+                !kept_stamps.contains(&old),
+                "the stalest chunk (stamp {old}) must be dropped, not frozen in"
+            );
+        }
+        // The newest chunk ever written must survive — the exact memory the old
+        // unsorted `take` dropped once the store passed the cap.
+        assert!(
+            kept_stamps.contains(&((total - 1) as u64)),
+            "the newest memory must be kept"
+        );
+    }
+
+    /// An unstamped legacy chunk (`0`) sorts last, so it never displaces a
+    /// real, freshly-stamped memory out of the capped page.
+    #[test]
+    fn unstamped_chunks_sort_behind_stamped_ones() {
+        let mut input = vec![with_body("agent-1/legacy", "legacy", 0)];
+        input.extend(
+            (1..=MAX_CONTEXT_ENTRIES)
+                .map(|i| with_body(&format!("agent-1/m{i}"), &format!("memory {i}"), i as u64)),
+        );
+
+        let kept = newest_context_chunks(input);
+        assert_eq!(kept.len(), MAX_CONTEXT_ENTRIES);
+        assert!(
+            !kept.iter().any(|c| c.stored_at_millis == 0),
+            "the unstamped chunk is evicted first, behind every stamped one"
+        );
+    }
+
+    /// The mirror-drop happens before the cap, and the bodies enumerated up
+    /// front reach the rendered rows without a second read.
+    #[test]
+    fn mirrors_drop_and_bodies_carry_through() {
+        let kept = newest_context_chunks(vec![
+            with_body("operator-fact/f1", "mirror body", 3),
+            with_body("agent-1/note", "real memory body", 2),
+        ]);
+        assert_eq!(kept.len(), 1, "the operator-fact mirror is dropped");
+        assert_eq!(kept[0].label, "agent-1/note");
+        assert_eq!(
+            kept[0].body, "real memory body",
+            "the body carried by the enumeration renders without a re-read"
+        );
     }
 
     fn fact(id: &str, kind: FactKind, title: &str) -> FactRecord {

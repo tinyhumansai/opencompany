@@ -1318,6 +1318,34 @@ impl ContextStore for FsContextStore {
             .collect())
     }
 
+    async fn list_with_bodies(
+        &self,
+        id: &CompanyId,
+        prefix: &str,
+    ) -> Result<Vec<crate::ports::types::ChunkWithBody>> {
+        // One index read + one blob read per matching row, rather than the
+        // default's `list` followed by a fresh `peek` (its own blob read) each.
+        let bundle = self.bundle(id);
+        let index = read_jsonl::<IndexEntry>(&bundle.context_index_jsonl()).await?;
+        let mut out = Vec::new();
+        for e in index.into_iter().filter(|e| e.label.starts_with(prefix)) {
+            let blob_path = bundle.context_blob(&e.addr);
+            let body = tokio::fs::read_to_string(&blob_path)
+                .await
+                .map_err(|err| io_err(&blob_path, err))?;
+            out.push(crate::ports::types::ChunkWithBody {
+                meta: ChunkMeta {
+                    addr: ChunkAddr::new(e.addr),
+                    label: e.label,
+                    len: e.len,
+                    stored_at_millis: e.stored_at_millis,
+                },
+                body,
+            });
+        }
+        Ok(out)
+    }
+
     async fn peek(
         &self,
         id: &CompanyId,
@@ -1330,14 +1358,7 @@ impl ContextStore for FsContextStore {
             .map_err(|e| io_err(&path, e))?;
         match range {
             None => Ok(body),
-            Some(r) => {
-                let start = r.start.min(body.len());
-                let end = r.end.min(body.len());
-                if start >= end {
-                    return Ok(String::new());
-                }
-                Ok(body[start..end].to_string())
-            }
+            Some(r) => Ok(crate::store::slice_on_char_boundaries(&body, r)),
         }
     }
 
@@ -1385,11 +1406,9 @@ impl ContextStore for FsContextStore {
                 continue;
             };
             if let Some(pos) = body.find(query) {
-                let start = pos.saturating_sub(24);
-                let end = (pos + query.len() + 24).min(body.len());
                 hits.push(ChunkHit {
                     addr: ChunkAddr::new(entry.addr),
-                    snippet: body[start..end].to_string(),
+                    snippet: crate::store::search_snippet(&body, pos, query),
                     score: 1.0,
                 });
             }
@@ -2160,6 +2179,14 @@ mod test {
         let root_dir = tmp_root();
         let root = root_dir.path().to_path_buf();
         conformance::assert_context_chunk_stamps(Arc::new(FsContextStore::new(&root))).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_multibyte_and_bodies() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_context_multibyte_and_bodies(Arc::new(FsContextStore::new(&root)))
+            .await;
     }
 
     /// Two event logs over one data root must not hand out the same sequence

@@ -2336,6 +2336,96 @@ pub async fn assert_context_chunk_stamps(context: Arc<dyn ContextStore>) {
     assert!(context.list(&beta, "").await.unwrap().is_empty());
 }
 
+/// Asserts every [`ContextStore`] backend handles multibyte bodies without
+/// panicking, and serves bodies through `list_with_bodies` in one pass.
+///
+/// Issue #1488's two backend-side majors, pinned as one contract every backend
+/// must satisfy:
+///
+/// - **Multibyte-safe reads.** Search snippets and ranged `peek` used to slice
+///   raw byte offsets, so a match or range abutting a multibyte char panicked
+///   with "byte index is not a char boundary". `memory_recall` routes agent
+///   queries into `search`, so the panic was agent-reachable — it aborted the
+///   call. The body is built so the snippet's leading window (`pos - 24`) lands
+///   *inside* a leading 2-byte "é", and a ranged peek ends *inside* it too; both
+///   must widen to a boundary rather than aborting.
+/// - **Bodies from the enumeration.** `list_with_bodies` must carry each body
+///   from the same pass, so the console's Brain list pays one read for the page
+///   rather than a `list` plus one `peek` per row.
+pub async fn assert_context_multibyte_and_bodies(context: Arc<dyn ContextStore>) {
+    let id = CompanyId::new("acme");
+    // A leading 2-byte "é" (bytes 0..2), then 23 ASCII fillers, so "brunch"
+    // begins at byte 25 and the snippet's `pos - 24 = 1` lands mid-"é" — the
+    // exact offset the old `body[pos-24..]` panicked on. A trailing "café" and
+    // "here" give the search a whole-char window on both sides.
+    let body = "éxxxxxxxxxxxxxxxxxxxxxxxbrunch and more café here";
+    let addr = context
+        .put(
+            &id,
+            ContextChunk {
+                label: "notes/menu".to_string(),
+                body: body.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Search: the raw `body[pos-24..]` used to land mid-"é" and panic.
+    let hits = context.search(&id, "brunch", 5).await.unwrap();
+    assert_eq!(hits.len(), 1, "the one matching chunk is found");
+    assert!(
+        hits[0].snippet.contains("brunch"),
+        "the snippet keeps the match without panicking mid-codepoint: {}",
+        hits[0].snippet
+    );
+
+    // Ranged peek: the leading "é" occupies bytes 0..2, so an end of 1 lands
+    // mid-char. A raw `body[0..1]` would panic; the read widens outward to 2.
+    let ranged = context.peek(&id, &addr, Some(0..1)).await.unwrap();
+    assert_eq!(
+        ranged, "é",
+        "a mid-codepoint range widens outward rather than panicking"
+    );
+
+    // list_with_bodies carries the body from the same enumeration.
+    context
+        .put(
+            &id,
+            ContextChunk {
+                label: "notes/plain".to_string(),
+                body: "second body".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut rows = context.list_with_bodies(&id, "notes/").await.unwrap();
+    rows.sort_by(|a, b| a.meta.label.cmp(&b.meta.label));
+    assert_eq!(rows.len(), 2, "both matching chunks come back with bodies");
+    assert_eq!(rows[0].meta.label, "notes/menu");
+    assert_eq!(rows[0].body, body);
+    assert_eq!(rows[1].meta.label, "notes/plain");
+    assert_eq!(rows[1].body, "second body");
+
+    // The prefix filter narrows both metadata and bodies, and isolation holds.
+    assert!(
+        context
+            .list_with_bodies(&id, "other/")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a non-matching prefix returns nothing"
+    );
+    let other = CompanyId::new("beta");
+    assert!(
+        context
+            .list_with_bodies(&other, "")
+            .await
+            .unwrap()
+            .is_empty(),
+        "list_with_bodies stays scoped to its company"
+    );
+}
+
 /// Asserts the [`UsageMeter`] contract: isolation, record, and windowed query.
 pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     let alpha = CompanyId::new("alpha");

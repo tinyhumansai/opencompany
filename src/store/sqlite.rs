@@ -1003,6 +1003,49 @@ impl ContextStore for SqliteStore {
         Ok(out)
     }
 
+    async fn list_with_bodies(
+        &self,
+        id: &CompanyId,
+        prefix: &str,
+    ) -> Result<Vec<crate::ports::types::ChunkWithBody>> {
+        // One query returns metadata and body together, rather than the
+        // default's `list` followed by a per-row `peek` (a `SELECT` each).
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT addr, label, len, stored_ms, body FROM context_chunks \
+                 WHERE company_id = ?1 ORDER BY rowid",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![id.as_ref()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (addr, label, len, stored_ms, body) = row.map_err(sql_err)?;
+            if label.starts_with(prefix) {
+                out.push(crate::ports::types::ChunkWithBody {
+                    meta: ChunkMeta {
+                        addr: ChunkAddr::new(addr),
+                        label,
+                        len: len as usize,
+                        stored_at_millis: stored_ms.max(0) as u64,
+                    },
+                    body,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn peek(
         &self,
         id: &CompanyId,
@@ -1023,14 +1066,7 @@ impl ContextStore for SqliteStore {
         })?;
         match range {
             None => Ok(body),
-            Some(r) => {
-                let start = r.start.min(body.len());
-                let end = r.end.min(body.len());
-                if start >= end {
-                    return Ok(String::new());
-                }
-                Ok(body[start..end].to_string())
-            }
+            Some(r) => Ok(crate::store::slice_on_char_boundaries(&body, r)),
         }
     }
 
@@ -1062,11 +1098,9 @@ impl ContextStore for SqliteStore {
             }
             let (addr, body) = row.map_err(sql_err)?;
             if let Some(pos) = body.find(query) {
-                let start = pos.saturating_sub(24);
-                let end = (pos + query.len() + 24).min(body.len());
                 hits.push(ChunkHit {
                     addr: ChunkAddr::new(addr),
-                    snippet: body[start..end].to_string(),
+                    snippet: crate::store::search_snippet(&body, pos, query),
                     score: 1.0,
                 });
             }
@@ -3669,6 +3703,11 @@ mod test {
     #[tokio::test]
     async fn conformance_context_chunk_stamps() {
         conformance::assert_context_chunk_stamps(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_multibyte_and_bodies() {
+        conformance::assert_context_multibyte_and_bodies(store()).await;
     }
 
     /// The migration path a fresh database never exercises.
