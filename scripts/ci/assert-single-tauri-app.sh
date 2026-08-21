@@ -9,23 +9,25 @@
 #
 # The tree had two: the shell in `src-tauri/`, and a leftover console wrapper in
 # `frontend/src-tauri/` that shared its `productName`. Because `tauri:dev` and
-# `tauri:build` live in `frontend/package.json`, npm ran them from `frontend/` —
-# so `npm run tauri:dev`, the obvious way to start the desktop app, started the
-# wrapper. The wrapper registered one command, `desktop_config`, which the
-# console had stopped invoking; every `oc_*` command the console uses to find a
-# host was missing from its `generate_handler!`. The window opened, the console
-# rendered, and no server was ever reachable. Nothing in CI could see it: both
-# crates compiled, both were tested, and the lane packaged only the right one.
+# `tauri:build` live in `frontend/package.json`, and npm runs a script from its
+# manifest's own directory, `npm run tauri:dev` — the obvious way to start the
+# desktop app — started the wrapper. The wrapper registered one command,
+# `desktop_config`, which the console had stopped invoking; every `oc_*` command
+# the console uses to find a host was missing from its `generate_handler!`. The
+# window opened, the console rendered, and no server was ever reachable. Nothing
+# in CI could see it: both crates compiled, both were tested, and the lane
+# packaged only the right one.
 #
 # Two rules, because either alone lets the failure back:
 #
 #   1. Exactly one `tauri.conf.json`, and it is `src-tauri/tauri.conf.json`. A
 #      second app is the ambiguity itself; there is no version of it that is
 #      safe just because it is currently correct.
-#   2. No `package.json` script invokes a bare `tauri` binary. A bare `tauri`
+#   2. No `package.json` script invokes the CLI without first establishing a
+#      directory. An unqualified `tauri` (or `cargo tauri`, or `npx tauri`)
 #      resolves its project from npm's working directory, which is wherever the
-#      manifest happens to live — the mechanism above. Scripts must name the
-#      directory (`cd ../src-tauri && …`) or delegate to a script that does.
+#      manifest happens to live — the mechanism above. A `cd` earlier in the
+#      same script, or a path-qualified binary, both say which app is meant.
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -33,17 +35,15 @@ cd "$(dirname "$0")/../.." || exit 1
 status=0
 
 # Vendored checkouts own their apps; this rule is about this repository's.
-configs=$(
-    find . -name tauri.conf.json \
-        -not -path './node_modules/*' \
-        -not -path '*/node_modules/*' \
-        -not -path './vendor/*' \
-        -not -path './target/*' \
-        -not -path '*/target/*' \
-        -not -path './worktrees/*' \
-        -not -path './.git/*' |
-        sed 's|^\./||' | sort
+prune=(
+    -not -path './node_modules/*' -not -path '*/node_modules/*'
+    -not -path './vendor/*'
+    -not -path './target/*' -not -path '*/target/*'
+    -not -path './worktrees/*'
+    -not -path './.git/*'
 )
+
+configs=$(find . -name tauri.conf.json "${prune[@]}" | sed 's|^\./||' | sort)
 
 if [ "${configs}" != "src-tauri/tauri.conf.json" ]; then
     echo "assert-single-tauri-app: expected exactly one Tauri app, at src-tauri/tauri.conf.json." >&2
@@ -55,31 +55,79 @@ if [ "${configs}" != "src-tauri/tauri.conf.json" ]; then
     status=1
 fi
 
-# `"tauri ` or `"tauri"` at the start of a script value, i.e. the binary invoked
-# with no directory established first. `cd ../src-tauri && …/tauri build` and
-# `../scripts/desktop-dev.sh` both pass, because both name the directory.
+# Whether one script value invokes the CLI with no directory established.
+#
+# Not "does the value start with tauri": `npm run build && tauri build` is the
+# same bug one operator away, and it is the shape a hurried fix reaches for. So
+# the value is split into command segments on `&&`, `||`, `;` and `|`, and the
+# FIRST WORD of each segment is what gets judged — which also means a
+# path-qualified `../frontend/node_modules/.bin/tauri` is not a bare `tauri` and
+# a package name like `@tauri-apps/cli` is not a command at all.
+#
+# A `cd` in an earlier segment clears the rest of the value: the whole point of
+# `cd ../src-tauri && … tauri build` is that it names the app, and a rule that
+# rejected it would have nothing left to recommend.
+unqualified_tauri() {
+    local value=$1
+    local segment first second saw_cd=0
+    local segments
+
+    # Split on the separators with IFS, then read words back with the default
+    # one. Doing both under `IFS=$'\n'` is a trap: the word split that follows
+    # would not split on spaces, and every segment's "first word" would be the
+    # whole segment — a check that silently accepts everything.
+    mapfile -t segments < <(printf '%s' "${value}" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
+
+    for segment in "${segments[@]}"; do
+        # shellcheck disable=SC2086 # deliberate: split the segment into words.
+        set -- ${segment}
+        first=${1-}
+        second=${2-}
+        case "${first}" in
+            cd) saw_cd=1 ;;
+            tauri | npx | pnpx)
+                if [ "${first}" = "tauri" ] || [ "${second}" = "tauri" ]; then
+                    [ "${saw_cd}" -eq 0 ] && return 0
+                fi
+                ;;
+            cargo)
+                if [ "${second}" = "tauri" ]; then
+                    [ "${saw_cd}" -eq 0 ] && return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+}
+
 while IFS= read -r manifest; do
-    offenders=$(grep -nE '"[^"]*"[[:space:]]*:[[:space:]]*"tauri([[:space:]]|")' "${manifest}")
+    offenders=""
+    # Every `"key": "value"` pair in the manifest. Dependency entries reach this
+    # too and are harmless: a version range has no `tauri` command in it.
+    while IFS= read -r pair; do
+        key=${pair%%\"*}
+        value=${pair#*\"}
+        if unqualified_tauri "${value}"; then
+            offenders="${offenders}    \"${key}\": \"${value}\""$'\n'
+        fi
+    done < <(
+        grep -oE '"[^"]+"[[:space:]]*:[[:space:]]*"[^"]*"' "${manifest}" |
+            sed -E 's/^"([^"]+)"[[:space:]]*:[[:space:]]*"(.*)"$/\1"\2/'
+    )
+
     if [ -n "${offenders}" ]; then
-        echo "assert-single-tauri-app: ${manifest} runs a bare 'tauri' binary:" >&2
-        echo "${offenders}" | sed 's/^/    /' >&2
+        echo "assert-single-tauri-app: ${manifest} invokes the Tauri CLI with no directory established:" >&2
+        printf '%s' "${offenders}" >&2
         echo >&2
-        echo "npm runs a script from the manifest's own directory, so a bare 'tauri'" >&2
-        echo "picks up whatever project sits beneath it. Name the directory instead:" >&2
+        echo "npm runs a script from the manifest's own directory, so an unqualified" >&2
+        echo "'tauri' picks up whatever project sits beneath it. Name the directory:" >&2
         echo '    "tauri:build": "npm run build && cd ../src-tauri && ../frontend/node_modules/.bin/tauri build"' >&2
         status=1
     fi
-done < <(
-    find . -name package.json \
-        -not -path './node_modules/*' \
-        -not -path '*/node_modules/*' \
-        -not -path './vendor/*' \
-        -not -path './worktrees/*' \
-        -not -path './.git/*'
-)
+done < <(find . -name package.json "${prune[@]}")
 
 if [ "${status}" -eq 0 ]; then
-    echo "assert-single-tauri-app: one Tauri app (src-tauri/), no bare 'tauri' invocations."
+    echo "assert-single-tauri-app: one Tauri app (src-tauri/), no unqualified CLI invocations."
 fi
 
 exit "${status}"
