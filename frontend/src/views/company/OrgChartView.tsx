@@ -37,6 +37,7 @@ import { toast } from "sonner";
 import { listPeople } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
 import { ApiError, type DeskDto, type TeamMemberDto } from "@/api/types";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -501,12 +502,9 @@ export function OrgChartView({ client, company, focusDeskId, onBack }: Props) {
         </div>
 
         {error && (
-          <div
-            role="alert"
-            className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-          >
-            {error}
-          </div>
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
         )}
 
         {load === "loading" ? (
@@ -1142,7 +1140,7 @@ function Seat({
       onDragOver={dragOver}
       onDrop={drop}
       className={cn(
-        "flex cursor-grab items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-sm active:cursor-grabbing",
+        "flex cursor-grab items-center justify-between gap-2 rounded-md border px-3 py-2 text-sm active:cursor-grabbing",
         busy && "opacity-50",
       )}
     >
@@ -1228,7 +1226,7 @@ function Unplaced({ tree }: { tree: OrgTree }) {
     <div className="space-y-4">
       {tree.unassigned.length > 0 && (
         <section className="space-y-2">
-          <h3 className="text-sm font-medium">Not on a desk</h3>
+          <h3 className="text-sm font-medium text-muted-foreground">Not on a desk</h3>
           <p className="text-xs text-muted-foreground">
             Roster teammates the company has not staffed anywhere. Add them to a
             desk above.
@@ -1266,7 +1264,7 @@ function Unplaced({ tree }: { tree: OrgTree }) {
       )}
       {tree.people.length > 0 && (
         <section className="space-y-2">
-          <h3 className="text-sm font-medium">People</h3>
+          <h3 className="text-sm font-medium text-muted-foreground">People</h3>
           <p className="text-xs text-muted-foreground">
             The humans who can sign in. Desks staff teammates, so the company
             declares no desk for a person, and this chart does not guess one.

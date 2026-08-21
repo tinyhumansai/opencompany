@@ -172,7 +172,7 @@ export function PeopleView({ client, company }: Props) {
 
   if (loading) {
     return (
-      <div className="space-y-3 p-6">
+      <div className="space-y-3 px-4 py-6">
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-24 w-full" />
         <Skeleton className="h-24 w-full" />
@@ -182,7 +182,7 @@ export function PeopleView({ client, company }: Props) {
 
   if (!isAdmin) {
     return (
-      <div className="mx-auto w-full max-w-3xl p-6">
+      <div className="mx-auto w-full max-w-3xl px-4 py-6">
         <div className="mb-6 space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">People</h1>
           <p className="text-sm text-muted-foreground">
@@ -201,7 +201,7 @@ export function PeopleView({ client, company }: Props) {
   }
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-8 p-6">
+    <div className="mx-auto w-full max-w-4xl space-y-6 px-4 py-6">
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">People</h1>
@@ -209,8 +209,8 @@ export function PeopleView({ client, company }: Props) {
             The humans who can sign in. Access is invite-only.
           </p>
         </div>
-        <Button onClick={() => setInviteOpen(true)}>
-          <UserPlus className="mr-2 size-4" />
+        <Button size="sm" variant="outline" onClick={() => setInviteOpen(true)}>
+          <UserPlus className="mr-1.5 size-4" />
           Invite
         </Button>
       </div>
