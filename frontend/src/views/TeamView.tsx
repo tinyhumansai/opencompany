@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Mail, MoreHorizontal, Network, Plus, Sparkles, UserPlus } from "lucide-react";
+import { Mail, MoreHorizontal, Network, Plus, Sparkles, UserPlus, Users } from "lucide-react";
 import { toast } from "sonner";
 
 import { listPeople, me as fetchMe, type Person } from "@/api/auth";
@@ -8,6 +8,7 @@ import { setInboxEnabled } from "@/api/inbox";
 import { listTasks } from "@/api/tasks";
 import { ApiError, type TeamMemberDto } from "@/api/types";
 import { TeammateAvatar } from "@/components/teammate-avatar";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -73,6 +74,12 @@ interface Props {
    * this view still stands alone.
    */
   onManageDesks?: () => void;
+  /**
+   * Open a single desk from a card's desk chip. Same destination as the chart's
+   * own desk links (`#/company/<deskId>`), and optional so the card stays inert
+   * — desk chips render as text, not buttons — when the shell does not wire it.
+   */
+  onNavigateToDesk?: (deskId: string) => void;
 }
 
 type Load = "loading" | "ready";
@@ -86,6 +93,7 @@ export function TeamView({
   refreshKey,
   onRunSetup,
   onManageDesks,
+  onNavigateToDesk,
 }: Props) {
   const [load, setLoad] = useState<Load>("loading");
   const [fromHost, setFromHost] = useState(false);
@@ -449,6 +457,7 @@ export function TeamView({
                 // nothing (idle, zero — worth saying), versus the board never
                 // answered (undefined — the card says nothing at all).
                 workload={workload ? (workload.get(m.id) ?? IDLE) : undefined}
+                onNavigateToDesk={onNavigateToDesk}
               />
             ))}
             <button
@@ -496,6 +505,7 @@ function MemberCard({
   onOpen,
   setByLabel,
   workload,
+  onNavigateToDesk,
 }: {
   member: TeamMember;
   onRemove: () => void;
@@ -508,6 +518,11 @@ function MemberCard({
    * not be read — in which case the card says nothing about either.
    */
   workload?: Workload;
+  /**
+   * Open one of this teammate's desks from its chip. Undefined when the shell
+   * does not offer desk navigation; the chips then render as plain text.
+   */
+  onNavigateToDesk?: (deskId: string) => void;
 }) {
   // Issue #1208: the role only earns its line when it is not the name again.
   // Every manifest-declared agent in the shipped companies resolves both to one
@@ -623,6 +638,43 @@ function MemberCard({
             {member.description}
           </p>
         )}
+        {/*
+          The desks this teammate sits on, one chip per desk (issue #1440). The
+          roster read already carries `desks` per member — the card just never
+          drew it. A chip is the desk's name plus a "(lead)" marker for the desk
+          it leads, and it links to that desk's own address (`#/company/<deskId>`),
+          the same destination as the chart's desk nodes. When the host reports
+          no desks the card says so outright rather than leaving a blank gap:
+          "on no desk" is a fact an operator scanning a roster wants to see.
+        */}
+        <div className="flex flex-wrap gap-1" data-testid="team-card-desks">
+          {member.desks.length === 0 ? (
+            <p className="text-xs text-muted-foreground" data-testid="team-card-no-desks">
+              Not on a desk
+            </p>
+          ) : (
+            member.desks.map((desk) => (
+              <Badge
+                key={desk.id}
+                variant="secondary"
+                className={cn("gap-1 text-3xs", onNavigateToDesk && "cursor-pointer")}
+                data-testid={`team-card-desk-${desk.id}`}
+                onClick={
+                  onNavigateToDesk
+                    ? (e) => {
+                        e.stopPropagation();
+                        onNavigateToDesk(desk.id);
+                      }
+                    : undefined
+                }
+              >
+                <Users className="size-2.5" aria-hidden />
+                {desk.name}
+                {desk.lead && <span className="text-3xs opacity-70">(lead)</span>}
+              </Badge>
+            ))
+          )}
+        </div>
         {/*
           Pinned to the bottom of the card, not left floating under whatever
           length the description happened to be.

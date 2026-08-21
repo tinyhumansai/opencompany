@@ -2047,6 +2047,8 @@ export function AppShell({
               // Skipping setup must not be a dead end: an unstaffed company keeps
               // a visible way back in.
               onRunSetup={() => setSetupForced(true)}
+              // A desk chip on a teammate's detail page opens that desk (issue #1440).
+              onNavigateToDesk={(deskId) => navigate("company", deskId)}
             />
           )}
           {view === "memory" && <MemoryView client={client} company={company} />}

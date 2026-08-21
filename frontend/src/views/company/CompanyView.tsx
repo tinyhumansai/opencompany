@@ -111,6 +111,9 @@ export function CompanyView({
       refreshKey={refreshKey}
       onRunSetup={onRunSetup}
       onManageDesks={() => onNavigate(DESKS_SEGMENT)}
+      // A desk chip on a card opens that desk's own address (issue #1440), the
+      // same destination as the chart's desk nodes.
+      onNavigateToDesk={(deskId) => onNavigate(deskId)}
     />
   );
 }
