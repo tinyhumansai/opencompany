@@ -78,7 +78,15 @@ env:
   # store on a mongodb tenant is refused by the ephemeral-/data guard anyway.
   # Self-hosters wanting the embedded contract driver compile it via
   # OPENCOMPANY_FEATURES (deploy/README.md).
-  TENANT_FEATURES: mongodb,openhuman,openhuman-rpc,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,telegram,medulla,tinycortex,sidecar,chargebee,paypal,tinymemory
+  #
+  # `tinymemory-module` is the loadable TinyMemory module driver (issue #1524):
+  # inert until a tenant's env sets OPENCOMPANY_MEMORY=embedded AND
+  # OPENCOMPANY_MEMORY_DRIVER=module (both — the driver knob alone does
+  # nothing under the `store` default). Unlike `tinymemory-embedded` it is
+  # slim-image-safe: the provider is a bus proxy, the loader stack is pure
+  # Rust, and `cargo tree -i libsqlite3-sys` / `-i cc` are both empty under
+  # this exact feature set — no bundled rusqlite, no C compiler.
+  TENANT_FEATURES: mongodb,openhuman,openhuman-rpc,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,telegram,medulla,tinycortex,sidecar,chargebee,paypal,tinymemory,tinymemory-module
 
 jobs:
   deploy:
