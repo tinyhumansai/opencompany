@@ -315,6 +315,17 @@ tinymemory-remote = { path = "vendor/openhuman/vendor/tinymemory/crates/tinymemo
 # byte-identical to the one `vendor/openhuman/Cargo.toml` declares.
 tinymemory-core = { path = "vendor/openhuman/vendor/tinymemory/crates/tinymemory-core", optional = true }
 tinymemory-tinycortex = { path = "vendor/openhuman/vendor/tinymemory/crates/tinymemory-tinycortex", optional = true }
+# The TinyBus module seam (issue #1524): `tinybus` hosts the loadable
+# TinyMemory module's broker, and `tinymemory-bus` carries the wire
+# vocabulary the host speaks to it — method-name constants
+# (`names::methods::*`) and the shared error table (`wire::from_wire`).
+# `tinymemory-bus` must be a DIRECT dependency: `tinymemory-api` re-exports
+# eleven bus modules but not `names`, so the transitive path does not
+# compile. `macros` on tinybus is mandatory (the service/proxy derives), and
+# the same directory as openhuman's own tinybus dep so cargo unifies the two
+# into one package.
+tinybus = { path = "vendor/openhuman/vendor/tinybus/crates/tinybus", optional = true, default-features = false, features = ["macros"] }
+tinymemory-bus = { path = "vendor/openhuman/vendor/tinymemory/crates/tinymemory-bus", optional = true }
 
 # Single-file `.tar` packing/unpacking for `opencompany export`/`import`. Pure
 # Rust, no system libs, no network. Only links under the `export` feature; the
@@ -520,6 +531,12 @@ tinymemory = [
     # `anyhow` directly. Already an optional dep for other features.
     "dep:anyhow",
 ]
+# The loadable TinyMemory module driver (issue #1524). Forwards tinybus's
+# loader sub-feature from opencompany's OWN gate — never from the dependency
+# line — mirroring how openhuman forwards it, so a build without this feature
+# carries no dlopen loader. Known consequence: cargo unifies our tinybus with
+# openhuman's (same directory), so enabling the loader enables it there too.
+tinymemory-module = ["tinymemory", "dep:tinymemory-bus", "dep:tinybus", "tinybus/modules"]
 # The embedded mode *through* that seam: `OPENCOMPANY_MEMORY=embedded` +
 # `OPENCOMPANY_MEMORY_DRIVER=namespace` binds `tinymemory-core`'s durable
 # `UnifiedMemory` (driver id `namespace`) as an in-pod provider — same

@@ -181,6 +181,153 @@ mod embedded {
     }
 }
 
+// ── The loadable TinyMemory module, on a real artifact ───────────────────────
+
+#[cfg(feature = "tinymemory-module")]
+mod module {
+    use super::*;
+
+    /// The artifact gate: these tests need a real module library, named by
+    /// `TINYMEMORY_TEST_MODULE`. A developer without one gets a skip, not a
+    /// failure; CI downloads the pinned release archive for its platform.
+    fn test_artifact() -> Option<std::path::PathBuf> {
+        std::env::var("TINYMEMORY_TEST_MODULE")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file())
+    }
+
+    fn module_config(dir: &std::path::Path) -> MemoryDriverConfig {
+        MemoryDriverConfig {
+            mode: MemoryMode::Embedded,
+            driver_id: Some("module".into()),
+            url: None,
+            api_key: None,
+            data_dir: Some(dir.to_path_buf()),
+        }
+    }
+
+    /// The full claim through the production path: retains, conforms, and
+    /// round-trips the facades — through `open_driver`, over the bus, against
+    /// the real loaded artifact.
+    ///
+    /// `#[ignore]`: a loaded module binds its broker tasks to the runtime
+    /// that created them, and tinymemory's own loader e2e documents that TWO
+    /// such tests in one process HANG rather than fail. Run it alone:
+    ///
+    /// ```text
+    /// TINYMEMORY_TEST_MODULE=/path/to/libtinymemory_module.so     ///   OPENCOMPANY_MEMORY_MODULE_PATH=$TINYMEMORY_TEST_MODULE     ///   cargo test --features tinymemory-module,tinymemory-embedded -- --ignored     ///   the_module_driver_upholds_the_contract --test-threads=1
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a module artifact and its own process; see the doc comment"]
+    async fn the_module_driver_upholds_the_contract() {
+        let Some(artifact) = test_artifact() else {
+            eprintln!("skipping: TINYMEMORY_TEST_MODULE names no artifact");
+            return;
+        };
+        // The load seam reads its own env var; point it at the test artifact
+        // for this process. Safe under --test-threads=1, which the one-
+        // process rule already requires.
+        unsafe { std::env::set_var(super::super::module::ops::MODULE_PATH_ENV, &artifact) };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, class) = open(&module_config(dir.path()));
+        assert_retains_then_conforms(Arc::clone(&provider)).await;
+        facade_round_trip(provider, class).await;
+    }
+
+    /// The differential: the module driver and the namespace driver answer
+    /// the same observable sequence identically — the only test that would
+    /// catch a semantic divergence between the in-process engine and the
+    /// same engine behind the bus. Divergences must be enumerated here and
+    /// accepted in writing, per the issue's DoD.
+    #[cfg(feature = "tinymemory-embedded")]
+    #[tokio::test]
+    #[ignore = "needs a module artifact and its own process; see the sibling test"]
+    async fn the_module_and_namespace_drivers_agree() {
+        let Some(artifact) = test_artifact() else {
+            eprintln!("skipping: TINYMEMORY_TEST_MODULE names no artifact");
+            return;
+        };
+        unsafe { std::env::set_var(super::super::module::ops::MODULE_PATH_ENV, &artifact) };
+
+        let module_dir = tempfile::tempdir().expect("tempdir");
+        let namespace_dir = tempfile::tempdir().expect("tempdir");
+        let (module, _) = open(&module_config(module_dir.path()));
+        let (namespace, _) = open(&MemoryDriverConfig {
+            mode: MemoryMode::Embedded,
+            driver_id: Some("namespace".into()),
+            url: None,
+            api_key: None,
+            data_dir: Some(namespace_dir.path().to_path_buf()),
+        });
+
+        use tinymemory_api::types::{MemoryCategory, MemoryTaint};
+        for provider in [&module, &namespace] {
+            provider
+                .store(
+                    "oc/diff",
+                    "alpha",
+                    "the alpha record",
+                    MemoryCategory::Core,
+                    None,
+                    MemoryTaint::Internal,
+                )
+                .await
+                .expect("store alpha");
+            provider
+                .store(
+                    "oc/diff",
+                    "beta",
+                    "the beta record",
+                    MemoryCategory::Conversation,
+                    Some("s-1"),
+                    MemoryTaint::ExternalSync,
+                )
+                .await
+                .expect("store beta");
+        }
+
+        for provider in [&module, &namespace] {
+            let got = provider
+                .get("oc/diff", "beta")
+                .await
+                .expect("get")
+                .expect("present");
+            assert_eq!(got.content, "the beta record");
+            assert_eq!(got.taint, MemoryTaint::ExternalSync);
+            assert_eq!(got.session_id.as_deref(), Some("s-1"));
+        }
+
+        let module_list = module
+            .list(Some("oc/diff"), None, None)
+            .await
+            .expect("list");
+        let namespace_list = namespace
+            .list(Some("oc/diff"), None, None)
+            .await
+            .expect("list");
+        let keys = |entries: &[tinymemory_api::types::MemoryEntry]| {
+            let mut keys: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&module_list), keys(&namespace_list));
+
+        for provider in [&module, &namespace] {
+            assert!(provider.forget("oc/diff", "alpha").await.expect("forget"));
+            assert!(
+                provider
+                    .get("oc/diff", "alpha")
+                    .await
+                    .expect("get")
+                    .is_none(),
+                "forgotten on both sides"
+            );
+        }
+    }
+}
+
 // ── Vendor doubles ───────────────────────────────────────────────────────────
 //
 // Ported from the vendored `adapters/remote/src/conformance_test.rs` at

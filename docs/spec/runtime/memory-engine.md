@@ -19,6 +19,7 @@ dedicated memory engine layered on top of that base. The base still owns every o
 | `store` (default) | The base backend's own memory | — | fs substring recall, or sqlite/mongodb |
 | `embedded` (or `tinycortex`) | In-pod TinyCortex engine | `tinycortex` | Persistent per-company store; vector-first recall with lexical/recency fallback when no embeddings backend resolves |
 | `embedded` + `OPENCOMPANY_MEMORY_DRIVER=namespace` | In-pod contract store | `tinymemory-embedded` | `tinymemory-core`'s durable `UnifiedMemory`, bound through the `MemoryProvider` contract; no network call |
+| `embedded` + `OPENCOMPANY_MEMORY_DRIVER=module` | The loadable TinyMemory module | `tinymemory-module` | The separately compiled `cdylib` over TinyBus (issue #1524): digest-verified, loaded eagerly at boot (refuse, never degrade), store at `<data_dir>/memory-module` — a **different engine and directory** than `namespace`, never an alias. Preflight: `opencompany modules check` |
 | `remote` | A hosted memory service | `tinymemory` | Bound through the `MemoryProvider` contract; needs a URL and a credential |
 | `null` | Nothing | `tinymemory` | Writes accepted and discarded, reads empty |
 

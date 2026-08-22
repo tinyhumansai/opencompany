@@ -782,7 +782,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Rust (openhuman, tinycortex)
-    runs-on: ubuntu-latest
+    # PINNED, not `ubuntu-latest`: this job downloads the ubuntu-24.04 module
+    # archive, whose glibc window is bounded (>=2.39 <2.42). `ubuntu-latest`
+    # is a moving alias — when GitHub advances it, the archive stops matching
+    # the runner and the module fails to `dlopen` at the first memory call,
+    # which reads as a broken test rather than an image bump (#1524, #1550).
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       # OpenHuman's agent loop requires the same stack its production runtimes
@@ -847,6 +852,36 @@ jobs:
       # is what makes it meaningful.
       - name: Clippy (openhuman, tinycortex)
         run: cargo clippy --locked --no-deps --features openhuman,tinycortex --all-targets -- -D warnings
+
+      # Issue #1524 (PR 1). `pub mod memory` is gated on `tinymemory`
+      # (`store/mod.rs`), and neither strict lane enabled that gate: the
+      # default-features clippy lints a tree where the module does not exist,
+      # and the step above compiles without it. `store::memory` was therefore
+      # linted by NO `-D warnings` lane at all — the silent-uncoverage class
+      # this job's own comments keep warning about. Same `--no-deps` reasoning
+      # as the step above; the union set matches the test steps below, so the
+      # compile is shared with them via the cache.
+      - name: Clippy (acp, runner, tinymemory)
+        run: cargo clippy --locked --no-deps --features acp,runner,tinymemory --all-targets -- -D warnings
+
+      # Issue #1524 (PR 1). The nested-vendor path deps must stay
+      # byte-identical to openhuman's own, or cargo resolves the same crate
+      # from two directories and two `MemoryProvider` traits exist in one
+      # process (the hazard recorded at `Cargo.toml:249-252`). `-d` prints
+      # duplicate versions of a package; any `tinymemory` line in that report
+      # is the failure.
+      - name: Assert no duplicated tinymemory crates
+        run: |
+          # Two separate failures, checked separately: a broken resolve must
+          # fail loudly, not read as "no duplicates" through an empty pipe.
+          if ! report="$(cargo tree --locked -e normal --features openhuman,tinycortex,tinymemory-embedded -d)"; then
+            echo "::error::cargo tree failed to resolve the graph"
+            exit 1
+          fi
+          if grep -E "^tinymemory" <<< "$report"; then
+            echo "::error::duplicated tinymemory-* package in the resolve graph"
+            exit 1
+          fi
 
       # `--tests` is LOAD-BEARING IN BOTH DIRECTIONS. Do not narrow it back to
       # `--lib`, and do not widen it to a bare `cargo test`.
@@ -916,6 +951,59 @@ jobs:
       # exits 0. The script asserts a non-zero count per filter.
       - name: Test the runner lane
         run: scripts/ci/run-scoped-suite.sh "runner" acp,runner,tinymemory runner
+
+      # Issue #1524: the loadable-module driver's own gate. A separate feature
+      # set (and so a separate compile unit) deliberately: the module host
+      # forwards tinybus's dlopen loader, which no other lane should carry.
+      - name: Test the tinymemory module driver
+        run: scripts/ci/run-scoped-suite.sh "tinymemory module" tinymemory-module store::memory::module
+
+      # Issue #1524: the module conformance + differential against the REAL
+      # released artifact — the tests are `#[ignore]`d because a loaded module
+      # binds its broker tasks to the runtime that created them and two such
+      # tests in one process HANG, so each runs in its own cargo invocation
+      # with --test-threads=1. The archive is fetched (not built: ~7 MB beats
+      # a 3-minute cdylib build, and these jobs skip submodule checkout of
+      # the module's own workspace anyway) and digest-checked against the
+      # value recorded verbatim from the release's checksum.toml.
+      #
+      # The bucket is ubuntu-24.04: this runner IS ubuntu-24.04 (glibc 2.39),
+      # which sits OUTSIDE the 22.04 archive's >=2.35 <2.39 window — the
+      # tenant image's bucket choice and this one differ for the same
+      # glibc-matching reason, each matched to where it runs.
+      - name: Fetch the pinned tinymemory module artifact
+        run: |
+          version="1.1.0"
+          archive="tinymemory-module-${version}-ubuntu-24.04-x86_64.tar.gz"
+          sha256="f5f10a71d1cdc58f91e6d1ac77c2b966dc9ede322a2ccf63048c1aeaf24e49a5"
+          curl -fsSL -o "$RUNNER_TEMP/$archive"             "https://github.com/tinyhumansai/tinymemory/releases/download/v${version}/${archive}"
+          echo "${sha256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/tinymemory-module"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/tinymemory-module"
+          # BOTH files, and the library is the load-bearing one. The tests are
+          # gated on TINYMEMORY_TEST_MODULE pointing at a real file and SKIP
+          # themselves when it does not — and a skipped `#[ignore]`d test still
+          # prints `test result: ok. 1 passed`, so the greps below would pass a
+          # lane that never loaded the module. Checking only `modules.toml`
+          # left exactly that hole open.
+          test -f "$RUNNER_TEMP/tinymemory-module/modules.toml"
+          test -f "$RUNNER_TEMP/tinymemory-module/libtinymemory_module.so"
+
+      - name: Module conformance against the real artifact
+        env:
+          TINYMEMORY_TEST_MODULE: ${{ runner.temp }}/tinymemory-module/libtinymemory_module.so
+          OPENCOMPANY_MEMORY_MODULE_PATH: ${{ runner.temp }}/tinymemory-module/libtinymemory_module.so
+        run: |
+          cargo test --locked --features tinymemory-module,tinymemory-embedded --lib --             --ignored --test-threads=1 the_module_driver_upholds_the_contract             | tee /tmp/module-e2e.log
+          grep -q "test result: ok. 1 passed" /tmp/module-e2e.log
+
+      - name: Module-vs-namespace differential against the real artifact
+        env:
+          TINYMEMORY_TEST_MODULE: ${{ runner.temp }}/tinymemory-module/libtinymemory_module.so
+          OPENCOMPANY_MEMORY_MODULE_PATH: ${{ runner.temp }}/tinymemory-module/libtinymemory_module.so
+        run: |
+          cargo test --locked --features tinymemory-module,tinymemory-embedded --lib --             --ignored --test-threads=1 the_module_and_namespace_drivers_agree             | tee /tmp/module-diff.log
+          grep -q "test result: ok. 1 passed" /tmp/module-diff.log
 
       # The ACP surface. Two invocations, not one: `run-scoped-suite.sh` takes
       # exactly one filter, and a second bare argument to `cargo test` narrows

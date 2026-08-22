@@ -194,19 +194,26 @@ pub fn open_driver(
                 // bind through this seam — see the module docs.
                 return Ok(None);
             };
-            if driver_id != NAMESPACE_DRIVER_ID {
+            if driver_id == MODULE_DRIVER_ID {
+                // The loadable TinyMemory module (issue #1524): in-process
+                // native code over the module bus — `Embedded` is the honest
+                // class, no egress, same trust posture as `namespace`.
+                let class = admit(MODULE_DRIVER_ID, DriverClass::Embedded)?;
+                (module_provider(config)?, class)
+            } else if driver_id == NAMESPACE_DRIVER_ID {
+                let class = admit(NAMESPACE_DRIVER_ID, DriverClass::Embedded)?;
+                (namespace_provider(config)?, class)
+            } else {
                 return Err(MemoryDriverError(format!(
                     "OPENCOMPANY_MEMORY=embedded with OPENCOMPANY_MEMORY_DRIVER=\
-                     {driver_id} names a driver this mode cannot bind. The only \
-                     embedded contract driver is `{NAMESPACE_DRIVER_ID}`; unset \
-                     OPENCOMPANY_MEMORY_DRIVER to keep the incumbent engine \
-                     overlay, or switch OPENCOMPANY_MEMORY=remote for a hosted \
-                     engine."
+                     {driver_id} names a driver this mode cannot bind. The \
+                     embedded contract drivers are `{NAMESPACE_DRIVER_ID}` and \
+                     `{MODULE_DRIVER_ID}`; unset OPENCOMPANY_MEMORY_DRIVER to \
+                     keep the incumbent engine overlay, or switch \
+                     OPENCOMPANY_MEMORY=remote for a hosted engine."
                 ))
                 .into());
             }
-            let class = admit(NAMESPACE_DRIVER_ID, DriverClass::Embedded)?;
-            (namespace_provider(config)?, class)
         }
         MemoryMode::Null => {
             let admission = admit(NULL_DRIVER_ID, DriverClass::Null)?;
@@ -329,13 +336,25 @@ fn require<'a>(value: Option<&'a str>, refusal: &str) -> Result<&'a str> {
 ///    under the checks meant for the other class — so it is refused rather than
 ///    quietly resolved in the registry's favour.
 fn admit(driver_id: &str, expected: DriverClass) -> Result<DriverClass> {
-    // `namespace` is `tinymemory-core`'s own durable store; the vendored
-    // registry does not know it, and `with_reserved` is the registry's door
-    // for exactly that ("a host that bundles an adapter this crate does not
-    // know about"). Reserved unconditionally — with the `tinymemory-embedded`
-    // feature off, nothing reaches this function with that id.
-    let registry =
-        DriverRegistry::builtin().with_reserved(NAMESPACE_DRIVER_ID, DriverClass::Embedded);
+    // `namespace` is `tinymemory-core`'s own durable store. Since the v1.1.0
+    // pin the vendored registry reserves the id itself
+    // (`registry/mod.rs:182`), so this `with_reserved` restates the same
+    // class the builtin table already carries — kept deliberately: repeating
+    // a reserved id's class is the one thing the registry's own rule permits
+    // ("may repeat, never override"), and the host-side line keeps the
+    // reservation visible where the driver is routed rather than only inside
+    // the vendor. Reserved unconditionally: with `tinymemory-embedded`
+    // disabled this function still runs for the id — admission comes first —
+    // and the feature-off `namespace_provider` fallback then rejects the
+    // bind, which is the fail-closed half of the pair.
+    let registry = DriverRegistry::builtin()
+        .with_reserved(NAMESPACE_DRIVER_ID, DriverClass::Embedded)
+        // The loadable module (issue #1524): reserved with the same class
+        // reasoning as `namespace` — in-process native code, no egress —
+        // and unconditionally for the same fail-closed reason: without the
+        // `tinymemory-module` feature, `module_provider` refuses the bind
+        // after admission names the missing feature.
+        .with_reserved(MODULE_DRIVER_ID, DriverClass::Embedded);
     // Trust is asserted by the host for a driver the host itself selected from
     // its own configuration: reaching this line already means the operator named
     // the engine and supplied its endpoint and credential. The registry's
@@ -421,6 +440,14 @@ pub const SUPPORTED_REMOTE_DRIVERS: [&str; 3] =
 /// configured id disagreed with its reported id would make status output lie.
 pub const NAMESPACE_DRIVER_ID: &str = "namespace";
 
+/// The loadable TinyMemory module driver id (issue #1524).
+///
+/// NOT an alias for [`NAMESPACE_DRIVER_ID`]: the module serves a tinycortex
+/// store under `<data_dir>/memory-module`, while `namespace` is
+/// `UnifiedMemory` at `<data_dir>/memory-namespace` — different engine,
+/// different on-disk layout, and aliasing them would strand data silently.
+const MODULE_DRIVER_ID: &str = "module";
+
 /// The subdirectory of the data root holding the contract driver's store.
 ///
 /// Beside — never inside — the incumbent engine's `memory/`: `UnifiedMemory`
@@ -428,6 +455,10 @@ pub const NAMESPACE_DRIVER_ID: &str = "namespace";
 /// `EngineCortex` mints a subdirectory per company under its own, so sharing
 /// one directory would interleave the two schemas and put a company named
 /// anything that sanitises to `namespaces` on top of the store's own layout.
+// Gated with its only consumer (`namespace_provider`): the new strict
+// `acp,runner,tinymemory` clippy lane compiles this file without
+// `tinymemory-embedded`, where an ungated const is dead code.
+#[cfg(feature = "tinymemory-embedded")]
 const NAMESPACE_STORE_SUBDIR: &str = "memory-namespace";
 
 /// Builds the in-pod contract driver over `tinymemory-core`'s durable store.
@@ -489,6 +520,37 @@ fn namespace_provider(_config: &MemoryDriverConfig) -> Result<Arc<dyn MemoryProv
     Err(MemoryDriverError(format!(
         "OPENCOMPANY_MEMORY_DRIVER={NAMESPACE_DRIVER_ID} requires a build with the \
          `tinymemory-embedded` feature"
+    ))
+    .into())
+}
+
+/// Builds the loadable-module driver (issue #1524).
+///
+/// Synchronous with no I/O, like every constructor on this path: the provider
+/// resolves the bus, the load and its proxies lazily on first use, because
+/// `open_driver` is reached by thousands of pre-boot test callers with no
+/// tokio runtime.
+#[cfg(feature = "tinymemory-module")]
+fn module_provider(config: &MemoryDriverConfig) -> Result<Arc<dyn MemoryProvider>> {
+    let Some(data_dir) = config.data_dir.clone() else {
+        return Err(MemoryDriverError(format!(
+            "OPENCOMPANY_MEMORY_DRIVER={MODULE_DRIVER_ID} stores under \
+             <data_dir>/{subdir}/ and no data dir is configured. Set \
+             OPENCOMPANY_DATA_DIR.",
+            subdir = crate::store::memory::module::ops::MODULE_STORE_SUBDIR,
+        ))
+        .into());
+    };
+    Ok(Arc::new(
+        crate::store::memory::module::provider::ModuleMemoryProvider::new(data_dir),
+    ))
+}
+
+#[cfg(not(feature = "tinymemory-module"))]
+fn module_provider(_config: &MemoryDriverConfig) -> Result<Arc<dyn MemoryProvider>> {
+    Err(MemoryDriverError(format!(
+        "OPENCOMPANY_MEMORY_DRIVER={MODULE_DRIVER_ID} requires a build with the \
+         `tinymemory-module` feature"
     ))
     .into())
 }
@@ -687,6 +749,49 @@ mod test {
         cfg.driver_id = Some(NAMESPACE_DRIVER_ID.into());
         let error = open_driver(&cfg).err().unwrap().to_string();
         assert!(error.contains("tinymemory-embedded"), "{error}");
+    }
+
+    #[test]
+    fn the_module_driver_without_a_data_dir_refuses_and_names_the_knob() {
+        let mut cfg = config(MemoryMode::Embedded);
+        cfg.driver_id = Some(MODULE_DRIVER_ID.into());
+        let error = open_driver(&cfg).err().unwrap().to_string();
+        // Feature off: the missing-feature refusal fires first and is the
+        // honest answer; feature on: the missing data dir is.
+        assert!(
+            error.contains("OPENCOMPANY_DATA_DIR") || error.contains("tinymemory-module"),
+            "{error}"
+        );
+    }
+
+    #[cfg(not(feature = "tinymemory-module"))]
+    #[test]
+    fn the_module_driver_without_the_feature_names_the_feature() {
+        let mut cfg = config(MemoryMode::Embedded);
+        cfg.driver_id = Some(MODULE_DRIVER_ID.into());
+        cfg.data_dir = Some(std::path::PathBuf::from("/tmp/never-used"));
+        let error = open_driver(&cfg).err().unwrap().to_string();
+        assert!(error.contains("tinymemory-module"), "{error}");
+    }
+
+    #[cfg(feature = "tinymemory-module")]
+    #[test]
+    fn the_module_driver_binds_lazily_with_class_embedded_and_audits_clean() {
+        // Binding is synchronous, does no I/O, and touches neither the bus nor
+        // the artifact — the module loads on first USE, not at bind. So this
+        // proves the routing, the reserved-id admission, the class, and the
+        // narrow advertisement's audit, all without a module present.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(MemoryMode::Embedded);
+        cfg.driver_id = Some(MODULE_DRIVER_ID.into());
+        cfg.data_dir = Some(dir.path().to_path_buf());
+        let (provider, class) = open_driver(&cfg).unwrap().unwrap();
+        assert_eq!(class, DriverClass::Embedded);
+        assert_eq!(provider.driver_id(), MODULE_DRIVER_ID);
+        assert!(
+            tinymemory_api::provider::audit_provider(provider.as_ref()).is_ok(),
+            "the module driver failed its capability audit"
+        );
     }
 
     #[cfg(feature = "tinymemory-embedded")]

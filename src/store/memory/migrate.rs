@@ -12,12 +12,13 @@
 //!
 //! # Failure is a stop, never a guess
 //!
-//! The contract's error type is still one coarse variant (`MemoryError::Other`
-//! — tinymemory#18 §A4), so mid-migration this code cannot tell a transient
-//! 500 from a real rejection. It therefore never retries (an import retried
-//! into a driver that half-applied the page could double-write) and instead
-//! stops at the first failed page, reporting the cursor that *started* that
-//! page. `--resume-cursor` re-enters there safely because import is
+//! The contract's §A4 taxonomy (13 wire-named `MemoryError` variants since
+//! tinymemory v1.1.0) means a transient `Timeout`/`Unavailable`/`Unreachable`
+//! is now distinguishable from a real rejection — but this code still never
+//! retries, and that decision does not rest on the taxonomy: an import
+//! retried into a driver that half-applied the page could double-write, and
+//! no error class proves how much of a page landed. It stops at the first
+//! failed page, reporting the cursor that *started* that page. `--resume-cursor` re-enters there safely because import is
 //! idempotent by `(namespace, key)`: a driver that recognises a present
 //! record reports it `skipped`, and one that does not simply overwrites in
 //! place — either way, re-running the failed page cannot duplicate.
@@ -348,9 +349,62 @@ pub fn resolve_migrate_configs(
                     .into(),
             ));
         }
+        "module" => {
+            // The same durability refusal the namespace arm carries: on a
+            // mongodb base the default data dir is ephemeral scratch, and a
+            // migration that "succeeds" into it is data loss with a success
+            // message.
+            if settings.kind == StorageKind::Mongodb
+                && to_data_dir.is_none()
+                && !settings.allow_ephemeral_memory
+            {
+                return Err(OpenCompanyError::Config(
+                    "OPENCOMPANY_STORAGE=mongodb treats the data dir as ephemeral scratch. \
+                     Migrating the module store into it would report success on data the next \
+                     container replacement deletes. Pass --to-data-dir pointing at a durable \
+                     volume, or assert durability with OPENCOMPANY_MEMORY_ALLOW_EPHEMERAL=1."
+                        .into(),
+                ));
+            }
+            // A loaded module is a process singleton — tinybus never unloads
+            // and refuses a second setup — so module→module cannot mean two
+            // stores. Refused by NAME here rather than discovered as a hang
+            // when the second bind waits on a bus that will never serve it
+            // (issue #1524). Every other FROM may migrate INTO the module:
+            // one load, one store, the import writes through it.
+            if from_config
+                .driver_id
+                .as_deref()
+                .is_some_and(|id| id == "module")
+            {
+                return Err(OpenCompanyError::Config(
+                    "--to module while OPENCOMPANY_MEMORY_DRIVER=module is module→module: a \
+                     loaded module is a process singleton serving ONE store, so there is no \
+                     second side to migrate into. Migrate via an intermediate engine, or move \
+                     the data dir offline."
+                        .into(),
+                ));
+            }
+            let data_dir = to_data_dir.clone().or_else(|| settings.data_dir.clone());
+            if data_dir.is_none() {
+                return Err(OpenCompanyError::Config(
+                    "--to module needs a directory for the target store: pass --to-data-dir \
+                     (OPENCOMPANY_DATA_DIR also serves as its default when set)."
+                        .into(),
+                ));
+            }
+            MemoryDriverConfig {
+                mode: MemoryMode::Embedded,
+                driver_id: Some(to.to_string()),
+                url: None,
+                api_key: None,
+                data_dir,
+            }
+        }
         other => {
             return Err(OpenCompanyError::Config(format!(
-                "--to {other} names no migratable driver: namespace, supermemory, mem0, cognee."
+                "--to {other} names no migratable driver: namespace, supermemory, mem0, cognee, \
+                 module."
             )));
         }
     };
@@ -853,6 +907,39 @@ mod test {
                 .to_string();
             assert!(err.contains(needle), "backend {backend:?}: {err}");
         }
+    }
+
+    #[test]
+    fn module_to_module_refuses_by_name_and_other_sources_may_target_the_module() {
+        // module→module: a loaded module is a process singleton serving one
+        // store, so there is no second side — refused with the named reason,
+        // never discovered as a hang (issue #1524).
+        let settings = StorageSettings {
+            memory_backend: MemoryBackend::Tinycortex,
+            memory_driver: Some("module".into()),
+            ..base_settings()
+        };
+        let err = resolve(&settings, "module", None, None)
+            .expect_err("module→module")
+            .to_string();
+        assert!(err.contains("process singleton"), "{err}");
+
+        // Any other FROM may migrate INTO the module: one load, one store.
+        let (from, to) = resolve(&base_settings(), "module", None, None).expect("remote→module");
+        assert_eq!(from.driver_id.as_deref(), Some("supermemory"));
+        assert_eq!(to.driver_id.as_deref(), Some("module"));
+        assert_eq!(to.mode, MemoryMode::Embedded);
+        assert_eq!(to.data_dir.as_deref(), Some(std::path::Path::new("/data")));
+
+        // And the target still needs a directory, in its own vocabulary.
+        let no_dir = StorageSettings {
+            data_dir: None,
+            ..base_settings()
+        };
+        let err = resolve(&no_dir, "module", None, None)
+            .expect_err("no dir")
+            .to_string();
+        assert!(err.contains("--to-data-dir"), "{err}");
     }
 
     #[test]

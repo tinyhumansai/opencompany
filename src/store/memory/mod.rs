@@ -69,6 +69,8 @@
 pub mod driver;
 pub mod facades;
 pub mod migrate;
+#[cfg(feature = "tinymemory-module")]
+pub mod module;
 mod namespace;
 
 use std::sync::Arc;

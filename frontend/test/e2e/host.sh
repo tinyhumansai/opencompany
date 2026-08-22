@@ -128,7 +128,12 @@ host_env=(
   "OPENCOMPANY_DATA_DIR=$data_dir"
 )
 
-passthrough=(HOME PATH TMPDIR TZ LANG LC_ALL RUST_LOG RUST_BACKTRACE)
+# The memory-engine knobs ride through when the caller sets them (issue
+# #1524, wiring row 8): a module-driver canary spec needs the env pair and
+# the artifact path to survive `env -i`, and set-if-present semantics keep
+# every existing run byte-identical — unset variables pass nothing.
+passthrough=(HOME PATH TMPDIR TZ LANG LC_ALL RUST_LOG RUST_BACKTRACE
+  OPENCOMPANY_MEMORY OPENCOMPANY_MEMORY_DRIVER OPENCOMPANY_MEMORY_MODULE_PATH)
 if [[ -n "${PW_HOST_PASSTHROUGH:-}" ]]; then
   # Deliberate word splitting: this variable is a list of variable NAMES.
   # shellcheck disable=SC2206

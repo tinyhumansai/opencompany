@@ -52,6 +52,7 @@ openhuman      | tested       | openhuman,tinycortex            | `rust-gated` r
 tinycortex     | tested       | openhuman,tinycortex            | Same lane, same unfiltered `--tests`.
 tinymemory     | partial      | acp,runner,tinymemory | store::memory store::select
 tinymemory-embedded | partial | openhuman,tinycortex,tinymemory-embedded | store::memory store::select
+tinymemory-module | partial | tinymemory-module | store::memory::module
 tinyplace      | tested       | tinyplace                       | Runs the whole `--lib` deliberately (issue #477) — it gates code across the tree.
 
 # --- Partial: a lane exists, but filtered ----------------------------------
