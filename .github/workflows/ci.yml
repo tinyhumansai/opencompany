@@ -848,6 +848,36 @@ jobs:
       - name: Clippy (openhuman, tinycortex)
         run: cargo clippy --locked --no-deps --features openhuman,tinycortex --all-targets -- -D warnings
 
+      # Issue #1524 (PR 1). `pub mod memory` is gated on `tinymemory`
+      # (`store/mod.rs`), and neither strict lane enabled that gate: the
+      # default-features clippy lints a tree where the module does not exist,
+      # and the step above compiles without it. `store::memory` was therefore
+      # linted by NO `-D warnings` lane at all — the silent-uncoverage class
+      # this job's own comments keep warning about. Same `--no-deps` reasoning
+      # as the step above; the union set matches the test steps below, so the
+      # compile is shared with them via the cache.
+      - name: Clippy (acp, runner, tinymemory)
+        run: cargo clippy --locked --no-deps --features acp,runner,tinymemory --all-targets -- -D warnings
+
+      # Issue #1524 (PR 1). The nested-vendor path deps must stay
+      # byte-identical to openhuman's own, or cargo resolves the same crate
+      # from two directories and two `MemoryProvider` traits exist in one
+      # process (the hazard recorded at `Cargo.toml:249-252`). `-d` prints
+      # duplicate versions of a package; any `tinymemory` line in that report
+      # is the failure.
+      - name: Assert no duplicated tinymemory crates
+        run: |
+          # Two separate failures, checked separately: a broken resolve must
+          # fail loudly, not read as "no duplicates" through an empty pipe.
+          if ! report="$(cargo tree --locked -e normal --features openhuman,tinycortex,tinymemory-embedded -d)"; then
+            echo "::error::cargo tree failed to resolve the graph"
+            exit 1
+          fi
+          if grep -E "^tinymemory" <<< "$report"; then
+            echo "::error::duplicated tinymemory-* package in the resolve graph"
+            exit 1
+          fi
+
       # `--tests` is LOAD-BEARING IN BOTH DIRECTIONS. Do not narrow it back to
       # `--lib`, and do not widen it to a bare `cargo test`.
       #

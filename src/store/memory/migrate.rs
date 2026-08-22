@@ -12,12 +12,13 @@
 //!
 //! # Failure is a stop, never a guess
 //!
-//! The contract's error type is still one coarse variant (`MemoryError::Other`
-//! — tinymemory#18 §A4), so mid-migration this code cannot tell a transient
-//! 500 from a real rejection. It therefore never retries (an import retried
-//! into a driver that half-applied the page could double-write) and instead
-//! stops at the first failed page, reporting the cursor that *started* that
-//! page. `--resume-cursor` re-enters there safely because import is
+//! The contract's §A4 taxonomy (13 wire-named `MemoryError` variants since
+//! tinymemory v1.1.0) means a transient `Timeout`/`Unavailable`/`Unreachable`
+//! is now distinguishable from a real rejection — but this code still never
+//! retries, and that decision does not rest on the taxonomy: an import
+//! retried into a driver that half-applied the page could double-write, and
+//! no error class proves how much of a page landed. It stops at the first
+//! failed page, reporting the cursor that *started* that page. `--resume-cursor` re-enters there safely because import is
 //! idempotent by `(namespace, key)`: a driver that recognises a present
 //! record reports it `skipped`, and one that does not simply overwrites in
 //! place — either way, re-running the failed page cannot duplicate.
