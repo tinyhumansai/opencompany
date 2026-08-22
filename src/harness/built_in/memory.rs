@@ -373,6 +373,18 @@ mod tests {
             Ok(guard.len() < before)
         }
 
+        async fn delete_label(
+            &self,
+            _id: &CompanyId,
+            addr: &ChunkAddr,
+            label: &str,
+        ) -> crate::Result<bool> {
+            let mut guard = self.chunks.lock().unwrap();
+            let before = guard.len();
+            guard.retain(|(a, c)| !(a == addr && c.label == label));
+            Ok(guard.len() < before)
+        }
+
         async fn search(
             &self,
             _id: &CompanyId,

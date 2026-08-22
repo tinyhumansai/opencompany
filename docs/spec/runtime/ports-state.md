@@ -210,10 +210,25 @@ pub trait ContextStore: Send + Sync {
     async fn list(&self, id: &CompanyId, prefix: &str) -> Result<Vec<ChunkMeta>>;
     async fn peek(&self, id: &CompanyId, addr: &ChunkAddr, range: Option<Range<usize>>)
         -> Result<String>;
+    async fn peek_many(&self, id: &CompanyId, addrs: &[ChunkAddr])
+        -> Result<Vec<Option<String>>>; // defaulted: loops peek
     async fn search(&self, id: &CompanyId, query: &str, limit: usize)
         -> Result<Vec<ChunkHit>>;
+    async fn delete(&self, id: &CompanyId, addr: &ChunkAddr) -> Result<bool>;
+    async fn delete_label(&self, id: &CompanyId, addr: &ChunkAddr, label: &str)
+        -> Result<bool>;
 }
 ```
+
+Chunks are content-addressed: byte-identical bodies share one address, and
+every backend keeps one claim per `(addr, label)` (issue #1300 — a re-`put`
+of an identical body under a new label lands that label's claim; under an
+identical label it is a no-op). `delete` is address-level and takes every
+claim with the body — the operator's hard-delete. `delete_label` removes one
+claim and reaps the body only with the last one, decided atomically inside
+the backend, which is what lets `memory_forget` and the fact-mirror reap
+remove their own claim on a shared address without racing a concurrent
+identical-content write.
 
 ## SecretStore
 

@@ -1824,6 +1824,14 @@ mod tests {
         ) -> crate::Result<bool> {
             Ok(false)
         }
+        async fn delete_label(
+            &self,
+            _: &CompanyId,
+            _: &crate::ports::types::ChunkAddr,
+            _: &str,
+        ) -> crate::Result<bool> {
+            Ok(false)
+        }
     }
 
     /// A no-op company store — `build_agent` only needs a handle; nothing here

@@ -38,9 +38,12 @@
 //! surfaces everything — task outcomes, operator-fact mirrors, other agents'
 //! memories — but delete is scoped to what this agent deliberately stored:
 //! task outcomes are the loop's record, and operator facts are the operator's.
-//! The guard is a list-membership check against the agent's own prefix before
-//! the port delete, so a hallucinated or copied address cannot reach anyone
-//! else's rows.
+//! The guard is a list-membership check against the agent's own prefix, and
+//! the delete itself is **label-scoped** (`ContextStore::delete_label`, issue
+//! #1300): it removes exactly this agent's own claims, so a hallucinated or
+//! copied address cannot reach anyone else's rows even when byte-identical
+//! content put their label on the same content address — the other labels
+//! keep the body, which is reaped only with its last claim.
 
 use std::sync::Arc;
 
@@ -331,8 +334,9 @@ impl Tool for MemoryForgetTool {
     fn description(&self) -> &str {
         "Discard one memory YOU deliberately stored with `memory_store`, by the addr \
          `memory_recall` reported — for something that stopped being true or was stored in \
-         error. Cannot touch task outcomes, operator facts, or other agents' memories. \
-         Forgetting an already-forgotten addr is a no-op, not an error."
+         error. Cannot touch task outcomes, operator facts, or other agents' memories; if \
+         someone else stored identical text, only your own copy is forgotten. Forgetting an \
+         already-forgotten addr is a no-op, not an error."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -362,21 +366,21 @@ impl Tool for MemoryForgetTool {
         if addr.is_empty() {
             return Ok(ToolResult::error("`addr` is required.".to_string()));
         }
-        // The scope guard: the addr must belong to THIS agent's own
+        // The scope guard: the addr must carry a label under THIS agent's own
         // deliberate-memory prefix. Checked against the store's own index at
         // call time — not against anything the model asserted — so a copied or
         // hallucinated address outside the prefix is refused, never deleted.
         //
-        // KNOWN RACE (#1300): this check is a snapshot — see
-        // reap_fact_mirror's twin note; the label-scoped delete tracked
-        // there closes it by construction.
-        //
-        // And checked against the WHOLE index, not just the agent's slice:
-        // chunks are content-addressed, so `ContextStore::delete` removes the
-        // address — every label pointing at that body goes with it. If any
-        // OTHER row (another agent's byte-identical memory, a task outcome
-        // with the same text) shares this address, deleting it would delete
-        // theirs too; refuse instead, naming why.
+        // The delete below is label-scoped (`ContextStore::delete_label`,
+        // issue #1300): it removes exactly this agent's own claims on the
+        // address, so a shared address — another agent's byte-identical
+        // memory, a task outcome with the same text — keeps every other row,
+        // and the body is reaped only with its last claim, atomically inside
+        // the port. That closes the two holes the old address-level delete
+        // had: a shared address no longer forces a refusal (which let anyone
+        // make an agent's memory un-forgettable by storing identical text),
+        // and the list below is advisory rather than a racy snapshot guard (a
+        // concurrent identical-content write can no longer lose its row).
         let all = self.mem.context.list(&self.mem.company, "").await?;
         let own_prefix = self.mem.own_prefix();
         let at_addr: Vec<&str> = all
@@ -395,7 +399,12 @@ impl Tool for MemoryForgetTool {
                 "`{addr}` was already gone; nothing to forget."
             )));
         }
-        if !at_addr.iter().any(|label| label.starts_with(&own_prefix)) {
+        let own: Vec<String> = at_addr
+            .iter()
+            .filter(|label| label.starts_with(&own_prefix))
+            .map(|label| label.to_string())
+            .collect();
+        if own.is_empty() {
             return Ok(ToolResult::error(format!(
                 "`{addr}` is not one of your own stored memories, so it cannot be forgotten from \
                  here. Task outcomes are the turn loop's record, and operator facts belong to \
@@ -403,23 +412,26 @@ impl Tool for MemoryForgetTool {
                  ones under `{own_prefix}`."
             )));
         }
-        if at_addr.iter().any(|label| !label.starts_with(&own_prefix)) {
-            return Ok(ToolResult::error(format!(
-                "`{addr}` is shared: this content is stored under other labels too (memory is \
-                 content-addressed, and identical text shares one address), so deleting it would \
-                 delete theirs as well. It stays. If your copy stops being true, store a \
-                 correction with `memory_store` instead."
-            )));
+        let shared = at_addr.iter().any(|label| !label.starts_with(&own_prefix));
+        let chunk_addr = ChunkAddr::new(addr.to_string());
+        let mut removed = false;
+        for label in &own {
+            removed |= self
+                .mem
+                .context
+                .delete_label(&self.mem.company, &chunk_addr, label)
+                .await?;
         }
-        let removed = self
-            .mem
-            .context
-            .delete(&self.mem.company, &ChunkAddr::new(addr.to_string()))
-            .await?;
-        Ok(ToolResult::success(if removed {
-            format!("Forgotten: `{addr}`. It will no longer surface in recall.")
-        } else {
+        Ok(ToolResult::success(if !removed {
             format!("`{addr}` was already gone; nothing to forget.")
+        } else if shared {
+            format!(
+                "Forgotten: `{addr}`. Your memory is gone. The same text is also stored under \
+                 other labels (a task record or another agent's memory), which keep their own \
+                 copies — recall may still surface it from those rows."
+            )
+        } else {
+            format!("Forgotten: `{addr}`. It will no longer surface in recall.")
         }))
     }
 }
@@ -528,12 +540,14 @@ mod test {
         }
     }
 
-    /// Content addressing means byte-identical bodies share ONE address, and
-    /// the port deletes by address. A forget whose address is shared with any
-    /// other row — another agent's identical memory here — must refuse, and
-    /// both rows must survive.
+    /// Content addressing means byte-identical bodies share ONE address. A
+    /// forget of a shared address removes exactly the caller's own claim
+    /// (label-scoped delete, #1300): the other agent's row and the body both
+    /// survive, and the caller is told the text lives on under other labels.
+    /// This replaces the old refusal, which let any agent make another's
+    /// memory permanently un-forgettable by storing identical text.
     #[tokio::test]
-    async fn forget_refuses_a_shared_address_instead_of_deleting_both() {
+    async fn forget_of_a_shared_address_removes_only_the_callers_claim() {
         let dir = tempfile::tempdir().unwrap();
         let company = CompanyId::new("acme");
         let context = ctx(dir.path());
@@ -550,22 +564,37 @@ mod test {
             .await
             .unwrap();
 
-        let refused = ceo_forget
+        let forgotten = ceo_forget
             .execute(json!({"addr": addr.clone()}))
             .await
             .unwrap();
-        assert!(refused.is_error, "shared address must refuse: {refused:?}");
-        assert!(refused.text().contains("shared"));
-        // Both label rows survive.
+        assert!(
+            !forgotten.is_error,
+            "a shared address must forget the caller's own claim: {forgotten:?}"
+        );
+        assert!(
+            forgotten.text().contains("other labels"),
+            "the reply must say the text lives on elsewhere: {forgotten:?}"
+        );
+        // Exactly the researcher's row remains, and the body with it.
         let rows = context
             .list(&company, AGENT_MEMORY_LABEL_PREFIX)
             .await
             .unwrap();
-        assert_eq!(
-            rows.iter().filter(|m| m.addr.as_ref() == addr).count(),
-            2,
-            "no row may vanish on a refusal"
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter(|m| m.addr.as_ref() == addr)
+            .map(|m| m.label.as_str())
+            .collect();
+        assert_eq!(labels.len(), 1, "only the ceo's claim may go: {labels:?}");
+        assert!(
+            labels[0].starts_with("agent-memory/researcher/"),
+            "{labels:?}"
         );
+        context
+            .peek(&company, &ChunkAddr::new(addr), None)
+            .await
+            .expect("the body must survive under the researcher's claim");
     }
 
     /// The regression lock the #1290 review found missing: deleting the

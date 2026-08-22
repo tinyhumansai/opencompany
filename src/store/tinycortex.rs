@@ -92,6 +92,10 @@ pub trait CortexClient: Send + Sync {
     /// Permanently removes the chunk at `addr`, returning whether it existed.
     /// Propagates to the backing store.
     async fn hard_delete_chunk(&self, company: &str, addr: &str) -> Result<bool>;
+    /// Removes `label`'s claim on the chunk at `addr` (issue #1300), reaping
+    /// the chunk when the last claim goes; returns whether that (addr, label)
+    /// pairing existed. Propagates to the backing store.
+    async fn delete_chunk_label(&self, company: &str, addr: &str, label: &str) -> Result<bool>;
     /// Rewrites every occurrence of `needle` with `replacement` across a
     /// company's traces (live and archived) and chunk bodies, returning the
     /// number of occurrences replaced. Propagates to the backing store.
@@ -200,8 +204,14 @@ impl CortexClient for InMemoryCortex {
 
     async fn put_chunk(&self, company: &str, addr: &str, chunk: ContextChunk) -> Result<()> {
         self.with_company(company, |c| {
-            // Content-addressed: an identical body is stored once.
-            if !c.chunks.iter().any(|s| s.addr == addr) {
+            // Content-addressed, one row per (addr, label) claim (#1300): an
+            // identical body under a new label lands its row, a re-put of an
+            // identical (addr, label) is a no-op.
+            if !c
+                .chunks
+                .iter()
+                .any(|s| s.addr == addr && s.label == chunk.label)
+            {
                 c.chunks.push(StoredChunk {
                     addr: addr.to_string(),
                     label: chunk.label,
@@ -262,6 +272,17 @@ impl CortexClient for InMemoryCortex {
         Ok(self.with_company(company, |c| {
             let before = c.chunks.len();
             c.chunks.retain(|s| s.addr != addr);
+            before != c.chunks.len()
+        }))
+    }
+
+    async fn delete_chunk_label(&self, company: &str, addr: &str, label: &str) -> Result<bool> {
+        // One row per (addr, label), so removing the claim IS removing the
+        // row; the body is gone exactly when the last row goes. Atomic under
+        // the cells mutex, like every other mutation here.
+        Ok(self.with_company(company, |c| {
+            let before = c.chunks.len();
+            c.chunks.retain(|s| !(s.addr == addr && s.label == label));
             before != c.chunks.len()
         }))
     }
@@ -480,6 +501,12 @@ impl ContextStore for CortexContextStore {
             .hard_delete_chunk(id.as_ref(), addr.as_ref())
             .await
     }
+
+    async fn delete_label(&self, id: &CompanyId, addr: &ChunkAddr, label: &str) -> Result<bool> {
+        self.client
+            .delete_chunk_label(id.as_ref(), addr.as_ref(), label)
+            .await
+    }
 }
 
 /// Builds a [`MemoryStore`] + [`ContextStore`] pair over one shared
@@ -561,6 +588,27 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let (_store, _events, _mem, ctx) = stores(dir.path());
         conformance::assert_multibyte_bodies_survive_search_and_ranged_peek(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_identical_body_two_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_identical_body_two_labels(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_delete_label_scoped(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_survives_a_concurrent_identical_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_delete_label_survives_a_concurrent_identical_put(ctx).await;
     }
 
     fn company() -> CompanyId {

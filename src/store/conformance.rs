@@ -33,8 +33,8 @@ use crate::ports::skills_state::{SkillSource, SkillState, SkillStateStore};
 use crate::ports::store::CompanyStore;
 use crate::ports::tasks::{TaskRecord, TaskStore};
 use crate::ports::types::{
-    ChunkAddr, CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk, EventSeq,
-    LedgerEntry, TemplateProvenance,
+    ChunkAddr, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk,
+    EventSeq, LedgerEntry, TemplateProvenance,
 };
 use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
 use crate::ports::users::{InviteRecord, UserRecord, UserRole, UserStatus, UserStore};
@@ -2346,11 +2346,13 @@ pub async fn assert_fact_store(facts: Arc<dyn FactStore>) {
 /// so without a per-chunk stamp the stat can only reflect operator-authored
 /// facts (see `server::ops::memory::memory_stats`).
 ///
-/// Deliberately says nothing about re-`put`ting an identical body: the backends
-/// genuinely differ there (sqlite/mongo dedupe on the content address and keep
-/// the first write, the fs index appends a second line), and pinning one
-/// behaviour here would assert a contract the suite's own backends do not share.
-/// Readers of the stamp take the max across chunks for that reason.
+/// Deliberately says nothing about a re-`put`'s effect on the stamp: every
+/// backend keeps one claim per (addr, label) since #1300 (see
+/// [`assert_identical_body_two_labels`]), but a *new* label on an existing
+/// body stamps per-label on fs/sqlite and keeps the address's first-write
+/// stamp on the single-record backends (mongodb, the provider facade, the
+/// tinycortex engine). Readers of the stamp take the max across chunks for
+/// that reason.
 pub async fn assert_context_chunk_stamps(context: Arc<dyn ContextStore>) {
     let alpha = CompanyId::new("alpha");
     let beta = CompanyId::new("beta");
@@ -2474,6 +2476,302 @@ pub async fn assert_multibyte_bodies_survive_search_and_ranged_peek(
 
     // A range ending inside the first "é" widens to its boundary.
     assert_eq!(context.peek(&alpha, &addr, Some(0..1)).await.unwrap(), "é");
+}
+
+/// Asserts byte-identical bodies under two labels both land (issue #1300):
+/// one content address, one claim per (addr, label), on every backend.
+///
+/// Before #1300 the backends diverged exactly here — the fs index appended a
+/// row per put (including duplicates), while sqlite/mongodb/the provider
+/// facade were first-write-wins on the address, answering a success receipt
+/// for a second label that never landed. A caller listing by their label then
+/// found nothing on those backends and everything on fs, and nothing pinned
+/// either behaviour because every other case in this suite uses distinct
+/// bodies.
+pub async fn assert_identical_body_two_labels(context: Arc<dyn ContextStore>) {
+    let company = CompanyId::new("alpha");
+    let twin = "twin body: byte-identical under two labels";
+    let first = context
+        .put(
+            &company,
+            ContextChunk {
+                label: "labels/first".to_string(),
+                body: twin.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let second = context
+        .put(
+            &company,
+            ContextChunk {
+                label: "labels/second".to_string(),
+                body: twin.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, second, "identical bodies share one content address");
+
+    let labels_at = |metas: &[ChunkMeta]| -> Vec<String> {
+        metas
+            .iter()
+            .filter(|m| m.addr == first)
+            .map(|m| m.label.clone())
+            .collect()
+    };
+    let mut labels = labels_at(&context.list(&company, "labels/").await.unwrap());
+    labels.sort();
+    assert_eq!(
+        labels,
+        ["labels/first", "labels/second"],
+        "both labels must claim the shared address"
+    );
+
+    // And each label's claim is findable through its own prefix — the exact
+    // read that used to answer empty on the first-write-wins backends.
+    let second_only = context.list(&company, "labels/second").await.unwrap();
+    assert_eq!(labels_at(&second_only), ["labels/second"]);
+
+    // Set semantics: a re-put of an identical (body, label) adds nothing.
+    context
+        .put(
+            &company,
+            ContextChunk {
+                label: "labels/first".to_string(),
+                body: twin.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let again = labels_at(&context.list(&company, "labels/").await.unwrap());
+    assert_eq!(
+        again
+            .iter()
+            .filter(|l| l.as_str() == "labels/first")
+            .count(),
+        1,
+        "a re-put of an identical (body, label) must not duplicate the claim: {again:?}"
+    );
+}
+
+/// Asserts [`ContextStore::delete_label`] removes one claim, reaps the body
+/// with the last claim, and answers `false` for claims that are not there
+/// (issue #1300) — and that address-level [`ContextStore::delete`] still
+/// takes every claim at once.
+pub async fn assert_delete_label_scoped(context: Arc<dyn ContextStore>) {
+    let company = CompanyId::new("alpha");
+    let body = "shared claim body for the label-scoped delete";
+    let addr = context
+        .put(
+            &company,
+            ContextChunk {
+                label: "scoped/mine".to_string(),
+                body: body.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    context
+        .put(
+            &company,
+            ContextChunk {
+                label: "scoped/theirs".to_string(),
+                body: body.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !context
+            .delete_label(&company, &addr, "scoped/absent")
+            .await
+            .unwrap(),
+        "an absent label answers false"
+    );
+    assert!(
+        context
+            .delete_label(&company, &addr, "scoped/mine")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !context
+            .delete_label(&company, &addr, "scoped/mine")
+            .await
+            .unwrap(),
+        "a second delete of the same claim answers false"
+    );
+
+    let labels: Vec<String> = context
+        .list(&company, "scoped/")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.addr == addr)
+        .map(|m| m.label)
+        .collect();
+    assert_eq!(
+        labels,
+        ["scoped/theirs"],
+        "only the named label's claim goes"
+    );
+    assert_eq!(
+        context.peek(&company, &addr, None).await.unwrap(),
+        body,
+        "the body survives while any label claims it"
+    );
+
+    assert!(
+        context
+            .delete_label(&company, &addr, "scoped/theirs")
+            .await
+            .unwrap()
+    );
+    assert!(
+        context
+            .list(&company, "scoped/")
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.addr != addr),
+        "no claim may remain after the last label goes"
+    );
+    assert!(
+        context.peek(&company, &addr, None).await.is_err(),
+        "the body is reaped with its last claim"
+    );
+    assert!(
+        !context
+            .delete_label(&company, &addr, "scoped/theirs")
+            .await
+            .unwrap(),
+        "a fully-reaped address answers false"
+    );
+
+    // Address-level delete still takes every claim at once — the operator
+    // semantics `delete_label` deliberately is not.
+    let addr = context
+        .put(
+            &company,
+            ContextChunk {
+                label: "scoped/a".to_string(),
+                body: "whole-address body".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    context
+        .put(
+            &company,
+            ContextChunk {
+                label: "scoped/b".to_string(),
+                body: "whole-address body".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(context.delete(&company, &addr).await.unwrap());
+    assert!(
+        context
+            .list(&company, "scoped/")
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.addr != addr),
+        "address-level delete takes every label's claim"
+    );
+    assert!(!context.delete(&company, &addr).await.unwrap());
+}
+
+/// Asserts a `delete_label` cannot lose a byte-identical write that lands
+/// beside it (issue #1300's TOCTOU half).
+///
+/// The defect this locks: both shared-address guards used to read a snapshot,
+/// decide nothing else claimed the address, and then delete it — so a write
+/// of identical content under another label landing in that window lost its
+/// row. `delete_label` closes it *by construction* only if each backend makes
+/// the claim-removal and the last-claim reap one atomic step (a lock, a
+/// transaction, or a conditional delete). This drives both operations
+/// concurrently, many times, and demands the second writer's claim and body
+/// survive every round.
+///
+/// What it can and cannot prove, stated plainly: the backends that serialise
+/// the two calls against each other (fs on its index lock, sqlite on its
+/// connection, the facade and the engine on their own locks) satisfy this
+/// whatever the interleaving, so here it is a **regression lock** — it fails
+/// if someone removes that serialisation. Only mongodb runs the two against a
+/// server that can genuinely interleave them, and it is the backend whose
+/// atomicity rests on a conditional delete rather than a lock, which is the
+/// case most worth driving. The tasks are spawned rather than awaited in
+/// order, so they interleave at every `.await` even on a current-thread
+/// runtime.
+pub async fn assert_delete_label_survives_a_concurrent_identical_put(
+    context: Arc<dyn ContextStore>,
+) {
+    let company = CompanyId::new("alpha");
+    // Each round uses a fresh body, so a round can never be satisfied by the
+    // previous round's surviving row.
+    for round in 0..32 {
+        let body = format!("racing body {round}");
+        let addr = context
+            .put(
+                &company,
+                ContextChunk {
+                    label: "race/first".to_string(),
+                    body: body.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let deleter = {
+            let context = Arc::clone(&context);
+            let company = company.clone();
+            let addr = addr.clone();
+            tokio::spawn(async move { context.delete_label(&company, &addr, "race/first").await })
+        };
+        let writer = {
+            let context = Arc::clone(&context);
+            let company = company.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                context
+                    .put(
+                        &company,
+                        ContextChunk {
+                            label: "race/second".to_string(),
+                            body,
+                        },
+                    )
+                    .await
+            })
+        };
+        deleter.await.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
+
+        let labels: Vec<String> = context
+            .list(&company, "race/")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.addr == addr)
+            .map(|m| m.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "race/second"),
+            "round {round}: the concurrent writer's claim was lost to the delete: {labels:?}"
+        );
+        assert_eq!(
+            context.peek(&company, &addr, None).await.unwrap(),
+            body,
+            "round {round}: the body was reaped while a claim still held it"
+        );
+
+        // Leave nothing behind for the next round.
+        context.delete(&company, &addr).await.unwrap();
+    }
 }
 
 /// Asserts the [`UsageMeter`] contract: isolation, record, and windowed query.

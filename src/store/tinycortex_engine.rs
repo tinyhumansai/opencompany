@@ -107,12 +107,31 @@ fn embed_text(label: &str, body: &str) -> String {
     format!("{label}\n{body}")
 }
 
-/// A persisted context chunk: its label, body, and first-stored wall-clock.
+/// A persisted context chunk: its label(s), body, and first-stored wall-clock.
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredChunk {
+    /// The first label to claim this address — kept meaningful on its own so a
+    /// binary from before `labels` existed still reads what it always read.
     label: String,
     body: String,
     stored_at_millis: u64,
+    /// Every label claiming this address (#1300) — content addressing means a
+    /// byte-identical body stored under a second label lands here rather than
+    /// as a second record. Records written before the field existed decode to
+    /// an empty vec; [`labels_of`] unions the scalar back in.
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+/// Every label claiming `chunk`, deduped, scalar (first-stored) label first.
+fn labels_of(chunk: &StoredChunk) -> Vec<String> {
+    let mut labels = vec![chunk.label.clone()];
+    for label in &chunk.labels {
+        if !labels.iter().any(|have| have == label) {
+            labels.push(label.clone());
+        }
+    }
+    labels
 }
 
 // ---------------------------------------------------------------------------
@@ -524,21 +543,32 @@ impl CortexClient for EngineCortex {
 
     async fn put_chunk(&self, company: &str, addr: &str, chunk: ContextChunk) -> Result<()> {
         let engine = self.engine(company).await?;
+        // Serialize the read-merge-write on the chunk record: two concurrent
+        // puts of one body under different labels must both land their claim
+        // (#1300), not both read the same record and drop one.
+        let _guard = engine.write_lock.lock().await;
         let key = format!("{KEY_CHUNK_PREFIX}{addr}");
-        // Content-addressed: an identical body is stored once.
-        if engine
-            .kv
-            .get_global(&key)
-            .map_err(|e| OpenCompanyError::Store(format!("kv get {key}: {e}")))?
-            .is_some()
-        {
-            return Ok(());
+        // Content-addressed: an identical body is stored once, and each label
+        // claiming it is folded into the record's label set. No re-embed on a
+        // label-only fold: the vector row was built from the first label and
+        // the body, and every label stays lexically findable through the KV
+        // record either way.
+        if let Some(existing) = engine.get_json::<StoredChunk>(&key)? {
+            let labels = labels_of(&existing);
+            if labels.iter().any(|have| have == &chunk.label) {
+                return Ok(());
+            }
+            let mut updated = existing;
+            updated.labels = labels;
+            updated.labels.push(chunk.label);
+            return engine.put_json(&key, &updated);
         }
         // The text used for the meaning tier, captured before the fields move.
         let text = embed_text(&chunk.label, &chunk.body);
         engine.put_json(
             &key,
             &StoredChunk {
+                labels: vec![chunk.label.clone()],
                 label: chunk.label,
                 body: chunk.body,
                 stored_at_millis: now_millis(),
@@ -562,12 +592,23 @@ impl CortexClient for EngineCortex {
         Ok(engine
             .all_chunks()?
             .into_iter()
-            .filter(|(_, chunk)| chunk.label.starts_with(prefix))
-            .map(|(addr, chunk)| ChunkMeta {
-                addr: ChunkAddr::new(addr),
-                len: chunk.body.len(),
-                label: chunk.label,
-                stored_at_millis: chunk.stored_at_millis,
+            .flat_map(|(addr, chunk)| {
+                // One meta per label claiming the address (#1300). The stamp
+                // is the address's first write: the record is one row however
+                // many labels claim it, so per-label stamps (an fs/sqlite
+                // refinement) are not kept here.
+                let len = chunk.body.len();
+                let stored_at_millis = chunk.stored_at_millis;
+                labels_of(&chunk)
+                    .into_iter()
+                    .filter(|label| label.starts_with(prefix))
+                    .map(move |label| ChunkMeta {
+                        addr: ChunkAddr::new(addr.clone()),
+                        len,
+                        label,
+                        stored_at_millis,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect())
     }
@@ -638,6 +679,48 @@ impl CortexClient for EngineCortex {
             tracing::warn!(company, addr, error = %e, "[tinycortex] deleting vector row failed");
         }
         Ok(deleted)
+    }
+
+    async fn delete_chunk_label(&self, company: &str, addr: &str, label: &str) -> Result<bool> {
+        let engine = self.engine(company).await?;
+        // Serialize against concurrent puts of the same address: the reap
+        // decision (last label gone → record goes) must see every claim a
+        // committed put landed (#1300).
+        let _guard = engine.write_lock.lock().await;
+        let key = format!("{KEY_CHUNK_PREFIX}{addr}");
+        let Some(chunk) = engine.get_json::<StoredChunk>(&key)? else {
+            return Ok(false);
+        };
+        let mut labels = labels_of(&chunk);
+        let before = labels.len();
+        labels.retain(|have| have != label);
+        if labels.len() == before {
+            return Ok(false);
+        }
+        if labels.is_empty() {
+            // Last claim gone: reap the record and its vector row, exactly as
+            // `hard_delete_chunk` does.
+            engine
+                .kv
+                .delete_global(&key)
+                .map_err(|e| OpenCompanyError::Store(format!("kv delete {key}: {e}")))?;
+            if let Some(vectors) = &engine.vectors
+                && let Err(e) = vectors.delete(company, addr)
+            {
+                tracing::warn!(company, addr, error = %e, "[tinycortex] deleting vector row failed");
+            }
+            return Ok(true);
+        }
+        let updated = StoredChunk {
+            // The scalar stays a real label so a pre-`labels` binary keeps
+            // reading a claim that still exists.
+            label: labels[0].clone(),
+            labels,
+            body: chunk.body,
+            stored_at_millis: chunk.stored_at_millis,
+        };
+        engine.put_json(&key, &updated)?;
+        Ok(true)
     }
 
     async fn redact(&self, company: &str, needle: &str, replacement: &str) -> Result<u64> {
@@ -932,6 +1015,105 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let (_store, _events, _mem, ctx) = stores(dir.path());
         conformance::assert_context_chunk_stamps(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_identical_body_two_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_identical_body_two_labels(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_delete_label_scoped(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_survives_a_concurrent_identical_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _events, _mem, ctx) = stores(dir.path());
+        conformance::assert_delete_label_survives_a_concurrent_identical_put(ctx).await;
+    }
+
+    /// A chunk record persisted before the `labels` set existed (scalar label
+    /// only) keeps its claim through the union read, folds a second label in
+    /// beside it, and stays label-deletable — the mixed-version story the
+    /// serde default alone does not prove.
+    #[tokio::test]
+    async fn legacy_scalar_label_records_fold_and_label_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let cortex = EngineCortex::new(dir.path().to_path_buf());
+        let body = "written before the labels set";
+        let addr = crate::store::content_address(body);
+        // Seed the pre-#1300 record shape directly at the KV tier — as a
+        // structured value, the same rule `put_json` documents.
+        {
+            let engine = cortex.engine("acme").await.unwrap();
+            engine
+                .kv
+                .set_global(
+                    &format!("{KEY_CHUNK_PREFIX}{addr}"),
+                    &serde_json::json!({
+                        "label": "agent/ceo",
+                        "body": body,
+                        "stored_at_millis": 7,
+                    }),
+                )
+                .unwrap();
+        }
+
+        let labels =
+            |metas: Vec<ChunkMeta>| -> Vec<String> { metas.into_iter().map(|m| m.label).collect() };
+        assert_eq!(
+            labels(cortex.list_chunks("acme", "").await.unwrap()),
+            ["agent/ceo"],
+            "the scalar label is a claim"
+        );
+
+        cortex
+            .put_chunk(
+                "acme",
+                &addr,
+                ContextChunk {
+                    label: "agent/ops".to_string(),
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut both = labels(cortex.list_chunks("acme", "").await.unwrap());
+        both.sort();
+        assert_eq!(both, ["agent/ceo", "agent/ops"]);
+
+        assert!(
+            cortex
+                .delete_chunk_label("acme", &addr, "agent/ceo")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            labels(cortex.list_chunks("acme", "").await.unwrap()),
+            ["agent/ops"]
+        );
+        assert_eq!(
+            cortex.peek_chunk("acme", &addr).await.unwrap().as_deref(),
+            Some(body),
+            "the body survives under the remaining claim"
+        );
+        assert!(
+            cortex
+                .delete_chunk_label("acme", &addr, "agent/ops")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cortex.peek_chunk("acme", &addr).await.unwrap(),
+            None,
+            "the record goes with its last claim"
+        );
     }
 
     fn company() -> CompanyId {

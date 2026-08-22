@@ -3752,6 +3752,15 @@ mod test {
         async fn delete(&self, id: &CompanyId, addr: &ChunkAddr) -> Result<bool> {
             self.inner.delete(id, addr).await
         }
+
+        async fn delete_label(
+            &self,
+            id: &CompanyId,
+            addr: &ChunkAddr,
+            label: &str,
+        ) -> Result<bool> {
+            self.inner.delete_label(id, addr, label).await
+        }
     }
 
     /// Issue #1175: a cycle used to load 32 recent traces *and the whole context

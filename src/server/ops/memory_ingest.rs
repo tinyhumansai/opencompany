@@ -245,16 +245,16 @@ async fn forget_document(
     for meta in all.iter().filter(|m| m.label.starts_with(&prefix)) {
         // Chunks are content-addressed, so one address can carry several
         // labels: two identical paragraphs in one folder drop, or a document
-        // re-dropped under a new name. Deleting an address another label still
-        // points at would delete that row too — the shared-address rule the
-        // fact mirror's reap follows for the same reason.
-        let shared = all
-            .iter()
-            .any(|m| m.addr == meta.addr && !m.label.starts_with(&prefix));
-        if shared {
-            continue;
-        }
-        if context.delete(company.id(), &meta.addr).await? {
+        // re-dropped under a new name. The delete is label-scoped (#1300):
+        // exactly this document's claim goes, any other label keeps the body,
+        // and the body is reaped with its last claim atomically inside the
+        // port — the same shape the fact mirror's reap uses, minus the old
+        // snapshot guard that skipped shared chunks entirely (which left a
+        // deleted document's claims listed forever).
+        if context
+            .delete_label(company.id(), &meta.addr, &meta.label)
+            .await?
+        {
             forgotten += 1;
         }
     }

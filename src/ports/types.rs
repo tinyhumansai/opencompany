@@ -2012,10 +2012,13 @@ pub struct ChunkMeta {
     /// (see `server::ops::memory::memory_stats`).
     ///
     /// Chunks are append-only and never rewritten, so this only ever moves for
-    /// a *new* chunk. Backends differ on a re-`put` of an identical body —
-    /// sqlite/mongo dedupe on the content address and keep the first write,
-    /// the fs index appends a second line — so read freshness as the max
-    /// across chunks rather than assuming one row per body.
+    /// a *new* claim: every backend keeps one row per (addr, label) — a
+    /// re-`put` of an identical (body, label) is a no-op everywhere (#1300).
+    /// A *new* label on an existing body stamps per-label on fs/sqlite and
+    /// reports the address's first-write stamp on the single-record backends
+    /// (mongodb, the provider facade, the tinycortex engine) — so read
+    /// freshness as the max across chunks rather than assuming one row per
+    /// body.
     #[serde(default)]
     pub stored_at_millis: u64,
 }

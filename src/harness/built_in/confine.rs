@@ -136,6 +136,16 @@ impl ContextStore for ConfinedContext {
         Ok(false)
     }
 
+    async fn delete_label(
+        &self,
+        _id: &CompanyId,
+        _addr: &crate::ports::types::ChunkAddr,
+        _label: &str,
+    ) -> crate::Result<bool> {
+        // Same truth as `delete`: no claim was ever stored.
+        Ok(false)
+    }
+
     async fn peek(
         &self,
         _id: &CompanyId,

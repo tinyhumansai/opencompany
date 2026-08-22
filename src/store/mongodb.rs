@@ -114,6 +114,43 @@ fn get_i64(doc: &Document, key: &str) -> Result<i64> {
         .map_err(|e| mongo_err(format!("missing field {key}: {e}")))
 }
 
+/// Every label claiming a context document (issue #1300): the `labels` set,
+/// plus the legacy scalar `label` field — documents written before the set
+/// existed carry only the scalar, and new writes keep it as the first label so
+/// a downgraded binary still reads what it always read. Deduped, scalar first.
+/// Wraps an array-valued aggregation expression in a `$reduce` that drops
+/// duplicates while **preserving order** — `$setUnion` dedupes but reorders,
+/// and the context-chunk label list is read in order (the first claim is the
+/// one the legacy scalar `label` names).
+fn dedupe_preserving_order(input: Document) -> Document {
+    doc! {"$reduce": {
+        "input": input,
+        "initialValue": [],
+        "in": {"$cond": [
+            {"$in": ["$$this", "$$value"]},
+            "$$value",
+            {"$concatArrays": ["$$value", ["$$this"]]},
+        ]},
+    }}
+}
+
+fn doc_labels(doc: &Document) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Ok(scalar) = doc.get_str("label") {
+        labels.push(scalar.to_string());
+    }
+    if let Ok(set) = doc.get_array("labels") {
+        for value in set {
+            if let Some(label) = value.as_str()
+                && !labels.iter().any(|have| have == label)
+            {
+                labels.push(label.to_string());
+            }
+        }
+    }
+    labels
+}
+
 /// A unique index restricted to the documents that carry `present` at all
 /// (issue #697).
 ///
@@ -944,17 +981,37 @@ impl ContextStore for MongoStore {
         let addr = content_address(&chunk.body);
         // Insertion order stands in for the sqlite backend's rowid ordering.
         let ord = self.next_seq(id, "context_ord").await?;
+        // Body + metadata land once and never move (first-write-wins per
+        // address); every put folds its label into the `labels` set — one
+        // claim per (addr, label), #1300 — so a byte-identical body stored
+        // under a second label keeps both claims.
+        //
+        // A pipeline rather than `$setOnInsert` + `$addToSet`, for the scalar
+        // `label`: `$setOnInsert` is skipped on a document that already
+        // exists, so a document that has somehow lost its scalar would gain a
+        // claim while staying scalar-less — and a pre-#1300 `list` reads that
+        // field with a hard error on absence, so a rollback would meet a
+        // document it cannot read. `$ifNull` restores it from this write
+        // instead, and keeps the existing one untouched when there is one.
+        let claims = dedupe_preserving_order(doc! {"$concatArrays": [
+            {"$ifNull": ["$labels", []]},
+            [chunk.label.as_str()],
+        ]});
         let result = self
             .collection("context_chunks")
             .update_one(
                 doc! {"company_id": id.as_ref(), "addr": &addr},
-                doc! {"$setOnInsert": {
-                    "label": &chunk.label,
-                    "body": &chunk.body,
-                    "len": chunk.body.len() as i64,
-                    "ord": ord as i64,
-                    "stored_ms": now_millis() as i64,
-                }},
+                vec![doc! {"$set": {
+                    "labels": claims,
+                    // `$ifNull` IS the first-write-wins rule: on an upsert
+                    // insert every field is missing and takes this write's
+                    // value; on an existing document each keeps what it has.
+                    "label": {"$ifNull": ["$label", chunk.label.as_str()]},
+                    "body": {"$ifNull": ["$body", chunk.body.as_str()]},
+                    "len": {"$ifNull": ["$len", chunk.body.len() as i64]},
+                    "ord": {"$ifNull": ["$ord", ord as i64]},
+                    "stored_ms": {"$ifNull": ["$stored_ms", now_millis() as i64]},
+                }}],
             )
             .with_options(UpdateOptions::builder().upsert(true).build())
             .await;
@@ -973,29 +1030,99 @@ impl ContextStore for MongoStore {
             .map_err(mongo_err)?;
         let mut out = Vec::new();
         while let Some(doc) = cursor.try_next().await.map_err(mongo_err)? {
-            let label = get_str(&doc, "label")?;
-            if label.starts_with(prefix) {
-                out.push(ChunkMeta {
-                    addr: ChunkAddr::new(get_str(&doc, "addr")?),
-                    label,
-                    len: get_i64(&doc, "len")? as usize,
-                    // Absent on documents written before the field existed;
-                    // those read as an unknown (`0`) store time rather than
-                    // failing the whole list.
-                    stored_at_millis: doc.get_i64("stored_ms").unwrap_or(0).max(0) as u64,
-                });
+            let addr = get_str(&doc, "addr")?;
+            let len = get_i64(&doc, "len")? as usize;
+            // Absent on documents written before the field existed; those
+            // read as an unknown (`0`) store time rather than failing the
+            // whole list. One document carries every label claiming its
+            // address, so the stamp is the address's first write — per-label
+            // stamps are an fs/sqlite refinement this backend does not keep.
+            let stored_at_millis = doc.get_i64("stored_ms").unwrap_or(0).max(0) as u64;
+            for label in doc_labels(&doc) {
+                if label.starts_with(prefix) {
+                    out.push(ChunkMeta {
+                        addr: ChunkAddr::new(addr.clone()),
+                        label,
+                        len,
+                        stored_at_millis,
+                    });
+                }
             }
         }
         Ok(out)
     }
 
     async fn delete(&self, id: &CompanyId, addr: &ChunkAddr) -> Result<bool> {
+        // Address-level: the one document carries the body and every label
+        // claim, so they go together.
         let result = self
             .collection("context_chunks")
             .delete_one(doc! {"company_id": id.as_ref(), "addr": addr.as_ref()})
             .await
             .map_err(mongo_err)?;
         Ok(result.deleted_count > 0)
+    }
+
+    async fn delete_label(&self, id: &CompanyId, addr: &ChunkAddr, label: &str) -> Result<bool> {
+        let chunks = self.collection("context_chunks");
+        // Every label claiming this document, as an expression over both
+        // shapes a claim lives in: the legacy scalar `label` first, then the
+        // `labels` set.
+        let claim_union = doc! {"$concatArrays": [
+            {"$cond": [{"$ifNull": ["$label", false]}, ["$label"], []]},
+            {"$ifNull": ["$labels", []]},
+        ]};
+
+        // Label-scoped (#1300), as ONE atomic document operation per outcome
+        // — never a read followed by a write, and never an intermediate state
+        // a concurrent reader or writer can observe.
+        //
+        // First outcome: this label is the ONLY claim, so the whole document
+        // goes. `$setEquals` ignores order and duplicates, and the condition
+        // is evaluated by the server as part of the delete, so a concurrent
+        // put that adds a second claim first simply makes this match nothing
+        // — the check-then-delete race the callers' old snapshot guards
+        // carried, closed by construction rather than by a snapshot.
+        let reaped = chunks
+            .delete_one(doc! {
+                "company_id": id.as_ref(),
+                "addr": addr.as_ref(),
+                "$expr": {"$setEquals": [claim_union.clone(), [label]]},
+            })
+            .await
+            .map_err(mongo_err)?;
+        if reaped.deleted_count > 0 {
+            return Ok(true);
+        }
+
+        // Second outcome: other claims remain, so only this one is removed.
+        // The scalar is re-pointed at a survivor in the SAME update, and this
+        // branch can only run while a survivor exists — so the document is
+        // never left without a scalar `label`, which a pre-#1300 `list` reads
+        // with a hard error on absence. Deduped by `$reduce` rather than
+        // `$setUnion`, which would not preserve read order.
+        let survivors = dedupe_preserving_order(doc! {"$filter": {
+            "input": claim_union,
+            "cond": {"$ne": ["$$this", label]},
+        }});
+        let removed = chunks
+            .update_one(
+                doc! {
+                    "company_id": id.as_ref(),
+                    "addr": addr.as_ref(),
+                    // Only a document this label actually claims, so a match
+                    // IS the answer to "did the pairing exist" — and so the
+                    // pipeline can never touch a document it has no claim on.
+                    "$or": [{"label": label}, {"labels": label}],
+                },
+                vec![doc! {"$set": {
+                    "labels": survivors.clone(),
+                    "label": {"$first": survivors},
+                }}],
+            )
+            .await
+            .map_err(mongo_err)?;
+        Ok(removed.matched_count > 0)
     }
 
     async fn peek(
@@ -4672,6 +4799,176 @@ mod test {
     async fn conformance_context_multibyte_bodies() {
         let Some(s) = store().await else { return };
         conformance::assert_multibyte_bodies_survive_search_and_ranged_peek(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_identical_body_two_labels() {
+        let Some(s) = store().await else { return };
+        conformance::assert_identical_body_two_labels(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_scoped() {
+        let Some(s) = store().await else { return };
+        conformance::assert_delete_label_scoped(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_survives_a_concurrent_identical_put() {
+        let Some(s) = store().await else { return };
+        conformance::assert_delete_label_survives_a_concurrent_identical_put(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    /// The legacy scalar-`label` document shape (written before the `labels`
+    /// set existed) keeps working through every read and through the
+    /// label-scoped delete — `doc_labels` unions the two shapes, and the
+    /// `$unset` leg of `delete_label` is what removes a scalar claim.
+    #[tokio::test]
+    async fn legacy_scalar_label_documents_list_and_label_delete() {
+        let Some(s) = store().await else { return };
+        let id = CompanyId::new("acme");
+        let body = "written before the labels set";
+        // Seed the pre-#1300 shape directly: scalar label, no labels array —
+        // at the body's real content address, so a later put folds into it.
+        s.collection("context_chunks")
+            .insert_one(doc! {
+                "company_id": id.as_ref(),
+                "addr": content_address(body),
+                "label": "agent/ceo",
+                "body": body,
+                "len": body.len() as i64,
+                "ord": 1_i64,
+                "stored_ms": 7_i64,
+            })
+            .await
+            .expect("seed a legacy document");
+
+        let metas = ContextStore::list(s.as_ref(), &id, "").await.expect("list");
+        assert_eq!(
+            metas.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
+            ["agent/ceo"],
+            "the scalar label is a claim"
+        );
+
+        // A second label on the same body folds into the set beside it.
+        let addr = s
+            .put(
+                &id,
+                ContextChunk {
+                    label: "agent/ops".to_string(),
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .expect("put an identical body under a new label");
+        let mut labels: Vec<String> = ContextStore::list(s.as_ref(), &id, "")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.addr == addr)
+            .map(|m| m.label)
+            .collect();
+        labels.sort();
+        assert_eq!(labels, ["agent/ceo", "agent/ops"]);
+
+        // Deleting the scalar claim leaves the set claim and the body.
+        assert!(
+            s.delete_label(&id, &addr, "agent/ceo")
+                .await
+                .expect("delete the scalar claim")
+        );
+        let after: Vec<String> = ContextStore::list(s.as_ref(), &id, "")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.addr == addr)
+            .map(|m| m.label)
+            .collect();
+        assert_eq!(after, ["agent/ops"]);
+        s.peek(&id, &addr, None).await.expect("the body survives");
+
+        // The rollback contract, read from the raw document: while any claim
+        // remains the scalar `label` is present AND names a live claim. A
+        // pre-#1300 binary reads that field with a hard error on absence, so
+        // a document left without one would fail its whole `list`.
+        let raw = s
+            .collection("context_chunks")
+            .find_one(doc! {"company_id": id.as_ref(), "addr": addr.as_ref()})
+            .await
+            .unwrap()
+            .expect("the document survives");
+        assert_eq!(
+            raw.get_str("label").ok(),
+            Some("agent/ops"),
+            "the scalar must re-point at a surviving claim: {raw:?}"
+        );
+
+        // And the last claim takes the document with it.
+        assert!(s.delete_label(&id, &addr, "agent/ops").await.unwrap());
+        assert!(s.peek(&id, &addr, None).await.is_err());
+        drop_db(&s).await;
+    }
+
+    /// A document carrying claims but no scalar `label` heals on the next
+    /// `put`, rather than gaining a claim and staying unreadable to a
+    /// pre-#1300 `list` (which reads that field with a hard error on
+    /// absence). `$setOnInsert` could not do this — it is skipped entirely on
+    /// a document that already exists — which is why `put` is a pipeline.
+    ///
+    /// Seeded directly rather than raced for: `delete_label` no longer leaves
+    /// this state (it either deletes the document atomically or re-points the
+    /// scalar in the same update), so the only honest way to test the healing
+    /// is to construct the state a rollback or an older build could leave.
+    #[tokio::test]
+    async fn a_put_restores_a_missing_scalar_label_and_keeps_first_write_wins() {
+        let Some(s) = store().await else { return };
+        let id = CompanyId::new("acme");
+        let body = "a document that lost its scalar label";
+        s.collection("context_chunks")
+            .insert_one(doc! {
+                "company_id": id.as_ref(),
+                "addr": content_address(body),
+                "body": body,
+                "len": body.len() as i64,
+                "ord": 1_i64,
+                "stored_ms": 7_i64,
+                "labels": [],
+            })
+            .await
+            .expect("seed a scalar-less document");
+
+        let addr = s
+            .put(
+                &id,
+                ContextChunk {
+                    label: "agent/ops".to_string(),
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .expect("put onto the scalar-less document");
+
+        let raw = s
+            .collection("context_chunks")
+            .find_one(doc! {"company_id": id.as_ref(), "addr": addr.as_ref()})
+            .await
+            .unwrap()
+            .expect("the document is still there");
+        assert_eq!(
+            raw.get_str("label").ok(),
+            Some("agent/ops"),
+            "the write restores the scalar it found missing: {raw:?}"
+        );
+        assert_eq!(doc_labels(&raw), ["agent/ops"], "and claims it once");
+        assert_eq!(
+            raw.get_i64("stored_ms").ok(),
+            Some(7),
+            "first-write-wins still holds for the fields that were present"
+        );
         drop_db(&s).await;
     }
 

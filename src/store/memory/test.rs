@@ -669,6 +669,21 @@ async fn conformance_context_multibyte_bodies() {
     conformance::assert_multibyte_bodies_survive_search_and_ranged_peek(engine().context()).await;
 }
 
+#[tokio::test]
+async fn conformance_context_identical_body_two_labels() {
+    conformance::assert_identical_body_two_labels(engine().context()).await;
+}
+
+#[tokio::test]
+async fn conformance_context_delete_label_scoped() {
+    conformance::assert_delete_label_scoped(engine().context()).await;
+}
+
+#[tokio::test]
+async fn conformance_context_delete_label_survives_a_concurrent_identical_put() {
+    conformance::assert_delete_label_survives_a_concurrent_identical_put(engine().context()).await;
+}
+
 /// The port conformance suite over the REAL `namespace` driver — not the fake.
 ///
 /// Everything above proves the decorator against `FakeEngine`; the driver
@@ -754,6 +769,20 @@ mod namespace_driver_conformance {
     async fn multibyte_bodies_survive_search_and_peek_on_the_namespace_driver() {
         let (store_dir, engine) = real_engine();
         conformance::assert_multibyte_bodies_survive_search_and_ranged_peek(engine.context()).await;
+        drop(store_dir);
+    }
+
+    #[tokio::test]
+    async fn identical_body_two_labels_holds_on_the_namespace_driver() {
+        let (store_dir, engine) = real_engine();
+        conformance::assert_identical_body_two_labels(engine.context()).await;
+        drop(store_dir);
+    }
+
+    #[tokio::test]
+    async fn delete_label_is_scoped_on_the_namespace_driver() {
+        let (store_dir, engine) = real_engine();
+        conformance::assert_delete_label_scoped(engine.context()).await;
         drop(store_dir);
     }
 

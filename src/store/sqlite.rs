@@ -98,6 +98,18 @@ CREATE TABLE IF NOT EXISTS context_chunks (
     stored_ms  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (company_id, addr)
 );
+-- The context index: one row per (addr, label) claim, the shape the fs
+-- backend's JSONL index always had (issue #1300). `context_chunks` keeps one
+-- body row per address (its `label` column stays the first write's label so a
+-- downgraded binary keeps reading what it always read); this table is what
+-- `list` and the label-scoped delete read and mutate.
+CREATE TABLE IF NOT EXISTS context_chunk_labels (
+    company_id TEXT NOT NULL,
+    addr       TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    stored_ms  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (company_id, addr, label)
+);
 CREATE TABLE IF NOT EXISTS secrets (
     company_id TEXT NOT NULL,
     key        TEXT NOT NULL,
@@ -416,6 +428,40 @@ fn relax_runs_task_id_nullability(conn: &Connection) -> Result<()> {
     .map_err(sql_err)
 }
 
+/// Heals `context_chunk_labels` against `context_chunks` at open (issue #1300).
+///
+/// Two idempotent steps, one transaction, covering every mixed-version
+/// history a database can have:
+///
+/// - **Backfill**: a body row whose (addr, label) has no index row — a
+///   database from before the labels table existed, or a row an older binary
+///   wrote since — gets one, carrying the body row's stamp. `INSERT OR
+///   IGNORE` on the full primary key makes re-running a no-op, and a
+///   label-scoped delete can never be undone by it: when the last label goes
+///   the body row goes in the same transaction, so there is nothing left to
+///   backfill from.
+/// - **Orphan sweep**: an index row whose body row is gone — an older
+///   binary's address-level delete removed only `context_chunks` — is
+///   dropped, so `list` never names a chunk `peek` cannot read.
+///
+/// Both run on every open rather than behind a version flag, matching the
+/// other heals in this file, which read the live schema instead of trusting a
+/// stamp. The cost is two anti-joins against a primary-key index, once per
+/// process, and neither writes anything on an already-healed database.
+fn sync_context_chunk_labels(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN;
+         INSERT OR IGNORE INTO context_chunk_labels (company_id, addr, label, stored_ms)
+             SELECT company_id, addr, label, stored_ms FROM context_chunks;
+         DELETE FROM context_chunk_labels WHERE NOT EXISTS (
+             SELECT 1 FROM context_chunks c
+             WHERE c.company_id = context_chunk_labels.company_id
+               AND c.addr = context_chunk_labels.addr);
+         COMMIT;",
+    )
+    .map_err(sql_err)
+}
+
 /// Runs `write` with `synchronous=FULL`, so its commit is fsynced, and restores
 /// `NORMAL` afterwards no matter how `write` ended.
 ///
@@ -489,6 +535,10 @@ impl SqliteStore {
         // insert on a constraint the record no longer has. Idempotent: it reads
         // the live schema and does nothing once the constraint is gone.
         relax_runs_task_id_nullability(&conn)?;
+        // Issue #1300: the context index moved into `context_chunk_labels`
+        // (one row per (addr, label) claim). Runs after the `stored_ms`
+        // column heal above, whose column it reads.
+        sync_context_chunk_labels(&conn)?;
         Ok(Self {
             conn: Arc::new(StdMutex::new(conn)),
             senders: Arc::new(StdMutex::new(HashMap::new())),
@@ -956,8 +1006,18 @@ impl MemoryStore for SqliteStore {
 impl ContextStore for SqliteStore {
     async fn put(&self, id: &CompanyId, chunk: ContextChunk) -> Result<ChunkAddr> {
         let addr = content_address(&chunk.body);
-        let conn = self.conn();
-        conn.execute(
+        // One clock read for both rows: a body row and the claim that lands
+        // with it describe the same write and must not disagree by a
+        // millisecond the caller can observe through `list`.
+        let stored_ms = now_millis() as i64;
+        let mut conn = self.conn();
+        // Body row first-write-wins per address; the labels index accumulates
+        // one row per (addr, label) — set semantics, so a byte-identical body
+        // stored under a second label keeps both claims, and a re-put of an
+        // identical (body, label) is a no-op (#1300). One transaction, so a
+        // body row can never land without its index row.
+        let tx = conn.transaction().map_err(sql_err)?;
+        tx.execute(
             "INSERT OR IGNORE INTO context_chunks (company_id, addr, label, body, len, stored_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -966,19 +1026,31 @@ impl ContextStore for SqliteStore {
                 chunk.label,
                 chunk.body,
                 chunk.body.len() as i64,
-                now_millis() as i64
+                stored_ms
             ],
         )
         .map_err(sql_err)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO context_chunk_labels (company_id, addr, label, stored_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id.as_ref(), addr, chunk.label, stored_ms],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(ChunkAddr::new(addr))
     }
 
     async fn list(&self, id: &CompanyId, prefix: &str) -> Result<Vec<ChunkMeta>> {
         let conn = self.conn();
+        // The labels table is the index (#1300); the join carries each claim's
+        // body length from the one body row. `l.rowid` keeps insertion order,
+        // the same order the single-table `rowid` scan used to give.
         let mut stmt = conn
             .prepare(
-                "SELECT addr, label, len, stored_ms FROM context_chunks \
-                 WHERE company_id = ?1 ORDER BY rowid",
+                "SELECT l.addr, l.label, c.len, l.stored_ms \
+                 FROM context_chunk_labels l \
+                 JOIN context_chunks c ON c.company_id = l.company_id AND c.addr = l.addr \
+                 WHERE l.company_id = ?1 ORDER BY l.rowid",
             )
             .map_err(sql_err)?;
         let rows = stmt
@@ -1060,13 +1132,59 @@ impl ContextStore for SqliteStore {
     }
 
     async fn delete(&self, id: &CompanyId, addr: &ChunkAddr) -> Result<bool> {
-        let conn = self.conn();
-        let removed = conn
+        let mut conn = self.conn();
+        // Address-level: the body row and every label claim go together, in
+        // one transaction so no half can survive the other.
+        let tx = conn.transaction().map_err(sql_err)?;
+        let removed_labels = tx
+            .execute(
+                "DELETE FROM context_chunk_labels WHERE company_id = ?1 AND addr = ?2",
+                params![id.as_ref(), addr.as_ref()],
+            )
+            .map_err(sql_err)?;
+        let removed = tx
             .execute(
                 "DELETE FROM context_chunks WHERE company_id = ?1 AND addr = ?2",
                 params![id.as_ref(), addr.as_ref()],
             )
             .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(removed > 0 || removed_labels > 0)
+    }
+
+    async fn delete_label(&self, id: &CompanyId, addr: &ChunkAddr, label: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        // Label-scoped (#1300): remove exactly one (addr, label) claim, and
+        // reap the body row when — and only when — no claim remains. The
+        // check and both deletes are one transaction, so a concurrent put of
+        // identical content under another label either commits its claim
+        // before this transaction (and keeps the body) or after it.
+        let tx = conn.transaction().map_err(sql_err)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM context_chunk_labels \
+                 WHERE company_id = ?1 AND addr = ?2 AND label = ?3",
+                params![id.as_ref(), addr.as_ref(), label],
+            )
+            .map_err(sql_err)?;
+        if removed > 0 {
+            let remaining: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM context_chunk_labels \
+                     WHERE company_id = ?1 AND addr = ?2",
+                    params![id.as_ref(), addr.as_ref()],
+                    |r| r.get(0),
+                )
+                .map_err(sql_err)?;
+            if remaining == 0 {
+                tx.execute(
+                    "DELETE FROM context_chunks WHERE company_id = ?1 AND addr = ?2",
+                    params![id.as_ref(), addr.as_ref()],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        tx.commit().map_err(sql_err)?;
         Ok(removed > 0)
     }
 
@@ -3711,6 +3829,21 @@ mod test {
         conformance::assert_multibyte_bodies_survive_search_and_ranged_peek(store()).await;
     }
 
+    #[tokio::test]
+    async fn conformance_context_identical_body_two_labels() {
+        conformance::assert_identical_body_two_labels(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_scoped() {
+        conformance::assert_delete_label_scoped(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_context_delete_label_survives_a_concurrent_identical_put() {
+        conformance::assert_delete_label_survives_a_concurrent_identical_put(store()).await;
+    }
+
     /// The migration path a fresh database never exercises.
     ///
     /// [`MIGRATIONS`] is all `CREATE TABLE IF NOT EXISTS`, which is a no-op
@@ -3790,6 +3923,79 @@ mod test {
             "INTEGER NOT NULL DEFAULT 0",
         )
         .expect("adding an existing column is a no-op, not an error");
+    }
+
+    /// Issue #1300's open-time heals on a mixed-version database: the
+    /// backfill gives a row an older binary wrote its label claim (so the
+    /// label-scoped delete can reach it), and the orphan sweep drops an index
+    /// row whose body row an older binary's address-level delete removed.
+    #[tokio::test]
+    async fn legacy_context_rows_gain_label_claims_and_orphans_are_swept_on_open() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE context_chunks (
+                 company_id TEXT NOT NULL,
+                 addr       TEXT NOT NULL,
+                 label      TEXT NOT NULL,
+                 body       TEXT NOT NULL,
+                 len        INTEGER NOT NULL,
+                 stored_ms  INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (company_id, addr)
+             );
+             CREATE TABLE context_chunk_labels (
+                 company_id TEXT NOT NULL,
+                 addr       TEXT NOT NULL,
+                 label      TEXT NOT NULL,
+                 stored_ms  INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (company_id, addr, label)
+             );
+             -- A row an older binary wrote after the labels table existed: the
+             -- body row is there, its claim is not.
+             INSERT INTO context_chunks (company_id, addr, label, body, len, stored_ms)
+             VALUES ('acme', 'old-binary-addr', 'agent/ceo', 'written by an old binary', 24, 7);
+             -- And the reverse: a claim whose body row an older binary's
+             -- address-level delete removed.
+             INSERT INTO context_chunk_labels (company_id, addr, label, stored_ms)
+             VALUES ('acme', 'reaped-addr', 'agent/ops', 9);",
+        )
+        .expect("seed a mixed-version database");
+
+        let store = SqliteStore::from_conn(conn).expect("migrations run");
+        let id = CompanyId::new("acme");
+
+        let metas = ContextStore::list(&store, &id, "")
+            .await
+            .expect("list after the heals");
+        assert_eq!(
+            metas.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
+            ["agent/ceo"],
+            "the old binary's row gains its claim; the orphaned claim is swept"
+        );
+        assert_eq!(
+            metas[0].stored_at_millis, 7,
+            "the backfilled claim carries the body row's stamp"
+        );
+
+        // The backfilled claim is label-deletable, and takes the body with it
+        // as the last claim.
+        let addr = ChunkAddr::new("old-binary-addr".to_string());
+        assert!(
+            store
+                .delete_label(&id, &addr, "agent/ceo")
+                .await
+                .expect("label-scoped delete on a backfilled claim")
+        );
+        assert!(
+            ContextStore::list(&store, &id, "")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no claim may remain"
+        );
+        assert!(
+            store.peek(&id, &addr, None).await.is_err(),
+            "the body row went with its last claim"
+        );
     }
 
     /// Issue #983: a database created while `runs.task_id` was `NOT NULL` must

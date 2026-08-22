@@ -392,11 +392,15 @@ re-derives them:
   `memory_recall`, `memory_forget` — over the company's own `ContextStore`,
   company and agent captured at build time, never a model-supplied
   namespace. Forget reaches only the agent's own `agent-memory/<id>/` rows;
-  task outcomes and operator facts are not an agent's to delete. And because
-  chunks are content-addressed with an ADDRESS-level `ContextStore::delete`,
-  a forget whose identical content is indexed under any other label (another
-  agent's byte-identical memory, a task outcome with the same text) refuses
-  rather than deleting theirs too — store a correction instead. The
+  task outcomes and operator facts are not an agent's to delete. Chunks are
+  content-addressed, and since #1300 every backend keeps one claim per
+  (addr, label) with a **label-scoped** `ContextStore::delete_label`: a
+  forget whose identical content is indexed under other labels (another
+  agent's byte-identical memory, a task outcome with the same text) removes
+  exactly the agent's own claims, the other labels keep the body, and the
+  body is reaped — atomically inside the port — only with its last claim.
+  (Before #1300 this case refused outright, which let anyone make an
+  agent's memory permanently un-forgettable by storing identical text.) The
   vendored upstream memory tools stay unwired: they resolve their store
   ambiently, which under multi-tenant-in-one-process is a cross-company
   leak (`src/harness/built_in/build.rs`, `memory_tools`).
