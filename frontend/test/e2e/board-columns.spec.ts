@@ -140,6 +140,16 @@ test("an empty board leaves its column affordances to explain the empty state", 
   try {
     await page.goto(`/#/ledgers/${slug}`);
     await dismissTour(page);
+
+    // Switch to the board explicitly. `defaultLedgerMode` gives columns to the
+    // native `tasks` ledger and rows to every other one — "columns for
+    // dispatched tasks; rows for every agent-written ledger" — so a ledger
+    // declared here opens as a list, and waiting for `ledger-board` without
+    // asking for it waits forever.
+    //
+    // By testid: the toggle's label and title both flip with the mode, and
+    // "Board" also matches the list switcher's trigger.
+    await page.getByTestId("ledger-mode-toggle").click();
     await expect(page.getByTestId("ledger-board")).toBeVisible({ timeout: 15_000 });
 
     // Board columns already say what an empty board is for. A second status
@@ -153,7 +163,7 @@ test("an empty board leaves its column affordances to explain the empty state", 
 
     // The list has no per-status-column affordance, so it retains both forms
     // of the above-list notice.
-    await page.getByRole("button", { name: "List" }).click();
+    await page.getByTestId("ledger-mode-toggle").click();
     await expect(page.getByTestId("ledger-filtered-empty")).toBeVisible({ timeout: 15_000 });
     await search.fill("");
     await expect(page.getByTestId("ledger-empty")).toBeVisible({ timeout: 15_000 });

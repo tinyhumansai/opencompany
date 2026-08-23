@@ -881,6 +881,12 @@ export function LedgersView({
                   variant="outline"
                   size="sm"
                   onClick={() => setMode(mode === "board" ? "list" : "board")}
+                  // Both the label and the title flip with the mode, so neither
+                  // is a stable handle for a test — and "Board" additionally
+                  // collides with the list switcher's own trigger. A testid is
+                  // what this screen's specs already prefer (see
+                  // `columnLabels`: "by testid, not by shape").
+                  data-testid="ledger-mode-toggle"
                   title={
                     mode === "board"
                       ? "Show every field on each row"
