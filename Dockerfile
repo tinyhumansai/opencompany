@@ -25,7 +25,21 @@ RUN apt-get update \
 # The whole workspace is copied (examples/*/Cargo.toml load the workspace;
 # vendor/openhuman/vendor/tinyagents backs the [patch.crates-io] entry).
 # vendor/openhuman, target/, and node_modules are trimmed via .dockerignore.
-COPY . .
+#
+# `COPY . .` is correct but expensive: it puts the console, the docs, the
+# skills and the whole git history into the build context. The builder only
+# reads what cargo resolves, so copy exactly that:
+#   * Cargo.toml / Cargo.lock / rust-toolchain.toml — resolution and toolchain.
+#   * src/, benches/, tests/, examples/ — auto-discovered workspace targets.
+#   * vendor/ — backs the [patch.crates-io] table.
+#   * companies/ — the default companies baked into the image.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src ./src
+COPY benches ./benches
+COPY tests ./tests
+COPY examples ./examples
+COPY vendor ./vendor
+COPY companies ./companies
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
