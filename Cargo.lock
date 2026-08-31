@@ -3340,7 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "openhuman"
-version = "0.63.18"
+version = "0.63.17"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -3402,12 +3402,10 @@ dependencies = [
  "tinymcp-bus",
  "tinymemory",
  "tinymemory-api",
- "tinymemory-bus",
  "tinymemory-core",
  "tinymemory-tinycortex",
  "tinyplace",
  "tinyruntime-bus",
- "tinytools",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
@@ -5333,7 +5331,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
- "tinytools",
  "tokio",
  "tracing",
 ]
@@ -5518,7 +5515,7 @@ dependencies = [
 
 [[package]]
 name = "tinymemory"
-version = "1.13.3"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5651,7 +5648,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "log",
- "rusqlite",
  "serde",
  "serde_json",
  "tinycortex",
@@ -5716,16 +5712,6 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc"
 dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "tinytools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
  "serde",
  "serde_json",
 ]
